@@ -100,6 +100,17 @@ Morton; Hilbert was considered and rejected (better MPI partition
 locality, but the rotation arithmetic is not worth it at realistic rank
 counts).
 
+**Neighbor asymmetry** (recorded from M1): neighbor finding is not
+symmetric under reversing the direction when levels differ — a coarse
+block found across a fine block's corner also spans the face beyond it,
+so the reversed direction from the coarse side points elsewhere. Exact
+reciprocity holds only between same-level neighbors; adjacency is always
+mutually discoverable, just not necessarily across the opposite
+direction. Under periodicity two blocks can additionally be adjacent in
+several directions at once (a single periodic root abuts both of its own
+faces). Ghost filling must therefore be formulated as each block asking
+for its own ghost sources — never as reversing a neighbor lookup.
+
 ### Domain and boundaries
 
 The root brick maps to a rectangular physical domain: root block
@@ -175,6 +186,13 @@ Edge and corner ghost regions are always filled — some stencils don't
 need them, but filling unconditionally is simpler, and cross-derivative
 stencils do. Application kernels are strictly block-local: neighbor data
 is visible only through ghost cells.
+
+Neighbor finding is a regridding-frequency operation; ghost filling runs
+at every RHS evaluation. The ghost-fill **exchange schedule** — the flat
+list of copy/prolongation/restriction source–target region pairs — is
+therefore precomputed whenever the tree changes and cached;
+`fill_ghosts!` only replays it. Tree queries (`neighbor_keys` and
+friends) must never appear in the per-evaluation path.
 
 Restriction is otherwise only needed when coarsening during regridding
 and for analysis/output — there is no periodic "restrict fine onto
@@ -374,11 +392,13 @@ established before any parallelism.
   roots, sorted leaf array, neighbor finding, refine/coarsen, 2:1
   balance enforcement, block storage, periodic wraparound. *Accept:*
   hand-rolled property tests with a seeded RNG (tiling, balance,
-  neighbor symmetry, periodicity) on random refinement patterns in
-  D = 1, 2, 3.
-- **M2 — Ghost exchange and default operators.** The phased ghost fill
-  (three cases, level-ordered prolongation), periodic boundaries,
-  physical-boundary hooks, default operators of configurable order —
+  neighbor soundness/completeness — exact reciprocity only at equal
+  levels, see neighbor asymmetry above — and periodicity) on random
+  refinement patterns in D = 1, 2, 3. *(Done.)*
+- **M2 — Ghost exchange and default operators.** The cached exchange
+  schedule, the phased ghost fill (three cases, level-ordered
+  prolongation), periodic boundaries, physical-boundary hooks, default
+  operators of configurable order with the `G`-sufficiency check —
   written as KernelAbstractions kernels (CPU backend). *Accept:*
   polynomial data reproduced exactly up to operator order across all
   face/edge/corner configurations, including periodic wraparound and
