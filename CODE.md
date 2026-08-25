@@ -60,11 +60,14 @@ in the working array, not in the ODE state vector (see
 Invariants tying the parameters together:
 
 - `N` is even (a fine block covers `N/2` cells at its parent's spacing).
-- `N ≥ 2G` (filling `G` coarse ghost layers by restriction reads `2G`
-  fine interior layers).
-- The prolongation stencil for `G` fine ghost layers must fit within the
-  coarse neighbor's interior plus ghosts; this couples `G` to the
-  operator order — higher-order operators need larger `G`.
+- Shifted restriction of order `p` reads fine interior cells up to depth
+  `2G + p/2 − 1`: `N ≥ 2G + p/2 − 1` (at `p = 2` this is the basic
+  `N ≥ 2G`).
+- Symmetric prolongation of order `p` reads up to `p/2` of the source
+  block's own ghost layers: `G ≥ p/2`. (Worst case is the first fine
+  ghost layer: its target sits a quarter coarse cell from the interface,
+  between the coarse nodes straddling it, and the node across the
+  interface is already ghost layer 1.)
 
 ### Tree structure
 
@@ -225,6 +228,24 @@ Operators are configured per field set, not per variable. Per-variable
 selection (e.g. conservative for density, plain for velocity) is
 deferred to M8, whose face-centered support forces an interface
 extension anyway.
+
+**Interface stencils** (decided in M2): near a coarse-fine interface the
+symmetric restriction window cannot exist — fine data across the
+interface would itself be prolongated coarse data, a circularity.
+Restriction therefore **shifts** its window inward (by `p/2 − 1` fine
+cells at the ghost layer nearest the interface). Shifting preserves
+polynomial exactness (Lagrange interpolation through any `p` distinct
+nodes is exact for degree `< p`) and keeps the target inside the node
+hull — interpolation, never extrapolation; the implementation asserts
+this. Reducing the order instead was rejected: a symmetric window at the
+first ghost layer collapses to order 2 regardless of `p`, and the
+interface truncation error acts as a reflection source for wave-type
+equations, capping global convergence near order 3. Prolongation, by
+contrast, stays symmetric: it may read the source block's ghosts (that
+is what the level-ordered sweep guarantees), at the cost of `G ≥ p/2`.
+Stability does not discriminate between the choices here
+(global `dt`, 2:1 balance); damping high-frequency interface modes
+remains the job of the application's usual Kreiss–Oliger dissipation.
 
 ### Conservation at coarse-fine faces
 
