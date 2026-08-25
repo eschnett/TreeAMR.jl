@@ -1,0 +1,7 @@
+name = "TreeAMR"
+uuid = "91bc416d-811c-44c1-9bc4-b9c8bbdbbd08"
+version = "0.1.0"
+authors = ["Erik Schnetter <schnetter@gmail.com>"]
+
+[compat]
+julia = "1.10"
