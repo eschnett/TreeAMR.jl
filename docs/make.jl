@@ -7,4 +7,4 @@ makedocs(;
     pages=["Home" => "index.md"],
 )
 
-deploydocs(; repo="github.com/eschnett/TreeAMR.jl.git")  # TODO: adjust once the repo has a home
+deploydocs(; repo="github.com/eschnett/TreeAMR.jl.git")

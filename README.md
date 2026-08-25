@@ -4,6 +4,8 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
+[![CI](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml)
+
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap. The package is currently at milestone **M0** (scaffolding).
 
