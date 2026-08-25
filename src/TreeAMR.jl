@@ -12,13 +12,20 @@ module TreeAMR
 # Tree core (M1)
 export MortonKey, MAX_LEVEL, level, parentkey, childkeys, sortedchildkeys, isancestor
 export Forest, nleaves, maxlevel, root_position, root_index, alldirections
-export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced
+export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
 export root_spacing, spacing, minimum_spacing, block_origin, block_extent, cell_center
 export FieldSet, nblocks, blockkey, blockview, interiorview, fill_by_coordinates!
+
+# Ghost exchange and interpolation operators (M2)
+export Operators, check_operators, GhostSchedule, isstale, fill_ghosts!,
+       boundary_by_coordinates
 
 include("morton.jl")
 include("forest.jl")
 include("geometry.jl")
 include("storage.jl")
+include("operators.jl")
+include("schedule.jl")
+include("ghosts.jl")
 
 end

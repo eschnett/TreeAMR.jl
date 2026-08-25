@@ -7,10 +7,11 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M1** (tree core): Morton keys over a brick
-of octree roots, the sorted leaf array, neighbor finding, refinement and
-coarsening, 2:1 balance, periodic wraparound, and block storage. Ghost
-exchange and the interpolation operators arrive in M2.
+The package is at milestone **M2**: the tree core (Morton keys over a
+brick of octree roots, neighbor finding, refinement and coarsening, 2:1
+balance, periodic wraparound, block storage) plus the cached ghost
+exchange and the default interpolation operators. The wave equation and
+`OrdinaryDiffEq` coupling arrive in M3.
 
 ## Overview
 
@@ -52,6 +53,45 @@ cases in M2.
 Data lives in a [`FieldSet`](@ref): one big array over all leaf blocks,
 cell indices fastest, ghosts included.
 
+## Ghost exchange
+
+Ghost filling runs at every RHS evaluation, while neighbor finding is
+only needed when the tree changes. So the exchange is split in two: a
+[`GhostSchedule`](@ref) is built once and [`fill_ghosts!`](@ref) merely
+replays it, with no tree query in the per-evaluation path.
+
+```jldoctest overview
+julia> schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2));
+
+julia> state = FieldSet(forest, 2);
+
+julia> fill_by_coordinates!((x, v) -> v * x[1], state);
+
+julia> fill_ghosts!(state, schedule);
+```
+
+Under 2:1 balance there are only three cases — a same-level copy, a
+restriction from finer neighbors, and a prolongation from a coarser one
+— and all three are tensor products of one-dimensional stencils, so a
+single KernelAbstractions kernel serves them all.
+
+The schedule is tied to the tree it was built from, and says so:
+
+```jldoctest overview
+julia> isstale(schedule)
+false
+
+julia> refine!(forest, last(forest.leaves));
+
+julia> isstale(schedule)
+true
+```
+
+Interpolation order is configurable via [`Operators`](@ref), and is
+constrained by the block geometry: order `p` prolongation needs
+`G ≥ p/2`, which [`check_operators`](@ref) enforces when the schedule is
+built.
+
 ## Module
 
 ```@docs
@@ -87,6 +127,7 @@ refine!
 coarsen!
 balance!
 isbalanced
+generation
 ```
 
 ## Geometry
@@ -109,6 +150,29 @@ blockkey
 blockview
 interiorview
 fill_by_coordinates!
+```
+
+## Ghost exchange and operators
+
+```@docs
+Operators
+check_operators
+GhostSchedule
+isstale
+fill_ghosts!
+boundary_by_coordinates
+```
+
+## Internals
+
+Not exported, and not part of the public interface, but documented
+because they define the shape of the schedule.
+
+```@docs
+TreeAMR.Stencil1D
+TreeAMR.TransferGroup
+TreeAMR.BoundaryRegion
+TreeAMR.lagrange_weights
 ```
 
 ## Index

@@ -38,6 +38,11 @@ struct Forest{D}
     N::Int
     G::Int
     leaves::Vector{MortonKey{D}}
+    # Bumped whenever the leaf array changes, so anything derived from
+    # the tree (a GhostSchedule, say) can detect in O(1) that it is
+    # stale — a same-size refine-then-coarsen would otherwise slip past
+    # a leaf-count check and silently transfer the wrong data.
+    generation::Base.RefValue{Int}
 end
 
 function Forest(roots::NTuple{D,Integer};
@@ -64,8 +69,17 @@ function Forest(roots::NTuple{D,Integer};
     rootsI = map(Int, roots)
     leaves = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
     sort!(leaves)
-    return Forest{D}(rootsI, periodic, ext, Int(N), Int(G), leaves)
+    return Forest{D}(rootsI, periodic, ext, Int(N), Int(G), leaves, Ref(0))
 end
+
+"""
+    generation(forest::Forest)
+
+A counter bumped on every change to the leaf array. Structures derived
+from the tree record it so they can tell in O(1) whether they are still
+valid — see [`GhostSchedule`](@ref).
+"""
+generation(forest::Forest) = forest.generation[]
 
 """
     nleaves(forest::Forest)
@@ -257,6 +271,7 @@ end
 function rebuild_leaves!(forest::Forest{D}, newleaves::Vector{MortonKey{D}}) where {D}
     empty!(forest.leaves)
     append!(forest.leaves, newleaves)
+    forest.generation[] += 1
     return forest
 end
 

@@ -3,6 +3,7 @@ using Random
 using TreeAMR
 
 include("oracles.jl")
+include("ghost_oracles.jl")
 
 @testset "TreeAMR.jl" begin
 
@@ -401,5 +402,7 @@ end
     cellvol = prod(_ -> spacing(forest, 0), 1:D)
     @test nblocks(fs) * forest.N^D * cellvol ≈ 2.0^D
 end
+
+include("ghost_tests.jl")
 
 end

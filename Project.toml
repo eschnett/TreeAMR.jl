@@ -3,5 +3,9 @@ uuid = "91bc416d-811c-44c1-9bc4-b9c8bbdbbd08"
 version = "0.1.0"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
+[deps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+
 [compat]
+KernelAbstractions = "0.9.42, 1"
 julia = "1.10"
