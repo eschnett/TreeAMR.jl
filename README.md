@@ -5,9 +5,11 @@ Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
 [![CI](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml)
+[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://eschnett.github.io/TreeAMR.jl/dev)
 
 See [CODE.md](CODE.md) for the full design document and the milestone
-roadmap. The package is currently at milestone **M0** (scaffolding).
+roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
+The package is currently at milestone **M0** (scaffolding).
 
 ## Status
 
