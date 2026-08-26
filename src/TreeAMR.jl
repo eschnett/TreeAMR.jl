@@ -18,8 +18,8 @@ export root_spacing, spacing, minimum_spacing, block_origin, block_extent, cell_
 export FieldSet, nblocks, blockkey, blockview, interiorview, fill_by_coordinates!
 
 # Ghost exchange and interpolation operators (M2)
-export Operators, check_operators, GhostSchedule, isstale, fill_ghosts!,
-       boundary_by_coordinates
+export Operators, OperatorFamily, PointValue, Conservative, check_operators,
+       GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,

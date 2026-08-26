@@ -212,6 +212,64 @@ function prolong_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int, p::Int) w
     return Stencil1D{T}(first(rng), srcstart, weights)
 end
 
+# Conservative prolongation weights: reconstruct a degree-(p-1)
+# polynomial over the coarse cell from the averages of the p cells
+# centered on it, then average that reconstruction over each half.
+#
+# Working through the primitive W (whose increments across cell
+# boundaries are the cell averages) turns "reconstruct from averages"
+# into ordinary interpolation: W is the degree-p polynomial through the
+# p+1 boundary values, and a subcell average is a difference of W
+# divided by the subcell width.
+#
+# The result is exactly conservative: the two subcell weight vectors
+# average to the unit vector on the center cell, so the children always
+# average back to their parent whatever the data.
+function conservative_prolong_weights(p::Int)
+    r = (p - 1) ÷ 2
+    boundaries = [-r - 0.5 + i for i in 0:p]        # p+1 cell boundaries
+    # W(x) = Σ_i L_i(x) W_i and W_i = Σ_{t<i} ū_t, so ū_t carries weight
+    # Σ_{i>t} L_i(x).
+    L = lagrange_weights(boundaries, 0.0)           # at the cell's own center
+    tail = [sum(L[(t + 2):(p + 1)]) for t in 0:(p - 1)]
+    low = [2 * (tail[t + 1] - (t < r ? 1.0 : 0.0)) for t in 0:(p - 1)]
+    high = [2 * ((t < r + 1 ? 1.0 : 0.0) - tail[t + 1]) for t in 0:(p - 1)]
+    return low, high
+end
+
+function conservative_prolong_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int,
+                                      p::Int) where {T}
+    rng = target_range(N, G, δd, od, false)
+    low, high = conservative_prolong_weights(p)
+    r = (p - 1) ÷ 2
+    srcstart = Vector{Int32}(undef, length(rng))
+    weights = Matrix{T}(undef, p, length(rng))
+    for (i, j) in enumerate(rng)
+        φ = od * N + j - G - 1
+        # Unlike the point-value case, the fine cell *is* a subcell of
+        # coarse cell fld(φ, 2) rather than a point near it.
+        c = fld(φ, 2)
+        subcell = φ - 2c                            # 0 = low half, 1 = high
+        origin = -N * source_direction(δd, od) + G + 1
+        srcstart[i] = c - r + origin
+        weights[:, i] = subcell == 0 ? low : high
+    end
+    return Stencil1D{T}(first(rng), srcstart, weights)
+end
+
+# The stencils a given operator family uses, so that the schedule and
+# the regrid transfer cannot drift apart.
+prolongation_stencil(::Type{T}, N, G, δd, od, ops::Operators) where {T} =
+    ops.family === Conservative ?
+    conservative_prolong_stencil(T, N, G, δd, od, ops.prolongation) :
+    prolong_stencil(T, N, G, δd, od, ops.prolongation)
+
+# Conservative restriction is the exact volume average, which the
+# point-value builder already produces at order 2: its window is a
+# cell's own two children and its weights are 1/2.
+restriction_stencil(::Type{T}, N, G, δd, od, ops::Operators) where {T} =
+    restrict_stencil(T, N, G, δd, od, ops.restriction)
+
 # --- Schedule construction -----------------------------------------------
 
 # A block's offset within its parent, per dimension.
@@ -266,9 +324,9 @@ function GhostSchedule(forest::Forest{D}, operators::Operators;
 
     build(kind, δ, o) =
         kind === :copy ? ntuple(d -> copy_stencil(T, N, G, δ[d]), D) :
-        kind === :restrict ? ntuple(d -> restrict_stencil(T, N, G, δ[d], o[d],
-                                                          operators.restriction), D) :
-        ntuple(d -> prolong_stencil(T, N, G, δ[d], o[d], operators.prolongation), D)
+        kind === :restrict ?
+        ntuple(d -> restriction_stencil(T, N, G, δ[d], o[d], operators), D) :
+        ntuple(d -> prolongation_stencil(T, N, G, δ[d], o[d], operators), D)
 
     phase1 = TransferGroup{T,D}[]
     bylevel = Dict{Int,Vector{TransferGroup{T,D}}}()

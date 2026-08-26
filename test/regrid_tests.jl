@@ -230,6 +230,60 @@ end
     @test total_mass(ofs) ≈ before rtol = 1e-12
 end
 
+@testset "Conservative family: transfer conserves any field: D=$D" for D in (1, 2, 3)
+    # The point of the conservative family. Prolongation reconstructs
+    # over the coarse cell preserving its average, so the children always
+    # average back to their parent -- exactly, for arbitrary data, not
+    # merely for fields the operators reproduce.
+    rng = MersenneTwister(1100 + D)
+    for p in (1, 3)
+        G = max(1, (p - 1) ÷ 2)
+        ops = Operators(prolongation=p, restriction=2, family=Conservative)
+        forest = Forest(ntuple(_ -> 3, D); N=4, G=G, periodic=ntuple(_ -> true, D),
+                        extents=ntuple(_ -> (0.0, 1.0), D))
+        fs = FieldSet(forest, 1)
+        for b in 1:nblocks(fs)
+            interiorview(fs, b, 1) .= rand(rng, size(interiorview(fs, b, 1))...)
+        end
+        before = total_mass(fs)
+
+        for _ in 1:5
+            schedule = GhostSchedule(forest, ops)
+            flags = flag_blocks(forest) do b, k
+                r = rand(rng)
+                r < 0.35 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
+            end
+            regrid!(forest, fs, schedule; flags=flags)
+            @test isbalanced(forest)
+        end
+        @test total_mass(fs) ≈ before rtol = 1e-12
+    end
+end
+
+@testset "Point-value transfer does not conserve arbitrary data" begin
+    # The contrast that makes the family selection meaningful: with
+    # point-value operators the same random field drifts, because
+    # prolongation draws on neighbour values through the parent's ghosts
+    # without those neighbours giving anything up.
+    rng = MersenneTwister(1234)
+    ops = Operators(prolongation=2, restriction=2)
+    forest = Forest((3,); N=4, G=1, periodic=(true,), extents=((0.0, 1.0),))
+    fs = FieldSet(forest, 1)
+    for b in 1:nblocks(fs)
+        interiorview(fs, b, 1) .= rand(rng, size(interiorview(fs, b, 1))...)
+    end
+    before = total_mass(fs)
+    for _ in 1:5
+        schedule = GhostSchedule(forest, ops)
+        flags = flag_blocks(forest) do b, k
+            r = rand(rng)
+            r < 0.35 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
+        end
+        regrid!(forest, fs, schedule; flags=flags)
+    end
+    @test !isapprox(total_mass(fs), before; rtol=1e-8)
+end
+
 @testset "Several field sets regrid together: D=$D" for D in (1, 2)
     forest = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))

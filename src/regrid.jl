@@ -127,8 +127,8 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
     stencils(kind, o) =
         kind === :copy ? ntuple(d -> copy_stencil(T, N, G, 0), D) :
         kind === :restrict ?
-            ntuple(d -> restrict_stencil(T, N, G, 0, o[d], operators.restriction), D) :
-            ntuple(d -> prolong_stencil(T, N, G, 0, o[d], operators.prolongation), D)
+        ntuple(d -> restriction_stencil(T, N, G, 0, o[d], operators), D) :
+        ntuple(d -> prolongation_stencil(T, N, G, 0, o[d], operators), D)
 
     return [TransferGroup{T,D}(kind, stencils(kind, o), targets, sources)
             for ((kind, o), (targets, sources)) in pairs]
@@ -260,10 +260,18 @@ end
 The volume integral of one variable over the domain — `Σ hᴰ u` over
 every interior cell, with each block weighted by its own cell volume.
 
-Regridding conserves this: restriction to a coarser block averages its
-children, and prolongation distributes a parent's value across its
-children, so the integral is unchanged to roundoff even though
-individual cell values are not.
+What [`regrid!`](@ref) does to this depends on the operator family:
+
+- With [`Conservative`](@ref OperatorFamily) operators it is preserved to roundoff for
+  **any** field. Restriction is the exact volume average, and
+  prolongation reconstructs over the coarse cell preserving its average,
+  so a parent's children always average back to it.
+- With [`PointValue`](@ref OperatorFamily) operators it is preserved only for fields the
+  operators reproduce exactly. Coarsening alone still conserves any
+  field — order-2 restriction is the `2^D` average — but refinement does
+  not: prolongation is not locally conservative, and at a refinement
+  boundary the fine region draws on neighbor values through the parent's
+  ghosts without those neighbors giving anything up.
 """
 function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest

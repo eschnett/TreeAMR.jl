@@ -5,7 +5,7 @@
     @test ops.prolongation == 4
     @test ops.restriction == 6
     @test sprint(show, Operators(prolongation=2, restriction=2)) ==
-          "Operators(prolongation=2, restriction=2)"
+          "Operators(prolongation=2, restriction=2, family=PointValue)"
 
     # Both orders are required. There is no order the mesh could default
     # to, because the right one follows from the application's
@@ -48,6 +48,61 @@
     @test_throws ArgumentError TreeAMR.interpolation_weights(1, 4, 0.5, "test")
 end
 
+@testset "Conservative operator family" begin
+    ops = Operators(prolongation=3, restriction=2, family=Conservative)
+    @test ops.family === Conservative
+    @test ops.prolongation == 3
+    @test occursin("Conservative", sprint(show, ops))
+    @test Operators(prolongation=2, restriction=2).family === PointValue
+
+    # Odd stencils, because the reconstruction is centered on the coarse
+    # cell rather than a quarter cell off a source center.
+    @test Operators(prolongation=1, restriction=2, family=Conservative) isa Operators
+    @test Operators(prolongation=5, restriction=2, family=Conservative) isa Operators
+    @test_throws ArgumentError Operators(prolongation=2, restriction=2, family=Conservative)
+    @test_throws ArgumentError Operators(prolongation=0, restriction=2, family=Conservative)
+    # ... and the point-value family still wants even ones.
+    @test_throws ArgumentError Operators(prolongation=3, restriction=2)
+
+    # Conservative restriction is the exact volume average, so there is
+    # no higher order to ask for.
+    @test_throws ArgumentError Operators(prolongation=3, restriction=4, family=Conservative)
+    @test_throws "exact volume average" Operators(prolongation=3, restriction=4,
+                                                  family=Conservative)
+
+    # The reconstruction weights are a partition of unity, and the two
+    # subcell weight vectors average to the unit vector on the centre
+    # cell -- which is local conservation, independent of the data.
+    for p in (1, 3, 5)
+        low, high = TreeAMR.conservative_prolong_weights(p)
+        @test length(low) == length(high) == p
+        @test sum(low) ≈ 1.0
+        @test sum(high) ≈ 1.0
+        centre = zeros(p)
+        centre[(p + 1) ÷ 2] = 1.0
+        @test (low .+ high) ./ 2 ≈ centre atol = 1e-12
+    end
+    # Order 3 is the familiar ±1/8 conservative slope.
+    low, high = TreeAMR.conservative_prolong_weights(3)
+    @test low ≈ [1 / 8, 1.0, -1 / 8]
+    @test high ≈ [-1 / 8, 1.0, 1 / 8]
+    # Order 1 is piecewise constant.
+    @test TreeAMR.conservative_prolong_weights(1) == ([1.0], [1.0])
+end
+
+@testset "Conservative exchange is exact for cell averages: D=$D" for D in (1, 2)
+    # The conservative family reproduces the cell *averages* of a
+    # polynomial of degree p-1 exactly, and no further -- the analogue of
+    # the point-value family's pointwise exactness.
+    for p in (1, 3, 5)
+        G = max(1, (p - 1) ÷ 2)
+        forest = nested_forest(Val(D); N=8, G=G)
+        ops = Operators(prolongation=p, restriction=2, family=Conservative)
+        @test conservative_exchange_error(forest, ops, scalarpoly(D, p - 1)) < 1e-11
+        @test conservative_exchange_error(forest, ops, scalarpoly(D, p)) > 1e-9
+    end
+end
+
 @testset "Operator/geometry compatibility" begin
     # Each constraint is isolated by pinning the other order low enough
     # that it cannot be the one that trips.
@@ -66,6 +121,17 @@ end
     @test check_operators(Forest((2,); N=4, G=2), restrict(2)) === nothing
     @test_throws ArgumentError check_operators(Forest((2,); N=4, G=2), restrict(4))
     @test check_operators(Forest((2,); N=6, G=2), restrict(4)) === nothing
+
+    # The conservative family needs one fewer ghost layer at the same
+    # order, because its stencil is centered on a cell rather than
+    # straddling one.
+    cons(p) = Operators(prolongation=p, restriction=2, family=Conservative)
+    @test TreeAMR.ghost_layers_read(cons(3)) == 1
+    @test TreeAMR.ghost_layers_read(cons(5)) == 2
+    @test TreeAMR.ghost_layers_read(Operators(prolongation=4, restriction=2)) == 2
+    @test check_operators(Forest((2,); N=8, G=1), cons(3)) === nothing
+    @test_throws ArgumentError check_operators(Forest((2,); N=8, G=1), cons(5))
+    @test check_operators(Forest((2,); N=8, G=2), cons(5)) === nothing
 
     # Ghost filling is meaningless without ghosts.
     @test_throws ArgumentError GhostSchedule(Forest((2,); N=4, G=0),

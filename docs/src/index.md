@@ -154,9 +154,15 @@ schedule, passes, converged = adapt_to_initial_data!(fs, operators;
                                                      initial = f, flag = flag)
 ```
 
-Transfer conserves [`total_mass`](@ref) to roundoff for any field the
-operators reproduce exactly, and coarsening conserves it for *any* field,
-since restriction at order 2 is the `2^D` average.
+Whether the transfer conserves [`total_mass`](@ref) depends on which
+operator family the field set uses. With [`Conservative`](@ref OperatorFamily)
+operators it is exact for arbitrary data; with [`PointValue`](@ref OperatorFamily) ones
+only for fields the operators reproduce exactly, since prolongation is
+not locally conservative. Coarsening alone conserves either way.
+
+```julia
+ops = Operators(prolongation = 3, restriction = 2, family = Conservative)
+```
 
 ## Module
 
@@ -223,6 +229,7 @@ fill_by_coordinates!
 
 ```@docs
 Operators
+OperatorFamily
 check_operators
 GhostSchedule
 isstale
@@ -263,6 +270,7 @@ TreeAMR.Stencil1D
 TreeAMR.TransferGroup
 TreeAMR.BoundaryRegion
 TreeAMR.lagrange_weights
+TreeAMR.ghost_layers_read
 ```
 
 ## Index

@@ -11,6 +11,85 @@ An operator of order `p` reproduces it exactly iff `deg < p`.
 makepoly(D, deg) = (x, v) -> sum(0.3v + 0.7d + 0.11 * (d + v) * x[d]^e
                                  for d in 1:D for e in 0:deg)
 
+# 5-point Gauss-Legendre on [-1, 1]: exact through degree 9, so the cell
+# averages below are exact for every polynomial the conservative family
+# claims to reproduce.
+const GAUSS_X = [-0.906179845938664, -0.5384693101056831, 0.0,
+                 0.5384693101056831, 0.906179845938664]
+const GAUSS_W = [0.23692688505618908, 0.47862867049936647, 0.5688888888888889,
+                 0.47862867049936647, 0.23692688505618908]
+
+"""
+The exact average of `f` over the cell of width `h` centered at `x` —
+what the conservative family treats a stored number as meaning.
+"""
+function cell_average(f, x::NTuple{D,Float64}, h::Real) where {D}
+    total = 0.0
+    for idx in CartesianIndices(ntuple(_ -> 1:length(GAUSS_X), D))
+        i = Tuple(idx)
+        weight = prod(GAUSS_W[i[d]] for d in 1:D) / 2^D
+        point = ntuple(d -> x[d] + h / 2 * GAUSS_X[i[d]], D)
+        total += weight * f(point)
+    end
+    return total
+end
+
+"""Fill every interior cell with the exact cell average of `f`."""
+function fill_cell_averages!(fs::FieldSet{T,D}, f) where {T,D}
+    forest = fs.forest
+    G, N = forest.G, forest.N
+    for b in 1:nblocks(fs)
+        k = blockkey(fs, b)
+        h = spacing(forest, k)
+        block = blockview(fs, b, 1)
+        for idx in CartesianIndices(ntuple(_ -> (G + 1):(G + N), D))
+            block[idx] = cell_average(f, cell_center(forest, k, Tuple(idx)), h)
+        end
+    end
+    return fs
+end
+
+"""A boundary hook imposing exact cell averages of `f`."""
+boundary_cell_averages(f) =
+    function (fs, b, key, δ, region)
+        h = spacing(fs.forest, key)
+        block = blockview(fs, b, 1)
+        for idx in region
+            block[idx] = cell_average(f, cell_center(fs.forest, key, Tuple(idx)), h)
+        end
+        return nothing
+    end
+
+"""Worst deviation of any stored cell from the exact cell average of `f`."""
+function max_average_deviation(fs::FieldSet{T,D}, f) where {T,D}
+    forest = fs.forest
+    worst = 0.0
+    for b in 1:nblocks(fs)
+        k = blockkey(fs, b)
+        h = spacing(forest, k)
+        block = blockview(fs, b, 1)
+        for idx in CartesianIndices(block)
+            exact = cell_average(f, cell_center(forest, k, Tuple(idx)), h)
+            worst = max(worst, abs(block[idx] - exact))
+        end
+    end
+    return worst
+end
+
+"""
+Fill a hierarchy with exact cell averages of `f`, exchange ghosts with
+the conservative family, and report the worst error anywhere.
+"""
+function conservative_exchange_error(forest, ops, f)
+    fs = FieldSet(forest, 1)
+    fill_cell_averages!(fs, f)
+    fill_ghosts!(fs, GhostSchedule(forest, ops); boundary=boundary_cell_averages(f))
+    return max_average_deviation(fs, f)
+end
+
+"""A polynomial of total degree `deg`, as a plain function of position."""
+scalarpoly(D, deg) = x -> sum(0.7d + 0.31 * (d + 1) * x[d]^e for d in 1:D for e in 0:deg)
+
 """Largest deviation of any stored cell (interior *and* ghost) from `f`."""
 function max_deviation(fs, f)
     forest = fs.forest
