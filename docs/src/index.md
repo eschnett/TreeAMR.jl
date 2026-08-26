@@ -7,12 +7,12 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M3**: the tree core (Morton keys over a
+The package is at milestone **M4**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
-with configurable interpolation operators, and the state-vector coupling
-that lets a standard ODE integrator drive the whole hierarchy.
-Regridding arrives in M4.
+with configurable interpolation operators, the state-vector coupling
+that lets a standard ODE integrator drive the whole hierarchy, and
+adaptive regridding. Multi-threading arrives in M5.
 
 ## Overview
 
@@ -123,6 +123,41 @@ Errors and tolerances on an adaptive mesh want
 [`volume_weighted_norm`](@ref): refined regions contribute more entries
 per unit volume, so an unweighted norm silently emphasizes them.
 
+## Regridding
+
+The application flags blocks; [`regrid!`](@ref) completes the marks to
+preserve 2:1 balance, rebuilds the key list, and moves the data —
+surviving blocks copied, refined blocks prolongated from their parent,
+coarsened blocks restricted from their children.
+
+```julia
+flags = flag_blocks((b, key) -> needs_refining(fs, b) ? Refine : Keep, forest)
+if regrid!(forest, fs, schedule; flags = flags)
+    schedule = GhostSchedule(forest, operators)   # the old one is now stale
+    u = statevector(fs); gather!(u, fs)           # and u changed length
+    # ... then reinit! the integrator
+end
+```
+
+Regridding changes both the size and the meaning of the state vector, so
+in practice it means stop → rebuild → `reinit!` for anything beyond a
+one-step method. Block indices are not stable across a regrid: slots are
+compacted, and `forest.leaves[b]` is the only way to say which block is
+which.
+
+Building initial data iterates the same machinery, *re-evaluating* the
+data on each new mesh rather than interpolating it — otherwise a newly
+refined block would only ever carry the coarse mesh's resolution:
+
+```julia
+schedule, passes, converged = adapt_to_initial_data!(fs, operators;
+                                                     initial = f, flag = flag)
+```
+
+Transfer conserves [`total_mass`](@ref) to roundoff for any field the
+operators reproduce exactly, and coarsening conserves it for *any* field,
+since restriction at order 2 is the `2^D` average.
+
 ## Module
 
 ```@docs
@@ -205,6 +240,17 @@ scatter!
 gather!
 map_blocks!
 volume_weighted_norm
+```
+
+## Regridding
+
+```@docs
+RegridFlag
+flag_blocks
+complete_marks
+regrid!
+adapt_to_initial_data!
+total_mass
 ```
 
 ## Internals

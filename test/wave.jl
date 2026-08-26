@@ -132,6 +132,124 @@ function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction
             h=h, nsteps=nsteps, nblocks=nleaves(forest))
 end
 
+"""
+A Gaussian pulse travelling in +x at the wave speed, exact for the 1D
+wave equation and (with `σ ≪ L`) periodic to roundoff:
+
+    u = G(d),  ∂ₜu = (d/σ²) G(d),   d = x - x₀ - t  (wrapped)
+
+In more than one dimension it is a plane pulse, uniform in the
+transverse directions, so `∇²u = ∂ₓ²u` and it stays exact.
+"""
+function pulse_exact(D, L, x0, σ, t)
+    return function (x, var)
+        d = mod(x[1] - x0 - t + L / 2, L) - L / 2
+        g = exp(-d^2 / (2σ^2))
+        return var == 1 ? g : (d / σ^2) * g
+    end
+end
+
+"""
+Evolve a travelling pulse, regridding every `chunk` of time so the
+refined region follows it. Returns the worst error over the run and how
+well the refinement tracked the pulse.
+
+Regridding changes both the length and the meaning of the state vector,
+so each chunk is a fresh `solve`: stop, rebuild the schedule and the
+state vector, restart — the pattern `CODE.md` prescribes for anything
+beyond a one-step method.
+"""
+function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
+                     ops=Operators(prolongation=4, restriction=4),
+                     t_end=0.5, chunk=0.05, cfl=0.25, maxlevel_wanted=2,
+                     threshold=0.05) where {D}
+    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, L), D))
+    fs = FieldSet(forest, 2)
+
+    # Refine where the pulse actually is, judged from the current data.
+    function flag(b, k)
+        peak = maximum(abs, interiorview(fs, b, 1))
+        want = peak > threshold ? maxlevel_wanted : 0
+        return level(k) < want ? Refine : level(k) > want ? Coarsen : Keep
+    end
+
+    fill_by_coordinates!(pulse_exact(D, L, x0, σ, 0.0), fs)
+    schedule, _, _ = adapt_to_initial_data!(fs, ops;
+                                            initial=pulse_exact(D, L, x0, σ, 0.0),
+                                            flag=flag, maxpasses=8)
+
+    worst = 0.0
+    refined_fraction = Float64[]
+    t = 0.0
+    while t < t_end - 1e-12
+        stop = min(t + chunk, t_end)
+        problem = WaveProblem(fs, schedule)
+        u = statevector(fs)
+        gather!(u, fs)
+        dt = cfl * minimum_spacing(forest)
+        nsteps = max(1, ceil(Int, (stop - t) / dt))
+        sol = solve(ODEProblem(wave_rhs!, u, (t, stop), problem), RK4();
+                    dt=(stop - t) / nsteps, adaptive=false, save_everystep=false)
+        scatter!(fs, sol.u[end])
+        t = stop
+
+        # Error against the exact travelling pulse.
+        exact = FieldSet(forest, 2)
+        fill_by_coordinates!(pulse_exact(D, L, x0, σ, t), exact)
+        ue = statevector(exact)
+        gather!(ue, exact)
+        worst = max(worst, volume_weighted_norm(fs, sol.u[end] .- ue; p=Inf))
+
+        # How much of the pulse sits in refined blocks -- the measure of
+        # whether the refined region is actually following it.
+        inside = 0.0
+        total = 0.0
+        for b in 1:nblocks(fs)
+            peak = maximum(abs, interiorview(fs, b, 1))
+            total = max(total, peak)
+            level(blockkey(fs, b)) > 0 && (inside = max(inside, peak))
+        end
+        push!(refined_fraction, total > 0 ? inside / total : 0.0)
+
+        fill_ghosts!(fs, schedule)
+        flags = flag_blocks(flag, forest)
+        if regrid!(forest, fs, schedule; flags=flags)
+            schedule = GhostSchedule(forest, ops)
+        end
+    end
+
+    return (worst=worst, tracking=minimum(refined_fraction),
+            nblocks=nleaves(forest), maxlevel=maxlevel(forest))
+end
+
+"""
+The same travelling pulse on a *uniform* mesh, as the reference the
+adaptive run is judged against: matching the finest uniform mesh is what
+"tracks the pulse without artifacts" has to mean.
+"""
+function uniform_pulse(::Val{D}; roots, N, G=2, L=1.0, σ=0.08, x0=0.25,
+                       ops=Operators(prolongation=4, restriction=4),
+                       t_end=0.5, cfl=0.25) where {D}
+    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, L), D))
+    fs = FieldSet(forest, 2)
+    schedule = GhostSchedule(forest, ops)
+    fill_by_coordinates!(pulse_exact(D, L, x0, σ, 0.0), fs)
+    u = statevector(fs)
+    gather!(u, fs)
+    dt = cfl * minimum_spacing(forest)
+    nsteps = ceil(Int, t_end / dt)
+    sol = solve(ODEProblem(wave_rhs!, u, (0.0, t_end), WaveProblem(fs, schedule)), RK4();
+                dt=t_end / nsteps, adaptive=false, save_everystep=false)
+    exact = FieldSet(forest, 2)
+    fill_by_coordinates!(pulse_exact(D, L, x0, σ, t_end), exact)
+    ue = statevector(exact)
+    gather!(ue, exact)
+    return (err=volume_weighted_norm(fs, sol.u[end] .- ue; p=Inf),
+            cells=nleaves(forest) * N^D)
+end
+
 """Least-squares convergence rate of `errs` against spacings `hs`."""
 function convergence_rate(hs, errs)
     x = log.(hs)

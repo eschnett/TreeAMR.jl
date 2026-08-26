@@ -8,7 +8,11 @@
 
 using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize
 
-@kernel function transfer_kernel!(work,
+# `dest` and `src` are the same array for ghost filling (targets are
+# ghosts, sources interiors, so they never overlap) and different arrays
+# when regridding transfers into freshly allocated storage. Neither is
+# marked @Const, so the aliasing case stays well defined.
+@kernel function transfer_kernel!(dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
                                   srcstarts, weights,
                                   targetfirst::NTuple{D,Int},
@@ -28,19 +32,20 @@ using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize
 
     # Tensor-product stencil: P^D contributions, the weight of each the
     # product of its D one-dimensional weights.
-    acc = zero(eltype(work))
+    acc = zero(eltype(dest))
     for m in 0:(P^D - 1)
         moff = ntuple(d -> (m ÷ P^(d - 1)) % P, Val(D))
-        w = one(eltype(work))
+        w = one(eltype(dest))
         for d in 1:D
             w *= weights[d][moff[d] + 1, off[d] + 1]
         end
-        acc += w * work[ntuple(d -> base[d] + moff[d], Val(D))..., v, sblock]
+        acc += w * src[ntuple(d -> base[d] + moff[d], Val(D))..., v, sblock]
     end
-    work[tidx..., v, tblock] = acc
+    dest[tidx..., v, tblock] = acc
 end
 
-function run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D}
+function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer,
+                    backend) where {T,D}
     n = ntransfers(group)
     n == 0 && return nothing
     blen = boxsize(group)
@@ -51,11 +56,14 @@ function run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where
     weights = ntuple(d -> group.stencils[d].weights, D)
 
     kernel! = transfer_kernel!(backend)
-    kernel!(fs.work, group.targetblocks, group.sourceblocks, srcstarts, weights,
+    kernel!(dest, src, group.targetblocks, group.sourceblocks, srcstarts, weights,
             tfirst, blen, stride, Val(order), Val(D);
-            ndrange=(prod(blen), fs.nvars, n))
+            ndrange=(prod(blen), nvars, n))
     return nothing
 end
+
+run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D} =
+    run_group!(fs.work, fs.work, group, fs.nvars, backend)
 
 """
     fill_ghosts!(fs::FieldSet, schedule::GhostSchedule; boundary=nothing)

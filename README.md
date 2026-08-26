@@ -9,7 +9,7 @@ no physics.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M3** (ODE coupling).
+The package is currently at milestone **M4** (regridding).
 
 ## Status
 
@@ -50,10 +50,23 @@ Implemented so far, serial and `D`-generic:
   volume-weighted L2 and L∞ errors against the exact sine mode, on a
   two-level periodic mesh.
 
-Note that reaching 2nd order on a refined mesh needs **order-4**
-interpolation, not the default order 2 — see the warning on `Operators`.
+**M4 — regridding**
 
-Next up is M4: regridding.
+- Flag → complete → rebuild → transfer, with marks completed so that 2:1
+  balance survives and coarsening only where a whole sibling group asks.
+- The initial-data cycle, which re-evaluates rather than interpolates as
+  the mesh adapts, iterated to a fixed point.
+- Conservation: transfer preserves the volume integral to roundoff for
+  any field the operators reproduce exactly, and coarsening preserves it
+  for *any* field.
+- Verified with a travelling pulse whose refined region follows it: the
+  adaptive run matches a uniformly fine mesh's accuracy using fewer
+  cells, so the moving coarse-fine interface introduces no artifacts.
+
+Note that reaching 2nd order on a refined mesh needs **order-4**
+interpolation — see the warning on `Operators`.
+
+Next up is M5: multi-threading.
 
 ## Installation
 

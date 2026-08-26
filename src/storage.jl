@@ -31,9 +31,12 @@ julia> size(fs.work)
 (6, 3, 2)
 ```
 """
-struct FieldSet{T,D,A<:AbstractArray{T}}
-    forest::Forest{D}
-    nvars::Int
+mutable struct FieldSet{T,D,A<:AbstractArray{T}}
+    const forest::Forest{D}
+    const nvars::Int
+    # Replaced wholesale by regridding, which compacts the block slots
+    # into a freshly sized array. Mutable so that references an
+    # application already holds stay valid across a regrid.
     work::A
 end
 

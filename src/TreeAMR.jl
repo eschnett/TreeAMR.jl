@@ -25,6 +25,10 @@ export Operators, check_operators, GhostSchedule, isstale, fill_ghosts!,
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
        volume_weighted_norm
 
+# Regridding (M4)
+export RegridFlag, Refine, Coarsen, Keep, flag_blocks, complete_marks, regrid!,
+       adapt_to_initial_data!, total_mass
+
 include("morton.jl")
 include("forest.jl")
 include("geometry.jl")
@@ -33,5 +37,6 @@ include("operators.jl")
 include("schedule.jl")
 include("ghosts.jl")
 include("state.jl")
+include("regrid.jl")
 
 end
