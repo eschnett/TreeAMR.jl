@@ -225,16 +225,33 @@ equations) needs correspondingly high-order restriction at coarse-fine
 interfaces, which are everywhere on a tree mesh. Whether an operator is
 conservative is a property of the operator, not of the mesh.
 
-The package defines the operator **interface** and ships polynomial
-operators of configurable order. There is **no default order** (amended
-after M3, which showed the original default of 2 silently producing
-first-order convergence): the right order depends on the application's
-differencing order via the interface-order rule below, which the mesh
-library cannot know, so `Operators` requires both orders explicitly.
-(Order 2 is linear interpolation, whose restriction counterpart is the
-`2^D` average.) The application chooses `G`; the package verifies at
-construction that `N`, `G`, and the requested operator orders satisfy
-the invariants listed under [Blocks](#blocks). Physics-specific operators —
+The package defines the operator **interface** and is required to ship
+two operator families:
+
+- **Polynomial point-value interpolation** (finite-difference semantics:
+  data are point samples at cell centers), order configurable. Order 2
+  is linear interpolation, whose restriction counterpart is the `2^D`
+  average.
+- **Conservative prolongation/restriction** (finite-volume semantics:
+  data are cell averages). Restriction is the exact volume average;
+  prolongation reconstructs a polynomial over each coarse cell,
+  constrained to preserve that cell's average, and evaluates fine values
+  as subcell averages — locally conservative by construction, order
+  configurable. Both are still *linear* operators with per-cell weights,
+  so they run through the same tensor-product stencil machinery, and the
+  same kind of `G`/`N` invariants apply at their order (constants per
+  family, enforced by the construction-time check). How the
+  interface-order rule below transfers to this family is to be measured
+  in M8.
+
+There is **no default order** (amended after M3, which showed the
+original default of 2 silently producing first-order convergence): the
+right order depends on the application's differencing order via the
+interface-order rule below, which the mesh library cannot know, so
+`Operators` requires both orders explicitly. The application chooses
+`G`; the package verifies at construction that `N`, `G`, and the
+requested operator orders satisfy the invariants listed under
+[Blocks](#blocks). Physics-specific operators —
 hydro-aware limited interpolation, primitive-variable-based prolongation
 — live in application packages and plug into the same interface. *(This
 resolves the original sketch's open question about where hydro-specific
@@ -298,15 +315,40 @@ the wave equation and the Einstein equations).
 
 ### Regridding
 
-1. The application supplies a flagging function (per cell or per block)
-   marking blocks for refinement or coarsening.
-2. Marks are completed to maintain 2:1 balance (refinement ripples
-   outward; coarsening happens only when all `2^D` siblings are marked
-   and balance permits).
+1. The application supplies a flagging function marking each block
+   `Refine`, `Coarsen`, or `Keep` (per block; per-cell criteria are
+   reduced to a block verdict inside the application's flag function —
+   the same shape the device-side flagging kernel takes in M6).
+2. Marks are requests, not commands: they are completed to maintain 2:1
+   balance (refinement ripples outward; coarsening happens only when all
+   `2^D` siblings ask for it, and is undone where balance cannot support
+   it).
 3. The new sorted key list is built; a new data array is allocated.
-4. Data transfer: same-level blocks are copied, newly refined blocks are
-   prolongated from their parent, coarsened blocks are restricted from
-   their children.
+4. Data transfer: same-level blocks are copied (bit for bit), newly
+   refined blocks are prolongated from their parent, coarsened blocks
+   are restricted from their children — the `δ = 0` cases of the same
+   stencil machinery ghost filling uses. Ghosts must be filled
+   immediately before the transfer, because prolongation from a parent
+   reads that parent's ghost layers.
+
+A single regrid moves a block by **at most one level**: marks move a
+block by one, and balance completion against an already-balanced tree
+adds at most one more, never two. This is what makes parent/child-only
+transfer sufficient; the transfer asserts it rather than trusting the
+argument.
+
+**Conservation of the transfer** (measured in M4): coarsening conserves
+the volume integral of *any* field exactly when restriction is the
+order-2 average; untouched blocks are copied bit for bit; refinement
+conserves exactly those fields the operators reproduce exactly, and
+**not** others — prolongation is not locally conservative, and at a
+refinement boundary the fine region draws on neighbor values through the
+parent's ghosts without those neighbors giving anything up
+(percent-level drift measured for a field discontinuous across a
+periodic seam). Selecting the **conservative operator family** (see
+[Operators](#operators)) makes the transfer exactly conservative for
+any field; that family is scheduled with M8, though it is independent of
+face-centered support and may land earlier.
 
 **Initialization** iterates the same machinery: fill initial data →
 flag → regrid → *re-evaluate* the initial data on the new mesh (rather
@@ -471,9 +513,13 @@ established before any parallelism.
   physics. *(Done.)*
 - **M4 — Regridding.** Flag → balance → rebuild → transfer; the
   initial-data cycle; integrator reinit. *Accept:* the initial-data
-  cycle converges to a stable hierarchy; a moving refined region tracks
-  a propagating pulse without artifacts; conservation of transferred
-  data.
+  cycle converges to a fixed-point hierarchy; a moving refined region
+  tracks a travelling pulse with the accuracy of the *uniformly finest*
+  mesh at fewer cells (measured error ratio 1.00 — matching that
+  reference is what "without artifacts" means operationally); transfer
+  conservation as stated under [Regridding](#regridding) (amended in M4
+  from the original blanket "conservation of transferred data", which
+  refinement cannot deliver without conservative operators). *(Done.)*
 - **M5 — Multi-threading.** Threaded loops over blocks. *Accept:*
   results match serial to roundoff; scaling measurement on a many-core
   node.
@@ -485,8 +531,12 @@ established before any parallelism.
   smoke test; then MPI+GPU with CUDA-aware MPI.
 - **M8 — Face-centered variables, conservation, hydro toy.**
   Face-centered field sets (copy/restriction/prolongation and MPI
-  exchange of face data), face-flux restriction, the two-phase
-  conservative RHS, simple hydro test. *Accept:* global conservation to
-  roundoff across coarse-fine faces.
+  exchange of face data); the **conservative cell-data operator family**
+  (exact-average restriction, reconstruct-and-average prolongation —
+  independent of face-centered support, may land earlier); face-flux
+  restriction and the two-phase conservative RHS; simple hydro test.
+  *Accept:* global conservation to roundoff across coarse-fine faces,
+  and an exactly mass-conserving regrid transfer for field sets using
+  the conservative family.
 - **M9 — I/O and visualization.** HDF5 output, checkpoint/restart, VTK
   export.
