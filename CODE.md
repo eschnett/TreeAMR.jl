@@ -63,6 +63,8 @@ Invariants tying the parameters together:
 - Shifted restriction of order `p` reads fine interior cells up to depth
   `2G + p/2 − 1`: `N ≥ 2G + p/2 − 1` (at `p = 2` this is the basic
   `N ≥ 2G`).
+- The restriction window itself must fit inside a fine block's interior:
+  `N ≥ p` (found in M2; binding when `G` is small).
 - Symmetric prolongation of order `p` reads up to `p/2` of the source
   block's own ghost layers: `G ≥ p/2`. (Worst case is the first fine
   ghost layer: its target sits a quarter coarse cell from the interface,
@@ -183,7 +185,14 @@ parallel loop over blocks, with barriers in between.
 Periodic boundaries need no special handling here — the tree wraps
 around (see [Domain and boundaries](#domain-and-boundaries)). Physical
 (outer) boundaries are filled by the user-supplied boundary hook,
-invoked per boundary face after the inter-block phases.
+invoked per outward-facing ghost region (faces, edges, and corners)
+**between phase 1 and the prolongation sweep** — amended in M2: a block
+at the domain edge has prolongation stencils that reach *tangentially*
+past the edge into the coarse source's own outer ghosts, so running the
+hook last would feed unwritten memory into the interpolation. The hook
+may therefore read its block's interior (as reflecting and extrapolating
+conditions do) but not other blocks' ghosts, and not ghosts that
+prolongation has yet to fill.
 
 Edge and corner ghost regions are always filled — some stencils don't
 need them, but filling unconditionally is simpler, and cross-derivative
@@ -195,7 +204,10 @@ at every RHS evaluation. The ghost-fill **exchange schedule** — the flat
 list of copy/prolongation/restriction source–target region pairs — is
 therefore precomputed whenever the tree changes and cached;
 `fill_ghosts!` only replays it. Tree queries (`neighbor_keys` and
-friends) must never appear in the per-evaluation path.
+friends) must never appear in the per-evaluation path. The forest
+carries a generation counter, bumped on every leaf-array change, so a
+stale schedule is detected in O(1) — a leaf count is not enough, since a
+refine-then-coarsen returns to the same size with different leaves.
 
 Restriction is otherwise only needed when coarsening during regridding
 and for analysis/output — there is no periodic "restrict fine onto
@@ -421,9 +433,13 @@ established before any parallelism.
   prolongation), periodic boundaries, physical-boundary hooks, default
   operators of configurable order with the `G`-sufficiency check —
   written as KernelAbstractions kernels (CPU backend). *Accept:*
-  polynomial data reproduced exactly up to operator order across all
-  face/edge/corner configurations, including periodic wraparound and
-  three-level corners.
+  polynomial data reproduced exactly up to operator order (degree
+  `p − 1` and no further) across all face/edge/corner and three-level
+  configurations. Periodic wraparound is tested by its definition
+  instead — an `M`-root periodic domain reproduces the middle tile of an
+  explicit `3M`-root tiling bit for bit (amended in M2: polynomials are
+  not periodic, so polynomial exactness across the seam is unattainable;
+  only constants are periodic polynomials). *(Done.)*
 - **M3 — Wave equation + OrdinaryDiffEq.** Scalar wave in 2nd-order
   form (state `(u, ∂ₜu)`, 2nd-order centered Laplacian), periodic cube,
   static two-level refinement over a sub-box, manual `f!`, fixed-`dt`
