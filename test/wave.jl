@@ -101,7 +101,8 @@ end
 Evolve the sine mode to `t_end` with fixed-step RK4 and return the
 volume-weighted L2 and L∞ errors, plus the finest spacing.
 """
-function wave_errors(::Val{D}; N, G=1, ops=Operators(), roots=4, L=1.0, m=1,
+function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction=2),
+                     roots=4, L=1.0, m=1,
                      cfl=0.25, periods=0.25, alg=RK4(), refined=true) where {D}
     forest = wave_forest(Val(D), N, G; roots=roots, L=L, refined=refined)
     fs = FieldSet(forest, 2)

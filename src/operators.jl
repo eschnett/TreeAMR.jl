@@ -17,20 +17,23 @@
 # orders are correspondingly wider.
 
 """
-    Operators(; prolongation=2, restriction=2)
+    Operators(; prolongation, restriction)
 
-The interpolation orders a [`GhostSchedule`](@ref) is built with.
-Both must be even and at least 2; the order is the number of source
-cells per dimension, and the operator is exact for polynomials of
-degree up to `order - 1`.
+The interpolation orders a [`GhostSchedule`](@ref) is built with. Both
+are required — there is deliberately **no default** — and both must be
+even and at least 2. The order is the number of source cells per
+dimension, and the operator is exact for polynomials of degree up to
+`order - 1`.
 
 Operators are configured per field set, not per variable — see
 `CODE.md`; per-variable selection is deferred to M8.
 
-!!! warning "Choose the order against your discretization, not the default"
+!!! warning "Choose the order against your discretization"
     Interpolation order must exceed the application's differencing order
     **by two**, for *both* operators, or the coarse-fine interface caps
-    global convergence.
+    global convergence. This is why there is no default: the right order
+    follows from the application's discretization, which the mesh cannot
+    know.
 
     A ghost filled by an order-`p` operator carries an `O(hᵖ)` error. A
     second-derivative stencil divides it by `h²`, so the truncation
@@ -53,8 +56,9 @@ Operators are configured per field set, not per variable — see
     converges at 2.0 with order-2 operators, so this is the interface
     and not the scheme.
 
-    The default of 2 is the cheapest correct *interpolation*, not the
-    right choice for a second-order-in-space application.
+    Order 2 is the cheapest correct *interpolation*, not the right choice
+    for a second-order-in-space application — which is what a default of
+    2 used to hide.
 
 The two operators behave differently at a coarse-fine interface.
 
@@ -85,8 +89,17 @@ struct Operators
     prolongation::Int
     restriction::Int
 
-    function Operators(; prolongation::Integer=2, restriction::Integer=2)
+    # Sentinel defaults rather than required keywords, so that omitting
+    # one reports *why* there is no default instead of a bare
+    # UndefKeywordError.
+    function Operators(; prolongation::Union{Integer,Nothing}=nothing,
+                       restriction::Union{Integer,Nothing}=nothing)
         for (name, p) in (("prolongation", prolongation), ("restriction", restriction))
+            p === nothing && throw(ArgumentError(
+                "Operators has no default order: pass $name explicitly. The order " *
+                "must exceed the application's differencing order by two. Order 2 " *
+                "against a second-derivative stencil leaves an O(1) error at " *
+                "coarse-fine interfaces, capping global convergence at first order."))
             p >= 2 || throw(ArgumentError("$name order must be at least 2, got $p"))
             iseven(p) ||
                 throw(ArgumentError("$name order must be even (symmetric cell-centered " *

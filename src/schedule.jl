@@ -89,7 +89,11 @@ so they are ordinary copies, restrictions, and prolongations.
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
-    GhostSchedule(forest, operators=Operators(); T=Float64)
+    GhostSchedule(forest, operators::Operators; T=Float64)
+
+`operators` is required: interpolation order follows from the
+application's discretization, so there is no order the mesh could
+sensibly default to. See [`Operators`](@ref).
 """
 struct GhostSchedule{T,D}
     forest::Forest{D}
@@ -213,7 +217,7 @@ end
 # A block's offset within its parent, per dimension.
 childoffset(k::MortonKey{D}) where {D} = ntuple(d -> Int(k.coords[d]) & 1, D)
 
-function GhostSchedule(forest::Forest{D}, operators::Operators=Operators();
+function GhostSchedule(forest::Forest{D}, operators::Operators;
                        T::Type=Float64) where {D}
     check_operators(forest, operators)
     N, G = forest.N, forest.G

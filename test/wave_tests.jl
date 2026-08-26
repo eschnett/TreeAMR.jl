@@ -56,7 +56,7 @@ end
         convergence_rate(hs, l2)
     end
 
-    @test rate(Operators(), 1) ≈ 1.0 atol = 0.2
+    @test rate(Operators(prolongation=2, restriction=2), 1) ≈ 1.0 atol = 0.2
     @test rate(Operators(prolongation=4, restriction=2), 2) < 1.5
     @test rate(Operators(prolongation=2, restriction=4), 2) < 1.5
     @test rate(Operators(prolongation=4, restriction=4), 2) ≈ 2.0 atol = 0.15

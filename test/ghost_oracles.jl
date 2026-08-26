@@ -124,7 +124,8 @@ coarse/fine interfaces sit exactly where the wraparound happens.
 Returns `(maxdiff, ncells)`, or `nothing` if the two refinement patterns
 failed to correspond.
 """
-function periodic_vs_tiled(::Val{D}, M::Int; N=4, G=1, nvars=2, ops=Operators(),
+function periodic_vs_tiled(::Val{D}, M::Int; N=4, G=1, nvars=2,
+                           ops=Operators(prolongation=2, restriction=2),
                            passes=2) where {D}
     L = Float64(M)
     seam(c, lvl) = lvl < passes &&
