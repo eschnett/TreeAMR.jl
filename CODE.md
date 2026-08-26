@@ -226,11 +226,15 @@ interfaces, which are everywhere on a tree mesh. Whether an operator is
 conservative is a property of the operator, not of the mesh.
 
 The package defines the operator **interface** and ships polynomial
-operators of configurable order; the default order is 2 (linear
-interpolation, whose restriction counterpart is the `2^D` average). The
-application chooses `G`; the package verifies at construction that `N`,
-`G`, and the requested operator orders satisfy the invariants listed
-under [Blocks](#blocks). Physics-specific operators —
+operators of configurable order. There is **no default order** (amended
+after M3, which showed the original default of 2 silently producing
+first-order convergence): the right order depends on the application's
+differencing order via the interface-order rule below, which the mesh
+library cannot know, so `Operators` requires both orders explicitly.
+(Order 2 is linear interpolation, whose restriction counterpart is the
+`2^D` average.) The application chooses `G`; the package verifies at
+construction that `N`, `G`, and the requested operator orders satisfy
+the invariants listed under [Blocks](#blocks). Physics-specific operators —
 hydro-aware limited interpolation, primitive-variable-based prolongation
 — live in application packages and plug into the same interface. *(This
 resolves the original sketch's open question about where hydro-specific
@@ -241,6 +245,20 @@ selection (e.g. conservative for density, plain for velocity) is
 deferred to M8, whose face-centered support forces an interface
 extension anyway.
 
+**Interface-order rule** (measured in M3): the interpolation order `p`
+must exceed the application's differencing order by two, for *both*
+operators. A ghost filled by an order-`p` operator carries an `O(hᵖ)`
+error; a second-derivative stencil divides it by `h²`, leaving an
+`O(h^{p−2})` truncation error along the interface, so the global rate is
+`min(interior order, p − m + 1)` with `m` the highest derivative order.
+The M3 wave equation (2nd-order Laplacian) measured L2 rates of 1.0 /
+0.9 / 1.0 / 2.0 for (prolongation, restriction) orders (2,2) / (4,2) /
+(2,4) / (4,4): raising one operator alone does not help, because each
+side of the interface gets its ghosts from a different one. The same
+mesh unrefined converges at 2.0 with order-2 operators, which pins this
+on the interface rather than the scheme. The tests assert all four
+rates.
+
 **Interface stencils** (decided in M2): near a coarse-fine interface the
 symmetric restriction window cannot exist — fine data across the
 interface would itself be prolongated coarse data, a circularity.
@@ -250,9 +268,10 @@ polynomial exactness (Lagrange interpolation through any `p` distinct
 nodes is exact for degree `< p`) and keeps the target inside the node
 hull — interpolation, never extrapolation; the implementation asserts
 this. Reducing the order instead was rejected: a symmetric window at the
-first ghost layer collapses to order 2 regardless of `p`, and the
-interface truncation error acts as a reflection source for wave-type
-equations, capping global convergence near order 3. Prolongation, by
+first ghost layer collapses to order 2 regardless of `p` — and by the
+interface-order rule above, order-2 ghost data feeding a
+second-derivative stencil leaves an `O(1)` interface truncation error,
+capping global convergence at *first* order (measured in M3). Prolongation, by
 contrast, stays symmetric: it may read the source block's ghosts (that
 is what the level-ordered sweep guarantees), at the cost of `G ≥ p/2`.
 Stability does not discriminate between the choices here
@@ -319,9 +338,9 @@ Indicative only — names and signatures will evolve:
     dt = cfl * minimum_spacing(forest)
 
     # ODE coupling
-    u = flatvector(state)             # interiors only
-    scatter!(state, u)                # working array ← flat vector
-    # application kernels write du directly in flat (interior) layout
+    u = statevector(state); gather!(u, state)   # interiors only
+    scatter!(state, u)                          # working array ← u
+    # kernels write du via statearray(du, state): flat interior layout
 
     # regridding
     regrid!(forest, state, aux; flag=...)  # flag → balance → transfer
@@ -409,7 +428,8 @@ entries per volume — documented here, implemented post-M3.
 All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
 
-- Volume-weighted `internalnorm` for adaptive integrators (post-M3).
+- Wiring `volume_weighted_norm` (implemented in M3) into adaptive
+  integrators as `internalnorm` (post-M3).
 - Per-variable (rather than per-field-set) operator selection (M8).
 - The detailed design of face-centered field sets (deliberately deferred
   to M8).
@@ -444,7 +464,11 @@ established before any parallelism.
   form (state `(u, ∂ₜu)`, 2nd-order centered Laplacian), periodic cube,
   static two-level refinement over a sub-box, manual `f!`, fixed-`dt`
   RK4. *Accept:* volume-weighted L2/L∞ errors against the exact
-  sine-mode solution converge at 2nd order.
+  sine-mode solution converge at 2nd order — which requires **order-4
+  operators and `G = 2`** (amended in M3; see the interface-order rule
+  under [Operators](#operators)), verified in D = 1, 2 with a 3D smoke
+  test. The wave equation lives in the tests: the package has no
+  physics. *(Done.)*
 - **M4 — Regridding.** Flag → balance → rebuild → transfer; the
   initial-data cycle; integrator reinit. *Accept:* the initial-data
   cycle converges to a stable hierarchy; a moving refined region tracks
