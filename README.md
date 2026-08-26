@@ -9,7 +9,7 @@ no physics.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M2** (ghost exchange).
+The package is currently at milestone **M3** (ODE coupling).
 
 ## Status
 
@@ -38,7 +38,22 @@ Implemented so far, serial and `D`-generic:
 - Periodic boundaries (free, via the tree) and a physical-boundary hook.
 - Written as KernelAbstractions kernels, CPU backend for now.
 
-Next up is M3: the scalar wave equation driven by OrdinaryDiffEq.
+**M3 — ODE coupling**
+
+- A flat state vector over leaf interiors, with `scatter!`/`gather!`
+  against the ghosted working array, so a standard integrator
+  (OrdinaryDiffEq) drives the whole hierarchy with one global `dt`.
+- `map_blocks!` to launch application kernels over every block.
+- Volume-weighted norms, so error measures are not skewed by refined
+  regions contributing more entries per unit volume.
+- Verified with the scalar wave equation: 2nd-order convergence in the
+  volume-weighted L2 and L∞ errors against the exact sine mode, on a
+  two-level periodic mesh.
+
+Note that reaching 2nd order on a refined mesh needs **order-4**
+interpolation, not the default order 2 — see the warning on `Operators`.
+
+Next up is M4: regridding.
 
 ## Installation
 

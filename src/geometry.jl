@@ -29,6 +29,16 @@ limit of its finest cells.
 minimum_spacing(forest::Forest) = spacing(forest, maxlevel(forest))
 
 """
+    block_spacings(forest, T=Float64)
+
+The cell size of every leaf, indexed by block — what a kernel needs to
+scale a finite-difference stencil, since blocks at different levels have
+different spacings.
+"""
+block_spacings(forest::Forest, ::Type{T}=Float64) where {T} =
+    T[spacing(forest, k) for k in forest.leaves]
+
+"""
     block_origin(forest, k::MortonKey)
 
 The physical position of the lower corner of block `k`'s interior (the

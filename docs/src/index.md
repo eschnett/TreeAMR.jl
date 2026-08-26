@@ -7,11 +7,12 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M2**: the tree core (Morton keys over a
+The package is at milestone **M3**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
-balance, periodic wraparound, block storage) plus the cached ghost
-exchange and the default interpolation operators. The wave equation and
-`OrdinaryDiffEq` coupling arrive in M3.
+balance, periodic wraparound, block storage), the cached ghost exchange
+with configurable interpolation operators, and the state-vector coupling
+that lets a standard ODE integrator drive the whole hierarchy.
+Regridding arrives in M4.
 
 ## Overview
 
@@ -90,7 +91,37 @@ true
 Interpolation order is configurable via [`Operators`](@ref), and is
 constrained by the block geometry: order `p` prolongation needs
 `G ≥ p/2`, which [`check_operators`](@ref) enforces when the schedule is
-built.
+built. It is also constrained by your discretization — see the warning
+in [`Operators`](@ref), which is worth reading before picking an order.
+
+## Time integration
+
+The whole hierarchy advances with one global `dt`, and the state is a
+single flat vector holding leaf **interiors only**, so a standard
+integrator drives it unmodified. Ghosts live in the working array, which
+is scratch, refreshed at every evaluation.
+
+The application writes its own `f!`, calling the three steps explicitly
+rather than through a `semidiscretize`-style wrapper:
+
+```julia
+function rhs!(du, u, p, t)
+    scatter!(p.fs, u)                    # flat vector -> working array
+    fill_ghosts!(p.fs, p.schedule)       # copies, restrictions, prolongations
+    map_blocks!(my_kernel!, p.fs, statearray(du, p.fs), p.fs.work, ...)
+end
+
+dt = cfl * minimum_spacing(forest)       # global step, set by the finest level
+solve(ODEProblem(rhs!, u, tspan, p), RK4(); dt = dt, adaptive = false)
+```
+
+Because the integrator owns the stages, ghosts are refilled at *every*
+evaluation; the classic wide-ghost optimization is unavailable by
+construction, which `CODE.md` accepts.
+
+Errors and tolerances on an adaptive mesh want
+[`volume_weighted_norm`](@ref): refined regions contribute more entries
+per unit volume, so an unweighted norm silently emphasizes them.
 
 ## Module
 
@@ -139,6 +170,7 @@ minimum_spacing
 block_origin
 block_extent
 cell_center
+block_spacings
 ```
 
 ## Storage
@@ -161,6 +193,18 @@ GhostSchedule
 isstale
 fill_ghosts!
 boundary_by_coordinates
+```
+
+## ODE coupling
+
+```@docs
+statelength
+statevector
+statearray
+scatter!
+gather!
+map_blocks!
+volume_weighted_norm
 ```
 
 ## Internals

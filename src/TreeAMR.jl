@@ -13,12 +13,17 @@ module TreeAMR
 export MortonKey, MAX_LEVEL, level, parentkey, childkeys, sortedchildkeys, isancestor
 export Forest, nleaves, maxlevel, root_position, root_index, alldirections
 export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
-export root_spacing, spacing, minimum_spacing, block_origin, block_extent, cell_center
+export root_spacing, spacing, minimum_spacing, block_origin, block_extent, cell_center,
+       block_spacings
 export FieldSet, nblocks, blockkey, blockview, interiorview, fill_by_coordinates!
 
 # Ghost exchange and interpolation operators (M2)
 export Operators, check_operators, GhostSchedule, isstale, fill_ghosts!,
        boundary_by_coordinates
+
+# ODE coupling (M3)
+export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
+       volume_weighted_norm
 
 include("morton.jl")
 include("forest.jl")
@@ -27,5 +32,6 @@ include("storage.jl")
 include("operators.jl")
 include("schedule.jl")
 include("ghosts.jl")
+include("state.jl")
 
 end

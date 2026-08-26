@@ -4,6 +4,7 @@ using TreeAMR
 
 include("oracles.jl")
 include("ghost_oracles.jl")
+include("wave.jl")
 
 @testset "TreeAMR.jl" begin
 
@@ -404,5 +405,7 @@ end
 end
 
 include("ghost_tests.jl")
+include("state_tests.jl")
+include("wave_tests.jl")
 
 end

@@ -27,6 +27,35 @@ degree up to `order - 1`.
 Operators are configured per field set, not per variable — see
 `CODE.md`; per-variable selection is deferred to M8.
 
+!!! warning "Choose the order against your discretization, not the default"
+    Interpolation order must exceed the application's differencing order
+    **by two**, for *both* operators, or the coarse-fine interface caps
+    global convergence.
+
+    A ghost filled by an order-`p` operator carries an `O(hᵖ)` error. A
+    second-derivative stencil divides it by `h²`, so the truncation
+    error along the interface is `O(h^{p-2})` — with `p = 2` that is
+    `O(1)`, and it does not shrink under refinement at all.
+
+    Measured with the M3 wave equation (2nd-order Laplacian, two-level
+    mesh), global L2 convergence comes out as
+
+    | prolongation | restriction | rate |
+    |---|---|---|
+    | 2 | 2 | 1.0 |
+    | 4 | 2 | 0.9 |
+    | 2 | 4 | 1.0 |
+    | 4 | 4 | 2.0 |
+
+    Raising one operator alone does not help: each side of the interface
+    gets its ghosts from a different operator, so whichever stays at
+    order 2 keeps its side first order. The same mesh with no refinement
+    converges at 2.0 with order-2 operators, so this is the interface
+    and not the scheme.
+
+    The default of 2 is the cheapest correct *interpolation*, not the
+    right choice for a second-order-in-space application.
+
 The two operators behave differently at a coarse-fine interface.
 
 **Prolongation stays symmetric.** Its window may reach into the coarse
