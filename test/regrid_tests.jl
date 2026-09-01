@@ -264,6 +264,109 @@ end
     end
 end
 
+@testset "A (Keep, box) source holds an equal-level margin" begin
+    # Box-as-source: a block already at its target level reports
+    # (Keep, box) and asks for its own level around it, pulling coarser
+    # neighbours up without touching those already there.
+    forest, mid = buffer_forest(Val(2); N=8, G=2)
+    refine!(forest, mid)
+    balance!(forest)
+
+    source = MortonKey{2}(mid.root, 1, (0, 0))
+    @test source in forest.leaves
+    flags = [k == source ? (Keep, (1:8, 1:8)) : Keep for k in forest.leaves]
+    recruits = buffer_recruits(forest, flags, 2)
+
+    reached = neighbors_over(forest, source, alldirections(Val(2)))
+    coarser = filter(k -> level(k) == 0, reached)        # across the root faces
+    same = filter(k -> level(k) == 1, reached)           # siblings inside the root
+    @test !isempty(coarser) && !isempty(same)
+
+    # Only the coarser leaves move, and they move all the way to level 1.
+    @test sort(collect(keys(recruits))) == sort(coarser)
+    @test all(==(Refine), values(recruits))
+    @test !any(k -> k in keys(recruits), same)
+end
+
+@testset "A bare Keep is not a source: D=$D" for D in (1, 2, 3)
+    # Without a box a Keep must recruit nothing, whatever the buffer:
+    # otherwise every quiescent block would hold its neighbours and
+    # coarsening would die globally.
+    forest, mid = buffer_forest(Val(D))
+    keep = fill(Keep, nleaves(forest))
+    @test buffered_flags(forest, keep, forest.N) == keep
+
+    quiet = RegridFlag[k == mid ? Keep : Coarsen for k in forest.leaves]
+    @test buffered_flags(forest, quiet, forest.N) == quiet
+end
+
+@testset "A (Coarsen, box) block is not a source: D=$D" for D in (1, 2, 3)
+    # A box says where the criterion fired, not that anything must be
+    # held: a block asking to coarsen never recruits.
+    forest, mid = buffer_forest(Val(D))
+    whole = ntuple(_ -> 1:(forest.N), D)
+    flags = flag_blocks((b, k) -> k == mid ? (Coarsen, whole) : Keep, forest)
+    @test isempty(buffer_recruits(forest, flags, forest.N))
+end
+
+@testset "A Keep source demotes at its level but not above it" begin
+    # The demotion is scoped to the requested level. A level-0 Keep source
+    # asks for level 0: its level-0 neighbours stop coarsening, but the
+    # level-1 leaves across its refined neighbour are above what it asked
+    # for and may still coarsen toward it.
+    forest, mid = buffer_forest(Val(2))
+    refine!(forest, mid)
+    balance!(forest)
+
+    source = only(filter(k -> level(k) == 0 && root_position(forest, k.root) == (0, 1),
+                         forest.leaves))
+    flags = [k == source ? (Keep, (1:8, 1:8)) : Coarsen for k in forest.leaves]
+    marks = buffered_flags(forest, flags, 2)
+
+    finer = neighbor_keys(forest, source, (1, 0))        # mid's children
+    @test length(finer) == 2 && all(k -> level(k) == 1, finer)
+    equal = neighbor_keys(forest, source, (0, 1))        # a plain level-0 neighbour
+    @test all(k -> level(k) == 0, equal)
+
+    for (b, k) in enumerate(forest.leaves)
+        if k in finer
+            @test marks[b] === Coarsen                   # above L: left alone
+        elseif k in equal
+            @test marks[b] === Keep                      # at L: demoted, not promoted
+        end
+    end
+end
+
+@testset "buffer=0 ignores box-as-source too: D=$D" for D in (1, 2)
+    # Boxes on Keep and Coarsen flags are the new source form; with no
+    # buffer they must still be inert, marks and data alike.
+    build() = begin
+        f = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+                   extents=ntuple(_ -> (0.0, 1.0), D))
+        refine!(f, f.leaves[1])
+        balance!(f)
+        f
+    end
+    forest = build()
+    fs = fill_noise!(FieldSet(forest, 1), 1300 + D)
+
+    cycle = (Refine, Coarsen, Keep)
+    plain = flag_blocks((b, k) -> cycle[mod1(b, 3)], forest)
+    @test all(f -> f in plain, cycle)
+    # Every flag carries a box, so under a nonzero buffer the Keeps would
+    # be sources; at buffer=0 none of them may be.
+    boxed = [(f, ntuple(d -> isodd(b + d) ? (1:2) : (3:(forest.N)), D))
+             for (b, f) in enumerate(plain)]
+    @test complete_marks(forest, boxed; buffer=0) == complete_marks(forest, plain)
+
+    twin = build()
+    tfs = fill_noise!(FieldSet(twin, 1), 1300 + D)
+    @test regrid!(forest, fs, GhostSchedule(forest, OPS2); flags=plain)
+    @test regrid!(twin, tfs, GhostSchedule(twin, OPS2); flags=boxed, buffer=0)
+    @test twin.leaves == forest.leaves
+    @test tfs.work == fs.work                            # bit for bit
+end
+
 @testset "Buffer argument checking" begin
     forest, mid = buffer_forest(Val(2); N=8)
     keep = fill(Keep, nleaves(forest))

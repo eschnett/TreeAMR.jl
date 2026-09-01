@@ -156,12 +156,13 @@ well the refinement tracked the pulse.
 
 The flagging criterion is deliberately tight — `threshold` sits well up
 the pulse rather than far down its tail — and it reports the bounding
-box of the cells that fired, so the mesh can dilate that box by
-`buffer` cells and refine ahead of the pulse, `CODE.md`'s step 2.
-`buffer` counts cells at each block's own resolution, and a buffer much
-narrower than a block reaches nothing here: a block ahead of the pulse
-is refined as soon as the criterion fires anywhere in it, so its box
-hugs the face the pulse arrived through.
+box of the cells that fired with *every* flag, so the mesh can dilate
+that box by `buffer` cells and refine ahead of the pulse, `CODE.md`'s
+step 2. `buffer` counts cells at each block's own resolution. The block
+that actually holds the pulse is at the target level and reports
+`(Keep, box)`; because its box tracks the pulse across the block rather
+than hugging the face the pulse entered through, a buffer of a few
+cells is enough to keep an equal-level margin ahead of it.
 
 Regridding changes both the length and the meaning of the state vector,
 so each chunk is a fresh `solve`: stop, rebuild the schedule and the
@@ -183,8 +184,11 @@ function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
     function flag(b, k)
         fired = findall(x -> abs(x) > threshold, interiorview(fs, b, 1))
         isempty(fired) && return level(k) > 0 ? Coarsen : Keep
-        level(k) >= maxlevel_wanted && return Keep
         box = ntuple(d -> minimum(i -> i[d], fired):maximum(i -> i[d], fired), D)
+        # At the target level the block reports (Keep, box): it wants no
+        # more refinement of itself, but it still asks for its own level
+        # around the box, which is the margin that travels with the pulse.
+        level(k) >= maxlevel_wanted && return (Keep, box)
         return (Refine, box)
     end
 

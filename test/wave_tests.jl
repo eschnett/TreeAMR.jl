@@ -79,14 +79,11 @@ end
     σ = 0.08
     coarse = uniform_pulse(Val(1); roots=8, N=8, σ=σ)     # level-0 equivalent
     fine = uniform_pulse(Val(1); roots=8, N=32, σ=σ)      # level-2 equivalent
-    # A tight flagging threshold (0.05 of the peak, not 1e-3 far down the
-    # tail) plus a buffer one block wide. The buffer has to be that wide
-    # to reach anything here: the block ahead of the pulse is refined as
-    # soon as the criterion fires in it at all, so its box of firing
-    # cells always hugs the face the pulse came in through, and only a
-    # dilation of most of a block width reaches out the *far* face to
-    # refine ahead of the pulse.
+    # A tight flagging threshold -- 0.05 of the peak, not 1e-3 far down
+    # the tail -- with buffers of one block width, of a few cells, and of
+    # nothing at all.
     amr = track_pulse(Val(1); roots=8, N=8, σ=σ, threshold=0.05, buffer=8, chunk=0.02)
+    narrow = track_pulse(Val(1); roots=8, N=8, σ=σ, threshold=0.05, buffer=4, chunk=0.02)
     unbuffered = track_pulse(Val(1); roots=8, N=8, σ=σ, threshold=0.05, buffer=0,
                              chunk=0.02)
 
@@ -102,6 +99,20 @@ end
     # improves the run over the same criterion with no margin at all.
     @test amr.worst < unbuffered.worst
     @test unbuffered.tracking == 1.0                  # the criterion alone still tracks
+
+    # And a buffer of a *few cells* now does that work too, which is why
+    # dilation is keyed on the reported box rather than on the Refine
+    # flag. Under the Refine-keyed rule this run was bit-identical to the
+    # unbuffered one: a block ahead of the pulse refined the moment the
+    # criterion fired anywhere in it, so its box hugged the face the
+    # pulse entered through and only a dilation of most of a block width
+    # reached out the far face. Now the block that holds the pulse is
+    # already at the target level and reports (Keep, box), so it carries
+    # an equal-level margin along with it and the width is free to be
+    # what the physics asks for -- feature speed times regrid cadence.
+    @test narrow.worst < unbuffered.worst
+    @test narrow.tracking == 1.0
+    @test narrow.maxlevel == 2
 
     # And the adaptive run is as accurate as the uniform fine one ...
     @test amr.worst ≈ fine.err rtol = 0.1

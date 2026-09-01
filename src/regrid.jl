@@ -28,8 +28,9 @@ block index and `key` its [`MortonKey`](@ref).
 `f` may return either a bare [`RegridFlag`](@ref) or a
 `(flag, box)` pair, where `box::NTuple{D,UnitRange{Int}}` is the
 bounding box of the cells that fired, in that block's own interior
-indices `1:N` (see [`complete_marks`](@ref) for what the box is used
-for). The two forms may be mixed within one vector.
+indices `1:N`. Reporting a box is what makes a block a source of the
+regrid buffer, so the form carries meaning beyond the flag — see
+[`buffered_flags`](@ref). The two forms may be mixed within one vector.
 
 A convenience for host-side flagging; an application is free to produce
 the vector any other way, which is what will let the flagging kernel run
@@ -57,23 +58,48 @@ function markbox(m::Tuple{RegridFlag,Any}, N::Int, ::Val{D}) where {D}
 end
 markbox(m, N::Int, ::Val) = markflag(m)      # not a flag at all: complain about that
 
+# A block is a dilation source iff it *explicitly* reports a box, with any
+# flag but `Coarsen`. With a bare flag only `Refine` is a source: a bare
+# `Keep` must not recruit, or every quiescent block would hold its
+# neighbours and coarsening would die globally.
+issource(m::RegridFlag) = m === Refine
+issource(m::Tuple{RegridFlag,Any}) = m[1] !== Coarsen
+
+# The level a source is asking to hold around itself.
+requestedlevel(f::RegridFlag, l::Int) = f === Refine ? l + 1 : l
+
 """
     buffered_flags(forest, flags, buffer) -> Vector{RegridFlag}
 
 The flags of `flags` widened by a `buffer`-cell margin around every
-region asking to refine — step 2 of the regridding sequence in
+region whose criterion fired — step 2 of the regridding sequence in
 `CODE.md`, evaluated in mark space, before any refine or coarsen is
 applied and before balancing, without touching `forest`.
 
-For each block marked `Refine`, its box of firing cells (the whole
-interior when the flagging function reported no box) is dilated by
-`buffer` cells per dimension *at that block's own resolution*. Every
-other leaf the dilated box reaches joins the buffer:
+The source of a margin is a **box**, not a flag. A block is a dilation
+source iff it *explicitly* reports a `(flag, box)` pair with any flag but
+`Coarsen`, or is marked with a bare `Refine` (whose box defaults to the
+whole interior, the conservative isotropic case). A bare `Keep` is never
+a source — else quiescent blocks would recruit their neighbours and
+coarsening would die globally — and `Coarsen` is never a source even
+with a box.
 
-- its `Coarsen` is demoted to `Keep` unconditionally, which is what
-  suppresses coarsen/refine flicker at the edge of the refined region;
-- it is marked `Refine` if its level is at or below the source's — a
-  finer neighbour is already fine enough and gets only the demotion.
+Each source asks for a **level** `L`: `level + 1` for `Refine`, `level`
+for `Keep`. Its box is dilated by `buffer` cells per dimension *at the
+source's own resolution*, and every other leaf the dilated box reaches
+joins the buffer:
+
+- it is promoted to `Refine` if its level is below `L` — a neighbour
+  already at or above `L` is fine enough;
+- its `Coarsen` is demoted to `Keep` if its level is at or below `L`,
+  which is what suppresses coarsen/refine flicker at the edge of the
+  refined region. An over-fine neighbour, above `L`, may still coarsen
+  toward it.
+
+A block holding a feature at its target level therefore returns
+`(Keep, box)` and holds an equal-level margin that travels with the
+feature — the proactive margin a `Refine`-keyed rule cannot give, since
+a freshly refined block's box hugs the face the feature entered through.
 
 The dilated box reaches the neighbour in direction `δ` exactly when it
 leaves the block along *every* nonzero component of `δ`, so a feature
@@ -103,9 +129,10 @@ function buffered_flags(forest::Forest{D}, flags::AbstractVector,
 
     directions = alldirections(Val(D))
     for (b, k) in enumerate(forest.leaves)
-        # The *reported* flag, not `marks[b]`: a block recruited into the
+        # The *reported* mark, not `marks[b]`: a block recruited into the
         # buffer by an earlier source must not become a source itself.
-        markflag(flags[b]) === Refine || continue
+        issource(flags[b]) || continue
+        L = requestedlevel(markflag(flags[b]), level(k))
         box = boxes[b]
         # The dilated box leaves the block in direction δ[d] = ∓1 only if
         # it crosses that face; a tangential dimension never restricts.
@@ -117,8 +144,8 @@ function buffered_flags(forest::Forest{D}, flags::AbstractVector,
             for nk in neighbor_keys(forest, k, δ)
                 j = find_leaf(forest, nk)
                 j === nothing && continue          # cannot happen: nk is a leaf
-                marks[j] === Coarsen && (marks[j] = Keep)
-                level(nk) <= level(k) && (marks[j] = Refine)
+                marks[j] === Coarsen && level(nk) <= L && (marks[j] = Keep)
+                level(nk) < L && (marks[j] = Refine)
             end
         end
     end
@@ -133,9 +160,10 @@ result is still 2:1 balanced.
 
 `flags` holds one entry per leaf, each either a [`RegridFlag`](@ref) or
 a `(flag, box)` pair as [`flag_blocks`](@ref) produces. `buffer` is a
-margin in **cells**, applied first: it widens every refinement request
-to the neighbouring leaves its box of firing cells comes within `buffer`
-cells of — see [`buffered_flags`](@ref).
+margin in **cells**, applied first: every block that reports a box (or
+is marked with a bare `Refine`) pulls the neighbouring leaves its box
+comes within `buffer` cells of up to the level it asks for — `level + 1`
+for `Refine`, `level` for `Keep`. See [`buffered_flags`](@ref).
 
 Refinement is applied first, then coarsening — but only for sibling
 groups where all `2^D` children are present as leaves and all of them

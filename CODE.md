@@ -319,30 +319,42 @@ the wave equation and the Einstein equations).
    `Refine`, `Coarsen`, or `Keep` (per block; per-cell criteria are
    reduced to a block verdict inside the application's flag function —
    the same shape the device-side flagging kernel takes in M6).
-2. **Buffering** (added post-M4; box-based per design review): alongside
-   `Refine`, a flagging function may report the **bounding box of the
-   cells that fired** (interior indices; omitted, the whole block is
-   assumed — the conservative isotropic case). The box, dilated by
-   `buffer` *cells* at the block's own resolution, is overlapped against
-   the tree: every leaf the dilated box reaches joins the buffer — its
-   `Coarsen` is demoted to `Keep` (suppressing coarsen/refine flicker at
-   the region's edge), and it is marked `Refine` if its level is at or
-   below the source's. Flagged cells well inside a block therefore
-   recruit no neighbors; a feature near one face recruits only that
-   side, with edge/corner neighbors following automatically from the box
-   geometry (the conjunction that per-direction booleans would have to
-   compute by hand), and `buffer > N` reaches second rings. The *width*
-   is the application's choice (feature speed × regrid cadence — physics
-   the mesh cannot know); the margin arithmetic and neighbor lookup are
-   the mesh's job. The box costs the application only a min/max
-   reduction over firing cells — the same shape the M6 device-side
-   flagging kernel produces. Accepted approximation: the box is convex,
-   so disconnected flagged clusters within one block inflate it. 2:1
-   completion (next step) independently adds a graded one-level-coarser
-   ring; the buffer provides the equal-level margin that keeps a feature
-   away from the coarse-fine interface. Buffers exist here only for
-   feature motion and interface distance — the subcycling rationale for
-   Carpet-style buffer zones does not apply under a global `dt`.
+2. **Buffering** (added post-M4; amended to *box-as-source* after the
+   first implementation measured Refine-keyed dilation to be inert at a
+   steady-state frontier): a flagging function may report, with **any**
+   flag, the **bounding box of the cells where its criterion fired**
+   (interior indices). A block is a **dilation source** iff it
+   explicitly reports a box — with a bare flag, only `Refine` is a
+   source (box defaulting to the whole interior, the conservative
+   isotropic case); a bare `Keep` never is, else quiescent blocks would
+   recruit their neighbors and coarsening would die globally; `Coarsen`
+   is never a source. Each source has a **requested level** `L`
+   (`Refine` → `l+1`, `Keep` → `l`). Its box, dilated by `buffer`
+   *cells* at the block's own resolution, reaches a direction only when
+   it exits the block along all of that direction's nonzero components
+   (the edge/corner conjunction comes from the geometry); every leaf
+   reached joins the buffer — promoted to `Refine` if its level is
+   below `L`, and its `Coarsen` demoted to `Keep` if its level is at or
+   below `L` (an over-fine neighbor may still coarsen toward `L`). A
+   feature-holding block at target level thus returns `(Keep, box)` and
+   holds an equal-level margin that travels with the feature — the
+   proactive margin the original Refine-keyed rule could not provide
+   (measured: buffers narrower than most of a block width were inert,
+   because a freshly refined block's box hugs the face the feature
+   entered through). `buffer ≤ N`: recruitment is a single pass reaching
+   one ring, the cap is rejected loudly rather than silently truncated,
+   and one ring covers any sane regrid cadence. The *width* is the
+   application's choice (feature speed × regrid cadence — physics the
+   mesh cannot know); the margin arithmetic and neighbor lookup are the
+   mesh's job. The box costs the application only a min/max reduction
+   over firing cells — the same shape the M6 device-side flagging kernel
+   produces. Accepted approximation: the box is convex, so disconnected
+   flagged clusters within one block inflate it. 2:1 completion (next
+   step) independently adds a graded one-level-coarser ring; the buffer
+   provides the equal-level margin that keeps a feature away from the
+   coarse-fine interface. Buffers exist here only for feature motion and
+   interface distance — the subcycling rationale for Carpet-style buffer
+   zones does not apply under a global `dt`.
 3. Marks are requests, not commands: they are completed to maintain 2:1
    balance (refinement ripples outward; coarsening happens only when all
    `2^D` siblings ask for it, and is undone where balance cannot support
