@@ -346,9 +346,12 @@ the wave equation and the Einstein equations).
    and one ring covers any sane regrid cadence. The *width* is the
    application's choice (feature speed × regrid cadence — physics the
    mesh cannot know); the margin arithmetic and neighbor lookup are the
-   mesh's job. The box costs the application only a min/max reduction
-   over firing cells — the same shape the M6 device-side flagging kernel
-   produces. Accepted approximation: the box is convex, so disconnected
+   mesh's job. Measured guidance: the width must *exceed* the feature's
+   travel per regrid interval (in cells at the feature's level) — a
+   margin narrower than the motion it must cover measured slightly
+   worse than no buffer at all. The box costs the application only a
+   min/max reduction over firing cells — the same shape the M6
+   device-side flagging kernel produces. Accepted approximation: the box is convex, so disconnected
    flagged clusters within one block inflate it. 2:1 completion (next
    step) independently adds a graded one-level-coarser ring; the buffer
    provides the equal-level margin that keeps a feature away from the
