@@ -70,6 +70,12 @@ Invariants tying the parameters together:
   ghost layer: its target sits a quarter coarse cell from the interface,
   between the coarse nodes straddling it, and the node across the
   interface is already ghost layer 1.)
+- The two restriction bullets and the `p/2` above are for the
+  point-value family. The conservative family (measured in its
+  implementation): prolongation orders are *odd* (the reconstruction is
+  centered on a cell, not a quarter cell off one) with `G ≥ (p−1)/2` —
+  one fewer ghost layer at comparable order — and restriction is the
+  fixed 2-cell exact average, needing only `N ≥ 2G`.
 
 ### Tree structure
 
@@ -233,16 +239,21 @@ two operator families:
   is linear interpolation, whose restriction counterpart is the `2^D`
   average.
 - **Conservative prolongation/restriction** (finite-volume semantics:
-  data are cell averages). Restriction is the exact volume average;
-  prolongation reconstructs a polynomial over each coarse cell,
+  data are cell averages). Restriction is the exact volume average — it
+  is exact for *any* field, so it carries no order knob (implemented as
+  the fixed 2-cell stencil the point-value family shares at order 2).
+  Prolongation reconstructs a polynomial over each coarse cell,
   constrained to preserve that cell's average, and evaluates fine values
-  as subcell averages — locally conservative by construction, order
-  configurable. Both are still *linear* operators with per-cell weights,
-  so they run through the same tensor-product stencil machinery, and the
-  same kind of `G`/`N` invariants apply at their order (constants per
-  family, enforced by the construction-time check). How the
-  interface-order rule below transfers to this family is to be measured
-  in M8.
+  as subcell averages — locally conservative by construction because the
+  two subcell weight vectors average to the unit vector on the center
+  cell, independent of the data. Orders are **odd** (`1` is piecewise
+  constant, `3` the familiar `±1/8` slope), built via the primitive
+  function so reconstruction-from-averages reduces to ordinary Lagrange
+  interpolation. Both operators are still *linear* with per-cell
+  weights, so they run through the same tensor-product stencil
+  machinery; the family-specific invariants are under
+  [Blocks](#blocks). How the interface-order rule below transfers to
+  this family is to be measured in M8.
 
 There is **no default order** (amended after M3, which showed the
 original default of 2 silently producing first-order convergence): the
@@ -291,6 +302,10 @@ second-derivative stencil leaves an `O(1)` interface truncation error,
 capping global convergence at *first* order (measured in M3). Prolongation, by
 contrast, stays symmetric: it may read the source block's ghosts (that
 is what the level-ordered sweep guarantees), at the cost of `G ≥ p/2`.
+The conservative family never shifts at all: its restriction window is
+exactly a cell's own children, and its prolongation *cannot* shift —
+an off-center reconstruction would no longer preserve the containing
+cell's average, so the `G ≥ (p−1)/2` bound has no shifted fallback.
 Stability does not discriminate between the choices here
 (global `dt`, 2:1 balance); damping high-frequency interface modes
 remains the job of the application's usual Kreiss–Oliger dissipation.
@@ -386,8 +401,9 @@ parent's ghosts without those neighbors giving anything up
 (percent-level drift measured for a field discontinuous across a
 periodic seam). Selecting the **conservative operator family** (see
 [Operators](#operators)) makes the transfer exactly conservative for
-any field; that family is scheduled with M8, though it is independent of
-face-centered support and may land earlier.
+any field; that family landed early (pre-M5), verified exactly
+conservative for random data under random regrids where the point-value
+family drifts at the percent level.
 
 **Initialization** iterates the same machinery: fill initial data →
 flag → regrid → *re-evaluate* the initial data on the new mesh (rather
@@ -570,12 +586,10 @@ established before any parallelism.
   smoke test; then MPI+GPU with CUDA-aware MPI.
 - **M8 — Face-centered variables, conservation, hydro toy.**
   Face-centered field sets (copy/restriction/prolongation and MPI
-  exchange of face data); the **conservative cell-data operator family**
-  (exact-average restriction, reconstruct-and-average prolongation —
-  independent of face-centered support, may land earlier); face-flux
-  restriction and the two-phase conservative RHS; simple hydro test.
-  *Accept:* global conservation to roundoff across coarse-fine faces,
-  and an exactly mass-conserving regrid transfer for field sets using
-  the conservative family.
+  exchange of face data); face-flux restriction and the two-phase
+  conservative RHS; simple hydro test. The conservative cell-data
+  operator family *(landed early, pre-M5, with its regrid-transfer
+  conservation already verified)*. *Accept:* global conservation to
+  roundoff across coarse-fine faces.
 - **M9 — I/O and visualization.** HDF5 output, checkpoint/restart, VTK
   export.
