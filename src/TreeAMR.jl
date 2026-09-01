@@ -26,8 +26,8 @@ export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
        volume_weighted_norm
 
 # Regridding (M4)
-export RegridFlag, Refine, Coarsen, Keep, flag_blocks, complete_marks, regrid!,
-       adapt_to_initial_data!, total_mass
+export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_marks,
+       regrid!, adapt_to_initial_data!, total_mass
 
 include("morton.jl")
 include("forest.jl")

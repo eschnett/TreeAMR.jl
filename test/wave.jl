@@ -154,6 +154,15 @@ Evolve a travelling pulse, regridding every `chunk` of time so the
 refined region follows it. Returns the worst error over the run and how
 well the refinement tracked the pulse.
 
+The flagging criterion is deliberately tight — `threshold` sits well up
+the pulse rather than far down its tail — and it reports the bounding
+box of the cells that fired, so the mesh can dilate that box by
+`buffer` cells and refine ahead of the pulse, `CODE.md`'s step 2.
+`buffer` counts cells at each block's own resolution, and a buffer much
+narrower than a block reaches nothing here: a block ahead of the pulse
+is refined as soon as the criterion fires anywhere in it, so its box
+hugs the face the pulse arrived through.
+
 Regridding changes both the length and the meaning of the state vector,
 so each chunk is a fresh `solve`: stop, rebuild the schedule and the
 state vector, restart — the pattern `CODE.md` prescribes for anything
@@ -162,22 +171,27 @@ beyond a one-step method.
 function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
                      ops=Operators(prolongation=4, restriction=4),
                      t_end=0.5, chunk=0.05, cfl=0.25, maxlevel_wanted=2,
-                     threshold=0.05) where {D}
+                     threshold=0.05, buffer=4) where {D}
     forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, L), D))
     fs = FieldSet(forest, 2)
 
-    # Refine where the pulse actually is, judged from the current data.
+    # Refine where the pulse actually is, judged from the current data,
+    # and report the bounding box of the cells that fired — the min/max
+    # reduction the mesh dilates by `buffer` cells. For this plane pulse
+    # the box is a slab: narrow in x, the whole block transversally.
     function flag(b, k)
-        peak = maximum(abs, interiorview(fs, b, 1))
-        want = peak > threshold ? maxlevel_wanted : 0
-        return level(k) < want ? Refine : level(k) > want ? Coarsen : Keep
+        fired = findall(x -> abs(x) > threshold, interiorview(fs, b, 1))
+        isempty(fired) && return level(k) > 0 ? Coarsen : Keep
+        level(k) >= maxlevel_wanted && return Keep
+        box = ntuple(d -> minimum(i -> i[d], fired):maximum(i -> i[d], fired), D)
+        return (Refine, box)
     end
 
     fill_by_coordinates!(pulse_exact(D, L, x0, σ, 0.0), fs)
     schedule, _, _ = adapt_to_initial_data!(fs, ops;
                                             initial=pulse_exact(D, L, x0, σ, 0.0),
-                                            flag=flag, maxpasses=8)
+                                            flag=flag, buffer=buffer, maxpasses=8)
 
     worst = 0.0
     refined_fraction = Float64[]
@@ -214,7 +228,7 @@ function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
 
         fill_ghosts!(fs, schedule)
         flags = flag_blocks(flag, forest)
-        if regrid!(forest, fs, schedule; flags=flags)
+        if regrid!(forest, fs, schedule; flags=flags, buffer=buffer)
             schedule = GhostSchedule(forest, ops)
         end
     end

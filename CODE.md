@@ -319,12 +319,36 @@ the wave equation and the Einstein equations).
    `Refine`, `Coarsen`, or `Keep` (per block; per-cell criteria are
    reduced to a block verdict inside the application's flag function —
    the same shape the device-side flagging kernel takes in M6).
-2. Marks are requests, not commands: they are completed to maintain 2:1
+2. **Buffering** (added post-M4; box-based per design review): alongside
+   `Refine`, a flagging function may report the **bounding box of the
+   cells that fired** (interior indices; omitted, the whole block is
+   assumed — the conservative isotropic case). The box, dilated by
+   `buffer` *cells* at the block's own resolution, is overlapped against
+   the tree: every leaf the dilated box reaches joins the buffer — its
+   `Coarsen` is demoted to `Keep` (suppressing coarsen/refine flicker at
+   the region's edge), and it is marked `Refine` if its level is at or
+   below the source's. Flagged cells well inside a block therefore
+   recruit no neighbors; a feature near one face recruits only that
+   side, with edge/corner neighbors following automatically from the box
+   geometry (the conjunction that per-direction booleans would have to
+   compute by hand), and `buffer > N` reaches second rings. The *width*
+   is the application's choice (feature speed × regrid cadence — physics
+   the mesh cannot know); the margin arithmetic and neighbor lookup are
+   the mesh's job. The box costs the application only a min/max
+   reduction over firing cells — the same shape the M6 device-side
+   flagging kernel produces. Accepted approximation: the box is convex,
+   so disconnected flagged clusters within one block inflate it. 2:1
+   completion (next step) independently adds a graded one-level-coarser
+   ring; the buffer provides the equal-level margin that keeps a feature
+   away from the coarse-fine interface. Buffers exist here only for
+   feature motion and interface distance — the subcycling rationale for
+   Carpet-style buffer zones does not apply under a global `dt`.
+3. Marks are requests, not commands: they are completed to maintain 2:1
    balance (refinement ripples outward; coarsening happens only when all
    `2^D` siblings ask for it, and is undone where balance cannot support
    it).
-3. The new sorted key list is built; a new data array is allocated.
-4. Data transfer: same-level blocks are copied (bit for bit), newly
+4. The new sorted key list is built; a new data array is allocated.
+5. Data transfer: same-level blocks are copied (bit for bit), newly
    refined blocks are prolongated from their parent, coarsened blocks
    are restricted from their children — the `δ = 0` cases of the same
    stencil machinery ghost filling uses. Ghosts must be filled

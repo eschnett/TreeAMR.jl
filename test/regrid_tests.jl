@@ -79,6 +79,206 @@ end
     @test length(planned) > length(forest.leaves) - 1 + 2^D
 end
 
+# --- Buffering (CODE.md regridding step 2) ----------------------------
+
+"""A uniform periodic brick and its centre block, for buffer tests."""
+function buffer_forest(::Val{D}; roots=3, N=8, G=1) where {D}
+    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, 1.0), D))
+    mid = only(filter(k -> root_position(forest, k.root) == ntuple(_ -> roots ÷ 2, D),
+                      forest.leaves))
+    return forest, mid
+end
+
+"""The leaves `neighbor_keys` reaches from `k` over the directions `δs`."""
+neighbors_over(forest, k, δs) =
+    unique(reduce(vcat, [neighbor_keys(forest, k, δ) for δ in δs]))
+
+"""Which leaves of `forest` the buffer moved, and to what."""
+function buffer_recruits(forest, flags, buffer)
+    plain = RegridFlag[TreeAMR.markflag(m) for m in flags]
+    marks = buffered_flags(forest, flags, buffer)
+    return Dict(forest.leaves[b] => marks[b]
+                for b in eachindex(marks) if marks[b] !== plain[b])
+end
+
+"""Fill every interior cell from a fresh seeded RNG, in block order."""
+function fill_noise!(fs, seed)
+    rng = MersenneTwister(seed)
+    for b in 1:nblocks(fs), v in 1:fs.nvars
+        interiorview(fs, b, v) .= rand(rng, size(interiorview(fs, b, v))...)
+    end
+    return fs
+end
+
+@testset "buffer=0 changes nothing: D=$D" for D in (1, 2)
+    # The default must reproduce the unbuffered behaviour exactly -- both
+    # the completed marks and the transferred data, bit for bit.
+    build() = begin
+        f = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+                   extents=ntuple(_ -> (0.0, 1.0), D))
+        refine!(f, f.leaves[1])
+        balance!(f)
+        f
+    end
+    forest = build()
+    fs = fill_noise!(FieldSet(forest, 1), 1300 + D)
+
+    rng = MersenneTwister(1400 + D)
+    flags = flag_blocks(forest) do b, k
+        r = rand(rng)
+        r < 0.3 ? Refine : r < 0.6 ? Coarsen : Keep
+    end
+    @test complete_marks(forest, flags; buffer=0) == complete_marks(forest, flags)
+    # A box spanning the whole interior is what an omitted box means.
+    boxed = [(f, ntuple(_ -> 1:(forest.N), D)) for f in flags]
+    @test complete_marks(forest, boxed; buffer=0) == complete_marks(forest, flags)
+
+    # And the same through regrid!, data included.
+    twin = build()
+    tfs = fill_noise!(FieldSet(twin, 1), 1300 + D)
+    @test twin.leaves == forest.leaves && tfs.work == fs.work
+    @test regrid!(forest, fs, GhostSchedule(forest, OPS2); flags=flags)
+    @test regrid!(twin, tfs, GhostSchedule(twin, OPS2); flags=flags, buffer=0)
+    @test twin.leaves == forest.leaves
+    @test tfs.work == fs.work                          # exactly
+end
+
+@testset "A box well inside a block recruits nobody: D=$D" for D in (1, 2, 3)
+    forest, mid = buffer_forest(Val(D))
+    flags = flag_blocks((b, k) -> k == mid ? (Refine, ntuple(_ -> 4:5, D)) : Keep, forest)
+    @test isempty(buffer_recruits(forest, flags, 2))   # margin 3 > buffer 2
+    @test !isempty(buffer_recruits(forest, flags, 4))  # a wider one does reach out
+end
+
+@testset "A box near one face recruits only that face: D=$D" for D in (1, 2, 3)
+    forest, mid = buffer_forest(Val(D))
+    # Near the low-x face, mid-range in every other dimension.
+    box = ntuple(d -> d == 1 ? (1:2) : (4:5), D)
+    flags = flag_blocks((b, k) -> k == mid ? (Refine, box) : Keep, forest)
+    recruits = buffer_recruits(forest, flags, 2)
+
+    lox = ntuple(d -> d == 1 ? -1 : 0, D)
+    @test sort(collect(keys(recruits))) == sort(neighbors_over(forest, mid, (lox,)))
+    @test all(==(Refine), values(recruits))            # equal level: promoted
+    if D >= 2
+        # In particular no corner: the box never leaves the block in y.
+        corner = only(neighbor_keys(forest, mid, ntuple(d -> d <= 2 ? -1 : 0, D)))
+        @test !(corner in keys(recruits))
+    end
+end
+
+@testset "A box near a corner recruits that corner's side: D=$D" for D in (2, 3)
+    forest, mid = buffer_forest(Val(D))
+    flags = flag_blocks((b, k) -> k == mid ? (Refine, ntuple(_ -> 1:2, D)) : Keep, forest)
+    recruits = buffer_recruits(forest, flags, 2)
+
+    # Every direction with only nonpositive components -- faces, edges,
+    # and the corner on the low side -- and nothing on the high side.
+    δs = filter(δ -> all(<=(0), δ), alldirections(Val(D)))
+    @test length(δs) == 2^D - 1
+    @test sort(collect(keys(recruits))) == sort(neighbors_over(forest, mid, δs))
+    @test all(==(Refine), values(recruits))
+
+    # The conjunction is the point: near low-x but mid-y, the (-1,-1,...)
+    # corner is *not* reached, even though the same buffer reaches -x.
+    corner = only(neighbor_keys(forest, mid, ntuple(_ -> -1, D)))
+    @test corner in keys(recruits)
+    edgebox = ntuple(d -> d == 1 ? (1:2) : (4:5), D)
+    edgeflags = flag_blocks((b, k) -> k == mid ? (Refine, edgebox) : Keep, forest)
+    @test !(corner in keys(buffer_recruits(forest, edgeflags, 2)))
+end
+
+@testset "An enum-only Refine buffers isotropically: D=$D" for D in (1, 2, 3)
+    forest, mid = buffer_forest(Val(D))
+    plain = flag_blocks((b, k) -> k == mid ? Refine : Keep, forest)
+    whole = flag_blocks((b, k) -> k == mid ? (Refine, ntuple(_ -> 1:(forest.N), D)) : Keep,
+                        forest)
+    @test buffered_flags(forest, plain, 2) == buffered_flags(forest, whole, 2)
+
+    # Every one of the 3^D - 1 surrounding directions joins the buffer.
+    recruits = buffer_recruits(forest, plain, 2)
+    @test sort(collect(keys(recruits))) ==
+          sort(neighbors_over(forest, mid, alldirections(Val(D))))
+end
+
+@testset "Coarsen inside the buffer is demoted, finer neighbours only so" begin
+    # The centre block is refined; the level-0 block across its low-x face
+    # flags Refine with a box against that face. The level-1 leaves it
+    # reaches are already finer, so they are demoted to Keep and not
+    # promoted -- which breaks the unanimity their group needed to coarsen.
+    forest, mid = buffer_forest(Val(2))
+    refine!(forest, mid)
+    balance!(forest)
+    children = filter(k -> isancestor(mid, k), forest.leaves)
+    @test length(children) == 4
+
+    source = only(filter(k -> level(k) == 0 && root_position(forest, k.root) == (0, 1),
+                         forest.leaves))
+    flags = [k == source ? (Refine, (7:8, 4:5)) : (k in children ? Coarsen : Keep)
+             for k in forest.leaves]
+
+    touching = neighbor_keys(forest, source, (1, 0))
+    @test length(touching) == 2                        # two children share the face
+    marks = buffered_flags(forest, flags, 2)
+    for (b, k) in enumerate(forest.leaves)
+        if k in touching
+            @test marks[b] === Keep                    # demoted, not promoted
+        elseif k in children
+            @test marks[b] === Coarsen                 # untouched by the buffer
+        end
+    end
+
+    # Without the buffer the group is unanimous and collapses; with it the
+    # children survive. That is the flicker suppression, operationally.
+    @test !any(k -> isancestor(mid, k), complete_marks(forest, flags))
+    @test count(k -> isancestor(mid, k), complete_marks(forest, flags; buffer=2)) == 4
+end
+
+@testset "A coarser neighbour in the buffer is promoted, and regrid! copes" begin
+    forest, mid = buffer_forest(Val(2); N=8, G=2)
+    refine!(forest, mid)
+    balance!(forest)
+    fs = FieldSet(forest, 1)
+    fill_by_coordinates!((x, v) -> 3.0, fs)
+
+    # A level-1 child with a box against the low-x face of its root: the
+    # leaf across that face is a level-0 block, coarser than the source.
+    source = MortonKey{2}(mid.root, 1, (0, 0))
+    @test source in forest.leaves
+    coarse = only(neighbor_keys(forest, source, (-1, 0)))
+    @test level(coarse) == 0
+
+    flags = [k == source ? (Refine, (1:2, 4:5)) : Keep for k in forest.leaves]
+    @test buffer_recruits(forest, flags, 2) == Dict(coarse => Refine)
+
+    @test regrid!(forest, fs, GhostSchedule(forest, OPS2); flags=flags, buffer=2)
+    @test isbalanced(forest)
+    @test issorted(forest.leaves)
+    @test maxlevel(forest) == 2
+    @test !(coarse in forest.leaves)                   # it really did refine
+    @test all(c -> c in forest.leaves, childkeys(coarse))
+    # A constant survives the transfer, so the promotion moved real data.
+    for b in 1:nblocks(fs)
+        @test all(≈(3.0), interiorview(fs, b, 1))
+    end
+end
+
+@testset "Buffer argument checking" begin
+    forest, mid = buffer_forest(Val(2); N=8)
+    keep = fill(Keep, nleaves(forest))
+    @test_throws ArgumentError buffered_flags(forest, keep, -1)
+    @test_throws ArgumentError buffered_flags(forest, keep, 9)   # wider than N
+    @test buffered_flags(forest, keep, 8) == keep                # exactly N is fine
+
+    bad(box) = [k == mid ? (Refine, box) : Keep for k in forest.leaves]
+    @test_throws ArgumentError buffered_flags(forest, bad((0:2, 1:2)), 1)   # below 1
+    @test_throws ArgumentError buffered_flags(forest, bad((1:2, 4:9)), 1)   # above N
+    @test_throws ArgumentError buffered_flags(forest, bad((3:2, 1:2)), 1)   # empty
+    @test_throws ArgumentError buffered_flags(forest, bad((1:2,)), 1)       # wrong rank
+    @test_throws ArgumentError buffered_flags(forest, fill(1, nleaves(forest)), 1)
+end
+
 @testset "regrid! mechanics: D=$D" for D in (1, 2)
     forest = Forest(ntuple(_ -> 4, D); N=4, G=1, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))

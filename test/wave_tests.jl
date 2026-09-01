@@ -79,7 +79,16 @@ end
     σ = 0.08
     coarse = uniform_pulse(Val(1); roots=8, N=8, σ=σ)     # level-0 equivalent
     fine = uniform_pulse(Val(1); roots=8, N=32, σ=σ)      # level-2 equivalent
-    amr = track_pulse(Val(1); roots=8, N=8, σ=σ, threshold=1e-3, chunk=0.02)
+    # A tight flagging threshold (0.05 of the peak, not 1e-3 far down the
+    # tail) plus a buffer one block wide. The buffer has to be that wide
+    # to reach anything here: the block ahead of the pulse is refined as
+    # soon as the criterion fires in it at all, so its box of firing
+    # cells always hugs the face the pulse came in through, and only a
+    # dilation of most of a block width reaches out the *far* face to
+    # refine ahead of the pulse.
+    amr = track_pulse(Val(1); roots=8, N=8, σ=σ, threshold=0.05, buffer=8, chunk=0.02)
+    unbuffered = track_pulse(Val(1); roots=8, N=8, σ=σ, threshold=0.05, buffer=0,
+                             chunk=0.02)
 
     # Refinement is worth having at all: the coarse mesh is far worse.
     @test coarse.err > 10 * fine.err
@@ -88,6 +97,11 @@ end
     # block over the whole run.
     @test amr.tracking == 1.0
     @test amr.maxlevel == 2
+
+    # The buffer did real work: refining ahead of the pulse measurably
+    # improves the run over the same criterion with no margin at all.
+    @test amr.worst < unbuffered.worst
+    @test unbuffered.tracking == 1.0                  # the criterion alone still tracks
 
     # And the adaptive run is as accurate as the uniform fine one ...
     @test amr.worst ≈ fine.err rtol = 0.1

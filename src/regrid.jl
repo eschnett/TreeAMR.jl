@@ -20,23 +20,122 @@ siblings ask for it *and* balance still permits — see
 @enum RegridFlag Coarsen Keep Refine
 
 """
-    flag_blocks(f, forest) -> Vector{RegridFlag}
+    flag_blocks(f, forest) -> Vector
 
 Build a flag vector by calling `f(b, key)` for every leaf, with `b` the
 block index and `key` its [`MortonKey`](@ref).
+
+`f` may return either a bare [`RegridFlag`](@ref) or a
+`(flag, box)` pair, where `box::NTuple{D,UnitRange{Int}}` is the
+bounding box of the cells that fired, in that block's own interior
+indices `1:N` (see [`complete_marks`](@ref) for what the box is used
+for). The two forms may be mixed within one vector.
 
 A convenience for host-side flagging; an application is free to produce
 the vector any other way, which is what will let the flagging kernel run
 on the device in M6 while the completion logic stays on the host.
 """
-flag_blocks(f, forest::Forest) =
-    RegridFlag[f(b, k) for (b, k) in enumerate(forest.leaves)]
+flag_blocks(f, forest::Forest) = [f(b, k) for (b, k) in enumerate(forest.leaves)]
+
+# Whatever a flagging function reported, reduced to its flag and to the
+# box of firing cells. An omitted box means the whole interior — the
+# conservative isotropic case.
+markflag(m::RegridFlag) = m
+markflag(m::Tuple{RegridFlag,Any}) = m[1]
+markflag(m) = throw(ArgumentError(
+    "a flag must be a RegridFlag or a (RegridFlag, box) pair, got $(typeof(m))"))
+
+markbox(m::RegridFlag, N::Int, ::Val{D}) where {D} = ntuple(_ -> 1:N, D)
+function markbox(m::Tuple{RegridFlag,Any}, N::Int, ::Val{D}) where {D}
+    box = m[2]
+    box isa NTuple{D,UnitRange{Int}} || throw(ArgumentError(
+        "a flag box must be an NTuple{$D,UnitRange{Int}} of interior indices, " *
+        "got $(typeof(box))"))
+    all(r -> !isempty(r) && first(r) >= 1 && last(r) <= N, box) || throw(ArgumentError(
+        "flag box $box is empty or outside the interior indices 1:$N"))
+    return box
+end
+markbox(m, N::Int, ::Val) = markflag(m)      # not a flag at all: complain about that
 
 """
-    complete_marks(forest, flags) -> Vector{MortonKey}
+    buffered_flags(forest, flags, buffer) -> Vector{RegridFlag}
+
+The flags of `flags` widened by a `buffer`-cell margin around every
+region asking to refine — step 2 of the regridding sequence in
+`CODE.md`, evaluated in mark space, before any refine or coarsen is
+applied and before balancing, without touching `forest`.
+
+For each block marked `Refine`, its box of firing cells (the whole
+interior when the flagging function reported no box) is dilated by
+`buffer` cells per dimension *at that block's own resolution*. Every
+other leaf the dilated box reaches joins the buffer:
+
+- its `Coarsen` is demoted to `Keep` unconditionally, which is what
+  suppresses coarsen/refine flicker at the edge of the refined region;
+- it is marked `Refine` if its level is at or below the source's — a
+  finer neighbour is already fine enough and gets only the demotion.
+
+The dilated box reaches the neighbour in direction `δ` exactly when it
+leaves the block along *every* nonzero component of `δ`, so a feature
+near one face recruits that face's neighbour only, while one near a
+corner recruits the face, edge, and corner neighbours on that side —
+the conjunction comes out of the box geometry rather than being
+computed by hand.
+
+Recruitment is a single pass over the original marks: a block pulled
+into the buffer does not itself recruit further neighbours. `buffer` is
+therefore limited to `N` cells, one block width, so that the dilated
+box cannot reach past the first ring of neighbours.
+"""
+function buffered_flags(forest::Forest{D}, flags::AbstractVector,
+                        buffer::Integer) where {D}
+    N = forest.N
+    buffer >= 0 || throw(ArgumentError("buffer must be non-negative, got $buffer"))
+    buffer <= N || throw(ArgumentError(
+        "buffer of $buffer cells exceeds the block width N = $N; recruitment is a " *
+        "single pass and cannot reach past the first ring of neighbours"))
+
+    # Validate every box even when there is no buffering to do, so that a
+    # malformed box is reported the same way either way.
+    boxes = [markbox(m, N, Val(D)) for m in flags]
+    marks = RegridFlag[markflag(m) for m in flags]
+    buffer == 0 && return marks
+
+    directions = alldirections(Val(D))
+    for (b, k) in enumerate(forest.leaves)
+        # The *reported* flag, not `marks[b]`: a block recruited into the
+        # buffer by an earlier source must not become a source itself.
+        markflag(flags[b]) === Refine || continue
+        box = boxes[b]
+        # The dilated box leaves the block in direction δ[d] = ∓1 only if
+        # it crosses that face; a tangential dimension never restricts.
+        exits = ntuple(d -> (first(box[d]) - buffer < 1, last(box[d]) + buffer > N), D)
+        for δ in directions
+            reaches = all(d -> δ[d] == 0 ||
+                               (δ[d] < 0 ? exits[d][1] : exits[d][2]), 1:D)
+            reaches || continue
+            for nk in neighbor_keys(forest, k, δ)
+                j = find_leaf(forest, nk)
+                j === nothing && continue          # cannot happen: nk is a leaf
+                marks[j] === Coarsen && (marks[j] = Keep)
+                level(nk) <= level(k) && (marks[j] = Refine)
+            end
+        end
+    end
+    return marks
+end
+
+"""
+    complete_marks(forest, flags; buffer=0) -> Vector{MortonKey}
 
 The sorted leaf array that `flags` asks for, completed so that the
 result is still 2:1 balanced.
+
+`flags` holds one entry per leaf, each either a [`RegridFlag`](@ref) or
+a `(flag, box)` pair as [`flag_blocks`](@ref) produces. `buffer` is a
+margin in **cells**, applied first: it widens every refinement request
+to the neighbouring leaves its box of firing cells comes within `buffer`
+cells of — see [`buffered_flags`](@ref).
 
 Refinement is applied first, then coarsening — but only for sibling
 groups where all `2^D` children are present as leaves and all of them
@@ -46,13 +145,15 @@ undo a coarsening that balance cannot support.
 
 `forest` is not modified.
 """
-function complete_marks(forest::Forest{D}, flags::AbstractVector{RegridFlag}) where {D}
+function complete_marks(forest::Forest{D}, flags::AbstractVector;
+                        buffer::Integer=0) where {D}
     length(flags) == nleaves(forest) || throw(DimensionMismatch(
         "got $(length(flags)) flags for $(nleaves(forest)) leaves"))
+    marks = buffered_flags(forest, flags, buffer)
 
     # A sibling group coarsens only if it is complete and unanimous.
     wanted = Dict{MortonKey{D},Int}()
-    for (k, f) in zip(forest.leaves, flags)
+    for (k, f) in zip(forest.leaves, marks)
         f === Coarsen && level(k) > 0 || continue
         parent = parentkey(k)
         wanted[parent] = get(wanted, parent, 0) + 1
@@ -62,7 +163,7 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector{RegridFlag}) wh
     candidate = Vector{MortonKey{D}}()
     sizehint!(candidate, length(forest.leaves))
     emitted = Set{MortonKey{D}}()
-    for (k, f) in zip(forest.leaves, flags)
+    for (k, f) in zip(forest.leaves, marks)
         parent = level(k) > 0 ? parentkey(k) : nothing
         if parent !== nothing && parent in coarsening
             # Descendants are contiguous on the curve, so emitting the
@@ -135,16 +236,23 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
 end
 
 """
-    regrid!(forest, fieldsets, schedule; flags, boundary=nothing, transfer=true)
+    regrid!(forest, fieldsets, schedule; flags, buffer=0, boundary=nothing,
+            transfer=true)
 
 Refine and coarsen `forest` as `flags` asks, and move every field set's
 data onto the new mesh. Returns `true` if the mesh changed.
 
-The steps are those in `CODE.md`: complete the marks to preserve 2:1
-balance ([`complete_marks`](@ref)), build the new sorted key list,
-allocate fresh block storage, and transfer — surviving blocks copied,
-newly refined blocks prolongated from their parent, coarsened blocks
-restricted from their children.
+The steps are those in `CODE.md`: widen the refinement requests by a
+`buffer`-cell margin ([`buffered_flags`](@ref)), complete the marks to
+preserve 2:1 balance ([`complete_marks`](@ref)), build the new sorted
+key list, allocate fresh block storage, and transfer — surviving blocks
+copied, newly refined blocks prolongated from their parent, coarsened
+blocks restricted from their children.
+
+`flags` holds a [`RegridFlag`](@ref) or a `(flag, box)` pair per leaf,
+as [`flag_blocks`](@ref) produces; `buffer` is a width in cells, the
+application's choice (feature speed × regrid cadence), and defaults to
+no buffering.
 
 `fieldsets` is a single [`FieldSet`](@ref) or a collection of them, all
 over `forest`. Each one's storage is replaced in place, so references an
@@ -171,7 +279,7 @@ initial data on the new mesh instead (see
 [`adapt_to_initial_data!`](@ref)).
 """
 function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
-                 flags::AbstractVector{RegridFlag}, boundary=nothing,
+                 flags::AbstractVector, buffer::Integer=0, boundary=nothing,
                  transfer::Bool=true) where {D}
     sets = fieldsets isa FieldSet ? (fieldsets,) : fieldsets
     for fs in sets
@@ -187,7 +295,7 @@ function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
         "schedule is stale; rebuild it before regridding"))
 
     oldleaves = copy(forest.leaves)
-    newleaves = complete_marks(forest, flags)
+    newleaves = complete_marks(forest, flags; buffer=buffer)
     newleaves == oldleaves && return false
 
     if transfer
@@ -219,7 +327,8 @@ function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
 end
 
 """
-    adapt_to_initial_data!(fs, operators; initial, flag, maxpasses=10, boundary=nothing)
+    adapt_to_initial_data!(fs, operators; initial, flag, buffer=0, maxpasses=10,
+                           boundary=nothing)
 
 Run the initialization cycle from `CODE.md`: fill the initial data, flag,
 regrid, then **re-evaluate** the initial data on the new mesh rather than
@@ -230,13 +339,16 @@ refined block would bake in the coarse mesh's resolution, so the
 refinement would never buy anything.
 
 `initial` is an `(x, v) -> value` callback as
-[`fill_by_coordinates!`](@ref) takes, and `flag` is
-`(b, key) -> RegridFlag` as [`flag_blocks`](@ref) takes. Returns
+[`fill_by_coordinates!`](@ref) takes, and `flag` is a
+`(b, key) -> RegridFlag` (or `(b, key) -> (flag, box)`) callback as
+[`flag_blocks`](@ref) takes; `buffer` is passed on to
+[`regrid!`](@ref). Returns
 `(schedule, passes, converged)`; `converged` is `false` if the hierarchy
 was still changing when `maxpasses` ran out.
 """
 function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
-                                initial, flag, maxpasses::Integer=10,
+                                initial, flag, buffer::Integer=0,
+                                maxpasses::Integer=10,
                                 boundary=nothing) where {T,D}
     forest = fs.forest
     schedule = GhostSchedule(forest, operators; T=T)
@@ -245,8 +357,8 @@ function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
     for pass in 1:maxpasses
         fill_ghosts!(fs, schedule; boundary=boundary)
         flags = flag_blocks(flag, forest)
-        changed = regrid!(forest, fs, schedule; flags=flags, boundary=boundary,
-                          transfer=false)
+        changed = regrid!(forest, fs, schedule; flags=flags, buffer=buffer,
+                          boundary=boundary, transfer=false)
         schedule = GhostSchedule(forest, operators; T=T)
         fill_by_coordinates!(initial, fs)
         changed || return (schedule, pass, true)
