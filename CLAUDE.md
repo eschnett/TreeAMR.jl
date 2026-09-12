@@ -61,9 +61,11 @@ the build errors out. **Adding a documented function means adding it to
 CI (`.github/workflows/CI.yml`) tests on Julia **1.10** and latest, on Linux
 and macOS. `Project.toml` says `julia = "1.10"`, so no 1.11+ features (no
 `public`, no `[sources]`). Your local Julia is newer. A seeded RNG stream can
-differ across Julia versions, so a test that depends on a particular random
-draw can pass locally and fail on 1.10 — "buffer=0 changes nothing: D=1" in
-`test/regrid_tests.jl` currently does exactly that.
+differ across Julia versions, so a test whose *assertions* depend on a
+particular random draw can pass locally and fail on 1.10: use a seeded RNG
+for the inputs, but make what the test asserts follow deterministically from
+the setup. `juliaup` has 1.10 installed, so a suspect test can be checked
+with `julia +1.10 --project=. -e 'using Pkg; Pkg.test()'`.
 
 There is no formatter or linter configured.
 

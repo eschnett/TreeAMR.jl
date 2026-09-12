@@ -129,6 +129,11 @@ end
         r = rand(rng)
         r < 0.3 ? Refine : r < 0.6 ? Coarsen : Keep
     end
+    # Whether a random draw alone moves the mesh depends on the RNG stream,
+    # which differs between Julia versions; one forced refinement makes the
+    # regrids below a change on every version, and refinement is the one mark
+    # that completion can never undo.
+    flags[findlast(k -> level(k) == 0, forest.leaves)] = Refine
     @test complete_marks(forest, flags; buffer=0) == complete_marks(forest, flags)
     # A box spanning the whole interior is what an omitted box means.
     boxed = [(f, ntuple(_ -> 1:(forest.N), D)) for f in flags]
