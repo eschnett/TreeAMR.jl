@@ -56,8 +56,7 @@ julia --project=docs docs/make.jl
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block in `docs/src/index.md`, and every `` [`name`](@ref) `` must resolve, or
 the build errors out. **Adding a documented function means adding it to
-`docs/src/index.md`.** (As of this writing `buffered_flags` is missing there
-and the Documentation CI is red because of it.)
+`docs/src/index.md`.**
 
 CI (`.github/workflows/CI.yml`) tests on Julia **1.10** and latest, on Linux
 and macOS. `Project.toml` says `julia = "1.10"`, so no 1.11+ features (no

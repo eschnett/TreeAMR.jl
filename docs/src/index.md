@@ -254,6 +254,7 @@ volume_weighted_norm
 ```@docs
 RegridFlag
 flag_blocks
+buffered_flags
 complete_marks
 regrid!
 adapt_to_initial_data!
