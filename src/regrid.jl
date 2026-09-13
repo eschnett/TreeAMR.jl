@@ -32,11 +32,23 @@ indices `1:N`. Reporting a box is what makes a block a source of the
 regrid buffer, so the form carries meaning beyond the flag — see
 [`buffered_flags`](@ref). The two forms may be mixed within one vector.
 
+`f` is called once per leaf, threaded over blocks (M5), so it must be a
+pure function of its arguments — reading field data is fine, writing to
+shared state of its own is not.
+
 A convenience for host-side flagging; an application is free to produce
 the vector any other way, which is what will let the flagging kernel run
 on the device in M6 while the completion logic stays on the host.
 """
-flag_blocks(f, forest::Forest) = [f(b, k) for (b, k) in enumerate(forest.leaves)]
+function flag_blocks(f, forest::Forest)
+    out = Vector{Any}(undef, nleaves(forest))
+    threaded_foreach(nleaves(forest)) do b
+        out[b] = f(b, forest.leaves[b])
+    end
+    # The element type has to come from the values, not from `f`: the
+    # bare and `(flag, box)` forms may be mixed within one vector.
+    return identity.(out)
+end
 
 # Whatever a flagging function reported, reduced to its flag and to the
 # box of firing cells. An omitted box means the whole interior — the
@@ -128,10 +140,17 @@ function buffered_flags(forest::Forest{D}, flags::AbstractVector,
     buffer == 0 && return marks
 
     directions = alldirections(Val(D))
-    for (b, k) in enumerate(forest.leaves)
+
+    # Each source's recruits are found in parallel — the neighbor search
+    # is the expensive half and touches only the tree — and the marks
+    # are then rewritten in a serial pass in block order. Writing them
+    # from the tasks would race: one leaf can be recruited by several
+    # sources at once.
+    recruits = threaded_collect(Pair{Int,Int}, nleaves(forest)) do found, b
         # The *reported* mark, not `marks[b]`: a block recruited into the
         # buffer by an earlier source must not become a source itself.
-        issource(flags[b]) || continue
+        issource(flags[b]) || return
+        k = forest.leaves[b]
         L = requestedlevel(markflag(flags[b]), level(k))
         box = boxes[b]
         # The dilated box leaves the block in direction δ[d] = ∓1 only if
@@ -144,10 +163,15 @@ function buffered_flags(forest::Forest{D}, flags::AbstractVector,
             for nk in neighbor_keys(forest, k, δ)
                 j = find_leaf(forest, nk)
                 j === nothing && continue          # cannot happen: nk is a leaf
-                marks[j] === Coarsen && level(nk) <= L && (marks[j] = Keep)
-                level(nk) < L && (marks[j] = Refine)
+                push!(found, j => L)
             end
         end
+    end
+
+    for (j, L) in recruits
+        l = level(forest.leaves[j])
+        marks[j] === Coarsen && l <= L && (marks[j] = Keep)
+        l < L && (marks[j] = Refine)
     end
     return marks
 end
@@ -223,21 +247,23 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
     N, G = forest.N, forest.G
     zerodir = ntuple(_ -> 0, D)
 
-    pairs = Dict{Tuple{Symbol,NTuple{D,Int}},Tuple{Vector{Int32},Vector{Int32}}}()
-    record!(kind, offset, target, source) =
-        push!.(get!(pairs, (kind, offset), (Int32[], Int32[])), (target, source))
-
-    for (bn, kn) in enumerate(newleaves)
+    # Classify every new block in parallel (dictionary *lookups* only —
+    # nothing is inserted), then merge in block order so the batches come
+    # out the same whatever the thread count.
+    perblock = [Pair{Tuple{Symbol,NTuple{D,Int}},Int32}[] for _ in 1:length(newleaves)]
+    threaded_foreach(length(newleaves)) do bn
+        kn = newleaves[bn]
+        out = perblock[bn]
         same = get(oldindex, kn, nothing)
         if same !== nothing
-            record!(:copy, zerodir, Int32(bn), same)
-            continue
+            push!(out, (:copy, zerodir) => same)
+            return
         end
 
         parent = level(kn) > 0 ? get(oldindex, parentkey(kn), nothing) : nothing
         if parent !== nothing
-            record!(:prolong, childoffset(kn), Int32(bn), parent)
-            continue
+            push!(out, (:prolong, childoffset(kn)) => parent)
+            return
         end
 
         # Otherwise this block was coarsened, so its children were leaves.
@@ -249,7 +275,14 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
                 "cannot rebuild $kn: neither it, its parent, nor its child $kc was a " *
                 "leaf before regridding. A single regrid may move a block by at most " *
                 "one level, which holds when the previous tree was 2:1 balanced."))
-            record!(:restrict, childoffset(kc), Int32(bn), child)
+            push!(out, (:restrict, childoffset(kc)) => child)
+        end
+    end
+
+    pairs = Dict{Tuple{Symbol,NTuple{D,Int}},Tuple{Vector{Int32},Vector{Int32}}}()
+    for bn in 1:length(newleaves)
+        for (key, source) in perblock[bn]
+            push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(bn), source))
         end
     end
 
@@ -338,13 +371,14 @@ function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
     stored = forest.N + 2 * forest.G
     for fs in sets
         fresh = similar(fs.work, ntuple(_ -> stored, D)..., fs.nvars, length(newleaves))
-        fill!(fresh, zero(eltype(fresh)))
+        zerofill!(fresh, get_backend(fs.work))
         if transfer
             groups = transfer_groups(eltype(fs.work), forest, oldleaves, newleaves,
                                      schedule.operators)
-            for group in groups
-                run_group!(fresh, fs.work, group, fs.nvars, backend)
-            end
+            # The transfer moves every cell in the domain, so it is
+            # threaded the same way a ghost phase is — its groups are
+            # just as uneven, a whole block against a single child.
+            run_phase!(fresh, fs.work, groups, phase_plan(groups), fs.nvars, backend)
             synchronize(backend)
         end
         fs.work = fresh
@@ -415,9 +449,13 @@ What [`regrid!`](@ref) does to this depends on the operator family:
 """
 function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest
-    total = zero(float(real(T)))
-    for b in 1:nblocks(fs)
-        total += spacing(forest, blockkey(fs, b))^D * sum(interiorview(fs, b, var))
+    R = float(real(T))
+    # One partial per block, summed afterwards in block order, so the
+    # answer does not move when the thread count does.
+    partials = Vector{R}(undef, nblocks(fs))
+    threaded_foreach(nblocks(fs)) do b
+        cellvolume = R(spacing(forest, blockkey(fs, b))^D)
+        partials[b] = cellvolume * sum(interiorview(fs, b, var))
     end
-    return total
+    return sum(partials)
 end

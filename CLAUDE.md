@@ -12,20 +12,30 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M4 are done (tree core, ghost exchange, ODE
-coupling, regridding), plus the conservative operator family that was
-scheduled for M8. Everything is serial and `D`-generic. Next is M5
-(multi-threading), then GPU (M6), MPI (M7), face-centered variables and
-conservation (M8), I/O (M9).
+Current state: milestones M0–M5 are done (tree core, ghost exchange, ODE
+coupling, regridding, multi-threading), plus the conservative operator
+family that was scheduled for M8. Everything is `D`-generic. Next is GPU
+(M6), MPI (M7), face-centered variables and conservation (M8), I/O
+(M9).
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
 ## Commands
 
-Full test suite (about 50 s):
+Full test suite (about 65 s — the thread-independence test spends ~25 s
+of that running `test/thread_workload.jl` in two subprocesses):
 
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+The tests inherit the caller's thread count; `Pkg.test` does not
+propagate `-t`, so pass it explicitly to exercise the threaded paths in
+the suite itself (the thread-independence test spawns its own
+subprocesses either way):
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test(; julia_args = ["--threads=8"])'
 ```
 
 A single test file. The `test/*_tests.jl` files are `include`d by
@@ -67,15 +77,26 @@ for the inputs, but make what the test asserts follow deterministically from
 the setup. `juliaup` has 1.10 installed, so a suspect test can be checked
 with `julia +1.10 --project=. -e 'using Pkg; Pkg.test()'`.
 
+Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
+takes a list of thread counts and prints a speedup table). Sizes come
+from `TREEAMR_BENCH_{D,N,ROOTS,REPS}`. On a NUMA node, run it under
+`numactl --interleave=all` — that is worth 3–7x at 64 threads and is
+what the numbers in CODE.md were taken with:
+
+```bash
+TREEAMR_BENCH_N=32 TREEAMR_BENCH_ROOTS=8 bench/scan.sh 1 2 4 8
+```
+
 There is no formatter or linter configured.
 
 ## Architecture
 
-Nine source files, included in dependency order from `src/TreeAMR.jl`; each
+Ten source files, included in dependency order from `src/TreeAMR.jl`; each
 layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
+| threading | `threading.jl` | `threadchunks` and the three host-side parallel-loop helpers everything else is built on |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G, …, N+2G, nvars, nblocks)` array over all leaves, ghosts included |
@@ -145,7 +166,22 @@ The ideas that span several files and are easy to violate:
   `Val` parameters. The CPU implementation is meant to already be the GPU
   implementation (M6). Don't write plain nested loops for cell work in
   `src/`; host-side driver logic (mark completion, balance, key rebuild)
-  stays ordinary Julia.
+  stays ordinary Julia — but *threaded* ordinary Julia, via
+  `threading.jl`.
+- **Bit-identical across thread counts.** This is a hard invariant, not
+  an aspiration: no parallel loop shares an accumulator, reductions form
+  one partial per block and sum them in block order, and collecting
+  passes fill one buffer per task and concatenate in block order. A new
+  parallel loop that breaks this breaks `test/thread_tests.jl`'s
+  acceptance test, which runs `test/thread_workload.jl` in subprocesses
+  at two thread counts and compares digests byte for byte.
+- **A ghost phase is one parallel loop.** `run_phase!` in `ghosts.jl`
+  flattens a phase's transfer batches into `PhaseSlice`s of roughly
+  equal cell count and deals them out largest first; a batch is *not*
+  the unit of parallelism, because batch sizes differ by orders of
+  magnitude (face slab vs corner) and per-batch launches capped the
+  ghost fill at ~2.5x. Only the CPU backend does this — `run_phase!`
+  has a generic method that keeps per-batch launches for devices.
 
 Index conventions: stored indices run `1:N+2G`, the interior is `G+1:G+N`.
 `cell_center(forest, key, idx)` takes **stored** indices, so interior cell
@@ -157,8 +193,8 @@ names the high ghost slab.
 ## Tests
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
-`ghost_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`
-(M2–M4). Three helper files are not tests:
+`ghost_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
+`thread_tests.jl` (M2–M5). Four helper files are not tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
   reference implementations (bit-plane Morton comparison, exact `Rational`
@@ -168,6 +204,12 @@ names the high ghost slab.
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.
+- `thread_workload.jl` — a standalone script, not `include`d. The thread
+  count is a command-line argument to Julia, so the M5 acceptance test runs
+  this in subprocesses at two thread counts and compares their output byte
+  for byte. It is deliberately self-contained (its own RK4, no ODE package)
+  so a subprocess starts in a couple of seconds; keep it that way, and keep
+  everything it prints deterministic.
 
 Testset names are claims ("Coarsening conserves any field exactly", not
 "coarsening test"), and each opens with a comment naming the failure mode it

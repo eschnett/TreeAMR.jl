@@ -13,8 +13,10 @@
 #
 # The 1D stencils depend only on the direction `δ` and on a child offset
 # `o` — never on which particular blocks are involved — so all transfers
-# sharing `(kind, δ, o)` share one set of stencils and are batched into a
-# single `TransferGroup` holding just the block-index pairs.
+# sharing `(kind, δ, o)` are batched into a single `TransferGroup`
+# holding just the block-index pairs. Prolongation groups are
+# additionally split by target level, because the phase-2 sweep
+# schedules a group by the level of its targets (see `GroupKey`).
 
 """
     Stencil1D{T}
@@ -38,8 +40,12 @@ Base.@propagate_inbounds stencilorder(s::Stencil1D) = size(s.weights, 1)
     TransferGroup{T,D}
 
 All transfers that share one set of 1D stencils — same kind, same
-direction, same child offset — reduced to a list of
-`(targetblock, sourceblock)` index pairs. One kernel launch per group.
+direction, same child offset, and for prolongations the same target
+level — reduced to a list of `(targetblock, sourceblock)` index pairs.
+
+A group is a batch of work, not a unit of scheduling: a phase runs as
+one parallel loop over [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, and a
+big group is launched in several of them.
 """
 struct TransferGroup{T,D}
     kind::Symbol                      # :copy, :restrict, or :prolong
@@ -65,6 +71,51 @@ struct BoundaryRegion{D}
 end
 
 """
+    PhaseSlice
+
+A contiguous run of one [`TransferGroup`](@ref TransferGroup)'s
+transfers — the unit of work one thread takes when a whole phase is run
+as a single parallel loop, and the reason `cells` is carried: the
+slices are dealt out largest first, so a phase made of one enormous face
+group and a hundred tiny corner ones still balances.
+"""
+struct PhaseSlice
+    group::Int32
+    first::Int32
+    last::Int32
+    cells::Int32                      # target cells, the cost of the slice
+end
+
+# Cells per slice. Big enough that a slice is worth a kernel launch (a
+# few microseconds of work), small enough that a hundred-odd threads
+# each get several slices of the largest group.
+const SLICE_CELLS = 4096
+
+# Cut a phase's groups into slices of about `SLICE_CELLS` target cells,
+# never crossing a group boundary (a group is one set of stencils, hence
+# one kernel), and order them largest first so that dealing them round
+# robin balances the phase.
+function phase_plan(groups::AbstractVector{<:TransferGroup})
+    slices = PhaseSlice[]
+    for (g, group) in enumerate(groups)
+        n = ntransfers(group)
+        n == 0 && continue
+        box = prod(boxsize(group))
+        per = max(1, cld(SLICE_CELLS, max(box, 1)))
+        lo = 1
+        while lo <= n
+            hi = min(n, lo + per - 1)
+            push!(slices, PhaseSlice(Int32(g), Int32(lo), Int32(hi),
+                                     Int32(min(box * (hi - lo + 1), typemax(Int32)))))
+            lo = hi + 1
+        end
+    end
+    # `sort!` is stable, so equal-cost slices keep their group order and
+    # the plan is a function of the schedule alone.
+    return sort!(slices; by=s -> -s.cells)
+end
+
+"""
     GhostSchedule{T,D}
 
 The precomputed ghost exchange for one forest, replayed by
@@ -76,12 +127,16 @@ The phasing follows `CODE.md`:
   only *interior* cells of other blocks and writes only ghosts, so the
   whole phase is race free and order independent.
 - `phase2` holds the prolongations, grouped by target level and ordered
-  **coarsest target first**. The sweep is required because a
+  **coarsest target first**; every transfer in a group has its target at
+  that group's level. The sweep is required because a
   prolongation stencil may read the coarse source's own ghosts, which
   may themselves have been prolongated from a still-coarser block —
   legal under 2:1 balance, where levels `l-2, l-1, l` can meet.
 - `boundaries` lists the ghost regions facing outside a non-periodic
   domain, filled by the user hook after the inter-block phases.
+- `phase1plan` and `phase2plans` cut each phase into balanced
+  [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, so that a phase runs as one
+  parallel loop rather than as a sequence of separate launches.
 
 Periodic boundaries appear nowhere special here: the tree wraps around,
 so they are ordinary copies, restrictions, and prolongations.
@@ -103,6 +158,10 @@ struct GhostSchedule{T,D}
     phase2::Vector{Vector{TransferGroup{T,D}}}   # by target level, coarsest first
     levels::Vector{Int}                          # target level of each phase2 entry
     boundaries::Vector{BoundaryRegion{D}}
+    # How each phase is cut up for the threads, precomputed here rather
+    # than at every ghost fill (see `PhaseSlice`).
+    phase1plan::Vector{PhaseSlice}
+    phase2plans::Vector{Vector{PhaseSlice}}
 end
 
 """
@@ -275,66 +334,128 @@ restriction_stencil(::Type{T}, N, G, δd, od, ops::Operators) where {T} =
 # A block's offset within its parent, per dimension.
 childoffset(k::MortonKey{D}) where {D} = ntuple(d -> Int(k.coords[d]) & 1, D)
 
+# What one ghost region of one block needs, as found by the neighbor
+# search. Transfers sharing a `GroupKey` share their 1D stencils and are
+# batched into one `TransferGroup`, hence one kernel launch.
+#
+# For prolongations the key also carries the target's *level*. The
+# stencils do not depend on it — but the phase-2 sweep does: a group is
+# scheduled at the level of its targets, so merging two levels into one
+# group would file them both under one of the two and silently defeat
+# the coarsest-target-first ordering that a prolongation reading its
+# source's own prolongated ghosts relies on. (Found in M5, while
+# threading this loop; see `CODE.md`.) Phase 1 is order independent by
+# construction, so copies and restrictions carry `level = 0` and stay
+# batched across levels — one launch instead of one per level.
+struct GroupKey{D}
+    kind::Symbol
+    direction::NTuple{D,Int}
+    offset::NTuple{D,Int}
+    level::Int
+end
+
+# The per-key transfer lists a schedule is assembled from: for each
+# group key, the target blocks and the source blocks of its transfers,
+# in the order the blocks were walked.
+const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
+
+# The neighbor search for a single block: every transfer its ghosts
+# need, appended to `pairs`, plus the regions that face out of the
+# domain and so belong to the boundary hook instead. Depends on the tree
+# alone, which is what makes it the part that threads — each task owns
+# its own `pairs` and `boundaries`.
+function block_sources!(pairs::TransferPairs{D},
+                        boundaries::Vector{BoundaryRegion{D}},
+                        forest::Forest{D}, b::Int, dirs) where {D}
+    k = forest.leaves[b]
+    N, G = forest.N, forest.G
+    zerooffset = ntuple(_ -> 0, D)
+    record!(kind, δ, offset, lvl, s) =
+        push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl), (Int32[], Int32[])),
+               (Int32(b), Int32(s)))
+    for δ in dirs
+        nbrs = neighbor_keys(forest, k, δ)
+        if isempty(nbrs)
+            region = CartesianIndices(ntuple(d -> target_range(N, G, δ[d], 0, false), D))
+            push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
+            continue
+        end
+        nblevel = level(first(nbrs))
+        if nblevel == level(k)
+            record!(:copy, δ, zerooffset, 0, find_leaf(forest, only(nbrs)))
+        elseif nblevel < level(k)
+            # Coarser neighbor: this block's ghosts are prolongated. The
+            # stencil geometry depends on where this block sits inside
+            # its own parent.
+            record!(:prolong, δ, childoffset(k), level(k), find_leaf(forest, only(nbrs)))
+        else
+            # Finer neighbors: each supplies one part of this block's
+            # ghost region, selected by its offset within its parent.
+            for nbr in nbrs
+                record!(:restrict, δ, childoffset(nbr), 0, find_leaf(forest, nbr))
+            end
+        end
+    end
+    return nothing
+end
+
+# Concatenate per-task transfer lists in task order, which is block
+# order — so the schedule does not depend on how the blocks were split.
+function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
+    for (key, (targets, sources)) in from
+        slot = get!(into, key, (Int32[], Int32[]))
+        append!(slot[1], targets)
+        append!(slot[2], sources)
+    end
+    return into
+end
+
 function GhostSchedule(forest::Forest{D}, operators::Operators;
                        T::Type=Float64) where {D}
     check_operators(forest, operators)
     N, G = forest.N, forest.G
     dirs = alldirections(Val(D))
+    nb = nleaves(forest)
 
-    # Transfers are collected keyed by (kind, δ, o): everything sharing
-    # that key shares one set of 1D stencils.
-    pairs = Dict{Tuple{Symbol,NTuple{D,Int},NTuple{D,Int}},
-                 Tuple{Vector{Int32},Vector{Int32}}}()
-    prolonglevel = Dict{Tuple{Symbol,NTuple{D,Int},NTuple{D,Int}},Int}()
-    boundaries = BoundaryRegion{D}[]
-
-    zerooffset = ntuple(_ -> 0, D)
-    for (b, k) in enumerate(forest.leaves)
-        for δ in dirs
-            nbrs = neighbor_keys(forest, k, δ)
-            if isempty(nbrs)
-                region = CartesianIndices(ntuple(d -> target_range(N, G, δ[d], 0, false), D))
-                push!(boundaries, BoundaryRegion{D}(b, δ, region))
-                continue
-            end
-            nblevel = level(first(nbrs))
-            if nblevel == level(k)
-                s = find_leaf(forest, only(nbrs))
-                key = (:copy, δ, zerooffset)
-                push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
-            elseif nblevel < level(k)
-                # Coarser neighbor: this block's ghosts are prolongated.
-                # The stencil geometry depends on where this block sits
-                # inside its own parent.
-                s = find_leaf(forest, only(nbrs))
-                key = (:prolong, δ, childoffset(k))
-                push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
-                prolonglevel[key] = level(k)
-            else
-                # Finer neighbors: each supplies one part of this block's
-                # ghost region, selected by its offset within its parent.
-                for nb in nbrs
-                    s = find_leaf(forest, nb)
-                    key = (:restrict, δ, childoffset(nb))
-                    push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
-                end
-            end
+    # Neighbor finding, threaded over blocks: it reads nothing but the
+    # tree, and each task collects into buffers of its own. Those are
+    # concatenated in block order, so the schedule that comes out is
+    # identical whatever `Threads.nthreads()` happens to be.
+    chunks = threadchunks(nb)
+    perpairs = [TransferPairs{D}() for _ in chunks]
+    perboundaries = [BoundaryRegion{D}[] for _ in chunks]
+    threaded_chunks(nb) do c, range
+        for b in range
+            block_sources!(perpairs[c], perboundaries[c], forest, b, dirs)
         end
     end
 
-    build(kind, δ, o) =
-        kind === :copy ? ntuple(d -> copy_stencil(T, N, G, δ[d]), D) :
-        kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, G, δ[d], o[d], operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, G, δ[d], o[d], operators), D)
+    # Merging per-task lists rather than per-block ones keeps the serial
+    # tail proportional to the number of *groups*, not to the number of
+    # transfers — which is what it costs, since the neighbor search
+    # itself threads perfectly (measured in M5).
+    pairs = TransferPairs{D}()
+    boundaries = BoundaryRegion{D}[]
+    for c in eachindex(chunks)
+        merge_pairs!(pairs, perpairs[c])
+        append!(boundaries, perboundaries[c])
+    end
+
+    build(key) =
+        key.kind === :copy ?
+        ntuple(d -> copy_stencil(T, N, G, key.direction[d]), D) :
+        key.kind === :restrict ?
+        ntuple(d -> restriction_stencil(T, N, G, key.direction[d], key.offset[d],
+                                        operators), D) :
+        ntuple(d -> prolongation_stencil(T, N, G, key.direction[d], key.offset[d],
+                                         operators), D)
 
     phase1 = TransferGroup{T,D}[]
     bylevel = Dict{Int,Vector{TransferGroup{T,D}}}()
     for (key, (targets, sources)) in pairs
-        kind, δ, o = key
-        group = TransferGroup{T,D}(kind, build(kind, δ, o), targets, sources)
-        if kind === :prolong
-            push!(get!(bylevel, prolonglevel[key], TransferGroup{T,D}[]), group)
+        group = TransferGroup{T,D}(key.kind, build(key), targets, sources)
+        if key.kind === :prolong
+            push!(get!(bylevel, key.level, TransferGroup{T,D}[]), group)
         else
             push!(phase1, group)
         end
@@ -343,7 +464,8 @@ function GhostSchedule(forest::Forest{D}, operators::Operators;
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
     return GhostSchedule{T,D}(forest, generation(forest), operators, phase1, phase2,
-                              levels, boundaries)
+                              levels, boundaries, phase_plan(phase1),
+                              [phase_plan(groups) for groups in phase2])
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

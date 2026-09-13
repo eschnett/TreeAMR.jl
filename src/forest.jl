@@ -356,11 +356,13 @@ prolongation stencils.
 function balance!(forest::Forest{D}) where {D}
     dirs = alldirections(Val(D))
     while true
-        toorefined = Set{MortonKey{D}}()
-        for k in forest.leaves
+        # The scan is threaded over leaves, each task collecting into its
+        # own buffer; the buffers are concatenated in leaf order (M5).
+        found = threaded_collect(MortonKey{D}, nleaves(forest)) do hits, b
+            k = forest.leaves[b]
             # Only a leaf at level >= 2 can have a neighbor two or more
             # levels coarser than itself.
-            level(k) >= 2 || continue
+            level(k) >= 2 || return
             for δ in dirs
                 anchor = neighbor_anchor(forest, k, δ)
                 anchor === nothing && continue
@@ -371,10 +373,12 @@ function balance!(forest::Forest{D}) where {D}
                 i = find_covering_leaf(forest, nbroot, level(k), nbcoords)
                 i === nothing && continue
                 nb = forest.leaves[i]
-                level(nb) < level(k) - 1 && push!(toorefined, nb)
+                level(nb) < level(k) - 1 && push!(hits, nb)
             end
         end
-        isempty(toorefined) && break
+
+        isempty(found) && break
+        toorefined = Set{MortonKey{D}}(found)
         refine!(forest, toorefined)
     end
     return forest
@@ -388,12 +392,15 @@ corners — the postcondition of [`balance!`](@ref).
 """
 function isbalanced(forest::Forest{D}) where {D}
     dirs = alldirections(Val(D))
-    for k in forest.leaves
-        for δ in dirs
-            for nb in neighbor_keys(forest, k, δ)
-                abs(level(nb) - level(k)) <= 1 || return false
+    ok = fill(true, nleaves(forest))
+    threaded_foreach(nleaves(forest)) do b
+        k = forest.leaves[b]
+        for δ in dirs, nb in neighbor_keys(forest, k, δ)
+            if abs(level(nb) - level(k)) > 1
+                ok[b] = false
+                return
             end
         end
     end
-    return true
+    return all(ok)
 end

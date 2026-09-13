@@ -9,12 +9,14 @@ See `CODE.md` in the package root for the full design document.
 """
 module TreeAMR
 
+using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize, CPU
+
 # Tree core (M1)
 export MortonKey, MAX_LEVEL, level, parentkey, childkeys, sortedchildkeys, isancestor
 export Forest, nleaves, maxlevel, root_position, root_index, alldirections
 export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
 export root_spacing, spacing, minimum_spacing, block_origin, block_extent, cell_center,
-       block_spacings
+       block_spacings, block_origins
 export FieldSet, nblocks, blockkey, blockview, interiorview, fill_by_coordinates!
 
 # Ghost exchange and interpolation operators (M2)
@@ -29,6 +31,7 @@ export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
 export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_marks,
        regrid!, adapt_to_initial_data!, total_mass
 
+include("threading.jl")
 include("morton.jl")
 include("forest.jl")
 include("geometry.jl")

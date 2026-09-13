@@ -13,13 +13,17 @@ concurrency:
 
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         version: ["1.10", "1"]
         os: [ubuntu-latest, macOS-latest]
+        # The suite must pass threaded as well as serial (M5). The
+        # thread-independence test spawns its own subprocesses either
+        # way; this is what runs the rest of the suite on threads.
+        threads: [1, 4]
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -28,3 +32,5 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: ${{ matrix.threads }}

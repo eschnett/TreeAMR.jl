@@ -6,6 +6,8 @@ include("oracles.jl")
 include("ghost_oracles.jl")
 include("wave.jl")
 
+@info "Running the tests on $(Threads.nthreads()) thread(s)"
+
 @testset "TreeAMR.jl" begin
 
 @testset "MortonKey" begin
@@ -408,5 +410,6 @@ include("ghost_tests.jl")
 include("state_tests.jl")
 include("regrid_tests.jl")
 include("wave_tests.jl")
+include("thread_tests.jl")
 
 end

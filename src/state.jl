@@ -97,8 +97,10 @@ block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
 is therefore `(i1, ..., iD, b)` with each `i` running over `1:N`; add
 `G` to reach the working array's stored indices.
 
-Blocks are uniform work units, so this is one flat parallel loop — the
-same launch that will be threaded in M5 and run on a device in M6.
+Blocks are uniform work units, so this is one flat parallel loop. The
+CPU backend spreads it over `Threads.nthreads()` as it stands (M5), and
+the same launch runs on a device in M6; every work item writes its own
+output cell, so the result does not depend on how the loop was split.
 
 ```julia
 @kernel function rhs!(du, @Const(work), @Const(h), ::Val{D}, ::Val{G}) where {D,G}
@@ -129,29 +131,38 @@ Weighting matters on an adaptive mesh: refined regions contribute more
 norm silently emphasizes them. This is also the shape an adaptive
 integrator's `internalnorm` needs; through M3 only fixed-`dt`
 integrators are exercised, so it is used here for error measurement.
+
+Threaded over blocks, with the per-block partials combined in block
+order, so the value does not depend on the thread count.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
     state = statearray(u, fs)
     forest = fs.forest
     colons = ntuple(_ -> Colon(), D)
+    R = float(real(T))
+
+    # One partial per block, then a serial pass over them in block
+    # order: threaded, and bit-for-bit independent of the thread count,
+    # which a running total split across tasks would not be.
+    partials = Vector{R}(undef, nblocks(fs))
 
     if isinf(p)
-        worst = zero(real(T))
-        for b in 1:nblocks(fs)
+        threaded_foreach(nblocks(fs)) do b
             block = view(state, colons..., :, b)
-            isempty(block) || (worst = max(worst, maximum(abs, block)))
+            partials[b] = isempty(block) ? zero(R) : maximum(abs, block)
         end
-        return worst
+        return isempty(partials) ? zero(R) : maximum(partials)
     end
 
-    total = zero(float(real(T)))
-    volume = zero(float(real(T)))
-    for b in 1:nblocks(fs)
-        cellvolume = spacing(forest, blockkey(fs, b))^D
+    volumes = Vector{R}(undef, nblocks(fs))
+    threaded_foreach(nblocks(fs)) do b
         block = view(state, colons..., :, b)
-        total += cellvolume * sum(x -> abs(x)^p, block)
-        volume += cellvolume * length(block)
+        cellvolume = R(spacing(forest, blockkey(fs, b))^D)
+        partials[b] = cellvolume * sum(x -> abs(x)^p, block)
+        volumes[b] = cellvolume * length(block)
     end
-    volume == 0 && return zero(float(real(T)))
-    return (total / volume)^(1 / p)
+
+    volume = sum(volumes)
+    volume == 0 && return zero(R)
+    return (sum(partials) / volume)^(1 / p)
 end

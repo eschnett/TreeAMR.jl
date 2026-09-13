@@ -93,6 +93,18 @@ function interiorview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D}
     return view(fs.work, ntuple(_ -> inner, D)..., v, b)
 end
 
+@kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings),
+                                     ::Val{D}, ::Val{G}) where {D,G}
+    I = @index(Global, NTuple)                     # (i1..iD, var, block)
+    v, b = I[D + 1], I[D + 2]
+    origin, h = origins[b], spacings[b]
+    # The stored index of interior cell i is i + G, so `cell_center`'s
+    # (idx - G - 1/2) is just (i - 1/2) — the same arithmetic, in the
+    # same order, so this reproduces `cell_center` bit for bit.
+    x = ntuple(d -> origin[d] + (I[d] - 0.5) * h, Val(D))
+    work[ntuple(d -> I[d] + G, Val(D))..., v, b] = f(x, v)
+end
+
 """
     fill_by_coordinates!(f, fs::FieldSet)
 
@@ -101,21 +113,37 @@ Set every interior cell of every block from the callback
 see [`cell_center`](@ref)) and `v` the variable index. Ghosts are left
 untouched — they are filled by the ghost exchange (M2).
 
-Serial and allocation-light; the parallel and GPU versions come with the
-KernelAbstractions kernels in M2 and M6.
+`f` is called once per cell from a KernelAbstractions kernel, so it runs
+concurrently across blocks (M5) and must be a pure function of its
+arguments. The tree is not consulted: the kernel gets the geometry as
+the two plain per-block arrays [`block_origins`](@ref) and
+[`block_spacings`](@ref), which is also what makes it a device kernel in
+M6.
 """
 function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
-    G, N = forest.G, forest.N
-    for b in 1:nblocks(fs)
-        k = blockkey(fs, b)
-        for v in 1:fs.nvars
-            block = blockview(fs, b, v)
-            for idx in CartesianIndices(ntuple(_ -> (G + 1):(G + N), D))
-                x = cell_center(forest, k, Tuple(idx))
-                block[idx] = f(x, v)
-            end
-        end
-    end
+    backend = get_backend(fs.work)
+    coordinates_kernel!(backend)(fs.work, f, block_origins(forest),
+                                 block_spacings(forest), Val(D), Val(forest.G);
+                                 ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars,
+                                          nblocks(fs)))
+    synchronize(backend)
     return fs
+end
+
+@kernel function zero_kernel!(work)
+    I = @index(Global, NTuple)
+    work[I...] = zero(eltype(work))
+end
+
+# Zeroing fresh block storage through a kernel rather than `fill!` is
+# not about speed: on a multi-socket node it is the *first touch* that
+# decides which NUMA domain each page lands in, and a serial `fill!`
+# would park the whole array on whichever domain the driver thread sits
+# on. The kernel touches each block from the same chunk of the ndrange
+# that will later compute on it.
+function zerofill!(work, backend)
+    zero_kernel!(backend)(work; ndrange=size(work))
+    synchronize(backend)
+    return work
 end

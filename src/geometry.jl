@@ -55,6 +55,21 @@ function block_origin(forest::Forest{D}, k::MortonKey{D}) where {D}
 end
 
 """
+    block_origins(forest, T=Float64)
+
+The lower corner of every leaf's interior, indexed by block — the
+companion of [`block_spacings`](@ref), and what a kernel needs to turn
+its cell index into a position without consulting the tree. Interior
+cell `i` of block `b` is centred at
+`origins[b][d] + (i - 1/2) * spacings[b]`.
+
+Together the two arrays are the whole geometry a device-side kernel
+sees: plain `isbits` arrays indexed by block, no keys and no forest.
+"""
+block_origins(forest::Forest{D}, ::Type{T}=Float64) where {D,T} =
+    NTuple{D,T}[block_origin(forest, k) for k in forest.leaves]
+
+"""
     block_extent(forest, k::MortonKey)
 
 The `(lo, hi)` physical extent of block `k`'s interior, per dimension.
