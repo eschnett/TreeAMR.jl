@@ -7,12 +7,12 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M4**: the tree core (Morton keys over a
+The package is at milestone **M5**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
-that lets a standard ODE integrator drive the whole hierarchy, and
-adaptive regridding. Multi-threading arrives in M5.
+that lets a standard ODE integrator drive the whole hierarchy, adaptive
+regridding, and multi-threading throughout. GPU support arrives in M6.
 
 ## Overview
 
@@ -164,6 +164,55 @@ not locally conservative. Coarsening alone conserves either way.
 ops = Operators(prolongation = 3, restriction = 2, family = Conservative)
 ```
 
+## Threading
+
+Start Julia with threads and everything in the package uses them:
+
+```bash
+julia -t auto --project=. my_run.jl
+```
+
+There is no switch to throw and nothing to configure. Per-cell work is
+KernelAbstractions kernels, whose CPU backend spreads a launch over the
+available threads, and the host-side passes over blocks — neighbor
+finding when a [`GhostSchedule`](@ref) is built, the mark arithmetic in
+[`regrid!`](@ref), the boundary hook, the reductions — are parallel
+loops over blocks.
+
+Results are **bit-identical** whatever the thread count. Every parallel
+loop writes to its own slot and every reduction combines its partials in
+block order, so a run on 64 threads reproduces a run on one exactly, not
+merely to roundoff. That is worth relying on when debugging: a
+difference between two runs is never the thread count.
+
+Two consequences for application code:
+
+- callbacks run concurrently. The `f(x, v)` of
+  [`fill_by_coordinates!`](@ref), the `f(b, key)` of
+  [`flag_blocks`](@ref), and the `boundary` hook of
+  [`fill_ghosts!`](@ref) are each called from several threads at once,
+  so they must be pure functions of their arguments (the boundary hook
+  may write the region it was handed, and nothing else);
+- a block is the unit of parallelism, so a mesh wants appreciably more
+  blocks than threads — a few dozen blocks per thread is comfortable,
+  a handful is not.
+
+On a multi-socket machine, **interleave the pages**:
+
+```bash
+numactl --interleave=all julia -t 64 --project=. my_run.jl
+```
+
+This is worth 2–6× at high thread counts and is not something the
+library can do for you — it is a policy for the whole process. The
+reason it helps rather than first-touch placement is that the same
+arrays are partitioned differently by different kernels (the working
+array by stored cell, the state vector by interior cell, a ghost region
+by target slab), so no single first-touch pattern serves them all.
+Measured numbers are in
+[CODE.md](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md#parallelism);
+`bench/scan.sh` reproduces them.
+
 ## Module
 
 ```@docs
@@ -212,6 +261,7 @@ block_origin
 block_extent
 cell_center
 block_spacings
+block_origins
 ```
 
 ## Storage
@@ -270,8 +320,19 @@ because they define the shape of the schedule.
 TreeAMR.Stencil1D
 TreeAMR.TransferGroup
 TreeAMR.BoundaryRegion
+TreeAMR.PhaseSlice
 TreeAMR.lagrange_weights
 TreeAMR.ghost_layers_read
+```
+
+The host-side threading primitives, for the same reason — the shape of
+every parallel pass over blocks in the package:
+
+```@docs
+TreeAMR.threadchunks
+TreeAMR.threaded_foreach
+TreeAMR.threaded_chunks
+TreeAMR.threaded_collect
 ```
 
 ## Index

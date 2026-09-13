@@ -9,13 +9,13 @@ no physics.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M4** (regridding).
+The package is currently at milestone **M5** (multi-threading).
 
 ## Status
 
 Early development. Not registered, not ready for use.
 
-Implemented so far, serial and `D`-generic:
+Implemented so far, `D`-generic and multi-threaded:
 
 **M1 — tree core**
 
@@ -67,10 +67,33 @@ Implemented so far, serial and `D`-generic:
   adaptive run matches a uniformly fine mesh's accuracy using fewer
   cells, so the moving coarse-fine interface introduces no artifacts.
 
+**M5 — multi-threading**
+
+- Every per-cell kernel and every host-side pass over blocks is a
+  parallel loop; start Julia with `-t auto` and there is nothing else to
+  configure.
+- Ghost filling runs one parallel loop per phase, with the transfers
+  sliced by cell count and dealt out largest first — batching them by
+  stencil alone left the small batches (edges, corners) serial and
+  capped the ghost fill at about 2.5×.
+- Results are **bit-identical** across thread counts, not merely equal
+  to roundoff: no parallel loop shares an accumulator, and every
+  reduction combines its partials in block order. The test suite checks
+  this by running a full adapt/evolve/regrid/evolve cycle in
+  subprocesses at different thread counts and comparing digests.
+- Application callbacks (initial data, flagging, the boundary hook) are
+  therefore called concurrently and must be pure.
+- Measured on a 64-core AMD EPYC 7532 (960 blocks of 32³, 31.5M cells):
+  **36.3×** on the RHS path and 59.5× on the compute-bound initial-data
+  pass — with `numactl --interleave=all`, which is worth 2–6× at that
+  thread count and which a library cannot set for itself.
+  `bench/scan.sh` reproduces the measurement; the full table and the
+  reasoning are in [CODE.md](CODE.md#parallelism).
+
 Note that reaching 2nd order on a refined mesh needs **order-4**
 interpolation — see the warning on `Operators`.
 
-Next up is M5: multi-threading.
+Next up is M6: GPU support.
 
 ## Installation
 
@@ -85,3 +108,8 @@ Pkg.develop(url="https://github.com/eschnett/TreeAMR.jl")
 using Pkg
 Pkg.test("TreeAMR")
 ```
+
+The tests run on whatever thread count they inherit; pass
+`julia_args = ["--threads=8"]` to exercise the threaded paths (they are
+covered either way, since the thread-independence test spawns its own
+subprocesses).

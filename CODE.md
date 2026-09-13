@@ -205,6 +205,20 @@ need them, but filling unconditionally is simpler, and cross-derivative
 stencils do. Application kernels are strictly block-local: neighbor data
 is visible only through ghost cells.
 
+Transfers are **batched by stencil**: everything sharing a kind, a
+direction and a child offset shares one set of one-dimensional stencils
+and so one kernel launch. Prolongations are additionally batched by
+*target level* (amended in M5): the batch is the unit the phase-2 sweep
+schedules, so a batch spanning two levels would be filed under one of
+them and the coarsest-target-first order would be quietly lost wherever
+three levels meet. The original keying did span levels; it was found
+while threading the schedule build, and no configuration could be
+constructed in which it actually produced wrong ghosts — but the
+ordering the sweep exists to guarantee was not in fact enforced, which
+is enough reason to fix it. Batching is an implementation detail of a
+phase, not the unit of parallelism: see
+[Parallelism](#parallelism) for how a phase is actually run.
+
 Neighbor finding is a regridding-frequency operation; ghost filling runs
 at every RHS evaluation. The ghost-fill **exchange schedule** — the flat
 list of copy/prolongation/restriction source–target region pairs — is
@@ -490,7 +504,82 @@ entries per volume — documented here, implemented post-M3.
 - **Multi-threading:** parallelize over blocks. Blocks are uniform-sized
   work units; RHS kernels are a single parallel loop, and ghost filling
   is a short sequence of parallel loops with barriers between the phases
-  described in [Ghost filling](#ghost-filling).
+  described in [Ghost filling](#ghost-filling). There is no switch: the
+  KernelAbstractions CPU backend spreads a launch over
+  `Threads.nthreads()`, and the host-side passes over blocks (neighbor
+  finding when the schedule is built, the mark arithmetic in
+  regridding, the boundary hook, the diagnostic reductions) are
+  threaded the same way.
+
+  **Bit-identical results, not merely equal to roundoff** (decided in
+  M5). No parallel loop shares an accumulator: each writes its own slot,
+  and every reduction forms one partial per block and sums the partials
+  in block order. The chunking is a function of the item count and the
+  thread count alone. So a 64-thread run reproduces a serial one exactly
+  — worth the discipline, because it makes "the thread count" something
+  a debugging session never has to consider. Collecting passes (the
+  neighbor search, the balance scan, the buffer dilation) follow the
+  same rule: each task fills a buffer of its own, and the buffers are
+  concatenated in block order.
+
+  **Application callbacks therefore run concurrently**: the `f(x, v)` of
+  `fill_by_coordinates!`, the `f(b, key)` of `flag_blocks`, and the
+  boundary hook. They must be pure functions of their arguments (the
+  hook may write the region it was handed, and nothing else). This is
+  the same contract M6 imposes anyway, since two of the three become
+  device kernels.
+
+  **A phase is one parallel loop, not a sequence of launches** (amended
+  in M5). Ghost transfers are batched by stencil, and the batches differ
+  in size by orders of magnitude — a face slab is `G·N^(D-1)` cells, a
+  corner `G^D`. Launching the batches one after another leaves the small
+  ones with a single workgroup each, i.e. serial, which measured as a
+  hard ceiling of ~2.5x on the ghost fill however many threads were
+  available, while the single-launch parts of the same step scaled
+  fine. Each phase is therefore flattened into slices of roughly equal
+  cell count, never crossing a batch, dealt out largest first, one task
+  per thread, each slice launching as a single inline workgroup. The
+  regrid transfer uses the same machinery for the same reason. A device
+  backend keeps the plain per-batch launches: there a launch *is* the
+  parallel unit.
+
+  **Page placement dominates everything else on a NUMA node** (measured
+  in M5, 64-core AMD EPYC 7532, 8 NUMA domains; 960 blocks of `32^3`,
+  31.5M cells, a 1.2 GB working set). The same kernels partition the
+  *same* arrays differently from one launch to the next — the working
+  array by stored cell, the state vector by interior cell, a ghost slab
+  by target region — so no first-touch pattern can serve them all, and
+  the default first-touch placement leaves most accesses off-domain.
+  Speedups on 64 cores against one:
+
+  | phase                 | first touch | pages interleaved |
+  |---|---|---|
+  | RHS evaluation        | 10.2 | **36.3** |
+  | ghost fill            |  9.9 | **36.6** |
+  | scatter               |  5.7 | **36.1** |
+  | initial data          | 22.4 | **59.5** |
+  | volume-weighted norm  | 21.8 | **37.8** |
+  | schedule build        |  2.8 |   2.4 |
+
+  Interleaving the pages (`numactl --interleave=all`) is thus worth
+  2–6x at high thread counts, and is a process-level policy the library
+  cannot set for itself — so it is documented as the way to run rather
+  than implemented. Pinning KernelAbstractions to its *static* schedule,
+  so that a chunk of an ndrange always lands on the same thread, was
+  measured as the alternative and rejected: with first-touch placement
+  it reproduced the left-hand column to within noise (RHS 10.0, scatter
+  5.5, norm 19.3), for exactly the reason above — stability within one
+  kernel does not make a page local to all the kernels that touch it.
+
+  The compute-bound pass (initial data, a sine per cell) scales past the
+  memory-bound ones, as it should. Two pieces do not scale, both by
+  construction and both negligible in absolute terms: building the
+  schedule saturates below 3x because its tail — merging the per-task
+  transfer lists into groups — is serial, and
+  `complete_marks` gets *slower* with threads (80 microseconds to 460)
+  because the pass is shorter than the cost of spawning the tasks. Both
+  are regrid-frequency and orders of magnitude below the regrid's own
+  data movement, so neither is worth a grain-size heuristic.
 - **GPU:** all kernels (ghost fill, prolongation, restriction,
   application RHS) are written with **KernelAbstractions.jl** from the
   start, so the CPU implementation is already the GPU implementation.
@@ -577,7 +666,16 @@ established before any parallelism.
   refinement cannot deliver without conservative operators). *(Done.)*
 - **M5 — Multi-threading.** Threaded loops over blocks. *Accept:*
   results match serial to roundoff; scaling measurement on a many-core
-  node.
+  node. Delivered stronger than asked on the first count: results are
+  **bit-identical** across thread counts, checked by running a full
+  adapt/evolve/regrid/evolve cycle in subprocesses at different thread
+  counts and comparing digests of the state vector, the leaf array, the
+  schedule shape and the reductions. Scaling on a 64-core AMD EPYC 7532
+  (8 NUMA domains, 960 blocks of `32^3`): **36.3x** on the RHS path,
+  59.5x on the compute-bound initial-data pass, with the table and the
+  two findings that got it there — a phase must be one parallel loop,
+  and pages must be interleaved — under [Parallelism](#parallelism).
+  `bench/scan.sh` reproduces the measurement. *(Done.)*
 - **M6 — GPU.** CUDA backend via KernelAbstractions; device-resident
   data. *Accept:* M3 convergence results reproduced on GPU; kernel
   benchmarks.
