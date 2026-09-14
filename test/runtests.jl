@@ -412,5 +412,6 @@ include("regrid_tests.jl")
 include("wave_tests.jl")
 include("type_tests.jl")
 include("thread_tests.jl")
+include("gpu_tests.jl")
 
 end

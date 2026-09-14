@@ -19,22 +19,38 @@
 # schedules a group by the level of its targets (see `GroupKey`).
 
 """
-    Stencil1D{T}
+    Stencil1D{T,VI,MW}
 
 One dimension of a transfer: for each cell of the target's index range,
 the first source cell and the `order` weights to apply from there.
 
 `srcstart[i]` and `weights[:, i]` describe target cell
 `targetfirst + i - 1`.
+
+`srcstart` and `weights` are read *inside* the transfer kernel, so their
+array types are parameters: a schedule built for a device holds them
+there (M6). They are always constructed on the host first — the weights
+are exact rational arithmetic, which is precisely the kind of work a
+device should not be asked to do — and uploaded once, when the schedule
+is built. `targetfirst` is a plain `Int` passed by value and stays on
+the host.
 """
-struct Stencil1D{T}
+struct Stencil1D{T,VI<:AbstractVector{Int32},MW<:AbstractMatrix{T}}
     targetfirst::Int
-    srcstart::Vector{Int32}
-    weights::Matrix{T}
+    srcstart::VI
+    weights::MW
 end
+
+Stencil1D{T}(targetfirst::Int, srcstart::AbstractVector{Int32},
+             weights::AbstractMatrix{T}) where {T} =
+    Stencil1D{T,typeof(srcstart),typeof(weights)}(targetfirst, srcstart, weights)
 
 ntarget(s::Stencil1D) = length(s.srcstart)
 Base.@propagate_inbounds stencilorder(s::Stencil1D) = size(s.weights, 1)
+
+todevice(backend::Backend, s::Stencil1D{T}) where {T} =
+    Stencil1D{T}(s.targetfirst, todevice(backend, s.srcstart),
+                 todevice(backend, s.weights))
 
 """
     TransferGroup{T,D}
@@ -47,15 +63,37 @@ A group is a batch of work, not a unit of scheduling: a phase runs as
 one parallel loop over [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, and a
 big group is launched in several of them.
 """
-struct TransferGroup{T,D}
+struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     kind::Symbol                      # :copy, :restrict, or :prolong
-    stencils::NTuple{D,Stencil1D{T}}
-    targetblocks::Vector{Int32}
-    sourceblocks::Vector{Int32}
+    stencils::NTuple{D,S}
+    targetblocks::VB
+    sourceblocks::VB
 end
+
+TransferGroup{T,D}(kind::Symbol, stencils::NTuple{D,S},
+                   targetblocks::VB, sourceblocks::VB) where {T,D,S,VB} =
+    TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks)
 
 boxsize(g::TransferGroup{T,D}) where {T,D} = ntuple(d -> ntarget(g.stencils[d]), D)
 ntransfers(g::TransferGroup) = length(g.targetblocks)
+
+# The whole group never reaches a kernel — `kind` is a `Symbol`, so the
+# struct is not `isbits` — and it does not need to: `run_group!`
+# destructures it into the four arrays the kernel actually reads. Only
+# those four move.
+todevice(backend::Backend, g::TransferGroup{T,D}) where {T,D} =
+    TransferGroup{T,D}(g.kind, ntuple(d -> todevice(backend, g.stencils[d]), D),
+                       todevice(backend, g.targetblocks),
+                       todevice(backend, g.sourceblocks))
+# The concrete group type on a given backend, so that a schedule's
+# `phase1`/`phase2` are concretely typed even when they are empty (a
+# uniform single-root forest has no restrictions and no prolongations).
+# Two throwaway allocations, once per schedule.
+function grouptype(backend::Backend, ::Type{T}, ::Val{D}) where {T,D}
+    VI = typeof(todevice(backend, Int32[0]))
+    MW = typeof(todevice(backend, Matrix{T}(undef, 1, 1)))
+    return TransferGroup{T,D,Stencil1D{T,VI,MW},VI}
+end
 
 """
     BoundaryRegion{D}
@@ -68,6 +106,89 @@ struct BoundaryRegion{D}
     block::Int32
     direction::NTuple{D,Int}
     region::CartesianIndices{D,NTuple{D,UnitRange{Int}}}
+end
+
+"""
+    BoundaryBatch{D}
+
+All outward-facing ghost regions of one *shape*, reduced to per-region
+arrays — the boundary counterpart of a [`TransferGroup`](@ref
+TransferGroup), and for the same reason.
+
+A region's extent is `G` along every nonzero component of `δ` and `N`
+along every zero one, so there are only a handful of distinct shapes
+however large the domain is. Batching by shape gives every batch a
+uniform `ndrange`, which is what lets the cell-wise boundary form
+([`CellBoundary`](@ref)) run as a few kernel launches instead of one per
+region.
+
+The three arrays live wherever the schedule's backend is (M6).
+"""
+struct BoundaryBatch{D,VB<:AbstractVector{Int32},VD<:AbstractVector{NTuple{D,Int8}},
+                     VF<:AbstractVector{NTuple{D,Int32}}}
+    boxlen::NTuple{D,Int}
+    blocks::VB
+    directions::VD
+    firsts::VF                        # first stored index of the region
+end
+
+nregions(b::BoundaryBatch) = length(b.blocks)
+
+todevice(backend::Backend, b::BoundaryBatch{D}) where {D} =
+    BoundaryBatch{D}(b.boxlen, todevice(backend, b.blocks),
+                     todevice(backend, b.directions), todevice(backend, b.firsts))
+BoundaryBatch{D}(boxlen, blocks::VB, directions::VD, firsts::VF) where {D,VB,VD,VF} =
+    BoundaryBatch{D,VB,VD,VF}(boxlen, blocks, directions, firsts)
+
+"""
+    BoundaryPlan{D}
+
+Everything the cell-wise boundary kernel reads that is not field data:
+the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
+origin and spacing it turns a stored index into a position with.
+
+The geometry is here rather than recomputed per fill for the same reason
+the exchange itself is precomputed: it depends only on the tree, which
+is exactly what a schedule is rebuilt for.
+"""
+struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector}
+    batches::Vector{BT}
+    origins::VO
+    spacings::VS
+end
+
+function batchtype(backend::Backend, ::Val{D}) where {D}
+    VB = typeof(todevice(backend, Int32[0]))
+    VD = typeof(todevice(backend, [ntuple(_ -> Int8(0), D)]))
+    VF = typeof(todevice(backend, [ntuple(_ -> Int32(0), D)]))
+    return BoundaryBatch{D,VB,VD,VF}
+end
+
+# Group the outward-facing regions by shape, then move the result to
+# wherever the kernels will run.
+function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
+                      boundaries::Vector{BoundaryRegion{D}}) where {T,D}
+    byshape = Dict{NTuple{D,Int},Tuple{Vector{Int32},Vector{NTuple{D,Int8}},
+                                       Vector{NTuple{D,Int32}}}}()
+    for r in boundaries
+        shape = ntuple(d -> length(r.region.indices[d]), D)
+        slot = get!(byshape, shape,
+                    (Int32[], NTuple{D,Int8}[], NTuple{D,Int32}[]))
+        push!(slot[1], r.block)
+        push!(slot[2], ntuple(d -> Int8(r.direction[d]), D))
+        push!(slot[3], ntuple(d -> Int32(first(r.region.indices[d])), D))
+    end
+    # Sorted by shape so the batch order is a function of the tree
+    # alone, not of dictionary iteration order.
+    shapes = sort!(collect(keys(byshape)))
+    # Concretely typed even when empty — a fully periodic domain has no
+    # outward-facing regions at all, which is the common case.
+    BT = batchtype(backend, Val(D))
+    batches = BT[todevice(backend, BoundaryBatch{D}(sh, byshape[sh]...)) for sh in shapes]
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings)}(
+        batches, origins, spacings)
 end
 
 """
@@ -133,7 +254,10 @@ The phasing follows `CODE.md`:
   may themselves have been prolongated from a still-coarser block —
   legal under 2:1 balance, where levels `l-2, l-1, l` can meet.
 - `boundaries` lists the ghost regions facing outside a non-periodic
-  domain, filled by the user hook after the inter-block phases.
+  domain, filled by the user hook after the inter-block phases;
+  `boundaryplan` is the same information batched by region shape and
+  resident on the backend, which is what the cell-wise hook form
+  ([`CellBoundary`](@ref)) is launched over.
 - `phase1plan` and `phase2plans` cut each phase into balanced
   [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, so that a phase runs as one
   parallel loop rather than as a sequence of separate launches.
@@ -144,20 +268,30 @@ so they are ordinary copies, restrictions, and prolongations.
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
-    GhostSchedule(forest, operators::Operators; T=floattype(forest))
+    GhostSchedule(forest, operators::Operators; T=floattype(forest), backend=CPU())
 
 `operators` is required: interpolation order follows from the
 application's discretization, so there is no order the mesh could
 sensibly default to. See [`Operators`](@ref).
+
+`backend` must be the backend of every field set the schedule is
+replayed over (M6). The stencil weights and index vectors are read
+*inside* the transfer kernel, so they have to live where it runs; they
+are built on the host in exact rational arithmetic and uploaded once,
+here, rather than at every ghost fill. That is the same argument that
+put the exchange in a cached schedule in the first place, applied one
+level down.
 """
-struct GhostSchedule{T,D,R}
+struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{D}}
     forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
     operators::Operators
-    phase1::Vector{TransferGroup{T,D}}
-    phase2::Vector{Vector{TransferGroup{T,D}}}   # by target level, coarsest first
+    backend::BK
+    phase1::Vector{GRP}
+    phase2::Vector{Vector{GRP}}                  # by target level, coarsest first
     levels::Vector{Int}                          # target level of each phase2 entry
     boundaries::Vector{BoundaryRegion{D}}
+    boundaryplan::BP
     # How each phase is cut up for the threads, precomputed here rather
     # than at every ghost fill (see `PhaseSlice`).
     phase1plan::Vector{PhaseSlice}
@@ -414,8 +548,9 @@ function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
 end
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
-                       T::Type=R) where {D,R}
+                       T::Type=R, backend::Backend=CPU()) where {D,R}
     check_operators(forest, operators)
+    check_floattype(T, backend)
     N, G = forest.N, forest.G
     dirs = alldirections(Val(D))
     nb = nleaves(forest)
@@ -453,12 +588,14 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         ntuple(d -> prolongation_stencil(T, N, G, key.direction[d], key.offset[d],
                                          operators), D)
 
-    phase1 = TransferGroup{T,D}[]
-    bylevel = Dict{Int,Vector{TransferGroup{T,D}}}()
+    GRP = grouptype(backend, T, Val(D))
+    phase1 = GRP[]
+    bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
-        group = TransferGroup{T,D}(key.kind, build(key), targets, sources)
+        group = todevice(backend, TransferGroup{T,D}(key.kind, build(key),
+                                                     targets, sources))
         if key.kind === :prolong
-            push!(get!(bylevel, key.level, TransferGroup{T,D}[]), group)
+            push!(get!(bylevel, key.level, GRP[]), group)
         else
             push!(phase1, group)
         end
@@ -466,9 +603,11 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
-    return GhostSchedule{T,D,R}(forest, generation(forest), operators, phase1, phase2,
-                                levels, boundaries, phase_plan(phase1),
-                                [phase_plan(groups) for groups in phase2])
+    bplan = BoundaryPlan(backend, T, forest, boundaries)
+    return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan)}(
+        forest, generation(forest), operators, backend, phase1, phase2,
+        levels, boundaries, bplan, phase_plan(phase1),
+        [phase_plan(groups) for groups in phase2])
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

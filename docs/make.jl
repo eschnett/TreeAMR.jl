@@ -1,4 +1,5 @@
 using Documenter
+using KernelAbstractions
 using TreeAMR
 
 DocMeta.setdocmeta!(TreeAMR, :DocTestSetup, :(using TreeAMR); recursive=true)

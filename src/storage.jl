@@ -18,12 +18,20 @@ also the type the geometry is computed in; the two are separate
 parameters only so that a field set may deliberately store something
 narrower than its coordinates.
 
+`backend` says where the storage lives, and thereby where every kernel
+over it runs (M6): each one takes its backend from `get_backend(fs.work)`,
+so this one keyword is the whole switch. A [`GhostSchedule`](@ref) used
+with this field set must be built for the same backend. On a device with
+no hardware fp64 a `Float64` field set is rejected here, with a message,
+rather than failing later inside a kernel compilation.
+
 A field set is tied to the forest's *current* leaf array. Block indices
 are deliberately not stable across regridding (M4), which compacts the
 block slots and rebuilds the storage.
 
     FieldSet(forest, nvars)          # element type = floattype(forest)
     FieldSet{Float32}(forest, nvars)
+    FieldSet{Float32}(forest, nvars; backend = CUDABackend())
 
 # Examples
 
@@ -45,13 +53,27 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     work::A
 end
 
-function FieldSet{T}(forest::Forest{D,R}, nvars::Integer) where {T,D,R}
+function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
+                     backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
+    check_floattype(T, backend)
     stored = forest.N + 2 * forest.G
-    work = zeros(T, ntuple(_ -> stored, D)..., Int(nvars), nleaves(forest))
+    work = allocate(backend, T, (ntuple(_ -> stored, D)..., Int(nvars), nleaves(forest)))
+    # Through the kernel rather than `fill!`, for the first-touch reason
+    # in `zerofill!` below.
+    zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), work)
 end
-FieldSet(forest::Forest{D,R}, nvars::Integer) where {D,R} = FieldSet{R}(forest, nvars)
+FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
+    FieldSet{R}(forest, nvars; kwargs...)
+
+"""
+    get_backend(fs::FieldSet)
+
+The KernelAbstractions backend this field set's storage lives on — the
+backend every kernel over it is launched with.
+"""
+KernelAbstractions.get_backend(fs::FieldSet) = get_backend(fs.work)
 
 """
     nblocks(fs::FieldSet)
@@ -125,14 +147,27 @@ exchange (M2).
 concurrently across blocks (M5) and must be a pure function of its
 arguments. The tree is not consulted: the kernel gets the geometry as
 the two plain per-block arrays [`block_origins`](@ref) and
-[`block_spacings`](@ref), which is also what makes it a device kernel in
-M6.
+[`block_spacings`](@ref), which is what makes it a device kernel (M6).
+
+!!! note "Callbacks on a device"
+    The callback becomes a kernel argument, so everything it closes over
+    must be `isbits`. A captured `Type` is the usual trip: write
+    `oftype(x[1], 2)` rather than closing over `T` and calling `T(2)`.
+    The same rule covers captured arrays (pass a device array, or index
+    the one the callback is already given) and any mutable state, which
+    the purity requirement rules out anyway.
 """
 function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
-    coordinates_kernel!(backend)(fs.work, f, block_origins(forest, T),
-                                 block_spacings(forest, T), Val(D), Val(forest.G);
+    # The geometry is built on the host and moved to wherever the kernel
+    # runs. This is a setup-frequency call (initial data, and one pass of
+    # `adapt_to_initial_data!`), not part of the per-evaluation path, so
+    # the upload is not worth caching.
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    coordinates_kernel!(backend)(fs.work, f, origins, spacings,
+                                 Val(D), Val(forest.G);
                                  ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars,
                                           nblocks(fs)))
     synchronize(backend)

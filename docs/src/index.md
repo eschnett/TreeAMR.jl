@@ -12,7 +12,9 @@ brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
 that lets a standard ODE integrator drive the whole hierarchy, adaptive
-regridding, and multi-threading throughout. GPU support arrives in M6.
+regridding, multi-threading throughout, and GPU support: the storage,
+the exchange schedule and every kernel follow a KernelAbstractions
+backend of the caller's choosing.
 
 ## Overview
 
@@ -243,6 +245,76 @@ Measured numbers are in
 [CODE.md](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md#parallelism);
 `bench/scan.sh` reproduces them.
 
+## Devices
+
+The storage decides where the work runs. Pass a KernelAbstractions
+backend when you allocate, and every kernel in the package follows:
+
+```julia
+using CUDA                                # or Metal, or any KA backend
+
+forest   = Forest((4, 4); N = 32, G = 2, periodic = (true, true),
+                  extents = ((0f0, 1f0), (0f0, 1f0)))
+fs       = FieldSet{Float32}(forest, 2; backend = CUDABackend())
+schedule = GhostSchedule(forest, ops; T = Float32, backend = CUDABackend())
+```
+
+There is nothing else to choose. [`statevector`](@ref) allocates where
+the field set lives, [`regrid!`](@ref) reallocates there, and each
+kernel takes its backend from the storage it is handed — so an RHS
+written for the CPU is already the device RHS.
+
+The schedule takes the backend too, and must be built for the same one:
+its stencil weights and index vectors are read *inside* the transfer
+kernel, so they have to live where that kernel runs. They are still
+built on the host in exact rational arithmetic and uploaded once, when
+the schedule is built, which is the same argument that put the exchange
+in a cached schedule in the first place. A mismatch is reported rather
+than left to fail in memory.
+
+**Precision.** The mesh is generic in its floating-point type and
+computes the geometry and the interpolation weights in it from the first
+operation, so `Float32` needs no fp64 anywhere. A `Float64` field set on
+a backend without hardware fp64 is refused at construction, with the
+reason.
+
+Two callbacks change shape on a device, because both used to be host
+loops over block data:
+
+- **Boundary conditions.** [`CellBoundary`](@ref) expresses the hook per
+  cell — `g(x, v, δ)` — and the package launches it as a kernel.
+  [`boundary_by_coordinates`](@ref) is one of these, so it runs
+  anywhere. The older whole-region form, `boundary(fs, b, key, δ,
+  region)`, is still accepted and is still what a condition that reads
+  the block's interior (reflecting, extrapolating) needs — but it
+  indexes the working array cell by cell, so it is CPU-only, and says so
+  if handed a device field set.
+- **Refinement criteria.** [`flag_blocks`](@ref) calls `f(b, key)` on
+  the host, which cannot read device data. [`firing_boxes`](@ref) is the
+  device form: it evaluates a per-cell predicate over every block in one
+  kernel and returns each block's firing-cell count and bounding box.
+  The *verdict* — which flag, against which maximum level — stays with
+  the application, because that is physics the mesh cannot know:
+
+```julia
+fires(work, idx, b, x) = abs(work[idx..., 1, b]) > threshold
+
+flags = map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
+    n == 0 && return Coarsen
+    level(forest.leaves[b]) < lmax ? (Refine, box) : (Keep, box)
+end
+regrid!(forest, fs, schedule; flags = flags, buffer = 4)
+```
+
+The box is exactly what [`regrid!`](@ref)'s buffering dilates, so the
+device path feeds the same machinery the host one does.
+[`adapt_to_initial_data!`](@ref) takes such a criterion through its
+`flags` keyword.
+
+`bench/gpu.jl` times the per-evaluation phases on a chosen backend, in
+the format `bench/threads.jl` prints, so a device run and a host run can
+be read side by side.
+
 ## Module
 
 ```@docs
@@ -304,6 +376,7 @@ blockkey
 blockview
 interiorview
 fill_by_coordinates!
+KernelAbstractions.get_backend(::FieldSet)
 ```
 
 ## Ghost exchange and operators
@@ -316,6 +389,7 @@ GhostSchedule
 isstale
 fill_ghosts!
 boundary_by_coordinates
+CellBoundary
 ```
 
 ## ODE coupling
@@ -340,6 +414,7 @@ complete_marks
 regrid!
 adapt_to_initial_data!
 total_mass
+firing_boxes
 ```
 
 ## Internals
@@ -351,6 +426,8 @@ because they define the shape of the schedule.
 TreeAMR.Stencil1D
 TreeAMR.TransferGroup
 TreeAMR.BoundaryRegion
+TreeAMR.BoundaryBatch
+TreeAMR.BoundaryPlan
 TreeAMR.PhaseSlice
 TreeAMR.lagrange_weights
 TreeAMR.ghost_layers_read
@@ -364,6 +441,13 @@ TreeAMR.threadchunks
 TreeAMR.threaded_foreach
 TreeAMR.threaded_chunks
 TreeAMR.threaded_collect
+```
+
+The device-residency helpers behind the `backend` keyword:
+
+```@docs
+TreeAMR.todevice
+TreeAMR.tohost
 ```
 
 ## Index

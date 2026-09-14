@@ -9,14 +9,15 @@ no physics.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M5** (multi-threading).
+The package is currently at milestone **M6** (GPU support).
 
 ## Status
 
 Early development. Not registered, not ready for use.
 
-Implemented so far, `D`-generic, floating-point-type generic, and
-multi-threaded:
+Implemented so far, `D`-generic, floating-point-type generic,
+multi-threaded, and able to run device-resident on any
+KernelAbstractions backend:
 
 **M1 — tree core**
 
@@ -37,7 +38,8 @@ multi-threaded:
 - Polynomial interpolation operators of configurable order, with the
   `G`/`N` sufficiency checks that tie order to block geometry.
 - Periodic boundaries (free, via the tree) and a physical-boundary hook.
-- Written as KernelAbstractions kernels, CPU backend for now.
+- Written as KernelAbstractions kernels, so the CPU implementation is
+  already the device one (M6).
 
 **M3 — ODE coupling**
 
@@ -91,10 +93,39 @@ multi-threaded:
   `bench/scan.sh` reproduces the measurement; the full table and the
   reasoning are in [CODE.md](CODE.md#parallelism).
 
+**M6 — GPU**
+
+- The storage picks the backend and everything follows it:
+  `FieldSet(forest, nvars; backend = CUDABackend())` puts the leaf data
+  on the device, and `statevector`, `regrid!` and every kernel allocate
+  and launch there.
+- The exchange schedule is device-resident too. Its stencil weights are
+  read inside the transfer kernel, so they are built on the host in
+  exact rational arithmetic and uploaded once, when the schedule is
+  built — never per ghost fill.
+- `CellBoundary` expresses a boundary condition per cell, which the
+  package launches as a kernel; `firing_boxes` evaluates a per-cell
+  refinement criterion and reduces each block to a firing-cell count and
+  bounding box on the device, leaving the verdict to the application.
+- The whole test suite passes on CUDA (NVIDIA H200) in Float64 *and*
+  Float32, and on Metal (Apple M3 Pro) in Float32 — a backend with no
+  hardware fp64 at all, which is the strongest available check that no
+  fp64 path is load-bearing. The M3 convergence result is reproduced on
+  the device: L2 rate 1.99 in either precision.
+- Measured on an H200 against the same node's 16 cores (960 blocks of
+  32³, 31.5M cells): **35×** on the RHS path, 32× on the ghost fill, 63×
+  on initial data — tracking the 19× bandwidth ratio, which is what a
+  mesh library should deliver. The two per-block reductions
+  (`volume_weighted_norm`, `firing_boxes`) deliberately do not: they run
+  one work item per block, which is what makes them deterministic, and
+  neither is on the per-evaluation path. Numbers and reasoning in
+  [CODE.md](CODE.md#parallelism); `bench/gpu.jl` reproduces them and
+  `bench/symmetry_gpu.sh` is the cluster job.
+
 Note that reaching 2nd order on a refined mesh needs **order-4**
 interpolation — see the warning on `Operators`.
 
-Next up is M6: GPU support.
+Next up is M7: MPI.
 
 ## Installation
 

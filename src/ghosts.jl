@@ -116,6 +116,125 @@ end
 run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
     run_phase!(fs.work, fs.work, groups, plan, fs.nvars, backend)
 
+# The cell-wise boundary form (M6).
+#
+# The region form hands the hook a `FieldSet` and a `CartesianIndices`
+# and lets it do as it likes, which on a device means scalar-indexing a
+# device array — the one place in the package that did. So the hook gets
+# a second, narrower form: a pure per-cell function, which the package
+# itself launches as a kernel. The offset arithmetic below is the same
+# as `transfer_kernel!`'s, and the position is formed exactly as
+# `cell_center` forms it, from the same origin and spacing, so the two
+# agree bit for bit.
+@kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
+                                  @Const(firsts), @Const(origins), @Const(spacings),
+                                  boxlen::NTuple{D,Int}, boxstride::NTuple{D,Int},
+                                  ::Val{D}, ::Val{G}) where {D,G}
+    cell, v, t = @index(Global, NTuple)
+    b = blocks[t]
+    δ = directions[t]
+    f = firsts[t]
+
+    r = cell - 1
+    off = ntuple(d -> (r ÷ boxstride[d]) % boxlen[d], Val(D))
+    idx = ntuple(d -> Int(f[d]) + off[d], Val(D))
+
+    origin, h = origins[b], spacings[b]
+    # `1//2`, not `0.5`: see `cell_center`. The literal would be an fp64
+    # operand and would drag the position into fp64.
+    half = oftype(h, 1//2)
+    x = ntuple(d -> origin[d] + (idx[d] - G - half) * h, Val(D))
+    work[idx..., v, b] = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
+end
+
+"""
+    CellBoundary(g)
+
+A boundary hook expressed **per cell**: `g(x, v, δ) -> value`, with `x`
+the cell center, `v` the variable index, and `δ` the outward direction
+of the region the cell belongs to.
+
+This is the form that runs on a device. The package launches it as a
+kernel over the outward-facing ghost cells, batched by region shape (see
+[`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)), so `g` must be a pure
+function of its three arguments — it never sees the field set and cannot
+read the block's interior.
+
+That is the trade. Conditions defined by position alone — Dirichlet
+data, a manufactured solution, an analytic exterior — are exactly this
+shape. Conditions that read the interior (reflecting, extrapolating
+outflow) are not, and stay with the region form
+[`fill_ghosts!`](@ref) also accepts, which is CPU-only.
+
+    fill_ghosts!(fs, schedule; boundary = CellBoundary((x, v, δ) -> zero(eltype(x))))
+
+!!! note "Callbacks on a device"
+    The callback becomes a kernel argument, so everything it closes over
+    must be `isbits`. A captured `Type` is the usual trip: write
+    `oftype(x[1], 2)` rather than closing over `T` and calling `T(2)`.
+    The same rule covers captured arrays (pass a device array, or index
+    the one the callback is already given) and any mutable state, which
+    the purity requirement rules out anyway.
+"""
+struct CellBoundary{F}
+    g::F
+end
+
+# The cell form runs through the kernel on every backend, the CPU
+# included — that is the point of it, and it is what keeps the form
+# under test without a device attached. Two dispatch entries rather than
+# one so that it wins against the CPU region-form method below without
+# an ambiguity.
+apply_boundary!(fs::FieldSet{T,D}, hook::CellBoundary, schedule::GhostSchedule{T,D},
+                backend::Backend) where {T,D} = cell_boundary!(fs, hook, schedule, backend)
+apply_boundary!(fs::FieldSet{T,D}, hook::CellBoundary, schedule::GhostSchedule{T,D},
+                backend::CPU) where {T,D} = cell_boundary!(fs, hook, schedule, backend)
+
+function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
+                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+    plan = schedule.boundaryplan
+    for batch in plan.batches
+        n = nregions(batch)
+        n == 0 && continue
+        blen = batch.boxlen
+        stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
+        boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
+                                  batch.firsts, plan.origins, plan.spacings,
+                                  blen, stride, Val(D), Val(fs.forest.G);
+                                  ndrange=(prod(blen), fs.nvars, n))
+    end
+    synchronize(backend)
+    return nothing
+end
+
+# The region form. It may do anything to the region it is handed, which
+# is exactly why it cannot be run on a device on the caller's behalf: a
+# hook that scalar-indexes would fail deep inside a task, with no hint
+# of what to do instead. So say it here.
+function apply_boundary!(fs::FieldSet{T,D}, hook,
+                         schedule::GhostSchedule{T,D}, backend) where {T,D}
+    throw(ArgumentError(
+        "this boundary hook takes a whole region — `(fs, b, key, δ, region)` — " *
+        "which is a host form: it indexes the working array cell by cell, and " *
+        "this field set lives on $(nameof(typeof(backend))). Wrap a per-cell " *
+        "function in `CellBoundary((x, v, δ) -> ...)`, which the package launches " *
+        "as a kernel. A condition that has to read the block's interior has no " *
+        "device form yet and needs the CPU backend."))
+end
+
+# The region form on the host, as it has always run: one parallel loop
+# over the outward-facing regions, the hook free to do as it likes with
+# the one it is handed.
+function apply_boundary!(fs::FieldSet{T,D}, hook,
+                         schedule::GhostSchedule{T,D}, backend::CPU) where {T,D}
+    threaded_foreach(length(schedule.boundaries)) do i
+        region = schedule.boundaries[i]
+        hook(fs, Int(region.block), fs.forest.leaves[region.block],
+             region.direction, region.region)
+    end
+    return nothing
+end
+
 """
     fill_ghosts!(fs::FieldSet, schedule::GhostSchedule; boundary=nothing)
 
@@ -172,6 +291,12 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
         "$(nleaves(schedule.forest)) leaves; rebuild both"))
 
     backend = get_backend(fs.work)
+    samebackend(backend, schedule.backend) || throw(ArgumentError(
+        "the field set lives on $(nameof(typeof(backend))) but this schedule was " *
+        "built for $(nameof(typeof(schedule.backend))); its stencils are in the " *
+        "wrong memory. Build it with " *
+        "`GhostSchedule(forest, operators; backend = $(nameof(typeof(backend)))())`, " *
+        "or let both default to the CPU."))
 
     # Phase 1: same-level copies and restrictions. Both read interiors
     # only, so they cannot race with each other.
@@ -183,11 +308,7 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     # stencils that reach tangentially past that edge into its coarse
     # source's outer ghosts, so those must already hold data.
     if boundary !== nothing
-        threaded_foreach(length(schedule.boundaries)) do i
-            region = schedule.boundaries[i]
-            boundary(fs, Int(region.block), fs.forest.leaves[region.block],
-                     region.direction, region.region)
-        end
+        apply_boundary!(fs, boundary, schedule, backend)
     end
 
     # Phase 2: prolongations, coarsest targets first. A prolongation may
@@ -222,15 +343,8 @@ the cell center and `v` the variable index — the same signature
 Useful when the exact solution is known (manufactured solutions,
 convergence tests); real applications supply their own hook to impose
 outgoing, reflecting, or symmetry conditions.
+
+A [`CellBoundary`](@ref) that ignores the direction, so it runs on every
+backend.
 """
-boundary_by_coordinates(f) =
-    function (fs, b, key, δ, region)
-        forest = fs.forest
-        for v in 1:fs.nvars
-            block = blockview(fs, b, v)
-            for idx in region
-                block[idx] = f(cell_center(eltype(block), forest, key, Tuple(idx)), v)
-            end
-        end
-        return nothing
-    end
+boundary_by_coordinates(f) = CellBoundary((x, v, δ) -> f(x, v))

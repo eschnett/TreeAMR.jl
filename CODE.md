@@ -658,6 +658,132 @@ entries per volume — documented here, implemented post-M3.
   (mark completion, 2:1 balance, key rebuild) runs on the host; block
   data transfer (copy/prolongate/restrict into the new array) runs on
   the device.
+
+  **The backend is chosen once, at allocation** (decided in M6). It is
+  a keyword on `FieldSet` and on `GhostSchedule`, and nothing else takes
+  one: every kernel in the package already read its backend off the
+  storage it was handed (`get_backend(fs.work)`), so the storage
+  decision *is* the backend decision. `statevector` allocates where its
+  field set lives and `regrid!` reallocates there, which is what keeps
+  an application's RHS — `scatter!` → `fill_ghosts!` → `map_blocks!` —
+  literally the same code on a device. No device package is a dependency
+  of TreeAMR; `KernelAbstractions.allocate` is the whole interface.
+
+  **The schedule has to move with the data** (found in M6; the paragraph
+  above did not anticipate it). "All kernels are KA kernels" is
+  necessary but not sufficient: a kernel also dereferences things that
+  are not field data. The transfer kernel reads the 1D stencils'
+  `srcstart` and `weights` and the group's block-index vectors, and
+  those were host arrays. So `Stencil1D` and `TransferGroup` became
+  parametric in their array type, and a `GhostSchedule` uploads them
+  once at construction. This costs nothing per ghost fill and is the
+  natural residency point, since a schedule is already rebuilt whenever
+  the tree changes — the same argument that put the exchange in a cached
+  schedule, one level down. The weights are still built on the host in
+  exact `Rational{BigInt}` arithmetic, which is a strength here: bignum
+  interpolation is exactly the work a device should not be asked to do.
+
+  **Two application callbacks needed a second form** (found in M6). M5
+  already required every callback to be a pure function of its
+  arguments, and expected that to be enough for M6 — "the same contract
+  M6 imposes anyway, since two of the three become device kernels". It
+  was not. Purity is about *concurrency*; what a device additionally
+  requires is that the callback never touch host memory, and two of the
+  three callbacks were handed structures that only exist on the host:
+
+  - The **boundary hook** received `(fs, b, key, δ, region)` and wrote
+    the region cell by cell — the one scalar-index path left in the
+    package. It gains a cell-wise form, `CellBoundary(g)` with
+    `g(x, v, δ)`, which the package launches as a kernel over the
+    outward-facing ghost cells, batched by region shape exactly as
+    transfers are batched by stencil (a region's extent is `G` along
+    each nonzero component of `δ` and `N` along each zero one, so there
+    are only a handful of shapes). `boundary_by_coordinates` is now one
+    of these, and it reproduces the old host loop *bit for bit*: the
+    kernel forms the position from the same per-block origin and spacing
+    `cell_center` uses, so M5's thread-independence digests did not
+    move. The region form is kept and is still what a condition reading
+    the block's interior needs — reflecting, extrapolating outflow — and
+    is CPU-only, which it says if handed a device field set. That
+    limitation is real and is not papered over: outer boundaries that
+    read their own interior are a CPU-only capability until the cell
+    form grows an interior accessor.
+  - The **flagging function** received `(b, key)` and no data, so an
+    application closed over its field set and read it on the host.
+    `firing_boxes(fires, fs)` is the device form: `fires(work, idx, b, x)`
+    is a per-cell predicate (given the *stored* index, so a stencil may
+    cross a block face into the ghosts), evaluated over every block in
+    one launch, returning each block's firing-cell count and the
+    bounding box of its firing cells. The *verdict* — which flag,
+    against which maximum level — stays with the application, because
+    that is physics. This is exactly the split step 1 of
+    [Regridding](#regridding) describes, and the box is exactly what
+    step 2 dilates. One work item per block, each looping its own cells:
+    integer min/max is order-independent and every item owns its output
+    slots, so the M5 determinism discipline carries over with nothing
+    added.
+
+  **Reductions got a device method, not a rewrite.** The diagnostics
+  (`volume_weighted_norm`, `total_mass`) form one partial per block and
+  sum the partials in block order. On a device the per-block host
+  reduction would be one launch and one synchronization *per block*,
+  issued from several host tasks at once; so the partials are formed in
+  a single launch there instead. The CPU path is untouched — the M5
+  numbers were measured with it — and the ordered combination, which is
+  what the bit-identity rests on, is shared.
+
+  **Measured on an H200** (960 blocks of `32^3`, 31.5M cells, `Float64`;
+  the host column is the same node's 16 allocated cores under
+  `numactl --interleave=all`, not the 64-core EPYC of the M5 table, so
+  the ratios are a device-versus-a-socket comparison and not a
+  device-versus-a-node one):
+
+  | phase                 | H200 (s) | 16 cores (s) | ratio |
+  |---|---|---|---|
+  | RHS evaluation        | 0.0070 | 0.249 | **35.5** |
+  | ghost fill            | 0.0053 | 0.170 | **32.2** |
+  | scatter               | 0.0010 | 0.034 | 35.0 |
+  | initial data          | 0.0013 | 0.083 | 63.4 |
+  | regrid transfer       | 0.0013 | 0.115 | 91.7 |
+  | volume-weighted norm  | 0.0232 | 0.058 | 2.5 |
+  | `firing_boxes`        | 0.0160 | 0.088 | 5.5 |
+  | schedule build        | 0.1114 | 0.105 | 0.9 |
+  | triad reference       | 3842 GB/s | 205 GB/s | 18.7 |
+
+  The per-evaluation path — the only part that runs at every RHS
+  evaluation — tracks the bandwidth ratio, which is what a mesh library
+  should deliver and is the whole claim. Three rows deserve their
+  explanation rather than a footnote:
+
+  - **The two per-block reductions are the weak rows, by choice.**
+    `volume_weighted_norm` and `firing_boxes` both run one work item per
+    *block*, so 960 work items on a device that wants tens of thousands.
+    A hierarchical reduction would fix that and would give up the
+    property that makes these functions trustworthy: one work item per
+    block, each accumulating its own cells in its own order, is
+    deterministic without a word of extra care, which is the M5
+    discipline. Neither is on the per-evaluation path — one is a
+    diagnostic, the other runs at regrid frequency — so the trade is
+    paid where it is cheap. It would have to be revisited if
+    `volume_weighted_norm` were ever wired in as an adaptive
+    integrator's `internalnorm`, which is still an open question above.
+  - **Building the schedule does not speed up, and should not.** It is
+    the host-side neighbor search, which M5 already measured as
+    saturating below 3x; the device upload added to it is small enough
+    to disappear into the noise (0.111 s against the host's 0.105 s).
+  - **The regrid transfer's 91.7 is not a device win over a host
+    one**, it is the transfer alone against a host path that is
+    bandwidth-bound in a worse access pattern; the honest reading is
+    that the transfer costs about one RHS evaluation on either.
+
+  **Metal, on an Apple M3 Pro, is the portability evidence rather than a
+  speed result.** The full suite passes there in `Float32` on a backend
+  that reports no hardware fp64 at all — which is the strongest
+  available check that no fp64 path is load-bearing, the same role
+  `Float32x2` plays for the type genericity. It is not a speedup: at
+  3.9M cells the RHS takes 0.0187 s against the same chip's 8 CPU
+  threads at 0.0217 s, and the two triad references agree (107 against
+  113 GB/s), because on that part it is one memory system either way.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
   ranks; prolongation/restriction happen on the owner of the finer data.
@@ -752,7 +878,28 @@ established before any parallelism.
   weights no longer evaluate in `Float64` on their way into a `Float32`
   field, so nothing on the per-cell path needs hardware fp64. See
   "Precision" under [Core concepts](#core-concepts). *Accept:* M3
-  convergence results reproduced on GPU; kernel benchmarks.
+  convergence results reproduced on GPU; kernel benchmarks. The backend
+  is a keyword on `FieldSet` and `GhostSchedule` and nothing else; what
+  the milestone did *not* anticipate, and what most of the work was, is
+  that the exchange schedule has to become device-resident and that two
+  application callbacks — the boundary hook and the flagging function —
+  needed a second, cell-wise form, both recorded under
+  [Parallelism](#parallelism). The whole suite passes on CUDA (NVIDIA
+  H200) in `Float64` *and* `Float32`, and on Metal (Apple M3 Pro) in
+  `Float32`, a backend with no hardware fp64 at all. The M3 convergence
+  result is reproduced on both: L2 rate **1.99** in `Float64` and
+  **1.99** in `Float32`, with order-4 operators and `G = 2` over the
+  two-level mesh. The `Float32` study has to be run at coarser
+  resolutions, and for a reason worth recording: the error measured is a
+  truncation error, the same number in every precision, while the
+  roundoff floor it must clear moves — and the step count grows with
+  `N`, so in `D = 1` the floor is already reached at `N = 64` (the rate
+  over `N = 16…128` collapses to 0.73). That is the positive-assertion
+  form of the caveat "Precision" records for negative ones.
+  `bench/gpu.jl` produces the kernel benchmarks in the format
+  `bench/threads.jl` uses, so a device run and a host run read side by
+  side; `bench/symmetry_gpu.sh` is the cluster job that runs both.
+  *(Done.)*
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange,
   distributed regridding. *Accept:* results match serial; weak-scaling
   smoke test; then MPI+GPU with CUDA-aware MPI.

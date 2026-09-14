@@ -9,7 +9,9 @@ See `CODE.md` in the package root for the full design document.
 """
 module TreeAMR
 
-using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize, CPU
+using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize,
+                          Backend, CPU, allocate, supports_float64
+import KernelAbstractions
 
 # Tree core (M1)
 export MortonKey, MAX_LEVEL, level, parentkey, childkeys, sortedchildkeys, isancestor
@@ -21,7 +23,7 @@ export FieldSet, nblocks, blockkey, blockview, interiorview, fill_by_coordinates
 
 # Ghost exchange and interpolation operators (M2)
 export Operators, OperatorFamily, PointValue, Conservative, check_operators,
-       GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates
+       GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates, CellBoundary
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
@@ -31,7 +33,11 @@ export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
 export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_marks,
        regrid!, adapt_to_initial_data!, total_mass
 
+# GPU (M6)
+export firing_boxes
+
 include("threading.jl")
+include("device.jl")
 include("morton.jl")
 include("forest.jl")
 include("geometry.jl")

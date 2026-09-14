@@ -26,8 +26,16 @@ statelength(fs::FieldSet{T,D}) where {T,D} = fs.forest.N^D * fs.nvars * nblocks(
 A freshly allocated, zeroed state vector for `fs` — the `u` an ODE
 integrator advances. Use [`gather!`](@ref) to load the field set's
 current interior values into it.
+
+Allocated on the field set's own backend, so a device-resident field set
+gets a device-resident state vector and the integrator never touches
+host memory (M6).
 """
-statevector(fs::FieldSet{T}) where {T} = zeros(T, statelength(fs))
+function statevector(fs::FieldSet{T}) where {T}
+    backend = get_backend(fs.work)
+    u = allocate(backend, T, (statelength(fs),))
+    return zerofill!(u, backend)
+end
 
 """
     statearray(u, fs::FieldSet)
@@ -119,6 +127,70 @@ function map_blocks!(kernel!, fs::FieldSet{T,D}, args...) where {T,D}
     return nothing
 end
 
+# Per-block partial reductions.
+#
+# Every diagnostic in the package has the same shape: one partial per
+# block, then a serial pass over the partials *in block order*. That
+# ordering is what makes the result bit-for-bit independent of the
+# thread count (M5), and it is preserved here — only how the partials
+# are produced changes with the backend.
+#
+# On the CPU the partials are host reductions over per-block views,
+# which is what M5 measured and what the recorded numbers were taken
+# with; that path is left exactly as it was. On a device the same
+# formulation would be one kernel launch and one device-to-host
+# synchronization *per block*, issued from several host tasks at once —
+# so there it becomes a single launch with one work item per block, each
+# looping over its own cells. Every work item owns its output slot, so
+# this is deterministic by construction: the same discipline as
+# everywhere else.
+#
+# `array` is either the working array (offset `g = G`, ghosts skipped)
+# or the state array (`g = 0`); `f` reduces one block's view on the
+# host, and `op`/`init` are the same reduction in the form a kernel can
+# take. The two are passed together so neither backend has to
+# reconstruct the other's version.
+@kernel function block_reduce_kernel!(partials, @Const(array), op, init,
+                                      firstvar::Int, lastvar::Int,
+                                      ::Val{D}, ::Val{G}, ::Val{N}) where {D,G,N}
+    b = @index(Global)
+    acc = init
+    for v in firstvar:lastvar
+        for c in CartesianIndices(ntuple(_ -> N, Val(D)))
+            acc = op(acc, array[ntuple(d -> Tuple(c)[d] + G, Val(D))..., v, b])
+        end
+    end
+    partials[b] = acc
+end
+
+function block_partials(f, op, init::R, array, fs::FieldSet{T,D};
+                        g::Integer=0, vars=1:fs.nvars) where {R,T,D}
+    backend = get_backend(array)
+    return block_partials(f, op, init, array, fs, backend; g=g, vars=vars)
+end
+
+function block_partials(f, op, init::R, array, fs::FieldSet{T,D}, backend::Backend;
+                        g::Integer=0, vars=1:fs.nvars) where {R,T,D}
+    n = nblocks(fs)
+    partials = allocate(backend, R, (n,))
+    block_reduce_kernel!(backend)(partials, array, op, init,
+                                  Int(first(vars)), Int(last(vars)),
+                                  Val(D), Val(Int(g)), Val(fs.forest.N); ndrange=n)
+    synchronize(backend)
+    return tohost(partials)
+end
+
+function block_partials(f, op, init::R, array, fs::FieldSet{T,D}, ::CPU;
+                        g::Integer=0, vars=1:fs.nvars) where {R,T,D}
+    N = fs.forest.N
+    inner = ntuple(_ -> (g + 1):(g + N), D)
+    partials = Vector{R}(undef, nblocks(fs))
+    threaded_foreach(nblocks(fs)) do b
+        partials[b] = f(view(array, inner..., vars, b))
+    end
+    return partials
+end
+
 """
     volume_weighted_norm(fs::FieldSet, u::AbstractVector; p=2)
 
@@ -138,28 +210,30 @@ order, so the value does not depend on the thread count.
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
     state = statearray(u, fs)
     forest = fs.forest
-    colons = ntuple(_ -> Colon(), D)
     R = float(real(T))
 
     # One partial per block, then a serial pass over them in block
     # order: threaded, and bit-for-bit independent of the thread count,
     # which a running total split across tasks would not be.
-    partials = Vector{R}(undef, nblocks(fs))
-
     if isinf(p)
-        threaded_foreach(nblocks(fs)) do b
-            block = view(state, colons..., :, b)
-            partials[b] = isempty(block) ? zero(R) : maximum(abs, block)
-        end
+        partials = block_partials(b -> isempty(b) ? zero(R) : maximum(abs, b),
+                                  (a, x) -> max(a, abs(x)), zero(R), state, fs)
         return isempty(partials) ? zero(R) : maximum(partials)
     end
 
+    # An integer exponent stays an integer: `abs(x)^2` is a squaring,
+    # while `abs(x)^2.0` would drag a `Float64` operand into the
+    # innermost loop — fatal on a device with no hardware fp64, and the
+    # exact leak the type-genericity work went after.
+    q = p isa Integer ? Int(p) : R(p)
+    partials = block_partials(b -> sum(x -> abs(x)^p, b),
+                              (a, x) -> a + abs(x)^q, zero(R), state, fs)
     volumes = Vector{R}(undef, nblocks(fs))
-    threaded_foreach(nblocks(fs)) do b
-        block = view(state, colons..., :, b)
+    cells = fs.forest.N^D * fs.nvars
+    for b in 1:nblocks(fs)
         cellvolume = spacing(R, forest, blockkey(fs, b))^D
-        partials[b] = cellvolume * sum(x -> abs(x)^p, block)
-        volumes[b] = cellvolume * length(block)
+        partials[b] *= cellvolume
+        volumes[b] = cellvolume * cells
     end
 
     volume = sum(volumes)

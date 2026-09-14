@@ -50,6 +50,118 @@ function flag_blocks(f, forest::Forest)
     return identity.(out)
 end
 
+# --- device flagging (M6) -------------------------------------------------
+#
+# `flag_blocks` calls the application's `f(b, key)` on the host, and a
+# realistic criterion reads its block's data — which is a scalar index
+# into a device array. So flagging gets a device form, split where
+# `CODE.md` says it should be: the mesh does the mechanical part (a
+# per-cell predicate and the min/max reduction over the cells that
+# fired) and the application supplies the *verdict*, which is physics
+# the mesh cannot know.
+#
+# One work item per block, looping that block's own cells. Regridding is
+# a rare operation and the reduction is over `N^D` cells per block, so
+# the block count is enough parallelism; more importantly, each item
+# owns its output slots and integer min/max is order independent, so the
+# result is deterministic without a word of extra care. That is the same
+# discipline as every other loop in the package.
+# Widen a running bounding box by one cell. Ordinary functions rather
+# than closures written inline: `lo` and `hi` are reassigned inside the
+# loop below, and a closure capturing a reassigned local boxes it, which
+# on a device is a dynamic `getindex` and so does not compile at all.
+# (Found on Metal; it is invisible on the CPU backend, where the box
+# costs only a pointer chase.)
+@inline widen_lo(lo::NTuple{D,Int32}, i::NTuple{D,Int}) where {D} =
+    ntuple(d -> min(lo[d], Int32(i[d])), Val(D))
+@inline widen_hi(hi::NTuple{D,Int32}, i::NTuple{D,Int}) where {D} =
+    ntuple(d -> max(hi[d], Int32(i[d])), Val(D))
+
+@kernel function firing_kernel!(counts, los, his, @Const(work), fires,
+                                @Const(origins), @Const(spacings),
+                                ::Val{D}, ::Val{G}, ::Val{N}) where {D,G,N}
+    b = @index(Global)
+    origin, h = origins[b], spacings[b]
+    half = oftype(h, 1//2)
+
+    n = 0
+    lo = ntuple(_ -> Int32(N + 1), Val(D))
+    hi = ntuple(_ -> Int32(0), Val(D))
+    for c in CartesianIndices(ntuple(_ -> N, Val(D)))
+        i = ntuple(d -> Tuple(c)[d], Val(D))           # interior index, 1:N
+        idx = ntuple(d -> i[d] + G, Val(D))            # stored index
+        x = ntuple(d -> origin[d] + (i[d] - half) * h, Val(D))
+        if fires(work, idx, b, x)
+            n += 1
+            lo = widen_lo(lo, i)
+            hi = widen_hi(hi, i)
+        end
+    end
+    counts[b] = Int32(n)
+    los[b] = lo
+    his[b] = hi
+end
+
+"""
+    firing_boxes(fires, fs::FieldSet) -> Vector{Tuple{Int,NTuple{D,UnitRange{Int}}}}
+
+Per block, how many interior cells satisfied `fires` and the bounding
+box of those cells, in that block's own interior indices `1:N`.
+
+`fires(work, idx, b, x) -> Bool` is evaluated at every interior cell of
+every block from a kernel, so it runs on the field set's backend and
+must be a pure function of its arguments. `work` is the whole working
+array, `idx` the cell's **stored** index (so `work[idx..., v, b]` reads
+it and `Base.setindex(idx, idx[d] + 1, d)` reaches its neighbour — the
+ghosts are there, so a stencil may cross a block face), `b` the block
+index, and `x` the cell center.
+
+This is the device half of regridding: the mesh does the per-cell sweep
+and the min/max reduction, and the application turns the result into
+flags, which is where the physics is. A criterion with a maximum
+refinement level reads
+
+```julia
+flags = map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
+    n == 0 && return Coarsen
+    level(forest.leaves[b]) < lmax ? (Refine, box) : (Keep, box)
+end
+```
+
+and the `(flag, box)` pairs go straight to [`regrid!`](@ref), whose
+buffering is driven by exactly this box (see [`buffered_flags`](@ref)).
+A block where nothing fired gets the empty box `1:0` in every dimension.
+
+[`flag_blocks`](@ref) remains the host form, for criteria that want the
+tree rather than the data.
+
+!!! note "Callbacks on a device"
+    The callback becomes a kernel argument, so everything it closes over
+    must be `isbits`. A captured `Type` is the usual trip: write
+    `oftype(x[1], 2)` rather than closing over `T` and calling `T(2)`.
+    The same rule covers captured arrays (pass a device array, or index
+    the one the callback is already given) and any mutable state, which
+    the purity requirement rules out anyway.
+"""
+function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    n = nblocks(fs)
+    counts = allocate(backend, Int32, (n,))
+    los = allocate(backend, NTuple{D,Int32}, (n,))
+    his = allocate(backend, NTuple{D,Int32}, (n,))
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    firing_kernel!(backend)(counts, los, his, fs.work, fires, origins, spacings,
+                            Val(D), Val(forest.G), Val(forest.N); ndrange=n)
+    synchronize(backend)
+
+    hc, hlo, hhi = tohost(counts), tohost(los), tohost(his)
+    return [(Int(hc[b]),
+             ntuple(d -> hc[b] == 0 ? (1:0) : Int(hlo[b][d]):Int(hhi[b][d]), D))
+            for b in 1:n]
+end
+
 # Whatever a flagging function reported, reduced to its flag and to the
 # box of firing cells. An omitted box means the whole interior — the
 # conservative isotropic case.
@@ -242,7 +354,7 @@ end
 # transfers by (kind, child offset) so each batch shares one set of
 # stencils — the same grouping the ghost schedule uses.
 function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
-                         operators::Operators) where {T,D}
+                         operators::Operators, backend::Backend) where {T,D}
     oldindex = Dict{MortonKey{D},Int32}(k => Int32(i) for (i, k) in enumerate(oldleaves))
     N, G = forest.N, forest.G
     zerodir = ntuple(_ -> 0, D)
@@ -292,8 +404,13 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
         ntuple(d -> restriction_stencil(T, N, G, 0, o[d], operators), D) :
         ntuple(d -> prolongation_stencil(T, N, G, 0, o[d], operators), D)
 
-    return [TransferGroup{T,D}(kind, stencils(kind, o), targets, sources)
-            for ((kind, o), (targets, sources)) in pairs]
+    # These stencils are rebuilt on every regrid — the child offsets
+    # involved depend on which blocks moved — so, like the schedule's,
+    # they are uploaded here, once, rather than at the launch.
+    GRP = grouptype(backend, T, Val(D))
+    return GRP[todevice(backend, TransferGroup{T,D}(kind, stencils(kind, o),
+                                                    targets, sources))
+               for ((kind, o), (targets, sources)) in pairs]
 end
 
 """
@@ -367,14 +484,16 @@ function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
         end
     end
 
-    backend = isempty(sets) ? nothing : get_backend(first(sets).work)
     stored = forest.N + 2 * forest.G
     for fs in sets
+        # Per field set, not once from the first one: nothing says two
+        # field sets over the same forest live on the same backend.
+        backend = get_backend(fs.work)
         fresh = similar(fs.work, ntuple(_ -> stored, D)..., fs.nvars, length(newleaves))
-        zerofill!(fresh, get_backend(fs.work))
+        zerofill!(fresh, backend)
         if transfer
             groups = transfer_groups(eltype(fs.work), forest, oldleaves, newleaves,
-                                     schedule.operators)
+                                     schedule.operators, backend)
             # The transfer moves every cell in the domain, so it is
             # threaded the same way a ghost phase is — its groups are
             # just as uneven, a whole block against a single child.
@@ -401,27 +520,42 @@ refined block would bake in the coarse mesh's resolution, so the
 refinement would never buy anything.
 
 `initial` is an `(x, v) -> value` callback as
-[`fill_by_coordinates!`](@ref) takes, and `flag` is a
-`(b, key) -> RegridFlag` (or `(b, key) -> (flag, box)`) callback as
-[`flag_blocks`](@ref) takes; `buffer` is passed on to
-[`regrid!`](@ref). Returns
-`(schedule, passes, converged)`; `converged` is `false` if the hierarchy
-was still changing when `maxpasses` ran out.
+[`fill_by_coordinates!`](@ref) takes; `buffer` is passed on to
+[`regrid!`](@ref). Returns `(schedule, passes, converged)`; `converged`
+is `false` if the hierarchy was still changing when `maxpasses` ran out.
+
+The criterion is given exactly one of two ways:
+
+- `flag`, a `(b, key) -> RegridFlag` (or `(b, key) -> (flag, box)`)
+  callback as [`flag_blocks`](@ref) takes — the host form;
+- `flags`, a callable `fs -> flagvector` producing the whole vector at
+  once. This is what a device-side criterion wants, since it reduces
+  every block in one kernel: `flags = fs -> map(..., firing_boxes(fires, fs))`.
+  See [`firing_boxes`](@ref).
+
+The schedule is rebuilt on the field set's own backend, so a
+device-resident field set adapts without anything further.
 """
 function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
-                                initial, flag, buffer::Integer=0,
-                                maxpasses::Integer=10,
+                                initial, flag=nothing, flags=nothing,
+                                buffer::Integer=0, maxpasses::Integer=10,
                                 boundary=nothing) where {T,D}
+    (flag === nothing) == (flags === nothing) && throw(ArgumentError(
+        "pass exactly one of `flag` (a (b, key) callback, evaluated per block on " *
+        "the host) and `flags` (a callable producing the whole flag vector, which " *
+        "is what a device-side criterion built on `firing_boxes` produces)"))
+    criterion = flags === nothing ? (f -> flag_blocks(flag, f.forest)) : flags
+
     forest = fs.forest
-    schedule = GhostSchedule(forest, operators; T=T)
+    backend = get_backend(fs.work)
+    schedule = GhostSchedule(forest, operators; T=T, backend=backend)
     fill_by_coordinates!(initial, fs)
 
     for pass in 1:maxpasses
         fill_ghosts!(fs, schedule; boundary=boundary)
-        flags = flag_blocks(flag, forest)
-        changed = regrid!(forest, fs, schedule; flags=flags, buffer=buffer,
+        changed = regrid!(forest, fs, schedule; flags=criterion(fs), buffer=buffer,
                           boundary=boundary, transfer=false)
-        schedule = GhostSchedule(forest, operators; T=T)
+        schedule = GhostSchedule(forest, operators; T=T, backend=backend)
         fill_by_coordinates!(initial, fs)
         changed || return (schedule, pass, true)
     end
@@ -451,11 +585,12 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest
     R = float(real(T))
     # One partial per block, summed afterwards in block order, so the
-    # answer does not move when the thread count does.
-    partials = Vector{R}(undef, nblocks(fs))
-    threaded_foreach(nblocks(fs)) do b
-        cellvolume = spacing(R, forest, blockkey(fs, b))^D
-        partials[b] = cellvolume * sum(interiorview(fs, b, var))
+    # answer does not move when the thread count does (M5) — nor with
+    # where the partials were formed (M6).
+    partials = block_partials(sum, +, zero(R), fs.work, fs;
+                              g=forest.G, vars=Int(var):Int(var))
+    for b in 1:nblocks(fs)
+        partials[b] *= spacing(R, forest, blockkey(fs, b))^D
     end
     return sum(partials)
 end

@@ -12,11 +12,11 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M5 are done (tree core, ghost exchange, ODE
-coupling, regridding, multi-threading), plus the conservative operator
-family that was scheduled for M8. Everything is `D`-generic. Next is GPU
-(M6), MPI (M7), face-centered variables and conservation (M8), I/O
-(M9).
+Current state: milestones M0–M6 are done (tree core, ghost exchange, ODE
+coupling, regridding, multi-threading, GPU), plus the conservative
+operator family that was scheduled for M8. Everything is `D`-generic and
+floating-point-type generic. Next is MPI (M7), face-centered variables
+and conservation (M8), I/O (M9).
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
