@@ -1,5 +1,5 @@
 """
-    FieldSet{T,D,A}
+    FieldSet{T,D,R,A}
 
 Block storage for `nvars` variables over every leaf of a
 [`Forest`](@ref): one big persistent array holding all leaf blocks
@@ -11,13 +11,18 @@ Cell indices vary fastest (so a GPU reads them coalesced), then the
 variable index, then the block index; blocks are ordered by the forest's
 Morton key order, so `forest.leaves[b]` is the key of block `b`.
 
-Element type `T` is generic — `Float64` by default, `Float32` for GPUs.
+Element type `T` is generic: `Float32` for GPUs, `Float64` on a host,
+or a software type such as a double-`Float32` where no hardware fp64
+exists. It defaults to the forest's own [`floattype`](@ref) `R`, which is
+also the type the geometry is computed in; the two are separate
+parameters only so that a field set may deliberately store something
+narrower than its coordinates.
 
 A field set is tied to the forest's *current* leaf array. Block indices
 are deliberately not stable across regridding (M4), which compacts the
 block slots and rebuilds the storage.
 
-    FieldSet(forest, nvars)          # Float64
+    FieldSet(forest, nvars)          # element type = floattype(forest)
     FieldSet{Float32}(forest, nvars)
 
 # Examples
@@ -31,8 +36,8 @@ julia> size(fs.work)
 (6, 3, 2)
 ```
 """
-mutable struct FieldSet{T,D,A<:AbstractArray{T}}
-    const forest::Forest{D}
+mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
+    const forest::Forest{D,R}
     const nvars::Int
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
@@ -40,13 +45,13 @@ mutable struct FieldSet{T,D,A<:AbstractArray{T}}
     work::A
 end
 
-function FieldSet{T}(forest::Forest{D}, nvars::Integer) where {T,D}
+function FieldSet{T}(forest::Forest{D,R}, nvars::Integer) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
     stored = forest.N + 2 * forest.G
     work = zeros(T, ntuple(_ -> stored, D)..., Int(nvars), nleaves(forest))
-    return FieldSet{T,D,typeof(work)}(forest, Int(nvars), work)
+    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), work)
 end
-FieldSet(forest::Forest, nvars::Integer) = FieldSet{Float64}(forest, nvars)
+FieldSet(forest::Forest{D,R}, nvars::Integer) where {D,R} = FieldSet{R}(forest, nvars)
 
 """
     nblocks(fs::FieldSet)
@@ -100,8 +105,10 @@ end
     origin, h = origins[b], spacings[b]
     # The stored index of interior cell i is i + G, so `cell_center`'s
     # (idx - G - 1/2) is just (i - 1/2) — the same arithmetic, in the
-    # same order, so this reproduces `cell_center` bit for bit.
-    x = ntuple(d -> origin[d] + (I[d] - 0.5) * h, Val(D))
+    # same order, on the same origin and spacing, so this reproduces
+    # `cell_center` bit for bit. `1//2` rather than `0.5` for the same
+    # reason as there: the literal would be an fp64 operand.
+    x = ntuple(d -> origin[d] + (I[d] - oftype(h, 1//2)) * h, Val(D))
     work[ntuple(d -> I[d] + G, Val(D))..., v, b] = f(x, v)
 end
 
@@ -109,9 +116,10 @@ end
     fill_by_coordinates!(f, fs::FieldSet)
 
 Set every interior cell of every block from the callback
-`f(x, v) -> value`, where `x` is the cell center (an `NTuple{D,Float64}`,
-see [`cell_center`](@ref)) and `v` the variable index. Ghosts are left
-untouched — they are filled by the ghost exchange (M2).
+`f(x, v) -> value`, where `x` is the cell center (an `NTuple{D,T}` in the
+field set's own element type, see [`cell_center`](@ref)) and `v` the
+variable index. Ghosts are left untouched — they are filled by the ghost
+exchange (M2).
 
 `f` is called once per cell from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
@@ -123,8 +131,8 @@ M6.
 function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
-    coordinates_kernel!(backend)(fs.work, f, block_origins(forest),
-                                 block_spacings(forest), Val(D), Val(forest.G);
+    coordinates_kernel!(backend)(fs.work, f, block_origins(forest, T),
+                                 block_spacings(forest, T), Val(D), Val(forest.G);
                                  ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars,
                                           nblocks(fs)))
     synchronize(backend)

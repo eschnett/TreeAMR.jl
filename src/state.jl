@@ -157,12 +157,15 @@ function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) w
     volumes = Vector{R}(undef, nblocks(fs))
     threaded_foreach(nblocks(fs)) do b
         block = view(state, colons..., :, b)
-        cellvolume = R(spacing(forest, blockkey(fs, b))^D)
+        cellvolume = spacing(R, forest, blockkey(fs, b))^D
         partials[b] = cellvolume * sum(x -> abs(x)^p, block)
         volumes[b] = cellvolume * length(block)
     end
 
     volume = sum(volumes)
     volume == 0 && return zero(R)
-    return (sum(partials) / volume)^(1 / p)
+    # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
+    # promotes the whole result to Float64 and made this function return a
+    # different type from the `isinf(p)` branch above.
+    return (sum(partials) / volume)^inv(R(p))
 end

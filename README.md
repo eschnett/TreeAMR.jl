@@ -15,7 +15,8 @@ The package is currently at milestone **M5** (multi-threading).
 
 Early development. Not registered, not ready for use.
 
-Implemented so far, `D`-generic and multi-threaded:
+Implemented so far, `D`-generic, floating-point-type generic, and
+multi-threaded:
 
 **M1 — tree core**
 

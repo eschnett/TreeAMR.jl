@@ -410,6 +410,7 @@ include("ghost_tests.jl")
 include("state_tests.jl")
 include("regrid_tests.jl")
 include("wave_tests.jl")
+include("type_tests.jl")
 include("thread_tests.jl")
 
 end

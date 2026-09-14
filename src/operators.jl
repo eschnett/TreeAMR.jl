@@ -225,6 +225,18 @@ function check_operators(forest::Forest, ops::Operators)
     return nothing
 end
 
+# `BigInt` rather than `Int`: the *running* products below outgrow a
+# 64-bit numerator at order 16 (measured: 5.79e20 there, 1.78e17 at order
+# 14), and `Rational` arithmetic is checked, so that would be a hard
+# error rather than a wrong answer. A bignum removes the ceiling
+# altogether instead of moving it, which costs nothing that matters: this
+# runs once per stencil entry when a schedule is built, never in the
+# per-evaluation path. It also buys correct rounding on the way out —
+# `T(::Rational{BigInt})` divides through `BigFloat`, so the quotient is
+# rounded once from the exact value rather than from a numerator and
+# denominator that were each rounded to `T` first.
+const WeightRational = Rational{BigInt}
+
 """
     lagrange_weights(nodes, x)
 
@@ -234,17 +246,27 @@ Weights `w` with `sum(w[i] * u(nodes[i])) == u(x)` for every polynomial
 Exactness holds for *any* distinct nodes, which is what lets the
 restriction stencil be shifted away from the coarse-fine interface (to
 stay inside the fine block's interior) without losing order.
+
+Nodes and target are **exact rationals**, and so is the result: every
+position a stencil is ever evaluated at is an integer or a quarter
+integer, so the weights are exact rational numbers and the only rounding
+in the whole construction is the single conversion into a
+[`Stencil1D`](@ref TreeAMR.Stencil1D)'s element type. Doing this in
+floating point instead would fix an accuracy ceiling at whatever type the
+weights were built in — and would need hardware fp64 to reach it.
 """
-function lagrange_weights(nodes::AbstractVector{<:Real}, x::Real)
+function lagrange_weights(nodes::AbstractVector{<:Rational}, x::Rational)
     n = length(nodes)
-    w = Vector{Float64}(undef, n)
+    ns = WeightRational.(nodes)
+    xq = WeightRational(x)
+    w = Vector{WeightRational}(undef, n)
     for i in 1:n
-        num = 1.0
-        den = 1.0
+        num = one(WeightRational)
+        den = one(WeightRational)
         for j in 1:n
             j == i && continue
-            num *= (x - nodes[j])
-            den *= (nodes[i] - nodes[j])
+            num *= (xq - ns[j])
+            den *= (ns[i] - ns[j])
         end
         w[i] = num / den
     end

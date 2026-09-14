@@ -116,7 +116,7 @@ function phase_plan(groups::AbstractVector{<:TransferGroup})
 end
 
 """
-    GhostSchedule{T,D}
+    GhostSchedule{T,D,R}
 
 The precomputed ghost exchange for one forest, replayed by
 [`fill_ghosts!`](@ref).
@@ -144,14 +144,14 @@ so they are ordinary copies, restrictions, and prolongations.
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
-    GhostSchedule(forest, operators::Operators; T=Float64)
+    GhostSchedule(forest, operators::Operators; T=floattype(forest))
 
 `operators` is required: interpolation order follows from the
 application's discretization, so there is no order the mesh could
 sensibly default to. See [`Operators`](@ref).
 """
-struct GhostSchedule{T,D}
-    forest::Forest{D}
+struct GhostSchedule{T,D,R}
+    forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
     operators::Operators
     phase1::Vector{TransferGroup{T,D}}
@@ -192,11 +192,11 @@ isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 # the target leaves the node hull, which would turn interpolation into
 # extrapolation and amplify error instead of damping it. Checked here,
 # at schedule-build time, so it costs nothing per evaluation.
-function interpolation_weights(lo::Int, p::Int, x::Real, what::AbstractString)
+function interpolation_weights(lo::Int, p::Int, x::Rational, what::AbstractString)
     lo <= x <= lo + p - 1 || throw(ArgumentError(
         "$what would extrapolate: target $x lies outside the source window " *
         "[$lo, $(lo + p - 1)]. The block geometry cannot support this order."))
-    return lagrange_weights(collect(lo:(lo + p - 1)), x)
+    return lagrange_weights([Rational(j) for j in lo:(lo + p - 1)], x)
 end
 
 # Target range of a transfer in dimension d.
@@ -233,7 +233,7 @@ function restrict_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int, p::Int) 
         # never read another block's ghosts.
         lo = clamp(f0 - p ÷ 2 + 1, G + 1, G + N - p + 1)
         srcstart[i] = lo
-        weights[:, i] = interpolation_weights(lo, p, f0 + 0.5, "restriction")
+        weights[:, i] = interpolation_weights(lo, p, f0 + 1//2, "restriction")
     end
     return Stencil1D{T}(first(rng), srcstart, weights)
 end
@@ -266,7 +266,7 @@ function prolong_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int, p::Int) w
         origin = -N * source_direction(δd, od) + G + 1
         lo = clamp(cld(φ, 2) - p ÷ 2 + origin, 1, N + 2G - p + 1)
         srcstart[i] = lo
-        weights[:, i] = interpolation_weights(lo, p, φ / 2 - 0.25 + origin, "prolongation")
+        weights[:, i] = interpolation_weights(lo, p, φ//2 - 1//4 + origin, "prolongation")
     end
     return Stencil1D{T}(first(rng), srcstart, weights)
 end
@@ -283,16 +283,19 @@ end
 #
 # The result is exactly conservative: the two subcell weight vectors
 # average to the unit vector on the center cell, so the children always
-# average back to their parent whatever the data.
+# average back to their parent whatever the data. In rational arithmetic
+# that is an algebraic identity rather than a roundoff claim — it holds
+# exactly, at every order and for every element type the weights are
+# later rounded into.
 function conservative_prolong_weights(p::Int)
     r = (p - 1) ÷ 2
-    boundaries = [-r - 0.5 + i for i in 0:p]        # p+1 cell boundaries
+    boundaries = [-r - 1//2 + i for i in 0:p]       # p+1 cell boundaries
     # W(x) = Σ_i L_i(x) W_i and W_i = Σ_{t<i} ū_t, so ū_t carries weight
     # Σ_{i>t} L_i(x).
-    L = lagrange_weights(boundaries, 0.0)           # at the cell's own center
+    L = lagrange_weights(boundaries, 0//1)          # at the cell's own center
     tail = [sum(L[(t + 2):(p + 1)]) for t in 0:(p - 1)]
-    low = [2 * (tail[t + 1] - (t < r ? 1.0 : 0.0)) for t in 0:(p - 1)]
-    high = [2 * ((t < r + 1 ? 1.0 : 0.0) - tail[t + 1]) for t in 0:(p - 1)]
+    low = [2 * (tail[t + 1] - (t < r ? 1//1 : 0//1)) for t in 0:(p - 1)]
+    high = [2 * ((t < r + 1 ? 1//1 : 0//1) - tail[t + 1]) for t in 0:(p - 1)]
     return low, high
 end
 
@@ -410,8 +413,8 @@ function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
     return into
 end
 
-function GhostSchedule(forest::Forest{D}, operators::Operators;
-                       T::Type=Float64) where {D}
+function GhostSchedule(forest::Forest{D,R}, operators::Operators;
+                       T::Type=R) where {D,R}
     check_operators(forest, operators)
     N, G = forest.N, forest.G
     dirs = alldirections(Val(D))
@@ -463,9 +466,9 @@ function GhostSchedule(forest::Forest{D}, operators::Operators;
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
-    return GhostSchedule{T,D}(forest, generation(forest), operators, phase1, phase2,
-                              levels, boundaries, phase_plan(phase1),
-                              [phase_plan(groups) for groups in phase2])
+    return GhostSchedule{T,D,R}(forest, generation(forest), operators, phase1, phase2,
+                                levels, boundaries, phase_plan(phase1),
+                                [phase_plan(groups) for groups in phase2])
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

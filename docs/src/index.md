@@ -54,6 +54,36 @@ cases in M2.
 Data lives in a [`FieldSet`](@ref): one big array over all leaf blocks,
 cell indices fastest, ghosts included.
 
+## Element types
+
+The mesh is generic in its floating-point type, and not merely in what it
+stores: the geometry is *computed* in that type too, so nothing on the
+path from a key to a cell center evaluates in `Float64` unless that is
+the type you asked for. This matters because hardware fp64 is not
+available everywhere — on many GPUs it is absent or an order of magnitude
+slower.
+
+A [`Forest`](@ref) carries the type, and [`FieldSet`](@ref) and
+[`GhostSchedule`](@ref) take theirs from it unless told otherwise:
+
+```jldoctest overview
+julia> floattype(forest)
+Float64
+
+julia> small = Forest{Float32}((2, 2); N = 8, G = 2);
+
+julia> eltype(FieldSet(small, 1).work)
+Float32
+```
+
+Interpolation weights are built in exact rational arithmetic and rounded
+once, at the point where they enter a stencil, so they carry no error
+beyond the target type's own — and the conservative family's
+"children average back to their parent" is an algebraic identity rather
+than a statement about roundoff. `Float64`, `Float32`, and a
+double-`Float32` (MultiFloats.jl's `Float32x2`, which has no hardware
+support at all) are exercised in the test suite.
+
 ## Ghost exchange
 
 Ghost filling runs at every RHS evaluation, while neighbor finding is
@@ -249,6 +279,7 @@ coarsen!
 balance!
 isbalanced
 generation
+floattype
 ```
 
 ## Geometry

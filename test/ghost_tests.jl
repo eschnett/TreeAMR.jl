@@ -24,28 +24,31 @@
     # Exact for polynomials of degree < length(nodes), for any nodes --
     # which is what lets restriction shift its stencil off-center near a
     # coarse/fine interface without losing order.
-    for nodes in ([0.0, 1.0], [-1.0, 0.0, 1.0, 2.0], [3.0, 4.0, 5.0, 6.0])
+    # The weights are built in exact rational arithmetic, so these are
+    # equalities rather than tolerances.
+    for nodes in ([0//1, 1//1], [-1//1, 0//1, 1//1, 2//1], [3//1, 4//1, 5//1, 6//1])
         p = length(nodes)
-        for deg in 0:(p - 1), x in (-0.25, 0.5, 1.25, 4.5)
+        for deg in 0:(p - 1), x in (-1//4, 1//2, 5//4, 9//2)
             w = TreeAMR.lagrange_weights(nodes, x)
-            @test sum(w[i] * nodes[i]^deg for i in 1:p) ≈ x^deg atol = 1e-10
-            @test sum(w) ≈ 1.0                                # partition of unity
+            @test sum(w[i] * nodes[i]^deg for i in 1:p) == x^deg
+            @test sum(w) == 1                                 # partition of unity
         end
     end
     # Order 2 gives the familiar weights: 1/4, 3/4 a quarter cell off
     # center, and 1/2, 1/2 at a midpoint (the 2^D average).
-    @test TreeAMR.lagrange_weights([0.0, 1.0], 0.75) ≈ [0.25, 0.75]
-    @test TreeAMR.lagrange_weights([0.0, 1.0], 0.5) ≈ [0.5, 0.5]
+    @test TreeAMR.lagrange_weights([0//1, 1//1], 3//4) == [1//4, 3//4]
+    @test TreeAMR.lagrange_weights([0//1, 1//1], 1//2) == [1//2, 1//2]
     # Order 4 restriction at a midpoint: the standard -1/16, 9/16 stencil.
-    @test TreeAMR.lagrange_weights([0.0, 1.0, 2.0, 3.0], 1.5) ≈
-          [-1 / 16, 9 / 16, 9 / 16, -1 / 16]
+    @test TreeAMR.lagrange_weights([0//1, 1//1, 2//1, 3//1], 3//2) ==
+          [-1//16, 9//16, 9//16, -1//16]
 
     # A shifted window is fine as long as the target stays bracketed;
     # shifting past it would be extrapolation, and is refused.
-    @test TreeAMR.interpolation_weights(1, 4, 2.5, "test") ≈ [-1 / 16, 9 / 16, 9 / 16, -1 / 16]
-    @test TreeAMR.interpolation_weights(1, 4, 4.0, "test") ≈ [0.0, 0.0, 0.0, 1.0]
-    @test_throws ArgumentError TreeAMR.interpolation_weights(1, 4, 4.5, "test")
-    @test_throws ArgumentError TreeAMR.interpolation_weights(1, 4, 0.5, "test")
+    @test TreeAMR.interpolation_weights(1, 4, 5//2, "test") ==
+          [-1//16, 9//16, 9//16, -1//16]
+    @test TreeAMR.interpolation_weights(1, 4, 4//1, "test") == [0, 0, 0, 1]
+    @test_throws ArgumentError TreeAMR.interpolation_weights(1, 4, 9//2, "test")
+    @test_throws ArgumentError TreeAMR.interpolation_weights(1, 4, 1//2, "test")
 end
 
 @testset "Conservative operator family" begin
@@ -76,18 +79,19 @@ end
     for p in (1, 3, 5)
         low, high = TreeAMR.conservative_prolong_weights(p)
         @test length(low) == length(high) == p
-        @test sum(low) ≈ 1.0
-        @test sum(high) ≈ 1.0
-        centre = zeros(p)
-        centre[(p + 1) ÷ 2] = 1.0
-        @test (low .+ high) ./ 2 ≈ centre atol = 1e-12
+        @test sum(low) == 1
+        @test sum(high) == 1
+        # Exact in rational arithmetic: this is an algebraic identity,
+        # not a statement about Float64 roundoff.
+        centre = [t == (p - 1) ÷ 2 ? 1//1 : 0//1 for t in 0:(p - 1)]
+        @test (low .+ high) .// 2 == centre
     end
     # Order 3 is the familiar ±1/8 conservative slope.
     low, high = TreeAMR.conservative_prolong_weights(3)
-    @test low ≈ [1 / 8, 1.0, -1 / 8]
-    @test high ≈ [-1 / 8, 1.0, 1 / 8]
+    @test low == [1//8, 1, -1//8]
+    @test high == [-1//8, 1, 1//8]
     # Order 1 is piecewise constant.
-    @test TreeAMR.conservative_prolong_weights(1) == ([1.0], [1.0])
+    @test TreeAMR.conservative_prolong_weights(1) == ([1//1], [1//1])
 end
 
 @testset "Conservative exchange is exact for cell averages: D=$D" for D in (1, 2)

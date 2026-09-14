@@ -199,6 +199,19 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     return fs
 end
 
+# The element types have to agree exactly — the transfer accumulates in
+# `eltype(dest)` and reads the weights straight out of the stencils, so a
+# mismatch would silently promote in the innermost loop. Caught here with
+# a reason rather than left to a `MethodError`, since the two types are
+# chosen at two different call sites.
+function fill_ghosts!(fs::FieldSet{T}, schedule::GhostSchedule{S};
+                      boundary=nothing) where {T,S}
+    throw(ArgumentError(
+        "the field set stores $T but this schedule carries $S weights; build " *
+        "the schedule with `GhostSchedule(forest, operators; T=$T)`, or let " *
+        "both default to the forest's floattype"))
+end
+
 """
     boundary_by_coordinates(f)
 
@@ -216,7 +229,7 @@ boundary_by_coordinates(f) =
         for v in 1:fs.nvars
             block = blockview(fs, b, v)
             for idx in region
-                block[idx] = f(cell_center(forest, key, Tuple(idx)), v)
+                block[idx] = f(cell_center(eltype(block), forest, key, Tuple(idx)), v)
             end
         end
         return nothing

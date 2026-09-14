@@ -154,7 +154,7 @@ Two arrays exist:
 - Cell indices vary fastest (GPU coalescing); blocks are ordered by
   Morton key.
 - Element type `T` is generic; `Float64` default, `Float32` relevant for
-  GPUs.
+  GPUs. See "Precision" below for what carries `T` (amended in M5).
 - Block slots are compacted at each regridding; block indices are **not**
   stable across regridding, and no stable region identifiers are offered
   (applications refer to space via keys or coordinates, not block
@@ -166,6 +166,72 @@ analysis quantities (constraint monitors), background/coordinate fields,
 ghost-bearing temporaries. Field sets are transferred across regridding
 (or re-evaluated, at the application's choice) but are not part of the
 ODE state vector.
+
+### Precision
+
+**The mesh is generic in its floating-point type, and the arithmetic is
+generic, not just the storage** (decided; amended in M5, when the
+implementation showed the original one-line rule was not enough).
+
+The original specification said only that the working array's element
+type is generic. That is too weak. Geometry was computed from `Float64`
+extents and *converted* at the end, so a `Float32` field set still needed
+hardware fp64 to find a cell center — and fp64 is exactly what a device
+may not have. So:
+
+- **`Forest{D,T}` carries the geometry type**, and every geometry
+  function computes in it from the first operation. Each takes an
+  optional leading type, defaulting to the forest's, so a caller can ask
+  for something else without the intermediate ever being `Float64`.
+- **`FieldSet` and `GhostSchedule` default their element type to the
+  forest's.** They remain free to differ — storing `Float32` fields over
+  `Float64` coordinates is a legitimate mixed-precision configuration —
+  but the two must agree with *each other*, which `fill_ghosts!` enforces
+  with a message rather than a `MethodError`.
+- **No floating-point literal may appear in per-cell arithmetic.** `0.5`
+  is an fp64 operand and drags the expression with it; `1//2` converted
+  to the working type is exact and folds at compile time. This is what
+  makes `fill_by_coordinates!` reproduce `cell_center` bit for bit at
+  every type, rather than only when both happened to be `Float64`.
+- **Interpolation weights are computed exactly and rounded once.** Every
+  position a stencil is evaluated at is an integer or a quarter integer,
+  so the Lagrange products are exact in `Rational`; the single conversion
+  into `Stencil1D{T}` is the only rounding in the construction.
+  `Rational{BigInt}`, not a fixed width: the running products outgrow a
+  64-bit numerator at order 16 (measured: 5.79e20 there, 1.78e17 at order
+  14), and a bignum removes the ceiling rather than moving it, at a cost
+  paid once per stencil entry at schedule-build time. It also buys
+  correct rounding on the way out, since `T(::Rational{BigInt})` divides
+  through `BigFloat` instead of rounding numerator and denominator to `T`
+  first.
+
+Two things this bought beyond portability. The conservative family's
+defining property — the two subcell weight vectors average to the unit
+vector on the center cell, so children always average back to their
+parent — is now an algebraic identity that holds *exactly* at every
+order, where it was previously only assertable to `atol = 1e-12`. And
+tolerances that were `Float64`-calibrated constants became type relative:
+the cube check's `rtol = 1e-12` is `4096·eps(T)` (1e-12/eps(Float64) ≈
+4500), which reproduces the old behavior at `Float64` instead of sitting
+below `eps(Float32)`.
+
+Exercised in the test suite at `Float64`, `Float32`, and `Float32x2` —
+MultiFloats.jl's double-`Float32`, a software type with no hardware
+support at all, and therefore the strongest available evidence that no
+fp64 path is load-bearing. The two non-default types catch opposite
+faults: `Float32` is the leak detector, since a stray `Float64` operand
+widens the result, while `Float32x2` promotes `Float64` *downward* and so
+absorbs leaks silently — it tests instead that nothing depends on a
+hardware float at all. Note that `eps(Float32x2) = 1.4e-14` is *coarser*
+than `Float64`: it is not an "at least as accurate" drop-in.
+
+One consequence worth stating: a negative accuracy assertion ("order `p`
+does *not* reproduce degree `p`") does not rescale with the type. It
+measures a truncation error, which is the same number in every
+precision, while the roundoff floor it must clear moves. At `Float32`
+and order 4 the two are only a decade apart, so the sharp
+order-boundary claims stay in the `Float64` tests and the type-generic
+tests assert a ratio instead.
 
 ## Operations
 
@@ -234,6 +300,10 @@ and for analysis/output — there is no periodic "restrict fine onto
 coarse" step, since no overlapping coarse data exists.
 
 ### Operators
+
+Both families' weights are built in exact rational arithmetic and rounded
+once into the stencil's element type; see "Precision" above for why, and
+for what that makes exact.
 
 Prolongation and restriction are **symmetric**: both are interpolation
 operators with a configurable accuracy order, matched to the
@@ -677,8 +747,12 @@ established before any parallelism.
   and pages must be interleaved — under [Parallelism](#parallelism).
   `bench/scan.sh` reproduces the measurement. *(Done.)*
 - **M6 — GPU.** CUDA backend via KernelAbstractions; device-resident
-  data. *Accept:* M3 convergence results reproduced on GPU; kernel
-  benchmarks.
+  data. Floating-point-type genericity *(landed early, after M5)* is a
+  prerequisite that is now in place: the geometry and the interpolation
+  weights no longer evaluate in `Float64` on their way into a `Float32`
+  field, so nothing on the per-cell path needs hardware fp64. See
+  "Precision" under [Core concepts](#core-concepts). *Accept:* M3
+  convergence results reproduced on GPU; kernel benchmarks.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange,
   distributed regridding. *Accept:* results match serial; weak-scaling
   smoke test; then MPI+GPU with CUDA-aware MPI.

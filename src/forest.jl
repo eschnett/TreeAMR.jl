@@ -1,5 +1,5 @@
 """
-    Forest{D}
+    Forest{D,T}
 
 A `D`-dimensional brick of `roots[1] × ... × roots[D]` octree roots
 covering the rectangular physical domain `extents`, refined into a
@@ -16,11 +16,15 @@ leaf-only linear octree.
 - `N` is the per-block interior size and `G` the ghost width, subject to
   the invariants in `CODE.md`: `N` even and `N ≥ 2G`.
 - Blocks are cubes, so `extents` must match the aspect ratio of `roots`.
+- `T` is the floating-point type the geometry is *computed* in, not
+  merely stored in — see [`floattype`](@ref) and "Precision" in
+  `CODE.md`.
 
 Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
     Forest(roots; N, G, periodic=all false, extents=one unit per root)
+    Forest{T}(roots; ...)                      # geometry in `T`
 
 # Examples
 
@@ -31,10 +35,10 @@ julia> nleaves(forest)
 4
 ```
 """
-struct Forest{D}
+struct Forest{D,T}
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
-    extents::NTuple{D,Tuple{Float64,Float64}}
+    extents::NTuple{D,Tuple{T,T}}
     N::Int
     G::Int
     leaves::Vector{MortonKey{D}}
@@ -45,32 +49,68 @@ struct Forest{D}
     generation::Base.RefValue{Int}
 end
 
-function Forest(roots::NTuple{D,Integer};
-                N::Integer,
-                G::Integer,
-                periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
-                extents::NTuple{D,Tuple{Real,Real}}=ntuple(d -> (0.0, Float64(roots[d])), D)) where {D}
+# The geometry type is a parameter rather than a fixed `Float64` because
+# the *arithmetic*, not just the storage, has to stay inside it: a device
+# without hardware fp64 must never evaluate a coordinate in `Float64` on
+# its way into a `Float32` field. Converting at the end would not do.
+function Forest{T}(roots::NTuple{D,Integer};
+                   N::Integer,
+                   G::Integer,
+                   periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
+                   extents::NTuple{D,Tuple{Real,Real}}=
+                       ntuple(d -> (zero(T), T(roots[d])), D)) where {T,D}
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
     N > 0 || throw(ArgumentError("N must be positive, got $N"))
     G >= 0 || throw(ArgumentError("G must be nonnegative, got $G"))
     iseven(N) || throw(ArgumentError("N must be even, got $N"))
     N >= 2G || throw(ArgumentError("N must be >= 2G, got N=$N, G=$G"))
 
-    ext = ntuple(d -> (Float64(extents[d][1]), Float64(extents[d][2])), D)
+    ext = ntuple(d -> (T(extents[d][1]), T(extents[d][2])), D)
     all(d -> ext[d][2] > ext[d][1], 1:D) ||
         throw(ArgumentError("each extent must be nonempty and increasing, got $ext"))
     # Blocks are cubes, so the root spacing must be the same in every
     # dimension.
     h = ntuple(d -> (ext[d][2] - ext[d][1]) / roots[d], D)
-    all(d -> isapprox(h[d], h[1]; rtol=1e-12), 1:D) ||
+    # 4096 eps is the type-generic spelling of the 1e-12 this check used
+    # when the geometry was always Float64: 1e-12 / eps(Float64) ≈ 4500.
+    # `h` can differ from `h[1]` only by the rounding of one subtraction
+    # and one division, so the slack is enormous either way; what matters
+    # is that it tracks the type rather than sitting below eps(Float32).
+    all(d -> isapprox(h[d], h[1]; rtol=4096 * eps(T)), 1:D) ||
         throw(ArgumentError("blocks must be cubes: extents $ext over roots $roots give " *
                             "anisotropic root spacings $h"))
 
     rootsI = map(Int, roots)
     leaves = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
     sort!(leaves)
-    return Forest{D}(rootsI, periodic, ext, Int(N), Int(G), leaves, Ref(0))
+    return Forest{D,T}(rootsI, periodic, ext, Int(N), Int(G), leaves, Ref(0))
 end
+
+# Without an explicit `T`, the geometry type follows the extents the
+# caller supplied; with no extents either, it is `Float64`. Both branches
+# are resolved from argument *types*, so this stays inferable.
+function Forest(roots::NTuple{D,Integer};
+                N::Integer,
+                G::Integer,
+                periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
+                extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing) where {D}
+    if extents === nothing
+        return Forest{Float64}(roots; N=N, G=G, periodic=periodic)
+    end
+    T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
+                                                    typeof(extents[d][2])), D)...))
+    return Forest{T}(roots; N=N, G=G, periodic=periodic, extents=extents)
+end
+
+"""
+    floattype(forest::Forest)
+
+The floating-point type `forest`'s geometry is computed in — what
+[`spacing`](@ref), [`cell_center`](@ref) and friends return, and the
+element type a [`FieldSet`](@ref) or [`GhostSchedule`](@ref) over this
+forest takes unless told otherwise.
+"""
+floattype(::Forest{D,T}) where {D,T} = T
 
 """
     generation(forest::Forest)

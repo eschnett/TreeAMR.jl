@@ -23,8 +23,8 @@ const GAUSS_W = [0.23692688505618908, 0.47862867049936647, 0.5688888888888889,
 The exact average of `f` over the cell of width `h` centered at `x` —
 what the conservative family treats a stored number as meaning.
 """
-function cell_average(f, x::NTuple{D,Float64}, h::Real) where {D}
-    total = 0.0
+function cell_average(f, x::NTuple{D,<:Real}, h::Real) where {D}
+    total = zero(promote_type(eltype(x), typeof(h)))
     for idx in CartesianIndices(ntuple(_ -> 1:length(GAUSS_X), D))
         i = Tuple(idx)
         weight = prod(GAUSS_W[i[d]] for d in 1:D) / 2^D
@@ -166,9 +166,10 @@ regions so that distant blocks stay at level 0. A single broad region
 would not do: balancing would lift everything off the coarsest level and
 leave only two levels in play.
 """
-function nested_forest(::Val{D}; N=4, G=1, roots=4, periodic=ntuple(_ -> false, D)) where {D}
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=periodic,
-                    extents=ntuple(_ -> (0.0, Float64(roots)), D))
+function nested_forest(::Val{D}; T=Float64, N=4, G=1, roots=4,
+                      periodic=ntuple(_ -> false, D)) where {D}
+    forest = Forest{T}(ntuple(_ -> roots, D); N=N, G=G, periodic=periodic,
+                       extents=ntuple(_ -> (0, roots), D))
     center = ntuple(_ -> 1.5, D)
     near(c, r) = all(d -> abs(c[d] - center[d]) <= r, 1:D)
     refine_where!(forest, (c, lvl) -> (lvl == 0 && near(c, 1.0)) ||

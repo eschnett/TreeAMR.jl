@@ -232,8 +232,8 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector;
     end
 
     # Balance the candidate tree without disturbing the live one.
-    scratch = Forest{D}(forest.roots, forest.periodic, forest.extents,
-                        forest.N, forest.G, candidate, Ref(0))
+    scratch = typeof(forest)(forest.roots, forest.periodic, forest.extents,
+                             forest.N, forest.G, candidate, Ref(0))
     balance!(scratch)
     return scratch.leaves
 end
@@ -454,7 +454,7 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     # answer does not move when the thread count does.
     partials = Vector{R}(undef, nblocks(fs))
     threaded_foreach(nblocks(fs)) do b
-        cellvolume = R(spacing(forest, blockkey(fs, b))^D)
+        cellvolume = spacing(R, forest, blockkey(fs, b))^D
         partials[b] = cellvolume * sum(interiorview(fs, b, var))
     end
     return sum(partials)
