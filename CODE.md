@@ -270,10 +270,11 @@ open, settled by the implementation:
   subtracts it, so one ghost width could not have distinguished them.
 - **`check_operators` takes the field set** and checks every constraint
   per dimension against that dimension's `G_d`, naming the dimension in
-  the message. It keeps `G_d ≥ 1` in every dimension, which means a
-  ghost-free field set cannot have a ghost schedule at all — correct for
-  the `G = 0` flux sets above, which are never ghost-filled, and the
-  message says so.
+  the message. It kept M2's blanket `G_d ≥ 1` in every dimension, so
+  that a ghost-free field set could not have a ghost schedule at all;
+  step 2 relaxed that along a stagger and a review after step 2 removed
+  it altogether — see the step-2 record below for why it was never
+  needed.
 - **`regrid!` allocates per field set from that set's own `G`**, and
   fills ghosts per field set from that set's own schedule, rather than
   once from a shared one.
@@ -290,16 +291,29 @@ weights as before, so no measured number moved: the whole suite passes
 unchanged, the M3 wave tables included, and the thread-independence
 digests still agree byte for byte. What the step settled or corrected:
 
-- **`G_d ≥ 1` is relaxed in vertex-like dimensions only.** Step 1's rule
-  — a dimension without ghosts has nothing to exchange, so a
-  ghost-filled field set needs `G_d ≥ 1` everywhere — stops being true
-  along a stagger: the block still has its shared plane, which is
-  exactly the whole exchange of a second-order evolved face field. So
-  the rule is kept in cell-centered dimensions and dropped in
-  vertex-like ones, and the message says which is which. `G = (0, g, g)`
-  on a face field at `p = 2` builds a schedule and fills it; in `D = 1`
-  that schedule is *entirely* injection, so the exchange is then exact
-  for arbitrary data rather than to an order.
+- **There is no blanket `G_d ≥ 1` at all** (amended after step 2; the
+  step itself only relaxed it along a stagger). Step 1's rule — a
+  dimension without ghosts has nothing to exchange, so a ghost-filled
+  field set needs `G_d ≥ 1` everywhere — was M2's uniform-`G` check made
+  per dimension, and it is redundant with the operator table wherever
+  interpolation reads a neighbor: point-value prolongation needs
+  `G_d ≥ p/2 ≥ 1`, conservative needs `G_d ≥ (p−1)/2`, which is 1 from
+  `p = 3` on, and restriction never reads ghosts in either family. The
+  one order it is not redundant for is conservative `p = 1`, where it
+  is *wrong*: piecewise-constant prolongation reads only the coarse
+  cell containing the fine one, tangentially as well as normally and in
+  the regrid transfer, so a cell-centered dimension with `G_d = 0` is a
+  legal layout for `Conservative` `(1, 2)` operators. That matters for
+  an auxiliary field set with no ghosts that must be carried across
+  regrids: `regrid!` needs a schedule, and the schedule needs
+  `check_operators` to pass. Its ghost exchange is simply empty (the
+  builder already skipped empty regions), and the conservative regrid
+  test now runs `p = 1` at `G = 0`. Along a stagger the reasoning is the
+  one step 2 gave: the block still has its shared plane, which is
+  exactly the whole exchange of a second-order evolved face field —
+  `G = (0, g, g)` at `p = 2` builds a schedule and fills it, and in
+  `D = 1` that schedule is *entirely* injection, so the exchange is then
+  exact for arbitrary data rather than to an order.
 - **`N ≥ p` is a cell-centered constraint**, not a global one. It was
   checked once against the forest's `N` because it does not mention `G`;
   it is about the restriction *window* fitting inside a fine block's
@@ -310,9 +324,9 @@ digests still agree byte for byte. What the step settled or corrected:
   slab on either side, so every direction that leaves the block along it
   has nothing to fill; testing the region for emptiness before the
   neighbor search spares the tree query as well as the zero-size launch.
-  (This is reachable only through the forest form of the constructor or
-  a mixed `G`; `check_operators` refuses a cell-centered `G_d = 0`
-  outright.)
+  (Reachable through the front door since the blanket `G_d ≥ 1` went: a
+  ghost-free cell-centered set with conservative `(1, 2)` operators has
+  an entirely empty schedule.)
 - **The oracle generalization the plan expected was not needed.** The
   plan anticipated teaching `cell_average` to average along cell-like
   dimensions only, so that a staggered field set could be checked as the
@@ -771,7 +785,8 @@ degree `p − 1` and no further, over all `2^D` centerings in `D = 1, 2, 3`
 at `p = 2` and `p = 4`, with `G = p/2 − 1` accepted where `G = p/2 − 2`
 is refused (M8a step 2); and as the convergence rate of an application
 that reads those ghosts, in the vertex-centered wave table under
-[the interface-order rule](#operators) above (M8a step 3). The last row is deliberately empty (decided). What a face- or
+[the interface-order rule](#operators) above (M8a step 3). The last row
+is deliberately empty (decided). What a face- or
 edge-centered quantity stores is an *average* along its cell-like
 dimensions and a *point value* along its vertex-like ones, so along a
 vertex dimension the conservative family has nothing to conserve and

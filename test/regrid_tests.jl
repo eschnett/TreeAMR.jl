@@ -556,7 +556,11 @@ end
     # merely for fields the operators reproduce.
     rng = MersenneTwister(1100 + D)
     for p in (1, 3)
-        G = max(1, (p - 1) ÷ 2)
+        # Exactly the ghosts the order needs -- none at p = 1, where the
+        # piecewise-constant prolongation reads only the containing cell
+        # and the exact average only a cell's own children, so this also
+        # carries a ghost-free field set across regrids.
+        G = (p - 1) ÷ 2
         ops = Operators(prolongation=p, restriction=2, family=Conservative)
         forest = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
                         extents=ntuple(_ -> (0.0, 1.0), D))

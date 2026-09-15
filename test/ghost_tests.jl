@@ -148,11 +148,19 @@ end
     @test_throws "dimension 2" check_operators(FieldSet(Forest((2, 2); N=8), 1;
                                                         G=(2, 1)), prolong(4))
 
-    # Ghost filling is meaningless without ghosts.
+    # There is no blanket "needs ghosts" rule: whether a ghost-free set
+    # can have a schedule follows from the orders alone. Point-value
+    # order 2 reads a neighbor and is refused by its own bound;
+    # conservative order 1 reads nothing outside the containing cell and
+    # gets a schedule -- an empty one; centering_tests.jl says what that
+    # buys.
     @test_throws ArgumentError GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=0),
                                              Operators(prolongation=2, restriction=2))
-    @test_throws "no ghosts" GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=0),
-                                           Operators(prolongation=2, restriction=2))
+    @test_throws "needs G >= 1" GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=0),
+                                              Operators(prolongation=2, restriction=2))
+    @test GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=0),
+                        Operators(prolongation=1, restriction=2,
+                                  family=Conservative)) isa GhostSchedule
 
     # The schedule requires operators too, for the same reason.
     @test_throws MethodError GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=1))
