@@ -12,20 +12,18 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6 are done (tree core, ghost exchange, ODE
-coupling, regridding, multi-threading, GPU), plus the conservative
-operator family that was scheduled for M8. Everything is `D`-generic and
-floating-point-type generic. Next is M8 — every centering, per-field-set
-ghost width, the interface restriction, Burgers — whose design is in
-CODE.md and whose step-by-step implementation plan is `M8-PLAN.md`; then
-MPI (M7), deliberately after M8 so the distributed exchange is built once
-over a layout-generic schedule; then I/O (M9).
+Current state: milestones M0–M6 and M8 are done (tree core, ghost
+exchange, ODE coupling, regridding, multi-threading, GPU; then every
+centering, per-field-set ghost widths, and conservation at coarse-fine
+faces). Everything is `D`-generic and floating-point-type generic. Next
+is MPI (M7), deliberately after M8 so the distributed exchange is built
+once over a layout-generic schedule; then I/O (M9).
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
 ## Commands
 
-Full test suite (about 65 s — the thread-independence test spends ~25 s
+Full test suite (about 3 min — the thread-independence test spends ~50 s
 of that running `test/thread_workload.jl` in two subprocesses):
 
 ```bash
@@ -91,7 +89,7 @@ is not simply `Pkg.test()` in this checkout: 1.10 cannot read a
 its `Pkg.test()` dies with "can not merge projects" whenever
 `test/Manifest.toml` exists — which the setup command above creates.
 Copy the tree without any manifest and run the test file directly
-(measured: 92366 tests, ~90 s):
+(measured: 96474 tests, ~2m15):
 
 ```bash
 rm -rf /tmp/amr110 && mkdir /tmp/amr110 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr110
@@ -217,12 +215,13 @@ names the high ghost slab.
 ## Tests
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
-`ghost_tests.jl`, `centering_tests.jl`, `state_tests.jl`,
-`regrid_tests.jl`, `wave_tests.jl`, `wave_cell_tests.jl`,
-`type_tests.jl`, `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
+`ghost_tests.jl`, `centering_tests.jl`, `interface_tests.jl`,
+`state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
+`wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
+`thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
 study comes in two halves: `wave_tests.jl` is the **vertex-centered**
 one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
-verbatim so its numbers stay under test. Four helper files are not
+verbatim so its numbers stay under test. Five helper files are not
 tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
@@ -236,12 +235,20 @@ tests:
   Every entry point takes `centering`, defaulting to `vertexcentered(D)`;
   `wave_forest` does not, because a centering does not change how space is
   cut into blocks.
+- `burgers.jl` — Burgers' equation as a **conservative** application
+  (`BurgersProblem`, `burgers_rhs!`, `burgers_errors`, `track_shock`,
+  `uniform_shock`), the M8b counterpart of `wave.jl`: the three-step
+  right-hand side, a cell-centered state with `G = 2` and `D`
+  face-centered flux sets with `G = 0`, and `fixup = false` as the
+  negative control for conservation. It reuses `to_backend` and
+  `convergence_rate` from `wave.jl` and `cell_average` from
+  `ghost_oracles.jl`, so `runtests.jl` includes it after both.
 - `thread_workload.jl` — a standalone script, not `include`d. The thread
   count is a command-line argument to Julia, so the M5 acceptance test runs
   this in subprocesses at two thread counts and compares their output byte
-  for byte. It is deliberately self-contained (its own RK4, no ODE package)
-  so a subprocess starts in a couple of seconds; keep it that way, and keep
-  everything it prints deterministic.
+  for byte. It is deliberately self-contained (its own RK4 and SSPRK3, no
+  ODE package) so a subprocess starts in a couple of seconds; keep it that
+  way, and keep everything it prints deterministic.
 
 Testset names are claims ("Coarsening conserves any field exactly", not
 "coarsening test"), and each opens with a comment naming the failure mode it

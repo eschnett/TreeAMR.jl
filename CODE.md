@@ -740,9 +740,40 @@ order by *one* only — the caveat on Erik's list that the rule "is only
 true if second derivatives are taken". For the conservative family, whose
 orders are odd, the prediction is therefore rates **1, 2, 2** for
 prolongation orders `p = 1, 3, 5` under a second-order finite-volume
-scheme, and `p = 3` is the first order that does not degrade it. This is
-what the M8 Burgers study measures (see [Milestones](#milestones)); the
-table goes here when it exists.
+scheme, and `p = 3` is the first order that does not degrade it.
+
+**Measured in M8b step 5**, with the Burgers study of `test/burgers.jl`:
+the smooth sine run to half its breaking time on the M3 two-level mesh,
+unlimited linear reconstruction, Rusanov flux, `SSPRK33`, conservative
+restriction (which is exact and therefore never enters), over
+`N = 8 … 64` in `D = 1` and `N = 8 … 32` in `D = 2`:
+
+| prolongation | L∞ rate, `D = 1` | L∞ rate, `D = 2` | L1 rate, `D = 1` | L1 rate, `D = 2` |
+|---|---|---|---|---|
+| 1 | **1.00** | **0.84** | 1.98 | 1.79 |
+| 3 | 1.97 | 1.81 | 1.96 | 1.88 |
+| 5 | 1.97 | 1.77 | 1.97 | 1.88 |
+| *unrefined control* | 1.93 | 1.76 | 1.97 | 1.90 |
+
+The prediction holds: order 1 costs a full order, order 3 recovers the
+scheme's own rate, and order 5 buys nothing further — the refined runs at
+`p = 3` and `p = 5` land on the *unrefined control's* rate, which is the
+sharper statement that the interface has stopped being what limits them.
+
+**The norm is part of the result** (measured in M8b step 5; the design
+did not anticipate it). The rule shows in `L∞` and **not** in an integral
+norm: every L1 column above is the scheme's own rate, `p = 1` included.
+An order-`p` prolongation leaves a flux defect on the coarse-fine face
+and nowhere else, and under a flux divergence — unlike under a second
+derivative — that defect stays where it is put, so the solution error it
+causes occupies a neighbourhood whose measure shrinks with `h`. A
+volume-weighted norm multiplies the two and sees `O(h²)` whatever `p` is.
+M3's wave study measured the same rule in L2 because a second-derivative
+stencil divides the ghost error by `h²` and radiates it over the whole
+domain; there the choice of norm did not matter, and here it decides
+whether the effect is visible at all. Both norms are asserted in
+`burgers_tests.jl`, in both directions, precisely because picking one and
+believing it is the easy mistake.
 
 **Interface stencils** (decided in M2): near a coarse-fine interface the
 symmetric restriction window cannot exist — fine data across the
@@ -942,6 +973,44 @@ and so does the two-cell average, since the coarse point is the midpoint
 of the two fine ones — which is the analytic claim the device test rests
 on. On Metal in `Float32` the fixup reproduces the CPU result bit for
 bit: it adds no arithmetic, only target ranges.
+
+**Measured in M8b step 5.** Burgers' equation (`test/burgers.jl`) is the
+application that puts a number on all of this, and every number below has
+its negative control — the identical run with step (ii) skipped, which is
+a keyword on the test problem and the *only* difference between the two.
+Mass is `Σ hᴰ u`, and the domain integral is exactly 1 here, so an "ulp"
+below is `eps(T)` of the answer itself.
+
+| configuration | mass drift | without the fixup |
+|---|---|---|
+| static two-level mesh, smooth, `D = 1` (62 steps) | 1.1e-16 (0.5 ulp) | 3.2e-4 |
+| the same, `D = 2` (123 steps) | 0 | 4.4e-5 |
+| the same, `D = 3` (92 steps) | 1.1e-16 (0.5 ulp) | 6.1e-5 |
+| shock tracked through regrids, `D = 1` (242 steps) | 3.3e-16 (1.5 ulp) | 3.8e-5 |
+| the same, `D = 2` (337 steps) | 5.6e-16 (2.5 ulp) | 5.1e-5 |
+| the same in `Float32`, `D = 1` (146 steps) | 1.2e-7 (1 ulp) | 2.5e-5 |
+
+Three things in that table are worth saying out loud. The drift is one or
+two ulp of the total mass and does **not** grow with the step count, so
+`c·eps(T)·Σ hᴰ|u|·nsteps` is a bound the runs sit ten orders inside
+rather than a rate they approach. The leak without the fixup is a
+*discretization* error, hence the same number in `Float64` and in
+`Float32` (2.466e-5 against 2.468e-5 in the same configuration) — which
+is why the separation is eleven orders of magnitude in double precision
+and a factor of 207 in single, and why the Float32 assertion has to be
+written against `eps(T)` rather than against a constant. And the
+**uniform** mesh conserves to roundoff with or without the fixup, since
+every face there is a same-level face: that is the control that pins all
+of the above on the coarse-fine faces rather than on the scheme.
+
+The same-level half of the argument is the application's obligation, and
+Burgers is where it becomes concrete: `G = 2` on the state, because the
+linear reconstruction at a block's own boundary face reads cells
+`i-2 … i+1`, and with one ghost the two sides of that face would
+reconstruct from different numbers. On Metal in `Float32` the whole
+three-step right-hand side reproduces the CPU bit for bit — the drift,
+the control's drift and the error norms are the same numbers — which is
+the strongest available statement that nothing in it is fp64-dependent.
 
 ### Regridding
 
@@ -1529,8 +1598,8 @@ design, see the M8 entry), and the list below is in execution order.
   side; `bench/symmetry_gpu.sh` is the cluster job that runs both.
   *(Done.)*
 - **M8 — Every centering, per-field-set ghost width, conservation,
-  Burgers.** Done before M7 (decided): the MPI exchange is built over
-  the schedule, and with the schedule layout-generic first, M7
+  Burgers.** *(Done.)* Done before M7 (decided): the MPI exchange is
+  built over the schedule, and with the schedule layout-generic first, M7
   distributes ghost fill, interface restriction and regrid transfer for
   every centering in one design, instead of building the cell-centered
   exchange and retrofitting it twice. The design is under
@@ -1583,8 +1652,9 @@ design, see the M8 entry), and the list below is in execution order.
     numbers stay under test; the thread digests. The cell-centered
     stencils are the same rational weights as before, so M8a changes no
     measured number. *(All of this is measured; see above.)*
-  - **M8b — conservation.** `InterfaceSchedule` / `restrict_interfaces!`
-    *(step 4, done; see "**Implemented in M8b step 4**" under
+  - **M8b — conservation.** *(Done.)* `InterfaceSchedule` /
+    `restrict_interfaces!`
+    *(step 4; see "**Implemented in M8b step 4**" under
     [Conservation](#conservation-at-coarse-fine-faces))*,
     `map_blocks!(…; closed = true)`, and Burgers' equation
     `∂ₜu + Σ_d ∂_d(u²/2) = 0` on a periodic box in `test/burgers.jl`:
@@ -1612,7 +1682,29 @@ design, see the M8 entry), and the list below is in execution order.
     restriction equal to a hand-computed average over the finer
     neighbors, and each target written exactly once per phase; the
     Burgers cycle in the thread-independence workload and in the device
-    suite.
+    suite. *(All of this is measured, in M8b step 5;
+    `test/burgers.jl` and `test/burgers_tests.jl` are the study.)*
+    **Mass is conserved to 0.5-2.5 ulp** of the domain integral, and the
+    drift does not grow with the step count; the negative control leaks
+    3.8e-5 to 3.2e-4 in the same runs, eleven orders of magnitude more,
+    with the full table and the `Float32` caveat under
+    [Conservation](#conservation-at-coarse-fine-faces). A **uniform**
+    mesh conserves with or without the fixup, which is what pins that on
+    the coarse-fine faces rather than on the scheme. The interface-order
+    rule comes out as predicted — L∞ rates **1.00 / 1.97 / 1.97** in
+    `D = 1` and **0.84 / 1.81 / 1.77** in `D = 2` for `p = 1, 3, 5`,
+    with `p = 3` and `p = 5` matching the *unrefined control's* own rate
+    — and the **norm turned out to be part of the result**: an integral
+    norm sees none of it, because a flux divergence leaves the defect on
+    the interface instead of radiating it as a second derivative does
+    (both under [Operators](#operators)). The tracked shock matches the
+    uniformly fine reference at **6.6e-4** against that mesh, where the
+    uniform coarse mesh is **5.2e-3** — 7.9x worse — using 80 cells
+    against 128, and with the travelling buffer removed the refined
+    region falls off the shock entirely. The Burgers cycle is in the
+    thread workload (bit-identical at 1 and 8 threads) and in the device
+    suite, where Metal in `Float32` reproduces the CPU numbers bit for
+    bit.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding.

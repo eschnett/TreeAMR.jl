@@ -7,7 +7,7 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M5**: the tree core (Morton keys over a
+The package is at milestone **M8**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -16,12 +16,18 @@ regridding, multi-threading throughout, and GPU support: the storage,
 the exchange schedule and every kernel follow a KernelAbstractions
 backend of the caller's choosing.
 
-M8 is under way; its layout half (M8a) has landed. The ghost width `G`
-is a [`FieldSet`](@ref) keyword now, one per dimension, rather than a
+M8 added the layout and the conservation. The ghost width `G` is a
+[`FieldSet`](@ref) keyword, one per dimension, rather than a
 [`Forest`](@ref) one, and a field set also carries a **centering** —
 [`cellcentered`](@ref), [`vertexcentered`](@ref), [`facecentered`](@ref)
 or [`edgecentered`](@ref) — so a [`GhostSchedule`](@ref) belongs to a
-*layout* rather than to a forest.
+*layout* rather than to a forest. [`InterfaceSchedule`](@ref) and
+[`restrict_interfaces!`](@ref) then make a finite-volume scheme
+conservative across coarse-fine faces, which under one global `dt` needs
+nothing but a spatial flux fixup within each right-hand side.
+
+Next is MPI (M7), so that the distributed exchange is built once over a
+layout-generic schedule.
 
 ## Overview
 

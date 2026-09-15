@@ -5,6 +5,7 @@ using TreeAMR
 include("oracles.jl")
 include("ghost_oracles.jl")
 include("wave.jl")
+include("burgers.jl")
 
 @info "Running the tests on $(Threads.nthreads()) thread(s)"
 
@@ -421,6 +422,7 @@ include("state_tests.jl")
 include("regrid_tests.jl")
 include("wave_tests.jl")
 include("wave_cell_tests.jl")
+include("burgers_tests.jl")
 include("type_tests.jl")
 include("thread_tests.jl")
 include("gpu_tests.jl")

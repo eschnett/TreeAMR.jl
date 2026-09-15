@@ -223,6 +223,31 @@ end
     @test Array(fs.work) == hostfs.work
 end
 
+@testset "$bname: the conservative cycle conserves on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # M8b's acceptance claim, on whatever backend: the three-step
+    # right-hand side of `burgers.jl` over the M3 two-level mesh keeps the
+    # domain integral of `u` to within a few ulp, and the same run with
+    # the fixup skipped does not.
+    #
+    # What is device-specific here is not the fixup — that has its own
+    # test above — but the shape of the right-hand side around it: a
+    # second field set per dimension with a different centering and no
+    # ghosts, a kernel launched over the *closed* range, and a divergence
+    # kernel whose flux argument is an `NTuple{D}` of device arrays,
+    # which has to survive the adaptation of kernel arguments intact.
+    ops = Operators(family=Conservative, prolongation=3, restriction=2)
+    common = (; N=8, roots=4, ops=ops, fraction=0.5, limiter=:none, T=T,
+              backend=backend)
+    r = burgers_errors(Val(D); common...)
+    control = burgers_errors(Val(D); common..., fixup=false)
+
+    @test r.nblocks > 4^D                         # the mesh really is two-level
+    @test isfinite(r.l1)
+    @test r.drift <= 64 * eps(T) * r.scale
+    @test control.drift > 100 * eps(T) * control.scale
+end
+
 @testset "$bname: the cell hook reproduces the host hook exactly: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # `boundary_by_coordinates` used to be a host loop calling

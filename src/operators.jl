@@ -88,8 +88,10 @@ forest, each with its own schedule.
     application's differencing order **by two**, for *both* operators, or
     the coarse-fine interface caps global convergence. This is why there
     is no default: the right order follows from the application's
-    discretization, which the mesh cannot know. (How the rule carries
-    over to the conservative family is to be measured in M8.)
+    discretization, which the mesh cannot know. The `+2` is the
+    second-derivative case; a flux divergence takes one derivative, so
+    for the conservative family the order must exceed the scheme's by
+    **one** — measured below.
 
     A ghost filled by an order-`p` operator carries an `O(hᵖ)` error. A
     second-derivative stencil divides it by `h²`, so the truncation
@@ -126,6 +128,23 @@ forest, each with its own schedule.
 
     at `G = 1`, where cell centering needs 2. The rows come in pairs
     because the two runs are the *same computation*, bit for bit.
+
+    For the **conservative** family under a second-order finite-volume
+    scheme the measured rates are (M8b, Burgers' equation, maximum norm;
+    the restriction order does not appear because conservative
+    restriction is exact)
+
+    | prolongation | rate, `D = 1` | rate, `D = 2` |
+    |---|---|---|
+    | 1 | 1.00 | 0.84 |
+    | 3 | 1.97 | 1.81 |
+    | 5 | 1.97 | 1.77 |
+
+    against 1.93 and 1.76 for the same mesh unrefined, so order 3 is the
+    first that does not degrade the scheme and order 5 buys nothing
+    more. The *maximum* norm: a flux divergence leaves the interface
+    defect where it is instead of radiating it, so an integral norm
+    converges at the scheme's own rate even at order 1. See `CODE.md`.
 
     Order 2 is the cheapest correct *interpolation*, not the right choice
     for a second-order-in-space application — which is what a default of

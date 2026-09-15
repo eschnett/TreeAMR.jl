@@ -9,7 +9,8 @@ no physics.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M6** (GPU support).
+The package is currently at milestone **M8** (every centering,
+per-field-set ghost widths, conservation at coarse-fine faces).
 
 ## Status
 
@@ -122,27 +123,41 @@ KernelAbstractions backend:
   [CODE.md](CODE.md#parallelism); `bench/gpu.jl` reproduces them and
   `bench/symmetry_gpu.sh` is the cluster job.
 
-Note that reaching 2nd order on a refined mesh needs **order-4**
-interpolation — see the warning on `Operators`.
+**M8 — centerings, ghost widths, conservation**
 
-M8 is under way, and its layout half (M8a) has landed. The ghost width
-`G` is a **field-set** keyword now, one per dimension, rather than a
-forest one — `FieldSet(forest, nvars; G = 2)` — because it says how far
-a stencil reaches into a neighbor's data, which is a property of what is
-stored. A field set also carries a **centering**: per dimension its
-values sit at the cell centers (`:cell`) or on the cell boundaries
-(`:vertex`), so `cellcentered`, `vertexcentered`, `facecentered` and
-`edgecentered` name the familiar layouts and the exchange, the geometry
-and the regrid transfer all follow from that one tuple. Two field sets
-over one forest with different `G` or centering is the normal case from
-here on, a `GhostSchedule` belongs to a layout rather than to a forest,
-and `regrid!` takes `fs => schedule` pairs. The wave-equation study is
-vertex-centered from here on, at `G = 1` where cell centering needs 2;
-the cell-centered study is kept beside it. Still to come (M8b): the
-interface restriction that makes a finite-volume scheme conservative
-across coarse-fine faces, and Burgers' equation as the test. MPI (M7)
-follows M8, so that the distributed exchange is built once over a
-layout-generic schedule; the design is in [CODE.md](CODE.md#centerings).
+- The ghost width `G` is a **field-set** keyword, one per dimension,
+  rather than a forest one — `FieldSet(forest, nvars; G = 2)` — because
+  it says how far a stencil reaches into a neighbor's data, which is a
+  property of what is stored, not of how space is cut up.
+- A field set also carries a **centering**: per dimension its values sit
+  at the cell centers (`:cell`) or on the cell boundaries (`:vertex`), so
+  `cellcentered`, `vertexcentered`, `facecentered` and `edgecentered`
+  name the familiar layouts, and the exchange, the geometry and the
+  regrid transfer all follow from that one tuple. Along a stagger
+  restriction is exact injection and prolongation needs one ghost less.
+- Two field sets over one forest with different `G` or centering is the
+  normal case — an evolved state with `G = 2` and the fluxes computed
+  from it with `G = 0` — so a `GhostSchedule` belongs to a *layout*
+  rather than to a forest, and `regrid!` takes `fs => schedule` pairs.
+- `InterfaceSchedule` / `restrict_interfaces!`: the flux fixup that makes
+  a finite-volume scheme conservative across coarse-fine faces. With one
+  global `dt` that is a purely spatial condition, so there are no flux
+  registers and no time-accumulated corrections.
+- Verified with Burgers' equation, in the tests as the wave equation is:
+  a shock crossing a refined region that follows it, regridding in
+  between, conserves the domain integral to **one or two ulp** over
+  hundreds of steps, where the same run without the fixup leaks eleven
+  orders of magnitude more — and a *uniform* mesh conserves either way,
+  which is what pins the effect on the coarse-fine faces.
+
+Note that reaching 2nd order on a refined mesh needs **order-4**
+interpolation for a second-derivative scheme, or order-3 conservative
+prolongation for a flux divergence — see the warning on `Operators`.
+
+Next is MPI (M7), deliberately after M8 so that the distributed
+exchange, the interface restriction and the regrid transfer are built
+once over a layout-generic schedule instead of being retrofitted for
+each centering; the design is in [CODE.md](CODE.md#centerings).
 
 ## Installation
 
