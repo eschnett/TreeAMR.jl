@@ -302,11 +302,12 @@ end
         FieldSet(Forest((2, 2); N=8), 1; G=(1, 2), centering=(:vertex, :cell)),
         ops(4)) === nothing
 
-    # A cell-centered dimension with no ghosts has nothing to exchange
-    # and is still refused; a vertex-like one has its shared plane and is
-    # accepted. That is the step-1 rule, relaxed exactly as far as the
-    # geometry allows.
-    @test_throws "no ghosts" GhostSchedule(FieldSet(Forest((2,); N=8), 1; G=0), OPS2C)
+    # There is no blanket G >= 1: the order constraints imply it wherever
+    # a stencil reads a neighbor. A cell-centered set with no ghosts is
+    # refused at point-value order 2 *by the order rule* -- the message
+    # names the layers the order needs, not a ghost-free layout -- and a
+    # vertex-like one has its shared plane and is accepted.
+    @test_throws "needs G >= 1" GhostSchedule(FieldSet(Forest((2,); N=8), 1; G=0), OPS2C)
     @test GhostSchedule(vset(0), OPS2C) isa GhostSchedule
 
     # One less than the bound fails; one more passes the exactness test.
@@ -315,6 +316,36 @@ end
                          centering=vertexcentered(1)) < 1e-10
     @test exchange_error(forest, ops(4), makepoly(1, 4); G=1,
                          centering=vertexcentered(1)) > 1e-8
+end
+
+@testset "A ghost-free cell-centered dimension is legal at conservative order 1" begin
+    # Piecewise-constant prolongation reads only the coarse cell that
+    # contains the fine one -- normally, tangentially, and in the regrid
+    # transfer -- and the exact average reads only a cell's own children,
+    # so conservative (1, 2) operators need no ghosts anywhere. M2's
+    # blanket `G >= 1`, made per dimension in step 1, would have refused
+    # exactly this layout: a ghost-free auxiliary set that must be
+    # carried across regrids, whose `regrid!` needs a schedule. The
+    # schedule exists and is empty; the exchange is a no-op.
+    cons1 = Operators(prolongation=1, restriction=2, family=Conservative)
+    ghostfree = FieldSet(Forest((2,); N=8), 1; G=0)
+    rng = MersenneTwister(2101)
+    interiorview(ghostfree, 1, 1) .= rand(rng, 8)
+    interiorview(ghostfree, 2, 1) .= rand(rng, 8)
+    before = copy(ghostfree.work)
+    schedule = GhostSchedule(ghostfree, cons1)
+    @test isempty(schedule.phase1) && isempty(schedule.phase2)
+    @test isempty(schedule.boundaries)
+    fill_ghosts!(ghostfree, schedule)
+    @test ghostfree.work == before
+
+    # A mixed layout: no ghosts along x, one along y. The x slabs do not
+    # exist, the y slabs are filled, and a constant -- all the family
+    # reproduces at order 1 -- comes through exactly on a three-level
+    # mesh, tangentially included.
+    forest = nested_forest(Val(2); N=8)
+    @test exchange_error(forest, cons1, makepoly(2, 0); G=(0, 1)) == 0
+    @test exchange_error(forest, cons1, makepoly(2, 0); G=(0, 0)) == 0
 end
 
 @testset "The conservative family is refused along a vertex-like dimension" begin

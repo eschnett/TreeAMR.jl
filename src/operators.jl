@@ -238,8 +238,15 @@ and prolongation reaches only `p/2 - 1` planes past the shared plane
 instead of `p/2` past the interface. In particular `G_d = 0` is legal
 there — a block still has its shared plane to exchange — and is exactly
 the second-order constrained-transport layout for an evolved face field.
-A cell-centered dimension with no ghosts has nothing to exchange, and is
-refused.
+
+There is no blanket requirement of `G_d ≥ 1` anywhere: the table implies
+it wherever interpolation reads a neighbor, which is every order except
+conservative prolongation of order 1. Piecewise-constant prolongation
+reads only the coarse cell containing the fine one and the exact average
+reads only a cell's own children, so a cell-centered dimension with
+`G_d = 0` is a legal layout for `Conservative` `(1, 2)` operators — a
+ghost-free auxiliary field set carried across regrids, say. Its exchange
+in that dimension is simply empty.
 """
 check_operators(fs::FieldSet, ops::Operators) =
     check_operators(fs.forest.N, fs.G, staggers(fs), ops)
@@ -273,13 +280,11 @@ function check_operators(N::Integer, G::NTuple{D,Int}, c::NTuple{D,Int},
                 "G >= $(pp ÷ 2 - 1), because its stencil reaches that many planes " *
                 "past the source's shared boundary plane, but G=$G (dimension $d)"))
         else
-            g >= 1 || throw(ArgumentError(
-                "ghost filling needs G >= 1 in a cell-centered dimension, got G=$G " *
-                "(dimension $d). A cell-centered dimension with no ghosts has " *
-                "nothing to exchange there and needs no GhostSchedule — which is " *
-                "what a computed flux set wants. (A vertex-like dimension does " *
-                "still have its shared boundary plane to exchange, and G = 0 is " *
-                "allowed there.)"))
+            # No blanket `g >= 1` here: the order constraints below imply
+            # it wherever a stencil reads a neighbor, and conservative
+            # order 1 — the one case they do not — reads nothing outside
+            # the containing cell, so a ghost-free dimension is legal for
+            # it and its exchange there is simply empty.
             g >= needed || throw(ArgumentError(
                 "$(ops.family) prolongation of order $pp needs G >= $needed ghost " *
                 "layers so its stencil fits within the coarse neighbor's interior " *
