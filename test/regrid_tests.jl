@@ -4,10 +4,10 @@ const OPS2 = Operators(prolongation=2, restriction=2)
 
 """A forest with random interior data, for transfer tests."""
 function noisy_forest(rng, ::Val{D}; roots=3, N=4, G=1, periodic=true, nvars=1) where {D}
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G,
+    forest = Forest(ntuple(_ -> roots, D); N=N,
                     periodic=ntuple(_ -> periodic, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
-    fs = FieldSet(forest, nvars)
+    fs = FieldSet(forest, nvars; G=G)
     for b in 1:nblocks(fs), v in 1:nvars
         interiorview(fs, b, v) .= rand(rng, size(interiorview(fs, b, v))...)
     end
@@ -15,7 +15,7 @@ function noisy_forest(rng, ::Val{D}; roots=3, N=4, G=1, periodic=true, nvars=1) 
 end
 
 @testset "complete_marks: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     before = copy(forest.leaves)
 
     # Keep everywhere is a no-op.
@@ -36,7 +36,7 @@ end
 end
 
 @testset "Coarsening needs a complete unanimous sibling group: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     parent = forest.leaves[1]
     refine!(forest, parent)
     balance!(forest)
@@ -55,14 +55,14 @@ end
     @test issorted(planned)
 
     # A root-level block cannot coarsen; asking is simply ignored.
-    flat = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    flat = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     @test complete_marks(flat, fill(Coarsen, nleaves(flat))) == flat.leaves
 end
 
 @testset "Marks are completed for 2:1 balance: D=$D" for D in (1, 2)
     # Refining one corner of a brick twice would leave a 2-level jump
     # against its neighbors, so completion must refine them too.
-    forest = Forest(ntuple(_ -> 4, D); N=4, G=1)
+    forest = Forest(ntuple(_ -> 4, D); N=4)
     refine!(forest, last(filter(k -> k.root == 0, forest.leaves)))
     balance!(forest)
     @test isbalanced(forest)
@@ -71,7 +71,7 @@ end
     flags = [k == deep ? Refine : Keep for k in forest.leaves]
     planned = complete_marks(forest, flags)
 
-    scratch = Forest(ntuple(_ -> 4, D); N=4, G=1)
+    scratch = Forest(ntuple(_ -> 4, D); N=4)
     empty!(scratch.leaves)
     append!(scratch.leaves, planned)
     @test isbalanced(scratch)
@@ -82,8 +82,8 @@ end
 # --- Buffering (CODE.md regridding step 2) ----------------------------
 
 """A uniform periodic brick and its centre block, for buffer tests."""
-function buffer_forest(::Val{D}; roots=3, N=8, G=1) where {D}
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+function buffer_forest(::Val{D}; roots=3, N=8) where {D}
+    forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
     mid = only(filter(k -> root_position(forest, k.root) == ntuple(_ -> roots ÷ 2, D),
                       forest.leaves))
@@ -115,14 +115,14 @@ end
     # The default must reproduce the unbuffered behaviour exactly -- both
     # the completed marks and the transferred data, bit for bit.
     build() = begin
-        f = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+        f = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
                    extents=ntuple(_ -> (0.0, 1.0), D))
         refine!(f, f.leaves[1])
         balance!(f)
         f
     end
     forest = build()
-    fs = fill_noise!(FieldSet(forest, 1), 1300 + D)
+    fs = fill_noise!(FieldSet(forest, 1; G=1), 1300 + D)
 
     rng = MersenneTwister(1400 + D)
     flags = flag_blocks(forest) do b, k
@@ -141,10 +141,10 @@ end
 
     # And the same through regrid!, data included.
     twin = build()
-    tfs = fill_noise!(FieldSet(twin, 1), 1300 + D)
+    tfs = fill_noise!(FieldSet(twin, 1; G=1), 1300 + D)
     @test twin.leaves == forest.leaves && tfs.work == fs.work
-    @test regrid!(forest, fs, GhostSchedule(forest, OPS2); flags=flags)
-    @test regrid!(twin, tfs, GhostSchedule(twin, OPS2); flags=flags, buffer=0)
+    @test regrid!(forest, fs => GhostSchedule(fs, OPS2); flags=flags)
+    @test regrid!(twin, tfs => GhostSchedule(tfs, OPS2); flags=flags, buffer=0)
     @test twin.leaves == forest.leaves
     @test tfs.work == fs.work                          # exactly
 end
@@ -241,10 +241,10 @@ end
 end
 
 @testset "A coarser neighbour in the buffer is promoted, and regrid! copes" begin
-    forest, mid = buffer_forest(Val(2); N=8, G=2)
+    forest, mid = buffer_forest(Val(2); N=8)
     refine!(forest, mid)
     balance!(forest)
-    fs = FieldSet(forest, 1)
+    fs = FieldSet(forest, 1; G=2)
     fill_by_coordinates!((x, v) -> 3.0, fs)
 
     # A level-1 child with a box against the low-x face of its root: the
@@ -257,7 +257,7 @@ end
     flags = [k == source ? (Refine, (1:2, 4:5)) : Keep for k in forest.leaves]
     @test buffer_recruits(forest, flags, 2) == Dict(coarse => Refine)
 
-    @test regrid!(forest, fs, GhostSchedule(forest, OPS2); flags=flags, buffer=2)
+    @test regrid!(forest, fs => GhostSchedule(fs, OPS2); flags=flags, buffer=2)
     @test isbalanced(forest)
     @test issorted(forest.leaves)
     @test maxlevel(forest) == 2
@@ -273,7 +273,7 @@ end
     # Box-as-source: a block already at its target level reports
     # (Keep, box) and asks for its own level around it, pulling coarser
     # neighbours up without touching those already there.
-    forest, mid = buffer_forest(Val(2); N=8, G=2)
+    forest, mid = buffer_forest(Val(2); N=8)
     refine!(forest, mid)
     balance!(forest)
 
@@ -346,14 +346,14 @@ end
     # Boxes on Keep and Coarsen flags are the new source form; with no
     # buffer they must still be inert, marks and data alike.
     build() = begin
-        f = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+        f = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
                    extents=ntuple(_ -> (0.0, 1.0), D))
         refine!(f, f.leaves[1])
         balance!(f)
         f
     end
     forest = build()
-    fs = fill_noise!(FieldSet(forest, 1), 1300 + D)
+    fs = fill_noise!(FieldSet(forest, 1; G=1), 1300 + D)
 
     cycle = (Refine, Coarsen, Keep)
     plain = flag_blocks((b, k) -> cycle[mod1(b, 3)], forest)
@@ -365,9 +365,9 @@ end
     @test complete_marks(forest, boxed; buffer=0) == complete_marks(forest, plain)
 
     twin = build()
-    tfs = fill_noise!(FieldSet(twin, 1), 1300 + D)
-    @test regrid!(forest, fs, GhostSchedule(forest, OPS2); flags=plain)
-    @test regrid!(twin, tfs, GhostSchedule(twin, OPS2); flags=boxed, buffer=0)
+    tfs = fill_noise!(FieldSet(twin, 1; G=1), 1300 + D)
+    @test regrid!(forest, fs => GhostSchedule(fs, OPS2); flags=plain)
+    @test regrid!(twin, tfs => GhostSchedule(tfs, OPS2); flags=boxed, buffer=0)
     @test twin.leaves == forest.leaves
     @test tfs.work == fs.work                            # bit for bit
 end
@@ -388,20 +388,20 @@ end
 end
 
 @testset "regrid! mechanics: D=$D" for D in (1, 2)
-    forest = Forest(ntuple(_ -> 4, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 4, D); N=4, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
-    fs = FieldSet(forest, 2)
+    fs = FieldSet(forest, 2; G=1)
     fill_by_coordinates!((x, v) -> v + sum(x), fs)
-    schedule = GhostSchedule(forest, OPS2)
+    schedule = GhostSchedule(fs, OPS2)
 
     # No flags set: nothing happens, and the schedule stays usable.
-    @test regrid!(forest, fs, schedule; flags=fill(Keep, nleaves(forest))) == false
+    @test regrid!(forest, fs => schedule; flags=fill(Keep, nleaves(forest))) == false
     @test !isstale(schedule)
 
     before = nleaves(forest)
     gen = generation(forest)
     flags = flag_blocks((b, k) -> block_extent(forest, k)[1][2] <= 0.5 ? Refine : Keep, forest)
-    @test regrid!(forest, fs, schedule; flags=flags) == true
+    @test regrid!(forest, fs => schedule; flags=flags) == true
 
     @test nleaves(forest) > before
     @test generation(forest) > gen
@@ -413,28 +413,38 @@ end
     @test size(fs.work)[end] == nleaves(forest)
     @test all(isfinite, fs.work)
 
-    rebuilt = GhostSchedule(forest, OPS2)
+    rebuilt = GhostSchedule(fs, OPS2)
     @test !isstale(rebuilt)
     @test fill_ghosts!(fs, rebuilt) === fs
 end
 
 @testset "regrid! argument checking" begin
-    forest = Forest((4,); N=4, G=1, periodic=(true,))
-    fs = FieldSet(forest, 1)
-    schedule = GhostSchedule(forest, OPS2)
+    forest = Forest((4,); N=4, periodic=(true,))
+    fs = FieldSet(forest, 1; G=1)
+    schedule = GhostSchedule(fs, OPS2)
     keep = fill(Keep, nleaves(forest))
 
-    @test_throws DimensionMismatch regrid!(forest, fs, schedule;
+    @test_throws DimensionMismatch regrid!(forest, fs => schedule;
                                            flags=fill(Keep, nleaves(forest) + 1))
 
-    other = Forest((4,); N=4, G=1, periodic=(true,))
-    @test_throws ArgumentError regrid!(other, fs, GhostSchedule(other, OPS2); flags=keep)
-    @test_throws ArgumentError regrid!(forest, FieldSet(other, 1), schedule; flags=keep)
+    other = Forest((4,); N=4, periodic=(true,))
+    @test_throws ArgumentError regrid!(other, fs => GhostSchedule(fs, OPS2); flags=keep)
+    @test_throws ArgumentError regrid!(forest, FieldSet(other, 1; G=1) => schedule;
+                                       flags=keep)
+
+    # A field set must bring its *own* schedule: one built for a
+    # different ghost width has the wrong ranges in every stencil.
+    @test_throws "pair each field set" regrid!(forest, FieldSet(forest, 1; G=2) => schedule;
+                                               flags=keep)
+
+    # Bare field sets are the M6 form, and say so.
+    @test_throws "=> schedule" regrid!(forest, fs, schedule; flags=keep)
+    @test_throws "=> schedule" regrid!(forest, [fs]; flags=keep)
 
     # A schedule that predates a tree change cannot be trusted to fill
     # the ghosts the transfer reads.
     refine!(forest, forest.leaves[1])
-    @test_throws ArgumentError regrid!(forest, fs, schedule;
+    @test_throws ArgumentError regrid!(forest, fs => schedule;
                                        flags=fill(Keep, nleaves(forest)))
 end
 
@@ -443,18 +453,18 @@ end
     # which holds whenever the previous tree was balanced. If that
     # invariant were ever broken, the transfer must say so rather than
     # silently produce wrong data.
-    forest = Forest((2,); N=4, G=1, periodic=(true,))
+    forest = Forest((2,); N=4, periodic=(true,))
     old = copy(forest.leaves)
     grandchildren = collect(Iterators.flatten(childkeys(c) for c in childkeys(old[1])))
     new = sort!(vcat(grandchildren, old[2:end]))
-    @test_throws ArgumentError TreeAMR.transfer_groups(Float64, forest, old, new, OPS2,
-                                                      CPU())
+    @test_throws ArgumentError TreeAMR.transfer_groups(Float64, forest, (1,), old, new,
+                                                      OPS2, CPU())
 end
 
 @testset "Untouched blocks are copied bit-exactly: D=$D" for D in (1, 2)
     rng = MersenneTwister(700 + D)
     forest, fs = noisy_forest(rng, Val(D); roots=4)
-    schedule = GhostSchedule(forest, OPS2)
+    schedule = GhostSchedule(fs, OPS2)
 
     untouched = [k for k in forest.leaves if block_extent(forest, k)[1][1] >= 0.5]
     saved = Dict(k => copy(interiorview(fs, findfirst(==(k), forest.leaves), 1))
@@ -462,7 +472,7 @@ end
 
     flags = flag_blocks((b, k) -> block_extent(forest, k)[1][2] <= 0.25 ? Refine : Keep,
                         forest)
-    @test regrid!(forest, fs, schedule; flags=flags)
+    @test regrid!(forest, fs => schedule; flags=flags)
 
     for k in untouched
         b = findfirst(==(k), forest.leaves)
@@ -476,19 +486,19 @@ end
     # exact mean of its children and the volume integral is untouched --
     # whatever the data.
     rng = MersenneTwister(800 + D)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
     refine!(forest, copy(forest.leaves))
     balance!(forest)
 
-    fs = FieldSet(forest, 1)
+    fs = FieldSet(forest, 1; G=1)
     for b in 1:nblocks(fs)
         interiorview(fs, b, 1) .= rand(rng, size(interiorview(fs, b, 1))...)
     end
     before = total_mass(fs)
 
     fine = nleaves(forest)
-    @test regrid!(forest, fs, GhostSchedule(forest, OPS2);
+    @test regrid!(forest, fs => GhostSchedule(fs, OPS2);
                   flags=fill(Coarsen, nleaves(forest)))
     @test nleaves(forest) < fine
     @test total_mass(fs) ≈ before rtol = 1e-14
@@ -501,18 +511,18 @@ end
     rng = MersenneTwister(900 + D)
 
     # A constant is representable at any order, on a periodic domain.
-    forest = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
-    fs = FieldSet(forest, 1)
+    fs = FieldSet(forest, 1; G=1)
     fill_by_coordinates!((x, v) -> 2.0, fs)
     before = total_mass(fs)
     for _ in 1:5
-        schedule = GhostSchedule(forest, OPS2)
+        schedule = GhostSchedule(fs, OPS2)
         flags = flag_blocks(forest) do b, k
             r = rand(rng)
             r < 0.35 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
         end
-        regrid!(forest, fs, schedule; flags=flags)
+        regrid!(forest, fs => schedule; flags=flags)
         @test isbalanced(forest)
     end
     @test total_mass(fs) ≈ before rtol = 1e-12
@@ -522,17 +532,17 @@ end
     # exact solution on the boundary. (A polynomial is discontinuous
     # across a periodic seam, so mass would legitimately drift there.)
     linear = (x, v) -> 1.0 + sum(x)
-    open = Forest(ntuple(_ -> 3, D); N=4, G=1, extents=ntuple(_ -> (0.0, 1.0), D))
-    ofs = FieldSet(open, 1)
+    open = Forest(ntuple(_ -> 3, D); N=4, extents=ntuple(_ -> (0.0, 1.0), D))
+    ofs = FieldSet(open, 1; G=1)
     fill_by_coordinates!(linear, ofs)
     before = total_mass(ofs)
     for _ in 1:5
-        schedule = GhostSchedule(open, OPS2)
+        schedule = GhostSchedule(ofs, OPS2)
         flags = flag_blocks(open) do b, k
             r = rand(rng)
             r < 0.35 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
         end
-        regrid!(open, ofs, schedule; flags=flags,
+        regrid!(open, ofs => schedule; flags=flags,
                 boundary=boundary_by_coordinates(linear))
         @test isbalanced(open)
     end
@@ -548,21 +558,21 @@ end
     for p in (1, 3)
         G = max(1, (p - 1) ÷ 2)
         ops = Operators(prolongation=p, restriction=2, family=Conservative)
-        forest = Forest(ntuple(_ -> 3, D); N=4, G=G, periodic=ntuple(_ -> true, D),
+        forest = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
                         extents=ntuple(_ -> (0.0, 1.0), D))
-        fs = FieldSet(forest, 1)
+        fs = FieldSet(forest, 1; G=G)
         for b in 1:nblocks(fs)
             interiorview(fs, b, 1) .= rand(rng, size(interiorview(fs, b, 1))...)
         end
         before = total_mass(fs)
 
         for _ in 1:5
-            schedule = GhostSchedule(forest, ops)
+            schedule = GhostSchedule(fs, ops)
             flags = flag_blocks(forest) do b, k
                 r = rand(rng)
                 r < 0.35 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
             end
-            regrid!(forest, fs, schedule; flags=flags)
+            regrid!(forest, fs => schedule; flags=flags)
             @test isbalanced(forest)
         end
         @test total_mass(fs) ≈ before rtol = 1e-12
@@ -576,35 +586,35 @@ end
     # without those neighbours giving anything up.
     rng = MersenneTwister(1234)
     ops = Operators(prolongation=2, restriction=2)
-    forest = Forest((3,); N=4, G=1, periodic=(true,), extents=((0.0, 1.0),))
-    fs = FieldSet(forest, 1)
+    forest = Forest((3,); N=4, periodic=(true,), extents=((0.0, 1.0),))
+    fs = FieldSet(forest, 1; G=1)
     for b in 1:nblocks(fs)
         interiorview(fs, b, 1) .= rand(rng, size(interiorview(fs, b, 1))...)
     end
     before = total_mass(fs)
     for _ in 1:5
-        schedule = GhostSchedule(forest, ops)
+        schedule = GhostSchedule(fs, ops)
         flags = flag_blocks(forest) do b, k
             r = rand(rng)
             r < 0.35 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
         end
-        regrid!(forest, fs, schedule; flags=flags)
+        regrid!(forest, fs => schedule; flags=flags)
     end
     @test !isapprox(total_mass(fs), before; rtol=1e-8)
 end
 
 @testset "Several field sets regrid together: D=$D" for D in (1, 2)
-    forest = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
-    state = FieldSet(forest, 2)
-    aux = FieldSet(forest, 1)
+    state = FieldSet(forest, 2; G=1)
+    aux = FieldSet(forest, 1; G=1)
     fill_by_coordinates!((x, v) -> 2.0, state)
     fill_by_coordinates!((x, v) -> 5.0, aux)
 
-    schedule = GhostSchedule(forest, OPS2)
     flags = flag_blocks((b, k) -> block_extent(forest, k)[1][2] <= 0.4 ? Refine : Keep,
                         forest)
-    @test regrid!(forest, [state, aux], schedule; flags=flags)
+    @test regrid!(forest, [state => GhostSchedule(state, OPS2),
+                           aux => GhostSchedule(aux, OPS2)]; flags=flags)
 
     @test nblocks(state) == nleaves(forest)
     @test nblocks(aux) == nleaves(forest)
@@ -615,14 +625,35 @@ end
     end
 end
 
-@testset "transfer=false rebuilds the mesh without moving data: D=$D" for D in (1, 2)
-    forest = Forest(ntuple(_ -> 3, D); N=4, G=1, periodic=ntuple(_ -> true, D))
-    fs = FieldSet(forest, 1)
-    fill_by_coordinates!((x, v) -> 7.0, fs)
-    schedule = GhostSchedule(forest, OPS2)
+@testset "`fs => nothing` resizes a field set without transferring: D=$D" for D in (1, 2)
+    # What a computed quantity wants — a flux the next right-hand side
+    # overwrites anyway, and whose ghost-free layout has no schedule to
+    # fill it from. The evolved set beside it still transfers.
+    forest = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, 1.0), D))
+    state = FieldSet(forest, 1; G=1)
+    flux = FieldSet(forest, 1; G=0)
+    fill_by_coordinates!((x, v) -> 2.0, state)
+    fill_by_coordinates!((x, v) -> 5.0, flux)
 
     flags = flag_blocks((b, k) -> b == 1 ? Refine : Keep, forest)
-    @test regrid!(forest, fs, schedule; flags=flags, transfer=false)
+    @test regrid!(forest, [state => GhostSchedule(state, OPS2), flux => nothing];
+                  flags=flags)
+
+    @test nblocks(state) == nblocks(flux) == nleaves(forest)
+    @test size(flux.work) == (ntuple(_ -> forest.N, D)..., 1, nleaves(forest))
+    @test all(b -> all(≈(2.0), interiorview(state, b, 1)), 1:nblocks(state))
+    @test all(iszero, flux.work)                 # resized, never transferred
+end
+
+@testset "transfer=false rebuilds the mesh without moving data: D=$D" for D in (1, 2)
+    forest = Forest(ntuple(_ -> 3, D); N=4, periodic=ntuple(_ -> true, D))
+    fs = FieldSet(forest, 1; G=1)
+    fill_by_coordinates!((x, v) -> 7.0, fs)
+    schedule = GhostSchedule(fs, OPS2)
+
+    flags = flag_blocks((b, k) -> b == 1 ? Refine : Keep, forest)
+    @test regrid!(forest, fs => schedule; flags=flags, transfer=false)
     @test nblocks(fs) == nleaves(forest)
     @test all(iszero, fs.work)                         # storage is fresh, not carried
 end
@@ -630,9 +661,9 @@ end
 @testset "Initial-data cycle: D=$D" for D in (1, 2)
     L = 1.0
     bump = (x, v) -> exp(-sum((x[d] - 0.5L)^2 for d in 1:D) / (2 * 0.06^2))
-    forest = Forest(ntuple(_ -> 4, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 4, D); N=4, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, L), D))
-    fs = FieldSet(forest, 1)
+    fs = FieldSet(forest, 1; G=1)
 
     # Refine towards the bump, in nested shells.
     function flag(b, k)
@@ -664,8 +695,8 @@ end
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         block = blockview(fs, b, 1)
-        for idx in CartesianIndices(ntuple(_ -> (forest.G + 1):(forest.G + forest.N), D))
-            @test block[idx] ≈ bump(cell_center(forest, k, Tuple(idx)), 1)
+        for idx in CartesianIndices(ntuple(_ -> (fs.G[1] + 1):(fs.G[1] + forest.N), D))
+            @test block[idx] ≈ bump(coordinates(fs, b, Tuple(idx)), 1)
         end
     end
 end

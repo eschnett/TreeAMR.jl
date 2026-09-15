@@ -98,24 +98,3 @@ function block_extent(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D}
     return ntuple(d -> (origin[d], origin[d] + width), D)
 end
 block_extent(forest::Forest{D,T}, k::MortonKey{D}) where {D,T} = block_extent(T, forest, k)
-
-"""
-    cell_center([T], forest, k::MortonKey, idx::NTuple{D,Integer})
-
-The physical position of the center of cell `idx` of block `k`. `idx` is
-1-based over the *stored* array, so interior cells are `G+1:G+N` and
-values outside that range name ghost cells (whose coordinates are still
-well defined, and lie outside the block).
-"""
-function cell_center(::Type{T}, forest::Forest{D}, k::MortonKey{D},
-                     idx::NTuple{D,<:Integer}) where {T,D}
-    origin = block_origin(T, forest, k)
-    h = spacing(T, forest, k)
-    # `1//2` rather than `0.5`: the literal would be a `Float64` operand
-    # and would drag the whole expression into fp64. The conversion is
-    # exact and folds away at compile time.
-    half = oftype(h, 1//2)
-    return ntuple(d -> origin[d] + (Int(idx[d]) - forest.G - half) * h, D)
-end
-cell_center(forest::Forest{D,T}, k::MortonKey{D}, idx::NTuple{D,<:Integer}) where {D,T} =
-    cell_center(T, forest, k, idx)

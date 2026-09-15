@@ -17,9 +17,10 @@ import KernelAbstractions
 export MortonKey, MAX_LEVEL, level, parentkey, childkeys, sortedchildkeys, isancestor
 export Forest, nleaves, maxlevel, root_position, root_index, alldirections, floattype
 export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
-export root_spacing, spacing, minimum_spacing, block_origin, block_extent, cell_center,
+export root_spacing, spacing, minimum_spacing, block_origin, block_extent,
        block_spacings, block_origins
-export FieldSet, nblocks, blockkey, blockview, interiorview, fill_by_coordinates!
+export FieldSet, nblocks, blockkey, blockview, interiorview, coordinates,
+       fill_by_coordinates!
 
 # Ghost exchange and interpolation operators (M2)
 export Operators, OperatorFamily, PointValue, Conservative, check_operators,

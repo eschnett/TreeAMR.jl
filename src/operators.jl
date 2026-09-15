@@ -131,7 +131,8 @@ target, so it stays interpolation and never becomes extrapolation (which
 the schedule asserts). Conservative restriction never shifts: its window
 is exactly a cell's own children.
 
-The orders are therefore constrained by the block geometry (see
+The orders are therefore constrained by the block geometry, per
+dimension against that dimension's ghost width (see
 [`check_operators`](@ref)):
 
 - `G ≥ prolongation ÷ 2` (point-value) or `(prolongation - 1) ÷ 2`
@@ -199,29 +200,46 @@ ghost_layers_read(ops::Operators) =
     ops.family === Conservative ? (ops.prolongation - 1) ÷ 2 : ops.prolongation ÷ 2
 
 """
-    check_operators(forest, ops::Operators)
+    check_operators(fs::FieldSet, ops::Operators)
 
-Verify that `forest`'s `N` and `G` support the requested interpolation
-orders, throwing an `ArgumentError` naming the violated invariant
-otherwise. Called when a [`GhostSchedule`](@ref) is built.
+Verify that the forest's `N` and the *field set's* per-dimension `G`
+support the requested interpolation orders, throwing an `ArgumentError`
+naming the violated invariant otherwise. Called when a
+[`GhostSchedule`](@ref) is built.
+
+Every constraint is per dimension, against that dimension's `G[d]`
+(amended in M8, with the ghost width): a field set may be wide in one
+dimension and narrow in another, and the stencils are built per
+dimension already.
 """
-function check_operators(forest::Forest, ops::Operators)
-    N, G = forest.N, forest.G
-    G >= 1 || throw(ArgumentError("ghost filling needs G >= 1, got G=$G"))
+check_operators(fs::FieldSet, ops::Operators) =
+    check_operators(fs.forest.N, fs.G, ops)
 
+function check_operators(N::Integer, G::NTuple{D,Int}, ops::Operators) where {D}
     pp = ops.prolongation
-    needed = ghost_layers_read(ops)
-    G >= needed || throw(ArgumentError(
-        "$(ops.family) prolongation of order $pp needs G >= $needed ghost layers so its " *
-        "stencil fits within the coarse neighbor's interior plus ghosts, but G=$G"))
-
     pr = ops.restriction
+    needed = ghost_layers_read(ops)
+
+    # `N` is the forest's, so the one constraint that does not mention
+    # `G` is checked once rather than once per dimension.
     N >= pr || throw(ArgumentError(
         "restriction of order $pr needs N >= $pr so the stencil fits within a fine " *
         "block's interior, but N=$N"))
-    N >= 2G + pr ÷ 2 - 1 || throw(ArgumentError(
-        "restriction of order $pr into G=$G ghost layers needs N >= $(2G + pr ÷ 2 - 1) " *
-        "fine interior cells, but N=$N"))
+
+    for d in 1:D
+        g = G[d]
+        g >= 1 || throw(ArgumentError(
+            "ghost filling needs G >= 1, got G=$G (dimension $d). A field set with " *
+            "no ghosts in some dimension has nothing to exchange there and needs " *
+            "no GhostSchedule — which is what a computed flux set wants."))
+        g >= needed || throw(ArgumentError(
+            "$(ops.family) prolongation of order $pp needs G >= $needed ghost layers " *
+            "so its stencil fits within the coarse neighbor's interior plus ghosts, " *
+            "but G=$G (dimension $d)"))
+        N >= 2g + pr ÷ 2 - 1 || throw(ArgumentError(
+            "restriction of order $pr into G=$g ghost layers (dimension $d) needs " *
+            "N >= $(2g + pr ÷ 2 - 1) fine interior cells, but N=$N"))
+    end
     return nothing
 end
 

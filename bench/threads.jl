@@ -35,7 +35,7 @@ const OPS = Operators(prolongation=4, restriction=4)
                                    ::Val{DD}, ::Val{GG}) where {DD,GG}
     I = @index(Global, NTuple)
     b = I[DD + 1]
-    c = ntuple(d -> I[d] + GG, Val(DD))
+    c = ntuple(d -> I[d] + GG[d], Val(DD))
     u0 = work[c..., 1, b]
     laplacian = zero(eltype(du))
     for d in 1:DD
@@ -58,7 +58,7 @@ end
 
 """A two-level mesh: the middle eighth of the domain refined once."""
 function build_forest(::Val{DD}) where {DD}
-    forest = Forest(ntuple(_ -> ROOTS, DD); N=N, G=G,
+    forest = Forest(ntuple(_ -> ROOTS, DD); N=N,
                     periodic=ntuple(_ -> true, DD),
                     extents=ntuple(_ -> (0.0, 1.0), DD))
     targets = filter(forest.leaves) do k
@@ -83,8 +83,8 @@ end
 
 function main()
     forest = build_forest(Val(D))
-    fs = FieldSet(forest, 2)
-    schedule = GhostSchedule(forest, OPS)
+    fs = FieldSet(forest, 2; G=G)
+    schedule = GhostSchedule(fs, OPS)
     spacings = block_spacings(forest)
     fill_by_coordinates!((x, v) -> sin(2π * x[1]) + v, fs)
 
@@ -96,7 +96,7 @@ function main()
     rhs!() = begin
         scatter!(fs, u)
         fill_ghosts!(fs, schedule)
-        map_blocks!(bench_rhs_kernel!, fs, dua, fs.work, spacings, Val(D), Val(G))
+        map_blocks!(bench_rhs_kernel!, fs, dua, fs.work, spacings, Val(D), Val(fs.G))
     end
 
     # Refine a slab, so the regrid really moves blocks around.
@@ -110,7 +110,7 @@ function main()
     t_scatter = best(() -> scatter!(fs, u))
     t_fill = best(() -> fill_by_coordinates!((x, v) -> sin(2π * x[1]) + v, fs))
     t_norm = best(() -> volume_weighted_norm(fs, u))
-    t_schedule = best(() -> GhostSchedule(forest, OPS), max(3, REPS ÷ 4))
+    t_schedule = best(() -> GhostSchedule(fs, OPS), max(3, REPS ÷ 4))
     t_marks = best(() -> complete_marks(forest, flags), max(3, REPS ÷ 4))
 
     # The bandwidth reference, on arrays the size of the working array.

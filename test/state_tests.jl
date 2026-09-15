@@ -7,15 +7,15 @@ using KernelAbstractions: @kernel, @index, @Const
     I = @index(Global, NTuple)                    # (i1..iD, block)
     b = I[D + 1]
     inner = ntuple(d -> I[d], Val(D))
-    c = ntuple(d -> I[d] + G, Val(D))
+    c = ntuple(d -> I[d] + G[d], Val(D))
     du[inner..., 1, b] = 2 * work[c..., 1, b]
 end
 
 @testset "State vector layout: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
-    fs = FieldSet(forest, 2)
+    fs = FieldSet(forest, 2; G=1)
 
     @test statelength(fs) == forest.N^D * fs.nvars * nblocks(fs)
     u = statevector(fs)
@@ -35,11 +35,11 @@ end
 end
 
 @testset "scatter!/gather! round trip: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
 
-    fs = FieldSet(forest, 2)
+    fs = FieldSet(forest, 2; G=1)
     f = (x, v) -> v + sum(x) + prod(x)
     fill_by_coordinates!(f, fs)
 
@@ -48,14 +48,23 @@ end
     @test !all(iszero, u)
 
     # Scattering into a fresh field set reproduces every interior cell...
-    other = FieldSet(forest, 2)
+    other = FieldSet(forest, 2; G=1)
     @test scatter!(other, u) === other
     @test all(b -> interiorview(other, b) == interiorview(fs, b), 1:nblocks(fs))
 
     # ... and leaves the ghosts alone: the integrator never sees them.
-    stored = forest.N + 2 * forest.G
+    stored = forest.N + 2 * other.G[1]
     ghostcells = (stored^D - forest.N^D) * nblocks(fs) * fs.nvars
     @test count(iszero, other.work) == ghostcells
+
+    # A field set with a different ghost width holds the same state:
+    # the owned range is `N` wide whatever `G` is.
+    lopsided = FieldSet(forest, 2; G=ntuple(d -> d - 1, D))
+    @test statelength(lopsided) == statelength(fs)
+    scatter!(lopsided, u)
+    u3 = statevector(lopsided)
+    gather!(u3, lopsided)
+    @test u3 == u
 
     # Round trip is exact, not merely close.
     u2 = statevector(other)
@@ -64,23 +73,23 @@ end
 end
 
 @testset "map_blocks!: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
-    fs = FieldSet(forest, 1)
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
+    fs = FieldSet(forest, 1; G=1)
     fill!(fs.work, 1.0)
 
     # Doubling every interior cell touches exactly N^D * nblocks cells.
     du = statevector(fs)
-    map_blocks!(double_interior!, fs, statearray(du, fs), fs.work, Val(D), Val(forest.G))
+    map_blocks!(double_interior!, fs, statearray(du, fs), fs.work, Val(D), Val(fs.G))
     @test all(==(2.0), du)
     @test length(du) == forest.N^D * nblocks(fs)
 end
 
 @testset "Volume-weighted norm: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
-    fs = FieldSet(forest, 1)
+    fs = FieldSet(forest, 1; G=1)
 
     # A constant field has that constant for its norm, whatever the
     # refinement -- this is what "volume weighted" buys.
@@ -101,9 +110,9 @@ end
     fill_by_coordinates!(g, fs)
     gather!(u, fs)
 
-    uniform = Forest(ntuple(_ -> 2, D); N=8, G=1, periodic=ntuple(_ -> true, D),
+    uniform = Forest(ntuple(_ -> 2, D); N=8, periodic=ntuple(_ -> true, D),
                      extents=ntuple(_ -> (0.0, 1.0), D))
-    ufs = FieldSet(uniform, 1)
+    ufs = FieldSet(uniform, 1; G=1)
     fill_by_coordinates!(g, ufs)
     uu = statevector(ufs)
     gather!(uu, ufs)
@@ -125,11 +134,11 @@ using KernelAbstractions: CPU
 # the wrong window, the poison shows up as a wrong number rather than a
 # near-miss that a tolerance would swallow.
 function poisoned_fieldset(::Val{D}, nvars; N=4, G=2, seed=7) where {D}
-    forest = Forest(ntuple(_ -> 2, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (0.0, 1.0), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
-    fs = FieldSet(forest, nvars)
+    fs = FieldSet(forest, nvars; G=G)
     rng = MersenneTwister(seed)
     fill!(fs.work, 1e6)                       # poison, ghosts included
     for b in 1:nblocks(fs), v in 1:nvars
@@ -172,7 +181,7 @@ end
     # Both paths are reachable on `CPU()`, so this is checked on every
     # run and not only where there is a device.
     fs = poisoned_fieldset(Val(D), 2)
-    G = fs.forest.G
+    G = fs.G
     half = 0.5
     cases = (("sum", identity, +, 0.0),
              ("max|x|", abs, max, 0.0),

@@ -36,14 +36,12 @@ end
 
 """Fill every interior cell with the exact cell average of `f`."""
 function fill_cell_averages!(fs::FieldSet{T,D}, f) where {T,D}
-    forest = fs.forest
-    G, N = forest.G, forest.N
+    N = fs.forest.N
     for b in 1:nblocks(fs)
-        k = blockkey(fs, b)
-        h = spacing(forest, k)
+        h = spacing(fs.forest, blockkey(fs, b))
         block = blockview(fs, b, 1)
-        for idx in CartesianIndices(ntuple(_ -> (G + 1):(G + N), D))
-            block[idx] = cell_average(f, cell_center(forest, k, Tuple(idx)), h)
+        for idx in CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + N), D))
+            block[idx] = cell_average(f, coordinates(fs, b, Tuple(idx)), h)
         end
     end
     return fs
@@ -55,21 +53,19 @@ boundary_cell_averages(f) =
         h = spacing(fs.forest, key)
         block = blockview(fs, b, 1)
         for idx in region
-            block[idx] = cell_average(f, cell_center(fs.forest, key, Tuple(idx)), h)
+            block[idx] = cell_average(f, coordinates(fs, b, Tuple(idx)), h)
         end
         return nothing
     end
 
 """Worst deviation of any stored cell from the exact cell average of `f`."""
 function max_average_deviation(fs::FieldSet{T,D}, f) where {T,D}
-    forest = fs.forest
     worst = 0.0
     for b in 1:nblocks(fs)
-        k = blockkey(fs, b)
-        h = spacing(forest, k)
+        h = spacing(fs.forest, blockkey(fs, b))
         block = blockview(fs, b, 1)
         for idx in CartesianIndices(block)
-            exact = cell_average(f, cell_center(forest, k, Tuple(idx)), h)
+            exact = cell_average(f, coordinates(fs, b, Tuple(idx)), h)
             worst = max(worst, abs(block[idx] - exact))
         end
     end
@@ -80,10 +76,10 @@ end
 Fill a hierarchy with exact cell averages of `f`, exchange ghosts with
 the conservative family, and report the worst error anywhere.
 """
-function conservative_exchange_error(forest, ops, f)
-    fs = FieldSet(forest, 1)
+function conservative_exchange_error(forest, ops, f; G)
+    fs = FieldSet(forest, 1; G=G)
     fill_cell_averages!(fs, f)
-    fill_ghosts!(fs, GhostSchedule(forest, ops); boundary=boundary_cell_averages(f))
+    fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_cell_averages(f))
     return max_average_deviation(fs, f)
 end
 
@@ -92,13 +88,11 @@ scalarpoly(D, deg) = x -> sum(0.7d + 0.31 * (d + 1) * x[d]^e for d in 1:D for e 
 
 """Largest deviation of any stored cell (interior *and* ghost) from `f`."""
 function max_deviation(fs, f)
-    forest = fs.forest
     worst = 0.0
     for b in 1:nblocks(fs), v in 1:fs.nvars
-        k = blockkey(fs, b)
         blk = blockview(fs, b, v)
         for idx in CartesianIndices(blk)
-            x = cell_center(forest, k, Tuple(idx))
+            x = coordinates(fs, b, Tuple(idx))
             worst = max(worst, abs(blk[idx] - f(x, v)))
         end
     end
@@ -106,11 +100,10 @@ function max_deviation(fs, f)
 end
 
 """Fill with `f`, exchange ghosts, and report the worst error anywhere."""
-function exchange_error(forest, ops, f; nvars=2)
-    schedule = GhostSchedule(forest, ops)
-    fs = FieldSet(forest, nvars)
-    fill_by_coordinates!(f, fs)
-    fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
+function exchange_error(forest, ops, f; nvars=2, G=1)
+    fs = FieldSet(forest, nvars; G=G)
+    fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops);
+                 boundary=boundary_by_coordinates(f))
     return max_deviation(fs, f)
 end
 
@@ -122,8 +115,8 @@ double-writes.
 """
 function write_counts(schedule::GhostSchedule{T,D}) where {T,D}
     forest = schedule.forest
-    stored = forest.N + 2 * forest.G
-    counts = zeros(Int, ntuple(_ -> stored, D)..., nleaves(forest))
+    stored = ntuple(d -> forest.N + 2 * schedule.G[d], D)
+    counts = zeros(Int, stored..., nleaves(forest))
 
     function tally!(group::TransferGroup)
         blen = boxsize(group)
@@ -166,9 +159,9 @@ regions so that distant blocks stay at level 0. A single broad region
 would not do: balancing would lift everything off the coarsest level and
 leave only two levels in play.
 """
-function nested_forest(::Val{D}; T=Float64, N=4, G=1, roots=4,
+function nested_forest(::Val{D}; T=Float64, N=4, roots=4,
                       periodic=ntuple(_ -> false, D)) where {D}
-    forest = Forest{T}(ntuple(_ -> roots, D); N=N, G=G, periodic=periodic,
+    forest = Forest{T}(ntuple(_ -> roots, D); N=N, periodic=periodic,
                        extents=ntuple(_ -> (0, roots), D))
     center = ntuple(_ -> 1.5, D)
     near(c, r) = all(d -> abs(c[d] - center[d]) <= r, 1:D)
@@ -211,22 +204,22 @@ function periodic_vs_tiled(::Val{D}, M::Int; N=4, G=1, nvars=2,
     seam(c, lvl) = lvl < passes &&
         all(d -> min(mod(c[d], L), L - mod(c[d], L)) < 0.55, 1:D)
 
-    periodic = Forest(ntuple(_ -> M, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+    periodic = Forest(ntuple(_ -> M, D); N=N, periodic=ntuple(_ -> true, D),
                       extents=ntuple(_ -> (0.0, L), D))
     refine_where!(periodic, seam, passes)
 
-    tiled = Forest(ntuple(_ -> 3M, D); N=N, G=G, extents=ntuple(_ -> (-L, 2L), D))
+    tiled = Forest(ntuple(_ -> 3M, D); N=N, extents=ntuple(_ -> (-L, 2L), D))
     refine_where!(tiled, seam, passes)
 
     data = (x, v) -> sum(sin(3.1 * mod(x[d], L) + 0.7v) * (1 + 0.3d) for d in 1:D)
 
-    fsp = FieldSet(periodic, nvars)
+    fsp = FieldSet(periodic, nvars; G=G)
     fill_by_coordinates!(data, fsp)
-    fill_ghosts!(fsp, GhostSchedule(periodic, ops))
+    fill_ghosts!(fsp, GhostSchedule(fsp, ops))
 
-    fst = FieldSet(tiled, nvars)
+    fst = FieldSet(tiled, nvars; G=G)
     fill_by_coordinates!(data, fst)
-    fill_ghosts!(fst, GhostSchedule(tiled, ops); boundary=boundary_by_coordinates(data))
+    fill_ghosts!(fst, GhostSchedule(fst, ops); boundary=boundary_by_coordinates(data))
 
     lower(forest, k) = ntuple(d -> block_extent(forest, k)[d][1], D)
     index = Dict((level(k), lower(tiled, k)) => b for (b, k) in enumerate(tiled.leaves))

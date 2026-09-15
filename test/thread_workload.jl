@@ -24,7 +24,7 @@ using SHA: sha256
                                       ::Val{D}, ::Val{G}) where {D,G}
     I = @index(Global, NTuple)
     b = I[D + 1]
-    c = ntuple(d -> I[d] + G, Val(D))
+    c = ntuple(d -> I[d] + G[d], Val(D))
     u0 = work[c..., 1, b]
     laplacian = zero(eltype(du))
     for d in 1:D
@@ -82,10 +82,10 @@ transfer, more evolution — reduced to a handful of printed lines.
 function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer) where {D}
     L = 1.0
     x0 = 0.35
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G,
+    forest = Forest(ntuple(_ -> roots, D); N=N,
                     periodic=ntuple(_ -> periodic, D),
                     extents=ntuple(_ -> (0.0, L), D))
-    fs = FieldSet(forest, 2)
+    fs = FieldSet(forest, 2; G=G)
     initial = workload_pulse(D, L, x0, σ, 0.0)
     boundary = periodic ? nothing : boundary_by_coordinates(initial)
 
@@ -105,17 +105,17 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer) where
     u = statevector(fs)
     gather!(u, fs)
     dt = 0.25 * minimum_spacing(forest)
-    rk4!(u, fs, schedule, dt, steps, Val(D), Val(forest.G), boundary)
+    rk4!(u, fs, schedule, dt, steps, Val(D), Val(fs.G), boundary)
 
     # A regrid that actually moves data, then more evolution on the new mesh.
     scatter!(fs, u)
     fill_ghosts!(fs, schedule; boundary=boundary)
-    changed = regrid!(forest, fs, schedule; flags=flag_blocks(flag, forest),
+    changed = regrid!(forest, fs => schedule; flags=flag_blocks(flag, forest),
                       buffer=buffer, boundary=boundary)
-    changed && (schedule = GhostSchedule(forest, ops))
+    changed && (schedule = GhostSchedule(fs, ops))
     u = statevector(fs)
     gather!(u, fs)
-    rk4!(u, fs, schedule, dt, steps, Val(D), Val(forest.G), boundary)
+    rk4!(u, fs, schedule, dt, steps, Val(D), Val(fs.G), boundary)
 
     tag = "D$(D)$(periodic ? "p" : "o")"
     println(tag, " passes ", passes, " ", converged, " changed ", changed)

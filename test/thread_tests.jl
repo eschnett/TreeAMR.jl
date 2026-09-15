@@ -65,7 +65,8 @@ end
     forest = nested_forest(Val(D))
     @test length(unique(level.(forest.leaves))) >= 3
 
-    schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2))
+    schedule = GhostSchedule(FieldSet(forest, 1; G=1),
+                             Operators(prolongation=2, restriction=2))
     @test issorted(schedule.levels)
     @test length(schedule.phase2) == length(schedule.levels)
     @test length(schedule.levels) >= 2
@@ -91,27 +92,30 @@ end
     @test prolongations == expected
 end
 
-@testset "fill_by_coordinates! reproduces cell_center exactly: D=$D" for D in (1, 2, 3)
+@testset "fill_by_coordinates! reproduces coordinates exactly: D=$D" for D in (1, 2, 3)
     # The kernel computes positions from the per-block origin and
     # spacing arrays rather than from the tree; it has to land on the
-    # same floating-point value `cell_center` gives, not merely a close
+    # same floating-point value `coordinates` gives, not merely a close
     # one, or ghost exchange and boundary hooks would disagree at the
-    # last bit.
-    forest = nested_forest(Val(D); N=4, G=1)
-    fs = FieldSet(forest, 2)
+    # last bit. Checked at two ghost widths, since the two expressions
+    # cancel `G` differently: the kernel never forms it, `coordinates`
+    # subtracts it.
+    forest = nested_forest(Val(D); N=4)
     f = (x, v) -> sum(x) + 100v
-    fill_by_coordinates!(f, fs)
+    for G in (1, 2)
+        fs = FieldSet(forest, 2; G=G)
+        fill_by_coordinates!(f, fs)
 
-    G, N = forest.G, forest.N
-    interior = CartesianIndices(ntuple(_ -> (G + 1):(G + N), D))
-    identical = all(1:nblocks(fs)) do b
-        k = blockkey(fs, b)
-        all(1:fs.nvars) do v
-            block = blockview(fs, b, v)
-            all(idx -> block[idx] === f(cell_center(forest, k, Tuple(idx)), v), interior)
+        N = forest.N
+        interior = CartesianIndices(ntuple(_ -> (G + 1):(G + N), D))
+        identical = all(1:nblocks(fs)) do b
+            all(1:fs.nvars) do v
+                block = blockview(fs, b, v)
+                all(idx -> block[idx] === f(coordinates(fs, b, Tuple(idx)), v), interior)
+            end
         end
+        @test identical
     end
-    @test identical
 end
 
 @testset "Results are bit-identical across thread counts" begin

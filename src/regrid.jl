@@ -89,7 +89,7 @@ end
     hi = ntuple(_ -> Int32(0), Val(D))
     for c in CartesianIndices(ntuple(_ -> N, Val(D)))
         i = ntuple(d -> Tuple(c)[d], Val(D))           # interior index, 1:N
-        idx = ntuple(d -> i[d] + G, Val(D))            # stored index
+        idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
         x = ntuple(d -> origin[d] + (i[d] - half) * h, Val(D))
         if fires(work, idx, b, x)
             n += 1
@@ -153,7 +153,7 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
     firing_kernel!(backend)(counts, los, his, fs.work, fires, origins, spacings,
-                            Val(D), Val(forest.G), Val(forest.N); ndrange=n)
+                            Val(D), Val(fs.G), Val(forest.N); ndrange=n)
     synchronize(backend)
 
     hc, hlo, hhi = tohost(counts), tohost(los), tohost(his)
@@ -345,7 +345,7 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector;
 
     # Balance the candidate tree without disturbing the live one.
     scratch = typeof(forest)(forest.roots, forest.periodic, forest.extents,
-                             forest.N, forest.G, candidate, Ref(0))
+                             forest.N, candidate, Ref(0))
     balance!(scratch)
     return scratch.leaves
 end
@@ -353,10 +353,11 @@ end
 # Classify every new leaf by where its data comes from, and batch the
 # transfers by (kind, child offset) so each batch shares one set of
 # stencils — the same grouping the ghost schedule uses.
-function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
+function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
+                         oldleaves, newleaves,
                          operators::Operators, backend::Backend) where {T,D}
     oldindex = Dict{MortonKey{D},Int32}(k => Int32(i) for (i, k) in enumerate(oldleaves))
-    N, G = forest.N, forest.G
+    N = forest.N
     zerodir = ntuple(_ -> 0, D)
 
     # Classify every new block in parallel (dictionary *lookups* only —
@@ -399,10 +400,10 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
     end
 
     stencils(kind, o) =
-        kind === :copy ? ntuple(d -> copy_stencil(T, N, G, 0), D) :
+        kind === :copy ? ntuple(d -> copy_stencil(T, N, G[d], 0), D) :
         kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, G, 0, o[d], operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, G, 0, o[d], operators), D)
+        ntuple(d -> restriction_stencil(T, N, G[d], 0, o[d], operators), D) :
+        ntuple(d -> prolongation_stencil(T, N, G[d], 0, o[d], operators), D)
 
     # These stencils are rebuilt on every regrid — the child offsets
     # involved depend on which blocks moved — so, like the schedule's,
@@ -414,8 +415,7 @@ function transfer_groups(::Type{T}, forest::Forest{D}, oldleaves, newleaves,
 end
 
 """
-    regrid!(forest, fieldsets, schedule; flags, buffer=0, boundary=nothing,
-            transfer=true)
+    regrid!(forest, pairs; flags, buffer=0, boundary=nothing, transfer=true)
 
 Refine and coarsen `forest` as `flags` asks, and move every field set's
 data onto the new mesh. Returns `true` if the mesh changed.
@@ -432,68 +432,83 @@ as [`flag_blocks`](@ref) produces; `buffer` is a width in cells, the
 application's choice (feature speed × regrid cadence), and defaults to
 no buffering.
 
-`fieldsets` is a single [`FieldSet`](@ref) or a collection of them, all
-over `forest`. Each one's storage is replaced in place, so references an
-application already holds stay valid, but **block indices do not
-survive**: slots are compacted, and `forest.leaves[b]` is the only way
-to say which block is which.
+`pairs` is one `fs => schedule` or a collection of them, each field set
+over `forest` and each schedule the current one *for that field set*
+(amended in M8: with `G` on the field set a schedule belongs to a
+layout, so a bare field set no longer says which schedule moves it).
+Every set's storage is replaced in place, so references an application
+already holds stay valid, but **block indices do not survive**: slots
+are compacted, and `forest.leaves[b]` is the only way to say which block
+is which.
 
-`schedule` must be the current schedule for `forest`. Ghosts are filled
-from it before the transfer, because a prolongation stencil reads its
-parent's ghost layers; pass `boundary` if the domain has non-periodic
-faces. Afterwards the schedule is stale and the state vector has changed
-length, so an application must rebuild both:
+Ghosts are filled from each schedule before that set's transfer, because
+a prolongation stencil reads its parent's ghost layers; pass `boundary`
+if the domain has non-periodic faces. Write `fs => nothing` for a set
+that should only be **resized** — a computed quantity such as a flux,
+which the next right-hand side overwrites anyway, and whose ghost-free
+layout has no schedule to fill it from. Afterwards every schedule is
+stale and the state vector has changed length, so an application must
+rebuild both:
 
 ```julia
-if regrid!(forest, fs, schedule; flags = flags)
-    schedule = GhostSchedule(forest, operators)
+if regrid!(forest, fs => schedule; flags = flags)
+    schedule = GhostSchedule(fs, operators)
     u = statevector(fs); gather!(u, fs)      # then reinit! the integrator
 end
 ```
 
 Set `transfer = false` to rebuild the mesh and storage without moving
-data — what the initial-data cycle wants, since it re-evaluates the
-initial data on the new mesh instead (see
+data at all — what the initial-data cycle wants, since it re-evaluates
+the initial data on the new mesh instead (see
 [`adapt_to_initial_data!`](@ref)).
 """
-function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
+function regrid!(forest::Forest{D}, pairs;
                  flags::AbstractVector, buffer::Integer=0, boundary=nothing,
                  transfer::Bool=true) where {D}
-    sets = fieldsets isa FieldSet ? (fieldsets,) : fieldsets
-    for fs in sets
+    sets = pairs isa Pair ? (pairs,) : pairs
+    for p in sets
+        p isa Pair && p.first isa FieldSet || throw(ArgumentError(
+            "regrid! takes `fs => schedule` pairs, got a $(typeof(p)). Each field " *
+            "set brings its own schedule, since a schedule belongs to a layout " *
+            "(G, element type, backend) and not to the forest; write " *
+            "`fs => nothing` for a set that should only be resized."))
+        fs, sched = p
         fs.forest === forest || throw(ArgumentError(
             "every field set must be over the forest being regridded"))
         nblocks(fs) == nleaves(forest) || throw(ArgumentError(
             "field set has $(nblocks(fs)) blocks but the forest has " *
             "$(nleaves(forest)) leaves"))
+        sched === nothing && continue
+        sched.forest === forest || throw(ArgumentError(
+            "schedule was built for a different forest"))
+        isstale(sched) && throw(ArgumentError(
+            "schedule is stale; rebuild it before regridding"))
+        fs.G == sched.G || throw(ArgumentError(
+            "the field set has ghost width G=$(fs.G) but its schedule was built " *
+            "for G=$(sched.G); pair each field set with its own schedule"))
     end
-    schedule.forest === forest || throw(ArgumentError(
-        "schedule was built for a different forest"))
-    isstale(schedule) && throw(ArgumentError(
-        "schedule is stale; rebuild it before regridding"))
 
     oldleaves = copy(forest.leaves)
     newleaves = complete_marks(forest, flags; buffer=buffer)
     newleaves == oldleaves && return false
 
-    if transfer
-        # Prolongation from a parent reaches into that parent's ghost
-        # layers, so they have to hold data before anything moves.
-        for fs in sets
-            fill_ghosts!(fs, schedule; boundary=boundary)
-        end
-    end
-
-    stored = forest.N + 2 * forest.G
-    for fs in sets
+    for (fs, sched) in sets
         # Per field set, not once from the first one: nothing says two
-        # field sets over the same forest live on the same backend.
+        # field sets over the same forest share a backend, a ghost width,
+        # or an operator family.
         backend = get_backend(fs.work)
-        fresh = similar(fs.work, ntuple(_ -> stored, D)..., fs.nvars, length(newleaves))
+        move = transfer && sched !== nothing
+        if move
+            # Prolongation from a parent reaches into that parent's ghost
+            # layers, so they have to hold data before anything moves.
+            fill_ghosts!(fs, sched; boundary=boundary)
+        end
+        stored = storedsize(forest.N, fs.G)
+        fresh = similar(fs.work, stored..., fs.nvars, length(newleaves))
         zerofill!(fresh, backend)
-        if transfer
-            groups = transfer_groups(eltype(fs.work), forest, oldleaves, newleaves,
-                                     schedule.operators, backend)
+        if move
+            groups = transfer_groups(eltype(fs.work), forest, fs.G, oldleaves,
+                                     newleaves, sched.operators, backend)
             # The transfer moves every cell in the domain, so it is
             # threaded the same way a ghost phase is — its groups are
             # just as uneven, a whole block against a single child.
@@ -506,6 +521,14 @@ function regrid!(forest::Forest{D}, fieldsets, schedule::GhostSchedule;
     rebuild_leaves!(forest, newleaves)
     return true
 end
+
+# The M6 form, so that a caller written against it gets told what moved
+# rather than a `MethodError` on a three-argument `regrid!`.
+regrid!(::Forest, ::Any, ::GhostSchedule; kwargs...) = throw(ArgumentError(
+    "regrid! now takes `fs => schedule` pairs rather than field sets and one " *
+    "shared schedule: write `regrid!(forest, fs => schedule; flags = ...)`. A " *
+    "schedule belongs to a layout (G, element type, backend) from M8 on, and " *
+    "different field sets over one forest have different layouts."))
 
 """
     adapt_to_initial_data!(fs, operators; initial, flag, buffer=0, maxpasses=10,
@@ -533,8 +556,9 @@ The criterion is given exactly one of two ways:
   every block in one kernel: `flags = fs -> map(..., firing_boxes(fires, fs))`.
   See [`firing_boxes`](@ref).
 
-The schedule is rebuilt on the field set's own backend, so a
-device-resident field set adapts without anything further.
+The schedule is rebuilt from `fs` itself, so it carries that field set's
+ghost width, element type and backend — a device-resident field set
+adapts without anything further.
 """
 function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
                                 initial, flag=nothing, flags=nothing,
@@ -547,15 +571,14 @@ function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
     criterion = flags === nothing ? (f -> flag_blocks(flag, f.forest)) : flags
 
     forest = fs.forest
-    backend = get_backend(fs.work)
-    schedule = GhostSchedule(forest, operators; T=T, backend=backend)
+    schedule = GhostSchedule(fs, operators)
     fill_by_coordinates!(initial, fs)
 
     for pass in 1:maxpasses
         fill_ghosts!(fs, schedule; boundary=boundary)
-        changed = regrid!(forest, fs, schedule; flags=criterion(fs), buffer=buffer,
+        changed = regrid!(forest, fs => schedule; flags=criterion(fs), buffer=buffer,
                           boundary=boundary, transfer=false)
-        schedule = GhostSchedule(forest, operators; T=T, backend=backend)
+        schedule = GhostSchedule(fs, operators)
         fill_by_coordinates!(initial, fs)
         changed || return (schedule, pass, true)
     end

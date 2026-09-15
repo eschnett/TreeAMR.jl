@@ -268,11 +268,18 @@ so they are ordinary copies, restrictions, and prolongations.
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
-    GhostSchedule(forest, operators::Operators; T=floattype(forest), backend=CPU())
+    GhostSchedule(fs::FieldSet, operators::Operators)
 
 `operators` is required: interpolation order follows from the
 application's discretization, so there is no order the mesh could
 sensibly default to. See [`Operators`](@ref).
+
+A schedule is built for one *layout* — one ghost width, one element
+type, one backend — which is exactly what a field set is, so it takes
+one (amended in M8, when `G` moved off the forest). [`fill_ghosts!`](@ref)
+refuses a field set whose layout differs from the one the schedule was
+built for. The forest form `GhostSchedule(forest, ops; G, T, backend)`
+spells the three out instead, for a caller with no field set in hand.
 
 `backend` must be the backend of every field set the schedule is
 replayed over (M6). The stencil weights and index vectors are read
@@ -285,6 +292,7 @@ level down.
 struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{D}}
     forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
+    G::NTuple{D,Int}                             # ghost width it was built for
     operators::Operators
     backend::BK
     phase1::Vector{GRP}
@@ -308,7 +316,8 @@ isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 
 # --- 1D stencil construction ---------------------------------------------
 #
-# Index conventions, all in *stored* indices (1:N+2G, interior G+1:G+N):
+# Index conventions, all in *stored* indices, per dimension `d` against
+# that dimension's ghost width `G = G[d]` (1:N+2G, owned G+1:G+N):
 #
 #   δ_d = +1  target is the high ghost slab  G+N+1 : G+N+G
 #   δ_d = -1  target is the low  ghost slab      1 : G
@@ -316,6 +325,10 @@ isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 #
 # For restriction the tangential extent is halved, since each of the
 # 2^(tangential) fine neighbors supplies one half.
+#
+# Every builder below takes a scalar `G` — the width in *its own*
+# dimension. `target_range` is the single source of truth for the ranges;
+# nothing re-derives one.
 
 # Weights for a window of `p` consecutive source cells starting at `lo`,
 # evaluated at `x`.
@@ -503,9 +516,9 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 # its own `pairs` and `boundaries`.
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
-                        forest::Forest{D}, b::Int, dirs) where {D}
+                        forest::Forest{D}, G::NTuple{D,Int}, b::Int, dirs) where {D}
     k = forest.leaves[b]
-    N, G = forest.N, forest.G
+    N = forest.N
     zerooffset = ntuple(_ -> 0, D)
     record!(kind, δ, offset, lvl, s) =
         push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl), (Int32[], Int32[])),
@@ -513,7 +526,7 @@ function block_sources!(pairs::TransferPairs{D},
     for δ in dirs
         nbrs = neighbor_keys(forest, k, δ)
         if isempty(nbrs)
-            region = CartesianIndices(ntuple(d -> target_range(N, G, δ[d], 0, false), D))
+            region = CartesianIndices(ntuple(d -> target_range(N, G[d], δ[d], 0, false), D))
             push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
             continue
         end
@@ -547,11 +560,17 @@ function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
     return into
 end
 
+GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
+    GhostSchedule(fs.forest, operators; G=fs.G, T=T, backend=get_backend(fs.work))
+
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
+                       G::Union{Integer,Tuple{Vararg{Integer}}},
                        T::Type=R, backend::Backend=CPU()) where {D,R}
-    check_operators(forest, operators)
+    N = forest.N
+    ghosts = ghostwidths(G, Val(D))
+    storedsize(N, ghosts)                        # the N >= 2G[d] invariant
+    check_operators(N, ghosts, operators)
     check_floattype(T, backend)
-    N, G = forest.N, forest.G
     dirs = alldirections(Val(D))
     nb = nleaves(forest)
 
@@ -564,7 +583,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            block_sources!(perpairs[c], perboundaries[c], forest, b, dirs)
+            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, b, dirs)
         end
     end
 
@@ -581,12 +600,12 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
 
     build(key) =
         key.kind === :copy ?
-        ntuple(d -> copy_stencil(T, N, G, key.direction[d]), D) :
+        ntuple(d -> copy_stencil(T, N, ghosts[d], key.direction[d]), D) :
         key.kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, G, key.direction[d], key.offset[d],
-                                        operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, G, key.direction[d], key.offset[d],
-                                         operators), D)
+        ntuple(d -> restriction_stencil(T, N, ghosts[d], key.direction[d],
+                                        key.offset[d], operators), D) :
+        ntuple(d -> prolongation_stencil(T, N, ghosts[d], key.direction[d],
+                                         key.offset[d], operators), D)
 
     GRP = grouptype(backend, T, Val(D))
     phase1 = GRP[]
@@ -605,7 +624,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     phase2 = [bylevel[l] for l in levels]
     bplan = BoundaryPlan(backend, T, forest, boundaries)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan)}(
-        forest, generation(forest), operators, backend, phase1, phase2,
+        forest, generation(forest), ghosts, operators, backend, phase1, phase2,
         levels, boundaries, bplan, phase_plan(phase1),
         [phase_plan(groups) for groups in phase2])
 end

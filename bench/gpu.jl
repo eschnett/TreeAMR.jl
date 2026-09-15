@@ -64,7 +64,7 @@ end
                                    ::Val{DD}, ::Val{GG}) where {DD,GG}
     I = @index(Global, NTuple)
     b = I[DD + 1]
-    c = ntuple(d -> I[d] + GG, Val(DD))
+    c = ntuple(d -> I[d] + GG[d], Val(DD))
     u0 = work[c..., 1, b]
     laplacian = zero(eltype(du))
     for d in 1:DD
@@ -86,7 +86,7 @@ end
 
 """A two-level mesh: the middle half of the domain refined once."""
 function build_forest(::Val{DD}) where {DD}
-    forest = Forest(ntuple(_ -> ROOTS, DD); N=N, G=G,
+    forest = Forest(ntuple(_ -> ROOTS, DD); N=N,
                     periodic=ntuple(_ -> true, DD),
                     extents=ntuple(_ -> (zero(T), one(T)), DD))
     targets = filter(forest.leaves) do k
@@ -113,8 +113,8 @@ end
 
 function main()
     forest = build_forest(Val(D))
-    fs = FieldSet{T}(forest, 2; backend=BACKEND)
-    schedule = GhostSchedule(forest, OPS; T=T, backend=BACKEND)
+    fs = FieldSet{T}(forest, 2; G=G, backend=BACKEND)
+    schedule = GhostSchedule(fs, OPS)
     spacings = let h = block_spacings(forest, T)
         BACKEND isa CPU ? h : (dev = similar(fs.work, T, length(h)); copyto!(dev, h); dev)
     end
@@ -129,7 +129,7 @@ function main()
     rhs!() = begin
         scatter!(fs, u)
         fill_ghosts!(fs, schedule)
-        map_blocks!(bench_rhs_kernel!, fs, dua, fs.work, spacings, Val(D), Val(G))
+        map_blocks!(bench_rhs_kernel!, fs, dua, fs.work, spacings, Val(D), Val(fs.G))
     end
 
     # The device flagging sweep, over a threshold that fires somewhere.
@@ -142,7 +142,7 @@ function main()
     t_fill = best(() -> fill_by_coordinates!(initial, fs))
     t_norm = best(() -> volume_weighted_norm(fs, u))
     t_flag = best(() -> firing_boxes(fires, fs), max(3, REPS ÷ 4))
-    t_schedule = best(() -> GhostSchedule(forest, OPS; T=T, backend=BACKEND),
+    t_schedule = best(() -> GhostSchedule(fs, OPS),
                       max(3, REPS ÷ 4))
 
     # The regrid transfer, measured on its own: a fresh array plus the

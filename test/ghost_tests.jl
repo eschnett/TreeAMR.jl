@@ -100,31 +100,34 @@ end
     # the point-value family's pointwise exactness.
     for p in (1, 3, 5)
         G = max(1, (p - 1) ÷ 2)
-        forest = nested_forest(Val(D); N=8, G=G)
+        forest = nested_forest(Val(D); N=8)
         ops = Operators(prolongation=p, restriction=2, family=Conservative)
-        @test conservative_exchange_error(forest, ops, scalarpoly(D, p - 1)) < 1e-11
-        @test conservative_exchange_error(forest, ops, scalarpoly(D, p)) > 1e-9
+        @test conservative_exchange_error(forest, ops, scalarpoly(D, p - 1); G=G) < 1e-11
+        @test conservative_exchange_error(forest, ops, scalarpoly(D, p); G=G) > 1e-9
     end
 end
 
 @testset "Operator/geometry compatibility" begin
     # Each constraint is isolated by pinning the other order low enough
-    # that it cannot be the one that trips.
+    # that it cannot be the one that trips. The constraints are against
+    # the *field set's* ghost width from M8 on, so these go through a
+    # field set.
     prolong(p) = Operators(prolongation=p, restriction=2)
     restrict(p) = Operators(prolongation=2, restriction=p)
+    set(N, G) = FieldSet(Forest((2,); N=N), 1; G=G)
 
     # G >= p/2, so a fine block's prolongation stencil fits inside its
     # coarse neighbor's interior plus that neighbor's own ghosts.
-    @test check_operators(Forest((2,); N=8, G=1), prolong(2)) === nothing
-    @test_throws ArgumentError check_operators(Forest((2,); N=8, G=1), prolong(4))
-    @test check_operators(Forest((2,); N=8, G=2), prolong(4)) === nothing
-    @test_throws ArgumentError check_operators(Forest((2,); N=8, G=2), prolong(6))
-    @test check_operators(Forest((2,); N=8, G=3), prolong(6)) === nothing
+    @test check_operators(set(8, 1), prolong(2)) === nothing
+    @test_throws ArgumentError check_operators(set(8, 1), prolong(4))
+    @test check_operators(set(8, 2), prolong(4)) === nothing
+    @test_throws ArgumentError check_operators(set(8, 2), prolong(6))
+    @test check_operators(set(8, 3), prolong(6)) === nothing
 
     # N >= 2G + p/2 - 1, so restriction reads fine *interior* cells only.
-    @test check_operators(Forest((2,); N=4, G=2), restrict(2)) === nothing
-    @test_throws ArgumentError check_operators(Forest((2,); N=4, G=2), restrict(4))
-    @test check_operators(Forest((2,); N=6, G=2), restrict(4)) === nothing
+    @test check_operators(set(4, 2), restrict(2)) === nothing
+    @test_throws ArgumentError check_operators(set(4, 2), restrict(4))
+    @test check_operators(set(6, 2), restrict(4)) === nothing
 
     # The conservative family needs one fewer ghost layer at the same
     # order, because its stencil is centered on a cell rather than
@@ -133,22 +136,75 @@ end
     @test TreeAMR.ghost_layers_read(cons(3)) == 1
     @test TreeAMR.ghost_layers_read(cons(5)) == 2
     @test TreeAMR.ghost_layers_read(Operators(prolongation=4, restriction=2)) == 2
-    @test check_operators(Forest((2,); N=8, G=1), cons(3)) === nothing
-    @test_throws ArgumentError check_operators(Forest((2,); N=8, G=1), cons(5))
-    @test check_operators(Forest((2,); N=8, G=2), cons(5)) === nothing
+    @test check_operators(set(8, 1), cons(3)) === nothing
+    @test_throws ArgumentError check_operators(set(8, 1), cons(5))
+    @test check_operators(set(8, 2), cons(5)) === nothing
+
+    # The constraints are per dimension, against that dimension's own
+    # ghost width: wide in x and narrow in y is refused for order 4 by
+    # the y bound alone, and the message names the dimension.
+    @test check_operators(FieldSet(Forest((2, 2); N=8), 1; G=(2, 2)),
+                          prolong(4)) === nothing
+    @test_throws "dimension 2" check_operators(FieldSet(Forest((2, 2); N=8), 1;
+                                                        G=(2, 1)), prolong(4))
 
     # Ghost filling is meaningless without ghosts.
-    @test_throws ArgumentError GhostSchedule(Forest((2,); N=4, G=0),
+    @test_throws ArgumentError GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=0),
                                              Operators(prolongation=2, restriction=2))
+    @test_throws "no ghosts" GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=0),
+                                           Operators(prolongation=2, restriction=2))
 
     # The schedule requires operators too, for the same reason.
-    @test_throws MethodError GhostSchedule(Forest((2,); N=4, G=1))
+    @test_throws MethodError GhostSchedule(FieldSet(Forest((2,); N=4), 1; G=1))
+end
+
+@testset "The ghost width belongs to the field set" begin
+    # The M8 move. A forest that is handed `G` says where it went rather
+    # than failing on an unrecognised keyword, and a field set with no
+    # `G` says why there is no default -- both are the first thing a
+    # caller written against M6 hits.
+    @test_throws ArgumentError Forest((2,); N=4, G=1)
+    @test_throws "moved from the forest to the field set" Forest((2,); N=4, G=1)
+    @test_throws ArgumentError Forest{Float32}((2,); N=4, G=1)
+    @test_throws ArgumentError FieldSet(Forest((2,); N=4), 1)
+    @test_throws "no default ghost width" FieldSet(Forest((2,); N=4), 1)
+
+    # Per dimension, with a plain integer as the uniform shorthand.
+    forest = Forest((2, 2); N=8, periodic=(true, true))
+    @test FieldSet(forest, 1; G=2).G == (2, 2)
+    @test size(FieldSet(forest, 3; G=(2, 0)).work) == (12, 8, 3, 4)
+    @test size(FieldSet(forest, 1; G=0).work) == (8, 8, 1, 4)
+    @test_throws ArgumentError FieldSet(forest, 1; G=(1, -1))
+    @test_throws "one width per dimension" FieldSet(forest, 1; G=(1, 1, 1))
+
+    # N >= 2G[d], per dimension: N = 8 takes G = 4 but not 5, and the
+    # violation in *either* dimension is enough.
+    @test FieldSet(forest, 1; G=4) isa FieldSet
+    @test_throws ArgumentError FieldSet(forest, 1; G=5)
+    @test_throws ArgumentError FieldSet(forest, 1; G=(2, 5))
+    @test_throws "N must be >= 2G" FieldSet(forest, 1; G=5)
+
+    # Two field sets over one forest with different widths is the case
+    # the move exists for; each gets its own schedule, and a schedule
+    # built for one layout is refused for the other.
+    ops = Operators(prolongation=2, restriction=2)
+    narrow, wide = FieldSet(forest, 1; G=1), FieldSet(forest, 1; G=2)
+    @test fill_ghosts!(narrow, GhostSchedule(narrow, ops)) === narrow
+    @test fill_ghosts!(wide, GhostSchedule(wide, ops)) === wide
+    @test_throws ArgumentError fill_ghosts!(wide, GhostSchedule(narrow, ops))
+    @test_throws "built for G=(1, 1)" fill_ghosts!(wide, GhostSchedule(narrow, ops))
+
+    # The forest form of the constructor spells the layout out instead,
+    # and produces the same schedule the field-set form does.
+    byforest = GhostSchedule(forest, ops; G=2)
+    @test byforest.G == wide.G
+    @test sprint(show, byforest) == sprint(show, GhostSchedule(wide, ops))
 end
 
 @testset "Schedule partitions the ghost cells: D=$D" for D in (1, 2, 3)
     rng = MersenneTwister(500 + D)
     for trial in 1:3
-        forest = Forest(ntuple(_ -> 2, D); N=4, G=1,
+        forest = Forest(ntuple(_ -> 2, D); N=4,
                         periodic=ntuple(d -> isodd(d + trial), D))
         for _ in 1:4
             k = rand(rng, forest.leaves)
@@ -156,9 +212,10 @@ end
         end
         balance!(forest)
 
-        schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2))
+        fs = FieldSet(forest, 1; G=1)
+        schedule = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
         counts = write_counts(schedule)
-        G, N = forest.G, forest.N
+        G, N = 1, forest.N
         interior = ntuple(_ -> (G + 1):(G + N), D)
 
         # Every ghost cell is written exactly once: the ghost regions
@@ -190,7 +247,7 @@ end
 
     # All three cases really are exercised, so the exactness below is
     # not vacuous.
-    counts = transfer_counts(GhostSchedule(forest, ops))
+    counts = transfer_counts(GhostSchedule(FieldSet(forest, 1; G=1), ops))
     @test counts[:copy] > 0
     @test counts[:restrict] > 0
     @test counts[:prolong] > 0
@@ -200,17 +257,17 @@ end
 
     # Higher order needs wider ghosts and bigger blocks; order p is exact
     # through degree p-1 and no further.
-    wide = nested_forest(Val(D); N=8, G=2)
+    wide = nested_forest(Val(D); N=8)
     ops4 = Operators(prolongation=4, restriction=4)
-    @test exchange_error(wide, ops4, makepoly(D, 3)) < 1e-10
-    @test exchange_error(wide, ops4, makepoly(D, 4)) > 1e-8
+    @test exchange_error(wide, ops4, makepoly(D, 3); G=2) < 1e-10
+    @test exchange_error(wide, ops4, makepoly(D, 4); G=2) > 1e-8
 end
 
 @testset "Order 6 exchange: D=$D" for D in (1, 2)
-    forest = nested_forest(Val(D); N=8, G=3)
+    forest = nested_forest(Val(D); N=8)
     ops = Operators(prolongation=6, restriction=6)
-    @test exchange_error(forest, ops, makepoly(D, 5)) < 1e-9
-    @test exchange_error(forest, ops, makepoly(D, 6)) > 1e-9
+    @test exchange_error(forest, ops, makepoly(D, 5); G=3) < 1e-9
+    @test exchange_error(forest, ops, makepoly(D, 6); G=3) > 1e-9
 end
 
 @testset "Three-level corners: D=$D" for D in (1, 2, 3)
@@ -223,7 +280,7 @@ end
     @test length(unique(level.(forest.leaves))) >= 3
 
     ops = Operators(prolongation=2, restriction=2)
-    schedule = GhostSchedule(forest, ops)
+    schedule = GhostSchedule(FieldSet(forest, 1; G=1), ops)
     # More than one prolongation sweep, ordered coarsest target first.
     @test length(schedule.levels) >= 2
     @test issorted(schedule.levels)
@@ -246,16 +303,16 @@ end
 end
 
 @testset "Ghost filling leaves interiors alone: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
 
-    fs = FieldSet(forest, 2)
+    fs = FieldSet(forest, 2; G=1)
     f = makepoly(D, 1)
     fill_by_coordinates!(f, fs)
     before = [copy(interiorview(fs, b)) for b in 1:nblocks(fs)]
 
-    fill_ghosts!(fs, GhostSchedule(forest, Operators(prolongation=2, restriction=2)))
+    fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=2, restriction=2)))
     @test all(b -> interiorview(fs, b) == before[b], 1:nblocks(fs))
 
     # Ghosts really were written: nothing is left at its initial zero.
@@ -263,9 +320,9 @@ end
 end
 
 @testset "Schedule staleness" begin
-    forest = Forest((2, 2); N=4, G=1, periodic=(true, true))
-    schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2))
-    fs = FieldSet(forest, 1)
+    forest = Forest((2, 2); N=4, periodic=(true, true))
+    fs = FieldSet(forest, 1; G=1)
+    schedule = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
     @test !isstale(schedule)
     @test fill_ghosts!(fs, schedule) === fs
 
@@ -281,31 +338,32 @@ end
     @test isstale(schedule)                        # ... but still stale
     @test_throws ArgumentError fill_ghosts!(fs, schedule)
 
-    rebuilt = GhostSchedule(forest, Operators(prolongation=2, restriction=2))
+    rebuilt = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
     @test !isstale(rebuilt)
     @test fill_ghosts!(fs, rebuilt) === fs
 
     # A field set over a different forest is rejected outright.
-    other = Forest((2, 2); N=4, G=1, periodic=(true, true))
-    @test_throws ArgumentError fill_ghosts!(FieldSet(other, 1), rebuilt)
+    other = Forest((2, 2); N=4, periodic=(true, true))
+    @test_throws ArgumentError fill_ghosts!(FieldSet(other, 1; G=1), rebuilt)
 end
 
 @testset "Element types" begin
-    forest = Forest((2, 2); N=4, G=1, periodic=(true, true))
+    forest = Forest((2, 2); N=4, periodic=(true, true))
     refine!(forest, forest.leaves[1])
     balance!(forest)
 
     f = makepoly(2, 1)
     for T in (Float64, Float32)
-        schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2); T=T)
-        fs = FieldSet{T}(forest, 1)
+        fs = FieldSet{T}(forest, 1; G=1)
+        schedule = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
         fill_by_coordinates!(f, fs)
         fill_ghosts!(fs, schedule)
         @test eltype(fs.work) == T
         @test all(isfinite, fs.work)
     end
 
-    schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2))
+    schedule = GhostSchedule(FieldSet(forest, 1; G=1),
+                             Operators(prolongation=2, restriction=2))
     @test occursin("GhostSchedule{Float64,2}", sprint(show, schedule))
     @test occursin("copies", sprint(show, schedule))
 end

@@ -53,19 +53,18 @@ end
 
 @kernel function scatter_kernel!(work, @Const(state), ::Val{D}, ::Val{G}) where {D,G}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
-    work[ntuple(d -> I[d] + G, Val(D))..., I[D + 1], I[D + 2]] = state[I...]
+    work[ntuple(d -> I[d] + G[d], Val(D))..., I[D + 1], I[D + 2]] = state[I...]
 end
 
 @kernel function gather_kernel!(state, @Const(work), ::Val{D}, ::Val{G}) where {D,G}
     I = @index(Global, NTuple)
-    state[I...] = work[ntuple(d -> I[d] + G, Val(D))..., I[D + 1], I[D + 2]]
+    state[I...] = work[ntuple(d -> I[d] + G[d], Val(D))..., I[D + 1], I[D + 2]]
 end
 
 function run_over_interiors!(kernel, fs::FieldSet{T,D}, a, b) where {T,D}
     backend = get_backend(fs.work)
-    N, G = fs.forest.N, fs.forest.G
-    kernel(backend)(a, b, Val(D), Val(G);
-                    ndrange=(ntuple(_ -> N, D)..., fs.nvars, nblocks(fs)))
+    kernel(backend)(a, b, Val(D), Val(fs.G);
+                    ndrange=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
     return nothing
 end
@@ -103,7 +102,7 @@ end
 Launch a KernelAbstractions kernel over every interior cell of every
 block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
 is therefore `(i1, ..., iD, b)` with each `i` running over `1:N`; add
-`G` to reach the working array's stored indices.
+`G[d]` to reach the working array's stored indices.
 
 Blocks are uniform work units, so this is one flat parallel loop. The
 CPU backend spreads it over `Threads.nthreads()` as it stands (M5), and
@@ -114,7 +113,7 @@ output cell, so the result does not depend on how the loop was split.
 @kernel function rhs!(du, @Const(work), @Const(h), ::Val{D}, ::Val{G}) where {D,G}
     I = @index(Global, NTuple)
     b = I[D + 1]
-    c = ntuple(d -> I[d] + G, Val(D))          # stored (ghosted) index
+    c = ntuple(d -> I[d] + G[d], Val(D))       # stored (ghosted) index
     du[ntuple(d -> I[d], Val(D))..., 1, b] = work[c..., 2, b]
 end
 ```
@@ -153,10 +152,10 @@ end
 # agreed for every shape the package itself passed, by accident of
 # `SubArray`'s `viewindexing` and nothing more (amended in M6).
 #
-# `array` is either the working array (offset `g = G`, so ghosts are
-# skipped) or the state array (`g = 0`). Neither helper below works that
-# out for itself; `block_mapreduce` does, which is why it and not these
-# is what an application calls.
+# `array` is either the working array (offset `g = fs.G`, so ghosts are
+# skipped) or the state array (`g` all zeros). Neither helper below works
+# that out for itself; `block_mapreduce` does, which is why it and not
+# these is what an application calls.
 @kernel function block_reduce_kernel!(values, @Const(array), f, op, init,
                                       firstvar::Int, lastvar::Int,
                                       ::Val{D}, ::Val{G}, ::Val{N}) where {D,G,N}
@@ -164,7 +163,7 @@ end
     acc = init
     for v in firstvar:lastvar
         for c in CartesianIndices(ntuple(_ -> N, Val(D)))
-            acc = op(acc, f(array[ntuple(d -> Tuple(c)[d] + G, Val(D))..., v, b]))
+            acc = op(acc, f(array[ntuple(d -> Tuple(c)[d] + G[d], Val(D))..., v, b]))
         end
     end
     values[b] = acc
@@ -172,7 +171,7 @@ end
 
 # The device path: one launch, one work item per block, one copy back.
 function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
-                                 backend::Backend, g::Int,
+                                 backend::Backend, g::NTuple{D,Int},
                                  vars::UnitRange{Int}) where {R,T,D}
     n = nblocks(fs)
     values = allocate(backend, R, (n,))
@@ -187,10 +186,11 @@ end
 # dispatched on `::CPU` so that both paths stay reachable on a machine
 # with no device, which is what lets the suite check that the two
 # compute the same fold.
-function _block_mapreduce_host(f, op, init::R, array, fs::FieldSet{T,D}, g::Int,
+function _block_mapreduce_host(f, op, init::R, array, fs::FieldSet{T,D},
+                               g::NTuple{D,Int},
                                vars::UnitRange{Int}) where {R,T,D}
     N = fs.forest.N
-    inner = ntuple(_ -> (g + 1):(g + N), D)
+    inner = ntuple(d -> (g[d] + 1):(g[d] + N), D)
     values = Vector{R}(undef, nblocks(fs))
     threaded_foreach(nblocks(fs)) do b
         values[b] = mapreduce(f, op, view(array, inner..., vars, b); init=init)
@@ -267,17 +267,17 @@ backends is not claimed and, for floating-point `op`, not true.
     same rule covers captured arrays and any mutable state.
 """
 function block_mapreduce(f, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars) where {T,D}
-    return _block_mapreduce(f, op, init, fs.work, fs, Int(fs.forest.G),
+    return _block_mapreduce(f, op, init, fs.work, fs, fs.G,
                             _varrange(vars, fs.nvars))
 end
 
 function block_mapreduce(f, op, init, fs::FieldSet{T,D}, u::AbstractVector;
                          vars=1:fs.nvars) where {T,D}
-    return _block_mapreduce(f, op, init, statearray(u, fs), fs, 0,
+    return _block_mapreduce(f, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
                             _varrange(vars, fs.nvars))
 end
 
-function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::Int,
+function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
                           vars::UnitRange{Int}) where {R,T,D}
     backend = get_backend(array)
     return backend isa CPU ?

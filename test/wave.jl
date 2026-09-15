@@ -30,7 +30,7 @@ using SciMLBase: ODEProblem, solve
     I = @index(Global, NTuple)                 # (i1..iD, block)
     b = I[D + 1]
     inner = ntuple(d -> I[d], Val(D))          # state-layout index
-    c = ntuple(d -> I[d] + G, Val(D))          # working-array index
+    c = ntuple(d -> I[d] + G[d], Val(D))       # working-array index
 
     u0 = work[c..., 1, b]
     laplacian = zero(eltype(du))
@@ -64,7 +64,7 @@ end
 # field set onto its backend — an application-side instance of what
 # `block_spacings` exists for.
 function WaveProblem(fs::FieldSet{T,D}, schedule) where {T,D}
-    G = fs.forest.G
+    G = fs.G
     spacings = to_backend(get_backend(fs.work), block_spacings(fs.forest, T))
     return WaveProblem{T,D,G,typeof(fs),typeof(schedule),typeof(spacings)}(
         fs, schedule, spacings, Val(D), Val(G))
@@ -117,10 +117,10 @@ refined once, held fixed in physical space as `N` varies so that a
 convergence study really does just shrink `h`. With `refined=false` the
 same box is left uniform, as a control.
 """
-function wave_forest(::Val{D}, N, G; roots=4, L=1.0, refined=true,
+function wave_forest(::Val{D}, N; roots=4, L=1.0, refined=true,
                     T::Type=Float64) where {D}
     L = T(L)
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G,
+    forest = Forest(ntuple(_ -> roots, D); N=N,
                     periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), L), D))
     refined || return forest
@@ -142,10 +142,10 @@ function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction
                      roots=4, L=1.0, m=1,
                      cfl=0.25, periods=0.25, alg=RK4(), refined=true,
                      T::Type=Float64, backend=CPU()) where {D}
-    forest = wave_forest(Val(D), N, G; roots=roots, L=L, refined=refined, T=T)
+    forest = wave_forest(Val(D), N; roots=roots, L=L, refined=refined, T=T)
     L = T(L)
-    fs = FieldSet{T}(forest, 2; backend=backend)
-    problem = WaveProblem(fs, GhostSchedule(forest, ops; T=T, backend=backend))
+    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    problem = WaveProblem(fs, GhostSchedule(fs, ops))
 
     fill_by_coordinates!(wave_exact(D, L, m, zero(T)), fs)
     u0 = statevector(fs)
@@ -160,7 +160,7 @@ function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction
     prob = ODEProblem(wave_rhs!, u0, (zero(T), t_end), problem)
     sol = solve(prob, alg; dt=dt, adaptive=false, save_everystep=false)
 
-    exact = FieldSet{T}(forest, 2; backend=backend)
+    exact = FieldSet{T}(forest, 2; G=G, backend=backend)
     fill_by_coordinates!(wave_exact(D, L, m, t_end), exact)
     uexact = statevector(exact)
     gather!(uexact, exact)
@@ -218,9 +218,9 @@ function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
                      T::Type=Float64, backend=CPU()) where {D}
     L, σ, x0 = T(L), T(σ), T(x0)
     t_end, chunk, cfl = T(t_end), T(chunk), T(cfl)
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), L), D))
-    fs = FieldSet{T}(forest, 2; backend=backend)
+    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
 
     # Refine where the pulse actually is, judged from the current data,
     # and report the bounding box of the cells that fired — the min/max
@@ -270,7 +270,7 @@ function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
         t = stop
 
         # Error against the exact travelling pulse.
-        exact = FieldSet{T}(forest, 2; backend=backend)
+        exact = FieldSet{T}(forest, 2; G=G, backend=backend)
         fill_by_coordinates!(pulse_exact(D, L, x0, σ, t), exact)
         ue = statevector(exact)
         gather!(ue, exact)
@@ -291,8 +291,8 @@ function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
         push!(refined_fraction, total > 0 ? inside / total : zero(T))
 
         fill_ghosts!(fs, schedule)
-        if regrid!(forest, fs, schedule; flags=flags_now(), buffer=buffer)
-            schedule = GhostSchedule(forest, ops; T=T, backend=backend)
+        if regrid!(forest, fs => schedule; flags=flags_now(), buffer=buffer)
+            schedule = GhostSchedule(fs, ops)
         end
     end
 
@@ -311,10 +311,10 @@ function uniform_pulse(::Val{D}; roots, N, G=2, L=1.0, σ=0.08, x0=0.25,
                        T::Type=Float64, backend=CPU()) where {D}
     L, σ, x0 = T(L), T(σ), T(x0)
     t_end, cfl = T(t_end), T(cfl)
-    forest = Forest(ntuple(_ -> roots, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), L), D))
-    fs = FieldSet{T}(forest, 2; backend=backend)
-    schedule = GhostSchedule(forest, ops; T=T, backend=backend)
+    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    schedule = GhostSchedule(fs, ops)
     fill_by_coordinates!(pulse_exact(D, L, x0, σ, zero(T)), fs)
     u = statevector(fs)
     gather!(u, fs)
@@ -322,7 +322,7 @@ function uniform_pulse(::Val{D}; roots, N, G=2, L=1.0, σ=0.08, x0=0.25,
     nsteps = ceil(Int, t_end / dt)
     sol = solve(ODEProblem(wave_rhs!, u, (zero(T), t_end), WaveProblem(fs, schedule)),
                 RK4(); dt=t_end / nsteps, adaptive=false, save_everystep=false)
-    exact = FieldSet{T}(forest, 2; backend=backend)
+    exact = FieldSet{T}(forest, 2; G=G, backend=backend)
     fill_by_coordinates!(pulse_exact(D, L, x0, σ, t_end), exact)
     ue = statevector(exact)
     gather!(ue, exact)
@@ -343,7 +343,7 @@ not depend on the backend or on how the loop was split.
     b = @index(Global)
     m = zero(eltype(peaks))
     for c in CartesianIndices(ntuple(_ -> N, Val(D)))
-        m = max(m, abs(work[ntuple(d -> Tuple(c)[d] + G, Val(D))..., 1, b]))
+        m = max(m, abs(work[ntuple(d -> Tuple(c)[d] + G[d], Val(D))..., 1, b]))
     end
     peaks[b] = m
 end
@@ -351,7 +351,7 @@ end
 function block_peaks(fs::FieldSet{T,D}) where {T,D}
     backend = get_backend(fs.work)
     peaks = KernelAbstractions.allocate(backend, T, (nblocks(fs),))
-    block_peak_kernel!(backend)(peaks, fs.work, Val(D), Val(fs.forest.G),
+    block_peak_kernel!(backend)(peaks, fs.work, Val(D), Val(fs.G),
                                 Val(fs.forest.N); ndrange=nblocks(fs))
     KernelAbstractions.synchronize(backend)
     return Array(peaks)

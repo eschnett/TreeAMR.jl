@@ -125,10 +125,10 @@ end
     # The integrator's `u` is authoritative; the working array is
     # scratch. A RHS that wrote back into `u` would corrupt multi-stage
     # methods like RK4.
-    forest = wave_forest(Val(1), 8, 2)
-    fs = FieldSet(forest, 2)
-    problem = WaveProblem(fs, GhostSchedule(forest, Operators(prolongation=4,
-                                                              restriction=4)))
+    forest = wave_forest(Val(1), 8)
+    fs = FieldSet(forest, 2; G=2)
+    problem = WaveProblem(fs, GhostSchedule(fs, Operators(prolongation=4,
+                                                          restriction=4)))
     fill_by_coordinates!(wave_exact(1, 1.0, 1, 0.0), fs)
     u = statevector(fs)
     gather!(u, fs)
@@ -156,10 +156,10 @@ end
     # treatment usually shows up as slow drift long before it shows up
     # as an outright instability.
     D, L, m = 1, 1.0, 1
-    forest = wave_forest(Val(D), 16, 2)
-    fs = FieldSet(forest, 2)
-    problem = WaveProblem(fs, GhostSchedule(forest, Operators(prolongation=4,
-                                                              restriction=4)))
+    forest = wave_forest(Val(D), 16)
+    fs = FieldSet(forest, 2; G=2)
+    problem = WaveProblem(fs, GhostSchedule(fs, Operators(prolongation=4,
+                                                          restriction=4)))
     fill_by_coordinates!(wave_exact(D, L, m, 0.0), fs)
     u0 = statevector(fs)
     gather!(u0, fs)

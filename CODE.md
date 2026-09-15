@@ -238,6 +238,42 @@ the long-deferred "per-variable operator selection" is delivered:
 conservative operators for a density and point-value ones for a velocity
 are two field sets over one forest, each with its own schedule.
 
+**Implemented in M8a step 1** (`G` alone; centering follows in step 2).
+`G` is a required `FieldSet` keyword with no default — an integer or an
+`NTuple{D,Integer}`, stored as `NTuple{D,Int}` — for the same reason
+`Operators` has no default order, and refusing it says so. `Forest` no
+longer takes `G`, and still accepts the keyword only in order to throw a
+message naming where it went; `regrid!` likewise keeps the M6
+three-argument form as a method that throws. Four things the design left
+open, settled by the implementation:
+
+- **`GhostSchedule` belongs to a layout, not to a forest.** The
+  documented form is `GhostSchedule(fs, ops)`. The forest form survives
+  as `GhostSchedule(forest, ops; G, T, backend)` because it costs
+  nothing — it is the body, and the field-set form is one line spelling
+  the triple out of `fs` — and it is what a caller with no field set in
+  hand uses. `fill_ghosts!` compares `fs.G` against the schedule's and
+  refuses a mismatch, alongside the existing forest, generation, element
+  type and backend checks: every target range in a schedule is wrong for
+  another `G`, and nothing else would have caught it.
+- **`coordinates` defaults to the *field set's* element type**, not the
+  forest's `floattype`, with the leading-type form
+  `coordinates(S, fs, b, idx)` as elsewhere in the geometry. That is the
+  type `fill_by_coordinates!` and `boundary_by_coordinates` already hand
+  their callbacks, and the bit-for-bit agreement between those kernels
+  and `coordinates` is under test at two ghost widths — the kernel never
+  forms `G` (its index *is* the owned index) while `coordinates`
+  subtracts it, so one ghost width could not have distinguished them.
+- **`check_operators` takes the field set** and checks every constraint
+  per dimension against that dimension's `G_d`, naming the dimension in
+  the message. It keeps `G_d ≥ 1` in every dimension, which means a
+  ghost-free field set cannot have a ghost schedule at all — correct for
+  the `G = 0` flux sets above, which are never ghost-filled, and the
+  message says so.
+- **`regrid!` allocates per field set from that set's own `G`**, and
+  fills ghosts per field set from that set's own schedule, rather than
+  once from a shared one.
+
 ### Tree structure
 
 The domain is a **forest**: a brick of `M_1 × ... × M_D` root blocks,
@@ -1321,6 +1357,12 @@ design, see the M8 entry), and the list below is in execution order.
     `GhostSchedule(fs, ops)`, per-dimension stencil widths, the vertex
     rows of the operator table, `regrid!` over `fs => schedule` pairs,
     and the wave test split into vertex- and cell-centered halves.
+    *The `G` move is done*; see "**Implemented in M8a step 1**" under
+    [Centerings](#centerings) for the four points the design left open
+    and the implementation settled. It changed no measured number, as
+    predicted: the whole suite passes unchanged at one and eight
+    threads, the M3 wave tables included, and the thread-independence
+    digests still agree byte for byte.
     *Accept:* the M2 exactness test (degree `p − 1`, face/edge/corner,
     three levels) over all `2^D` centerings in `D = 1, 2, 3`, the oracle
     averaging along cell-like dimensions and sampling along vertex-like

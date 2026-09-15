@@ -97,7 +97,7 @@ Deliberately left unbalanced, so `balance!` has real work to do.
 function random_forest(rng, ::Val{D}; nsteps, maxlvl, maxroot=2) where {D}
     roots = ntuple(_ -> rand(rng, 1:maxroot), D)
     periodic = ntuple(_ -> rand(rng, Bool), D)
-    forest = Forest(roots; N=4, G=1, periodic=periodic)
+    forest = Forest(roots; N=4, periodic=periodic)
     for _ in 1:nsteps
         k = rand(rng, forest.leaves)
         if level(k) < maxlvl && rand(rng) < 0.75

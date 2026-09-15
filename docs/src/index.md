@@ -16,6 +16,11 @@ regridding, multi-threading throughout, and GPU support: the storage,
 the exchange schedule and every kernel follow a KernelAbstractions
 backend of the caller's choosing.
 
+M8 is under way; its first step has landed. The ghost width `G` is a
+[`FieldSet`](@ref) keyword now, one per dimension, rather than a
+[`Forest`](@ref) one, and a [`GhostSchedule`](@ref) accordingly belongs
+to a *layout* rather than to a forest.
+
 ## Overview
 
 The domain is a brick of `M₁ × … × M_D` octree roots. Refinement is
@@ -25,7 +30,7 @@ domain exactly:
 ```jldoctest overview
 julia> using TreeAMR
 
-julia> forest = Forest((2, 2); N = 8, G = 2, periodic = (true, true));
+julia> forest = Forest((2, 2); N = 8, periodic = (true, true));
 
 julia> nleaves(forest)
 4
@@ -54,7 +59,20 @@ at most one level up or down, which is what bounds the ghost-filling
 cases in M2.
 
 Data lives in a [`FieldSet`](@ref): one big array over all leaf blocks,
-cell indices fastest, ghosts included.
+cell indices fastest, ghosts included. The ghost width `G` belongs to the
+field set rather than to the forest, per dimension: it says how far a
+stencil reaches into a neighbor's data, which is a property of what is
+stored. An evolved state with `G = 2` and the fluxes computed from it
+with `G = 0`, over one forest, is the normal case.
+
+```jldoctest overview
+julia> state = FieldSet(forest, 2; G = 2);
+
+julia> flux = FieldSet(forest, 2; G = 0);
+
+julia> size(state.work), size(flux.work)
+((12, 12, 2, 7), (8, 8, 2, 7))
+```
 
 ## Element types
 
@@ -72,9 +90,9 @@ A [`Forest`](@ref) carries the type, and [`FieldSet`](@ref) and
 julia> floattype(forest)
 Float64
 
-julia> small = Forest{Float32}((2, 2); N = 8, G = 2);
+julia> small = Forest{Float32}((2, 2); N = 8);
 
-julia> eltype(FieldSet(small, 1).work)
+julia> eltype(FieldSet(small, 1; G = 2).work)
 Float32
 ```
 
@@ -93,10 +111,11 @@ only needed when the tree changes. So the exchange is split in two: a
 [`GhostSchedule`](@ref) is built once and [`fill_ghosts!`](@ref) merely
 replays it, with no tree query in the per-evaluation path.
 
-```jldoctest overview
-julia> schedule = GhostSchedule(forest, Operators(prolongation=2, restriction=2));
+A schedule belongs to a *layout* — one ghost width, one element type,
+one backend — so it is built from a field set:
 
-julia> state = FieldSet(forest, 2);
+```jldoctest overview
+julia> schedule = GhostSchedule(state, Operators(prolongation=2, restriction=2));
 
 julia> fill_by_coordinates!((x, v) -> v * x[1], state);
 
@@ -121,9 +140,9 @@ true
 ```
 
 Interpolation order is configurable via [`Operators`](@ref), and is
-constrained by the block geometry: order `p` prolongation needs
-`G ≥ p/2`, which [`check_operators`](@ref) enforces when the schedule is
-built. It is also constrained by your discretization — see the warning
+constrained by the block geometry, per dimension: order `p` prolongation
+needs `G[d] ≥ p/2`, which [`check_operators`](@ref) enforces when the
+schedule is built. It is also constrained by your discretization — see the warning
 in [`Operators`](@ref), which is worth reading before picking an order.
 
 ## Time integration
@@ -164,8 +183,8 @@ coarsened blocks restricted from their children.
 
 ```julia
 flags = flag_blocks((b, key) -> needs_refining(fs, b) ? Refine : Keep, forest)
-if regrid!(forest, fs, schedule; flags = flags)
-    schedule = GhostSchedule(forest, operators)   # the old one is now stale
+if regrid!(forest, fs => schedule; flags = flags)
+    schedule = GhostSchedule(fs, operators)       # the old one is now stale
     u = statevector(fs); gather!(u, fs)           # and u changed length
     # ... then reinit! the integrator
 end
@@ -253,10 +272,10 @@ backend when you allocate, and every kernel in the package follows:
 ```julia
 using CUDA                                # or Metal, or any KA backend
 
-forest   = Forest((4, 4); N = 32, G = 2, periodic = (true, true),
+forest   = Forest((4, 4); N = 32, periodic = (true, true),
                   extents = ((0f0, 1f0), (0f0, 1f0)))
-fs       = FieldSet{Float32}(forest, 2; backend = CUDABackend())
-schedule = GhostSchedule(forest, ops; T = Float32, backend = CUDABackend())
+fs       = FieldSet{Float32}(forest, 2; G = 2, backend = CUDABackend())
+schedule = GhostSchedule(fs, ops)
 ```
 
 There is nothing else to choose. [`statevector`](@ref) allocates where
@@ -303,7 +322,7 @@ flags = map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
     n == 0 && return Coarsen
     level(forest.leaves[b]) < lmax ? (Refine, box) : (Keep, box)
 end
-regrid!(forest, fs, schedule; flags = flags, buffer = 4)
+regrid!(forest, fs => schedule; flags = flags, buffer = 4)
 ```
 
 The box is exactly what [`regrid!`](@ref)'s buffering dilates, so the
@@ -362,7 +381,6 @@ spacing
 minimum_spacing
 block_origin
 block_extent
-cell_center
 block_spacings
 block_origins
 ```
@@ -371,6 +389,7 @@ block_origins
 
 ```@docs
 FieldSet
+coordinates
 nblocks
 blockkey
 blockview

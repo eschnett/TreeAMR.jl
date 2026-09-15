@@ -124,7 +124,7 @@ run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
 # a second, narrower form: a pure per-cell function, which the package
 # itself launches as a kernel. The offset arithmetic below is the same
 # as `transfer_kernel!`'s, and the position is formed exactly as
-# `cell_center` forms it, from the same origin and spacing, so the two
+# `coordinates` forms it, from the same origin and spacing, so the two
 # agree bit for bit.
 @kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
                                   @Const(firsts), @Const(origins), @Const(spacings),
@@ -140,10 +140,10 @@ run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
     idx = ntuple(d -> Int(f[d]) + off[d], Val(D))
 
     origin, h = origins[b], spacings[b]
-    # `1//2`, not `0.5`: see `cell_center`. The literal would be an fp64
+    # `1//2`, not `0.5`: see `coordinates`. The literal would be an fp64
     # operand and would drag the position into fp64.
     half = oftype(h, 1//2)
-    x = ntuple(d -> origin[d] + (idx[d] - G - half) * h, Val(D))
+    x = ntuple(d -> origin[d] + (idx[d] - G[d] - half) * h, Val(D))
     work[idx..., v, b] = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
 end
 
@@ -200,7 +200,7 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
         stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
         boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
                                   batch.firsts, plan.origins, plan.spacings,
-                                  blen, stride, Val(D), Val(fs.forest.G);
+                                  blen, stride, Val(D), Val(fs.G);
                                   ndrange=(prod(blen), fs.nvars, n))
     end
     synchronize(backend)
@@ -258,7 +258,7 @@ domain, as
 
 with `key` the block's [`MortonKey`](@ref), `δ` the outward direction,
 and `region` the `CartesianIndices` of the ghost cells in stored
-coordinates. Use [`cell_center`](@ref) to get their positions. Passing
+coordinates. Use [`coordinates`](@ref) to get their positions. Passing
 `nothing` leaves those ghosts untouched, which is what a fully periodic
 domain wants.
 
@@ -289,6 +289,11 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     nblocks(fs) == nleaves(schedule.forest) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
         "$(nleaves(schedule.forest)) leaves; rebuild both"))
+    fs.G == schedule.G || throw(ArgumentError(
+        "the field set has ghost width G=$(fs.G) but this schedule was built for " *
+        "G=$(schedule.G); every target range and stencil in it is wrong for this " *
+        "layout. A schedule belongs to a layout, not to a forest: build one with " *
+        "`GhostSchedule(fs, operators)`."))
 
     backend = get_backend(fs.work)
     samebackend(backend, schedule.backend) || throw(ArgumentError(

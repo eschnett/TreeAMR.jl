@@ -76,16 +76,15 @@ end
 end
 
 @testset "Forest construction" begin
-    @test_throws ArgumentError Forest((1, 1); N=3, G=1)              # N odd
-    @test_throws ArgumentError Forest((1, 1); N=2, G=2)              # N < 2G
-    @test_throws ArgumentError Forest((0, 1); N=4, G=1)              # empty brick
-    @test_throws ArgumentError Forest((1, 1); N=0, G=0)              # N not positive
+    @test_throws ArgumentError Forest((1, 1); N=3)                   # N odd
+    @test_throws ArgumentError Forest((0, 1); N=4)                   # empty brick
+    @test_throws ArgumentError Forest((1, 1); N=0)                   # N not positive
     # Non-cubic blocks: a 2:1 domain over a 1:1 root brick.
-    @test_throws ArgumentError Forest((1, 1); N=4, G=1, extents=((0.0, 2.0), (0.0, 1.0)))
+    @test_throws ArgumentError Forest((1, 1); N=4, extents=((0.0, 2.0), (0.0, 1.0)))
     # ... but the same domain over a matching 2:1 brick is fine.
-    @test Forest((2, 1); N=4, G=1, extents=((0.0, 2.0), (0.0, 1.0))) isa Forest{2}
+    @test Forest((2, 1); N=4, extents=((0.0, 2.0), (0.0, 1.0))) isa Forest{2}
 
-    forest = Forest((2, 3); N=4, G=1)
+    forest = Forest((2, 3); N=4)
     @test nleaves(forest) == 6
     @test maxlevel(forest) == 0
     @test issorted(forest.leaves)
@@ -100,7 +99,7 @@ end
 end
 
 @testset "Refine/coarsen: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 1, D); N=4, G=1)
+    forest = Forest(ntuple(_ -> 1, D); N=4)
     root = only(forest.leaves)
 
     refine!(forest, root)
@@ -130,8 +129,8 @@ end
     @test_throws ArgumentError refine!(forest, root)                 # no longer a leaf
 
     # Refining several keys at once matches refining them one at a time.
-    a = Forest(ntuple(_ -> 1, D); N=4, G=1)
-    b = Forest(ntuple(_ -> 1, D); N=4, G=1)
+    a = Forest(ntuple(_ -> 1, D); N=4)
+    b = Forest(ntuple(_ -> 1, D); N=4)
     refine!(a, only(a.leaves))
     refine!(b, only(b.leaves))
     targets = [a.leaves[1], a.leaves[end]]
@@ -243,12 +242,12 @@ end
 
     # A lone root, periodic everywhere, is its own neighbor in every
     # direction — the M_i = 1 self-neighbor case.
-    forest = Forest(ntuple(_ -> 1, D); N=4, G=1, periodic=ntuple(_ -> true, D))
+    forest = Forest(ntuple(_ -> 1, D); N=4, periodic=ntuple(_ -> true, D))
     k = only(forest.leaves)
     @test all(δ -> neighbor_keys(forest, k, δ) == [k], dirs)
 
     # The same brick, non-periodic, has no neighbors at all.
-    open = Forest(ntuple(_ -> 1, D); N=4, G=1)
+    open = Forest(ntuple(_ -> 1, D); N=4)
     ko = only(open.leaves)
     @test all(δ -> isempty(neighbor_keys(open, ko, δ)), dirs)
 
@@ -262,7 +261,7 @@ end
 
 @testset "Periodic wraparound across roots" begin
     # Two roots along dimension 1, periodic there only.
-    forest = Forest((2, 2); N=4, G=1, periodic=(true, false))
+    forest = Forest((2, 2); N=4, periodic=(true, false))
     r0 = forest.leaves[findfirst(k -> k.root == root_index(forest, (0, 0)), forest.leaves)]
     r1 = forest.leaves[findfirst(k -> k.root == root_index(forest, (1, 0)), forest.leaves)]
 
@@ -283,7 +282,7 @@ end
 @testset "Balance ripples outward" begin
     # Nesting refinement into one corner of a *single* root keeps every
     # intermediate level present, so it is balanced already.
-    nested = Forest((1, 1); N=4, G=1)
+    nested = Forest((1, 1); N=4)
     for _ in 1:3
         refine!(nested, first(nested.leaves))
     end
@@ -293,7 +292,7 @@ end
     # Driving the refinement into the corner where root 0 meets the
     # other three roots does create an imbalance: those roots sit at
     # level 0 against level-3 cells.
-    forest = Forest((2, 2); N=4, G=1)
+    forest = Forest((2, 2); N=4)
     deepest = nothing
     for _ in 1:3
         # The last leaf of root 0 in curve order is its max-coordinate
@@ -324,7 +323,7 @@ end
 end
 
 @testset "Geometry: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1,
+    forest = Forest(ntuple(_ -> 2, D); N=4,
                     extents=ntuple(_ -> (-1.0, 1.0), D))
     # Two roots spanning [-1,1] with N=4 gives cells of width 1/4.
     @test root_spacing(forest) ≈ 0.25
@@ -336,10 +335,15 @@ end
                                 forest.leaves)]
     @test all(block_origin(forest, k) .≈ -1.0)
     @test all(e -> e[1] ≈ -1.0 && e[2] ≈ 0.0, block_extent(forest, k))
-    # First interior cell (index G+1) is half a spacing in from the corner.
-    @test all(cell_center(forest, k, ntuple(_ -> forest.G + 1, D)) .≈ -0.875)
-    # The first ghost cell lies half a spacing outside.
-    @test all(cell_center(forest, k, ntuple(_ -> forest.G, D)) .≈ -1.125)
+    # Positions come from the field set, which is what carries G: the
+    # first interior cell (stored index G+1) is half a spacing in from
+    # the corner, and the first ghost cell half a spacing outside.
+    b = findfirst(==(k), forest.leaves)
+    for G in (1, 2)
+        fs = FieldSet(forest, 1; G=G)
+        @test all(coordinates(fs, b, ntuple(_ -> G + 1, D)) .≈ -0.875)
+        @test all(coordinates(fs, b, ntuple(_ -> G, D)) .≈ -1.125)
+    end
 
     # Refining halves the spacing, and children tile the parent's extent.
     refine!(forest, k)
@@ -357,17 +361,19 @@ end
 end
 
 @testset "FieldSet: D=$D" for D in (1, 2, 3)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=1, extents=ntuple(_ -> (0.0, 2.0), D))
+    forest = Forest(ntuple(_ -> 2, D); N=4, extents=ntuple(_ -> (0.0, 2.0), D))
     nvars = 3
-    fs = FieldSet(forest, nvars)
+    G = 1
+    fs = FieldSet(forest, nvars; G=G)
 
-    stored = forest.N + 2 * forest.G
+    stored = forest.N + 2G
+    @test fs.G == ntuple(_ -> G, D)
     @test size(fs.work) == (ntuple(_ -> stored, D)..., nvars, 2^D)
     @test nblocks(fs) == nleaves(forest) == 2^D
     @test eltype(fs.work) == Float64
     @test all(iszero, fs.work)
-    @test FieldSet{Float32}(forest, 1).work isa Array{Float32}
-    @test_throws ArgumentError FieldSet(forest, 0)
+    @test FieldSet{Float32}(forest, 1; G=G).work isa Array{Float32}
+    @test_throws ArgumentError FieldSet(forest, 0; G=G)
 
     @test all(b -> blockkey(fs, b) == forest.leaves[b], 1:nblocks(fs))
 
@@ -375,6 +381,9 @@ end
     @test size(blockview(fs, 1, 2)) == ntuple(_ -> stored, D)
     @test size(interiorview(fs, 1)) == (ntuple(_ -> forest.N, D)..., nvars)
     @test size(interiorview(fs, 1, 2)) == ntuple(_ -> forest.N, D)
+    # The owned part is `N` wide whatever the ghost width, which is what
+    # makes the state layout independent of it.
+    @test size(interiorview(FieldSet(forest, 1; G=0), 1, 1)) == ntuple(_ -> forest.N, D)
 
     # Views alias the working array, and the interior really is the
     # ghost-free part of the block.
@@ -386,13 +395,12 @@ end
 
     # Filling by coordinates touches interiors only, and reproduces a
     # linear function exactly.
-    fs2 = FieldSet(forest, 2)
+    fs2 = FieldSet(forest, 2; G=G)
     fill_by_coordinates!((x, v) -> v == 1 ? sum(x) : 1.0, fs2)
     for b in 1:nblocks(fs2)
-        k = blockkey(fs2, b)
         block = blockview(fs2, b, 1)
-        for idx in CartesianIndices(ntuple(_ -> (forest.G + 1):(forest.G + forest.N), D))
-            @test block[idx] ≈ sum(cell_center(forest, k, Tuple(idx)))
+        for idx in CartesianIndices(ntuple(_ -> (G + 1):(G + forest.N), D))
+            @test block[idx] ≈ sum(coordinates(fs2, b, Tuple(idx)))
         end
         @test all(==(1.0), interiorview(fs2, b, 2))
     end

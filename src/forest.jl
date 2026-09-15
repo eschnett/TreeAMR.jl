@@ -13,8 +13,12 @@ leaf-only linear octree.
 - `periodic[d]` selects whether dimension `d` wraps around the brick.
   Wraparound lives in the neighbor arithmetic, so periodic ghost filling
   needs no special-casing later.
-- `N` is the per-block interior size and `G` the ghost width, subject to
-  the invariants in `CODE.md`: `N` even and `N ≥ 2G`.
+- `N` is the per-block interior size, and it is even: cells are the
+  tree's geometry, so `N` belongs here. The ghost width `G` does **not**
+  — it says how far a stencil reaches into a neighbor's data, which is a
+  property of what is stored, and it belongs to the
+  [`FieldSet`](@ref) (amended in M8; through M6 it was a forest
+  keyword).
 - Blocks are cubes, so `extents` must match the aspect ratio of `roots`.
 - `T` is the floating-point type the geometry is *computed* in, not
   merely stored in — see [`floattype`](@ref) and "Precision" in
@@ -23,13 +27,13 @@ leaf-only linear octree.
 Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
-    Forest(roots; N, G, periodic=all false, extents=one unit per root)
+    Forest(roots; N, periodic=all false, extents=one unit per root)
     Forest{T}(roots; ...)                      # geometry in `T`
 
 # Examples
 
 ```jldoctest
-julia> forest = Forest((2, 2); N = 8, G = 2, periodic = (true, true));
+julia> forest = Forest((2, 2); N = 8, periodic = (true, true));
 
 julia> nleaves(forest)
 4
@@ -40,7 +44,6 @@ struct Forest{D,T}
     periodic::NTuple{D,Bool}
     extents::NTuple{D,Tuple{T,T}}
     N::Int
-    G::Int
     leaves::Vector{MortonKey{D}}
     # Bumped whenever the leaf array changes, so anything derived from
     # the tree (a GhostSchedule, say) can detect in O(1) that it is
@@ -49,21 +52,31 @@ struct Forest{D,T}
     generation::Base.RefValue{Int}
 end
 
+# `G` is still accepted as a keyword so that the move can be reported
+# instead of surfacing as a bare `MethodError` on an unrecognised
+# keyword. It is the first thing a caller written against M6 hits.
+const no_forest_ghosts = ArgumentError(
+    "the ghost width moved from the forest to the field set in M8: write " *
+    "`Forest(roots; N = ...)` and `FieldSet(forest, nvars; G = ...)`. Ghosts " *
+    "say how far a stencil reaches into a neighbor's data, which is a property " *
+    "of what is stored, not of how space is cut up — two field sets over one " *
+    "forest with different G is the normal case. `G` may be a plain integer or " *
+    "an NTuple{D,Integer}, one width per dimension.")
+
 # The geometry type is a parameter rather than a fixed `Float64` because
 # the *arithmetic*, not just the storage, has to stay inside it: a device
 # without hardware fp64 must never evaluate a coordinate in `Float64` on
 # its way into a `Float32` field. Converting at the end would not do.
 function Forest{T}(roots::NTuple{D,Integer};
                    N::Integer,
-                   G::Integer,
                    periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
                    extents::NTuple{D,Tuple{Real,Real}}=
-                       ntuple(d -> (zero(T), T(roots[d])), D)) where {T,D}
+                       ntuple(d -> (zero(T), T(roots[d])), D),
+                   G=nothing) where {T,D}
+    G === nothing || throw(no_forest_ghosts)
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
     N > 0 || throw(ArgumentError("N must be positive, got $N"))
-    G >= 0 || throw(ArgumentError("G must be nonnegative, got $G"))
     iseven(N) || throw(ArgumentError("N must be even, got $N"))
-    N >= 2G || throw(ArgumentError("N must be >= 2G, got N=$N, G=$G"))
 
     ext = ntuple(d -> (T(extents[d][1]), T(extents[d][2])), D)
     all(d -> ext[d][2] > ext[d][1], 1:D) ||
@@ -83,7 +96,7 @@ function Forest{T}(roots::NTuple{D,Integer};
     rootsI = map(Int, roots)
     leaves = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
     sort!(leaves)
-    return Forest{D,T}(rootsI, periodic, ext, Int(N), Int(G), leaves, Ref(0))
+    return Forest{D,T}(rootsI, periodic, ext, Int(N), leaves, Ref(0))
 end
 
 # Without an explicit `T`, the geometry type follows the extents the
@@ -91,22 +104,23 @@ end
 # are resolved from argument *types*, so this stays inferable.
 function Forest(roots::NTuple{D,Integer};
                 N::Integer,
-                G::Integer,
                 periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
-                extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing) where {D}
+                extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
+                G=nothing) where {D}
+    G === nothing || throw(no_forest_ghosts)
     if extents === nothing
-        return Forest{Float64}(roots; N=N, G=G, periodic=periodic)
+        return Forest{Float64}(roots; N=N, periodic=periodic)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
-    return Forest{T}(roots; N=N, G=G, periodic=periodic, extents=extents)
+    return Forest{T}(roots; N=N, periodic=periodic, extents=extents)
 end
 
 """
     floattype(forest::Forest)
 
 The floating-point type `forest`'s geometry is computed in — what
-[`spacing`](@ref), [`cell_center`](@ref) and friends return, and the
+[`spacing`](@ref), [`block_origin`](@ref) and friends return, and the
 element type a [`FieldSet`](@ref) or [`GhostSchedule`](@ref) over this
 forest takes unless told otherwise.
 """

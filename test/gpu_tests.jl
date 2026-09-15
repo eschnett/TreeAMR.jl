@@ -62,9 +62,9 @@ gputol(::Type{T}, k=4096) where {T} = k * eps(T)
 
 @testset "$bname: a field set is allocated where it is asked for: T=$T" for
         (bname, backend, types) in BACKENDS, T in types
-    forest = Forest((2, 2); N=4, G=1, periodic=(true, true),
+    forest = Forest((2, 2); N=4, periodic=(true, true),
                     extents=ntuple(_ -> (zero(T), one(T)), 2))
-    fs = FieldSet{T}(forest, 2; backend=backend)
+    fs = FieldSet{T}(forest, 2; G=1, backend=backend)
     @test eltype(fs.work) === T
     @test typeof(get_backend(fs)) === typeof(backend)
     @test typeof(get_backend(statevector(fs))) === typeof(backend)
@@ -74,19 +74,19 @@ end
 
 @testset "$bname: a device rejects Float64 with a reason" for (bname, backend, _) in BACKENDS
     supports_float64(backend) && continue
-    forest = Forest((2,); N=4, G=1, periodic=(true,))
-    @test_throws "no hardware Float64" FieldSet{Float64}(forest, 1; backend=backend)
+    forest = Forest((2,); N=4, periodic=(true,))
+    @test_throws "no hardware Float64" FieldSet{Float64}(forest, 1; G=1, backend=backend)
 end
 
 @testset "$bname: a schedule and a field set must agree on the backend" for
         (bname, backend, types) in BACKENDS
     bname == "CPU" && continue
     T = first(types)
-    forest = Forest((2,); N=4, G=1, periodic=(true,),
+    forest = Forest((2,); N=4, periodic=(true,),
                     extents=((zero(T), one(T)),))
     ops = Operators(prolongation=2, restriction=2)
-    fs = FieldSet{T}(forest, 1; backend=backend)
-    host = GhostSchedule(forest, ops; T=T)              # CPU stencils
+    fs = FieldSet{T}(forest, 1; G=1, backend=backend)
+    host = GhostSchedule(forest, ops; G=1, T=T)         # CPU stencils
     @test_throws "wrong memory" fill_ghosts!(fs, host)
 end
 
@@ -97,7 +97,7 @@ end
     # outer-boundary cells the cell-wise hook fills.
     p = 4
     ops = Operators(prolongation=p, restriction=p)
-    forest = Forest(ntuple(_ -> 3, D); N=8, G=2, periodic=ntuple(_ -> false, D),
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> false, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
@@ -117,8 +117,9 @@ end
         acc
     end
 
-    fs = FieldSet{T}(forest, 2; backend=backend)
-    schedule = GhostSchedule(forest, ops; T=T, backend=backend)
+    G = 2
+    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    schedule = GhostSchedule(fs, ops)
     fill_by_coordinates!(poly, fs)
     fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(poly))
 
@@ -126,9 +127,8 @@ end
     work = Array(fs.work)
     worst = zero(T)
     for b in 1:nblocks(fs), v in 1:2
-        k = blockkey(fs, b)
-        for idx in CartesianIndices(ntuple(_ -> forest.N + 2 * forest.G, D))
-            x = cell_center(T, forest, k, Tuple(idx))
+        for idx in CartesianIndices(ntuple(_ -> forest.N + 2G, D))
+            x = coordinates(T, fs, b, Tuple(idx))
             worst = max(worst, abs(work[Tuple(idx)..., v, b] - poly(x, v)))
         end
     end
@@ -138,26 +138,26 @@ end
 @testset "$bname: the cell hook reproduces the host hook exactly: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # `boundary_by_coordinates` used to be a host loop calling
-    # `cell_center`; it is now a kernel forming the position from the
+    # `coordinates`; it is now a kernel forming the position from the
     # same origin and spacing. "Same expression" has to mean bit for
     # bit, or M5's thread-independence digests would have moved.
     ops = Operators(prolongation=2, restriction=2)
-    forest = Forest(ntuple(_ -> 2, D); N=4, G=2, periodic=ntuple(_ -> false, D),
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> false, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     f = (x, v) -> sum(x) * oftype(x[1], v) + one(x[1])
 
-    fs = FieldSet{T}(forest, 2; backend=backend)
-    fill_ghosts!(fs, GhostSchedule(forest, ops; T=T, backend=backend);
-                 boundary=boundary_by_coordinates(f))
+    fs = FieldSet{T}(forest, 2; G=2, backend=backend)
+    fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
     got = Array(fs.work)
 
     # The host formulation, spelled out here so the comparison is
     # against something independent of the implementation under test.
+    hostfs = FieldSet{T}(forest, 2; G=2)
     want = zeros(T, size(got))
-    schedule = GhostSchedule(forest, ops; T=T)
+    schedule = GhostSchedule(hostfs, ops)
     for r in schedule.boundaries, v in 1:2, idx in r.region
         want[Tuple(idx)..., v, r.block] =
-            f(cell_center(T, forest, forest.leaves[r.block], Tuple(idx)), v)
+            f(coordinates(T, hostfs, Int(r.block), Tuple(idx)), v)
     end
     for r in schedule.boundaries, v in 1:2, idx in r.region
         @test got[Tuple(idx)..., v, r.block] === want[Tuple(idx)..., v, r.block]
@@ -169,22 +169,23 @@ end
         (bname, backend, types) in BACKENDS
     bname == "CPU" && continue
     T = first(types)
-    forest = Forest((2,); N=4, G=1, periodic=(false,),
+    forest = Forest((2,); N=4, periodic=(false,),
                     extents=((zero(T), one(T)),))
     ops = Operators(prolongation=2, restriction=2)
-    fs = FieldSet{T}(forest, 1; backend=backend)
-    schedule = GhostSchedule(forest, ops; T=T, backend=backend)
+    fs = FieldSet{T}(forest, 1; G=1, backend=backend)
+    schedule = GhostSchedule(fs, ops)
     region_form = (fs, b, key, δ, region) -> nothing
     @test_throws "CellBoundary" fill_ghosts!(fs, schedule; boundary=region_form)
 end
 
 @testset "$bname: firing_boxes matches a host sweep: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
-    forest = Forest(ntuple(_ -> 3, D); N=8, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
-    fs = FieldSet{T}(forest, 1; backend=backend)
+    G = 1
+    fs = FieldSet{T}(forest, 1; G=G, backend=backend)
     # A blob, so that some blocks fire in part, some wholly, some not at
     # all — the three cases the box reduction has to get right.
     centre = ntuple(_ -> T(3) / 8, D)
@@ -197,7 +198,7 @@ end
 
     # The oracle: the same predicate, on the host, over the interior.
     work = Array(fs.work)
-    G, N = forest.G, forest.N
+    N = forest.N
     for b in 1:nblocks(fs)
         hits = [Tuple(c) for c in CartesianIndices(ntuple(_ -> N, D))
                 if work[ntuple(d -> Tuple(c)[d] + G, D)..., 1, b] > thr]
@@ -221,10 +222,10 @@ end
     # end: flag on the backend, regrid, and the volume integral must
     # survive with the conservative family.
     ops = Operators(prolongation=3, restriction=2, family=Conservative)
-    forest = Forest(ntuple(_ -> 3, D); N=8, G=2, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
-    fs = FieldSet{T}(forest, 1; backend=backend)
-    schedule = GhostSchedule(forest, ops; T=T, backend=backend)
+    fs = FieldSet{T}(forest, 1; G=2, backend=backend)
+    schedule = GhostSchedule(fs, ops)
     centre = ntuple(_ -> T(1) / 2, D)
     width = T(0.05)
     fill_by_coordinates!((x, v) -> exp(-sum((x .- centre) .^ 2) / width), fs)
@@ -236,7 +237,7 @@ end
     flags = map(firing_boxes(fires, fs)) do (n, box)
         n == 0 ? Coarsen : (Refine, box)
     end
-    @test regrid!(forest, fs, schedule; flags=flags)
+    @test regrid!(forest, fs => schedule; flags=flags)
     @test nleaves(forest) > 3^D                   # something really refined
     @test total_mass(fs) ≈ before rtol = gputol(T, 256)
 end
@@ -246,19 +247,19 @@ end
     # The device reduction is a per-block kernel; the CPU one is a host
     # `sum` over views. They cannot be bit-identical — the summation
     # orders differ — but they must agree to the precision's roundoff.
-    forest = Forest(ntuple(_ -> 3, D); N=8, G=1, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
     four = T(4)
     f = (x, v) -> sin(four * x[1]) + oftype(x[1], v)
 
-    dev = FieldSet{T}(forest, 2; backend=backend)
+    dev = FieldSet{T}(forest, 2; G=1, backend=backend)
     fill_by_coordinates!(f, dev)
     u = statevector(dev)
     gather!(u, dev)
 
-    host = FieldSet{T}(forest, 2)
+    host = FieldSet{T}(forest, 2; G=1)
     fill_by_coordinates!(f, host)
     uh = statevector(host)
     gather!(uh, host)
@@ -276,16 +277,16 @@ end
     # threaded `mapreduce`s over views; only the association of `op`
     # differs, so `max` and an integer count must agree exactly and a
     # sum to the precision's roundoff.
-    forest = Forest(ntuple(_ -> 3, D); N=8, G=2, periodic=ntuple(_ -> true, D),
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
     four = T(4)
     f = (x, v) -> sin(four * x[1]) + oftype(x[1], v)
 
-    dev = FieldSet{T}(forest, 2; backend=backend)
+    dev = FieldSet{T}(forest, 2; G=2, backend=backend)
     fill_by_coordinates!(f, dev)
-    host = FieldSet{T}(forest, 2)
+    host = FieldSet{T}(forest, 2; G=2)
     fill_by_coordinates!(f, host)
 
     half = T(1) / 2
