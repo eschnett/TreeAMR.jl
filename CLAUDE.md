@@ -102,7 +102,7 @@ layer uses only the ones before it:
 | storage | `storage.jl` | `FieldSet`: one `(N+2G, …, N+2G, nvars, nblocks)` array over all leaves, ghosts included |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
-| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, `volume_weighted_norm` |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, `block_mapreduce`, `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 
 The ideas that span several files and are easy to violate:
@@ -278,7 +278,8 @@ of the *public API only*. Facts that matter here:
   `cell_center`, `FieldSet`, `nblocks`, `blockkey`, `blockview`,
   `interiorview`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
   `fill_ghosts!`, `statevector`, `statearray`, `scatter!`, `gather!`,
-  `map_blocks!`, `volume_weighted_norm`, `flag_blocks`, `buffered_flags`,
+  `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
+  `flag_blocks`, `buffered_flags`,
   `complete_marks`, `regrid!`, `adapt_to_initial_data!`, the `RegridFlag`
   values, and the `(flag, box)` flag form. Renaming or re-signaturing any of
   these breaks it.

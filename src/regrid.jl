@@ -584,11 +584,11 @@ What [`regrid!`](@ref) does to this depends on the operator family:
 function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest
     R = float(real(T))
-    # One partial per block, summed afterwards in block order, so the
-    # answer does not move when the thread count does (M5) — nor with
-    # where the partials were formed (M6).
-    partials = block_partials(sum, +, zero(R), fs.work, fs;
-                              g=forest.G, vars=Int(var):Int(var))
+    # One value per block, summed afterwards in block order, so the
+    # answer does not move when the thread count does (M5). It is not
+    # promised to be bit-identical on a device, where the fold cannot
+    # reassociate — the suite asserts agreement to roundoff there.
+    partials = block_mapreduce(identity, +, zero(R), fs; vars=var)
     for b in 1:nblocks(fs)
         partials[b] *= spacing(R, forest, blockkey(fs, b))^D
     end

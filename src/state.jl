@@ -127,68 +127,162 @@ function map_blocks!(kernel!, fs::FieldSet{T,D}, args...) where {T,D}
     return nothing
 end
 
-# Per-block partial reductions.
+# Per-block reductions.
 #
-# Every diagnostic in the package has the same shape: one partial per
-# block, then a serial pass over the partials *in block order*. That
+# Every diagnostic in the package has the same shape: one value per
+# block, then a serial pass over those values *in block order*. That
 # ordering is what makes the result bit-for-bit independent of the
-# thread count (M5), and it is preserved here — only how the partials
-# are produced changes with the backend.
+# thread count (M5), and it is preserved here — only how the per-block
+# values are produced changes with the backend.
 #
-# On the CPU the partials are host reductions over per-block views,
+# On the CPU they are threaded host reductions over per-block views,
 # which is what M5 measured and what the recorded numbers were taken
-# with; that path is left exactly as it was. On a device the same
-# formulation would be one kernel launch and one device-to-host
-# synchronization *per block*, issued from several host tasks at once —
-# so there it becomes a single launch with one work item per block, each
-# looping over its own cells. Every work item owns its output slot, so
-# this is deterministic by construction: the same discipline as
-# everywhere else.
+# with. On a device that same formulation would be one kernel launch and
+# one device-to-host synchronization *per block*, issued from several
+# host tasks at once — so there it becomes a single launch with one work
+# item per block, each looping over its own cells. Every work item owns
+# its output slot, so this is deterministic by construction: the same
+# discipline as everywhere else.
 #
-# `array` is either the working array (offset `g = G`, ghosts skipped)
-# or the state array (`g = 0`); `f` reduces one block's view on the
-# host, and `op`/`init` are the same reduction in the form a kernel can
-# take. The two are passed together so neither backend has to
-# reconstruct the other's version.
-@kernel function block_reduce_kernel!(partials, @Const(array), op, init,
+# The two paths share one specification of the reduction, `(f, op,
+# init)`. They did not always: an earlier version passed a host
+# block-reducer *and* a kernel-form fold, and nothing checked that the
+# two agreed. `sum` over a block view is a sequential `mapfoldl` when
+# the view is `IndexCartesian` but a *pairwise* one when it is
+# `IndexLinear` — which `D = 1` with a scalar `vars` actually is. They
+# agreed for every shape the package itself passed, by accident of
+# `SubArray`'s `viewindexing` and nothing more (amended in M6).
+#
+# `array` is either the working array (offset `g = G`, so ghosts are
+# skipped) or the state array (`g = 0`). Neither helper below works that
+# out for itself; `block_mapreduce` does, which is why it and not these
+# is what an application calls.
+@kernel function block_reduce_kernel!(values, @Const(array), f, op, init,
                                       firstvar::Int, lastvar::Int,
                                       ::Val{D}, ::Val{G}, ::Val{N}) where {D,G,N}
     b = @index(Global)
     acc = init
     for v in firstvar:lastvar
         for c in CartesianIndices(ntuple(_ -> N, Val(D)))
-            acc = op(acc, array[ntuple(d -> Tuple(c)[d] + G, Val(D))..., v, b])
+            acc = op(acc, f(array[ntuple(d -> Tuple(c)[d] + G, Val(D))..., v, b]))
         end
     end
-    partials[b] = acc
+    values[b] = acc
 end
 
-function block_partials(f, op, init::R, array, fs::FieldSet{T,D};
-                        g::Integer=0, vars=1:fs.nvars) where {R,T,D}
-    backend = get_backend(array)
-    return block_partials(f, op, init, array, fs, backend; g=g, vars=vars)
-end
-
-function block_partials(f, op, init::R, array, fs::FieldSet{T,D}, backend::Backend;
-                        g::Integer=0, vars=1:fs.nvars) where {R,T,D}
+# The device path: one launch, one work item per block, one copy back.
+function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
+                                 backend::Backend, g::Int,
+                                 vars::UnitRange{Int}) where {R,T,D}
     n = nblocks(fs)
-    partials = allocate(backend, R, (n,))
-    block_reduce_kernel!(backend)(partials, array, op, init,
-                                  Int(first(vars)), Int(last(vars)),
-                                  Val(D), Val(Int(g)), Val(fs.forest.N); ndrange=n)
+    values = allocate(backend, R, (n,))
+    block_reduce_kernel!(backend)(values, array, f, op, init,
+                                  first(vars), last(vars),
+                                  Val(D), Val(g), Val(fs.forest.N); ndrange=n)
     synchronize(backend)
-    return tohost(partials)
+    return tohost(values)
 end
 
-function block_partials(f, op, init::R, array, fs::FieldSet{T,D}, ::CPU;
-                        g::Integer=0, vars=1:fs.nvars) where {R,T,D}
+# The host path. It is split out under its own name rather than
+# dispatched on `::CPU` so that both paths stay reachable on a machine
+# with no device, which is what lets the suite check that the two
+# compute the same fold.
+function _block_mapreduce_host(f, op, init::R, array, fs::FieldSet{T,D}, g::Int,
+                               vars::UnitRange{Int}) where {R,T,D}
     N = fs.forest.N
     inner = ntuple(_ -> (g + 1):(g + N), D)
-    partials = Vector{R}(undef, nblocks(fs))
+    values = Vector{R}(undef, nblocks(fs))
     threaded_foreach(nblocks(fs)) do b
-        partials[b] = f(view(array, inner..., vars, b))
+        values[b] = mapreduce(f, op, view(array, inner..., vars, b); init=init)
     end
-    return partials
+    return values
+end
+
+# `vars` ends up as a pair of kernel arguments, so it has to name a
+# contiguous run of variables: there is no way to hand a device an
+# arbitrary index vector cell by cell, and silently reducing
+# `first:last` instead would be worse than refusing.
+function _varrange(vars, nvars::Integer)
+    r = if vars isa Integer
+        Int(vars):Int(vars)
+    elseif vars isa AbstractUnitRange{<:Integer}
+        Int(first(vars)):Int(last(vars))
+    else
+        throw(ArgumentError("vars must be an integer or a contiguous range of " *
+                            "variable indices, got a $(typeof(vars)): the " *
+                            "selection becomes a kernel argument, and a kernel " *
+                            "cannot be handed an arbitrary index vector"))
+    end
+    isempty(r) || 1 <= first(r) <= last(r) <= nvars ||
+        throw(ArgumentError("vars = $vars is out of range for a field set with " *
+                            "$nvars variable(s); valid indices are 1:$nvars"))
+    return r
+end
+
+"""
+    block_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars)
+    block_mapreduce(f, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars)
+
+Reduce each block's interior cells to one value: `f` transforms a cell
+value and `op` folds the transformed values into an accumulator that
+starts at `init`. The result is a host `Vector` of length
+`nblocks(fs)`, indexed by block, with element type taken from `init`.
+
+The first form reads the working array's interiors, skipping the ghosts;
+the second reads a state vector, which has no ghosts to skip. `vars` is
+an integer or a contiguous range of variable indices.
+
+This is the read-side counterpart of [`map_blocks!`](@ref), and it is
+the shape every diagnostic here has. Combining the values is left to the
+caller, because the useful combination usually weights each block by its
+own geometry first — see [`total_mass`](@ref). Combine them **in block
+order** (`sum`, `maximum`, a loop over `1:nblocks(fs)`) and the answer
+does not depend on the thread count; a running total split across tasks
+would not, which is why this returns the per-block values rather than a
+number.
+
+The largest value of each variable, which a refinement criterion needs
+for its scale:
+
+```julia
+scales = [maximum(block_mapreduce(abs, max, zero(eltype(fs.work)), fs; vars=v))
+          for v in 1:fs.nvars]
+```
+
+It runs wherever the data lives: threaded host reductions over per-block
+views on the CPU, one kernel work item per block on a device. It
+synchronizes and copies back to the host, so it belongs at diagnostic or
+regrid frequency — not inside a right-hand side.
+
+The fold is one specification on both backends, but its *association* is
+not: the host's `mapreduce` may reassociate `op` where the kernel's
+sequential loop cannot. The guarantee is bit-identical results across
+thread counts, which is what `CODE.md` claims; identical results across
+backends is not claimed and, for floating-point `op`, not true.
+
+!!! note "Callbacks on a device"
+    `f` and `op` become kernel arguments, so everything they close over
+    must be `isbits`. A captured `Type` is the usual trip: write
+    `oftype(x, 2)` rather than closing over `T` and calling `T(2)`. The
+    same rule covers captured arrays and any mutable state.
+"""
+function block_mapreduce(f, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars) where {T,D}
+    return _block_mapreduce(f, op, init, fs.work, fs, Int(fs.forest.G),
+                            _varrange(vars, fs.nvars))
+end
+
+function block_mapreduce(f, op, init, fs::FieldSet{T,D}, u::AbstractVector;
+                         vars=1:fs.nvars) where {T,D}
+    return _block_mapreduce(f, op, init, statearray(u, fs), fs, 0,
+                            _varrange(vars, fs.nvars))
+end
+
+function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::Int,
+                          vars::UnitRange{Int}) where {R,T,D}
+    backend = get_backend(array)
+    return backend isa CPU ?
+           _block_mapreduce_host(f, op, init, array, fs, g, vars) :
+           _block_mapreduce_device(f, op, init, array, fs, backend, g, vars)
 end
 
 """
@@ -208,7 +302,6 @@ Threaded over blocks, with the per-block partials combined in block
 order, so the value does not depend on the thread count.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
-    state = statearray(u, fs)
     forest = fs.forest
     R = float(real(T))
 
@@ -216,8 +309,7 @@ function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) w
     # order: threaded, and bit-for-bit independent of the thread count,
     # which a running total split across tasks would not be.
     if isinf(p)
-        partials = block_partials(b -> isempty(b) ? zero(R) : maximum(abs, b),
-                                  (a, x) -> max(a, abs(x)), zero(R), state, fs)
+        partials = block_mapreduce(abs, max, zero(R), fs, u)
         return isempty(partials) ? zero(R) : maximum(partials)
     end
 
@@ -226,8 +318,7 @@ function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) w
     # innermost loop — fatal on a device with no hardware fp64, and the
     # exact leak the type-genericity work went after.
     q = p isa Integer ? Int(p) : R(p)
-    partials = block_partials(b -> sum(x -> abs(x)^p, b),
-                              (a, x) -> a + abs(x)^q, zero(R), state, fs)
+    partials = block_mapreduce(x -> abs(x)^q, +, zero(R), fs, u)
     volumes = Vector{R}(undef, nblocks(fs))
     cells = fs.forest.N^D * fs.nvars
     for b in 1:nblocks(fs)

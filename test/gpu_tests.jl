@@ -269,6 +269,45 @@ end
     @test total_mass(dev) ≈ total_mass(host) rtol = gputol(T, 65536)
 end
 
+@testset "$bname: block_mapreduce agrees with a host sweep: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # The reduction an application builds its own diagnostics on. The
+    # device forms the per-block values in one launch and the host in
+    # threaded `mapreduce`s over views; only the association of `op`
+    # differs, so `max` and an integer count must agree exactly and a
+    # sum to the precision's roundoff.
+    forest = Forest(ntuple(_ -> 3, D); N=8, G=2, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    four = T(4)
+    f = (x, v) -> sin(four * x[1]) + oftype(x[1], v)
+
+    dev = FieldSet{T}(forest, 2; backend=backend)
+    fill_by_coordinates!(f, dev)
+    host = FieldSet{T}(forest, 2)
+    fill_by_coordinates!(f, host)
+
+    half = T(1) / 2
+    for vars in (1, 1:2)
+        @test block_mapreduce(abs, max, zero(T), dev; vars=vars) ==
+              block_mapreduce(abs, max, zero(T), host; vars=vars)
+        @test block_mapreduce(x -> abs(x) > half, +, 0, dev; vars=vars) ==
+              block_mapreduce(x -> abs(x) > half, +, 0, host; vars=vars)
+        @test block_mapreduce(identity, +, zero(T), dev; vars=vars) ≈
+              block_mapreduce(identity, +, zero(T), host; vars=vars) rtol = gputol(T)
+    end
+
+    # The state-vector form reads a different array with a different
+    # ghost offset, so it is exercised separately.
+    u = statevector(dev)
+    gather!(u, dev)
+    uh = statevector(host)
+    gather!(uh, host)
+    @test block_mapreduce(abs, max, zero(T), dev, u) ==
+          block_mapreduce(abs, max, zero(T), host, uh)
+end
+
 # --- the acceptance test -------------------------------------------------
 
 @testset "$bname: M3 convergence reproduced: T=$T, D=$D" for

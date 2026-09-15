@@ -732,6 +732,59 @@ entries per volume — documented here, implemented post-M3.
   numbers were measured with it — and the ordered combination, which is
   what the bit-identity rests on, is shared.
 
+  **The reduction became public, as `block_mapreduce` (amended).** It
+  was an internal helper, on the reasoning that the package ships the
+  diagnostics an application needs. That reasoning was wrong, and the
+  downstream application found it from the outside: the diagnostics it
+  needs are *its* diagnostics — the per-variable scale a refinement
+  criterion divides by, a coverage count, a pulse tracker — and there
+  was no supported way to build one that is threaded, backend-agnostic
+  and thread-count deterministic. What the mesh owns here is not the
+  reduction but the *determinism discipline*, and a second copy of that
+  argument downstream is a second thing to get wrong. It is the same
+  split `firing_boxes` already makes, and the read-side counterpart of
+  `map_blocks!`, which was exported from M3.
+
+  Exporting it meant fixing it first, and the fix is the point:
+
+  - **One specification of the reduction, not two.** The internal form
+    took a host block-reducer `f` *and* a kernel-form fold `(op, init)`,
+    which had to agree and which nothing checked. They do not agree in
+    general: `sum` over a block view is a sequential `mapfoldl` when the
+    view is `IndexCartesian` but a *pairwise* one when it is
+    `IndexLinear`, and `D = 1` with a scalar variable selection is the
+    latter — measured, at 3.0e-15 relative over 4096 cells. Every shape
+    the package itself passed happened to be `IndexCartesian`, so the
+    two paths agreed by accident of `SubArray`'s `viewindexing` and
+    nothing more. The public form is `mapreduce`-shaped — `f` a
+    per-cell transform, `(op, init)` the fold — so the host can still
+    reassociate while both backends compute the same thing. A second
+    latent copy of this went with it: the host path raised `abs(x)^p`
+    where the kernel raised `abs(x)^q`, the `Float64`-exponent leak the
+    comment two lines above it warns against.
+  - **No ghost offset in the signature.** The internal form took a bare
+    array plus the `g` that matched it; omitting `g` silently reduced
+    the wrong cells. The public form takes the field set (working array,
+    ghosts skipped) or the field set and a state vector (no ghosts), and
+    works `g` out itself. This is the same off-by-`G` that `cell_center`
+    taking stored indices invites, and one the caller should not be
+    asked to get right twice.
+  - **A variable selection a kernel cannot take is refused.** The host
+    used `vars` as a view index and the device used
+    `first(vars):last(vars)`, so a non-contiguous selection silently
+    meant different things on the two backends. It is now an
+    `ArgumentError` saying why.
+
+  The guarantee is stated as what it is: bit-identical across thread
+  counts, because every block owns its output slot and combining happens
+  in block order. Identical across *backends* is not claimed and, for a
+  floating-point `op`, is not true — the association differs. The CPU
+  numbers did not move: `volume_weighted_norm` at `p = 1, 2, 3, ∞` and
+  `total_mass` reproduce their pre-M6 values bit for bit in `D = 1, 2, 3`
+  and in both `Float64` and `Float32`. Both paths are reachable on
+  `CPU()`, so the suite checks that they compute the same fold on every
+  run and not only where there is a device.
+
   **Measured on an H200** (960 blocks of `32^3`, 31.5M cells, `Float64`;
   the host column is the same node's 16 allocated cores under
   `numactl --interleave=all`, not the 64-core EPYC of the M5 table, so
