@@ -66,6 +66,14 @@ julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.in
 julia --project=docs docs/make.jl
 ```
 
+Both `Pkg.develop` lines above have a side effect on a current Julia: they
+write a `[sources]` entry into that environment's `Project.toml`. It is a
+1.11+ feature, so it is exactly what the compat bound below forbids, and it
+turns a local convenience into a build everyone else's 1.10 cannot parse.
+The `Manifest.toml` they also write is the part you want, and is
+gitignored. Check `git status` after running either and revert
+`test/Project.toml` or `docs/Project.toml` if it moved.
+
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block in `docs/src/index.md`, and every `` [`name`](@ref) `` must resolve, or
 the build errors out. **Adding a documented function means adding it to
@@ -77,8 +85,21 @@ and macOS. `Project.toml` says `julia = "1.10"`, so no 1.11+ features (no
 differ across Julia versions, so a test whose *assertions* depend on a
 particular random draw can pass locally and fail on 1.10: use a seeded RNG
 for the inputs, but make what the test asserts follow deterministically from
-the setup. `juliaup` has 1.10 installed, so a suspect test can be checked
-with `julia +1.10 --project=. -e 'using Pkg; Pkg.test()'`.
+the setup. `juliaup` has 1.10 installed, but checking a suspect test on it
+is not simply `Pkg.test()` in this checkout: 1.10 cannot read a
+`Manifest.toml` a newer Julia resolved, and even against fresh manifests
+its `Pkg.test()` dies with "can not merge projects" whenever
+`test/Manifest.toml` exists — which the setup command above creates.
+Copy the tree without any manifest and run the test file directly
+(measured: 92366 tests, ~90 s):
+
+```bash
+rm -rf /tmp/amr110 && mkdir /tmp/amr110 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr110
+```
+
+```bash
+cd /tmp/amr110 && julia +1.10 --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()' && julia +1.10 --project=test test/runtests.jl
+```
 
 Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
 takes a list of thread counts and prints a speedup table). Sizes come
@@ -105,7 +126,7 @@ layer uses only the ones before it:
 | storage | `storage.jl` | `FieldSet`: one `(N+2G, …, N+2G, nvars, nblocks)` array over all leaves, ghosts included |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
-| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, `volume_weighted_norm` |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, `block_mapreduce`, `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 
 The ideas that span several files and are easy to violate:
@@ -281,7 +302,8 @@ of the *public API only*. Facts that matter here:
   `cell_center`, `FieldSet`, `nblocks`, `blockkey`, `blockview`,
   `interiorview`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
   `fill_ghosts!`, `statevector`, `statearray`, `scatter!`, `gather!`,
-  `map_blocks!`, `volume_weighted_norm`, `flag_blocks`, `buffered_flags`,
+  `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
+  `flag_blocks`, `buffered_flags`,
   `complete_marks`, `regrid!`, `adapt_to_initial_data!`, the `RegridFlag`
   values, and the `(flag, box)` flag form. Renaming or re-signaturing any of
   these breaks it.

@@ -401,6 +401,7 @@ statearray
 scatter!
 gather!
 map_blocks!
+block_mapreduce
 volume_weighted_norm
 ```
 

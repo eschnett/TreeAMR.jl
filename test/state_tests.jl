@@ -115,3 +115,103 @@ end
     # Linf really is the maximum.
     @test volume_weighted_norm(fs, u; p=Inf) ≈ maximum(abs, u)
 end
+
+# Per-block reductions (M3 shape, made public in M6).
+
+using TreeAMR: _block_mapreduce_host, _block_mapreduce_device
+using KernelAbstractions: CPU
+
+# A refined, periodic mesh with poisoned ghosts: if a reduction picked
+# the wrong window, the poison shows up as a wrong number rather than a
+# near-miss that a tolerance would swallow.
+function poisoned_fieldset(::Val{D}, nvars; N=4, G=2, seed=7) where {D}
+    forest = Forest(ntuple(_ -> 2, D); N=N, G=G, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, 1.0), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    fs = FieldSet(forest, nvars)
+    rng = MersenneTwister(seed)
+    fill!(fs.work, 1e6)                       # poison, ghosts included
+    for b in 1:nblocks(fs), v in 1:nvars
+        iv = interiorview(fs, b, v)
+        for i in eachindex(iv)
+            iv[i] = randn(rng)
+        end
+    end
+    return fs
+end
+
+@testset "Per-block reductions read interiors only: D=$D" for D in (1, 2, 3)
+    # Guards the off-by-G that a `g` the caller had to supply invited:
+    # the working-array form must skip the ghosts and the state-vector
+    # form must not shift by G.
+    fs = poisoned_fieldset(Val(D), 2)
+    oracle = [sum(sum(interiorview(fs, b, v)) for v in 1:2) for b in 1:nblocks(fs)]
+
+    @test block_mapreduce(identity, +, 0.0, fs) ≈ oracle
+    @test maximum(block_mapreduce(abs, max, 0.0, fs)) < 1e5     # no poison read
+
+    u = statevector(fs)
+    gather!(u, fs)
+    @test block_mapreduce(identity, +, 0.0, fs, u) ≈ oracle
+
+    # One variable at a time, as a scalar and as a range.
+    for v in 1:2
+        per_v = [sum(interiorview(fs, b, v)) for b in 1:nblocks(fs)]
+        @test block_mapreduce(identity, +, 0.0, fs; vars=v) ≈ per_v
+        @test block_mapreduce(identity, +, 0.0, fs; vars=v:v) ≈ per_v
+        @test block_mapreduce(identity, +, 0.0, fs, u; vars=v) ≈ per_v
+    end
+end
+
+@testset "Host and kernel reductions compute the same fold: D=$D" for D in (1, 2, 3)
+    # The two backends carried separate specifications of the reduction
+    # until M6, and nothing checked they agreed — `sum` over a block view
+    # is pairwise for an `IndexLinear` view and sequential for an
+    # `IndexCartesian` one, and D=1 with a scalar `vars` is the first.
+    # Both paths are reachable on `CPU()`, so this is checked on every
+    # run and not only where there is a device.
+    fs = poisoned_fieldset(Val(D), 2)
+    G = fs.forest.G
+    half = 0.5
+    cases = (("sum", identity, +, 0.0),
+             ("max|x|", abs, max, 0.0),
+             ("count", x -> abs(x) > half, +, 0))
+    for (name, f, op, init) in cases, vars in (1, 1:1, 1:2)
+        r = vars isa Integer ? (Int(vars):Int(vars)) : vars
+        host = _block_mapreduce_host(f, op, init, fs.work, fs, G, r)
+        device = _block_mapreduce_device(f, op, init, fs.work, fs, CPU(), G, r)
+        # Exact for `max` and for the integer count; `+` may reassociate.
+        if init isa Integer || op === max
+            @test host == device
+        else
+            @test host ≈ device rtol = 1e-12
+        end
+        @test block_mapreduce(f, op, init, fs; vars=vars) == host
+    end
+end
+
+@testset "Per-block reductions take their element type from init" begin
+    # A predicate count into an `Int` accumulator over a `Float64` field
+    # set: the result type follows `init`, not `eltype(fs.work)`.
+    fs = poisoned_fieldset(Val(2), 1)
+    counts = block_mapreduce(x -> abs(x) > 0.5, +, 0, fs)
+    @test counts isa Vector{Int}
+    @test counts == [count(x -> abs(x) > 0.5, interiorview(fs, b, 1))
+                     for b in 1:nblocks(fs)]
+
+    @test block_mapreduce(identity, +, 0.0f0, fs) isa Vector{Float32}
+end
+
+@testset "A variable selection that a kernel cannot take is refused" begin
+    # Silently reducing `first:last` instead — which the device path once
+    # did — would give a different answer from the host for the same call.
+    fs = poisoned_fieldset(Val(2), 3)
+    @test_throws "contiguous range" block_mapreduce(identity, +, 0.0, fs; vars=[1, 3])
+    @test_throws "contiguous range" block_mapreduce(identity, +, 0.0, fs; vars=1:2:3)
+    @test_throws "out of range" block_mapreduce(identity, +, 0.0, fs; vars=0:2)
+    @test_throws "out of range" block_mapreduce(identity, +, 0.0, fs; vars=4)
+    @test_throws "out of range" block_mapreduce(identity, +, 0.0, fs; vars=1:4)
+    # An empty selection is not an error: every block reduces to `init`.
+    @test block_mapreduce(identity, +, 0.0, fs; vars=1:0) == zeros(nblocks(fs))
+end
