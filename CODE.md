@@ -906,16 +906,27 @@ survived contact with the code; four things it left open, settled here:
   `G+N+1`), so they never collide and share a phase; it is *dimensions*
   that have to be separated, because the line where two coarse-fine
   faces of a block meet is a target of both.
-- **The phases commute, and 2:1 balance is why** (measured; the design
-  argued only that a doubly written point gets the same value twice).
-  No plane the fixup writes is a plane it reads, over all phases: a
-  point where that could happen lies on the line where two faces of a
-  fine block meet, so the level-`l+2` block that wrote it and the
-  level-`l` block that would read it touch across a *corner*, which
-  `balance!` forbids — it walks all `3^D − 1` directions, not just the
-  faces. The stronger statement is under test and is what makes the
-  fixup a pure function of the fluxes it is handed, whatever order the
-  phases run in and however `run_phase!` deals its slices out.
+- **The phases commute, for two reasons, and 2:1 balance is one of
+  them** (measured). No plane the fixup writes is a plane it reads, over
+  all phases: a point where that could happen lies on the line where two
+  faces of a fine block meet, so the level-`l+2` block that wrote it and
+  the level-`l` block that would read it touch across an edge or a
+  *corner*, which `balance!` forbids — it walks all `3^D − 1`
+  directions, not just the faces. That is stronger than the design
+  claimed and is under test (`isdisjoint(targets, sources)` over a
+  three-level forest, every centering that has an interface, `G = 0`
+  and `1`). The design's own argument remains the *other* reason: a
+  point on the line where two coarse-fine faces of the same block meet
+  is written in two phases, once from each finer neighbor, and the result
+  is order-independent only because both neighbors computed the same
+  value there from the same data — the application's obligation, the one
+  that also makes same-level fluxes agree. For a face field the
+  tangential range is owned, so no point is written twice and balance
+  alone suffices; for an edge field with its closed tangential range
+  both conditions are needed, and the oracle test satisfies the second
+  by construction, its data being a function of position. Together they
+  make the fixup a pure function of the fluxes it is handed, whatever
+  order the phases run in and however `run_phase!` deals its slices out.
 - **`target_range` grew a `closed` flag rather than the interface
   schedule growing a range of its own.** Tangentially the fixup wants
   the closed range where the ghost exchange wants the owned one, and
