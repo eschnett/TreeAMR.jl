@@ -131,7 +131,14 @@ Changes:
   cell-centered dimensions; `check_operators` **refuses** the conservative
   family on any field set with a vertex-like dimension, with the reason
   from CODE.md. Point-value constraint in a vertex-like dimension:
-  `G_d ≥ p/2 − 1`.
+  `G_d ≥ p/2 − 1`. **Relax step 1's `G_d ≥ 1` accordingly**: keep it in
+  cell-centered dimensions (no ghosts there means nothing to exchange
+  there), but a vertex-like dimension with `G_d = 0` still has its shared
+  plane to exchange, and `G = (0, g, g)` on an evolved face field at
+  `p = 2` is exactly the second-order constrained-transport configuration
+  CODE.md describes ("zero at `p = 2`") — it needs a ghost schedule and
+  must be accepted. Reword the step-1 message, which says a dimension
+  without ghosts has nothing to exchange; that stops being true.
 - `transfer_kernel!` takes `::Val{Ps}` with `Ps::NTuple{D,Int}` and loops
   `CartesianIndices(Ps)`; `run_group!` builds `Ps` from the stencils.
 - Boundary regions include the shared plane on the domain's high side
