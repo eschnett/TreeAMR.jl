@@ -125,7 +125,12 @@ KernelAbstractions backend:
 Note that reaching 2nd order on a refined mesh needs **order-4**
 interpolation — see the warning on `Operators`.
 
-Next up is M7: MPI.
+Next up is M8: every centering (cell, vertex, face, edge), per-field-set
+ghost width, the interface restriction that makes a finite-volume scheme
+conservative across coarse-fine faces, and Burgers' equation as the
+test. MPI (M7) follows M8, so that the distributed exchange is built
+once over a layout-generic schedule; the design is in
+[CODE.md](CODE.md#centerings).
 
 ## Installation
 

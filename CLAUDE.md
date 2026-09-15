@@ -15,8 +15,11 @@ summary.
 Current state: milestones M0–M6 are done (tree core, ghost exchange, ODE
 coupling, regridding, multi-threading, GPU), plus the conservative
 operator family that was scheduled for M8. Everything is `D`-generic and
-floating-point-type generic. Next is MPI (M7), face-centered variables
-and conservation (M8), I/O (M9).
+floating-point-type generic. Next is M8 — every centering, per-field-set
+ghost width, the interface restriction, Burgers — whose design is in
+CODE.md and whose step-by-step implementation plan is `M8-PLAN.md`; then
+MPI (M7), deliberately after M8 so the distributed exchange is built once
+over a layout-generic schedule; then I/O (M9).
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
