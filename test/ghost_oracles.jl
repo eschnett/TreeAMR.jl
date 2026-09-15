@@ -150,9 +150,15 @@ is what makes a bit-for-bit comparison across blocks meaningful.
 arbitrary_value(::Type{T}, p, v::Integer) where {T} =
     T(2 * (hash((p, v)) / typemax(UInt64)) - 1)
 
-"""Fill every owned point of every block from [`arbitrary_value`](@ref)."""
-function fill_arbitrary!(fs::FieldSet{T,D}) where {T,D}
-    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D))
+"""
+Fill every owned point of every block from [`arbitrary_value`](@ref), or
+every *closed*-range point with `closed = true` — which is what a block
+computes for itself when it holds a flux or an EMF, the shared plane
+included, and so what the interface restriction finds in place.
+"""
+function fill_arbitrary!(fs::FieldSet{T,D}; closed::Bool=false) where {T,D}
+    c = closed ? staggers(fs) : ntuple(_ -> 0, D)
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D))
     for b in 1:nblocks(fs), v in 1:fs.nvars, idx in owned
         fs.work[Tuple(idx)..., v, b] =
             arbitrary_value(T, exact_point(fs, b, Tuple(idx)), v)
@@ -345,4 +351,137 @@ function periodic_vs_tiled(::Val{D}, M::Int; N=4, G=1, nvars=2,
         end
     end
     return (worst, ncells)
+end
+
+# --- Interface restriction (M8b) -----------------------------------------
+
+"""
+Every closed-range point of every block, keyed by `(level, exact
+position)`.
+
+Two blocks at one level that name the same point store the same number
+once the data comes from [`arbitrary_value`](@ref), so the map is well
+defined even though the closed ranges of neighbouring blocks overlap on
+their shared plane.
+"""
+function closed_values(fs::FieldSet{T,D}) where {T,D}
+    out = Dict{Tuple{Int,NTuple{D,Rational{Int}}},Vector{T}}()
+    c = staggers(fs)
+    closed = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D))
+    for b in 1:nblocks(fs), idx in closed
+        out[(level(blockkey(fs, b)), exact_point(fs, b, Tuple(idx)))] =
+            T[fs.work[Tuple(idx)..., v, b] for v in 1:fs.nvars]
+    end
+    return out
+end
+
+"""
+The interface restriction computed by hand, as `(block, stored index) =>
+expected value` for every point it should touch.
+
+For every block, every vertex-like dimension and both sides,
+`neighbor_keys` says whether the neighbours across that face are finer;
+where they are, the block's boundary plane must come back as the average
+of the coincident fine values. *Which* fine values those are is decided
+by position and nothing else — a cell-like tangential dimension
+contributes the two fine points half a fine spacing to either side, a
+vertex-like one the single coincident point — from the exact rational
+geometry of [`exact_point`](@ref), never from the package's stencils or
+target ranges.
+
+`values` is [`closed_values`](@ref) of the *pristine* field set, taken
+before the restriction runs.
+"""
+function interface_targets(fs::FieldSet{T,D}, values) where {T,D}
+    forest = fs.forest
+    N, G, c = forest.N, fs.G, staggers(fs)
+    wrap(d, x) = forest.periodic[d] ? mod(x, forest.roots[d]) : x
+    out = Dict{Tuple{Int,NTuple{D,Int}},Vector{T}}()
+    for b in 1:nblocks(fs)
+        k = blockkey(fs, b)
+        l = level(k)
+        half = 1 // (2 * N * (1 << (l + 1)))        # half a fine spacing, in root cells
+        for d in 1:D
+            c[d] == 1 || continue
+            for s in (-1, 1)
+                δ = ntuple(e -> e == d ? s : 0, D)
+                nbrs = neighbor_keys(forest, k, δ)
+                (isempty(nbrs) || level(first(nbrs)) <= l) && continue
+                # 2:1 balance, so the finer side is exactly one level down.
+                @assert all(nbr -> level(nbr) == l + 1, nbrs)
+                plane = s == 1 ? G[d] + N + 1 : G[d] + 1
+                rng = ntuple(e -> e == d ? (plane:plane) :
+                             ((G[e] + 1):(G[e] + N + c[e])), D)
+                shifts = Iterators.product(ntuple(e -> (e != d && c[e] == 0) ?
+                                                  (-1, 1) : (0,), D)...)
+                for idx in CartesianIndices(rng)
+                    p = exact_point(fs, b, Tuple(idx))
+                    acc = zeros(T, fs.nvars)
+                    n = 0
+                    for sh in shifts
+                        q = ntuple(e -> wrap(e, p[e] + sh[e] * half), D)
+                        acc .+= values[(l + 1, q)]
+                        n += 1
+                    end
+                    out[(b, Tuple(idx))] = acc ./ n
+                end
+            end
+        end
+    end
+    return out
+end
+
+"""
+How many times each phase of an [`InterfaceSchedule`](@ref) writes each
+stored point: one count array per phase, in phase order.
+
+A phase must write every target exactly once — the fixup overwrites a
+block's own computed values, so a double write would make the result
+depend on which of two fine sources landed last.
+"""
+function interface_write_counts(isched::InterfaceSchedule{T,D}) where {T,D}
+    forest = isched.forest
+    c = staggers(isched.centering)
+    stored = ntuple(d -> forest.N + 2 * isched.G[d] + c[d], D)
+    return map(isched.phases) do groups
+        counts = zeros(Int, stored..., nleaves(forest))
+        for group in groups
+            blen = boxsize(group)
+            first = ntuple(d -> group.stencils[d].targetfirst, D)
+            for t in 1:ntransfers(group)
+                b = group.targetblocks[t]
+                for off in CartesianIndices(ntuple(d -> 0:(blen[d] - 1), D))
+                    counts[ntuple(d -> first[d] + off[d], D)..., b] += 1
+                end
+            end
+        end
+        counts
+    end
+end
+
+"""
+Every `(block, stored index)` an [`InterfaceSchedule`](@ref) writes and
+every one it reads, as two sets over all phases.
+"""
+function interface_touches(isched::InterfaceSchedule{T,D}) where {T,D}
+    targets = Set{Tuple{Int,NTuple{D,Int}}}()
+    sources = Set{Tuple{Int,NTuple{D,Int}}}()
+    for groups in isched.phases, group in groups
+        blen = boxsize(group)
+        tfirst = ntuple(d -> group.stencils[d].targetfirst, D)
+        srcstart = ntuple(d -> group.stencils[d].srcstart, D)
+        width = ntuple(d -> size(group.stencils[d].weights, 1), D)
+        for t in 1:ntransfers(group)
+            tb, sb = Int(group.targetblocks[t]), Int(group.sourceblocks[t])
+            for off in CartesianIndices(ntuple(d -> 0:(blen[d] - 1), D))
+                o = Tuple(off)
+                push!(targets, (tb, ntuple(d -> tfirst[d] + o[d], D)))
+                base = ntuple(d -> Int(srcstart[d][o[d] + 1]), D)
+                for m in CartesianIndices(ntuple(d -> 0:(width[d] - 1), D))
+                    push!(sources, (sb, ntuple(d -> base[d] + Tuple(m)[d], D)))
+                end
+            end
+        end
+    end
+    return targets, sources
 end

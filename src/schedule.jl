@@ -310,9 +310,11 @@ end
 
 """
     isstale(schedule::GhostSchedule)
+    isstale(schedule::InterfaceSchedule)
 
 Whether the forest has changed since `schedule` was built, in which case
-it must be rebuilt before [`fill_ghosts!`](@ref) will accept it.
+it must be rebuilt before [`fill_ghosts!`](@ref) — or
+[`restrict_interfaces!`](@ref) — will accept it.
 """
 isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 
@@ -358,11 +360,23 @@ function interpolation_weights(lo::Int, p::Int, x::Rational, what::AbstractStrin
 end
 
 # Target range of a transfer in dimension d.
-function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool)
+#
+# `closed` extends the block's *own* range (δd = 0) by the shared plane,
+# turning the owned range into the closed one and giving the top half of
+# a halved range the extra point. The ghost exchange never wants it — a
+# block's shared plane is the target of its δ_d = +1 region, not of a
+# tangential one — but the interface restriction does: it overwrites the
+# block's own closed-range values, and in a vertex-like dimension the
+# boundary line of a coarse-fine face is part of what must agree. Keeping
+# it here, rather than in a range the interface schedule derives for
+# itself, is what keeps this function the single source of truth.
+function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
+                      closed::Bool=false)
     δd == 1 && return (G + N + 1):(N + 2G + c)
     δd == -1 && return 1:G
-    halved && return (G + 1 + od * (N ÷ 2)):(G + od * (N ÷ 2) + N ÷ 2)
-    return (G + 1):(G + N)
+    top = closed ? c : 0                            # the shared plane, to the top half
+    halved && return (G + 1 + od * (N ÷ 2)):(G + od * (N ÷ 2) + N ÷ 2 + od * top)
+    return (G + 1):(G + N + top)
 end
 
 # Same-level copy: a pure shift of N cells against the direction, for
@@ -386,9 +400,16 @@ end
 # and never has to shift — the circularity that forces the cell-centered
 # window inward cannot arise, because the coincident fine point is always
 # owned by the fine block (that is the `N ≥ 2G + 2` invariant).
-function restrict_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
-                          p::Int) where {T}
-    rng = target_range(N, G, c, δd, od, true)
+restrict_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
+                 p::Int) where {T} =
+    restrict_stencil_over(T, target_range(N, G, c, δd, od, true), N, G, c, δd, od, p)
+
+# The body, over an explicit target range. The interface restriction
+# (M8b) is the same transfer over a different range — one plane in the
+# face dimension, the closed range tangentially — so it calls this rather
+# than repeating the arithmetic that maps a target point to its source.
+function restrict_stencil_over(::Type{T}, rng::UnitRange{Int}, N::Int, G::Int, c::Int,
+                               δd::Int, od::Int, p::Int) where {T}
     # Step into the adjacent node's frame, where the source's parent has
     # the target block's own layout.
     shift = -N * δd

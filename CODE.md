@@ -814,8 +814,9 @@ original plan tied this to M8 and left applications non-conservative at
 coarse-fine interfaces until then (fine for the wave equation and the
 Einstein equations); the M8 design of step (ii) follows.
 
-**Interface restriction** (M8 design; the "flux fixup"). A mesh
-operation on any field set with a vertex-like dimension:
+**Interface restriction** (M8 design, implemented in M8b step 4; the
+"flux fixup"). A mesh operation on any field set with a vertex-like
+dimension:
 
     isched = InterfaceSchedule(flux)             # rebuilt when the tree changes
     restrict_interfaces!(flux, isched)
@@ -887,6 +888,49 @@ range cut down to one plane — and it is batched, sliced and replayed by
 the same `TransferGroup` / `run_phase!` machinery on any backend. It
 records the forest generation and the field set's layout, and refuses to
 run stale or on a different layout, as the ghost schedule does.
+
+**Implemented in M8b step 4.** `InterfaceSchedule(fs)` and
+`restrict_interfaces!(fs, isched)`, in `src/interfaces.jl`; no new
+kernel, no new struct beyond the schedule itself. The design above
+survived contact with the code; four things it left open, settled here:
+
+- **The schedule takes no `Operators`**, unlike the ghost schedule. The
+  transfer is injection and the exact two-cell average, both fixed by
+  the geometry, so there is no order for a caller to choose and no
+  family to select — the point-value builder at `p = 2` *is* the exact
+  average, which is also what the conservative family's restriction is.
+  `InterfaceSchedule(fs)` is therefore the whole signature.
+- **A phase is a face *dimension*, not a signed direction** — `D`
+  launches, as the design's count said, but arrived at differently. The
+  two signs of one dimension target different planes (`G+1` and
+  `G+N+1`), so they never collide and share a phase; it is *dimensions*
+  that have to be separated, because the line where two coarse-fine
+  faces of a block meet is a target of both.
+- **The phases commute, and 2:1 balance is why** (measured; the design
+  argued only that a doubly written point gets the same value twice).
+  No plane the fixup writes is a plane it reads, over all phases: a
+  point where that could happen lies on the line where two faces of a
+  fine block meet, so the level-`l+2` block that wrote it and the
+  level-`l` block that would read it touch across a *corner*, which
+  `balance!` forbids — it walks all `3^D − 1` directions, not just the
+  faces. The stronger statement is under test and is what makes the
+  fixup a pure function of the fluxes it is handed, whatever order the
+  phases run in and however `run_phase!` deals its slices out.
+- **`target_range` grew a `closed` flag rather than the interface
+  schedule growing a range of its own.** Tangentially the fixup wants
+  the closed range where the ghost exchange wants the owned one, and
+  that is one `od * c` on the top half of the halved case; the two
+  boundary planes are the first points of ranges the function already
+  names. For the same reason the stencils come from the ghost
+  restriction's builder over an explicit target range
+  (`restrict_stencil_over`), so the fixup and the exchange cannot
+  disagree about where a coincident fine point is.
+
+A linear field is *invariant* under the fixup — injection reproduces it
+and so does the two-cell average, since the coarse point is the midpoint
+of the two fine ones — which is the analytic claim the device test rests
+on. On Metal in `Float32` the fixup reproduces the CPU result bit for
+bit: it adds no arithmetic, only target ranges.
 
 ### Regridding
 
@@ -1528,7 +1572,9 @@ design, see the M8 entry), and the list below is in execution order.
     numbers stay under test; the thread digests. The cell-centered
     stencils are the same rational weights as before, so M8a changes no
     measured number. *(All of this is measured; see above.)*
-  - **M8b — conservation.** `InterfaceSchedule` / `restrict_interfaces!`,
+  - **M8b — conservation.** `InterfaceSchedule` / `restrict_interfaces!`
+    *(step 4, done; see "**Implemented in M8b step 4**" under
+    [Conservation](#conservation-at-coarse-fine-faces))*,
     `map_blocks!(…; closed = true)`, and Burgers' equation
     `∂ₜu + Σ_d ∂_d(u²/2) = 0` on a periodic box in `test/burgers.jl`:
     finite volume, linear reconstruction (unlimited for the smooth

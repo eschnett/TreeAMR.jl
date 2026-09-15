@@ -38,6 +38,9 @@ export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_
 # GPU (M6)
 export firing_boxes
 
+# Conservation at coarse-fine faces (M8)
+export InterfaceSchedule, restrict_interfaces!
+
 include("threading.jl")
 include("device.jl")
 include("morton.jl")
@@ -47,6 +50,7 @@ include("storage.jl")
 include("operators.jl")
 include("schedule.jl")
 include("ghosts.jl")
+include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
 

@@ -183,6 +183,33 @@ enforces when the schedule is built. It is also constrained by your
 discretization — see the warning in [`Operators`](@ref), which is worth
 reading before picking an order.
 
+## Conservation at coarse-fine faces
+
+With one global timestep, a conservative scheme needs only that the flux
+a coarse cell sees on a coarse-fine face equals the area-weighted sum of
+the fine-face fluxes there. That is a purely spatial condition, settled
+within a single right-hand side, so there are no flux registers and no
+time-accumulated corrections — they exist only to bridge subcycled steps.
+
+A conservative RHS is therefore three steps: compute the fluxes over each
+face set's closed range, restrict them at coarse-fine faces, then apply
+the divergence.
+
+```julia
+map_blocks!(flux_kernel!, flux, ...; closed = true)   # N+1 faces per dimension
+restrict_interfaces!(flux, isched)                    # the fixup
+map_blocks!(divergence_kernel!, state, ...)
+```
+
+[`InterfaceSchedule`](@ref) is built once per tree like a
+[`GhostSchedule`](@ref), and takes no [`Operators`](@ref): the transfer
+is injection and the exact two-cell average, fixed by the geometry, not
+interpolation. It is built over the *flux* field set — the one whose
+centering is vertex-like in the face dimension — and refuses a
+cell-centered one, which has no values lying on a block's face at all. It
+reads and writes closed-range values only, so a computed flux may carry
+`G = 0`.
+
 ## Time integration
 
 The whole hierarchy advances with one global `dt`, and the state is a
@@ -453,6 +480,13 @@ isstale
 fill_ghosts!
 boundary_by_coordinates
 CellBoundary
+```
+
+## Conservation at coarse-fine faces
+
+```@docs
+InterfaceSchedule
+restrict_interfaces!
 ```
 
 ## ODE coupling

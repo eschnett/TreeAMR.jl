@@ -180,6 +180,49 @@ end
     end
 end
 
+@testset "$bname: the interface fixup runs on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2, 3)
+    # M8b. The fixup adds no kernel of its own — it is the transfer
+    # kernel over one-plane target ranges — so what has to hold on a
+    # device is that the schedule's stencils were uploaded with it and
+    # that the generic per-batch `run_phase!` drives them. Two claims: a
+    # linear field is *invariant* under the restriction (injection and
+    # the exact two-cell average both reproduce it), and the device lands
+    # on the same numbers as the CPU for data with no structure at all.
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> false, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+
+    C = facecentered(D, 1)
+    c = staggers(C)
+    # A flux carries no ghosts, so its stored range *is* its closed
+    # range: what a block computes for itself, its own high face
+    # included.
+    closed = CartesianIndices(ntuple(d -> 1:(forest.N + c[d]), D))
+
+    hostfs = FieldSet{T}(forest, 2; G=0, centering=C)
+    for b in 1:nblocks(hostfs), v in 1:2, idx in closed
+        x = coordinates(T, hostfs, b, Tuple(idx))
+        hostfs.work[Tuple(idx)..., v, b] = sum(x) + T(v)
+    end
+    linear = copy(hostfs.work)
+    restrict_interfaces!(hostfs, InterfaceSchedule(hostfs))
+    @test maximum(abs, hostfs.work .- linear) < gputol(T)
+
+    # The same schedule over structureless data, on both backends. What
+    # the numbers are does not matter; that the two agree bit for bit
+    # does, so the assertion does not depend on the RNG stream.
+    noise = T.(rand(MersenneTwister(42), size(linear)...))
+    copyto!(hostfs.work, noise)
+    restrict_interfaces!(hostfs, InterfaceSchedule(hostfs))
+
+    fs = FieldSet{T}(forest, 2; G=0, centering=C, backend=backend)
+    copyto!(fs.work, noise)
+    restrict_interfaces!(fs, InterfaceSchedule(fs))
+    @test Array(fs.work) == hostfs.work
+end
+
 @testset "$bname: the cell hook reproduces the host hook exactly: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # `boundary_by_coordinates` used to be a host loop calling
