@@ -192,14 +192,22 @@ end
           100 * exchange_error(forest, ops, makepoly(D, 1))
 end
 
-@testset "A staggered layout is type generic too: T=$T, D=$D" for
-        T in FLOATTYPES, D in (1, 2)
+@testset "A staggered layout is type generic too: T=$T, D=$D, C=$C" for
+        T in FLOATTYPES, D in (1, 2), C in (facecentered(D, 1), vertexcentered(D))
     # The centering changes the position arithmetic — a vertex-like
     # dimension subtracts a whole cell where a cell-centered one
     # subtracts half — so the same three claims are made again for a
     # staggered set: exact rational geometry, bit-for-bit agreement
     # between the kernel and `coordinates`, and an exact exchange.
-    C = facecentered(D, 1)
+    #
+    # Both a partly and a wholly staggered set, because the arithmetic
+    # is per dimension and a face field in D = 2 leaves one dimension
+    # cell-centered: only `vertexcentered` exercises the vertex-like
+    # branch in *every* dimension at once. The vertex-centered wave
+    # equation itself is Float64/Float32 only and lives in
+    # `gpu_tests.jl`, whose CPU backend runs both — MultiFloats
+    # implements no trigonometry, so `wave.jl` cannot be generalized
+    # past those two (see the header above).
     c = staggers(C)
     forest = Forest{T}(ntuple(_ -> 2, D); N=8)
     refine!(forest, first(forest.leaves))
@@ -208,9 +216,9 @@ end
     fs = FieldSet(forest, 1; G=G, centering=C)
     @test eltype(fs.work) === T
 
-    # An owned face sits *on* the block's lower boundary in the staggered
-    # dimension and half a cell in across it. Dyadic rationals throughout,
-    # so these are equalities.
+    # An owned point sits *on* the block's lower boundary in a
+    # vertex-like dimension and half a cell in across it. Dyadic
+    # rationals throughout, so these are equalities.
     for (b, k) in enumerate(forest.leaves)
         lo, hi = leafbox(forest, k)
         got = coordinates(fs, b, ntuple(_ -> G + 1, D))

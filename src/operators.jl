@@ -112,6 +112,21 @@ forest, each with its own schedule.
     converges at 2.0 with order-2 operators, so this is the interface
     and not the scheme.
 
+    Along a **vertex-like** dimension only the prolongation order
+    enters, because restriction there is injection — a coincident point
+    copied, exact for any data, with no order to raise. The same study
+    on a vertex-centered field set measures (M8a)
+
+    | prolongation | restriction | rate, `D = 1` | rate, `D = 2` |
+    |---|---|---|---|
+    | 2 | 2 | 0.99 | 1.01 |
+    | 2 | 4 | 0.99 | 1.01 |
+    | 4 | 2 | 1.99 | 1.99 |
+    | 4 | 4 | 1.99 | 1.99 |
+
+    at `G = 1`, where cell centering needs 2. The rows come in pairs
+    because the two runs are the *same computation*, bit for bit.
+
     Order 2 is the cheapest correct *interpolation*, not the right choice
     for a second-order-in-space application — which is what a default of
     2 used to hide.

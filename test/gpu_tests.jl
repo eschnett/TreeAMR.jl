@@ -360,7 +360,9 @@ end
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # `CODE.md`'s M6 acceptance criterion: the M3 convergence result, on
     # a device. Order-4 operators with G = 2 over a two-level mesh give
-    # 2nd order, by the interface-order rule.
+    # 2nd order, by the interface-order rule. Cell-centered, spelled out:
+    # this is the M3 study, and `wave_errors` is vertex-centered by
+    # default from M8 on.
     #
     # The resolutions differ by precision, and deliberately. The error
     # measured here is a truncation error, which is the same number in
@@ -374,7 +376,33 @@ end
     Ns = T === Float64 ? (8, 16, 32) : (D == 1 ? (16, 32) : (8, 16, 32))
     hs, l2 = T[], T[]
     for N in Ns
-        r = wave_errors(Val(D); N=N, G=2, ops=ops, T=T, backend=backend)
+        r = wave_errors(Val(D); N=N, G=2, ops=ops, centering=cellcentered(D),
+                        T=T, backend=backend)
+        push!(hs, r.h)
+        push!(l2, r.l2)
+        @test isfinite(r.l2)
+        @test r.nblocks > 2^D                     # refinement really happened
+    end
+    @test all(l2[i] > l2[i + 1] for i in 1:(length(l2) - 1))
+    @test convergence_rate(Float64.(hs), Float64.(l2)) ≈ 2.0 atol = 0.15
+end
+
+@testset "$bname: vertex convergence reproduced: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # M8a's acceptance criterion on a device: the same 2nd-order result
+    # on a *staggered* layout, at G = 1. Three things here are
+    # device-specific rather than merely centering-specific — the
+    # per-dimension stencil widths the transfer kernel carries as a
+    # `Val` of a tuple, the exchange filling a shared plane that the
+    # state vector does not hold, and the regrid-free but
+    # prolongation-heavy two-level mesh — and all three run through the
+    # same launches as the cell-centered study above.
+    ops = Operators(prolongation=4, restriction=4)
+    Ns = T === Float64 ? (8, 16, 32) : (D == 1 ? (16, 32) : (8, 16, 32))
+    hs, l2 = T[], T[]
+    for N in Ns
+        r = wave_errors(Val(D); N=N, G=1, ops=ops, centering=vertexcentered(D),
+                        T=T, backend=backend)
         push!(hs, r.h)
         push!(l2, r.l2)
         @test isfinite(r.l2)

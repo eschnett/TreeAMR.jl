@@ -16,10 +16,12 @@ regridding, multi-threading throughout, and GPU support: the storage,
 the exchange schedule and every kernel follow a KernelAbstractions
 backend of the caller's choosing.
 
-M8 is under way; its first step has landed. The ghost width `G` is a
-[`FieldSet`](@ref) keyword now, one per dimension, rather than a
-[`Forest`](@ref) one, and a [`GhostSchedule`](@ref) accordingly belongs
-to a *layout* rather than to a forest.
+M8 is under way; its layout half (M8a) has landed. The ghost width `G`
+is a [`FieldSet`](@ref) keyword now, one per dimension, rather than a
+[`Forest`](@ref) one, and a field set also carries a **centering** —
+[`cellcentered`](@ref), [`vertexcentered`](@ref), [`facecentered`](@ref)
+or [`edgecentered`](@ref) — so a [`GhostSchedule`](@ref) belongs to a
+*layout* rather than to a forest.
 
 ## Overview
 

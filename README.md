@@ -125,18 +125,24 @@ KernelAbstractions backend:
 Note that reaching 2nd order on a refined mesh needs **order-4**
 interpolation — see the warning on `Operators`.
 
-M8 is under way. Its first step has landed: the ghost width `G` is a
-**field-set** keyword now, one per dimension, rather than a forest one —
-`FieldSet(forest, nvars; G = 2)` — because it says how far a stencil
-reaches into a neighbor's data, which is a property of what is stored.
-Two field sets over one forest with different `G` is the normal case
-from here on, a `GhostSchedule` belongs to a layout rather than to a
-forest, and `regrid!` takes `fs => schedule` pairs. Still to come:
-every centering (cell, vertex, face, edge), the interface restriction
-that makes a finite-volume scheme conservative across coarse-fine faces,
-and Burgers' equation as the test. MPI (M7) follows M8, so that the
-distributed exchange is built once over a layout-generic schedule; the
-design is in [CODE.md](CODE.md#centerings).
+M8 is under way, and its layout half (M8a) has landed. The ghost width
+`G` is a **field-set** keyword now, one per dimension, rather than a
+forest one — `FieldSet(forest, nvars; G = 2)` — because it says how far
+a stencil reaches into a neighbor's data, which is a property of what is
+stored. A field set also carries a **centering**: per dimension its
+values sit at the cell centers (`:cell`) or on the cell boundaries
+(`:vertex`), so `cellcentered`, `vertexcentered`, `facecentered` and
+`edgecentered` name the familiar layouts and the exchange, the geometry
+and the regrid transfer all follow from that one tuple. Two field sets
+over one forest with different `G` or centering is the normal case from
+here on, a `GhostSchedule` belongs to a layout rather than to a forest,
+and `regrid!` takes `fs => schedule` pairs. The wave-equation study is
+vertex-centered from here on, at `G = 1` where cell centering needs 2;
+the cell-centered study is kept beside it. Still to come (M8b): the
+interface restriction that makes a finite-volume scheme conservative
+across coarse-fine faces, and Burgers' equation as the test. MPI (M7)
+follows M8, so that the distributed exchange is built once over a
+layout-generic schedule; the design is in [CODE.md](CODE.md#centerings).
 
 ## Installation
 

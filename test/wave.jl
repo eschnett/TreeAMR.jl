@@ -12,13 +12,25 @@
 # is an exact solution, which is what the convergence test measures
 # against.
 #
-# Everything here is generic in the element type and in the backend, so
-# that the same study runs on a device (M6): the mesh is generic in its
-# float type, and the only thing a backend changes is where the storage
-# is allocated. `T` and `backend` travel together through every entry
-# point; the defaults are `Float64` on the CPU, which is what the M3
-# convergence tests measure and what their recorded rates were taken
-# with.
+# Everything here is generic in the element type, in the backend and --
+# from M8 -- in the centering, so that the same study runs on a device
+# (M6) and on a staggered layout (M8a): the mesh is generic in its float
+# type, the only thing a backend changes is where the storage is
+# allocated, and the only thing a centering changes is where a stored
+# value sits. `T`, `backend` and `centering` travel together through
+# every entry point.
+#
+# The defaults are `Float64` on the CPU and **vertex centering**: from
+# M8 on the wave study is the vertex-centered one (`wave_tests.jl`),
+# with the cell-centered study of M3 kept verbatim beside it
+# (`wave_cell_tests.jl`) so that the M3 numbers stay under test. Nothing
+# in the right-hand side knows which it is -- the Laplacian reads its
+# own point and its neighbours a spacing away, which is the same stencil
+# wherever those points sit -- so `wave_rhs_kernel!` takes no `Val(C)`.
+#
+# `wave_forest` deliberately does *not* take a centering: it builds the
+# forest, and how space is cut into blocks is exactly what a centering
+# does not change.
 
 import KernelAbstractions
 using KernelAbstractions: @kernel, @index, @Const, get_backend, CPU
@@ -137,14 +149,21 @@ end
 """
 Evolve the sine mode to `t_end` with fixed-step RK4 and return the
 volume-weighted L2 and L∞ errors, plus the finest spacing.
+
+`centering` picks where the values sit, and with them what the
+interface-order rule predicts: vertex-centered (the default from M8 on)
+restricts by injection, so only the prolongation order enters the rate
+and `G = 1` suffices at order 4; cell-centered is the M3 study and needs
+`G = 2` there.
 """
 function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction=2),
                      roots=4, L=1.0, m=1,
                      cfl=0.25, periods=0.25, alg=RK4(), refined=true,
+                     centering=vertexcentered(D),
                      T::Type=Float64, backend=CPU()) where {D}
     forest = wave_forest(Val(D), N; roots=roots, L=L, refined=refined, T=T)
     L = T(L)
-    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    fs = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
     problem = WaveProblem(fs, GhostSchedule(fs, ops))
 
     fill_by_coordinates!(wave_exact(D, L, m, zero(T)), fs)
@@ -160,7 +179,7 @@ function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction
     prob = ODEProblem(wave_rhs!, u0, (zero(T), t_end), problem)
     sol = solve(prob, alg; dt=dt, adaptive=false, save_everystep=false)
 
-    exact = FieldSet{T}(forest, 2; G=G, backend=backend)
+    exact = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
     fill_by_coordinates!(wave_exact(D, L, m, t_end), exact)
     uexact = statevector(exact)
     gather!(uexact, exact)
@@ -214,13 +233,13 @@ beyond a one-step method.
 function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
                      ops=Operators(prolongation=4, restriction=4),
                      t_end=0.5, chunk=0.05, cfl=0.25, maxlevel_wanted=2,
-                     threshold=0.05, buffer=4,
+                     threshold=0.05, buffer=4, centering=vertexcentered(D),
                      T::Type=Float64, backend=CPU()) where {D}
     L, σ, x0 = T(L), T(σ), T(x0)
     t_end, chunk, cfl = T(t_end), T(chunk), T(cfl)
     forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), L), D))
-    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    fs = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
 
     # Refine where the pulse actually is, judged from the current data,
     # and report the bounding box of the cells that fired — the min/max
@@ -270,7 +289,7 @@ function track_pulse(::Val{D}; N=8, G=2, roots=8, L=1.0, σ=0.05, x0=0.25,
         t = stop
 
         # Error against the exact travelling pulse.
-        exact = FieldSet{T}(forest, 2; G=G, backend=backend)
+        exact = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
         fill_by_coordinates!(pulse_exact(D, L, x0, σ, t), exact)
         ue = statevector(exact)
         gather!(ue, exact)
@@ -307,13 +326,13 @@ adaptive run is judged against: matching the finest uniform mesh is what
 """
 function uniform_pulse(::Val{D}; roots, N, G=2, L=1.0, σ=0.08, x0=0.25,
                        ops=Operators(prolongation=4, restriction=4),
-                       t_end=0.5, cfl=0.25,
+                       t_end=0.5, cfl=0.25, centering=vertexcentered(D),
                        T::Type=Float64, backend=CPU()) where {D}
     L, σ, x0 = T(L), T(σ), T(x0)
     t_end, cfl = T(t_end), T(cfl)
     forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), L), D))
-    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    fs = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
     schedule = GhostSchedule(fs, ops)
     fill_by_coordinates!(pulse_exact(D, L, x0, σ, zero(T)), fs)
     u = statevector(fs)
@@ -322,7 +341,7 @@ function uniform_pulse(::Val{D}; roots, N, G=2, L=1.0, σ=0.08, x0=0.25,
     nsteps = ceil(Int, t_end / dt)
     sol = solve(ODEProblem(wave_rhs!, u, (zero(T), t_end), WaveProblem(fs, schedule)),
                 RK4(); dt=t_end / nsteps, adaptive=false, save_everystep=false)
-    exact = FieldSet{T}(forest, 2; G=G, backend=backend)
+    exact = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
     fill_by_coordinates!(pulse_exact(D, L, x0, σ, t_end), exact)
     ue = statevector(exact)
     gather!(ue, exact)

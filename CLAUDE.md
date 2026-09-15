@@ -217,8 +217,13 @@ names the high ghost slab.
 ## Tests
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
-`ghost_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
-`thread_tests.jl` (M2–M5). Four helper files are not tests:
+`ghost_tests.jl`, `centering_tests.jl`, `state_tests.jl`,
+`regrid_tests.jl`, `wave_tests.jl`, `wave_cell_tests.jl`,
+`type_tests.jl`, `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
+study comes in two halves: `wave_tests.jl` is the **vertex-centered**
+one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
+verbatim so its numbers stay under test. Four helper files are not
+tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
   reference implementations (bit-plane Morton comparison, exact `Rational`
@@ -228,6 +233,9 @@ names the high ghost slab.
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.
+  Every entry point takes `centering`, defaulting to `vertexcentered(D)`;
+  `wave_forest` does not, because a centering does not change how space is
+  cut into blocks.
 - `thread_workload.jl` — a standalone script, not `include`d. The thread
   count is a command-line argument to Julia, so the M5 acceptance test runs
   this in subprocesses at two thread counts and compares their output byte

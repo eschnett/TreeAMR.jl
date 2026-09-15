@@ -1,9 +1,34 @@
-# M3: the scalar wave equation driven by OrdinaryDiffEq.
+# M8a: the scalar wave equation, **vertex-centered**.
 #
-# The acceptance criterion is that volume-weighted L2/L∞ errors against
-# the exact sine-mode solution converge at 2nd order.
+# From M8 on this is the wave study: the values sit on the cell
+# boundaries, so a block owns its points 0 … N-1 and the plane at N is
+# shared with its high-side neighbor and exchange-filled exactly as a
+# ghost is. The M3 study is kept beside it in `wave_cell_tests.jl` with
+# `centering = cellcentered(D)` said out loud, so the M3 numbers stay
+# under test.
+#
+# Nothing in the application changed. `wave_rhs_kernel!` takes no
+# `Val(C)`: it reads its own point and its two neighbours a spacing
+# away, which is the same stencil wherever those points sit. What
+# changes is what the mesh does at a coarse-fine interface, and with it
+# two predictions from the operator table under "Operators" in CODE.md:
+#
+#   * **Restriction along a stagger is injection** — the coincident fine
+#     point copied, exact for arbitrary data — so the restriction order
+#     does not enter the global rate at all. M3's "raising one operator
+#     alone does not help" becomes "only the prolongation order
+#     matters", and that is asserted here bit for bit rather than as a
+#     rate.
+#   * **Prolongation reaches `p/2 - 1` planes past the shared plane**,
+#     against `p/2` past an interface, so `G = 1` suffices at order 4
+#     where cell centering needs 2.
+#
+# The interface-order rule itself is unchanged: an order-`p` ghost
+# carries an `O(h^p)` error and the 2nd-order Laplacian divides it by
+# `h²`, so the global rate is `min(2, p - 1)` — 1 at `p = 2`, 2 at
+# `p = 4`.
 
-@testset "Wave equation on a uniform grid: D=$D" for D in (1, 2)
+@testset "Vertex-centered wave equation on a uniform grid: D=$D" for D in (1, 2)
     # Control: with no coarse-fine interfaces the 2nd-order Laplacian and
     # fixed-step RK4 must give a clean 2nd-order rate. Anything the
     # refined runs below lose is then attributable to the interface.
@@ -17,16 +42,15 @@
     @test convergence_rate(hs, l2) ≈ 2.0 atol = 0.15
 end
 
-@testset "Wave equation on a two-level mesh: D=$D" for D in (1, 2)
-    # Interpolation order must exceed the differencing order by two:
-    # a prolongated ghost carries an O(h^p) error, and the 2nd-order
-    # Laplacian divides it by h², leaving an O(h^(p-2)) truncation error
-    # along the coarse-fine interface. With p = 4 that is O(h²) and does
-    # not pollute the interior scheme.
+@testset "Vertex-centered wave equation on a two-level mesh: D=$D" for D in (1, 2)
+    # The M3 claim on a staggered layout, at the ghost width the vertex
+    # row of the operator table allows: order-4 prolongation reaches one
+    # plane past the source's shared plane, and the Laplacian reaches one
+    # point past the owned range, so G = 1 is enough for both.
     ops = Operators(prolongation=4, restriction=4)
     hs, l2, linf = Float64[], Float64[], Float64[]
     for N in (8, 16, 32)
-        r = wave_errors(Val(D); N=N, G=2, ops=ops)
+        r = wave_errors(Val(D); N=N, G=1, ops=ops)
         push!(hs, r.h)
         push!(l2, r.l2)
         push!(linf, r.linf)
@@ -40,12 +64,13 @@ end
     @test convergence_rate(hs, linf) ≈ 2.0 atol = 0.2
 end
 
-@testset "Interface order limits the global rate: D=$D" for D in (1,)
-    # Documents the mechanism above, and guards it: with order-2
-    # operators the interface error is O(1) and drags the global rate
-    # down to first order, even though the interior scheme is 2nd order.
-    # Both operators matter -- raising only one leaves the other side of
-    # the interface first order.
+@testset "Only prolongation limits the vertex rate: D=$D" for D in (1,)
+    # The cell-centered study needs *both* orders raised, because each
+    # side of the interface gets its ghosts from a different operator.
+    # Along a stagger the restriction side is injection — a coincident
+    # point, exact for any data, with no order to raise — so the whole
+    # rate is the prolongation's: 1 at order 2, 2 at order 4, whatever
+    # the restriction order says.
     rate(ops, G) = begin
         hs, l2 = Float64[], Float64[]
         for N in (8, 16, 32)
@@ -57,15 +82,46 @@ end
     end
 
     @test rate(Operators(prolongation=2, restriction=2), 1) ≈ 1.0 atol = 0.2
-    @test rate(Operators(prolongation=4, restriction=2), 2) < 1.5
-    @test rate(Operators(prolongation=2, restriction=4), 2) < 1.5
-    @test rate(Operators(prolongation=4, restriction=4), 2) ≈ 2.0 atol = 0.15
+    @test rate(Operators(prolongation=2, restriction=4), 1) ≈ 1.0 atol = 0.2
+    @test rate(Operators(prolongation=4, restriction=2), 1) ≈ 2.0 atol = 0.15
+    @test rate(Operators(prolongation=4, restriction=4), 1) ≈ 2.0 atol = 0.15
 end
 
-@testset "Wave equation in 3D" begin
+@testset "The restriction order is inert along a stagger: D=$D" for D in (1, 2)
+    # Stronger than the rates above, and the reason they come in pairs:
+    # the restriction stencil in a vertex-like dimension is width 1 with
+    # weight 1 *regardless of the order asked for*, so the two runs are
+    # not merely equally accurate, they are the same computation. A
+    # future restriction builder that quietly used `p` along a stagger
+    # would break this long before it moved a rate.
+    for p in (2, 4)
+        a = wave_errors(Val(D); N=16, G=1, ops=Operators(prolongation=p, restriction=2))
+        b = wave_errors(Val(D); N=16, G=1, ops=Operators(prolongation=p, restriction=4))
+        @test a.l2 === b.l2
+        @test a.linf === b.linf
+    end
+end
+
+@testset "G = 1 is the whole requirement at order 4: D=$D" for D in (1, 2)
+    # The vertex row of the operator table says G >= p/2 - 1, so a
+    # second ghost plane buys nothing at order 4 — not "almost nothing",
+    # nothing: the same stencils read the same points. Cell centering
+    # needs G >= p/2 and refuses G = 1 outright, which is what makes the
+    # relaxation worth a test rather than a remark.
+    ops = Operators(prolongation=4, restriction=4)
+    one_ghost = wave_errors(Val(D); N=16, G=1, ops=ops)
+    two_ghosts = wave_errors(Val(D); N=16, G=2, ops=ops)
+    @test one_ghost.l2 === two_ghosts.l2
+    @test one_ghost.linf === two_ghosts.linf
+
+    @test_throws "G >= 2" wave_errors(Val(D); N=16, G=1, ops=ops,
+                                      centering=cellcentered(D))
+end
+
+@testset "Vertex-centered wave equation in 3D" begin
     # Smoke test only: 3D convergence runs are expensive, so this checks
     # that the same code path works and that the solution stays sane.
-    r = wave_errors(Val(3); N=8, G=2, ops=Operators(prolongation=4, restriction=4))
+    r = wave_errors(Val(3); N=8, G=1, ops=Operators(prolongation=4, restriction=4))
     @test r.nblocks > 8
     @test isfinite(r.l2)
     @test r.l2 < 0.05
@@ -73,9 +129,10 @@ end
 end
 
 @testset "A moving refined region tracks a propagating pulse" begin
-    # The measure of "without artifacts" is that the adaptive run matches
-    # the *uniformly finest* mesh: if the moving coarse-fine interface
-    # were reflecting or smearing the pulse, the error would exceed it.
+    # M4's claim, on the staggered layout: "without artifacts" means the
+    # adaptive run matches the *uniformly finest* mesh, so a moving
+    # coarse-fine interface that reflected or smeared the pulse would
+    # show up as an error above it.
     σ = 0.08
     coarse = uniform_pulse(Val(1); roots=8, N=8, σ=σ)     # level-0 equivalent
     fine = uniform_pulse(Val(1); roots=8, N=32, σ=σ)      # level-2 equivalent
@@ -96,20 +153,11 @@ end
     @test amr.maxlevel == 2
 
     # The buffer did real work: refining ahead of the pulse measurably
-    # improves the run over the same criterion with no margin at all.
+    # improves the run over the same criterion with no margin at all,
+    # and a buffer of a few *cells* does that work too, because dilation
+    # is keyed on the reported box rather than on the Refine flag (M4).
     @test amr.worst < unbuffered.worst
     @test unbuffered.tracking == 1.0                  # the criterion alone still tracks
-
-    # And a buffer of a *few cells* now does that work too, which is why
-    # dilation is keyed on the reported box rather than on the Refine
-    # flag. Under the Refine-keyed rule this run was bit-identical to the
-    # unbuffered one: a block ahead of the pulse refined the moment the
-    # criterion fired anywhere in it, so its box hugged the face the
-    # pulse entered through and only a dilation of most of a block width
-    # reached out the far face. Now the block that holds the pulse is
-    # already at the target level and reports (Keep, box), so it carries
-    # an equal-level margin along with it and the width is free to be
-    # what the physics asks for -- feature speed times regrid cadence.
     @test narrow.worst < unbuffered.worst
     @test narrow.tracking == 1.0
     @test narrow.maxlevel == 2
@@ -124,9 +172,12 @@ end
 @testset "RHS does not mutate the state vector" begin
     # The integrator's `u` is authoritative; the working array is
     # scratch. A RHS that wrote back into `u` would corrupt multi-stage
-    # methods like RK4.
+    # methods like RK4. Asserted on the staggered layout because the
+    # working array has a plane there that the state vector does not —
+    # the shared boundary plane — and scatter/gather must still be
+    # inverse to each other over the owned range alone.
     forest = wave_forest(Val(1), 8)
-    fs = FieldSet(forest, 2; G=2)
+    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(1))
     problem = WaveProblem(fs, GhostSchedule(fs, Operators(prolongation=4,
                                                           restriction=4)))
     fill_by_coordinates!(wave_exact(1, 1.0, 1, 0.0), fs)
@@ -139,6 +190,10 @@ end
     @test u == before
     @test !all(iszero, du)
     @test all(isfinite, du)
+
+    # The state vector is N^D per variable per block for every
+    # centering, so its shape has not moved either.
+    @test length(u) == forest.N * 2 * nblocks(fs)
 
     # ∂ₜu = v, so the first half of du is exactly the second field.
     state, dstate = statearray(u, fs), statearray(du, fs)
@@ -157,7 +212,7 @@ end
     # as an outright instability.
     D, L, m = 1, 1.0, 1
     forest = wave_forest(Val(D), 16)
-    fs = FieldSet(forest, 2; G=2)
+    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
     problem = WaveProblem(fs, GhostSchedule(fs, Operators(prolongation=4,
                                                           restriction=4)))
     fill_by_coordinates!(wave_exact(D, L, m, 0.0), fs)

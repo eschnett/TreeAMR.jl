@@ -79,13 +79,14 @@ digest(s::AbstractString) = digest(codeunits(s))
 One full cycle — initial-data adaptation, evolution, a regrid with data
 transfer, more evolution — reduced to a handful of printed lines.
 """
-function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer) where {D}
+function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
+                  centering=cellcentered(D)) where {D}
     L = 1.0
     x0 = 0.35
     forest = Forest(ntuple(_ -> roots, D); N=N,
                     periodic=ntuple(_ -> periodic, D),
                     extents=ntuple(_ -> (0.0, L), D))
-    fs = FieldSet(forest, 2; G=G)
+    fs = FieldSet(forest, 2; G=G, centering=centering)
     initial = workload_pulse(D, L, x0, σ, 0.0)
     boundary = periodic ? nothing : boundary_by_coordinates(initial)
 
@@ -117,7 +118,7 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer) where
     gather!(u, fs)
     rk4!(u, fs, schedule, dt, steps, Val(D), Val(fs.G), boundary)
 
-    tag = "D$(D)$(periodic ? "p" : "o")"
+    tag = "D$(D)$(periodic ? "p" : "o")$(all(==(:cell), centering) ? "c" : "v")"
     println(tag, " passes ", passes, " ", converged, " changed ", changed)
     println(tag, " leaves ", nleaves(forest), " ", digest(string(forest.leaves)))
     println(tag, " schedule ", length(schedule.phase1), " ", schedule.levels, " ",
@@ -136,3 +137,14 @@ workload(Val(1); roots=8, N=8, G=2, ops=OPS4, periodic=true, σ=0.04, steps=24, 
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=true, σ=0.05, steps=20, buffer=3)
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=20, buffer=3)
 workload(Val(3); roots=4, N=4, G=1, ops=OPS2, periodic=true, σ=0.03, steps=6, buffer=1)
+
+# The same cycle on a staggered layout (M8a). It is not a rerun with a
+# keyword changed: a vertex-like dimension adds the shared boundary
+# plane to every exchange region, replaces the restriction stencils with
+# injection, and narrows the prolongation window, so the parallel loops
+# `run_phase!` deals out are differently shaped ones. `G = 1` is what
+# order 4 needs along a stagger, which also keeps these cheap.
+workload(Val(1); roots=8, N=8, G=1, ops=OPS4, periodic=true, σ=0.04, steps=24, buffer=3,
+         centering=vertexcentered(1))
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2))

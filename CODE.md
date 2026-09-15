@@ -321,6 +321,43 @@ digests still agree byte for byte. What the step settled or corrected:
   stagger, so every staggered set under test is point-value throughout
   and is compared at `coordinates`. The oracle was left alone.
 
+**Implemented in M8a step 3** (the application). The wave equation is
+vertex-centered from here on — `centering` is a keyword on every entry
+point of `test/wave.jl`, defaulting to `vertexcentered(D)`, and the M3
+study survives verbatim in `test/wave_cell_tests.jl` saying
+`cellcentered(D)` out loud at every call. The measured table is under
+[Operators](#operators); no cell-centered number moved. What the step
+settled:
+
+- **Nothing in the application knows the centering.**
+  `wave_rhs_kernel!` takes no `Val(C)`, as the plan predicted: it reads
+  its own point and its neighbours a spacing away, which is the same
+  stencil wherever those points sit. `WaveProblem` needs no centering
+  either, since it carries the field set. So the whole staggered study
+  is the cell-centered one with one keyword changed at the
+  `FieldSet` calls — which is the claim a centering that is "a property
+  of the field set and nothing else" has to make good on.
+- **`wave_forest` deliberately does not take a centering**, against the
+  plan's list. It builds the forest, and how space is cut into blocks is
+  exactly what a centering does not change; a keyword that is accepted
+  and ignored would say otherwise.
+- **The staggered `Float32` wave case lives in `gpu_tests.jl`, not
+  `type_tests.jl`.** `wave.jl` is structurally `Float64`/`Float32` only
+  — MultiFloats implements no trigonometric functions at all — and
+  `gpu_tests.jl` runs its whole matrix on the `CPU()` backend in both,
+  so the vertex convergence study is already measured in `Float32`
+  there. `type_tests.jl`'s vertex case is the *layout* one: the
+  staggered testset gained `vertexcentered(D)` beside `facecentered(D,
+  1)`, which is the first case that is vertex-like in every dimension at
+  once.
+- **The thread workload gains two staggered cycles, not a rerun.** A
+  vertex-like dimension lengthens every exchange region by the shared
+  plane, replaces the restriction stencils with injection and narrows
+  the prolongation window, so `run_phase!` deals out differently shaped
+  slices; the D = 1 periodic cycle also regrids and transfers, and the
+  D = 2 non-periodic one exercises the boundary hook on the upper
+  boundary plane that belongs to nobody.
+
 ### Tree structure
 
 The domain is a **forest**: a brick of `M_1 × ... × M_D` root blocks,
@@ -656,6 +693,33 @@ mesh unrefined converges at 2.0 with order-2 operators, which pins this
 on the interface rather than the scheme. The tests assert all four
 rates.
 
+**The same rule along a stagger** (measured in M8a step 3). Repeating
+that study on a **vertex-centered** field set — same equation, same
+Laplacian, same two-level mesh, values moved from the cell centers to
+the cell boundaries — changes the table in exactly the way the vertex
+row of the operator table predicts, and in no other way. Restriction is
+injection, which has no order, so only the prolongation order enters;
+`min(2, p − 1)` is then 1 at `p = 2` and 2 at `p = 4`:
+
+| prolongation | restriction | L2 rate, `D = 1` | L2 rate, `D = 2` |
+|---|---|---|---|
+| 2 | 2 | 0.99 | 1.01 |
+| 2 | 4 | 0.99 | 1.01 |
+| 4 | 2 | 1.99 | 1.99 |
+| 4 | 4 | 1.99 | 1.99 |
+
+all at **`G = 1`**, where the cell-centered study needs `G = 2` and
+`check_operators` refuses one less; the unrefined control converges at
+2.00 in both dimensions. The rows come in pairs because the two runs
+are *the same computation*: a vertex-like restriction stencil is width
+one with weight one whatever order is asked for, so the errors agree bit
+for bit, and the tests assert that identity rather than the two rates —
+it is the claim that would break first if a builder ever started using
+`p` along a stagger. `G = 2` at `p = 4` likewise reproduces `G = 1` bit
+for bit: the relaxed bound is not "nearly enough", it is the whole
+requirement. The cell-centered study is kept verbatim beside it
+(`test/wave_cell_tests.jl`) so the M3 numbers above stay under test.
+
 The `+2` is the second-derivative case, `m = 2`. A flux divergence has
 `m = 1`, so a first-order-in-derivatives scheme needs `p` to exceed its
 order by *one* only — the caveat on Erik's list that the rule "is only
@@ -702,10 +766,12 @@ constraint is checked per dimension against that dimension's `G_d`:
 | vertex | `Conservative` | *refused* | *refused* | — |
 
 The first two rows are the cell-centered ones; the third follows from
-[Ghost filling](#ghost-filling) and is measured — exactness to degree
-`p − 1` and no further, over all `2^D` centerings in `D = 1, 2, 3` at
-`p = 2` and `p = 4`, and `G = p/2 − 1` accepted where `G = p/2 − 2` is
-refused. The last row is deliberately empty (decided). What a face- or
+[Ghost filling](#ghost-filling) and is measured twice — as exactness to
+degree `p − 1` and no further, over all `2^D` centerings in `D = 1, 2, 3`
+at `p = 2` and `p = 4`, with `G = p/2 − 1` accepted where `G = p/2 − 2`
+is refused (M8a step 2); and as the convergence rate of an application
+that reads those ghosts, in the vertex-centered wave table under
+[the interface-order rule](#operators) above (M8a step 3). The last row is deliberately empty (decided). What a face- or
 edge-centered quantity stores is an *average* along its cell-like
 dimensions and a *point value* along its vertex-like ones, so along a
 vertex dimension the conservative family has nothing to conserve and
@@ -1338,7 +1404,11 @@ design, see the M8 entry), and the list below is in execution order.
   operators and `G = 2`** (amended in M3; see the interface-order rule
   under [Operators](#operators)), verified in D = 1, 2 with a 3D smoke
   test. The wave equation lives in the tests: the package has no
-  physics. *(Done.)*
+  physics. *(Done.)* *(Amended in M8a: the wave study is
+  **vertex-centered** from M8 on — `test/wave_tests.jl`, with its own
+  rate table under [Operators](#operators) — and this cell-centered
+  study is kept verbatim as `test/wave_cell_tests.jl` so the M3 numbers
+  stay under test.)*
 - **M4 — Regridding.** Flag → balance → rebuild → transfer; the
   initial-data cycle; integrator reinit. *Accept:* the initial-data
   cycle converges to a fixed-point hierarchy; a moving refined region
@@ -1407,21 +1477,27 @@ design, see the M8 entry), and the list below is in execution order.
     `GhostSchedule(fs, ops)`, per-dimension stencil widths, the vertex
     rows of the operator table, `regrid!` over `fs => schedule` pairs,
     and the wave test split into vertex- and cell-centered halves.
-    *The `G` move and the centering are done*; see "**Implemented in
-    M8a step 1**" and "**Implemented in M8a step 2**" under
-    [Centerings](#centerings) for what the design left open and the
-    implementation settled. Neither changed a measured number, as
-    predicted: the whole suite passes unchanged at one and eight
-    threads, the M3 wave tables included, and the thread-independence
-    digests still agree byte for byte. The centering's own acceptance
-    tests pass — the M2 exactness claim over all `2^D` centerings in
-    `D = 1, 2, 3` at `p = 2` and `p = 4`, the write-count partition of
-    the stored points including the shared plane and with `G = 0` along
-    a stagger, bit-for-bit injection on position-determined data (with
-    the cell-centered control showing *no* coincident points across
-    levels at all), the `G ≥ p/2 − 1` bound, the conservative refusal,
-    and the regrid transfer exact for every centering. What remains of
-    M8a is the wave equation.
+    *(Done.)* See "**Implemented in M8a step 1**", "**step 2**" and
+    "**step 3**" under [Centerings](#centerings) for what the design
+    left open and the implementation settled. Nothing changed a measured
+    cell-centered number, as predicted: the whole suite passes at one
+    and eight threads with the M3 wave tables unchanged, and the
+    thread-independence digests still agree byte for byte. The
+    centering's own acceptance tests pass — the M2 exactness claim over
+    all `2^D` centerings in `D = 1, 2, 3` at `p = 2` and `p = 4`, the
+    write-count partition of the stored points including the shared
+    plane and with `G = 0` along a stagger, bit-for-bit injection on
+    position-determined data (with the cell-centered control showing
+    *no* coincident points across levels at all), the `G ≥ p/2 − 1`
+    bound, the conservative refusal, and the regrid transfer exact for
+    every centering — and so does the wave equation on top of them: the
+    predicted rates **1 and 2** at prolongation orders 2 and 4, measured
+    0.99 / 1.99 in `D = 1` and 1.01 / 1.99 in `D = 2`, at **`G = 1`**,
+    with the restriction order and the second ghost plane both
+    bit-for-bit inert, the M4 pulse tracked to the uniformly finest
+    mesh's accuracy (0.0240 against 0.0233, at 176 cells against 256),
+    and two staggered cycles in the thread workload. The table is under
+    [Operators](#operators).
     *Accept:* the M2 exactness test (degree `p − 1`, face/edge/corner,
     three levels) over all `2^D` centerings in `D = 1, 2, 3`, the oracle
     averaging along cell-like dimensions and sampling along vertex-like
@@ -1436,7 +1512,7 @@ design, see the M8 entry), and the list below is in execution order.
     the cell-centered study is kept verbatim as `wave_cell` so the M3
     numbers stay under test; the thread digests. The cell-centered
     stencils are the same rational weights as before, so M8a changes no
-    measured number.
+    measured number. *(All of this is measured; see above.)*
   - **M8b — conservation.** `InterfaceSchedule` / `restrict_interfaces!`,
     `map_blocks!(…; closed = true)`, and Burgers' equation
     `∂ₜu + Σ_d ∂_d(u²/2) = 0` on a periodic box in `test/burgers.jl`:
