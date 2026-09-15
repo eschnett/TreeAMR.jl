@@ -79,18 +79,19 @@ end
 
 @kernel function firing_kernel!(counts, los, his, @Const(work), fires,
                                 @Const(origins), @Const(spacings),
-                                ::Val{D}, ::Val{G}, ::Val{N}) where {D,G,N}
+                                ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}) where {D,G,C,N}
     b = @index(Global)
     origin, h = origins[b], spacings[b]
-    half = oftype(h, 1//2)
+    # The same expression `coordinates` forms, per centering.
+    off = pointoffsets(h, C)
 
     n = 0
     lo = ntuple(_ -> Int32(N + 1), Val(D))
     hi = ntuple(_ -> Int32(0), Val(D))
     for c in CartesianIndices(ntuple(_ -> N, Val(D)))
-        i = ntuple(d -> Tuple(c)[d], Val(D))           # interior index, 1:N
+        i = ntuple(d -> Tuple(c)[d], Val(D))           # owned index, 1:N
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
-        x = ntuple(d -> origin[d] + (i[d] - half) * h, Val(D))
+        x = ntuple(d -> origin[d] + (i[d] - off[d]) * h, Val(D))
         if fires(work, idx, b, x)
             n += 1
             lo = widen_lo(lo, i)
@@ -108,13 +109,14 @@ end
 Per block, how many interior cells satisfied `fires` and the bounding
 box of those cells, in that block's own interior indices `1:N`.
 
-`fires(work, idx, b, x) -> Bool` is evaluated at every interior cell of
+`fires(work, idx, b, x) -> Bool` is evaluated at every **owned** point of
 every block from a kernel, so it runs on the field set's backend and
 must be a pure function of its arguments. `work` is the whole working
-array, `idx` the cell's **stored** index (so `work[idx..., v, b]` reads
+array, `idx` the point's **stored** index (so `work[idx..., v, b]` reads
 it and `Base.setindex(idx, idx[d] + 1, d)` reaches its neighbour — the
 ghosts are there, so a stencil may cross a block face), `b` the block
-index, and `x` the cell center.
+index, and `x` its position for this field set's centering (see
+[`coordinates`](@ref)).
 
 This is the device half of regridding: the mesh does the per-cell sweep
 and the min/max reduction, and the application turns the result into
@@ -153,7 +155,8 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
     firing_kernel!(backend)(counts, los, his, fs.work, fires, origins, spacings,
-                            Val(D), Val(fs.G), Val(forest.N); ndrange=n)
+                            Val(D), Val(fs.G), Val(staggers(fs)), Val(forest.N);
+                            ndrange=n)
     synchronize(backend)
 
     hc, hlo, hhi = tohost(counts), tohost(los), tohost(his)
@@ -354,7 +357,7 @@ end
 # transfers by (kind, child offset) so each batch shares one set of
 # stencils — the same grouping the ghost schedule uses.
 function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
-                         oldleaves, newleaves,
+                         c::NTuple{D,Int}, oldleaves, newleaves,
                          operators::Operators, backend::Backend) where {T,D}
     oldindex = Dict{MortonKey{D},Int32}(k => Int32(i) for (i, k) in enumerate(oldleaves))
     N = forest.N
@@ -399,11 +402,16 @@ function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
         end
     end
 
+    # Every target here is the new block's *owned* range — the δ = 0 case
+    # of the same builders. A fresh block's shared plane and ghosts are
+    # left to the next `fill_ghosts!`, as ghosts always are; in a
+    # vertex-like dimension that makes coarsening halved injection from
+    # the children's even points, all of which they own.
     stencils(kind, o) =
-        kind === :copy ? ntuple(d -> copy_stencil(T, N, G[d], 0), D) :
+        kind === :copy ? ntuple(d -> copy_stencil(T, N, G[d], c[d], 0), D) :
         kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, G[d], 0, o[d], operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, G[d], 0, o[d], operators), D)
+        ntuple(d -> restriction_stencil(T, N, G[d], c[d], 0, o[d], operators), D) :
+        ntuple(d -> prolongation_stencil(T, N, G[d], c[d], 0, o[d], operators), D)
 
     # These stencils are rebuilt on every regrid — the child offsets
     # involved depend on which blocks moved — so, like the schedule's,
@@ -440,6 +448,12 @@ Every set's storage is replaced in place, so references an application
 already holds stay valid, but **block indices do not survive**: slots
 are compacted, and `forest.leaves[b]` is the only way to say which block
 is which.
+
+The target of every transfer is the new block's **owned** range, whatever
+the centering: a fresh block's shared boundary plane and its ghosts are
+left to the next [`fill_ghosts!`](@ref), as ghosts always are. A test
+that inspects a staggered field set after a regrid has to fill ghosts
+first.
 
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
@@ -486,6 +500,10 @@ function regrid!(forest::Forest{D}, pairs;
         fs.G == sched.G || throw(ArgumentError(
             "the field set has ghost width G=$(fs.G) but its schedule was built " *
             "for G=$(sched.G); pair each field set with its own schedule"))
+        fs.centering == sched.centering || throw(ArgumentError(
+            "the field set has centering $(fs.centering) but its schedule was " *
+            "built for $(sched.centering); pair each field set with its own " *
+            "schedule"))
     end
 
     oldleaves = copy(forest.leaves)
@@ -503,12 +521,12 @@ function regrid!(forest::Forest{D}, pairs;
             # layers, so they have to hold data before anything moves.
             fill_ghosts!(fs, sched; boundary=boundary)
         end
-        stored = storedsize(forest.N, fs.G)
+        stored = storedsize(forest.N, fs.G, staggers(fs))
         fresh = similar(fs.work, stored..., fs.nvars, length(newleaves))
         zerofill!(fresh, backend)
         if move
-            groups = transfer_groups(eltype(fs.work), forest, fs.G, oldleaves,
-                                     newleaves, sched.operators, backend)
+            groups = transfer_groups(eltype(fs.work), forest, fs.G, staggers(fs),
+                                     oldleaves, newleaves, sched.operators, backend)
             # The transfer moves every cell in the domain, so it is
             # threaded the same way a ghost phase is — its groups are
             # just as uneven, a whole block against a single child.

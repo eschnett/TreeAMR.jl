@@ -274,12 +274,13 @@ must be rebuilt after any refinement, coarsening, or regridding.
 application's discretization, so there is no order the mesh could
 sensibly default to. See [`Operators`](@ref).
 
-A schedule is built for one *layout* — one ghost width, one element
-type, one backend — which is exactly what a field set is, so it takes
-one (amended in M8, when `G` moved off the forest). [`fill_ghosts!`](@ref)
-refuses a field set whose layout differs from the one the schedule was
-built for. The forest form `GhostSchedule(forest, ops; G, T, backend)`
-spells the three out instead, for a caller with no field set in hand.
+A schedule is built for one *layout* — one ghost width, one centering,
+one element type, one backend — which is exactly what a field set is, so
+it takes one (amended in M8, when `G` moved off the forest).
+[`fill_ghosts!`](@ref) refuses a field set whose layout differs from the
+one the schedule was built for. The forest form
+`GhostSchedule(forest, ops; G, centering, T, backend)` spells the four
+out instead, for a caller with no field set in hand.
 
 `backend` must be the backend of every field set the schedule is
 replayed over (M6). The stencil weights and index vectors are read
@@ -293,6 +294,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
     G::NTuple{D,Int}                             # ghost width it was built for
+    centering::NTuple{D,Symbol}                  # centering it was built for
     operators::Operators
     backend::BK
     phase1::Vector{GRP}
@@ -317,18 +319,27 @@ isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 # --- 1D stencil construction ---------------------------------------------
 #
 # Index conventions, all in *stored* indices, per dimension `d` against
-# that dimension's ghost width `G = G[d]` (1:N+2G, owned G+1:G+N):
+# that dimension's ghost width `G = G[d]` and stagger `c = c[d]` (`1` in
+# a vertex-like dimension, `0` in a cell-centered one). The stored extent
+# is 1:N+2G+c and the owned range is G+1:G+N whatever the centering:
 #
-#   δ_d = +1  target is the high ghost slab  G+N+1 : G+N+G
-#   δ_d = -1  target is the low  ghost slab      1 : G
-#   δ_d =  0  target spans the block's own extent
+#   δ_d = +1  target is the high exchange region  G+N+1 : N+2G+c
+#   δ_d = -1  target is the low  ghost slab           1 : G
+#   δ_d =  0  target spans the block's own owned extent
+#
+# The high region is one plane longer in a vertex-like dimension: that is
+# the boundary plane the block *shares* with its high-side neighbor,
+# which the neighbor owns and the exchange therefore fills, exactly as it
+# fills a ghost. Everything above the owned range is exchange-filled, so
+# the asymmetry is bookkeeping in the target ranges and nothing more.
 #
 # For restriction the tangential extent is halved, since each of the
-# 2^(tangential) fine neighbors supplies one half.
+# 2^(tangential) fine neighbors supplies one half. That split is of the
+# *owned* range, so it does not depend on the centering.
 #
-# Every builder below takes a scalar `G` — the width in *its own*
-# dimension. `target_range` is the single source of truth for the ranges;
-# nothing re-derives one.
+# Every builder below takes scalar `G` and `c` — the width and stagger in
+# *its own* dimension. `target_range` is the single source of truth for
+# the ranges; nothing re-derives one.
 
 # Weights for a window of `p` consecutive source cells starting at `lo`,
 # evaluated at `x`.
@@ -347,16 +358,20 @@ function interpolation_weights(lo::Int, p::Int, x::Rational, what::AbstractStrin
 end
 
 # Target range of a transfer in dimension d.
-function target_range(N::Int, G::Int, δd::Int, od::Int, halved::Bool)
-    δd == 1 && return (G + N + 1):(G + N + G)
+function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool)
+    δd == 1 && return (G + N + 1):(N + 2G + c)
     δd == -1 && return 1:G
     halved && return (G + 1 + od * (N ÷ 2)):(G + od * (N ÷ 2) + N ÷ 2)
     return (G + 1):(G + N)
 end
 
-# Same-level copy: a pure shift of N cells against the direction.
-function copy_stencil(::Type{T}, N::Int, G::Int, δd::Int) where {T}
-    rng = target_range(N, G, δd, 0, false)
+# Same-level copy: a pure shift of N cells against the direction, for
+# every centering. In a vertex-like dimension the high target is one
+# plane longer and its first entry, the shared plane G+N+1, reads the
+# neighbor's first *owned* point G+1 — which is the same point. So a copy
+# still reads interiors only, which is what makes phase 1 race free.
+function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    rng = target_range(N, G, c, δd, 0, false)
     srcstart = Int32[j - N * δd for j in rng]
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
@@ -364,11 +379,23 @@ end
 # Restriction, fine -> coarse. `od` is the source's child offset within
 # the (refined) node adjacent to the target, so it selects which half of
 # the target's extent this source covers.
-function restrict_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int, p::Int) where {T}
-    rng = target_range(N, G, δd, od, true)
+#
+# In a vertex-like dimension restriction is **injection**: the coarse
+# point at position `q` coincides with fine point `2q`, so the stencil is
+# width one with weight one. It is exact for any data, carries no order,
+# and never has to shift — the circularity that forces the cell-centered
+# window inward cannot arise, because the coincident fine point is always
+# owned by the fine block (that is the `N ≥ 2G + 2` invariant).
+function restrict_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
+                          p::Int) where {T}
+    rng = target_range(N, G, c, δd, od, true)
     # Step into the adjacent node's frame, where the source's parent has
     # the target block's own layout.
     shift = -N * δd
+    if c == 1
+        srcstart = Int32[G + 1 + 2 * (j + shift - G - 1 - od * (N ÷ 2)) for j in rng]
+        return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
+    end
     srcstart = Vector{Int32}(undef, length(rng))
     weights = Matrix{T}(undef, p, length(rng))
     for (i, j) in enumerate(rng)
@@ -399,21 +426,37 @@ source_direction(δd::Int, od::Int) =
 # Prolongation, coarse -> fine. `od` is the *target*'s child offset
 # within its own parent, which fixes where the target's cells fall
 # inside the coarse frame.
-function prolong_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int, p::Int) where {T}
-    rng = target_range(N, G, δd, od, false)
+function prolong_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
+                         p::Int) where {T}
+    rng = target_range(N, G, c, δd, od, false)
+    stored = N + 2G + c
     srcstart = Vector{Int32}(undef, length(rng))
     weights = Matrix{T}(undef, p, length(rng))
     for (i, j) in enumerate(rng)
         # Fine offset from the parent's interior start, so that coarse
-        # cell c covers fine cells 2c and 2c+1.
+        # cell c covers fine cells 2c and 2c+1 (cell-centered) or coarse
+        # point c coincides with fine point 2c (vertex-like).
         φ = od * N + j - G - 1
-        # Fine cell φ sits at coarse coordinate φ/2 - 1/4; center a
-        # window of p coarse cells on it. Translating into the source's
-        # stored frame costs N cells per unit of direction.
+        # Translating into the source's stored frame costs N cells per
+        # unit of direction.
         origin = -N * source_direction(δd, od) + G + 1
-        lo = clamp(cld(φ, 2) - p ÷ 2 + origin, 1, N + 2G - p + 1)
+        if c == 1
+            # Fine point φ sits at coarse coordinate φ/2: an integer for
+            # even φ, where the Lagrange weights through any window
+            # containing that node are the unit vector *exactly* (they
+            # are built in rational arithmetic), and a half-integer for
+            # odd φ, where a symmetric window of even width p applies.
+            # One builder serves both.
+            lo = clamp(fld(φ, 2) - p ÷ 2 + 1 + origin, 1, stored - p + 1)
+            x = φ//2 + origin
+        else
+            # Fine cell φ sits at coarse coordinate φ/2 - 1/4; center a
+            # window of p coarse cells on it.
+            lo = clamp(cld(φ, 2) - p ÷ 2 + origin, 1, stored - p + 1)
+            x = φ//2 - 1//4 + origin
+        end
         srcstart[i] = lo
-        weights[:, i] = interpolation_weights(lo, p, φ//2 - 1//4 + origin, "prolongation")
+        weights[:, i] = interpolation_weights(lo, p, x, "prolongation")
     end
     return Stencil1D{T}(first(rng), srcstart, weights)
 end
@@ -446,9 +489,11 @@ function conservative_prolong_weights(p::Int)
     return low, high
 end
 
-function conservative_prolong_stencil(::Type{T}, N::Int, G::Int, δd::Int, od::Int,
-                                      p::Int) where {T}
-    rng = target_range(N, G, δd, od, false)
+function conservative_prolong_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int,
+                                      od::Int, p::Int) where {T}
+    # `check_operators` refuses this family on a field set with any
+    # vertex-like dimension, so `c` only ever reaches `target_range`.
+    rng = target_range(N, G, c, δd, od, false)
     low, high = conservative_prolong_weights(p)
     r = (p - 1) ÷ 2
     srcstart = Vector{Int32}(undef, length(rng))
@@ -468,16 +513,16 @@ end
 
 # The stencils a given operator family uses, so that the schedule and
 # the regrid transfer cannot drift apart.
-prolongation_stencil(::Type{T}, N, G, δd, od, ops::Operators) where {T} =
+prolongation_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
     ops.family === Conservative ?
-    conservative_prolong_stencil(T, N, G, δd, od, ops.prolongation) :
-    prolong_stencil(T, N, G, δd, od, ops.prolongation)
+    conservative_prolong_stencil(T, N, G, c, δd, od, ops.prolongation) :
+    prolong_stencil(T, N, G, c, δd, od, ops.prolongation)
 
 # Conservative restriction is the exact volume average, which the
 # point-value builder already produces at order 2: its window is a
 # cell's own two children and its weights are 1/2.
-restriction_stencil(::Type{T}, N, G, δd, od, ops::Operators) where {T} =
-    restrict_stencil(T, N, G, δd, od, ops.restriction)
+restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
+    restrict_stencil(T, N, G, c, δd, od, ops.restriction)
 
 # --- Schedule construction -----------------------------------------------
 
@@ -516,7 +561,8 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 # its own `pairs` and `boundaries`.
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
-                        forest::Forest{D}, G::NTuple{D,Int}, b::Int, dirs) where {D}
+                        forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
+                        b::Int, dirs) where {D}
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
@@ -524,9 +570,17 @@ function block_sources!(pairs::TransferPairs{D},
         push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl), (Int32[], Int32[])),
                (Int32(b), Int32(s)))
     for δ in dirs
+        region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0,
+                                                           false), D))
+        # A cell-centered dimension with `G_d = 0` has no low slab and no
+        # high one, so every direction that leaves the block along it has
+        # nothing to fill. Skipping here rather than launching an empty
+        # kernel also spares the tree query. (Halving a tangential range
+        # cannot empty it, so testing the unhalved region covers every
+        # kind.)
+        isempty(region) && continue
         nbrs = neighbor_keys(forest, k, δ)
         if isempty(nbrs)
-            region = CartesianIndices(ntuple(d -> target_range(N, G[d], δ[d], 0, false), D))
             push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
             continue
         end
@@ -561,15 +615,19 @@ function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
 end
 
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
-    GhostSchedule(fs.forest, operators; G=fs.G, T=T, backend=get_backend(fs.work))
+    GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, T=T,
+                  backend=get_backend(fs.work))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
+                       centering=cellcentered(D),
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
     ghosts = ghostwidths(G, Val(D))
-    storedsize(N, ghosts)                        # the N >= 2G[d] invariant
-    check_operators(N, ghosts, operators)
+    centers = centerings(centering, Val(D))
+    stags = staggers(centers)
+    storedsize(N, ghosts, stags)                 # the N >= 2G[d] + 2c[d] invariant
+    check_operators(N, ghosts, stags, operators)
     check_floattype(T, backend)
     dirs = alldirections(Val(D))
     nb = nleaves(forest)
@@ -583,7 +641,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, b, dirs)
+            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags, b,
+                           dirs)
         end
     end
 
@@ -600,11 +659,11 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
 
     build(key) =
         key.kind === :copy ?
-        ntuple(d -> copy_stencil(T, N, ghosts[d], key.direction[d]), D) :
+        ntuple(d -> copy_stencil(T, N, ghosts[d], stags[d], key.direction[d]), D) :
         key.kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, ghosts[d], key.direction[d],
+        ntuple(d -> restriction_stencil(T, N, ghosts[d], stags[d], key.direction[d],
                                         key.offset[d], operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, ghosts[d], key.direction[d],
+        ntuple(d -> prolongation_stencil(T, N, ghosts[d], stags[d], key.direction[d],
                                          key.offset[d], operators), D)
 
     GRP = grouptype(backend, T, Val(D))
@@ -624,8 +683,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     phase2 = [bylevel[l] for l in levels]
     bplan = BoundaryPlan(backend, T, forest, boundaries)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan)}(
-        forest, generation(forest), ghosts, operators, backend, phase1, phase2,
-        levels, boundaries, bplan, phase_plan(phase1),
+        forest, generation(forest), ghosts, centers, operators, backend, phase1,
+        phase2, levels, boundaries, bplan, phase_plan(phase1),
         [phase_plan(groups) for groups in phase2])
 end
 

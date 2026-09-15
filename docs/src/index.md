@@ -68,11 +68,45 @@ with `G = 0`, over one forest, is the normal case.
 ```jldoctest overview
 julia> state = FieldSet(forest, 2; G = 2);
 
-julia> flux = FieldSet(forest, 2; G = 0);
-
-julia> size(state.work), size(flux.work)
-((12, 12, 2, 7), (8, 8, 2, 7))
+julia> size(state.work)
+(12, 12, 2, 7)
 ```
+
+## Centerings
+
+A field set also carries a **centering**: per dimension, its values sit
+either at cell centers (`:cell`) or at cell boundaries (`:vertex`). The
+familiar names are spellings of that tuple — [`cellcentered`](@ref),
+[`vertexcentered`](@ref), [`facecentered`](@ref), [`edgecentered`](@ref)
+— because every transfer is a product of `D` one-dimensional stencils,
+and the stencil for dimension `d` depends on the centering in *that*
+dimension alone.
+
+A vertex-like dimension stores one plane more: the boundary plane a block
+**shares** with its high-side neighbor. Ownership is half-open — a block
+owns its points `0 … N−1` in every dimension, whatever the centering — so
+the state vector still holds `N^D` values per block per variable, and the
+shared plane is filled by the exchange exactly as a ghost is. A flux
+therefore needs no ghosts at all, only that one extra plane:
+
+```jldoctest overview
+julia> flux = FieldSet(forest, 2; G = (0, 0), centering = facecentered(2, 1));
+
+julia> size(flux.work)
+(9, 8, 2, 7)
+```
+
+[`interiorview`](@ref) returns the owned points and [`closedview`](@ref)
+the owned points plus the shared plane — a block's `N+1` faces in the
+staggered dimension, which is what a flux kernel launched with
+`map_blocks!(...; closed = true)` writes.
+
+In a vertex-like dimension the inter-grid operators change with it:
+restriction is exact **injection** (the coarse point at position `X`
+coincides with fine point `2X`), and prolongation interpolates at integer
+or half-integer coarse coordinates, needing `G[d] ≥ p/2 − 1` rather than
+`p/2`. The conservative family is refused along a stagger, where a
+staggered quantity stores a point value and there is nothing to conserve.
 
 ## Element types
 
@@ -111,8 +145,8 @@ only needed when the tree changes. So the exchange is split in two: a
 [`GhostSchedule`](@ref) is built once and [`fill_ghosts!`](@ref) merely
 replays it, with no tree query in the per-evaluation path.
 
-A schedule belongs to a *layout* — one ghost width, one element type,
-one backend — so it is built from a field set:
+A schedule belongs to a *layout* — one ghost width, one centering, one
+element type, one backend — so it is built from a field set:
 
 ```jldoctest overview
 julia> schedule = GhostSchedule(state, Operators(prolongation=2, restriction=2));
@@ -140,10 +174,12 @@ true
 ```
 
 Interpolation order is configurable via [`Operators`](@ref), and is
-constrained by the block geometry, per dimension: order `p` prolongation
-needs `G[d] ≥ p/2`, which [`check_operators`](@ref) enforces when the
-schedule is built. It is also constrained by your discretization — see the warning
-in [`Operators`](@ref), which is worth reading before picking an order.
+constrained by the block geometry, per dimension and per centering: order
+`p` prolongation needs `G[d] ≥ p/2` in a cell-centered dimension and
+`G[d] ≥ p/2 − 1` in a vertex-like one, which [`check_operators`](@ref)
+enforces when the schedule is built. It is also constrained by your
+discretization — see the warning in [`Operators`](@ref), which is worth
+reading before picking an order.
 
 ## Time integration
 
@@ -389,11 +425,17 @@ block_origins
 
 ```@docs
 FieldSet
+cellcentered
+vertexcentered
+facecentered
+edgecentered
+staggers
 coordinates
 nblocks
 blockkey
 blockview
 interiorview
+closedview
 fill_by_coordinates!
 KernelAbstractions.get_backend(::FieldSet)
 ```

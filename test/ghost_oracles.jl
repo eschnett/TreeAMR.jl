@@ -99,12 +99,118 @@ function max_deviation(fs, f)
     return worst
 end
 
-"""Fill with `f`, exchange ghosts, and report the worst error anywhere."""
-function exchange_error(forest, ops, f; nvars=2, G=1)
-    fs = FieldSet(forest, nvars; G=G)
+"""
+Fill with `f`, exchange ghosts, and report the worst error anywhere.
+
+`max_deviation` evaluates `f` at [`coordinates`](@ref), which knows the
+field set's centering, so this is the same claim for every centering: a
+face-centered set is filled and compared at face centers, a vertex set at
+the vertices, including the shared boundary plane and the domain's upper
+boundary plane that the hook fills.
+"""
+function exchange_error(forest::Forest{D}, ops, f; nvars=2, G=1,
+                        centering=cellcentered(D)) where {D}
+    fs = FieldSet(forest, nvars; G=G, centering=centering)
     fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops);
                  boundary=boundary_by_coordinates(f))
     return max_deviation(fs, f)
+end
+
+"""Every one of the `2^D` centerings, in a fixed order."""
+allcenterings(::Val{D}) where {D} =
+    [NTuple{D,Symbol}(c) for c in Iterators.product(ntuple(_ -> (:cell, :vertex), D)...)]
+
+"""
+The position of stored index `idx` of leaf `k`, in exact rational units
+of root cells, from the oracle's own box geometry (`leafbox`) rather than
+from the package's floating-point `coordinates`. Wrapped into the domain
+where a dimension is periodic, so that two blocks abutting across a seam
+name a shared point identically.
+"""
+function exact_point(forest::Forest{D}, k::MortonKey{D}, G::NTuple{D,Int},
+                     c::NTuple{D,Int}, idx::NTuple{D,Int}) where {D}
+    lo, _ = leafbox(forest, k)
+    n = forest.N * (1 << level(k))
+    return ntuple(D) do d
+        off = c[d] == 1 ? 1//1 : 1//2
+        p = lo[d] + (idx[d] - G[d] - off) // n
+        Rational{Int}(forest.periodic[d] ? mod(p, forest.roots[d]) : p)
+    end
+end
+
+exact_point(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,Int}) where {T,D} =
+    exact_point(fs.forest, blockkey(fs, b), fs.G, staggers(fs), idx)
+
+"""
+A value determined by a point's exact position and nothing else — data
+with no polynomial structure at all, so that no interpolation reproduces
+it, but the *same* number wherever two blocks name the same point, which
+is what makes a bit-for-bit comparison across blocks meaningful.
+"""
+arbitrary_value(::Type{T}, p, v::Integer) where {T} =
+    T(2 * (hash((p, v)) / typemax(UInt64)) - 1)
+
+"""Fill every owned point of every block from [`arbitrary_value`](@ref)."""
+function fill_arbitrary!(fs::FieldSet{T,D}) where {T,D}
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D))
+    for b in 1:nblocks(fs), v in 1:fs.nvars, idx in owned
+        fs.work[Tuple(idx)..., v, b] =
+            arbitrary_value(T, exact_point(fs, b, Tuple(idx)), v)
+    end
+    return fs
+end
+
+"""
+Every owned point of every block, keyed by its exact position: the
+level of the block that owns it and that block's stored values.
+
+Ownership is half-open in every dimension and the owned boxes tile the
+domain, so each position appears exactly once.
+"""
+function owned_points(fs::FieldSet{T,D}) where {T,D}
+    out = Dict{NTuple{D,Rational{Int}},Tuple{Int,Vector{T}}}()
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D))
+    for b in 1:nblocks(fs), idx in owned
+        p = exact_point(fs, b, Tuple(idx))
+        out[p] = (level(blockkey(fs, b)),
+                  T[fs.work[Tuple(idx)..., v, b] for v in 1:fs.nvars])
+    end
+    return out
+end
+
+"""
+Compare every exchange-filled point of `fs` against the block that
+*owns* that position, and report `(nfiner, nsame, mismatches)`: how many
+exchange points coincide with an owned point of a finer block, how many
+with one at the same level, and how many of those did not come back bit
+for bit.
+
+Injection and a same-level copy both reproduce the owner's stored value
+exactly, whatever the data; an averaging or interpolating restriction
+does not. Points whose owner is *coarser* were prolongated and are
+skipped — prolongation is genuine interpolation.
+"""
+function injection_report(fs::FieldSet{T,D}) where {T,D}
+    owners = owned_points(fs)
+    G, N = fs.G, fs.forest.N
+    nfiner = nsame = bad = 0
+    stored = CartesianIndices(ntuple(d -> axes(fs.work, d), D))
+    for b in 1:nblocks(fs)
+        l = level(blockkey(fs, b))
+        for idx in stored
+            i = Tuple(idx)
+            all(d -> G[d] < i[d] <= G[d] + N, 1:D) && continue   # owned, not exchanged
+            entry = get(owners, exact_point(fs, b, i), nothing)
+            entry === nothing && continue
+            ownerlevel, values = entry
+            ownerlevel < l && continue                           # prolongated
+            ownerlevel > l ? (nfiner += 1) : (nsame += 1)
+            for v in 1:fs.nvars
+                fs.work[i..., v, b] == values[v] || (bad += 1)
+            end
+        end
+    end
+    return (nfiner, nsame, bad)
 end
 
 """
@@ -115,7 +221,8 @@ double-writes.
 """
 function write_counts(schedule::GhostSchedule{T,D}) where {T,D}
     forest = schedule.forest
-    stored = ntuple(d -> forest.N + 2 * schedule.G[d], D)
+    c = staggers(schedule.centering)
+    stored = ntuple(d -> forest.N + 2 * schedule.G[d] + c[d], D)
     counts = zeros(Int, stored..., nleaves(forest))
 
     function tally!(group::TransferGroup)

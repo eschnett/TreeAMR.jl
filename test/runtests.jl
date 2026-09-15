@@ -415,6 +415,7 @@ end
 end
 
 include("ghost_tests.jl")
+include("centering_tests.jl")
 include("state_tests.jl")
 include("regrid_tests.jl")
 include("wave_tests.jl")

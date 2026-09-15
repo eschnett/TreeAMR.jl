@@ -97,12 +97,19 @@ function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
 end
 
 """
-    map_blocks!(kernel!, fs::FieldSet, args...)
+    map_blocks!(kernel!, fs::FieldSet, args...; closed=false)
 
-Launch a KernelAbstractions kernel over every interior cell of every
+Launch a KernelAbstractions kernel over every **owned** point of every
 block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
 is therefore `(i1, ..., iD, b)` with each `i` running over `1:N`; add
 `G[d]` to reach the working array's stored indices.
+
+With `closed = true` the loop runs over the **closed** range instead —
+`N + c[d]` per dimension, so a vertex-like dimension also covers the
+shared boundary plane (see [`closedview`](@ref)). That is what a
+quantity defined on a block's faces wants: a flux has `N+1` faces per
+dimension, not `N`, and the extra one is the block's own high face. In a
+cell-centered field set the two are the same loop.
 
 Blocks are uniform work units, so this is one flat parallel loop. The
 CPU backend spreads it over `Threads.nthreads()` as it stands (M5), and
@@ -118,10 +125,12 @@ output cell, so the result does not depend on how the loop was split.
 end
 ```
 """
-function map_blocks!(kernel!, fs::FieldSet{T,D}, args...) where {T,D}
+function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
+                     closed::Bool=false) where {T,D}
     backend = get_backend(fs.work)
-    kernel!(backend)(args...;
-                     ndrange=(ntuple(_ -> fs.forest.N, D)..., nblocks(fs)))
+    c = staggers(fs)
+    extent = ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
+    kernel!(backend)(args...; ndrange=(extent..., nblocks(fs)))
     synchronize(backend)
     return nothing
 end

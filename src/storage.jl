@@ -1,3 +1,85 @@
+# --- Centerings ----------------------------------------------------------
+#
+# Per dimension a variable lives either at cell centers (`:cell`, `N`
+# values per block at the half-integer positions) or at cell boundaries
+# (`:vertex`, the integer positions). A centering is therefore a
+# `D`-tuple, and the familiar names are spellings of tuples — see
+# "Centerings" in CODE.md for why a tuple rather than an enumeration of
+# the `2^D` cases: every transfer is a product of `D` one-dimensional
+# stencils, and the stencil for dimension `d` depends on the centering in
+# *that dimension* alone.
+
+"""
+    cellcentered(D)
+
+The all-`:cell` centering: `N^D` values per block at the cell centers.
+This is what every field set was through M6, and what
+[`FieldSet`](@ref) defaults to.
+"""
+cellcentered(D::Integer) = ntuple(_ -> :cell, Int(D))
+
+"""
+    vertexcentered(D)
+
+The all-`:vertex` centering: values at the integer positions, so a block
+stores its `N` owned points per dimension plus the boundary plane it
+shares with its high-side neighbor.
+"""
+vertexcentered(D::Integer) = ntuple(_ -> :vertex, Int(D))
+
+"""
+    facecentered(D, d)
+
+The centering of a quantity living on the faces **normal to** dimension
+`d` — `:vertex` in `d`, `:cell` in every other dimension. A flux `F_d`
+or a face-centered magnetic field `B_d` has this centering.
+"""
+facecentered(D::Integer, d::Integer) = staggeredalong(D, d, :vertex, :cell)
+
+"""
+    edgecentered(D, d)
+
+The centering of a quantity living on the edges running **along**
+dimension `d` — `:cell` in `d`, `:vertex` in every other dimension, the
+complement of [`facecentered`](@ref). A constrained-transport EMF `E_d`
+or a vector potential `A_d` has this centering.
+"""
+edgecentered(D::Integer, d::Integer) = staggeredalong(D, d, :cell, :vertex)
+
+function staggeredalong(D::Integer, d::Integer, along::Symbol, across::Symbol)
+    1 <= d <= D || throw(ArgumentError(
+        "the staggered dimension must be in 1:$D, got $d"))
+    return ntuple(e -> e == d ? along : across, Int(D))
+end
+
+# Validate a user-supplied centering into an `NTuple{D,Symbol}` — the
+# same shape `ghostwidths` gives `G`.
+function centerings(C::Tuple{Vararg{Symbol}}, ::Val{D}) where {D}
+    length(C) == D || throw(ArgumentError(
+        "centering must have one entry per dimension: got $(length(C)) for a " *
+        "$D-dimensional forest, $C. Spell it with cellcentered($D), " *
+        "vertexcentered($D), facecentered($D, d) or edgecentered($D, d)."))
+    all(s -> s === :cell || s === :vertex, C) || throw(ArgumentError(
+        "each centering entry must be :cell or :vertex, got $C. A dimension is " *
+        "either cell-centered (values at the half-integer positions) or " *
+        "vertex-like (values at the integer positions, with a shared boundary " *
+        "plane)."))
+    return ntuple(d -> C[d], D)
+end
+centerings(C, ::Val{D}) where {D} = throw(ArgumentError(
+    "centering must be a tuple of :cell / :vertex symbols, got a $(typeof(C))"))
+
+"""
+    staggers(centering::NTuple{D,Symbol})
+    staggers(fs::FieldSet)
+
+The centering as the arithmetic sees it: `c_d = 1` where dimension `d`
+is vertex-like, `0` where it is cell-centered. This is the `c_d` of
+CODE.md — the extra stored plane, the offset from a stored index to a
+position, and the length a `closed` loop adds.
+"""
+staggers(C::NTuple{D,Symbol}) where {D} = ntuple(d -> C[d] === :vertex ? 1 : 0, D)
+
 """
     FieldSet{T,D,R,A}
 
@@ -5,7 +87,7 @@ Block storage for `nvars` variables over every leaf of a
 [`Forest`](@ref): one big persistent array holding all leaf blocks
 including their ghosts,
 
-    work :: A   # size (N+2G[1], ..., N+2G[D], nvars, nblocks)
+    work :: A   # size (N+2G[1]+c[1], ..., N+2G[D]+c[D], nvars, nblocks)
 
 Cell indices vary fastest (so a GPU reads them coalesced), then the
 variable index, then the block index; blocks are ordered by the forest's
@@ -19,8 +101,30 @@ evolved state with `G = 2` and the fluxes computed from it with `G = 0` —
 is the normal case. It is **required**: like the operator orders, it
 follows from the application's discretization, which the mesh cannot
 know. Pass a plain integer for the uniform case or an `NTuple{D,Integer}`
-for one width per dimension; it is stored as an `NTuple{D,Int}`. The
-invariant `N ≥ 2G[d]` is checked here, per dimension.
+for one width per dimension; it is stored as an `NTuple{D,Int}`.
+
+`centering` says, per dimension, whether a value sits at a cell center
+(`:cell`) or at a cell boundary (`:vertex`), and defaults to
+[`cellcentered`](@ref)`(D)`. Spell it with [`cellcentered`](@ref),
+[`vertexcentered`](@ref), [`facecentered`](@ref) or
+[`edgecentered`](@ref). A vertex-like dimension stores one plane more —
+the boundary plane the block **shares** with its high-side neighbor,
+which that neighbor owns and the exchange fills exactly as it fills a
+ghost. Three ranges per dimension have names, with `c_d = 1` in a
+vertex-like dimension and `0` otherwise:
+
+| stored index | role | view |
+|---|---|---|
+| `1 … G` | low ghosts | |
+| `G+1 … G+N` | **owned** — what the state vector holds | [`interiorview`](@ref) |
+| `G+1 … G+N+c` | **closed** — both boundary planes included | [`closedview`](@ref) |
+| `G+N+1 … N+2G+c` | high exchange region | |
+
+Everything outside the owned range is exchange-filled, so the asymmetry
+is bookkeeping in the target ranges and nothing more. The invariant
+`N ≥ 2G[d] + 2c[d]` is checked here, per dimension: a block's high
+exchange region must be reachable from one ring of neighbors, and a
+finer neighbor spans only `N/2` of this block's cells.
 
 Element type `T` is generic: `Float32` for GPUs, `Float64` on a host,
 or a software type such as a double-`Float32` where no hardware fp64
@@ -42,6 +146,7 @@ block slots and rebuilds the storage.
 
     FieldSet(forest, nvars; G)          # element type = floattype(forest)
     FieldSet{Float32}(forest, nvars; G = (2, 0))
+    FieldSet(forest, nvars; G = 0, centering = facecentered(3, 1))
     FieldSet{Float32}(forest, nvars; G = 2, backend = CUDABackend())
 
 # Examples
@@ -56,12 +161,17 @@ julia> size(fs.work)
 
 julia> FieldSet(Forest((1, 1); N = 8), 1; G = (2, 0)).G
 (2, 0)
+
+julia> size(FieldSet(Forest((1, 1); N = 8), 1;
+                     G = 0, centering = facecentered(2, 1)).work)
+(9, 8, 1, 1)
 ```
 """
 mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const forest::Forest{D,R}
     const nvars::Int
     const G::NTuple{D,Int}
+    const centering::NTuple{D,Symbol}
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
@@ -70,9 +180,12 @@ end
 
 # `G` as a sentinel-defaulted keyword rather than a required one, so that
 # omitting it reports *why* there is no default — the same reason
-# `Operators` has no default order.
+# `Operators` has no default order. `centering` does have one:
+# cell-centered is what a field set was before M8, and it is the answer
+# for everything that is not deliberately staggered.
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
+                     centering=cellcentered(D),
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
     G === nothing && throw(ArgumentError(
@@ -82,20 +195,23 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
         "none at all — which the mesh cannot know."))
     check_floattype(T, backend)
     ghosts = ghostwidths(G, Val(D))
-    stored = storedsize(forest.N, ghosts)
+    centers = centerings(centering, Val(D))
+    stored = storedsize(forest.N, ghosts, staggers(centers))
     work = allocate(backend, T, (stored..., Int(nvars), nleaves(forest)))
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
-    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, work)
+    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
 
-# The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d]` is
-# what makes a block's high exchange region reachable from one ring of
-# neighbors even when those neighbors are finer and each spans only
-# `N/2` coarse cells (see "Blocks" in CODE.md).
+staggers(fs::FieldSet) = staggers(fs.centering)
+
+# The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d] +
+# 2c[d]` is what makes a block's high exchange region reachable from one
+# ring of neighbors even when those neighbors are finer and each spans
+# only `N/2` coarse cells (see "Blocks" in CODE.md).
 ghostwidths(G::Integer, ::Val{D}) where {D} = ghostwidths(ntuple(_ -> G, D), Val(D))
 function ghostwidths(G::Tuple{Vararg{Integer}}, ::Val{D}) where {D}
     length(G) == D || throw(ArgumentError(
@@ -105,12 +221,14 @@ function ghostwidths(G::Tuple{Vararg{Integer}}, ::Val{D}) where {D}
     return ntuple(d -> Int(G[d]), D)
 end
 
-function storedsize(N::Int, G::NTuple{D,Int}) where {D}
-    all(d -> N >= 2 * G[d], 1:D) || throw(ArgumentError(
-        "N must be >= 2G in every dimension, got N=$N, G=$G. A block's high " *
-        "ghost layers must be reachable from one ring of neighbors, and a finer " *
-        "neighbor spans only N/2 of this block's cells."))
-    return ntuple(d -> N + 2 * G[d], D)
+function storedsize(N::Int, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    all(d -> N >= 2 * G[d] + 2 * c[d], 1:D) || throw(ArgumentError(
+        "N must be >= 2G + 2c in every dimension, got N=$N, G=$G, c=$c. A block's " *
+        "high exchange region must be reachable from one ring of neighbors, and a " *
+        "finer neighbor spans only N/2 of this block's cells; a vertex-like " *
+        "dimension (c=1) needs one more, because its shared boundary plane makes " *
+        "that region one plane longer."))
+    return ntuple(d -> N + 2 * G[d] + c[d], D)
 end
 
 """
@@ -139,9 +257,9 @@ blockkey(fs::FieldSet, b::Integer) = fs.forest.leaves[b]
     blockview(fs::FieldSet, b::Integer)
     blockview(fs::FieldSet, b::Integer, v::Integer)
 
-A view of block `b` **including ghosts** — shape `(N+2G[1], ...,
-N+2G[D], nvars)`, or without the trailing `nvars` for a single variable
-`v`.
+A view of block `b` **including ghosts** — shape `(N+2G[1]+c[1], ...,
+N+2G[D]+c[D], nvars)`, or without the trailing `nvars` for a single
+variable `v`.
 """
 blockview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
     view(fs.work, ntuple(_ -> Colon(), D + 1)..., b)
@@ -152,9 +270,12 @@ blockview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
     interiorview(fs::FieldSet, b::Integer)
     interiorview(fs::FieldSet, b::Integer, v::Integer)
 
-A view of block `b` **excluding ghosts** — shape `(N, ..., N, nvars)`,
-or `(N, ..., N)` for a single variable `v`. This is the part that tiles
-the domain and that the ODE state vector holds.
+A view of block `b`'s **owned** points — shape `(N, ..., N, nvars)`, or
+`(N, ..., N)` for a single variable `v`. This is the part that tiles the
+domain and that the ODE state vector holds, for every centering: in a
+vertex-like dimension a block owns its points `0 … N-1` and the boundary
+point `N` belongs to the neighbor on that side (see
+[`closedview`](@ref)).
 """
 interiorview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
     view(fs.work, interiorranges(fs)..., :, b)
@@ -166,16 +287,61 @@ interiorranges(fs::FieldSet{T,D}) where {T,D} =
     ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D)
 
 """
+    closedview(fs::FieldSet, b::Integer)
+    closedview(fs::FieldSet, b::Integer, v::Integer)
+
+A view of block `b`'s **closed** range — shape `(N+c[1], ..., N+c[D],
+nvars)`, or without the trailing `nvars` for a single variable `v`: the
+owned points plus the shared boundary plane at the high end of every
+vertex-like dimension.
+
+This is what a quantity defined on a block's faces or edges is computed
+over — a flux `F_d` has `N+1` faces in `d`, not `N` — and it is what
+[`map_blocks!`](@ref)`(...; closed = true)` launches over. In a
+cell-centered field set it is exactly [`interiorview`](@ref).
+
+The extra plane is not owned: it belongs to the high-side neighbor, and
+the exchange fills it. A kernel launched over the closed range
+nevertheless *writes* it, because a flux is needed on both of a block's
+faces; making the two sides of a coarse-fine face agree afterwards is
+the interface restriction's job (see `CODE.md`, "Conservation at
+coarse-fine faces").
+"""
+closedview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
+    view(fs.work, closedranges(fs)..., :, b)
+closedview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
+    view(fs.work, closedranges(fs)..., v, b)
+
+# The closed range per dimension, `G[d]+1 … G[d]+N+c[d]`.
+function closedranges(fs::FieldSet{T,D}) where {T,D}
+    c = staggers(fs)
+    return ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D)
+end
+
+# The offset from a stored index to a position, per dimension: half a
+# cell in a cell-centered dimension (the value sits at the center), a
+# whole one in a vertex-like dimension (it sits on the boundary). `1//2`
+# and `1//1` rather than `0.5` and `1.0`: a floating-point literal would
+# be an fp64 operand and would drag the whole position into fp64. The
+# conversions are exact and fold away at compile time.
+@inline pointoffsets(h, c::NTuple{D,Int}) where {D} =
+    ntuple(d -> c[d] == 1 ? oftype(h, 1//1) : oftype(h, 1//2), Val(D))
+
+"""
     coordinates([S], fs::FieldSet, b::Integer, idx::NTuple{D,Integer})
 
 The physical position of point `idx` of block `b` of `fs`. `idx` is
-1-based over the **stored** array, so the owned cells are
-`G[d]+1 : G[d]+N` and values outside that range name ghosts, whose
-positions are still well defined and lie outside the block.
+1-based over the **stored** array, so the owned points are
+`G[d]+1 : G[d]+N` and values outside that range name the shared plane
+and the ghosts, whose positions are still well defined and lie on or
+outside the block's boundary.
 
-The position depends on the *field set's* ghost width, which is why this
+The position depends on the field set's ghost width *and* on its
+centering — `origin + (i - G[d] - 1/2)·h` in a cell-centered dimension,
+`origin + (i - G[d] - 1)·h` in a vertex-like one — which is why this
 takes a field set and a block index rather than a forest and a key
-(replacing `cell_center`, which assumed the forest carried `G`).
+(replacing `cell_center`, which assumed the forest carried `G` and that
+every dimension was cell-centered).
 
 The optional leading `S` is the type the arithmetic is done in, as
 everywhere in `geometry.jl`; it defaults to the field set's own element
@@ -187,39 +353,37 @@ function coordinates(::Type{S}, fs::FieldSet{T,D}, b::Integer,
     forest = fs.forest
     origin = block_origin(S, forest, blockkey(fs, b))
     h = spacing(S, forest, blockkey(fs, b))
-    # `1//2` rather than `0.5`: the literal would be a `Float64` operand
-    # and would drag the whole expression into fp64. The conversion is
-    # exact and folds away at compile time.
-    half = oftype(h, 1//2)
-    return ntuple(d -> origin[d] + (Int(idx[d]) - fs.G[d] - half) * h, D)
+    off = pointoffsets(h, staggers(fs))
+    return ntuple(d -> origin[d] + (Int(idx[d]) - fs.G[d] - off[d]) * h, D)
 end
 coordinates(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,<:Integer}) where {T,D} =
     coordinates(T, fs, b, idx)
 
 @kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings),
-                                     ::Val{D}, ::Val{G}) where {D,G}
+                                     ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
     v, b = I[D + 1], I[D + 2]
     origin, h = origins[b], spacings[b]
-    # The stored index of interior cell i is i + G[d], so `coordinates`'
-    # (idx - G[d] - 1/2) is just (i - 1/2) — the same arithmetic, in the
-    # same order, on the same origin and spacing, so this reproduces
-    # `coordinates` bit for bit. `1//2` rather than `0.5` for the same
-    # reason as there: the literal would be an fp64 operand.
-    x = ntuple(d -> origin[d] + (I[d] - oftype(h, 1//2)) * h, Val(D))
+    # The stored index of owned point i is i + G[d], so `coordinates`'
+    # (idx - G[d] - off[d]) is just (i - off[d]) — the same arithmetic,
+    # in the same order, on the same origin and spacing, so this
+    # reproduces `coordinates` bit for bit.
+    off = pointoffsets(h, C)
+    x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
     work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, v)
 end
 
 """
     fill_by_coordinates!(f, fs::FieldSet)
 
-Set every interior cell of every block from the callback
-`f(x, v) -> value`, where `x` is the cell center (an `NTuple{D,T}` in the
-field set's own element type, see [`coordinates`](@ref)) and `v` the
-variable index. Ghosts are left untouched — they are filled by the ghost
-exchange (M2).
+Set every **owned** point of every block from the callback
+`f(x, v) -> value`, where `x` is that point's position — a cell center,
+a face center, a vertex, whatever this field set's centering says (an
+`NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
+`v` the variable index. The ghosts and the shared boundary plane are
+left untouched: they are filled by the ghost exchange (M2).
 
-`f` is called once per cell from a KernelAbstractions kernel, so it runs
+`f` is called once per point from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
 arguments. The tree is not consulted: the kernel gets the geometry as
 the two plain per-block arrays [`block_origins`](@ref) and
@@ -243,7 +407,7 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
     coordinates_kernel!(backend)(fs.work, f, origins, spacings,
-                                 Val(D), Val(fs.G);
+                                 Val(D), Val(fs.G), Val(staggers(fs));
                                  ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars,
                                           nblocks(fs)))
     synchronize(backend)

@@ -77,8 +77,11 @@ mass-conserving for arbitrary data — see [`regrid!`](@ref) and
 [`total_mass`](@ref). The point-value family conserves only fields it
 reproduces exactly.
 
-Operators are configured per field set, not per variable — see
-`CODE.md`; per-variable selection is deferred to M8.
+Operators are configured per field set, not per variable — and from M8
+on that *is* per-variable selection: a field set is the unit of
+centering, ghost width and operators alike, so conservative operators for
+a density and point-value ones for a velocity are two field sets over one
+forest, each with its own schedule.
 
 !!! warning "Choose the order against your discretization"
     For the point-value family, interpolation order must exceed the
@@ -132,8 +135,8 @@ the schedule asserts). Conservative restriction never shifts: its window
 is exactly a cell's own children.
 
 The orders are therefore constrained by the block geometry, per
-dimension against that dimension's ghost width (see
-[`check_operators`](@ref)):
+dimension against that dimension's ghost width *and centering* (see
+[`check_operators`](@ref)). In a cell-centered dimension:
 
 - `G ≥ prolongation ÷ 2` (point-value) or `(prolongation - 1) ÷ 2`
   (conservative), so a fine block's ghost stencil fits within its coarse
@@ -141,6 +144,12 @@ dimension against that dimension's ghost width (see
 - `N ≥ 2G + restriction ÷ 2 - 1` and `N ≥ restriction`, so a coarse
   block's ghost layers can be restricted from fine *interior* cells
   alone.
+
+In a vertex-like dimension neither operator is the same object:
+restriction is injection (no order, no shifting) and prolongation
+evaluates at integer or half-integer coarse coordinates, so the whole
+requirement is `G ≥ prolongation ÷ 2 - 1` — and the conservative family
+is refused there outright.
 """
 struct Operators
     family::OperatorFamily
@@ -202,43 +211,86 @@ ghost_layers_read(ops::Operators) =
 """
     check_operators(fs::FieldSet, ops::Operators)
 
-Verify that the forest's `N` and the *field set's* per-dimension `G`
-support the requested interpolation orders, throwing an `ArgumentError`
-naming the violated invariant otherwise. Called when a
+Verify that the forest's `N` and the *field set's* per-dimension `G` and
+centering support the requested interpolation orders, throwing an
+`ArgumentError` naming the violated invariant otherwise. Called when a
 [`GhostSchedule`](@ref) is built.
 
 Every constraint is per dimension, against that dimension's `G[d]`
-(amended in M8, with the ghost width): a field set may be wide in one
-dimension and narrow in another, and the stencils are built per
-dimension already.
+(amended in M8, with the ghost width) and that dimension's centering
+(M8a step 2): a family is a rule giving one-dimensional operators per
+centering, so what a dimension needs depends on where its values sit.
+
+| `d` | family | restriction | prolongation | needs, in `d` |
+|---|---|---|---|---|
+| cell | `PointValue` | shifted Lagrange | quarter offsets | `G ≥ p/2`, `N ≥ 2G+p/2-1` |
+| cell | `Conservative` | 2-cell average | subcell averages | `G ≥ (p-1)/2` |
+| vertex | `PointValue` | injection | integer / half-integer | `G ≥ p/2 - 1` |
+| vertex | `Conservative` | *refused* | *refused* | — |
+
+A cell-centered dimension additionally needs `N ≥ restriction`, so that
+the restriction window fits inside a fine block's interior; along a
+stagger there is no window.
+
+A vertex-like dimension needs less, in both directions: restriction is
+injection, which carries no order and reads a point the fine block owns,
+and prolongation reaches only `p/2 - 1` planes past the shared plane
+instead of `p/2` past the interface. In particular `G_d = 0` is legal
+there — a block still has its shared plane to exchange — and is exactly
+the second-order constrained-transport layout for an evolved face field.
+A cell-centered dimension with no ghosts has nothing to exchange, and is
+refused.
 """
 check_operators(fs::FieldSet, ops::Operators) =
-    check_operators(fs.forest.N, fs.G, ops)
+    check_operators(fs.forest.N, fs.G, staggers(fs), ops)
 
-function check_operators(N::Integer, G::NTuple{D,Int}, ops::Operators) where {D}
+function check_operators(N::Integer, G::NTuple{D,Int}, c::NTuple{D,Int},
+                         ops::Operators) where {D}
     pp = ops.prolongation
     pr = ops.restriction
     needed = ghost_layers_read(ops)
 
-    # `N` is the forest's, so the one constraint that does not mention
-    # `G` is checked once rather than once per dimension.
-    N >= pr || throw(ArgumentError(
-        "restriction of order $pr needs N >= $pr so the stencil fits within a fine " *
-        "block's interior, but N=$N"))
-
     for d in 1:D
         g = G[d]
-        g >= 1 || throw(ArgumentError(
-            "ghost filling needs G >= 1, got G=$G (dimension $d). A field set with " *
-            "no ghosts in some dimension has nothing to exchange there and needs " *
-            "no GhostSchedule — which is what a computed flux set wants."))
-        g >= needed || throw(ArgumentError(
-            "$(ops.family) prolongation of order $pp needs G >= $needed ghost layers " *
-            "so its stencil fits within the coarse neighbor's interior plus ghosts, " *
-            "but G=$G (dimension $d)"))
-        N >= 2g + pr ÷ 2 - 1 || throw(ArgumentError(
-            "restriction of order $pr into G=$g ghost layers (dimension $d) needs " *
-            "N >= $(2g + pr ÷ 2 - 1) fine interior cells, but N=$N"))
+        if c[d] == 1
+            # What a face- or edge-centered quantity stores is an average
+            # along its cell-like dimensions and a *point value* along
+            # its vertex-like ones, so along a vertex dimension the
+            # conservative family has nothing to conserve and would
+            # merely interpolate — at an even order its odd `p` does not
+            # name. Refused rather than guessed at; see "Operators" in
+            # CODE.md.
+            ops.family === Conservative && throw(ArgumentError(
+                "the Conservative family is not defined along a vertex-like " *
+                "dimension (dimension $d of centering with c=$c). What a staggered " *
+                "quantity stores is a point value there, not an average, so there " *
+                "is nothing to conserve and the family's odd orders do not name " *
+                "the interpolation that would be wanted. Use PointValue for a " *
+                "staggered field set; fluxes and EMFs are never ghost-filled at " *
+                "all."))
+            g >= pp ÷ 2 - 1 || throw(ArgumentError(
+                "prolongation of order $pp into a vertex-like dimension needs " *
+                "G >= $(pp ÷ 2 - 1), because its stencil reaches that many planes " *
+                "past the source's shared boundary plane, but G=$G (dimension $d)"))
+        else
+            g >= 1 || throw(ArgumentError(
+                "ghost filling needs G >= 1 in a cell-centered dimension, got G=$G " *
+                "(dimension $d). A cell-centered dimension with no ghosts has " *
+                "nothing to exchange there and needs no GhostSchedule — which is " *
+                "what a computed flux set wants. (A vertex-like dimension does " *
+                "still have its shared boundary plane to exchange, and G = 0 is " *
+                "allowed there.)"))
+            g >= needed || throw(ArgumentError(
+                "$(ops.family) prolongation of order $pp needs G >= $needed ghost " *
+                "layers so its stencil fits within the coarse neighbor's interior " *
+                "plus ghosts, but G=$G (dimension $d)"))
+            N >= 2g + pr ÷ 2 - 1 || throw(ArgumentError(
+                "restriction of order $pr into G=$g ghost layers (dimension $d) " *
+                "needs N >= $(2g + pr ÷ 2 - 1) fine interior cells, but N=$N"))
+            N >= pr || throw(ArgumentError(
+                "restriction of order $pr needs N >= $pr so the stencil fits " *
+                "within a fine block's interior (dimension $d), but N=$N"))
+        end
     end
     return nothing
 end

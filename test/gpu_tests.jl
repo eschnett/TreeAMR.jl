@@ -135,6 +135,51 @@ end
     @test worst < gputol(T)
 end
 
+@testset "$bname: a staggered exchange runs on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # The same claim for a vertex-like layout (M8). Two things here are
+    # device-specific rather than merely centering-specific: the transfer
+    # kernel now carries one stencil width *per dimension*, so its
+    # `Val{Ps}` must still be `isbits` and its `CartesianIndices(Ps)` loop
+    # must still compile; and the boundary kernel forms a position from
+    # the centering, which must agree with `coordinates` on the host.
+    ops = Operators(prolongation=2, restriction=2)
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> false, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+
+    # Linear in each coordinate, which order 2 reproduces exactly. As
+    # above, the element type comes from `x` rather than being closed
+    # over: a kernel argument has to be `isbits`.
+    poly = (x, v) -> begin
+        acc = oftype(x[1], v)
+        for d in 1:D
+            acc += (1 + oftype(x[1], d)) * x[d]
+        end
+        acc
+    end
+
+    for C in (vertexcentered(D), facecentered(D, D))
+        c = staggers(C)
+        G = 1
+        fs = FieldSet{T}(forest, 2; G=G, centering=C, backend=backend)
+        schedule = GhostSchedule(fs, ops)
+        fill_by_coordinates!(poly, fs)
+        fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(poly))
+
+        work = Array(fs.work)
+        worst = zero(T)
+        for b in 1:nblocks(fs), v in 1:2
+            for idx in CartesianIndices(ntuple(d -> forest.N + 2G + c[d], D))
+                x = coordinates(T, fs, b, Tuple(idx))
+                worst = max(worst, abs(work[Tuple(idx)..., v, b] - poly(x, v)))
+            end
+        end
+        @test worst < gputol(T)
+    end
+end
+
 @testset "$bname: the cell hook reproduces the host hook exactly: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # `boundary_by_coordinates` used to be a host loop calling

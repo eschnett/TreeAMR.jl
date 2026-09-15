@@ -192,6 +192,51 @@ end
           100 * exchange_error(forest, ops, makepoly(D, 1))
 end
 
+@testset "A staggered layout is type generic too: T=$T, D=$D" for
+        T in FLOATTYPES, D in (1, 2)
+    # The centering changes the position arithmetic — a vertex-like
+    # dimension subtracts a whole cell where a cell-centered one
+    # subtracts half — so the same three claims are made again for a
+    # staggered set: exact rational geometry, bit-for-bit agreement
+    # between the kernel and `coordinates`, and an exact exchange.
+    C = facecentered(D, 1)
+    c = staggers(C)
+    forest = Forest{T}(ntuple(_ -> 2, D); N=8)
+    refine!(forest, first(forest.leaves))
+    balance!(forest)
+    G, N = 1, forest.N
+    fs = FieldSet(forest, 1; G=G, centering=C)
+    @test eltype(fs.work) === T
+
+    # An owned face sits *on* the block's lower boundary in the staggered
+    # dimension and half a cell in across it. Dyadic rationals throughout,
+    # so these are equalities.
+    for (b, k) in enumerate(forest.leaves)
+        lo, hi = leafbox(forest, k)
+        got = coordinates(fs, b, ntuple(_ -> G + 1, D))
+        for d in 1:D
+            w = (hi[d] - lo[d]) // N
+            @test got[d] == T(lo[d] + (c[d] == 1 ? 0//1 : 1//2) * w)
+        end
+    end
+
+    fill_by_coordinates!((x, v) -> x[1], fs)
+    for b in 1:nblocks(fs)
+        owned = interiorview(fs, b, 1)
+        for idx in CartesianIndices(owned)
+            stored = ntuple(d -> Tuple(idx)[d] + G, D)
+            @test owned[idx] === coordinates(fs, b, stored)[1]
+        end
+    end
+
+    nested = nested_forest(Val(D); T=T, N=8)
+    ops = Operators(prolongation=2, restriction=2)
+    @test exchange_error(nested, ops, makepoly(D, 1); G=G,
+                         centering=C) < reltol(T, 4096)
+    @test exchange_error(nested, ops, makepoly(D, 2); G=G, centering=C) >
+          100 * exchange_error(nested, ops, makepoly(D, 1); G=G, centering=C)
+end
+
 @testset "Nothing widens to Float64: T=$T" for T in FLOATTYPES
     forest = Forest{T}((2, 2); N=4, periodic=(true, true))
     refine!(forest, first(forest.leaves))

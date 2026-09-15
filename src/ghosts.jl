@@ -16,7 +16,7 @@
                                   targetfirst::NTuple{D,Int},
                                   boxlen::NTuple{D,Int},
                                   boxstride::NTuple{D,Int},
-                                  ::Val{P}, ::Val{D}) where {P,D}
+                                  ::Val{Ps}, ::Val{D}) where {Ps,D}
     cell, v, t = @index(Global, NTuple)
 
     tblock = targetblocks[t]
@@ -28,11 +28,16 @@
     tidx = ntuple(d -> targetfirst[d] + off[d], Val(D))
     base = ntuple(d -> Int(srcstarts[d][off[d] + 1]), Val(D))
 
-    # Tensor-product stencil: P^D contributions, the weight of each the
-    # product of its D one-dimensional weights.
+    # Tensor-product stencil: prod(Ps) contributions, the weight of each
+    # the product of its D one-dimensional weights. The widths are **per
+    # dimension** (M8): a transfer can be injection in one dimension and
+    # order-p interpolation in another, and padding the narrow one to the
+    # common width with zero weights would read slots that need not hold
+    # data at all — a G = 0 face field has none beyond its high face —
+    # and `0 * NaN` is `NaN`.
     acc = zero(eltype(dest))
-    for m in 0:(P^D - 1)
-        moff = ntuple(d -> (m ÷ P^(d - 1)) % P, Val(D))
+    for m in CartesianIndices(Ps)
+        moff = ntuple(d -> Tuple(m)[d] - 1, Val(D))
         w = one(eltype(dest))
         for d in 1:D
             w *= weights[d][moff[d] + 1, off[d] + 1]
@@ -52,16 +57,18 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     n = length(range)
     n == 0 && return nothing
     blen = boxsize(group)
+    prod(blen) == 0 && return nothing
     stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
     tfirst = ntuple(d -> group.stencils[d].targetfirst, D)
-    order = size(group.stencils[1].weights, 1)
+    # One width per dimension, not one shared width: see the kernel.
+    orders = ntuple(d -> stencilorder(group.stencils[d]), D)
     srcstarts = ntuple(d -> group.stencils[d].srcstart, D)
     weights = ntuple(d -> group.stencils[d].weights, D)
     ndrange = (prod(blen), Int(nvars), n)
 
     kernel! = transfer_kernel!(backend)
     kernel!(dest, src, view(group.targetblocks, range), view(group.sourceblocks, range),
-            srcstarts, weights, tfirst, blen, stride, Val(order), Val(D);
+            srcstarts, weights, tfirst, blen, stride, Val(orders), Val(D);
             ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
     return nothing
 end
@@ -129,7 +136,7 @@ run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
 @kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
                                   @Const(firsts), @Const(origins), @Const(spacings),
                                   boxlen::NTuple{D,Int}, boxstride::NTuple{D,Int},
-                                  ::Val{D}, ::Val{G}) where {D,G}
+                                  ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     cell, v, t = @index(Global, NTuple)
     b = blocks[t]
     δ = directions[t]
@@ -140,10 +147,12 @@ run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
     idx = ntuple(d -> Int(f[d]) + off[d], Val(D))
 
     origin, h = origins[b], spacings[b]
-    # `1//2`, not `0.5`: see `coordinates`. The literal would be an fp64
-    # operand and would drag the position into fp64.
-    half = oftype(h, 1//2)
-    x = ntuple(d -> origin[d] + (idx[d] - G[d] - half) * h, Val(D))
+    # The same expression `coordinates` forms, in the same order, from
+    # the same origin and spacing, so the two agree bit for bit — half a
+    # cell in a cell-centered dimension, a whole one in a vertex-like
+    # dimension.
+    poff = pointoffsets(h, C)
+    x = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
     work[idx..., v, b] = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
 end
 
@@ -200,7 +209,7 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
         stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
         boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
                                   batch.firsts, plan.origins, plan.spacings,
-                                  blen, stride, Val(D), Val(fs.G);
+                                  blen, stride, Val(D), Val(fs.G), Val(staggers(fs));
                                   ndrange=(prod(blen), fs.nvars, n))
     end
     synchronize(backend)
@@ -262,6 +271,14 @@ coordinates. Use [`coordinates`](@ref) to get their positions. Passing
 `nothing` leaves those ghosts untouched, which is what a fully periodic
 domain wants.
 
+In a vertex-like dimension the outward region on the domain's **high**
+side starts at the shared boundary plane `G+N+1`, one plane further in
+than a ghost slab: those points belong to nobody, since ownership is
+half-open, so the hook fills them and the application never evolves them.
+The low boundary points are owned and evolved as usual. This asymmetry is
+the price of a uniform `N^D` state layout for every centering; see
+"Centerings" in `CODE.md`.
+
 !!! note "Where the boundary hook runs"
     The hook runs after the copies and restrictions but **before** the
     prolongation sweep, not after every inter-block phase. A block
@@ -294,6 +311,11 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
         "G=$(schedule.G); every target range and stencil in it is wrong for this " *
         "layout. A schedule belongs to a layout, not to a forest: build one with " *
         "`GhostSchedule(fs, operators)`."))
+    fs.centering == schedule.centering || throw(ArgumentError(
+        "the field set has centering $(fs.centering) but this schedule was built " *
+        "for $(schedule.centering); the stored extent, the target ranges and the " *
+        "one-dimensional operators all differ between a cell-centered and a " *
+        "vertex-like dimension. Build one with `GhostSchedule(fs, operators)`."))
 
     backend = get_backend(fs.work)
     samebackend(backend, schedule.backend) || throw(ArgumentError(

@@ -95,19 +95,23 @@ dimension's `G_d`, from M8 on):
   one fewer ghost layer at comparable order — and restriction is the
   fixed 2-cell exact average, needing only `N ≥ 2G`.
 - All of the above is for a cell-centered dimension. In a vertex-like
-  dimension (M8 design): the exchange region must fit within one ring of
-  finer neighbors, `N ≥ 2G + 2` (the shared boundary plane makes the
-  high-side region one plane longer, and `N` is even); restriction is
-  injection and needs nothing further; point-value prolongation reads
-  `p/2 − 1` planes beyond the shared plane, so `G ≥ p/2 − 1`. The
-  conservative family is refused along a vertex-like dimension (see
-  [Operators](#operators)). Derivations under [Centerings](#centerings)
-  and [Ghost filling](#ghost-filling).
+  dimension (measured in M8a step 2): the exchange region must fit
+  within one ring of finer neighbors, `N ≥ 2G + 2` (the shared boundary
+  plane makes the high-side region one plane longer, and `N` is even);
+  restriction is injection and needs nothing further; point-value
+  prolongation reads `p/2 − 1` planes beyond the shared plane, so
+  `G ≥ p/2 − 1` — and nothing else, in particular neither of the two
+  restriction bullets above, which are about a window that no longer
+  exists. The conservative family is refused along a vertex-like
+  dimension (see [Operators](#operators)). Derivations under
+  [Centerings](#centerings) and [Ghost filling](#ghost-filling).
 
 ### Centerings
 
-*(Designed in M8, before implementation; "decided" below records the
-design discussion, "measured" is still to come.)*
+*(Designed in M8, before implementation, and implemented in M8a steps 1
+and 2. "Decided" below records the design discussion; the two
+"Implemented in M8a" notes at the end of this section record what the
+implementation settled or had to correct.)*
 
 **The model.** Per dimension, a variable lives either at **cell centers**
 — `N` values per block, at half-integer positions — or at **cell
@@ -273,6 +277,49 @@ open, settled by the implementation:
 - **`regrid!` allocates per field set from that set's own `G`**, and
   fills ghosts per field set from that set's own schedule, rather than
   once from a shared one.
+
+**Implemented in M8a step 2** (the centering itself). `centering` is a
+`FieldSet` keyword defaulting to `cellcentered(D)` — unlike `G` it *does*
+get a default, because cell-centered is what a field set was through M6
+and what everything not deliberately staggered wants. It is validated
+into an `NTuple{D,Symbol}`; `staggers` turns it into the `c_d` tuple the
+arithmetic uses, and is exported so that an application can size its own
+loops. `closedview` and `map_blocks!(…; closed = true)` are the closed
+range's two faces. The cell-centered stencils are the same rational
+weights as before, so no measured number moved: the whole suite passes
+unchanged, the M3 wave tables included, and the thread-independence
+digests still agree byte for byte. What the step settled or corrected:
+
+- **`G_d ≥ 1` is relaxed in vertex-like dimensions only.** Step 1's rule
+  — a dimension without ghosts has nothing to exchange, so a
+  ghost-filled field set needs `G_d ≥ 1` everywhere — stops being true
+  along a stagger: the block still has its shared plane, which is
+  exactly the whole exchange of a second-order evolved face field. So
+  the rule is kept in cell-centered dimensions and dropped in
+  vertex-like ones, and the message says which is which. `G = (0, g, g)`
+  on a face field at `p = 2` builds a schedule and fills it; in `D = 1`
+  that schedule is *entirely* injection, so the exchange is then exact
+  for arbitrary data rather than to an order.
+- **`N ≥ p` is a cell-centered constraint**, not a global one. It was
+  checked once against the forest's `N` because it does not mention `G`;
+  it is about the restriction *window* fitting inside a fine block's
+  interior, and along a stagger there is no window. It moved into the
+  per-dimension loop with everything else.
+- **An empty target region is skipped when the schedule is built**, not
+  filtered at launch. A cell-centered dimension with `G_d = 0` has no
+  slab on either side, so every direction that leaves the block along it
+  has nothing to fill; testing the region for emptiness before the
+  neighbor search spares the tree query as well as the zero-size launch.
+  (This is reachable only through the forest form of the constructor or
+  a mixed `G`; `check_operators` refuses a cell-centered `G_d = 0`
+  outright.)
+- **The oracle generalization the plan expected was not needed.** The
+  plan anticipated teaching `cell_average` to average along cell-like
+  dimensions only, so that a staggered field set could be checked as the
+  mixed average-and-point-value object it is. Nothing needs it: that
+  reading belongs to the conservative family, which is refused along a
+  stagger, so every staggered set under test is point-value throughout
+  and is compared at `coordinates`. The oracle was left alone.
 
 ### Tree structure
 
@@ -451,10 +498,10 @@ Under 2:1 balance there are exactly three cases per ghost region:
 3. **Finer neighbor** (coarse ghosts): **restriction** — interpolation
    from fine cells.
 
-**In a vertex-like dimension** (M8 design; see [Centerings](#centerings))
-the three cases keep their names and change their one-dimensional
-stencils. A copy is a shift by `N` as before, with the high-side target
-one plane longer. Restriction is **injection**: a coarse point at
+**In a vertex-like dimension** (implemented in M8a step 2; see
+[Centerings](#centerings)) the three cases keep their names and change
+their one-dimensional stencils. A copy is a shift by `N` as before, with
+the high-side target one plane longer. Restriction is **injection**: a coarse point at
 position `X` coincides with fine point `2X`, the stencil has width one and
 weight one, it is exact for any data, carries no order, and never has to
 shift — the circularity that forces cell-centered restriction to shift
@@ -642,10 +689,10 @@ Stability does not discriminate between the choices here
 (global `dt`, 2:1 balance); damping high-frequency interface modes
 remains the job of the application's usual Kreiss–Oliger dissipation.
 
-**Operators per centering** (M8 design). Because the operator is a
-tensor product, a family is a rule giving one-dimensional operators per
-dimension's centering, and every constraint is checked per dimension
-against that dimension's `G_d`:
+**Operators per centering** (M8 design; the vertex rows measured in M8a
+step 2). Because the operator is a tensor product, a family is a rule
+giving one-dimensional operators per dimension's centering, and every
+constraint is checked per dimension against that dimension's `G_d`:
 
 | centering of `d` | family | restriction | prolongation | needs, in `d` |
 |---|---|---|---|---|
@@ -654,13 +701,16 @@ against that dimension's `G_d`:
 | vertex | `PointValue` | injection | Lagrange at integers / half-integers, even `p` | `G ≥ p/2 − 1` |
 | vertex | `Conservative` | *refused* | *refused* | — |
 
-The first two rows are today's, the third follows from
-[Ghost filling](#ghost-filling). The last row is deliberately empty
-(decided). What a face- or edge-centered quantity stores is an *average*
-along its cell-like dimensions and a *point value* along its vertex-like
-ones, so along a vertex dimension the conservative family has nothing to
-conserve and would merely interpolate — at an even order that the
-family's odd `p` does not name (`p + 1` was the candidate). Rather than
+The first two rows are the cell-centered ones; the third follows from
+[Ghost filling](#ghost-filling) and is measured — exactness to degree
+`p − 1` and no further, over all `2^D` centerings in `D = 1, 2, 3` at
+`p = 2` and `p = 4`, and `G = p/2 − 1` accepted where `G = p/2 − 2` is
+refused. The last row is deliberately empty (decided). What a face- or
+edge-centered quantity stores is an *average* along its cell-like
+dimensions and a *point value* along its vertex-like ones, so along a
+vertex dimension the conservative family has nothing to conserve and
+would merely interpolate — at an even order that the family's odd `p`
+does not name (`p + 1` was the candidate). Rather than
 fix that rule before anything exercises it, `GhostSchedule` refuses a
 conservative field set with a vertex-like dimension, with a message
 saying why. Nothing in M8 needs it: fluxes and EMFs are never
@@ -1357,17 +1407,29 @@ design, see the M8 entry), and the list below is in execution order.
     `GhostSchedule(fs, ops)`, per-dimension stencil widths, the vertex
     rows of the operator table, `regrid!` over `fs => schedule` pairs,
     and the wave test split into vertex- and cell-centered halves.
-    *The `G` move is done*; see "**Implemented in M8a step 1**" under
-    [Centerings](#centerings) for the four points the design left open
-    and the implementation settled. It changed no measured number, as
+    *The `G` move and the centering are done*; see "**Implemented in
+    M8a step 1**" and "**Implemented in M8a step 2**" under
+    [Centerings](#centerings) for what the design left open and the
+    implementation settled. Neither changed a measured number, as
     predicted: the whole suite passes unchanged at one and eight
     threads, the M3 wave tables included, and the thread-independence
-    digests still agree byte for byte.
+    digests still agree byte for byte. The centering's own acceptance
+    tests pass — the M2 exactness claim over all `2^D` centerings in
+    `D = 1, 2, 3` at `p = 2` and `p = 4`, the write-count partition of
+    the stored points including the shared plane and with `G = 0` along
+    a stagger, bit-for-bit injection on position-determined data (with
+    the cell-centered control showing *no* coincident points across
+    levels at all), the `G ≥ p/2 − 1` bound, the conservative refusal,
+    and the regrid transfer exact for every centering. What remains of
+    M8a is the wave equation.
     *Accept:* the M2 exactness test (degree `p − 1`, face/edge/corner,
     three levels) over all `2^D` centerings in `D = 1, 2, 3`, the oracle
     averaging along cell-like dimensions and sampling along vertex-like
-    ones; vertex restriction bit-for-bit injection on random data; **the
-    wave equation is vertex-centered from here on**, with the M3 study
+    ones *(amended in M8a step 2: the averaging half has no consumer,
+    since the conservative family is refused along a stagger — see
+    [Centerings](#centerings))*; vertex restriction bit-for-bit
+    injection on arbitrary data; **the wave equation is vertex-centered
+    from here on**, with the M3 study
     repeated on it — predicted rates **1 and 2** for prolongation orders
     2 and 4 at *any* restriction order, since restriction is exact, and
     `G = 1` sufficient at order 4 where cell centering needs 2 — while
