@@ -21,7 +21,15 @@
 # error. `bench/symmetry_gpu.sh` does exactly this on Symmetry's H200
 # partition, which is where the Float64 CUDA numbers come from.
 
-using KernelAbstractions: CPU, get_backend, supports_float64
+using KernelAbstractions: CPU, get_backend, supports_float64, @kernel, @index
+
+# A pointwise pass over every *stored* cell: the global index already is
+# the stored index under `stored = true`, so this kernel adds no `G`.
+@kernel function double_stored!(work, ::Val{D}) where {D}
+    I = @index(Global, NTuple)
+    c = ntuple(d -> I[d], Val(D))
+    work[c..., 1, I[D + 1]] = 2 * work[c..., 1, I[D + 1]]
+end
 
 # The device package is loaded at top level, in its own statement, so
 # that everything after it is compiled in a world that can see it.
@@ -276,6 +284,67 @@ end
         @test got[Tuple(idx)..., v, r.block] === want[Tuple(idx)..., v, r.block]
     end
     @test !isempty(schedule.boundaries)
+end
+
+@testset "$bname: a stored-range launch reaches every ghost: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # `map_blocks!(...; stored = true)` is a third ndrange, not a third
+    # kernel, so what has to hold on a device is only that the extent is
+    # read off the storage that lives there. The pass is the shape its
+    # consumer has: a pointwise map over every stored cell, ghosts
+    # included, reading and writing the same cell.
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    G = 1
+    fs = FieldSet{T}(forest, 2; G=G, backend=backend)
+    fill!(fs.work, one(T))                        # ghosts included
+
+    map_blocks!(double_stored!, fs, fs.work, Val(D); stored=true)
+    want = ntuple(d -> forest.N + 2G, D)
+    @test size(fs.work)[1:D] == want
+    # Every stored cell of variable 1 was doubled; variable 2, which the
+    # kernel does not touch, was not.
+    work = Array(fs.work)
+    @test all(==(T(2)), view(work, ntuple(_ -> Colon(), D)..., 1, :))
+    @test all(==(one(T)), view(work, ntuple(_ -> Colon(), D)..., 2, :))
+    @test count(==(T(2)), work) == prod(want) * nblocks(fs)
+end
+
+@testset "$bname: the all-variables callbacks match the per-variable: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # `AllVariables` is a second kernel for each of the two coordinate
+    # callbacks, with no variable axis in its ndrange and a tuple
+    # unrolled over the variables at the end. Both of those are exactly
+    # the kind of thing that compiles on the host and not on a device, so
+    # the form runs here on whatever backend there is — and its result
+    # must equal the per-variable form's bit for bit, which is the claim
+    # `allvariables_tests.jl` makes on the CPU.
+    ops = Operators(prolongation=2, restriction=2)
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> false, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+
+    # The element type comes from `x`, not from a captured `Type`: a
+    # kernel argument has to be `isbits`.
+    per = (x, v) -> sum(x) * oftype(x[1], v) + one(x[1])
+    whole = AllVariables(x -> ntuple(v -> sum(x) * oftype(x[1], v) + one(x[1]), Val(2)))
+
+    a = FieldSet{T}(forest, 2; G=1, backend=backend)
+    b = FieldSet{T}(forest, 2; G=1, backend=backend)
+    fill_by_coordinates!(per, a)
+    fill_by_coordinates!(whole, b)
+    @test Array(b.work) == Array(a.work)
+
+    fill_ghosts!(a, GhostSchedule(a, ops); boundary=boundary_by_coordinates(per))
+    fill_ghosts!(b, GhostSchedule(b, ops); boundary=boundary_by_coordinates(whole))
+    @test Array(b.work) == Array(a.work)
+    @test !iszero(sum(Array(a.work)))             # something was written
+
+    # The host-side length check fires before the launch, on every
+    # backend, because a kernel could not report it.
+    short = FieldSet{T}(forest, 3; G=1, backend=backend)
+    @test_throws "nvars = 3" fill_by_coordinates!(whole, short)
 end
 
 @testset "$bname: the region hook is refused on a device, with a way out" for
