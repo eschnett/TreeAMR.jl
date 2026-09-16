@@ -149,7 +149,8 @@ function main()
     # move, with the host driver logic (marks, balance, key rebuild)
     # excluded, since that is not what a backend changes.
     oldleaves = copy(forest.leaves)
-    groups = TreeAMR.transfer_groups(T, forest, oldleaves, oldleaves, OPS, BACKEND)
+    groups = TreeAMR.transfer_groups(T, forest, fs.G, staggers(fs),
+                                     oldleaves, oldleaves, OPS, BACKEND)
     plan = TreeAMR.phase_plan(groups)
     fresh = similar(fs.work)
     transfer!() = begin
