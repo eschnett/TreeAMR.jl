@@ -113,17 +113,19 @@ There is no formatter or linter configured.
 
 ## Architecture
 
-Ten source files, included in dependency order from `src/TreeAMR.jl`; each
+Twelve source files, included in dependency order from `src/TreeAMR.jl`; each
 layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
 | threading | `threading.jl` | `threadchunks` and the three host-side parallel-loop helpers everything else is built on |
+| residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
-| storage | `storage.jl` | `FieldSet`: one `(N+2G, …, N+2G, nvars, nblocks)` array over all leaves, ghosts included |
+| storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
+| conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, `block_mapreduce`, `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 
@@ -205,12 +207,16 @@ The ideas that span several files and are easy to violate:
   ghost fill at ~2.5x. Only the CPU backend does this — `run_phase!`
   has a generic method that keeps per-batch launches for devices.
 
-Index conventions: stored indices run `1:N+2G`, the interior is `G+1:G+N`.
-`cell_center(forest, key, idx)` takes **stored** indices, so interior cell
-`i` is `idx = i + G`. Kernels launched by `map_blocks!` get the global index
-`(i1, …, iD, b)` with each `i` in `1:N` and add `G` to reach the working
-array. Directions are `δ ∈ {-1, 0, 1}^D` from `alldirections(Val(D))`; `+1`
-names the high ghost slab.
+Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
+(`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
+**owned** range is `G_d+1:G_d+N` and the **closed** range `G_d+1:G_d+N+c_d`.
+`coordinates(fs, b, idx)` — which replaced `cell_center` in M8, and takes the
+field set rather than the forest — takes **stored** indices, so owned point
+`i` is `idx = i + G_d`. Kernels launched by `map_blocks!` get the global index
+`(i1, …, iD, b)` with each `i` in `1:N` (or `1:N+c_d` under `closed = true`)
+and add `G_d` to reach the working array. Directions are
+`δ ∈ {-1, 0, 1}^D` from `alldirections(Val(D))`; `+1` names the high
+ghost slab.
 
 ## Tests
 
@@ -312,9 +318,19 @@ of the *public API only*. Facts that matter here:
   Pkg.test()'` there, about 20 s), temporarily dev'ing this checkout into
   TreeWave's environment if the change is unpushed — and revert TreeWave's
   `Project.toml` and `Manifest.toml` afterwards.
+- **TreeWave is still pre-M8 and will break when `m8` lands on `main`.**
+  Measured against this checkout: it calls `FieldSet(forest, nvars;
+  backend)` with no `G`, the three-argument `regrid!(forest, fs, schedule;
+  …)`, and `GhostSchedule(forest, ops; …)` without `G` — the first two now
+  throw by construction, which is the message M8a step 1 added for exactly
+  this caller — and `bin/visualize.jl` still calls `cell_center`, which no
+  longer exists. Note that `bin/` is outside `src/` and `test/`, so its
+  breakage does not show up in TreeWave's own test run. Porting it is part
+  of landing M8, not an afterthought: that is what the pin to `main` is
+  for.
 - It calls: `Forest`, `refine!`, `balance!`, `nleaves`, `level`, `maxlevel`,
   `spacing`, `minimum_spacing`, `block_spacings`, `block_extent`,
-  `cell_center`, `FieldSet`, `nblocks`, `blockkey`, `blockview`,
+  `coordinates`, `FieldSet`, `nblocks`, `blockkey`, `blockview`,
   `interiorview`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
   `fill_ghosts!`, `statevector`, `statearray`, `scatter!`, `gather!`,
   `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
@@ -324,7 +340,7 @@ of the *public API only*. Facts that matter here:
   these breaks it.
 - Its `CLAUDE.md` and `CODE.md` record API sharp edges found from the
   outside — a keyword named `maxlevel` shadows the exported
-  `maxlevel(forest)` inside a function body; `cell_center` taking stored
+  `maxlevel(forest)` inside a function body; `coordinates` taking stored
   indices is an easy off-by-`G`. Read them when changing anything
   user-facing.
 - Mesh machinery belongs here; physics belongs there. If a TreeWave change

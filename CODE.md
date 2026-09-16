@@ -108,8 +108,8 @@ dimension's `G_d`, from M8 on):
 
 ### Centerings
 
-*(Designed in M8, before implementation, and implemented in M8a steps 1
-and 2. "Decided" below records the design discussion; the two
+*(Designed in M8, before implementation, and implemented in M8a steps
+1, 2 and 3. "Decided" below records the design discussion; the three
 "Implemented in M8a" notes at the end of this section record what the
 implementation settled or had to correct.)*
 
@@ -253,13 +253,17 @@ open, settled by the implementation:
 
 - **`GhostSchedule` belongs to a layout, not to a forest.** The
   documented form is `GhostSchedule(fs, ops)`. The forest form survives
-  as `GhostSchedule(forest, ops; G, T, backend)` because it costs
-  nothing — it is the body, and the field-set form is one line spelling
-  the triple out of `fs` — and it is what a caller with no field set in
-  hand uses. `fill_ghosts!` compares `fs.G` against the schedule's and
-  refuses a mismatch, alongside the existing forest, generation, element
-  type and backend checks: every target range in a schedule is wrong for
-  another `G`, and nothing else would have caught it.
+  as `GhostSchedule(forest, ops; G, T, backend)` — `centering` joined
+  its keywords in step 2 — because it costs nothing: it is the body, and
+  the field-set form is one line spelling the triple out of `fs`, and it
+  is what a caller with no field set in hand uses. `fill_ghosts!`
+  compares `fs.G` against the schedule's and refuses a mismatch,
+  alongside the existing forest, generation, element type and backend
+  checks: every target range in a schedule is wrong for another `G`, and
+  nothing else would have caught it. Step 2 added the centering to that
+  same check, for the same reason — the stored extent, the target ranges
+  and the one-dimensional operators all differ between a cell-centered
+  and a vertex-like dimension.
 - **`coordinates` defaults to the *field set's* element type**, not the
   forest's `floattype`, with the leading-type form
   `coordinates(S, fs, b, idx)` as elsewhere in the geometry. That is the
@@ -818,10 +822,11 @@ Stability does not discriminate between the choices here
 (global `dt`, 2:1 balance); damping high-frequency interface modes
 remains the job of the application's usual Kreiss–Oliger dissipation.
 
-**Operators per centering** (M8 design; the vertex rows measured in M8a
-step 2). Because the operator is a tensor product, a family is a rule
-giving one-dimensional operators per dimension's centering, and every
-constraint is checked per dimension against that dimension's `G_d`:
+**Operators per centering** (decided in the M8 design; the vertex rows
+measured in M8a steps 2 and 3). Because the operator is a tensor
+product, a family is a rule giving one-dimensional operators per
+dimension's centering, and every constraint is checked per dimension
+against that dimension's `G_d`:
 
 | centering of `d` | family | restriction | prolongation | needs, in `d` |
 |---|---|---|---|---|
