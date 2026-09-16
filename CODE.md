@@ -1238,10 +1238,18 @@ usefully, so it is checked **once on the host** before the launch, by
 evaluating the callback at one owned point of block 1 (and, for the
 boundary form, with the sample direction `δ = (−1, 0, …, 0)`); the
 `ArgumentError` names both numbers. Calling the callback on the host is
-always legal, because everything it closes over is `isbits` by the
-device rule — that is what lets it be a kernel argument at all. The
-boundary form pays that one host call per ghost fill, against a launch
-over every outward-facing ghost cell.
+legal, because everything it closes over is `isbits` by the device rule
+— that is what lets it be a kernel argument at all. The boundary form
+pays that one host call per ghost fill, against a launch over every
+outward-facing ghost cell.
+
+The one case the host call does not cover is a callback closing over a
+*device array*, which a kernel argument may legally do (the backend
+adapts it on the way in) and which the host call would scalar-index.
+That is a narrow gap and it is documented rather than worked around:
+such a callback uses the per-variable form, which has no host call.
+Silently skipping the check instead would trade a named error for a
+wrong number of variables written into the storage.
 
 The region form of the boundary hook is untouched: `AllVariables` is
 about how many values a *cell-wise* callback returns, not about which

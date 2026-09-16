@@ -395,7 +395,11 @@ a kernel cannot report it usefully; the message names both numbers.
 !!! note "Callbacks on a device"
     The wrapped callback becomes a kernel argument, so everything it
     closes over must be `isbits` — the rule the per-variable forms state
-    too. Return a tuple, not a vector.
+    too. Return a tuple, not a vector. One consequence is specific to
+    this form: the length check evaluates the callback **on the host**,
+    so one that closes over a *device array* — which a kernel argument
+    may legally do, since the backend adapts it on the way in — would
+    scalar-index it there. Such a callback needs the per-variable form.
 """
 struct AllVariables{F}
     f::F
