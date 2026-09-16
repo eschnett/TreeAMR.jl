@@ -13,6 +13,24 @@ const OPS2C = Operators(prolongation=2, restriction=2)
     work[ntuple(d -> I[d] + G[d], Val(D))..., 1, I[D + 1]] = 1.0
 end
 
+# The stored form's counterpart. Two things differ and both are the
+# point: it does *not* add `G` — under `stored = true` the global index
+# already is the stored index — and it writes a value that encodes that
+# index, so a launch that covered the right *number* of cells but the
+# wrong ones is caught as well. `S` is a radix larger than any stored
+# extent here.
+@kernel function mark_stored_kernel!(work, ::Val{D}, ::Val{S}) where {D,S}
+    I = @index(Global, NTuple)                     # already a stored index
+    idx = ntuple(d -> I[d], Val(D))
+    code = 0
+    for d in 1:D
+        code = code * S + idx[d]
+    end
+    work[idx..., 1, I[D + 1]] = code
+end
+
+storedcode(idx, S) = foldl((acc, i) -> acc * S + i, idx; init=0)
+
 @testset "The familiar centerings are spellings of tuples" begin
     # A tuple rather than an enumeration of the 2^D cases, because every
     # transfer is a product of D one-dimensional stencils and the stencil
@@ -172,6 +190,65 @@ end
         @test count(==(1.0), fs.work) == nblocks(fs) * 4^D
         @test all(==(1.0), interiorview(fs, 1, 1))
     end
+end
+
+@testset "map_blocks! over the stored range reaches every ghost: D=$D" for
+        D in (1, 2, 3)
+    # The third range (added for TreeHydro): a pointwise pass that has to
+    # cover the ghosts too, because the application will read them. The
+    # failure mode is an off-by-`G`: under `stored = true` the global
+    # index *is* the stored index, while the other two forms hand out an
+    # offset into the owned range and the kernel adds `G`. A kernel
+    # written for the wrong form still writes in bounds, so nothing but a
+    # comparison against the index itself would catch it -- hence the
+    # value each cell must hold encodes that cell's own stored index.
+    N = D == 3 ? 4 : 8
+    forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
+    # Several centerings and per-dimension ghost widths, a zero among
+    # them: `G = 0` is exactly what a face-centered flux set carries.
+    cases = D == 1 ? ((cellcentered(1), (1,)), (vertexcentered(1), (0,)),
+                      (facecentered(1, 1), (2,))) :
+            D == 2 ? ((cellcentered(2), (1, 1)), (vertexcentered(2), (1, 0)),
+                      (facecentered(2, 1), (0, 0)), (cellcentered(2), (0, 2))) :
+                     ((cellcentered(3), (1, 1, 1)), (vertexcentered(3), (1, 1, 1)),
+                      (facecentered(3, 1), (0, 0, 0)), (edgecentered(3, 1), (2, 0, 1)))
+    for (C, G) in cases
+        c = staggers(C)
+        fs = FieldSet(forest, 2; G=G, centering=C)
+        stored = ntuple(d -> N + 2G[d] + c[d], D)
+        @test size(fs.work)[1:D] == stored
+        S = maximum(stored) + 1
+
+        map_blocks!(mark_stored_kernel!, fs, fs.work, Val(D), Val(S); stored=true)
+
+        # Every stored cell of every block was written, ghosts and the
+        # shared plane included, and each holds its own index.
+        slab = view(fs.work, ntuple(_ -> Colon(), D)..., 1, :)
+        @test count(!iszero, fs.work) == nblocks(fs) * prod(stored)
+        correct = all(1:nblocks(fs)) do b
+            all(idx -> slab[Tuple(idx)..., b] == storedcode(Tuple(idx), S),
+                CartesianIndices(stored))
+        end
+        @test correct
+        # Variable 2 is untouched: the ndrange has no variable axis, and
+        # this kernel writes variable 1 only.
+        @test all(iszero, view(fs.work, ntuple(_ -> Colon(), D)..., 2, :))
+
+        # The owned form covers strictly fewer points wherever there is
+        # anything outside the owned range to cover.
+        fill!(fs.work, 0.0)
+        map_blocks!(mark_kernel!, fs, fs.work, Val(D), Val(fs.G))
+        @test count(!iszero, fs.work) == nblocks(fs) * N^D
+        @test prod(stored) > N^D               # so the claim is not vacuous
+    end
+
+    # The closed range is a sub-range of the stored one, so asking for
+    # both names two different loops rather than an intersection.
+    fs = FieldSet(forest, 1; G=1)
+    @test_throws ArgumentError map_blocks!(mark_kernel!, fs, fs.work, Val(D),
+                                           Val(fs.G); closed=true, stored=true)
+    @test_throws "not both" map_blocks!(mark_kernel!, fs, fs.work, Val(D),
+                                        Val(fs.G); closed=true, stored=true)
 end
 
 @testset "The flagging kernel forms the same position: D=$D" for D in (1, 2, 3)

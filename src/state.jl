@@ -97,7 +97,7 @@ function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
 end
 
 """
-    map_blocks!(kernel!, fs::FieldSet, args...; closed=false)
+    map_blocks!(kernel!, fs::FieldSet, args...; closed=false, stored=false)
 
 Launch a KernelAbstractions kernel over every **owned** point of every
 block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
@@ -110,6 +110,32 @@ shared boundary plane (see [`closedview`](@ref)). That is what a
 quantity defined on a block's faces wants: a flux has `N+1` faces per
 dimension, not `N`, and the extra one is the block's own high face. In a
 cell-centered field set the two are the same loop.
+
+With `stored = true` the loop runs over every **stored** point of every
+block, ghosts included — `ndrange = (size(fs.work)[1:D]..., nblocks(fs))`,
+that is `N + 2G[d] + c[d]` per dimension.
+
+!!! warning "The three forms index differently"
+    Under `stored = true` the kernel's global index **is** the stored
+    index: there is nothing to add. Under the default and under
+    `closed = true` it is an offset into the owned range and the kernel
+    adds `G[d]`. A kernel written for one form is wrong under the other
+    — silently so, since both are in bounds — so a kernel meant for the
+    stored form should not add `G` anywhere.
+
+`stored = true` together with `closed = true` is an error: the closed
+range is a sub-range of the stored one, so asking for both is a
+contradiction.
+
+The stored form exists because a pointwise pass sometimes has to cover
+the ghosts too. The case that asked for it is a hydrodynamics code
+exchanging *conserved* variables and recovering *primitive* ones from
+them: its reconstruction reads primitives two cells into the
+neighbours, so the recovery has to have run in the ghost cells as well.
+Which points a block stores is the mesh's business, not the
+application's, so the launch says `stored = true` rather than the
+application spelling out `N + 2G + c` for itself (see `CODE.md`,
+"Application interface").
 
 Blocks are uniform work units, so this is one flat parallel loop. The
 CPU backend spreads it over `Threads.nthreads()` as it stands (M5), and
@@ -124,12 +150,31 @@ output cell, so the result does not depend on how the loop was split.
     du[ntuple(d -> I[d], Val(D))..., 1, b] = work[c..., 2, b]
 end
 ```
+
+The same pass over the stored extent, which reaches the ghosts and does
+not shift:
+
+```julia
+@kernel function recover!(prim, @Const(cons), ::Val{D}) where {D}
+    I = @index(Global, NTuple)                 # already a stored index
+    b = I[D + 1]
+    c = ntuple(d -> I[d], Val(D))
+    prim[c..., 1, b] = sqrt(cons[c..., 1, b])
+end
+```
 """
 function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
-                     closed::Bool=false) where {T,D}
+                     closed::Bool=false, stored::Bool=false) where {T,D}
+    stored && closed && throw(ArgumentError(
+        "map_blocks! takes `closed = true` or `stored = true`, not both: the " *
+        "closed range G+1 … G+N+c is a sub-range of the stored one 1 … N+2G+c, " *
+        "so asking for both names two different loops. Pass `stored = true` for " *
+        "every stored point, ghosts included, and `closed = true` for the owned " *
+        "points plus the shared boundary plane."))
     backend = get_backend(fs.work)
     c = staggers(fs)
-    extent = ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
+    extent = stored ? ntuple(d -> size(fs.work, d), D) :
+             ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
     kernel!(backend)(args...; ndrange=(extent..., nblocks(fs)))
     synchronize(backend)
     return nothing
