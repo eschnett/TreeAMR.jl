@@ -764,16 +764,36 @@ sharper statement that the interface has stopped being what limits them.
 did not anticipate it). The rule shows in `L∞` and **not** in an integral
 norm: every L1 column above is the scheme's own rate, `p = 1` included.
 An order-`p` prolongation leaves a flux defect on the coarse-fine face
-and nowhere else, and under a flux divergence — unlike under a second
-derivative — that defect stays where it is put, so the solution error it
-causes occupies a neighbourhood whose measure shrinks with `h`. A
-volume-weighted norm multiplies the two and sees `O(h²)` whatever `p` is.
-M3's wave study measured the same rule in L2 because a second-derivative
-stencil divides the ghost error by `h²` and radiates it over the whole
-domain; there the choice of norm did not matter, and here it decides
-whether the effect is visible at all. Both norms are asserted in
-`burgers_tests.jl`, in both directions, precisely because picking one and
-believing it is the easy mistake.
+and nowhere else, and the solution error it causes stays in a
+neighbourhood of the face whose measure shrinks with `h`; a
+volume-weighted norm multiplies the two and sees `O(h²)` whatever `p` is,
+while `L∞` sees the defect's own `O(h^p)`. M3's wave study measured the
+same rule in L2 because a second-derivative stencil divides the ghost
+error by `h²` and radiates it over the whole domain; there the choice of
+norm did not matter, and here it decides whether the effect is visible at
+all. Both norms are asserted in `burgers_tests.jl`, in both directions,
+precisely because picking one and believing it is the easy mistake.
+
+**Why the defect stays local is conservation, not the flux-divergence
+form** (amended after step 5, when the record credited the form; the
+prediction below was made before the run). The residual the defect
+creates is a *dipole*: after the fixup both sides of the face use the
+same flux, so the fine cell loses exactly what the coarse cell gains and
+the residual has zero net mass. A first-order hyperbolic operator carries
+a zero-mean residual nowhere — the contributions injected at successive
+steps travel the same characteristic and telescope — which is what
+leaves an `O(h)` bump on an `O(h)` neighbourhood and nothing downstream.
+Without the fixup the fine flux error is `O(h)` at `p = 1` while the
+coarse side's is `O(h²)`, so the residual has net mass `O(h)` per unit
+time (the leak the drift test measures), and the equation transports it
+downstream as an `O(h)` plateau. Measured: the order-1 L1 rate **falls
+from 1.98 to 1.12** in `D = 1` and **from 1.80 to 1.25** in `D = 2` when
+the fixup is skipped, while `L∞` stays at 1.0 either way; at `p = 3` the
+leak is `O(h³)` and the rate does not see it (2.00 without the fixup).
+So "the rule shows only in `L∞`" is a property of a *conservative*
+scheme: a non-conservative flux-divergence scheme radiates its interface
+defect as the wave equation does, and its L1 rate says so. The negative
+control on the rate is asserted alongside the one on the drift.
 
 **Interface stencils** (decided in M2): near a coarse-fine interface the
 symmetric restriction window cannot exist — fine data across the

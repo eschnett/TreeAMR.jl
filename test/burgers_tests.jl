@@ -143,15 +143,19 @@ end
     # measure of the region it occupies — converges at the scheme's own
     # rate whatever `p` is; that is asserted below too, because it is the
     # part of this that is easy to get wrong by picking a norm and
-    # believing it.
+    # believing it. The defect stays local *because the fixup makes it
+    # zero-mean*: a first-order hyperbolic operator carries a zero-mean
+    # residual nowhere, but it carries a leak downstream as an O(h)
+    # plateau, so without the fixup the L1 rate at order 1 falls to first
+    # order too. Predicted before it was run; asserted at the end.
     Ns = D == 1 ? (8, 16, 32, 64) : (8, 16, 32)
     unlimited = :none                            # a limiter clips at smooth extrema
 
-    rates(ops; refined=true) = begin
+    rates(ops; refined=true, fixup=true) = begin
         hs, l1, linf = Float64[], Float64[], Float64[]
         for N in Ns
             r = burgers_errors(Val(D); N=N, ops=ops, roots=4, refined=refined,
-                               limiter=unlimited)
+                               limiter=unlimited, fixup=fixup)
             push!(hs, r.h)
             push!(l1, r.l1)
             push!(linf, r.linf)
@@ -186,6 +190,18 @@ end
         @test r.l1 > 1.65
     end
     @test first_order.l1 > 1.65
+
+    # The negative control on the *rate*: the same order-1 run without
+    # the fixup leaks O(h) of mass per unit time at each interface, and
+    # the leak is transported downstream, so the L1 norm now sees the
+    # interface — measured 1.12 in D = 1 and 1.25 in D = 2 against the
+    # scheme's own 1.98 and 1.80 with the fixup — while L∞ never depended
+    # on the fixup at all. This is what pins the localization on
+    # conservation rather than on the flux-divergence form.
+    leaky = rates(ops(1); fixup=false)
+    @test leaky.l1 < 1.45
+    @test leaky.l1 < first_order.l1 - 0.4
+    @test leaky.linf ≈ 1.0 atol = 0.25
 end
 
 @testset "A tracked shock matches the uniformly fine reference" begin
