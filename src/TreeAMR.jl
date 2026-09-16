@@ -41,6 +41,9 @@ export firing_boxes
 # Conservation at coarse-fine faces (M8)
 export InterfaceSchedule, restrict_interfaces!
 
+# The all-variables form of the coordinate callbacks (for TreeHydro)
+export AllVariables
+
 include("threading.jl")
 include("device.jl")
 include("morton.jl")

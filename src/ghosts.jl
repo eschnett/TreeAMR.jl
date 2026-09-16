@@ -156,8 +156,39 @@ run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
     work[idx..., v, b] = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
 end
 
+# The all-variables form of the same kernel: no variable axis in the
+# ndrange, one call per cell, every slot written from the tuple that
+# comes back. The index and position arithmetic is the same as above, so
+# the two forms write bit-for-bit the same numbers.
+@kernel function boundary_all_kernel!(work, g, @Const(blocks), @Const(directions),
+                                      @Const(firsts), @Const(origins),
+                                      @Const(spacings),
+                                      boxlen::NTuple{D,Int}, boxstride::NTuple{D,Int},
+                                      ::Val{D}, ::Val{G}, ::Val{C},
+                                      ::Val{NV}) where {D,G,C,NV}
+    cell, t = @index(Global, NTuple)
+    b = blocks[t]
+    δ = directions[t]
+    f = firsts[t]
+
+    r = cell - 1
+    off = ntuple(d -> (r ÷ boxstride[d]) % boxlen[d], Val(D))
+    idx = ntuple(d -> Int(f[d]) + off[d], Val(D))
+
+    origin, h = origins[b], spacings[b]
+    poff = pointoffsets(h, C)
+    x = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
+    vals = g(x, ntuple(d -> Int(δ[d]), Val(D)))
+    # Unrolled through `Val`, as in `coordinates_all_kernel!`.
+    ntuple(Val(NV)) do v
+        work[idx..., v, b] = vals[v]
+        nothing
+    end
+end
+
 """
     CellBoundary(g)
+    CellBoundary(AllVariables(g))
 
 A boundary hook expressed **per cell**: `g(x, v, δ) -> value`, with `x`
 the cell center, `v` the variable index, and `δ` the outward direction
@@ -166,8 +197,8 @@ of the region the cell belongs to.
 This is the form that runs on a device. The package launches it as a
 kernel over the outward-facing ghost cells, batched by region shape (see
 [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)), so `g` must be a pure
-function of its three arguments — it never sees the field set and cannot
-read the block's interior.
+function of its arguments — it never sees the field set and cannot read
+the block's interior.
 
 That is the trade. Conditions defined by position alone — Dirichlet
 data, a manufactured solution, an analytic exterior — are exactly this
@@ -175,7 +206,21 @@ shape. Conditions that read the interior (reflecting, extrapolating
 outflow) are not, and stay with the region form
 [`fill_ghosts!`](@ref) also accepts, which is CPU-only.
 
+Wrapping `g` in [`AllVariables`](@ref) selects the once-per-cell form,
+`g(x, δ) -> vals`, which drops the variable index and returns all
+`fs.nvars` values as a tuple. That is what a boundary state definable
+only as a whole needs — a hydrodynamics code's Dirichlet data is a
+primitive state converted to a conserved one — and it matters more here
+than for the initial data, because this hook runs at every ghost fill,
+hence at every right-hand side evaluation. The two forms write
+bit-for-bit the same numbers. The tuple's length is checked on the host
+before each launch, at the first owned point of block 1 with the sample
+direction `δ = (-1, 0, …, 0)`; any outward direction would do, since
+what is checked is how many values come back.
+
     fill_ghosts!(fs, schedule; boundary = CellBoundary((x, v, δ) -> zero(eltype(x))))
+    fill_ghosts!(fs, schedule;                         # nvars == 2
+                 boundary = CellBoundary(AllVariables((x, δ) -> (x[1], -x[1]))))
 
 !!! note "Callbacks on a device"
     The callback becomes a kernel argument, so everything it closes over
@@ -211,6 +256,32 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
                                   batch.firsts, plan.origins, plan.spacings,
                                   blen, stride, Val(D), Val(fs.G), Val(staggers(fs));
                                   ndrange=(prod(blen), fs.nvars, n))
+    end
+    synchronize(backend)
+    return nothing
+end
+
+# The all-variables form. The length check runs here rather than in
+# `AllVariables` because only the field set knows `nvars`; it costs one
+# host call per ghost fill, against a launch over every outward-facing
+# ghost cell.
+function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
+                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+    g = hook.g.f
+    δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
+    check_allvariables(g(allvariables_sample(fs), δ), fs, "boundary hook")
+
+    plan = schedule.boundaryplan
+    for batch in plan.batches
+        n = nregions(batch)
+        n == 0 && continue
+        blen = batch.boxlen
+        stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
+        boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
+                                      batch.firsts, plan.origins, plan.spacings,
+                                      blen, stride, Val(D), Val(fs.G),
+                                      Val(staggers(fs)), Val(fs.nvars);
+                                      ndrange=(prod(blen), n))
     end
     synchronize(backend)
     return nothing
@@ -362,6 +433,7 @@ end
 
 """
     boundary_by_coordinates(f)
+    boundary_by_coordinates(AllVariables(f))
 
 A boundary hook that sets each outer ghost cell from `f(x, v)`, with `x`
 the cell center and `v` the variable index — the same signature
@@ -372,6 +444,10 @@ convergence tests); real applications supply their own hook to impose
 outgoing, reflecting, or symmetry conditions.
 
 A [`CellBoundary`](@ref) that ignores the direction, so it runs on every
-backend.
+backend. Wrapped in [`AllVariables`](@ref) it is
+`CellBoundary(AllVariables((x, δ) -> f(x)))`: the same hook built from a
+once-per-cell `f(x) -> vals`, which is the shape of a Dirichlet
+condition set from initial data that is itself stated all at once.
 """
 boundary_by_coordinates(f) = CellBoundary((x, v, δ) -> f(x, v))
+boundary_by_coordinates(w::AllVariables) = CellBoundary(AllVariables((x, δ) -> w.f(x)))

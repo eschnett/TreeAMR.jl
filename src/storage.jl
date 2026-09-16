@@ -359,6 +359,73 @@ end
 coordinates(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,<:Integer}) where {T,D} =
     coordinates(T, fs, b, idx)
 
+"""
+    AllVariables(f)
+
+Wraps a coordinate callback that is called **once per point** and returns
+**every variable at once**, as an `NTuple{nvars}`, instead of once per
+point and variable. It selects that form wherever the package takes such
+a callback: [`fill_by_coordinates!`](@ref)`(AllVariables(f), fs)` with
+`f(x) -> vals`, [`CellBoundary`](@ref)`(AllVariables(g))` with
+`g(x, δ) -> vals`, [`boundary_by_coordinates`](@ref)`(AllVariables(f))`,
+and [`adapt_to_initial_data!`](@ref)'s `initial`. The per-variable forms
+are unchanged and remain the default.
+
+The reason is that some states are only definable as a whole (added for
+the TreeHydro application; see `CODE.md`, "Application interface"). A
+hydrodynamics code states its initial and boundary data as *primitive*
+variables and stores *conserved* ones, and the conversion between them
+needs all the primitives of a point together: the energy density is
+built from the density, the velocity and the pressure. Called once per
+variable, such a callback would redo the whole conversion `nvars` times
+per point and throw all but one number away — at setup for the initial
+data, and at **every** right-hand side evaluation for the boundary hook.
+
+It is a wrapper type rather than an arity test on `f` because a closure
+does not advertise its arity reliably, and because the package already
+spells a callback's form as a type ([`CellBoundary`](@ref)). A single
+field, so `AllVariables(f)` is `isbits` whenever `f` is and can be a
+kernel argument like the bare callback.
+
+The tuple's length is checked once on the host before the launch, since
+a kernel cannot report it usefully; the message names both numbers.
+
+    fill_by_coordinates!(AllVariables(x -> (sum(x), prod(x))), fs)     # nvars == 2
+
+!!! note "Callbacks on a device"
+    The wrapped callback becomes a kernel argument, so everything it
+    closes over must be `isbits` — the rule the per-variable forms state
+    too. Return a tuple, not a vector.
+"""
+struct AllVariables{F}
+    f::F
+end
+
+# The sample point the host-side length check evaluates at: the first
+# owned point of block 1, which every field set has. Any point would do
+# — the check is about how many values come back, and a callback whose
+# tuple length varies with position is broken in a way no single
+# evaluation could catch.
+allvariables_sample(fs::FieldSet{T,D}) where {T,D} =
+    coordinates(T, fs, 1, ntuple(d -> fs.G[d] + 1, D))
+
+# Check, once on the host, that an `AllVariables` callback returns one
+# value per variable. A kernel cannot say this usefully: an out-of-range
+# tuple index inside a launch is an error with no context on a good day
+# and a wrong number on a bad one. Evaluating the callback on the host is
+# always legal — everything it closes over is `isbits` by the device
+# rule, which is what lets it be a kernel argument at all — and it costs
+# one call at setup, or one per ghost fill for the boundary form.
+function check_allvariables(vals, fs::FieldSet, what::AbstractString)
+    length(vals) == fs.nvars && return nothing
+    throw(ArgumentError(
+        "an AllVariables $what must return one value per variable, as a tuple: " *
+        "this field set has nvars = $(fs.nvars), but the callback returned " *
+        "$(length(vals)). A per-variable callback takes the variable index and " *
+        "returns one number; an AllVariables one takes no index and returns the " *
+        "whole tuple."))
+end
+
 @kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings),
                                      ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
@@ -373,8 +440,32 @@ coordinates(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,<:Integer}) where {T,D}
     work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, v)
 end
 
+# The all-variables form: no variable axis in the ndrange, one call per
+# point, every slot written from the tuple that comes back. The position
+# is formed by the same expression as `coordinates_kernel!` above, on the
+# same origin and spacing in the same order, so the two forms fill a
+# field set with bit-for-bit the same numbers.
+@kernel function coordinates_all_kernel!(work, f, @Const(origins), @Const(spacings),
+                                         ::Val{D}, ::Val{G}, ::Val{C},
+                                         ::Val{NV}) where {D,G,C,NV}
+    I = @index(Global, NTuple)                     # (i1..iD, block)
+    b = I[D + 1]
+    origin, h = origins[b], spacings[b]
+    off = pointoffsets(h, C)
+    x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+    vals = f(x)
+    idx = ntuple(d -> I[d] + G[d], Val(D))
+    # Unrolled through `Val`, so every tuple index is a literal: a
+    # runtime index into a tuple would spill it to local memory.
+    ntuple(Val(NV)) do v
+        work[idx..., v, b] = vals[v]
+        nothing
+    end
+end
+
 """
     fill_by_coordinates!(f, fs::FieldSet)
+    fill_by_coordinates!(AllVariables(f), fs::FieldSet)
 
 Set every **owned** point of every block from the callback
 `f(x, v) -> value`, where `x` is that point's position — a cell center,
@@ -388,6 +479,16 @@ concurrently across blocks (M5) and must be a pure function of its
 arguments. The tree is not consulted: the kernel gets the geometry as
 the two plain per-block arrays [`block_origins`](@ref) and
 [`block_spacings`](@ref), which is what makes it a device kernel (M6).
+
+Wrapping the callback in [`AllVariables`](@ref) selects the second form:
+`f(x) -> vals` is then called **once per point** and returns all
+`fs.nvars` values as a tuple, which is what a state that is only
+definable as a whole needs. The two forms fill a field set with
+bit-for-bit the same numbers — the position is formed by the same
+expression, on the same origin and spacing, in the same order — so
+switching between them is not a numerical change. The tuple's length is
+checked once on the host, at the first owned point of block 1, before
+anything is launched.
 
 !!! note "Callbacks on a device"
     The callback becomes a kernel argument, so everything it closes over
@@ -410,6 +511,21 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
                                  Val(D), Val(fs.G), Val(staggers(fs));
                                  ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars,
                                           nblocks(fs)))
+    synchronize(backend)
+    return fs
+end
+
+function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    coordinates_all_kernel!(backend)(fs.work, w.f, origins, spacings,
+                                     Val(D), Val(fs.G), Val(staggers(fs)),
+                                     Val(fs.nvars);
+                                     ndrange=(ntuple(_ -> forest.N, D)...,
+                                              nblocks(fs)))
     synchronize(backend)
     return fs
 end

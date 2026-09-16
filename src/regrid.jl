@@ -561,9 +561,12 @@ refined block would bake in the coarse mesh's resolution, so the
 refinement would never buy anything.
 
 `initial` is an `(x, v) -> value` callback as
-[`fill_by_coordinates!`](@ref) takes; `buffer` is passed on to
-[`regrid!`](@ref). Returns `(schedule, passes, converged)`; `converged`
-is `false` if the hierarchy was still changing when `maxpasses` ran out.
+[`fill_by_coordinates!`](@ref) takes — or an [`AllVariables`](@ref)`(f)`
+with `f(x) -> vals`, which the cycle simply hands on, and which is what
+an initial state definable only as a whole needs; `buffer` is passed on
+to [`regrid!`](@ref). Returns `(schedule, passes, converged)`;
+`converged` is `false` if the hierarchy was still changing when
+`maxpasses` ran out.
 
 The criterion is given exactly one of two ways:
 
