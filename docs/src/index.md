@@ -107,7 +107,11 @@ julia> size(flux.work)
 [`interiorview`](@ref) returns the owned points and [`closedview`](@ref)
 the owned points plus the shared plane — a block's `N+1` faces in the
 staggered dimension, which is what a flux kernel launched with
-`map_blocks!(...; closed = true)` writes.
+`map_blocks!(...; closed = true)` writes. A third launch range,
+`map_blocks!(...; stored = true)`, covers every stored point, ghosts
+included; there the kernel's global index *is* the stored index, while
+the other two hand out an offset into the owned range that the kernel
+shifts by `G`.
 
 In a vertex-like dimension the inter-grid operators change with it:
 restriction is exact **injection** (the coarse point at position `X`
@@ -163,6 +167,20 @@ julia> fill_by_coordinates!((x, v) -> v * x[1], state);
 
 julia> fill_ghosts!(state, schedule);
 ```
+
+A coordinate callback is called once per point *and variable*. Wrapping
+it in [`AllVariables`](@ref) selects the once-per-point form instead,
+which returns every variable at once — what a state that is only
+definable as a whole needs, such as a set of conserved variables built
+from a primitive one:
+
+```jldoctest overview
+julia> fill_by_coordinates!(AllVariables(x -> (x[1], 2 * x[1])), state);
+```
+
+The two forms write bit-for-bit the same numbers, and
+[`CellBoundary`](@ref), [`boundary_by_coordinates`](@ref) and
+[`adapt_to_initial_data!`](@ref)'s `initial` take the wrapper too.
 
 Under 2:1 balance there are only three cases — a same-level copy, a
 restriction from finer neighbors, and a prolongation from a coarser one
@@ -372,8 +390,9 @@ Two callbacks change shape on a device, because both used to be host
 loops over block data:
 
 - **Boundary conditions.** [`CellBoundary`](@ref) expresses the hook per
-  cell — `g(x, v, δ)` — and the package launches it as a kernel.
-  [`boundary_by_coordinates`](@ref) is one of these, so it runs
+  cell — `g(x, v, δ)`, or `g(x, δ)` returning every variable at once
+  under [`AllVariables`](@ref) — and the package launches it as a
+  kernel. [`boundary_by_coordinates`](@ref) is one of these, so it runs
   anywhere. The older whole-region form, `boundary(fs, b, key, δ,
   region)`, is still accepted and is still what a condition that reads
   the block's interior (reflecting, extrapolating) needs — but it
@@ -472,6 +491,7 @@ blockview
 interiorview
 closedview
 fill_by_coordinates!
+AllVariables
 KernelAbstractions.get_backend(::FieldSet)
 ```
 

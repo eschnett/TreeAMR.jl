@@ -214,7 +214,11 @@ Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 field set rather than the forest — takes **stored** indices, so owned point
 `i` is `idx = i + G_d`. Kernels launched by `map_blocks!` get the global index
 `(i1, …, iD, b)` with each `i` in `1:N` (or `1:N+c_d` under `closed = true`)
-and add `G_d` to reach the working array. Directions are
+and add `G_d` to reach the working array — **except** under
+`stored = true`, the third range, where the loop runs over `1:N+2G_d+c_d`
+and the global index already *is* the stored index, so the kernel adds
+nothing. A kernel written for one form is wrong under the other and still
+in bounds. Directions are
 `δ ∈ {-1, 0, 1}^D` from `alldirections(Val(D))`; `+1` names the high
 ghost slab.
 
@@ -222,7 +226,7 @@ ghost slab.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `interface_tests.jl`,
-`state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
+`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
 study comes in two halves: `wave_tests.jl` is the **vertex-centered**
@@ -345,3 +349,21 @@ of the *public API only*. Facts that matter here:
   user-facing.
 - Mesh machinery belongs here; physics belongs there. If a TreeWave change
   turns out to be about trees, ghosts, or interpolation, it comes upstream.
+
+## Downstream: TreeHydro
+
+`~/src/jl/TreeHydro` is the second worked application: Newtonian ideal
+hydrodynamics with a high-resolution shock-capturing finite-volume
+scheme — the *conservative* counterpart of TreeWave, and the first
+downstream user of M8. It is **design only so far**: its `CODE.md` is
+the whole package, nothing is implemented, and nothing here is under
+test from it yet.
+
+It will lean on `map_blocks!(…; stored = true)` and `AllVariables` —
+both added here as its prerequisites, see "Application interface" in
+`CODE.md` — and on `InterfaceSchedule`/`restrict_interfaces!`,
+`CellBoundary` (it is the first caller of the physical-boundary hook at
+all; TreeWave is periodic throughout), `firing_boxes`, and
+`block_mapreduce`. Its `CODE.md` section "Upstream prerequisites" is
+where it records what it still needs from here; read it before changing
+any of those.

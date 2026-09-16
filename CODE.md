@@ -1178,6 +1178,75 @@ face itself is stored at `i + G_f` — the off-by-`G` sharp edge TreeWave's
 notes already warn about, now with two `G`s; the Burgers kernels in the
 tests are the worked example.
 
+**Three launch ranges, not two** (amended for TreeHydro). `map_blocks!`
+launched over the owned range `N` or, with `closed = true`, the closed
+range `N + c_d`. It gains a third: `stored = true` launches over every
+*stored* point of every block, ghosts included — `N + 2G_d + c_d` per
+dimension, which is exactly `size(fs.work)`. The consumer is the
+primitive recovery of a finite-volume hydrodynamics code: the exchange
+carries *conserved* variables, its reconstruction reads *primitives* two
+cells into the neighbours, so the pointwise conversion between them has
+to have run in the ghost cells as well. Nothing about that is
+hydrodynamics — it is a pass over the storage — and which points a block
+stores is the mesh's business, so the mesh spells the range rather than
+the application recomputing `N + 2G + c` for itself.
+
+Under `stored = true` the kernel's global index **is** the stored index;
+under the other two it is an offset into the owned range and the kernel
+adds `G_d`. That is a real trap, because a kernel written for the wrong
+form still writes in bounds — it writes the wrong cells — so the
+docstring says it first and the test asserts the index each cell holds
+and not merely how many were written. `stored = true` with
+`closed = true` is refused: the closed range is a sub-range of the
+stored one, so asking for both names two different loops rather than an
+intersection.
+
+**An all-variables form of the coordinate callbacks** (amended for
+TreeHydro). `fill_by_coordinates!(f, fs)` calls `f(x, v)` once per point
+*and variable* — its kernel has a variable axis in the ndrange — and
+`CellBoundary(g)` calls `g(x, v, δ)` the same way. Beside those, and
+without changing them, there is now a form called once per *point* that
+returns every variable at once, selected by wrapping the callback in
+`AllVariables`:
+
+    fill_by_coordinates!(AllVariables(f), fs)       # f(x)    -> NTuple{nvars}
+    CellBoundary(AllVariables(g))                   # g(x, δ) -> NTuple{nvars}
+    adapt_to_initial_data!(fs, ops; initial = AllVariables(f), …)
+    boundary_by_coordinates(AllVariables(f))
+        # = CellBoundary(AllVariables((x, δ) -> f(x)))
+
+The reason is that some states are only definable as a whole. A
+hydrodynamics code states its initial and boundary data as *primitive*
+variables and stores *conserved* ones, and the conversion needs all the
+primitives of a point together. Per variable, the whole conversion would
+run `nvars` times per point with all but one number thrown away — at
+setup for the initial data, and at **every** right-hand side evaluation
+for the boundary hook, which is the case that decided it.
+
+A wrapper type rather than arity detection on the callback: a closure
+does not advertise its arity reliably, and the package already spells a
+hook's form as a type (`CellBoundary`). One field, so it is `isbits`
+whenever the callback is and can be a kernel argument unchanged. The
+all-variables kernels form the position with the same expression as the
+per-variable ones, on the same origin and spacing in the same order, so
+the two forms fill a field set with bit-for-bit the same numbers and
+switching between them is not a numerical change — the same claim, for
+the same reason, as the M6 cell-wise boundary hook's.
+
+The tuple's length has to be `nvars`, and a kernel cannot say so
+usefully, so it is checked **once on the host** before the launch, by
+evaluating the callback at one owned point of block 1 (and, for the
+boundary form, with the sample direction `δ = (−1, 0, …, 0)`); the
+`ArgumentError` names both numbers. Calling the callback on the host is
+always legal, because everything it closes over is `isbits` by the
+device rule — that is what lets it be a kernel argument at all. The
+boundary form pays that one host call per ghost fill, against a launch
+over every outward-facing ghost cell.
+
+The region form of the boundary hook is untouched: `AllVariables` is
+about how many values a *cell-wise* callback returns, not about which
+form the hook takes.
+
 ## Time integration
 
 The whole hierarchy advances with one global `dt` (finest-level CFL). The
@@ -1250,11 +1319,11 @@ entries per volume — documented here, implemented post-M3.
   concatenated in block order.
 
   **Application callbacks therefore run concurrently**: the `f(x, v)` of
-  `fill_by_coordinates!`, the `f(b, key)` of `flag_blocks`, and the
-  boundary hook. They must be pure functions of their arguments (the
-  hook may write the region it was handed, and nothing else). This is
-  the same contract M6 imposes anyway, since two of the three become
-  device kernels.
+  `fill_by_coordinates!` (or the `f(x)` of its `AllVariables` form), the
+  `f(b, key)` of `flag_blocks`, and the boundary hook. They must be pure
+  functions of their arguments (the hook may write the region it was
+  handed, and nothing else). This is the same contract M6 imposes
+  anyway, since two of the three become device kernels.
 
   **A phase is one parallel loop, not a sequence of launches** (amended
   in M5). Ghost transfers are batched by stencil, and the batches differ
@@ -1379,6 +1448,25 @@ entries per volume — documented here, implemented post-M3.
     integer min/max is order-independent and every item owns its output
     slots, so the M5 determinism discipline carries over with nothing
     added.
+
+  **The coordinate callbacks got a third form, over the variable axis**
+  (amended for TreeHydro). The two forms above are about *where* a
+  callback runs; this one is about *how much it returns*. `AllVariables(f)`
+  makes `fill_by_coordinates!` and `CellBoundary` call their callback
+  once per point instead of once per point and variable, with the whole
+  `NTuple{nvars}` coming back at once — because a conserved state built
+  from a primitive one cannot be produced a variable at a time, and
+  producing it `nvars` times per point and keeping one number is what the
+  per-variable form would cost, at every RHS evaluation in the hook's
+  case. The all-variables kernels have no variable axis in their ndrange
+  and unroll the write over the variables with a `Val`; they form the
+  position with the same expression as the per-variable ones, so the two
+  agree bit for bit and the M5 digests do not move. The concurrency
+  contract is unchanged — one work item per point, each owning every
+  variable slot of that point — and so is the `isbits` rule, which the
+  single-field wrapper preserves. See
+  [Application interface](#application-interface-sketch) for the
+  argument and for the host-side length check.
 
   **Reductions got a device method, not a rewrite.** The diagnostics
   (`volume_weighted_norm`, `total_mass`) form one partial per block and
