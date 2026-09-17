@@ -6,6 +6,7 @@ no physics.
 
 [![CI](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml)
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://eschnett.github.io/TreeAMR.jl/dev)
+[![codecov](https://codecov.io/gh/eschnett/TreeAMR.jl/graph/badge.svg?token=IHXP23WQ1H)](https://codecov.io/gh/eschnett/TreeAMR.jl)
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
