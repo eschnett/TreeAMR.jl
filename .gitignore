@@ -2,5 +2,7 @@
 *.swp
 .DS_Store
 /docs/build/
+*.cov
+/lcov.info
 Manifest.toml
 TODO.md

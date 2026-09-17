@@ -53,6 +53,32 @@ On a fresh clone the test environment has no Manifest; run this once first:
 julia --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
 ```
 
+Coverage, the way CI's single-threaded cells measure it. Note that
+`julia-actions/julia-runtest` defaults `coverage` to `true`, so until
+the Codecov upload was added *every* cell was paying for coverage and
+discarding it; CI.yml now ties coverage to `threads == 1`, which keeps
+it on the four cheap cells (both operating systems, both Julia
+versions, merged by Codecov) and drops it from the expensive threaded
+ones. Instrumentation cost **2.61x** locally
+(measured: 3m23.6s → 8m51.8s, 88819 tests, 4 threads both times) —
+though that is not the CI factor, because the action also defaults
+`check_bounds` to `yes` and a plain `Pkg.test` no longer does.
+`Base.julia_cmd()` forwards `--code-coverage` to the subprocesses the
+thread-independence test spawns, so those are instrumented too — three
+PIDs write `.cov` files and `julia-processcoverage` merges them per
+source file, which is why a single-threaded cell still sees the
+threaded code paths. The `.cov` files scattered through `src/` are
+gitignored; delete them before the next run, because counts from
+separate runs accumulate:
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test(; coverage=true, julia_args=["--threads=4"])'
+```
+
+```bash
+find src -name '*.cov' -delete
+```
+
 Docs build. This is also the **only place doctests run** — `Pkg.test` does
 not run the `jldoctest` blocks in docstrings and `docs/src/index.md`:
 

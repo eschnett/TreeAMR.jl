@@ -24,6 +24,24 @@ jobs:
         # thread-independence test spawns its own subprocesses either
         # way; this is what runs the rest of the suite on threads.
         threads: [1, 4]
+    # Coverage exactly on the single-threaded cells. `julia-runtest`
+    # defaults `coverage` to true, so until now every cell was
+    # instrumented and every report thrown away; turning it off on the
+    # `threads: 4` cells makes CI faster than it was before coverage
+    # was reported at all, because those are the expensive ones -- a
+    # 4-vCPU runner is oversubscribed by `--threads=4` plus the
+    # subprocesses the thread-independence test spawns, which made
+    # `threads: 4` a ~1.7x penalty over `threads: 1` (measured over
+    # five runs on main: 12.1 min vs 7.2 min for the worst pair).
+    #
+    # The four remaining cells still cover both operating systems and
+    # both Julia versions, and Codecov merges their reports. Dropping
+    # the threaded cells costs little: `Base.julia_cmd()` forwards
+    # `--code-coverage`, and `thread_tests.jl` spawns its workload at 1
+    # *and* at `max(2, min(4, Sys.CPU_THREADS))` threads whatever the
+    # parent's thread count is, so the multi-task branch of
+    # `threadchunks` and the `@spawn` branch of `threaded_chunks` are
+    # still reached -- as far into them as `thread_workload.jl` goes.
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -32,5 +50,16 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: ${{ matrix.threads == 1 }}
         env:
           JULIA_NUM_THREADS: ${{ matrix.threads }}
+      - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.threads == 1
+      - uses: codecov/codecov-action@v5
+        if: matrix.threads == 1
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # A Codecov outage should not turn a green test run red.
+          fail_ci_if_error: false
