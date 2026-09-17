@@ -20,28 +20,15 @@ jobs:
       matrix:
         version: ["1.10", "1"]
         os: [ubuntu-latest, macOS-latest]
-        # The suite must pass threaded as well as serial (M5). The
+        # The suite must pass threaded as well as serial. The
         # thread-independence test spawns its own subprocesses either
         # way; this is what runs the rest of the suite on threads.
         threads: [1, 4]
-    # Coverage exactly on the single-threaded cells. `julia-runtest`
-    # defaults `coverage` to true, so until now every cell was
-    # instrumented and every report thrown away; turning it off on the
-    # `threads: 4` cells makes CI faster than it was before coverage
-    # was reported at all, because those are the expensive ones -- a
-    # 4-vCPU runner is oversubscribed by `--threads=4` plus the
-    # subprocesses the thread-independence test spawns, which made
-    # `threads: 4` a ~1.7x penalty over `threads: 1` (measured over
-    # five runs on main: 12.1 min vs 7.2 min for the worst pair).
-    #
-    # The four remaining cells still cover both operating systems and
-    # both Julia versions, and Codecov merges their reports. Dropping
-    # the threaded cells costs little: `Base.julia_cmd()` forwards
-    # `--code-coverage`, and `thread_tests.jl` spawns its workload at 1
-    # *and* at `max(2, min(4, Sys.CPU_THREADS))` threads whatever the
-    # parent's thread count is, so the multi-task branch of
-    # `threadchunks` and the `@spawn` branch of `threaded_chunks` are
-    # still reached -- as far into them as `thread_workload.jl` goes.
+    # Coverage exactly on the single-threaded cells. Turning coverage
+    # off on the `threads: 4` cells makes CI faster, because those are
+    # the expensive ones -- a 4-vCPU runner is oversubscribed by
+    # `--threads=4` plus the subprocesses the thread-independence test
+    # spawns.
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
