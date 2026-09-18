@@ -1,8 +1,7 @@
 # TreeAMR.jl
 
-TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
-Julia. It provides the mesh, the storage, and the inter-grid operations —
-no physics.
+TreeAMR.jl implements a tree-based (octree-style) AMR discretization
+for Julia. It provides mesh, storage, and inter-grid operations.
 
 [![CI](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml)
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://eschnett.github.io/TreeAMR.jl/dev)
@@ -13,154 +12,101 @@ roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
 The package is currently at milestone **M8** (every centering,
 per-field-set ghost widths, conservation at coarse-fine faces).
 
-## Status
+This package is still under development. It is ready for experimental use.
 
-Early development. Not registered, not ready for use.
+## Overview
 
-Implemented so far, `D`-generic, floating-point-type generic,
-multi-threaded, and able to run device-resident on any
-KernelAbstractions backend:
+TreeAMR is the mesh layer of a block-structured AMR code. It stores
+the data, keeps the ghost zones filled, interpolates between levels,
+and adapts the mesh. The equations, fluxes, boundary conditions, and
+refinement criterion are decided by the application. A
+finite-difference or finite-volume code written for one uniform block
+should need little additional work to run on an adaptive mesh.
 
-**M1 — tree core**
+**The mesh.** The domain is a brick (rectangular grid) of octree
+roots, each a block of `N^D` cells. Each block can be refined with a
+factor of two between levels and 2:1 balance enforced across faces,
+edges, and corners. Only the leaves of the tree store data, there is
+no coarse data underneath refined regions. The leaves are kept as a
+sorted vector of Morton keys, so neighbour finding is just arithmetic
+on keys rather than pointer chasing, and periodic directions are built
+into that arithmetic. Other physical boundaries need to go through a
+per-cell hook that the application needs to define. The dimension `D`
+is a type parameter, and the same code runs in 1D, 2D, and 3D, and the
+tests cover all three.
 
-- Morton keys over a brick of `M₁ × … × M_D` octree roots, as a sorted
-  linear octree of leaves.
-- Neighbor finding across faces, edges, and corners, including periodic
-  wraparound and coarse/fine interfaces.
-- Refinement and coarsening, and 2:1 balance enforcement.
-- Block storage: one array over all leaf blocks, ghosts included, plus
-  the physical geometry (spacings, block extents, cell centers).
+**Global time stepping.** There is no subcycling. Every block advances
+with the same global `dt`, set by the finest level. Ghost filling does
+not need to interpolate in time. The whole hierarchy is one flat state
+vector, so any time integrator from OrdinaryDiffEq.jl (or your own)
+can drive an adaptive run exactly as it would a uniform one.
+Conservation at coarse-fine faces reduces to a purely spatial
+condition: the fine fluxes are averaged onto the coarse face within
+each right-hand-side evaluation, with no flux registers necessary and
+no corrections accumulated over time. The disadvantage is that coarse
+levels take more steps than they need.
 
-**M2 — ghost exchange and operators**
+**Numerics.** Inter-level transfer comes in two families since
+finite-difference and finite-volume codes require different
+properties. The *point-value* family is Lagrange interpolation of even
+order, for schemes whose unknowns are values at points. The
+*conservative* family restricts by exact cell averaging and prolongs
+by reconstructing a polynomial of odd order and averaging it over the
+fine cells, so both operators preserve the volume integral of
+arbitrary data to roundoff. You would choose the order according to
+the discretization scheme you are using. For example, to stay second
+order across a refinement boundary, a second-derivative stencil needs
+order-4 interpolation, and a flux divergence needs order-3
+conservative prolongation, two orders above the differencing in either
+family.
 
-- A cached exchange schedule, built when the tree changes and replayed
-  by `fill_ghosts!`, so no tree query runs per RHS evaluation.
-- The phased fill: same-level copies and restrictions first, then
-  prolongations swept coarsest target first.
-- Polynomial interpolation operators of configurable order, with the
-  `G`/`N` sufficiency checks that tie order to block geometry.
-- Periodic boundaries (free, via the tree) and a physical-boundary hook.
-- Written as KernelAbstractions kernels, so the CPU implementation is
-  already the device one (M6).
+Fields (variables) can live at cell centers (cell averages), vertices,
+faces, or edges, per dimension, and different field sets with
+different centerings and ghost widths can coexist on one refinement
+forest. A typical hydro setup might use a cell-centered state with two
+ghost cells and face-centered fluxes without ghosts.
 
-**M3 — ODE coupling**
+**Regridding.** The application needs to flag blocks, either directly
+or through a per-cell criterion. TreeAMR does the rest automatically:
+it buffers the flags (i.e. it increases the set of flagged cells
+outwards to ensure that the newly refined region stays safe for some
+time) and completes them to ensure the 2:1 balance. Blocks are only
+coarsened once a whole sibling group agrees. TreeAMR then
+rebuilds the tree, and transfers the data with the same operators it
+uses for ghost filling. A block can change by at most one level per
+regrid. Initial data is re-evaluated on each new mesh rather than
+interpolated, iterating until the mesh stops changing.
 
-- A flat state vector over leaf interiors, with `scatter!`/`gather!`
-  against the ghosted working array, so a standard integrator
-  (OrdinaryDiffEq) drives the whole hierarchy with one global `dt`.
-- `map_blocks!` to launch application kernels over every block.
-- Volume-weighted norms, so error measures are not skewed by refined
-  regions contributing more entries per unit volume.
-- Verified with the scalar wave equation: 2nd-order convergence in the
-  volume-weighted L2 and L∞ errors against the exact sine mode, on a
-  two-level periodic mesh.
+**Performance.** All per-cell work is implemented as
+KernelAbstractions kernels, so that one implementation runs
+multi-threaded on the CPU and efficiently on a GPU. If you start Julia
+with `--threads=auto` then everything is multi-threaded, with results
+that are bit-identical across thread counts. If you allocate the state
+vector storage with `backend=CUDABackend()`, then the data and the
+exchange schedule live on the device, and every kernel runs on the
+device. Both Float64 and Float32 are supported, and the test suite
+passes both on CUDA (with both precisions) and on Metal (which does
+not support double precision). Some performance measurements are
+listed in [CODE.md](CODE.md#parallelism).
 
-**M4 — regridding**
+**Tests.** The test suite contains two small applications. The scalar
+wave equation, as a vertex-centered finite-difference code, converges
+at second order on a refined mesh, and a travelling pulse followed by
+a moving refined region matches the accuracy of a uniformly fine mesh
+with fewer cells. Burgers' equation, as a cell-centered finite-volume
+code, sends a shock through a refined region that regrids around it
+and conserves the domain integral to one or two ulp over hundreds of
+steps. A standalone sample application,
+[TreeWave.jl](https://github.com/eschnett/TreeWave.jl), solves the
+wave equation with a Löhner refinement criterion.
 
-- Flag → complete → rebuild → transfer, with marks completed so that 2:1
-  balance survives and coarsening only where a whole sibling group asks.
-- The initial-data cycle, which re-evaluates rather than interpolates as
-  the mesh adapts, iterated to a fixed point.
-- Two operator families: point-value (finite differences) and
-  conservative (finite volumes — exact-average restriction,
-  reconstruct-and-average prolongation).
-- Conservation: with conservative operators the transfer preserves the
-  volume integral to roundoff for *arbitrary* data. With point-value
-  operators it does so only for fields they reproduce exactly, though
-  coarsening alone conserves either way.
-- Verified with a travelling pulse whose refined region follows it: the
-  adaptive run matches a uniformly fine mesh's accuracy using fewer
-  cells, so the moving coarse-fine interface introduces no artifacts.
+**Still missing.** There is no MPI parallelism yet. The code runs on a
+single node, either on its CPU cores or on one GPU. MPI is the next
+milestone. There is no I/O or visualization output yet either. The
+leaf-only storage also rules out multigrid algorithms on the mesh
+hierarchy.
 
-**M5 — multi-threading**
-
-- Every per-cell kernel and every host-side pass over blocks is a
-  parallel loop; start Julia with `-t auto` and there is nothing else to
-  configure.
-- Ghost filling runs one parallel loop per phase, with the transfers
-  sliced by cell count and dealt out largest first — batching them by
-  stencil alone left the small batches (edges, corners) serial and
-  capped the ghost fill at about 2.5×.
-- Results are **bit-identical** across thread counts, not merely equal
-  to roundoff: no parallel loop shares an accumulator, and every
-  reduction combines its partials in block order. The test suite checks
-  this by running a full adapt/evolve/regrid/evolve cycle in
-  subprocesses at different thread counts and comparing digests.
-- Application callbacks (initial data, flagging, the boundary hook) are
-  therefore called concurrently and must be pure.
-- Measured on a 64-core AMD EPYC 7532 (960 blocks of 32³, 31.5M cells):
-  **36.3×** on the RHS path and 59.5× on the compute-bound initial-data
-  pass — with `numactl --interleave=all`, which is worth 2–6× at that
-  thread count and which a library cannot set for itself.
-  `bench/scan.sh` reproduces the measurement; the full table and the
-  reasoning are in [CODE.md](CODE.md#parallelism).
-
-**M6 — GPU**
-
-- The storage picks the backend and everything follows it:
-  `FieldSet(forest, nvars; G = 2, backend = CUDABackend())` puts the leaf data
-  on the device, and `statevector`, `regrid!` and every kernel allocate
-  and launch there.
-- The exchange schedule is device-resident too. Its stencil weights are
-  read inside the transfer kernel, so they are built on the host in
-  exact rational arithmetic and uploaded once, when the schedule is
-  built — never per ghost fill.
-- `CellBoundary` expresses a boundary condition per cell, which the
-  package launches as a kernel; `firing_boxes` evaluates a per-cell
-  refinement criterion and reduces each block to a firing-cell count and
-  bounding box on the device, leaving the verdict to the application.
-- The whole test suite passes on CUDA (NVIDIA H200) in Float64 *and*
-  Float32, and on Metal (Apple M3 Pro) in Float32 — a backend with no
-  hardware fp64 at all, which is the strongest available check that no
-  fp64 path is load-bearing. The M3 convergence result is reproduced on
-  the device: L2 rate 1.99 in either precision.
-- Measured on an H200 against the same node's 16 cores (960 blocks of
-  32³, 31.5M cells): **35×** on the RHS path, 32× on the ghost fill, 63×
-  on initial data — tracking the 19× bandwidth ratio, which is what a
-  mesh library should deliver. The two per-block reductions
-  (`volume_weighted_norm`, `firing_boxes`) deliberately do not: they run
-  one work item per block, which is what makes them deterministic, and
-  neither is on the per-evaluation path. Numbers and reasoning in
-  [CODE.md](CODE.md#parallelism); `bench/gpu.jl` reproduces them and
-  `bench/symmetry_gpu.sh` is the cluster job.
-
-**M8 — centerings, ghost widths, conservation**
-
-- The ghost width `G` is a **field-set** keyword, one per dimension,
-  rather than a forest one — `FieldSet(forest, nvars; G = 2)` — because
-  it says how far a stencil reaches into a neighbor's data, which is a
-  property of what is stored, not of how space is cut up.
-- A field set also carries a **centering**: per dimension its values sit
-  at the cell centers (`:cell`) or on the cell boundaries (`:vertex`), so
-  `cellcentered`, `vertexcentered`, `facecentered` and `edgecentered`
-  name the familiar layouts, and the exchange, the geometry and the
-  regrid transfer all follow from that one tuple. Along a stagger
-  restriction is exact injection and prolongation needs one ghost less.
-- Two field sets over one forest with different `G` or centering is the
-  normal case — an evolved state with `G = 2` and the fluxes computed
-  from it with `G = 0` — so a `GhostSchedule` belongs to a *layout*
-  rather than to a forest, and `regrid!` takes `fs => schedule` pairs.
-- `InterfaceSchedule` / `restrict_interfaces!`: the flux fixup that makes
-  a finite-volume scheme conservative across coarse-fine faces. With one
-  global `dt` that is a purely spatial condition, so there are no flux
-  registers and no time-accumulated corrections.
-- Verified with Burgers' equation, in the tests as the wave equation is:
-  a shock crossing a refined region that follows it, regridding in
-  between, conserves the domain integral to **one or two ulp** over
-  hundreds of steps, where the same run without the fixup leaks eleven
-  orders of magnitude more — and a *uniform* mesh conserves either way,
-  which is what pins the effect on the coarse-fine faces.
-
-Note that reaching 2nd order on a refined mesh needs **order-4**
-interpolation for a second-derivative scheme, or order-3 conservative
-prolongation for a flux divergence — see the warning on `Operators`.
-
-Next is MPI (M7), deliberately after M8 so that the distributed
-exchange, the interface restriction and the regrid transfer are built
-once over a layout-generic schedule instead of being retrofitted for
-each centering; the design is in [CODE.md](CODE.md#centerings).
-
-## Installation
+## Installing
 
 ```julia
 using Pkg
@@ -173,8 +119,3 @@ Pkg.develop(url="https://github.com/eschnett/TreeAMR.jl")
 using Pkg
 Pkg.test("TreeAMR")
 ```
-
-The tests run on whatever thread count they inherit; pass
-`julia_args = ["--threads=8"]` to exercise the threaded paths (they are
-covered either way, since the thread-independence test spawns its own
-subprocesses).
