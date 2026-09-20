@@ -356,7 +356,9 @@ function interpolation_weights(lo::Int, p::Int, x::Rational, what::AbstractStrin
     lo <= x <= lo + p - 1 || throw(ArgumentError(
         "$what would extrapolate: target $x lies outside the source window " *
         "[$lo, $(lo + p - 1)]. The block geometry cannot support this order."))
-    return lagrange_weights([Rational(j) for j in lo:(lo + p - 1)], x)
+    # Asked for in the window's own frame, which is what makes the
+    # answer cacheable across every window of this width in the mesh.
+    return unit_lagrange_weights(p, x - lo)
 end
 
 # Target range of a transfer in dimension d.
@@ -498,7 +500,7 @@ end
 # that is an algebraic identity rather than a roundoff claim — it holds
 # exactly, at every order and for every element type the weights are
 # later rounded into.
-function conservative_prolong_weights(p::Int)
+function build_conservative_prolong_weights(p::Int)
     r = (p - 1) ÷ 2
     boundaries = [-r - 1//2 + i for i in 0:p]       # p+1 cell boundaries
     # W(x) = Σ_i L_i(x) W_i and W_i = Σ_{t<i} ū_t, so ū_t carries weight
@@ -509,6 +511,19 @@ function conservative_prolong_weights(p::Int)
     high = [2 * ((t < r + 1 ? 1//1 : 0//1) - tail[t + 1]) for t in 0:(p - 1)]
     return low, high
 end
+
+# Memoised on `p`, for the same reason as the Lagrange weights it is
+# built from: a schedule rebuild asks for the same order over and over,
+# and a regridding run rebuilds at every regrid. The two vectors are
+# shared, so nothing may mutate one — the one caller copies them into a
+# `Stencil1D`'s element type.
+const CONSERVATIVE_CACHE =
+    Dict{Int,Tuple{Vector{WeightRational},Vector{WeightRational}}}()
+
+conservative_prolong_weights(p::Int) =
+    lock(LAGRANGE_LOCK) do
+        get!(() -> build_conservative_prolong_weights(p), CONSERVATIVE_CACHE, p)
+    end
 
 function conservative_prolong_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int,
                                       od::Int, p::Int) where {T}
