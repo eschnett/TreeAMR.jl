@@ -381,3 +381,40 @@ function lagrange_weights(nodes::AbstractVector{<:Rational}, x::Rational)
     end
     return w
 end
+
+# Lagrange weights are translation invariant: shifting every node and
+# the target by the same amount leaves every difference
+# `x - nodes[j]` and `nodes[i] - nodes[j]` unchanged, and in exact
+# rational arithmetic that is an identity, not an approximation. So a
+# window of `p` consecutive integer nodes is fully described by `p` and
+# by where the target sits inside it, and the whole package only ever
+# asks for integer or quarter-integer targets — a handful of distinct
+# `(p, ξ)` pairs however big the mesh is.
+#
+# That is what makes the bignum arithmetic affordable. It was never in
+# the per-evaluation path, but it *is* in the per-schedule path, which a
+# regridding run pays at every regrid and a test suite pays once per
+# problem it builds: a `p = 6` schedule over a two-level 3D mesh spent
+# 90 ms and 104 MiB, almost all of it recomputing the same few weight
+# vectors. See "What the ghost fill costs" in CODE.md.
+#
+# The cached vectors are shared, so nothing may mutate one; the two
+# callers copy them into a `Stencil1D`'s element type on the way out.
+const LAGRANGE_CACHE = Dict{Tuple{Int,WeightRational},Vector{WeightRational}}()
+const LAGRANGE_LOCK = ReentrantLock()
+
+"""
+    unit_lagrange_weights(p, ξ)
+
+Weights for a window of `p` consecutive integer nodes `0:(p-1)`,
+evaluated at `ξ`, memoised. See [`lagrange_weights`](@ref
+TreeAMR.lagrange_weights) for what they mean and why they are exact.
+"""
+function unit_lagrange_weights(p::Int, ξ::Rational)
+    key = (p, WeightRational(ξ))
+    return lock(LAGRANGE_LOCK) do
+        get!(LAGRANGE_CACHE, key) do
+            lagrange_weights([Rational(j) for j in 0:(p - 1)], WeightRational(ξ))
+        end
+    end
+end
