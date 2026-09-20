@@ -36,8 +36,15 @@ jobs:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
+      # `check_bounds: yes` is the action's default, but it is stated
+      # here because the package now relies on it: the transfer kernel's
+      # reads are `@inbounds` (see "What the ghost fill costs" in
+      # CODE.md), and `--check-bounds=yes` overrides `@inbounds`
+      # package-wide, so this is the only place a stencil that walks out
+      # of its block would be caught.
       - uses: julia-actions/julia-runtest@v1
         with:
+          check_bounds: 'yes'
           coverage: ${{ matrix.threads == 1 }}
         env:
           JULIA_NUM_THREADS: ${{ matrix.threads }}

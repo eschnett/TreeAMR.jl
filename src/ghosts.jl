@@ -6,45 +6,95 @@
 # KA from the start so the CPU implementation is already the GPU one
 # (M6); the only backend-specific step is `get_backend`.
 
+# Every index this file's kernels form is built by the schedule, whose
+# job is precisely to guarantee them: a target offset runs over the
+# stencil's own `ntarget`, a source window is `clamp`ed into the stored
+# extent at construction, and KernelAbstractions' CPU emitter guards the
+# body with `__validindex`, so the global index never leaves the
+# `ndrange`. Bounds checking them again in the innermost loop of the
+# per-evaluation path cost more than the physics did — a quarter of the
+# ghost fill, see "What the ghost fill costs" in CODE.md — so the reads
+# and writes below are `@inbounds`. The claim is checked rather than
+# asserted: CI runs `julia-runtest` with `check_bounds=yes`, which
+# overrides `@inbounds` package-wide, so a stencil that walks out of its
+# block fails there even though it would not fail locally.
+
+# Tensor-product stencil: `prod(Ps)` contributions, the weight of each
+# the product of its D one-dimensional weights. The widths are **per
+# dimension** (M8): a transfer can be injection in one dimension and
+# order-p interpolation in another, and padding the narrow one to the
+# common width with zero weights would read slots that need not hold
+# data at all — a G = 0 face field has none beyond its high face — and
+# `0 * NaN` is `NaN`.
+#
+# `Ps` is a compile-time constant, so the sum is *generated* as a loop
+# nest with literal trip counts instead of iterating
+# `CartesianIndices(Ps)`. That iterator spent its time in `__inc`, and
+# it hid the fact that D-1 of the D weight loads per stencil point are
+# invariant in the inner loops.
+#
+# The nest reproduces the old loop exactly, not merely to the same
+# accuracy: `m_1` runs innermost, as column-major `CartesianIndices`
+# iteration did, so the contributions are summed in the same order; and
+# the weight product is still formed as `((w₁ * w₂) * …) * w_D`, since
+# floating-point multiplication does not associate and hoisting a
+# partial product out of the inner loop would reassociate it. Only the
+# *loads* are hoisted.
+@generated function stencil_sum(src, weights, base::NTuple{D,Int},
+                                wcol::NTuple{D,Int}, v, sblock,
+                                ::Val{Ps}) where {D,Ps}
+    idx = [:(base[$d] + $(Symbol(:m_, d)) - 1) for d in 1:D]
+    wprod = foldl((a, d) -> :($a * $(Symbol(:wt_, d))), 2:D;
+                  init=Symbol(:wt_, 1))
+    body = quote
+        acc += $wprod * src[$(idx...), v, sblock]
+    end
+    for d in 1:D
+        body = quote
+            for $(Symbol(:m_, d)) in 1:$(Ps[d])
+                $(Symbol(:wt_, d)) = weights[$d][$(Symbol(:m_, d)), wcol[$d]]
+                $body
+            end
+        end
+    end
+    return quote
+        Base.@_inline_meta
+        acc = zero(eltype(src))
+        @inbounds $body
+        acc
+    end
+end
+
 # `dest` and `src` are the same array for ghost filling (targets are
 # ghosts, sources interiors, so they never overlap) and different arrays
 # when regridding transfers into freshly allocated storage. Neither is
 # marked @Const, so the aliasing case stays well defined.
+#
+# The launch is over the target box itself — `ndrange = (blen…, nvars,
+# ntransfers)` — so the backend supplies the per-axis position and the
+# kernel does no index arithmetic to recover it. Flattening the box into
+# one axis and unflattening it here cost an integer `div` and `rem` per
+# dimension per ghost point per variable: 9 % of a copy-dominated fill's
+# self time, and the single largest entry after the bounds checks.
 @kernel function transfer_kernel!(dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
                                   srcstarts, weights,
-                                  targetfirst::NTuple{D,Int},
-                                  boxlen::NTuple{D,Int},
-                                  boxstride::NTuple{D,Int},
+                                  targetfirst::NTuple{D,Int}, toffset::Int,
                                   ::Val{Ps}, ::Val{D}) where {Ps,D}
-    cell, v, t = @index(Global, NTuple)
+    I = @index(Global, NTuple)
+    # `I[1:D]` is the position within the target region, one-based.
+    v = I[D + 1]
+    t = I[D + 2] + toffset
 
-    tblock = targetblocks[t]
-    sblock = sourceblocks[t]
+    @inbounds tblock = targetblocks[t]
+    @inbounds sblock = sourceblocks[t]
 
-    # Position within the target region, as a per-dimension offset.
-    r = cell - 1
-    off = ntuple(d -> (r ÷ boxstride[d]) % boxlen[d], Val(D))
-    tidx = ntuple(d -> targetfirst[d] + off[d], Val(D))
-    base = ntuple(d -> Int(srcstarts[d][off[d] + 1]), Val(D))
+    wcol = ntuple(d -> I[d], Val(D))
+    tidx = ntuple(d -> targetfirst[d] + I[d] - 1, Val(D))
+    @inbounds base = ntuple(d -> Int(srcstarts[d][I[d]]), Val(D))
 
-    # Tensor-product stencil: prod(Ps) contributions, the weight of each
-    # the product of its D one-dimensional weights. The widths are **per
-    # dimension** (M8): a transfer can be injection in one dimension and
-    # order-p interpolation in another, and padding the narrow one to the
-    # common width with zero weights would read slots that need not hold
-    # data at all — a G = 0 face field has none beyond its high face —
-    # and `0 * NaN` is `NaN`.
-    acc = zero(eltype(dest))
-    for m in CartesianIndices(Ps)
-        moff = ntuple(d -> Tuple(m)[d] - 1, Val(D))
-        w = one(eltype(dest))
-        for d in 1:D
-            w *= weights[d][moff[d] + 1, off[d] + 1]
-        end
-        acc += w * src[ntuple(d -> base[d] + moff[d], Val(D))..., v, sblock]
-    end
-    dest[tidx..., v, tblock] = acc
+    acc = stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
+    @inbounds dest[tidx..., v, tblock] = acc
 end
 
 # Launch one group's transfers `range` — the whole group by default.
@@ -58,17 +108,22 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     n == 0 && return nothing
     blen = boxsize(group)
     prod(blen) == 0 && return nothing
-    stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
-    tfirst = ntuple(d -> group.stencils[d].targetfirst, D)
+    tfirst = ntuple(d -> group.stencils[d].targetfirst, Val(D))
     # One width per dimension, not one shared width: see the kernel.
-    orders = ntuple(d -> stencilorder(group.stencils[d]), D)
-    srcstarts = ntuple(d -> group.stencils[d].srcstart, D)
-    weights = ntuple(d -> group.stencils[d].weights, D)
-    ndrange = (prod(blen), Int(nvars), n)
+    orders = ntuple(d -> stencilorder(group.stencils[d]), Val(D))
+    srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
+    weights = ntuple(d -> group.stencils[d].weights, Val(D))
+    ndrange = (blen..., Int(nvars), n)
 
+    # A slice of a group is passed as an offset into the group's own
+    # block lists rather than as two `view`s: every kernel argument
+    # lands in a tuple that KernelAbstractions heap-allocates on each
+    # launch, and two `SubArray`s are the largest arguments here. See
+    # "What the ghost fill costs" in CODE.md for what that buys and what
+    # it does not.
     kernel! = transfer_kernel!(backend)
-    kernel!(dest, src, view(group.targetblocks, range), view(group.sourceblocks, range),
-            srcstarts, weights, tfirst, blen, stride, Val(orders), Val(D);
+    kernel!(dest, src, group.targetblocks, group.sourceblocks,
+            srcstarts, weights, tfirst, first(range) - 1, Val(orders), Val(D);
             ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
     return nothing
 end
@@ -135,25 +190,27 @@ run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
 # agree bit for bit.
 @kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
                                   @Const(firsts), @Const(origins), @Const(spacings),
-                                  boxlen::NTuple{D,Int}, boxstride::NTuple{D,Int},
                                   ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
-    cell, v, t = @index(Global, NTuple)
-    b = blocks[t]
-    δ = directions[t]
-    f = firsts[t]
+    I = @index(Global, NTuple)
+    v = I[D + 1]
+    t = I[D + 2]
+    @inbounds b = blocks[t]
+    @inbounds δ = directions[t]
+    @inbounds f = firsts[t]
 
-    r = cell - 1
-    off = ntuple(d -> (r ÷ boxstride[d]) % boxlen[d], Val(D))
-    idx = ntuple(d -> Int(f[d]) + off[d], Val(D))
+    idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
-    origin, h = origins[b], spacings[b]
+    @inbounds origin, h = origins[b], spacings[b]
     # The same expression `coordinates` forms, in the same order, from
     # the same origin and spacing, so the two agree bit for bit — half a
     # cell in a cell-centered dimension, a whole one in a vertex-like
     # dimension.
     poff = pointoffsets(h, C)
     x = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
-    work[idx..., v, b] = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
+    # `g` is the user's, and is deliberately *outside* the `@inbounds`
+    # above: whatever it indexes is checked as it would be anywhere else.
+    val = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
+    @inbounds work[idx..., v, b] = val
 end
 
 # The all-variables form of the same kernel: no variable axis in the
@@ -163,25 +220,23 @@ end
 @kernel function boundary_all_kernel!(work, g, @Const(blocks), @Const(directions),
                                       @Const(firsts), @Const(origins),
                                       @Const(spacings),
-                                      boxlen::NTuple{D,Int}, boxstride::NTuple{D,Int},
                                       ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
-    cell, t = @index(Global, NTuple)
-    b = blocks[t]
-    δ = directions[t]
-    f = firsts[t]
+    I = @index(Global, NTuple)
+    t = I[D + 1]
+    @inbounds b = blocks[t]
+    @inbounds δ = directions[t]
+    @inbounds f = firsts[t]
 
-    r = cell - 1
-    off = ntuple(d -> (r ÷ boxstride[d]) % boxlen[d], Val(D))
-    idx = ntuple(d -> Int(f[d]) + off[d], Val(D))
+    idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
-    origin, h = origins[b], spacings[b]
+    @inbounds origin, h = origins[b], spacings[b]
     poff = pointoffsets(h, C)
     x = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
     vals = g(x, ntuple(d -> Int(δ[d]), Val(D)))
     # Unrolled through `Val`, as in `coordinates_all_kernel!`.
     ntuple(Val(NV)) do v
-        work[idx..., v, b] = vals[v]
+        @inbounds work[idx..., v, b] = vals[v]
         nothing
     end
 end
@@ -251,11 +306,10 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
-        stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
         boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
                                   batch.firsts, plan.origins, plan.spacings,
-                                  blen, stride, Val(D), Val(fs.G), Val(staggers(fs));
-                                  ndrange=(prod(blen), fs.nvars, n))
+                                  Val(D), Val(fs.G), Val(staggers(fs));
+                                  ndrange=(blen..., fs.nvars, n))
     end
     synchronize(backend)
     return nothing
@@ -276,12 +330,11 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
-        stride = ntuple(d -> prod(ntuple(e -> blen[e], d - 1)), D)
         boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
                                       batch.firsts, plan.origins, plan.spacings,
-                                      blen, stride, Val(D), Val(fs.G),
+                                      Val(D), Val(fs.G),
                                       Val(staggers(fs)), Val(fs.nvars);
-                                      ndrange=(prod(blen), n))
+                                      ndrange=(blen..., n))
     end
     synchronize(backend)
     return nothing
