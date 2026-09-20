@@ -635,6 +635,114 @@ Restriction is otherwise only needed when coarsening during regridding
 and for analysis/output — there is no periodic "restrict fine onto
 coarse" step, since no overlapping coarse data exists.
 
+### What the ghost fill costs
+
+Profiling a downstream solve (TreeGeneralizedHarmonic, a uniform mesh of
+120 blocks of `8^3`) found that **the ghost machinery owned most of the
+non-compilation run time and essentially all of the remaining heap
+allocation**: the floating-point work of the physics was about 22 % of
+run self time and the transfer kernel's addressing about 19 %. That is
+the right order of magnitude to care about — and it understates the
+refined case, where the same application measures the fill at 79 % of an
+evaluation at a coarse-fine face against 22 % uniform. Four costs were
+named; all four are real, one was diagnosed wrongly, and a fifth turned
+out to be the largest. Measured here with `bench/ghosts.jl`, one thread,
+`D = 3`, `N = 8`, 4 roots per edge, 10 variables, `p = 4`, flat *self*
+time:
+
+| | before | after |
+|---|---|---|
+| uniform mesh, 64 blocks, one fill | 5.12 ms, 17552 B | **2.90 ms, 10896 B** |
+| two-level mesh, 120 blocks, one fill | 28.4 ms, 157408 B | **15.4 ms, 97504 B** |
+| two-level mesh, schedule build | 19.6 ms, 39.1 MiB | **3.15 ms, 4.28 MiB** |
+| `p = 6` schedule build | 89.5 ms, 104.4 MiB | **4.2 ms, 6.28 MiB** |
+
+The same fills at four threads, where a phase runs as slices rather than
+as one launch per group, gain slightly more: 1.01 ms → **0.53 ms**
+uniform and 6.57 ms → **2.85 ms** two-level. So this is a change to what
+the kernel does per point, not an accident of the serial schedule.
+
+**Bounds checking was the largest cost, and was not on the list**
+(found here). `checkbounds_indices` and its `size` calls were 15 % of
+the uniform fill's self time and 25 % of the two-level one — more than
+the interpolation arithmetic. Every index the transfer kernel forms is
+constructed by the schedule, whose whole job is to guarantee it: a
+target offset runs over the stencil's own `ntarget`, a source window is
+clamped into the stored extent when the stencil is built, and
+KernelAbstractions' CPU emitter guards the body with `__validindex`, so
+the global index never leaves the `ndrange`. So the kernel's reads and
+writes are `@inbounds`. That is an assertion, and it is checked rather
+than believed: CI runs `julia-runtest` with its default
+`check_bounds=yes`, which overrides `@inbounds` package-wide, so a
+stencil that walks out of its block fails there. The user's boundary
+hook is deliberately left outside the `@inbounds` region — whatever it
+indexes is checked as it would be anywhere else.
+
+**The launch is over the target box, not over a flattened copy of it.**
+The kernel took `ndrange = (prod(boxlen), nvars, ntransfers)` and
+recovered the per-axis position with an integer `div` and `rem` per
+dimension, per ghost point, per variable — 9 % of the uniform fill's
+self time, and the largest entry after the bounds checks. It is now
+`ndrange = (boxlen…, nvars, ntransfers)`, so the backend supplies the
+position and no division happens at all. `map_blocks!` already launched
+a `D + 1`-dimensional ndrange, so this is not new ground for the device
+backends; on a GPU the division moves into KernelAbstractions' own
+`expand`, where it belongs. The two boundary kernels had the same
+flattening and got the same treatment. Since this is the one change that
+alters launch geometry, it was checked on real hardware and not only
+argued: the whole suite passes on Metal (Apple M3 Pro, `Float32`).
+
+**The tensor-product sum is generated, not iterated.** `for m in
+CartesianIndices(Ps)` cost its trip count in `__inc` even though `Ps` is
+a compile-time constant, and it recomputed the full `D`-fold weight
+product at every stencil point. It is now a generated loop nest with
+literal trip counts, which hoists `D − 1` of the `D` weight loads out of
+the inner loops. The nest reproduces the old loop *exactly*, not merely
+to the same accuracy: `m_1` runs innermost, as column-major
+`CartesianIndices` iteration did, so the contributions are summed in the
+same order, and the weight product is still formed as
+`((w₁ · w₂) · …) · w_D`, since floating-point multiplication does not
+associate. Only the loads move. Ghost fills are bit-identical to the
+previous implementation across `D = 1, 2, 3`, both centerings and both
+operator families — checked by digest against the previous commit, not
+inferred.
+
+**The per-launch allocation is KernelAbstractions', not ours**
+(corrects the downstream brief, which put it on `run_group!`
+reassembling the group's geometry). Rebuilding the geometry tuples costs
+nothing measurable; what allocates is the argument tuple that
+`Kernel{CPU}`'s varargs call boxes on the way into KA's `__run`
+inference barrier — 672 B per launch, of which the group geometry
+accounted for 32. Passing a slice as an offset into the group's block
+lists instead of as two `SubArray`s, and dropping the two box-shape
+tuples the flat launch needed, brings it to 416 B. The rest is KA's and
+would take either fewer launches or a leaner launch path to remove;
+neither is worth doing for allocation alone, since at ~200 launches per
+fill it is well under a microsecond of time.
+
+**The exact rational weights are memoised.** Building them in
+`Rational{BigInt}` is deliberate — it is what makes them exact before
+the single rounding into `T` (see [Precision](#precision)) — and it was
+never in the per-evaluation path. It *is* in the per-schedule path,
+which a regridding run pays at every regrid and a test suite pays once
+per problem it builds, and it was recomputing the same few weight
+vectors thousands of times: 39 MiB of bignums for one `p = 4` schedule,
+104 MiB at `p = 6`. Lagrange weights are translation invariant — shift
+every node and the target together and every difference is unchanged,
+which in exact rational arithmetic is an identity — so a window of `p`
+consecutive integer nodes is fully described by `p` and by where the
+target falls inside it, and the package only ever asks for integer or
+quarter-integer targets. A cache keyed on that pair (and one on `p` for
+the conservative subcell weights) cuts a `p = 6` schedule build by 21x
+and its allocation by 17x, with the weights unchanged to the last bit
+because nothing about the arithmetic changed.
+
+What is left, at one thread, is loads, floating-point work, and
+KernelAbstractions' own `CartesianIndices` iteration over the workgroup
+— which is now the single largest entry in a copy-dominated fill, where
+each ghost point does exactly one stencil point of work. That is KA's
+loop, not ours, and removing it would mean not using KA's CPU emitter.
+
 ### Operators
 
 Both families' weights are built in exact rational arithmetic and rounded
