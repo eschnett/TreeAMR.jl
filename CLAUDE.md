@@ -345,27 +345,26 @@ of the *public API only*. Facts that matter here:
   checkout. A push to `main` here is immediately what TreeWave's tests see;
   an uncommitted change here is invisible to it. Before pushing an API
   change, run TreeWave's tests (`julia --project=. -e 'using Pkg;
-  Pkg.test()'` there, about 20 s), temporarily dev'ing this checkout into
+  Pkg.test()'` there, about 1.5 min), temporarily dev'ing this checkout into
   TreeWave's environment if the change is unpushed — and revert TreeWave's
-  `Project.toml` and `Manifest.toml` afterwards.
-- **TreeWave is still pre-M8 and will break when `m8` lands on `main`.**
-  Measured against this checkout: it calls `FieldSet(forest, nvars;
-  backend)` with no `G`, the three-argument `regrid!(forest, fs, schedule;
-  …)`, and `GhostSchedule(forest, ops; …)` without `G` — the first two now
-  throw by construction, which is the message M8a step 1 added for exactly
-  this caller — and `bin/visualize.jl` still calls `cell_center`, which no
-  longer exists. Note that `bin/` is outside `src/` and `test/`, so its
-  breakage does not show up in TreeWave's own test run. Porting it is part
-  of landing M8, not an afterthought: that is what the pin to `main` is
-  for.
+  `Project.toml` and `Manifest.toml` afterwards. Copying the checkout
+  somewhere scratch and repointing *its* `[sources]` at this worktree
+  leaves the real one alone and is the safer form of the same thing.
+- **TreeWave is ported to M8 and green.** It takes `FieldSet(forest,
+  nvars; G, centering, backend)`, the `fs => schedule` form of `regrid!`,
+  `GhostSchedule(fs, ops)`, and `coordinates(fs, b, idx)` in `bin/` —
+  measured against this checkout, 310 tests passing. Note that `bin/` is
+  outside `src/` and `test/`, so breakage there does *not* show up in
+  TreeWave's own test run and has to be checked by hand.
 - It calls: `Forest`, `refine!`, `balance!`, `nleaves`, `level`, `maxlevel`,
   `spacing`, `minimum_spacing`, `block_spacings`, `block_extent`,
   `coordinates`, `FieldSet`, `nblocks`, `blockkey`, `blockview`,
   `interiorview`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
   `fill_ghosts!`, `statevector`, `statearray`, `scatter!`, `gather!`,
   `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
-  `flag_blocks`, `buffered_flags`,
-  `complete_marks`, `regrid!`, `adapt_to_initial_data!`, the `RegridFlag`
+  `flag_blocks`, `buffered_flags`, `firing_boxes`,
+  `complete_marks`, `regrid!`, `adapt_to_initial_data!`, `cellcentered`,
+  `vertexcentered`, `hostcopy`, `todevice`, the `RegridFlag`
   values, and the `(flag, box)` flag form. Renaming or re-signaturing any of
   these breaks it.
 - Its `CLAUDE.md` and `CODE.md` record API sharp edges found from the
@@ -378,18 +377,40 @@ of the *public API only*. Facts that matter here:
 
 ## Downstream: TreeHydro
 
-`~/src/jl/TreeHydro` is the second worked application: Newtonian ideal
-hydrodynamics with a high-resolution shock-capturing finite-volume
-scheme — the *conservative* counterpart of TreeWave, and the first
-downstream user of M8. It is **design only so far**: its `CODE.md` is
-the whole package, nothing is implemented, and nothing here is under
-test from it yet.
+`~/src/jl/TreeHydro` (github.com/eschnett/TreeHydro.jl) is the second
+worked application: Newtonian ideal hydrodynamics with a
+high-resolution shock-capturing finite-volume scheme — the
+*conservative* counterpart of TreeWave, and the heaviest downstream user
+of M8. It is **implemented, not a sketch**: fifteen source files, its own
+CI and Codecov, and its milestones H0–H5 all marked done — the scheme,
+coarse-fine faces, regridding, Sedov, and Kelvin–Helmholtz. Its two
+"Upstream prerequisites" (`map_blocks!(…; stored = true)` and
+`AllVariables`) are satisfied and merged; that section of its `CODE.md`
+is now history rather than a request.
 
-It will lean on `map_blocks!(…; stored = true)` and `AllVariables` —
-both added here as its prerequisites, see "Application interface" in
-`CODE.md` — and on `InterfaceSchedule`/`restrict_interfaces!`,
-`CellBoundary` (it is the first caller of the physical-boundary hook at
-all; TreeWave is periodic throughout), `firing_boxes`, and
-`block_mapreduce`. Its `CODE.md` section "Upstream prerequisites" is
-where it records what it still needs from here; read it before changing
-any of those.
+Like TreeWave it pins TreeAMR to **GitHub `main`**, so the same rule
+applies: a push to `main` here is what its tests see. Its suite is much
+longer than TreeWave's — 11622 tests in about 4 minutes, against
+TreeWave's 310 in 1.5 — so TreeWave stays the cheap downstream check and
+this is the thorough one. It is worth the four minutes for anything that
+touches the exchange, the interface restriction or the operators,
+because it is the only place conservation at coarse-fine faces is
+exercised by a real scheme rather than by Burgers in `test/`.
+
+It is the only caller of several things, which makes it the only test of
+them outside this repo: `InterfaceSchedule` / `restrict_interfaces!`,
+`CellBoundary` and the physical-boundary hook at all (TreeWave is
+periodic throughout), `map_blocks!(…; stored = true)`, `AllVariables`,
+`facecentered` field sets with `G = 0`, `total_mass`, and
+`regrid!` over several `fs => schedule` pairs including `fs => nothing`.
+Beyond those it calls `FieldSet`, `Forest`, `Operators` with
+`Conservative`, `GhostSchedule`, `fill_ghosts!`, `scatter!`,
+`statevector`, `statearray`, `map_blocks!`, `block_mapreduce`,
+`volume_weighted_norm`, `firing_boxes`, `regrid!`,
+`adapt_to_initial_data!`, `fill_by_coordinates!`, `coordinates`,
+`blockkey`, `blockview`, `interiorview`, `block_extent`,
+`block_spacings`, `minimum_spacing`, `nblocks`, `nleaves`, `maxlevel`,
+`hostcopy` and `todevice`.
+
+Mesh machinery belongs here; physics belongs there — the same rule as
+for TreeWave.
