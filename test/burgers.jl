@@ -107,15 +107,20 @@ end
     m2 = Base.setindex(c, c[d] - 2, d)
     p1 = Base.setindex(c, c[d] + 1, d)
 
-    um2 = work[m2..., 1, b]
-    um1 = work[m1..., 1, b]
-    u0 = work[c..., 1, b]
-    up1 = work[p1..., 1, b]
+    # `@inbounds` as in `wave_rhs_kernel!` and for the same reason. The
+    # binding index here is `c[d] - 2`, the far end of the reconstruction
+    # stencil, which is exactly why the state carries `G = 2`; the flux
+    # set's own `G = 0` is not involved, since a face index never leaves
+    # the closed range `map_blocks!` launched over.
+    @inbounds um2 = work[m2..., 1, b]
+    @inbounds um1 = work[m1..., 1, b]
+    @inbounds u0 = work[c..., 1, b]
+    @inbounds up1 = work[p1..., 1, b]
 
     uL = um1 + burgers_slope(lim, um1 - um2, u0 - um1) / 2
     uR = u0 - burgers_slope(lim, u0 - um1, up1 - u0) / 2
 
-    flux[ntuple(e -> I[e] + GF[e], Val(D))..., 1, b] = rusanov(uL, uR)
+    @inbounds flux[ntuple(e -> I[e] + GF[e], Val(D))..., 1, b] = rusanov(uL, uR)
 end
 
 # `du = -Σ_d (F_d[i+1] - F_d[i]) / h`, over the state's owned cells and
@@ -130,11 +135,11 @@ end
     b = I[D + 1]
     c = ntuple(e -> I[e] + GF[e], Val(D))
     acc = zero(eltype(du))
-    for d in 1:D
+    @inbounds for d in 1:D
         hi = Base.setindex(c, c[d] + 1, d)
         acc += fluxes[d][hi..., 1, b] - fluxes[d][c..., 1, b]
     end
-    du[ntuple(e -> I[e], Val(D))..., 1, b] = -acc / spacings[b]
+    @inbounds du[ntuple(e -> I[e], Val(D))..., 1, b] = -acc / spacings[b]
 end
 
 """

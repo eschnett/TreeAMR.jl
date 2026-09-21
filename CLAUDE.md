@@ -24,7 +24,15 @@ once over a layout-generic schedule; then I/O (M9).
 ## Commands
 
 Full test suite (about 3 min — the thread-independence test spends ~50 s
-of that running `test/thread_workload.jl` in two subprocesses):
+of that running `test/thread_workload.jl` in two subprocesses).
+
+**The suite is compilation-bound, not kernel-bound**, so do not try to
+shorten it by making the kernels faster. Measured: annotating the test
+applications' kernels `@inbounds` made `wave_rhs_kernel!` 6.8x faster
+and left the suite at 3m11 against 3m14, inside the 7 % run-to-run
+noise; the same treatment of `test/thread_workload.jl` moved its 18.8 s
+by 2 %. CI gains nothing from such a change in any case, since
+`check_bounds: yes` overrides `@inbounds` package-wide:
 
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'
