@@ -42,10 +42,20 @@ jobs:
       - uses: JuliaRegistries/TagBot@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # A tag pushed with `GITHUB_TOKEN` does not trigger other
-          # workflows, so `Documentation.yml`'s `tags: ["*"]` build —
-          # the versioned docs — would never fire for a release. A
-          # deploy key in `DOCUMENTER_KEY` pushes the tag as a user and
-          # does trigger it. The secret is optional: if it is unset,
-          # TagBot still tags, and only the versioned docs build is lost.
+          # This key is **required**, not an optimisation, because this
+          # repository has workflow files. GitHub refuses a ref pushed
+          # with an App token whose content includes
+          # `.github/workflows/*` unless the token carries the
+          # `workflows` scope, and `GITHUB_TOKEN` structurally cannot:
+          # there is no such key in a workflow's `permissions:` block.
+          # So every tag push over HTTPS fails with "refusing to allow a
+          # GitHub App to create or update workflow". A deploy key
+          # sidesteps this by pushing over SSH as a user rather than as
+          # an App. It also makes the tag trigger `Documentation.yml`'s
+          # `tags: ["*"]` job, which an App-pushed tag would not.
+          #
+          # The secret must have a *write* deploy key registered on the
+          # repository to match; a `DOCUMENTER_KEY` with no matching
+          # deploy key authenticates as nobody and TagBot falls back to
+          # HTTPS, which is the failure above.
           ssh: ${{ secrets.DOCUMENTER_KEY }}
