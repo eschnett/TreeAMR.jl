@@ -37,6 +37,15 @@ using KernelAbstractions: @kernel, @index, @Const, get_backend, CPU
 using OrdinaryDiffEqLowOrderRK: RK4
 using SciMLBase: ODEProblem, solve
 
+# `@inbounds`, for the reason the package's own kernels are: the index
+# comes from `map_blocks!`, whose contract is that it runs over the owned
+# range, and the one point either side is what `G >= 1` guarantees is
+# there. Re-checking that in the innermost loop is what "What the ghost
+# fill costs" in CODE.md measures the price of. An application kernel is
+# the *reader's* model of how to write one, so the annotation belongs
+# here too and not only in `src/` -- with the same obligation attached:
+# it is an assertion, and CI's `check_bounds: yes` is what keeps it
+# honest by overriding it and re-checking every index.
 @kernel function wave_rhs_kernel!(du, @Const(work), @Const(spacings),
                                   ::Val{D}, ::Val{G}) where {D,G}
     I = @index(Global, NTuple)                 # (i1..iD, block)
@@ -44,17 +53,17 @@ using SciMLBase: ODEProblem, solve
     inner = ntuple(d -> I[d], Val(D))          # state-layout index
     c = ntuple(d -> I[d] + G[d], Val(D))       # working-array index
 
-    u0 = work[c..., 1, b]
+    @inbounds u0 = work[c..., 1, b]
     laplacian = zero(eltype(du))
-    for d in 1:D
+    @inbounds for d in 1:D
         up = Base.setindex(c, c[d] + 1, d)
         um = Base.setindex(c, c[d] - 1, d)
         laplacian += work[up..., 1, b] - 2 * u0 + work[um..., 1, b]
     end
-    h = spacings[b]
+    @inbounds h = spacings[b]
 
-    du[inner..., 1, b] = work[c..., 2, b]
-    du[inner..., 2, b] = laplacian / (h * h)
+    @inbounds du[inner..., 1, b] = work[c..., 2, b]
+    @inbounds du[inner..., 2, b] = laplacian / (h * h)
 end
 
 """
@@ -361,10 +370,10 @@ not depend on the backend or on how the loop was split.
                                     ::Val{N}) where {D,G,N}
     b = @index(Global)
     m = zero(eltype(peaks))
-    for c in CartesianIndices(ntuple(_ -> N, Val(D)))
+    @inbounds for c in CartesianIndices(ntuple(_ -> N, Val(D)))
         m = max(m, abs(work[ntuple(d -> Tuple(c)[d] + G[d], Val(D))..., 1, b]))
     end
-    peaks[b] = m
+    @inbounds peaks[b] = m
 end
 
 function block_peaks(fs::FieldSet{T,D}) where {T,D}
