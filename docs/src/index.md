@@ -319,11 +319,15 @@ finding when a [`GhostSchedule`](@ref) is built, the mark arithmetic in
 [`regrid!`](@ref), the boundary hook, the reductions — are parallel
 loops over blocks.
 
-Results are **bit-identical** whatever the thread count. Every parallel
-loop writes to its own slot and every reduction combines its partials in
-block order, so a run on 64 threads reproduces a run on one exactly, not
-merely to roundoff. That is worth relying on when debugging: a
-difference between two runs is never the thread count.
+Results are **bit-identical** whatever the thread count, for everything
+that is not a floating-point sum: every parallel loop writes to its own
+slot, so the state, the mesh, the schedule and every max or integer
+reduction on 64 threads reproduce a run on one exactly. A floating-point
+sum — a norm, a total mass — is promised to roundoff only, so that a
+device may reduce hierarchically and MPI may `Allreduce`; today's CPU
+fold is per-block and so still exact. That is worth relying on when
+debugging: a difference between two runs beyond the last bits of a sum
+is never the thread count.
 
 Two consequences for application code:
 

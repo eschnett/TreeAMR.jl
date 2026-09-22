@@ -5,10 +5,12 @@
 # TreeAMR cycle produces: the state vector bit for bit, the leaf array,
 # the schedule's shape, and the diagnostic reductions. Two runs at
 # different thread counts must print the same lines, character for
-# character. That is stricter than `CODE.md`'s "matches serial to
-# roundoff", and it is the property the implementation actually has:
-# every parallel loop in the package writes to its own slot and every
-# combination happens in a fixed order.
+# character. For everything but the `l2` and `mass` lines that is what
+# `CODE.md` promises — every parallel loop in the package writes to its
+# own slot. Those two are floating-point sums, promised to roundoff only
+# since M8; they are exact today because the CPU fold combines its
+# per-block partials in block order, and they are the lines to relax if
+# that ever changes. See `thread_tests.jl`.
 #
 # It is a script rather than a testset because the thread count is a
 # command-line argument to Julia and cannot be changed from inside a

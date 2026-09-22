@@ -226,13 +226,21 @@ The ideas that span several files and are easy to violate:
   `src/`; host-side driver logic (mark completion, balance, key rebuild)
   stays ordinary Julia — but *threaded* ordinary Julia, via
   `threading.jl`.
-- **Bit-identical across thread counts.** This is a hard invariant, not
-  an aspiration: no parallel loop shares an accumulator, reductions form
-  one partial per block and sum them in block order, and collecting
-  passes fill one buffer per task and concatenate in block order. A new
-  parallel loop that breaks this breaks `test/thread_tests.jl`'s
-  acceptance test, which runs `test/thread_workload.jl` in subprocesses
-  at two thread counts and compares digests byte for byte.
+- **Bit-identical across thread counts, except floating-point sums.**
+  Every work item owns its output slot, no parallel loop shares an
+  accumulator, and collecting passes fill one buffer per task and
+  concatenate in block order. That is race freedom and a hard invariant:
+  the state vector, the leaf array, the schedule and every max or
+  integer reduction are bit-identical whatever the thread count.
+  Floating-point sums are promised to roundoff only (narrowed after M8,
+  so that a device can reduce hierarchically and MPI can `Allreduce`);
+  the CPU fold is still one `mapreduce` per block summed in block
+  order, and so still exact, which is why `test/thread_tests.jl`'s
+  acceptance test — `test/thread_workload.jl` in subprocesses at two
+  thread counts, digests compared byte for byte — passes unchanged. A
+  new parallel loop that races on a slot breaks it; a reassociated sum
+  would move only its `l2` and `mass` lines, which are the ones to give
+  a tolerance if that day comes.
 - **A ghost phase is one parallel loop.** `run_phase!` in `ghosts.jl`
   flattens a phase's transfer batches into `PhaseSlice`s of roughly
   equal cell count and deals them out largest first; a batch is *not*

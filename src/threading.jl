@@ -14,10 +14,14 @@
 # Every one of them is written as "compute per block in parallel, then
 # combine in block order", never as "accumulate into shared state". The
 # partition below depends only on the item count and the thread count,
-# and the combining pass is serial and ordered, so results are
-# **bit-for-bit** independent of how many threads Julia was started
-# with — a stronger property than the "matches serial to roundoff" that
-# `CODE.md` asks of M5, and one that costs nothing but the discipline.
+# and the combining pass is serial and ordered, so everything these
+# loops produce — schedules, marks, per-block values — is **bit-for-bit**
+# independent of how many threads Julia was started with, and costs
+# nothing but the discipline. Summing floating-point partials in block
+# order is how the diagnostics happen to be written and is free here
+# too, but since M8 it is not a promise: `CODE.md` ("Parallelism")
+# guarantees a floating-point sum to roundoff only, so that a device
+# may reduce hierarchically and MPI may `Allreduce`.
 
 """
     threadchunks(n) -> Vector{UnitRange{Int}}

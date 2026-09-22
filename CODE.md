@@ -1424,15 +1424,49 @@ entries per volume — documented here, implemented post-M3.
   threaded the same way.
 
   **Bit-identical results, not merely equal to roundoff** (decided in
-  M5). No parallel loop shares an accumulator: each writes its own slot,
-  and every reduction forms one partial per block and sums the partials
-  in block order. The chunking is a function of the item count and the
-  thread count alone. So a 64-thread run reproduces a serial one exactly
-  — worth the discipline, because it makes "the thread count" something
-  a debugging session never has to consider. Collecting passes (the
-  neighbor search, the balance scan, the buffer dilation) follow the
-  same rule: each task fills a buffer of its own, and the buffers are
-  concatenated in block order.
+  M5; narrowed after M8, next paragraph). No parallel loop shares an
+  accumulator: each writes its own slot, and every reduction forms one
+  partial per block and sums the partials in block order. The chunking
+  is a function of the item count and the thread count alone. So a
+  64-thread run reproduces a serial one exactly — worth the discipline,
+  because it makes "the thread count" something a debugging session
+  never has to consider. Collecting passes (the neighbor search, the
+  balance scan, the buffer dilation) follow the same rule: each task
+  fills a buffer of its own, and the buffers are concatenated in block
+  order.
+
+  **Floating-point sums are promised to roundoff only** (narrowed after
+  M8). The paragraph above bundles two rules under one name, and only
+  one of them is about reductions. That every work item owns its output
+  slot, and every collecting pass fills one buffer per task and
+  concatenates in block order, is race freedom: it costs nothing, it
+  stays, and it is what makes the state vector, the leaf array, the
+  schedule, and every max, min or integer reduction bit-identical across
+  thread counts — and, once M7 exists, across rank counts. That the
+  partials of a floating-point *sum* are combined in block order is the
+  rule that is no longer a guarantee. It was free on the CPU, where one
+  `mapreduce` per block and a serial pass over the partials is how the
+  diagnostics would be written anyway — the M5 table was measured that
+  way, and the CPU fold is unchanged — but it prices two things the
+  design now wants: a hierarchical reduction on a device, where one work
+  item per block is the weak row of the M6 table below, and a plain
+  `Allreduce` under MPI, where identity across rank counts would mean
+  every rank seeing the same association wherever the partition falls,
+  i.e. a global gather of block partials on every reduction. What did
+  *not* force the change is worth recording, because it is the usual
+  argument: SIMD inside a block leaves thread-count identity intact,
+  since a block's partial depends on its data and the compilation target
+  and not on which thread ran it. What SIMD breaks is identity across
+  *machines*, which was never claimed and which TreeHydro measured at
+  1–4 ulp across CI runners. The claim is therefore: everything that is
+  not a floating-point sum is bit-identical across thread counts; a
+  floating-point sum is reproducible to roundoff across thread counts,
+  rank counts, backends and machines, and exactly from run to run at a
+  fixed configuration wherever the reduction underneath uses a fixed
+  tree and no atomics. `block_mapreduce` keeps returning per-block
+  values, each still bit-identical; how a caller combines them is the
+  caller's. What the narrowing permits is specified under "**Planned**"
+  below, after the M6 paragraphs it revises.
 
   **Application callbacks therefore run concurrently**: the `f(x, v)` of
   `fill_by_coordinates!` (or the `f(x)` of its `AllVariables` form), the
@@ -1590,8 +1624,10 @@ entries per volume — documented here, implemented post-M3.
   reduction would be one launch and one synchronization *per block*,
   issued from several host tasks at once; so the partials are formed in
   a single launch there instead. The CPU path is untouched — the M5
-  numbers were measured with it — and the ordered combination, which is
-  what the bit-identity rests on, is shared.
+  numbers were measured with it — and the ordered combination is
+  shared. (That combination was what the bit-identity of the sums
+  rested on; since the narrowing above it is how the code happens to be
+  written, not a promise.)
 
   **The reduction became public, as `block_mapreduce` (amended).** It
   was an internal helper, on the reasoning that the package ships the
@@ -1636,15 +1672,17 @@ entries per volume — documented here, implemented post-M3.
     meant different things on the two backends. It is now an
     `ArgumentError` saying why.
 
-  The guarantee is stated as what it is: bit-identical across thread
-  counts, because every block owns its output slot and combining happens
-  in block order. Identical across *backends* is not claimed and, for a
-  floating-point `op`, is not true — the association differs. The CPU
-  numbers did not move: `volume_weighted_norm` at `p = 1, 2, 3, ∞` and
-  `total_mass` reproduce their pre-M6 values bit for bit in `D = 1, 2, 3`
-  and in both `Float64` and `Float32`. Both paths are reachable on
-  `CPU()`, so the suite checks that they compute the same fold on every
-  run and not only where there is a device.
+  The guarantee is stated as what it is (and narrowed after M8, see
+  above): each block's value is bit-identical across thread counts,
+  because every block owns its output slot; the combination is the
+  caller's, and a floating-point one is promised to roundoff. Identical
+  across *backends* was never claimed and, for a floating-point `op`, is
+  not true — the association differs. The CPU numbers did not move:
+  `volume_weighted_norm` at `p = 1, 2, 3, ∞` and `total_mass` reproduce
+  their pre-M6 values bit for bit in `D = 1, 2, 3` and in both `Float64`
+  and `Float32`. Both paths are reachable on `CPU()`, so the suite checks
+  that they compute the same fold on every run and not only where there
+  is a device.
 
   **Measured on an H200** (960 blocks of `32^3`, 31.5M cells, `Float64`;
   the host column is the same node's 16 allocated cores under
@@ -1669,18 +1707,30 @@ entries per volume — documented here, implemented post-M3.
   should deliver and is the whole claim. Three rows deserve their
   explanation rather than a footnote:
 
-  - **The two per-block reductions are the weak rows, by choice.**
-    `volume_weighted_norm` and `firing_boxes` both run one work item per
-    *block*, so 960 work items on a device that wants tens of thousands.
-    A hierarchical reduction would fix that and would give up the
-    property that makes these functions trustworthy: one work item per
-    block, each accumulating its own cells in its own order, is
-    deterministic without a word of extra care, which is the M5
-    discipline. Neither is on the per-evaluation path — one is a
-    diagnostic, the other runs at regrid frequency — so the trade is
-    paid where it is cheap. It would have to be revisited if
-    `volume_weighted_norm` were ever wired in as an adaptive
-    integrator's `internalnorm`, which is still an open question above.
+  - **The two per-block reductions are the weak rows, by choice**
+    (revisited after M8, below). `volume_weighted_norm` and
+    `firing_boxes` both run one work item per *block*, so 960 work items
+    on a device that wants tens of thousands. A hierarchical reduction
+    would fix that and would give up the property that makes these
+    functions trustworthy: one work item per block, each accumulating
+    its own cells in its own order, is deterministic without a word of
+    extra care, which is the M5 discipline. Neither is on the
+    per-evaluation path — one is a diagnostic, the other runs at regrid
+    frequency — so the trade is paid where it is cheap. It would have to
+    be revisited if `volume_weighted_norm` were ever wired in as an
+    adaptive integrator's `internalnorm`, which is still an open
+    question above.
+
+    *Revisited after M8.* The trade is no longer cheap and the property
+    is no longer promised. TreeHydro takes a signal-speed maximum at
+    every step for its CFL condition, through `block_mapreduce`; at the
+    table's sizes that is 3.3 RHS evaluations per step on the device,
+    which under a three-stage integrator doubles the step. And the
+    argument above was only half right on its own terms: `firing_boxes`
+    reduces an integer count and integer min/max, which are
+    order-independent, so a hierarchical form of it is bit-identical
+    anyway — it was one item per block by simplicity, not by necessity.
+    Both are to be rewritten as specified under "**Planned**" below.
   - **Building the schedule does not speed up, and should not.** It is
     the host-side neighbor search, which M5 already measured as
     saturating below 3x; the device upload added to it is small enough
@@ -1698,6 +1748,64 @@ entries per volume — documented here, implemented post-M3.
   3.9M cells the RHS takes 0.0187 s against the same chip's 8 CPU
   threads at 0.0217 s, and the two triad references agree (107 against
   113 GB/s), because on that part it is one memory system either way.
+
+  **Planned: a hierarchical device reduction and a global scalar form**
+  (decided after M8, not yet implemented). Two pieces, both made
+  admissible by the narrowing of the bit-identity claim above and both
+  wanted before M7.
+
+  - **`block_mapreduce` stays as it is**: per-block, local to the
+    process, a host `Vector`. Refinement criteria are per-block by
+    nature — TreeWave's per-variable peaks and hot-cell counts,
+    TreeHydro's floor counts — and under MPI they need no communication,
+    which is why the per-block form must survive as the local one. Only
+    its contract changed, as stated above; its *device path* is what
+    gets rewritten.
+  - **The device path becomes one workgroup per block, not one work
+    item.** Each work item strides over the block's `N^D · nvars` cells
+    into a private accumulator; the workgroup then folds those in a
+    fixed tree through `@localmem` and `@synchronize`, and item one
+    writes the block's slot. No atomics and a fixed tree at a fixed
+    workgroup size: deterministic from run to run, and bit-identical for
+    an order-independent `op`. This is the bandwidth-bound shape the RHS
+    already has, and the acceptance is that the norm row tracks the RHS
+    row's ratio in the M6 table instead of sitting at 2.5 — the norm
+    reads the state vector once, a fraction of a millisecond at the
+    H200's triad rate, against 23.2 ms measured. The kernel is
+    KernelAbstractions, not an array library's `mapreduce`: the package
+    depends on KernelAbstractions alone, and a group fold is a few
+    lines. The CPU keeps the threaded per-block `mapreduce` it has —
+    that is what M5 measured, and a workgroup on the CPU backend is one
+    task looping — and both paths stay reachable on `CPU()`, so the
+    suite keeps checking that they compute the same fold to roundoff.
+    `firing_boxes` gets the same shape, its three order-independent
+    accumulators (count, low corner, high corner) folded the same way,
+    and stays bit-identical while doing so.
+  - **A global scalar form, `mesh_mapreduce`.** `mesh_mapreduce(f, op,
+    init, fs[, u]; vars, weight = nothing)` returns one number: the
+    per-block values of `block_mapreduce`, each scaled by `weight(key)`
+    when a weight is given, combined over the local blocks and — once
+    M7 exists — across ranks with `Allreduce`. The weight is a host
+    function of the block's key, applied on the host to the per-block
+    values before they are combined, because that is where the geometry
+    is and because the cross-block stage is `nblocks` numbers and not
+    worth a launch; it is meant for sums (a cell volume,
+    `spacing(key)^D`) and is documented as such. `volume_weighted_norm`
+    and `total_mass` become calls to it, which is how they turn global
+    in M7 without changing signature; the M7 `Allreduce` lives in
+    `mesh_mapreduce` and nowhere else, since the mesh owns the
+    communicator and an application must not be asked to. The name sits
+    beside `block_mapreduce`: one returns a value per block, the other
+    one value for the mesh.
+  - **What this changes around it.** The guidance that `block_mapreduce`
+    belongs at diagnostic or regrid frequency relaxes, once the device
+    path is bandwidth-bound, to "not inside a right-hand side": a
+    per-step reduction is then a fraction of an RHS evaluation on either
+    backend. The open question of wiring `volume_weighted_norm` in as an
+    adaptive integrator's `internalnorm` loses its cost objection at the
+    same time. The thread-independence digests do not move — the CPU
+    fold is untouched — and the device tests already compare the
+    reductions to roundoff.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
   ranks; prolongation/restriction happen on the owner of the finer data.
@@ -1727,7 +1835,10 @@ All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
 
 - Wiring `volume_weighted_norm` (implemented in M3) into adaptive
-  integrators as `internalnorm` (post-M3).
+  integrators as `internalnorm` (post-M3). Its cost objection on a
+  device — the norm at one work item per block costs three RHS
+  evaluations — goes with the planned hierarchical reduction under
+  [Parallelism](#parallelism).
 - The one-dimensional operators of the conservative family along a
   vertex-like dimension: refused until an application needs them, with
   order-`(p+1)` Lagrange as the recorded candidate (see
@@ -1792,7 +1903,10 @@ design, see the M8 entry), and the list below is in execution order.
   **bit-identical** across thread counts, checked by running a full
   adapt/evolve/regrid/evolve cycle in subprocesses at different thread
   counts and comparing digests of the state vector, the leaf array, the
-  schedule shape and the reductions. Scaling on a 64-core AMD EPYC 7532
+  schedule shape and the reductions — the floating-point sums among
+  those narrowed to a roundoff promise after M8, see
+  [Parallelism](#parallelism); the digests still agree, because the CPU
+  fold did not change. Scaling on a 64-core AMD EPYC 7532
   (8 NUMA domains, 960 blocks of `32^3`): **36.3x** on the RHS path,
   59.5x on the compute-bound initial-data pass, with the table and the
   two findings that got it there — a phase must be one parallel loop,
@@ -1936,8 +2050,12 @@ design, see the M8 entry), and the list below is in execution order.
     bit.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
-  transfers over the same schedule machinery), distributed regridding.
-  *Accept:* results match serial; weak-scaling smoke test; then MPI+GPU
-  with CUDA-aware MPI.
+  transfers over the same schedule machinery), distributed regridding,
+  and the `Allreduce` inside `mesh_mapreduce` (the planned global
+  reduction under [Parallelism](#parallelism)), the one place a
+  communicator appears in a reduction. *Accept:* results match serial
+  to roundoff — bit-identical for everything but floating-point sums,
+  as [Parallelism](#parallelism) states; weak-scaling smoke test; then
+  MPI+GPU with CUDA-aware MPI.
 - **M9 — I/O and visualization.** HDF5 output, checkpoint/restart, VTK
   export.

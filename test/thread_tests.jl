@@ -3,10 +3,14 @@
 # Two things are asserted here. The host-side helpers partition work
 # correctly and thread-safely, and — the milestone's acceptance test —
 # a complete cycle produces *bit-identical* results whatever thread
-# count Julia was started with. `CODE.md` asks only for agreement to
-# roundoff; the implementation gives exact agreement, because every
-# parallel loop writes to its own slot and every combination of partial
-# results happens in a fixed order, so that is what is tested.
+# count Julia was started with. For the state vector, the leaf array,
+# the schedule and the max norm that is what `CODE.md` promises: every
+# parallel loop writes to its own slot. For the two floating-point sums
+# in the digest (`l2`, `mass`) `CODE.md` promises roundoff only, since
+# M8; they come out exact because the CPU fold sums its per-block
+# partials in block order, and they are the lines to give a tolerance
+# if that fold is ever reassociated. Everything else must stay exact —
+# that is the race detector.
 
 using TreeAMR: threadchunks, threaded_foreach, TransferGroup, ntransfers
 

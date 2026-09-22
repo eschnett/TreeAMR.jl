@@ -183,10 +183,15 @@ end
 # Per-block reductions.
 #
 # Every diagnostic in the package has the same shape: one value per
-# block, then a serial pass over those values *in block order*. That
-# ordering is what makes the result bit-for-bit independent of the
-# thread count (M5), and it is preserved here — only how the per-block
-# values are produced changes with the backend.
+# block, then a serial pass over those values *in block order*. Each
+# block's value is bit-for-bit independent of the thread count (M5),
+# because it is computed from that block's cells alone; the ordered
+# pass over them keeps the sums exact across thread counts too, which
+# is how the code is written but, since M8, not what is promised — a
+# floating-point sum is guaranteed to roundoff only, so that the device
+# path may become a hierarchical reduction and M7 may `Allreduce`
+# (`CODE.md`, "Parallelism"). Only how the per-block values are
+# produced changes with the backend.
 #
 # On the CPU they are threaded host reductions over per-block views,
 # which is what M5 measured and what the recorded numbers were taken
@@ -194,8 +199,10 @@ end
 # one device-to-host synchronization *per block*, issued from several
 # host tasks at once — so there it becomes a single launch with one work
 # item per block, each looping over its own cells. Every work item owns
-# its output slot, so this is deterministic by construction: the same
-# discipline as everywhere else.
+# its output slot, so this is deterministic by construction. It is also
+# the weak row of the M6 table — 960 work items on a device that wants
+# tens of thousands — and is to be replaced by one workgroup per block
+# with a fixed-tree fold, as `CODE.md` specifies under "Planned".
 #
 # The two paths share one specification of the reduction, `(f, op,
 # init)`. They did not always: an earlier version passed a host
@@ -289,11 +296,10 @@ an integer or a contiguous range of variable indices.
 This is the read-side counterpart of [`map_blocks!`](@ref), and it is
 the shape every diagnostic here has. Combining the values is left to the
 caller, because the useful combination usually weights each block by its
-own geometry first — see [`total_mass`](@ref). Combine them **in block
-order** (`sum`, `maximum`, a loop over `1:nblocks(fs)`) and the answer
-does not depend on the thread count; a running total split across tasks
-would not, which is why this returns the per-block values rather than a
-number.
+own geometry first — see [`total_mass`](@ref). Each block's value is
+bit-identical whatever the thread count, since it is computed from that
+block's cells alone; a floating-point combination of them is promised
+to roundoff only, whichever way it is written.
 
 The largest value of each variable, which a refinement criterion needs
 for its scale:
@@ -310,9 +316,10 @@ regrid frequency — not inside a right-hand side.
 
 The fold is one specification on both backends, but its *association* is
 not: the host's `mapreduce` may reassociate `op` where the kernel's
-sequential loop cannot. The guarantee is bit-identical results across
-thread counts, which is what `CODE.md` claims; identical results across
-backends is not claimed and, for floating-point `op`, not true.
+sequential loop cannot. The guarantee is per-block values that are
+bit-identical across thread counts and, for a floating-point `op`, agree
+to roundoff across backends — identical across backends is not claimed,
+and is not true.
 
 !!! note "Callbacks on a device"
     `f` and `op` become kernel arguments, so everything they close over
@@ -352,16 +359,18 @@ norm silently emphasizes them. This is also the shape an adaptive
 integrator's `internalnorm` needs; through M3 only fixed-`dt`
 integrators are exercised, so it is used here for error measurement.
 
-Threaded over blocks, with the per-block partials combined in block
-order, so the value does not depend on the thread count.
+Threaded over blocks. The value is reproducible to roundoff across
+thread counts and backends; on the CPU, where the partials are combined
+in block order, it is exact across thread counts as well.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
     forest = fs.forest
     R = float(real(T))
 
     # One partial per block, then a serial pass over them in block
-    # order: threaded, and bit-for-bit independent of the thread count,
-    # which a running total split across tasks would not be.
+    # order: threaded, and on the CPU bit-for-bit independent of the
+    # thread count — which is how it is written, not what is promised
+    # (a sum is guaranteed to roundoff only; `CODE.md`, "Parallelism").
     if isinf(p)
         partials = block_mapreduce(abs, max, zero(R), fs, u)
         return isempty(partials) ? zero(R) : maximum(partials)
