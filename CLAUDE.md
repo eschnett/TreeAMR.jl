@@ -335,7 +335,13 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. Not registered.
+  only. **Registered in General** since 2026-09-21; 0.1.1 is the current
+  release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
+  GitHub release for each registered version, and needs the write deploy
+  key behind `DOCUMENTER_KEY` to push them — the file says why. Both
+  downstreams bound TreeAMR by `[compat]` over the `0.1` series, so a
+  `0.1.x` release lands on their next resolve, and an API break has to go
+  to `0.2`.
 - All `Manifest.toml` files (root, `test/`, `docs/`) and `docs/build/` are
   gitignored.
 - `.claude/worktrees/` holds a leftover git worktree from an earlier session.
@@ -349,32 +355,37 @@ application: the scalar wave equation with a Löhner refinement criterion,
 ported from `test/wave.jl`. It exists so that there is a real downstream user
 of the *public API only*. Facts that matter here:
 
-- It pins TreeAMR to **GitHub `main`** via a `[sources]` entry, not to this
-  checkout. A push to `main` here is immediately what TreeWave's tests see;
-  an uncommitted change here is invisible to it. Before pushing an API
-  change, run TreeWave's tests (`julia --project=. -e 'using Pkg;
-  Pkg.test()'` there, about 1.5 min), temporarily dev'ing this checkout into
-  TreeWave's environment if the change is unpushed — and revert TreeWave's
-  `Project.toml` and `Manifest.toml` afterwards. Copying the checkout
-  somewhere scratch and repointing *its* `[sources]` at this worktree
-  leaves the real one alone and is the safer form of the same thing.
+- It takes TreeAMR from the **General registry**, not from `main` and not
+  from this checkout: `Project.toml` bounds it with `TreeAMR = "0.1.0"`
+  under `[compat]`, and `bin/Project.toml` inherits that bound through
+  its `TreeWave = {path = ".."}` source. The `[sources]` pins to `main`
+  went when 0.1.1 was released, which is also what dropped its Julia
+  floor to 1.10. So neither a push to `main` nor an uncommitted change
+  here reaches it; a change arrives with the next release. Before
+  tagging one that touches the API, run TreeWave's tests (`julia
+  --project=. -e 'using Pkg; Pkg.test()'` there, about 1.5 min) against
+  this checkout: copy TreeWave somewhere scratch and `Pkg.develop` this
+  worktree into the copy, never into the real one, whose manifest would
+  keep pointing at the checkout until someone runs `Pkg.free`.
 - **TreeWave is ported to M8 and green.** It takes `FieldSet(forest,
   nvars; G, centering, backend)`, the `fs => schedule` form of `regrid!`,
   `GhostSchedule(fs, ops)`, and `coordinates(fs, b, idx)` in `bin/` —
-  measured against this checkout, 310 tests passing. Note that `bin/` is
-  outside `src/` and `test/`, so breakage there does *not* show up in
-  TreeWave's own test run and has to be checked by hand.
-- It calls: `Forest`, `refine!`, `balance!`, `nleaves`, `level`, `maxlevel`,
-  `spacing`, `minimum_spacing`, `block_spacings`, `block_extent`,
-  `coordinates`, `FieldSet`, `nblocks`, `blockkey`, `blockview`,
-  `interiorview`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
-  `fill_ghosts!`, `statevector`, `statearray`, `scatter!`, `gather!`,
-  `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
-  `flag_blocks`, `buffered_flags`, `firing_boxes`,
-  `complete_marks`, `regrid!`, `adapt_to_initial_data!`, `cellcentered`,
-  `vertexcentered`, `hostcopy`, `todevice`, the `RegridFlag`
-  values, and the `(flag, box)` flag form. Renaming or re-signaturing any of
-  these breaks it.
+  310 tests passing against the registered 0.1.1 (measured 2026-09-22).
+  `bin/` is outside `src/` and `test/`, so `Pkg.test` never runs it; its
+  CI's `viewer` job renders every figure on each push, which is what
+  catches breakage there.
+- Its `src/` calls: `Forest`, `refine!`, `balance!`, `nleaves`, `level`,
+  `maxlevel`, `spacing`, `minimum_spacing`, `block_spacings`,
+  `block_extent`, `MortonKey`, `FieldSet`, `nblocks`, `blockkey`,
+  `fill_by_coordinates!`, `Operators`, `GhostSchedule`, `fill_ghosts!`,
+  `statelength`, `statevector`, `statearray`, `scatter!`, `gather!`,
+  `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`, `flag_blocks`,
+  `firing_boxes`, `regrid!`, `adapt_to_initial_data!`, `cellcentered`,
+  `vertexcentered`, the `RegridFlag` values, and the `(flag, box)` flag
+  form; `bin/` adds `blockview`, `interiorview` and `coordinates`, and
+  its tests add `buffered_flags`, `complete_marks` and `block_origin`.
+  `hostcopy` is its own, in its `device.jl`, and it does not use
+  `todevice`. Renaming or re-signaturing any of these breaks it.
 - Its `CLAUDE.md` and `CODE.md` record API sharp edges found from the
   outside — a keyword named `maxlevel` shadows the exported
   `maxlevel(forest)` inside a function body; `coordinates` taking stored
@@ -389,36 +400,63 @@ of the *public API only*. Facts that matter here:
 worked application: Newtonian ideal hydrodynamics with a
 high-resolution shock-capturing finite-volume scheme — the
 *conservative* counterpart of TreeWave, and the heaviest downstream user
-of M8. It is **implemented, not a sketch**: fifteen source files, its own
-CI and Codecov, and its milestones H0–H5 all marked done — the scheme,
-coarse-fine faces, regridding, Sedov, and Kelvin–Helmholtz. Its two
-"Upstream prerequisites" (`map_blocks!(…; stored = true)` and
-`AllVariables`) are satisfied and merged; that section of its `CODE.md`
-is now history rather than a request.
+of M8. It is **implemented, not a sketch**: sixteen files in `src/`,
+fourteen test files, two viewers in `bin/`, its own CI and Codecov, and
+milestones H0–H5 marked done in its `CODE.md` — the scheme, coarse-fine
+faces, regridding, Sedov with the atmosphere reset, Kelvin–Helmholtz
+with its viewers — with measured results recorded through step 11;
+H6 (precision, threads, device) is next. Its two "Upstream
+prerequisites" (`map_blocks!(…; stored = true)` and `AllVariables`) are
+satisfied and released, so that section of its `CODE.md` is history.
 
-Like TreeWave it pins TreeAMR to **GitHub `main`**, so the same rule
-applies: a push to `main` here is what its tests see. Its suite is much
-longer than TreeWave's — 11622 tests in about 4 minutes, against
-TreeWave's 310 in 1.5 — so TreeWave stays the cheap downstream check and
-this is the thorough one. It is worth the four minutes for anything that
-touches the exchange, the interface restriction or the operators,
-because it is the only place conservation at coarse-fine faces is
-exercised by a real scheme rather than by Burgers in `test/`.
+It pins **neither `main` nor this checkout**: since TreeAMR 0.1.1 reached
+the General registry, its `Project.toml` and `bin/Project.toml` have no
+`[sources]` entry for TreeAMR, only `TreeAMR = "0.1.1"` under `[compat]`.
+A change here reaches its tests only once it is tagged and registered,
+a higher bar than a push; to try one sooner, `Pkg.develop` this checkout
+into a scratch copy of TreeHydro, never the real one. Its suite is much
+longer than TreeWave's — 11622 tests in 3.5 to 4.5 minutes at one
+thread, against TreeWave's 310 in 1.5 — so TreeWave stays the cheap
+downstream check and this is the thorough one. It is worth the minutes
+for anything that touches the exchange, the interface restriction or
+the operators, because it is the only place conservation at coarse-fine
+faces is exercised by a real scheme rather than by Burgers in `test/`.
 
-It is the only caller of several things, which makes it the only test of
-them outside this repo: `InterfaceSchedule` / `restrict_interfaces!`,
-`CellBoundary` and the physical-boundary hook at all (TreeWave is
-periodic throughout), `map_blocks!(…; stored = true)`, `AllVariables`,
-`facecentered` field sets with `G = 0`, `total_mass`, and
-`regrid!` over several `fs => schedule` pairs including `fs => nothing`.
-Beyond those it calls `FieldSet`, `Forest`, `Operators` with
-`Conservative`, `GhostSchedule`, `fill_ghosts!`, `scatter!`,
-`statevector`, `statearray`, `map_blocks!`, `block_mapreduce`,
-`volume_weighted_norm`, `firing_boxes`, `regrid!`,
-`adapt_to_initial_data!`, `fill_by_coordinates!`, `coordinates`,
-`blockkey`, `blockview`, `interiorview`, `block_extent`,
-`block_spacings`, `minimum_spacing`, `nblocks`, `nleaves`, `maxlevel`,
-`hostcopy` and `todevice`.
+It is the only caller of several things, which makes it the only test
+of them outside this repo: `InterfaceSchedule` / `restrict_interfaces!`,
+the physical-boundary hook at all (`boundary_by_coordinates` over an
+`AllVariables` callback; TreeWave is periodic throughout),
+`map_blocks!(…; stored = true)`, `facecentered` field sets with `G = 0`,
+`total_mass`, and `regrid!` over several `fs => schedule` pairs including
+`fs => nothing`. Beyond those its `src/` calls `Forest`, `refine!`,
+`balance!`, `nleaves`, `level`, `spacing`, `minimum_spacing`,
+`block_spacings`, `block_extent`, `FieldSet`, `nblocks`, `blockkey`,
+`coordinates`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
+`fill_ghosts!`, `statelength`, `statevector`, `statearray`, `scatter!`,
+`gather!`, `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
+`firing_boxes` with the `(flag, box)` form of `Refine`/`Keep`/`Coarsen`,
+and `adapt_to_initial_data!`. Its tests add `Conservative` (every
+`Operators` they build), `maxlevel`, `block_origin`, `cellcentered`,
+`staggers`, `RegridFlag` and `buffered_flags`; `bin/` adds
+`interiorview`. It uses neither `todevice` nor a TreeAMR `hostcopy`:
+`to_backend` and `hostcopy` are its own, in its `device.jl`.
+
+Which of its tests reach TreeAMR: `prerequisite_tests.jl` tests the mesh
+directly — `AllVariables` runs once per point, a `stored = true` launch
+reaches every ghost, and a name list asserts the resolved release still
+exports the M8 surface. The rest go through the scheme:
+`interface_tests.jl` (the fixup is what conserves at a coarse-fine face;
+the interface-order rule for a system), `sod_tests.jl` and
+`sedov_tests.jl` (the Dirichlet hook on a face, and at a corner and an
+edge — the M2 ordering case), `refinement_tests.jl` (`firing_boxes`, the
+four marks, `buffered_flags`), `driver_tests.jl` and
+`kelvinhelmholtz_tests.jl` (`regrid!`, `adapt_to_initial_data!`,
+conservation through the regrids), `evolution_tests.jl` and
+`reset_tests.jl` (`fill_ghosts!` and `map_blocks!` over `statearray`,
+through the right-hand side and the reset). `eos_`, `riemann_`,
+`exact_riemann_` and `precision_tests.jl` are pointwise physics and touch
+nothing here. Its `bin/`, like TreeWave's, is run by its CI's `viewer`
+job rather than by `Pkg.test`.
 
 Mesh machinery belongs here; physics belongs there — the same rule as
 for TreeWave.
