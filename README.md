@@ -83,10 +83,11 @@ multi-threaded on the CPU and efficiently on a GPU. If you start Julia
 with `--threads=auto` then everything is multi-threaded, with results
 that are bit-identical across thread counts except for floating-point
 sums such as norms and totals, which are promised to roundoff only (so
-that a device may reduce hierarchically and MPI may `Allreduce`). If
-you allocate the state vector storage with `backend=CUDABackend()`,
-then the data and the exchange schedule live on the device, and every
-kernel runs on the device. Both Float64 and Float32 are supported, and
+that a device may reduce hierarchically, as it does, and MPI may
+`Allreduce`). If you allocate the state vector storage with
+`backend=CUDABackend()`, then the data and the exchange schedule live
+on the device, and every kernel, the reductions included, runs on the
+device. Both Float64 and Float32 are supported, and
 the test suite passes both on CUDA (with both precisions) and on Metal
 (which does not support double precision). Some performance
 measurements are listed in [CODE.md](CODE.md#parallelism).

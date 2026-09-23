@@ -1465,8 +1465,8 @@ entries per volume — documented here, implemented post-M3.
   fixed configuration wherever the reduction underneath uses a fixed
   fold order and no atomics. `block_mapreduce` keeps returning per-block
   values, each still bit-identical; how a caller combines them is the
-  caller's. What the narrowing permits is specified under "**Planned**"
-  below, after the M6 paragraphs it revises.
+  caller's. What the narrowing permits is specified and measured under
+  "**Implemented**" below, after the M6 paragraphs it revises.
 
   **Application callbacks therefore run concurrently**: the `f(x, v)` of
   `fill_by_coordinates!` (or the `f(x)` of its `AllVariables` form), the
@@ -1730,7 +1730,7 @@ entries per volume — documented here, implemented post-M3.
     reduces an integer count and integer min/max, which are
     order-independent, so a hierarchical form of it is bit-identical
     anyway — it was one item per block by simplicity, not by necessity.
-    Both are to be rewritten as specified under "**Planned**" below.
+    Both were rewritten as specified under "**Implemented**" below.
   - **Building the schedule does not speed up, and should not.** It is
     the host-side neighbor search, which M5 already measured as
     saturating below 3x; the device upload added to it is small enough
@@ -1749,10 +1749,10 @@ entries per volume — documented here, implemented post-M3.
   threads at 0.0217 s, and the two triad references agree (107 against
   113 GB/s), because on that part it is one memory system either way.
 
-  **Planned: a hierarchical device reduction and a global scalar form**
-  (decided after M8, amended before implementation, not yet
-  implemented). Two pieces, both made admissible by the narrowing of the
-  bit-identity claim above and both wanted before M7.
+  **Implemented: the two-launch device reduction and the global scalar
+  form** (decided after M8, amended before implementation, implemented
+  and measured 2026-09-22). Two pieces, both made admissible by the
+  narrowing of the bit-identity claim above and both wanted before M7.
 
   - **`block_mapreduce` stays as it is**: per-block, local to the
     process, a host `Vector`. Refinement criteria are per-block by
@@ -1838,22 +1838,54 @@ entries per volume — documented here, implemented post-M3.
     sequential left fold (measured on 960 values, 2026-09-22). The
     weight is applied as `values[b] *= weight(key)`, the multiplication
     order `total_mass` uses today, so that stays exact too.
-  - **What this changes around it.** The guidance that `block_mapreduce`
-    belongs at diagnostic or regrid frequency relaxes, once the device
-    path is bandwidth-bound, to "not inside a right-hand side": a
-    per-step reduction is then a fraction of an RHS evaluation on either
-    backend. The open question of wiring `volume_weighted_norm` in as an
-    adaptive integrator's `internalnorm` loses its cost objection at the
-    same time. The thread-independence digests do not move — the CPU
-    fold is untouched — and that is the acceptance for the rewiring:
-    the `l2` and `mass` lines `test/thread_workload.jl` prints must be
-    identical before and after, so they are recorded first. The device
-    tests already compare the reductions to roundoff; they gain a check
-    that two device calls return identical bits, a block smaller than a
-    workgroup and one whose cell count is not a multiple of it, and
-    `firing_boxes` against the host sweep exactly. Order of work: the
-    device path, then `firing_boxes`, then the global form with the
-    rewired norm and mass, then the measurement.
+  - **What this changed around it.** The guidance that `block_mapreduce`
+    belongs at diagnostic or regrid frequency relaxed, with the device
+    path bandwidth-bound, to "not inside a right-hand side": a per-step
+    reduction is a fraction of an RHS evaluation on either backend. The
+    open question of wiring `volume_weighted_norm` in as an adaptive
+    integrator's `internalnorm` lost its cost objection at the same
+    time. The thread-independence digests did not move — the CPU fold
+    is untouched — and that was the acceptance for the rewiring: the 56
+    lines `test/thread_workload.jl` prints, the `l2` and `mass` sums
+    included, were recorded before the change and are byte for byte
+    the same after it. The device tests compare the reductions to
+    roundoff as before and gained three checks: two device calls return
+    identical bits, a block smaller than a workgroup and one whose cell
+    count is not a multiple of the lane count agree with the host, and
+    `firing_boxes` matches the host sweep exactly at those sizes too.
+
+  *Measured on the Apple M3 Pro under Metal, in `Float32`* (120 blocks
+  of `32^3`, 3.9M cells, two variables; `bench/gpu.jl`, best of 20,
+  before and after the change on the same day):
+
+  | phase                 | one item per block | two launches | speedup |
+  |---|---|---|---|
+  | RHS evaluation        | 13.0 ms | 11.7 ms | — |
+  | volume-weighted norm  | 16.3 ms | **0.67 ms** | **24x** |
+  | `firing_boxes`        |  9.2 ms | **1.84 ms** | **5.0x** |
+  | triad reference       |  1.24 ms | 1.40 ms | — |
+
+  The norm went from 1.3 RHS evaluations to 6 % of one, and reads its
+  31 MB state vector at about half the triad rate once the two launch
+  latencies, the synchronization and the copy back are counted — the
+  bandwidth-bound shape the design asked for. `firing_boxes` is 5x
+  faster but still an order of magnitude above its own bandwidth floor
+  (16 MB in 1.8 ms); the suspect is the 64-bit integer division in the
+  linear-to-Cartesian conversion of every cell, which no GPU does
+  natively, and it is left as is because the sweep runs at regrid
+  frequency. The H200 row of the M6 table above is still the
+  one-item-per-block measurement; `bench/symmetry_gpu.sh` re-measures
+  it. Two things the implementation turned up are recorded here rather
+  than lost. The lane fold in `firing_boxes` first failed to compile on
+  Metal — a closure inside `ntuple` capturing the running corner, which
+  the loop reassigns, is boxed and becomes a dynamic call — which is
+  the trap `widen_lo`/`widen_hi` already exist for, so the fold goes
+  through them too. And `fill_by_coordinates!` evaluating `sin` on the
+  device gives a value one ulp from the host's at some points in
+  `Float32`, which the one-item form had never exposed because no test
+  compared per-block maxima at those positions; the device tests now
+  reduce a copy of the device's data on the host instead of recomputing
+  it, since the reduction is what is under test, not the transcendental.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
   ranks; prolongation/restriction happen on the owner of the finer data.
@@ -1884,8 +1916,9 @@ Remaining, none blocking before their milestone:
 
 - Wiring `volume_weighted_norm` (implemented in M3) into adaptive
   integrators as `internalnorm` (post-M3). Its cost objection on a
-  device — the norm at one work item per block costs three RHS
-  evaluations — goes with the planned hierarchical reduction under
+  device — the norm at one work item per block cost three RHS
+  evaluations — went with the two-launch reduction: on Metal the norm
+  is 6 % of an RHS evaluation, measured under
   [Parallelism](#parallelism).
 - The one-dimensional operators of the conservative family along a
   vertex-like dimension: refused until an application needs them, with

@@ -160,7 +160,7 @@ layer uses only the ones before it:
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
-| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, `block_mapreduce`, `volume_weighted_norm` |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number, where M7's Allreduce will go), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 
 The ideas that span several files and are easy to violate:
@@ -233,7 +233,8 @@ The ideas that span several files and are easy to violate:
   the state vector, the leaf array, the schedule and every max or
   integer reduction are bit-identical whatever the thread count.
   Floating-point sums are promised to roundoff only (narrowed after M8,
-  so that a device can reduce hierarchically and MPI can `Allreduce`);
+  so that a device can reduce hierarchically — it does, in two launches
+  with 256 lanes per block and no barrier — and MPI can `Allreduce`);
   the CPU fold is still one `mapreduce` per block summed in block
   order, and so still exact, which is why `test/thread_tests.jl`'s
   acceptance test — `test/thread_workload.jl` in subprocesses at two
