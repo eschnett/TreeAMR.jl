@@ -1463,7 +1463,7 @@ entries per volume — documented here, implemented post-M3.
   floating-point sum is reproducible to roundoff across thread counts,
   rank counts, backends and machines, and exactly from run to run at a
   fixed configuration wherever the reduction underneath uses a fixed
-  tree and no atomics. `block_mapreduce` keeps returning per-block
+  fold order and no atomics. `block_mapreduce` keeps returning per-block
   values, each still bit-identical; how a caller combines them is the
   caller's. What the narrowing permits is specified under "**Planned**"
   below, after the M6 paragraphs it revises.
@@ -1750,9 +1750,9 @@ entries per volume — documented here, implemented post-M3.
   113 GB/s), because on that part it is one memory system either way.
 
   **Planned: a hierarchical device reduction and a global scalar form**
-  (decided after M8, not yet implemented). Two pieces, both made
-  admissible by the narrowing of the bit-identity claim above and both
-  wanted before M7.
+  (decided after M8, amended before implementation, not yet
+  implemented). Two pieces, both made admissible by the narrowing of the
+  bit-identity claim above and both wanted before M7.
 
   - **`block_mapreduce` stays as it is**: per-block, local to the
     process, a host `Vector`. Refinement criteria are per-block by
@@ -1761,26 +1761,56 @@ entries per volume — documented here, implemented post-M3.
     which is why the per-block form must survive as the local one. Only
     its contract changed, as stated above; its *device path* is what
     gets rewritten.
-  - **The device path becomes one workgroup per block, not one work
-    item.** Each work item strides over the block's `N^D · nvars` cells
-    into a private accumulator; the workgroup then folds those in a
-    fixed tree through `@localmem` and `@synchronize`, and item one
-    writes the block's slot. No atomics and a fixed tree at a fixed
-    workgroup size: deterministic from run to run, and bit-identical for
-    an order-independent `op`. This is the bandwidth-bound shape the RHS
-    already has, and the acceptance is that the norm row tracks the RHS
-    row's ratio in the M6 table instead of sitting at 2.5 — the norm
-    reads the state vector once, a fraction of a millisecond at the
-    H200's triad rate, against 23.2 ms measured. The kernel is
-    KernelAbstractions, not an array library's `mapreduce`: the package
-    depends on KernelAbstractions alone, and a group fold is a few
-    lines. The CPU keeps the threaded per-block `mapreduce` it has —
-    that is what M5 measured, and a workgroup on the CPU backend is one
-    task looping — and both paths stay reachable on `CPU()`, so the
-    suite keeps checking that they compute the same fold to roundoff.
-    `firing_boxes` gets the same shape, its three order-independent
-    accumulators (count, low corner, high corner) folded the same way,
-    and stays bit-identical while doing so.
+  - **The device path becomes one workgroup per block, in two launches
+    and with no barrier** (amended before implementation; the first
+    version of this block said a tree in local memory, see below). The
+    first launch runs 256 lanes per block, an `ndrange` of lanes times
+    blocks. Lane `l` of block `b` strides over the block's
+    `N^D · nvars` cells in linear order, `l, l + 256, …`, converting
+    each linear index to a Cartesian one so that adjacent lanes read
+    adjacent cells, folds them from `init` into a private accumulator,
+    and writes its partial to a scratch array of shape lanes by blocks.
+    The second launch is one work item per block, folding that block's
+    256 partials in lane order into its slot — a few hundred thousand
+    operations at the table's size, so it costs nothing, and it keeps
+    the copy back at `nblocks` values. Each partial is a function of the
+    block's cells and the stride alone, and the lane fold has a fixed
+    order, so the result is reproducible from run to run and exact for
+    `max`, `min` and integer sums. The first launch is the
+    bandwidth-bound shape the RHS already has, and the acceptance is
+    that the norm row tracks the RHS row's ratio in the M6 table instead
+    of sitting at 2.5 — the norm reads the state vector once, a fraction
+    of a millisecond at the H200's triad rate, against 23.2 ms measured.
+    The kernels are KernelAbstractions, not an array library's
+    `mapreduce`: the package depends on KernelAbstractions alone. The
+    CPU keeps the threaded per-block `mapreduce` it has — that is what
+    M5 measured, and a workgroup on the CPU backend is one task looping
+    — and both paths stay reachable on `CPU()`, so the suite keeps
+    checking that they compute the same fold to roundoff. `firing_boxes`
+    gets the same two launches, its three order-independent accumulators
+    (count, low corner, high corner) folded the same way, and stays
+    bit-identical while doing so.
+
+    *Why not a tree in local memory.* The barrier is the problem, on
+    the one backend where a tree gains nothing. KernelAbstractions
+    0.9.42 — the floor of this package's compat bound — implements
+    `@synchronize` on the CPU backend by splitting the kernel into
+    separate loops over the workgroup at each barrier, so a local that
+    is written before a barrier and read after it does not survive
+    unless it is declared `@private`, and a barrier inside a loop splits
+    the loop. That is a documented pitfall, it is invisible on CUDA and
+    Metal, and the CPU backend is exactly where the suite cross-checks
+    the device fold. Two launches have no barrier and nothing to get
+    wrong; the second could be folded into local memory later if it ever
+    showed in a profile, which at `nblocks` items of 256 values it will
+    not.
+  - **`init` must be a neutral element for `op`.** The first launch
+    folds `init` into every lane, so it enters the result once per lane
+    rather than once. Base's `reduce` requires exactly this of its
+    `init`, and every `init` in the package and downstream is a zero;
+    but the docstring of `block_mapreduce` says the accumulator "starts
+    at `init`", which a one-item-per-block kernel made true and a
+    hierarchical one does not, so the docstring says neutral instead.
   - **A global scalar form, `mesh_mapreduce`.** `mesh_mapreduce(f, op,
     init, fs[, u]; vars, weight = nothing)` returns one number: the
     per-block values of `block_mapreduce`, each scaled by `weight(key)`
@@ -1794,9 +1824,20 @@ entries per volume — documented here, implemented post-M3.
     and `total_mass` become calls to it, which is how they turn global
     in M7 without changing signature; the M7 `Allreduce` lives in
     `mesh_mapreduce` and nowhere else, since the mesh owns the
-    communicator and an application must not be asked to. The name sits
-    beside `block_mapreduce`: one returns a value per block, the other
-    one value for the mesh.
+    communicator and an application must not be asked to — `+`, `max`
+    and `min` map to the builtin operations, anything else to a custom
+    one. The name sits beside `block_mapreduce`: one returns a value per
+    block, the other one value for the mesh.
+
+    *The combination is `mapreduce(identity, op, values)` with no
+    `init`, and `init` is returned only for an empty vector.* This is
+    what keeps every recorded norm and mass where it is. `sum(v)` and
+    `mapreduce(identity, +, v)` agree bit for bit — both are Base's
+    pairwise `@simd` reduction — but `reduce(+, v; init = 0.0)` does
+    not, because an explicit `init` turns the combination into a
+    sequential left fold (measured on 960 values, 2026-09-22). The
+    weight is applied as `values[b] *= weight(key)`, the multiplication
+    order `total_mass` uses today, so that stays exact too.
   - **What this changes around it.** The guidance that `block_mapreduce`
     belongs at diagnostic or regrid frequency relaxes, once the device
     path is bandwidth-bound, to "not inside a right-hand side": a
@@ -1804,8 +1845,15 @@ entries per volume — documented here, implemented post-M3.
     backend. The open question of wiring `volume_weighted_norm` in as an
     adaptive integrator's `internalnorm` loses its cost objection at the
     same time. The thread-independence digests do not move — the CPU
-    fold is untouched — and the device tests already compare the
-    reductions to roundoff.
+    fold is untouched — and that is the acceptance for the rewiring:
+    the `l2` and `mass` lines `test/thread_workload.jl` prints must be
+    identical before and after, so they are recorded first. The device
+    tests already compare the reductions to roundoff; they gain a check
+    that two device calls return identical bits, a block smaller than a
+    workgroup and one whose cell count is not a multiple of it, and
+    `firing_boxes` against the host sweep exactly. Order of work: the
+    device path, then `firing_boxes`, then the global form with the
+    rewired norm and mass, then the measurement.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
   ranks; prolongation/restriction happen on the owner of the finer data.
