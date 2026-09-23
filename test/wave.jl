@@ -362,9 +362,11 @@ end
 The peak |u| of every block, as one launch on whatever backend the field
 set lives on.
 
-An application-side reduction, written the way the mesh writes its own:
-one work item per block, each looping its own cells, so the answer does
-not depend on the backend or on how the loop was split.
+An application-side reduction, written the way the mesh wrote its own
+through M8: one work item per block, each looping its own cells, so the
+answer does not depend on how the loop was split. (The mesh's own
+reductions have since become two launches over 256 lanes per block; see
+`block_mapreduce`.)
 """
 @kernel function block_peak_kernel!(peaks, @Const(work), ::Val{D}, ::Val{G},
                                     ::Val{N}) where {D,G,N}

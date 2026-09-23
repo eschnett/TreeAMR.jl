@@ -429,9 +429,10 @@ end
 
 @testset "$bname: the volume-weighted norm agrees with the CPU: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
-    # The device reduction is a per-block kernel; the CPU one is a host
-    # `sum` over views. They cannot be bit-identical — the summation
-    # orders differ — but they must agree to the precision's roundoff.
+    # The device reduction folds each block over 256 lanes; the CPU one
+    # is a host `sum` over views. They cannot be bit-identical — the
+    # summation orders differ — but they must agree to the precision's
+    # roundoff.
     forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
@@ -512,7 +513,7 @@ end
     half = T(1) / 2
     for (f, op, init) in ((identity, +, zero(T)), (abs, max, zero(T)),
                           (x -> abs(x) > half, +, 0))
-        @test block_mapreduce(f, op, init, fs) == block_mapreduce(f, op, init, fs)
+        @test isequal(block_mapreduce(f, op, init, fs), block_mapreduce(f, op, init, fs))
     end
     @test mesh_mapreduce(identity, +, zero(T), fs) ===
           mesh_mapreduce(identity, +, zero(T), fs)
@@ -526,7 +527,8 @@ end
     # Fewer cells than lanes, a cell count that is not a multiple of the
     # lane count, and an exact multiple, against the host on each. The
     # host reduces a copy of the device's values, for the reason given
-    # in the previous testset — this is where the ulp was found.
+    # in the `block_mapreduce` testset above — this is where the ulp was
+    # found.
     forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])

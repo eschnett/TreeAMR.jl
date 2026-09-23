@@ -199,18 +199,25 @@ end
 # looping its own cells — was the weak row of the M6 table, 960 work
 # items on a device that wants tens of thousands. So a device reduces
 # in two launches: `REDUCE_LANES` lanes per block, each striding over
-# the block's cells in linear order (adjacent lanes read adjacent cells)
-# into a private partial, then one work item per block folding its
-# lanes in order. There is no barrier and no local memory, deliberately:
-# KernelAbstractions realises a barrier on the CPU backend by splitting
-# the kernel into separate loops over the workgroup, so a local does not
-# survive a `@synchronize` unless it is `@private`, and the CPU backend
-# is exactly where the suite cross-checks this path. Every partial is a
-# function of the block's cells and the stride, and the lane fold has a
-# fixed order, so the device result is reproducible from run to run and
-# exact for an order-independent `op`. `init` is folded into every
-# lane, so it has to be a neutral element for `op` — which Base's
-# `reduce` requires of its `init` as well.
+# the block's cells and variables in linear order (adjacent lanes read
+# adjacent cells) into a private partial, then one work item per block
+# folding its lanes in order. There is no barrier and no local memory,
+# deliberately: KernelAbstractions realises a barrier on the CPU backend
+# by splitting the kernel into separate loops over the workgroup, so a
+# local does not survive a `@synchronize` unless it is `@private`, and
+# the CPU backend is exactly where the suite cross-checks this path.
+# Without a barrier the lanes of a block need not share a workgroup
+# either, so none is imposed: a lane is a work item of an ordinary
+# launch, and block and lane are read off the global index. (A static
+# workgroup of 256 was the first form; Metal.jl launches one without
+# checking the pipeline's own limit, so a register-heavy `f` could have
+# failed to launch.) Every partial is a function of the block's cells
+# and the stride, and the lane fold has a fixed order, so the device
+# result is reproducible from run to run and exact for an
+# order-independent `op`. `init` starts every lane, so it enters the
+# fold once per lane rather than once: it must satisfy
+# `op(init, init) == init`, which a neutral element does, and so does
+# any `init` under an idempotent `op` such as `max`.
 #
 # The two paths share one specification of the reduction, `(f, op,
 # init)`. They did not always: an earlier version passed a host
@@ -226,36 +233,38 @@ end
 # that out for itself; `block_mapreduce` does, which is why it and not
 # these is what an application calls.
 
-# Lanes per block in the device reductions. A workgroup of this size is
-# available on every backend the package has run on; a block with fewer
-# cells than lanes simply leaves the surplus lanes at `init`.
+# Lanes per block in the device reductions. A power of two, so that
+# block and lane come out of the global index as a shift and a mask; a
+# block with fewer cells times variables than lanes leaves the surplus
+# lanes at `init`.
 const REDUCE_LANES = 256
 
-# Launch one: lane `l` of block `b` folds cells `l, l + W, l + 2W, …` of
-# every selected variable, from `init`, into its own slot.
+# Launch one: lane `l` of block `b` folds entries `l, l + W, l + 2W, …`
+# of the block's cells times selected variables, cells fastest, from
+# `init`, into its own slot.
 @kernel function block_partials_kernel!(partials, @Const(array), f, op, init,
                                         firstvar::Int, lastvar::Int,
                                         ::Val{D}, ::Val{G}, ::Val{N},
                                         ::Val{W}) where {D,G,N,W}
-    b = @index(Group)
-    l = @index(Local)
+    g = @index(Global)
+    b, l = divrem(g - 1, W) .+ 1
     cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    ncells = length(cells)
     acc = init
-    for v in firstvar:lastvar
-        for i in l:W:length(cells)
-            c = Tuple(cells[i])
-            acc = op(acc, f(array[ntuple(d -> c[d] + G[d], Val(D))..., v, b]))
-        end
+    for j in l:W:(ncells * (lastvar - firstvar + 1))
+        q, r = divrem(j - 1, ncells)
+        c = Tuple(cells[r + 1])
+        acc = op(acc, f(array[ntuple(d -> c[d] + G[d], Val(D))..., firstvar + q, b]))
     end
     partials[l, b] = acc
 end
 
-# Launch two: one work item per block folds its lanes, in lane order.
-@kernel function fold_lanes_kernel!(values, @Const(partials), op, init,
-                                    ::Val{W}) where {W}
+# Launch two: one work item per block folds its lanes, in lane order,
+# starting from the first lane's partial.
+@kernel function fold_lanes_kernel!(values, @Const(partials), op, ::Val{W}) where {W}
     b = @index(Global)
-    acc = init
-    for l in 1:W
+    acc = partials[1, b]
+    for l in 2:W
         acc = op(acc, partials[l, b])
     end
     values[b] = acc
@@ -270,11 +279,11 @@ function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
     W = REDUCE_LANES
     partials = allocate(backend, R, (W, n))
     values = allocate(backend, R, (n,))
-    block_partials_kernel!(backend, W)(partials, array, f, op, init,
-                                       first(vars), last(vars),
-                                       Val(D), Val(g), Val(fs.forest.N), Val(W);
-                                       ndrange=W * n)
-    fold_lanes_kernel!(backend)(values, partials, op, init, Val(W); ndrange=n)
+    block_partials_kernel!(backend)(partials, array, f, op, init,
+                                    first(vars), last(vars),
+                                    Val(D), Val(g), Val(fs.forest.N), Val(W);
+                                    ndrange=W * n)
+    fold_lanes_kernel!(backend)(values, partials, op, Val(W); ndrange=n)
     synchronize(backend)
     return tohost(values)
 end
@@ -323,9 +332,11 @@ end
 Reduce each block's interior cells to one value: `f` transforms a cell
 value and `op` folds the transformed values, starting from `init`. The
 result is a host `Vector` of length `nblocks(fs)`, indexed by block,
-with element type taken from `init`. `init` must be a neutral element
-for `op`, as Base's `reduce` requires of its `init`: on a device the
-fold starts from it once per lane, not once per block.
+with element type taken from `init`. `init` must satisfy
+`op(init, init) == init` — a neutral element does, as Base's `reduce`
+requires of its `init`, and so does any `init` under an idempotent `op`
+such as `max` — because on a device the fold starts from it once per
+lane, not once per block.
 
 The first form reads the working array's interiors, skipping the ghosts;
 the second reads a state vector, which has no ghosts to skip. `vars` is
@@ -399,11 +410,13 @@ of `block_mapreduce`; `init` is returned for a mesh with no blocks and
 must be a neutral element for `op`.
 
 `weight` is a function of a block's [`MortonKey`](@ref), evaluated on the
-host and converted to the type of `init` before it multiplies; it is
-meant for sums, where a block's contribution has to be scaled by its
-geometry — a cell volume, `spacing(T, forest, key)^D`, is what
-[`volume_weighted_norm`](@ref) and [`total_mass`](@ref) pass. A weight
-on a `max` means nothing and is not refused.
+host and converted to the type of `init` before it multiplies each
+block's value — so `init` has to be a floating-point value when a
+weight is given. It scales a block's contribution by its geometry: a
+cell volume, `spacing(T, forest, key)^D`, is what
+[`volume_weighted_norm`](@ref) and [`total_mass`](@ref) pass to `+`,
+and a positive weight is equally meaningful under `max` or `min`, where
+`max |v| / h` is a CFL rate.
 
 This is the form a conserved total, a norm, or a CFL speed wants, and
 the one place a reduction crosses blocks: the per-block values are
@@ -478,17 +491,22 @@ function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) w
     # innermost loop — fatal on a device with no hardware fp64, and the
     # exact leak the type-genericity work went after.
     q = p isa Integer ? Int(p) : R(p)
-    cellvolume(key) = spacing(R, forest, key)^D
+    # `float(real(T))` inline rather than the local `R`: a closure over a
+    # local holding a type stores it as a `DataType` on Julia 1.10 and
+    # returns `Any`, which cost the norm a dynamic dispatch per block
+    # (found in review, measured at 2x the host time on 1.10.12).
+    cellvolume(key) = spacing(float(real(T)), forest, key)^D
     total = mesh_mapreduce(x -> abs(x)^q, +, zero(R), fs, u; weight=cellvolume)
 
-    # The domain volume as the sum of the block volumes, in a vector so
-    # that `sum` associates as it did in M3; MPI will reduce it too.
+    # The domain volume as the sum of the block volumes, through the same
+    # combination as everything else — so `sum`'s association from M3 is
+    # kept, and M7 has one place to reduce across ranks.
     cells = forest.N^D * fs.nvars
     volumes = Vector{R}(undef, nblocks(fs))
     for b in 1:nblocks(fs)
         volumes[b] = cellvolume(blockkey(fs, b)) * cells
     end
-    volume = sum(volumes)
+    volume = combine_blocks(+, zero(R), fs, volumes, nothing)
     volume == 0 && return zero(R)
     # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
     # promotes the whole result to Float64 and made this function return a

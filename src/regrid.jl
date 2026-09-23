@@ -65,18 +65,21 @@ end
 # block's cells into a private count and box, then one work item per
 # block folding its lanes. One work item per block, the M6 form, was
 # enough parallelism for a rare operation but sat at 5.5x against the
-# RHS path's 35x on the H200 (`CODE.md`, "Parallelism"). Every lane owns
-# its output slots, and a count, a min and a max are order independent,
-# so the result is bit-identical to the one-item form whatever the lane
-# count and however the lanes are scheduled.
+# RHS path's 35x on the H200 (`CODE.md`, "Parallelism") — and on the
+# CPU backend it was *serial*, since an ndrange of up to 1024 items is
+# one workgroup there. Every lane owns its output slots, and a count, a
+# min and a max are order independent, so the result is bit-identical
+# to the one-item form whatever the lane count and however the lanes
+# are scheduled.
+#
 # Widen a running bounding box by one cell. Ordinary functions rather
 # than closures written inline: `lo` and `hi` are reassigned inside the
 # loop below, and a closure capturing a reassigned local boxes it, which
 # on a device is a dynamic `getindex` and so does not compile at all.
 # (Found on Metal; it is invisible on the CPU backend, where the box
-# costs only a pointer chase.)
-# The fold over lanes below reuses them, with another lane's corner in
-# place of a cell index — the same boxing trap, in the same loop shape.
+# costs only a pointer chase.) The fold over lanes below reuses them,
+# with another lane's corner in place of a cell index — the same boxing
+# trap, in the same loop shape.
 @inline widen_lo(lo::NTuple{D,Int32}, i::NTuple{D,<:Integer}) where {D} =
     ntuple(d -> min(lo[d], Int32(i[d])), Val(D))
 @inline widen_hi(hi::NTuple{D,Int32}, i::NTuple{D,<:Integer}) where {D} =
@@ -86,8 +89,8 @@ end
                                       @Const(origins), @Const(spacings),
                                       ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
                                       ::Val{W}) where {D,G,C,N,W}
-    b = @index(Group)
-    l = @index(Local)
+    g = @index(Global)
+    b, l = divrem(g - 1, W) .+ 1
     origin, h = origins[b], spacings[b]
     # The same expression `coordinates` forms, per centering.
     off = pointoffsets(h, C)
@@ -183,9 +186,9 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     his = allocate(backend, NTuple{D,Int32}, (n,))
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    firing_lanes_kernel!(backend, W)(lcounts, llos, lhis, fs.work, fires, origins,
-                                     spacings, Val(D), Val(fs.G), Val(staggers(fs)),
-                                     Val(forest.N), Val(W); ndrange=W * n)
+    firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
+                                  spacings, Val(D), Val(fs.G), Val(staggers(fs)),
+                                  Val(forest.N), Val(W); ndrange=W * n)
     firing_fold_kernel!(backend)(counts, los, his, lcounts, llos, lhis, Val(D), Val(W);
                                  ndrange=n)
     synchronize(backend)
@@ -665,6 +668,7 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     # how it is written, not what is promised: a sum is guaranteed to
     # roundoff only, and the suite asserts exactly that on a device,
     # where the lanes split the cells differently.
+    # `float(real(T))` inline, not the local `R`: see `volume_weighted_norm`.
     return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
-                          weight=key -> spacing(R, forest, key)^D)
+                          weight=key -> spacing(float(real(T)), forest, key)^D)
 end

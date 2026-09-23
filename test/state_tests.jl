@@ -241,13 +241,24 @@ end
                                  (x -> abs(x) > half, +, 0, true))
         host = _block_mapreduce_host(f, op, init, fs.work, fs, G, 1:2)
         dev = _block_mapreduce_device(f, op, init, fs.work, fs, CPU(), G, 1:2)
-        @test dev == _block_mapreduce_device(f, op, init, fs.work, fs, CPU(), G, 1:2)
+        @test isequal(dev,
+                      _block_mapreduce_device(f, op, init, fs.work, fs, CPU(), G, 1:2))
         if exact
             @test host == dev
         else
             @test host ≈ dev rtol = 1e-12
         end
     end
+    # The state-array form has no ghost offset, and an empty variable
+    # range reduces every block to `init` — both through the same kernels.
+    u = statevector(fs)
+    gather!(u, fs)
+    sa = statearray(u, fs)
+    zg = ntuple(_ -> 0, D)
+    @test _block_mapreduce_device(abs, max, 0.0, sa, fs, CPU(), zg, 1:2) ==
+          _block_mapreduce_host(abs, max, 0.0, sa, fs, zg, 1:2)
+    @test _block_mapreduce_device(identity, +, 0.0, fs.work, fs, CPU(), G, 1:0) ==
+          zeros(nblocks(fs))
 end
 
 @testset "mesh_mapreduce combines the per-block values as M3 did: D=$D" for D in (1, 2, 3)
@@ -255,7 +266,9 @@ end
     # bit for bit — `mapreduce(identity, +, v)` does, `reduce(+, v; init)`
     # does not — or every recorded norm and mass moves in its last bits.
     # The weight scales each block's value before the combination, in
-    # the order `total_mass` has always used.
+    # the order `total_mass` has always used. (These meshes are small;
+    # the two associations only part ways past a few dozen values, which
+    # the next testset covers.)
     fs = poisoned_fieldset(Val(D), 2)
     forest = fs.forest
     values = block_mapreduce(identity, +, 0.0, fs)
@@ -283,4 +296,31 @@ end
     fs32 = FieldSet{Float32}(forest, 1; G=2)
     fill!(fs32.work, 1.0f0)
     @test mesh_mapreduce(identity, +, 0.0f0, fs32; weight=key -> 0.5) isa Float32
+end
+
+@testset "mesh_mapreduce keeps sum's association on a large mesh" begin
+    # Base's `reduce(+, v; init)` and `sum(v)` coincide for short vectors
+    # and part ways from a few dozen values on (measured: equal at 17,
+    # different at 64 and 960 on Julia 1.13), then again past the
+    # pairwise block size of 1024. So the guard for the association rule
+    # has to run on a mesh with more blocks than either threshold.
+    forest = Forest((32, 32); N=4, periodic=(true, true),
+                    extents=((0.0, 1.0), (0.0, 1.0)))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    @test nleaves(forest) > 1024
+    fs = FieldSet(forest, 1; G=1)
+    rng = MersenneTwister(11)
+    for b in 1:nblocks(fs)
+        iv = interiorview(fs, b, 1)
+        for i in eachindex(iv)
+            iv[i] = randn(rng)
+        end
+    end
+    values = block_mapreduce(identity, +, 0.0, fs)
+    @test mesh_mapreduce(identity, +, 0.0, fs) === sum(values)
+    vol(key) = spacing(Float64, forest, key)^2
+    weighted = [values[b] * vol(blockkey(fs, b)) for b in 1:nblocks(fs)]
+    @test mesh_mapreduce(identity, +, 0.0, fs; weight=vol) === sum(weighted)
+    @test total_mass(fs) === sum(weighted)
 end
