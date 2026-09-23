@@ -1526,6 +1526,94 @@ entries per volume — documented here, implemented post-M3.
   because the pass is shorter than the cost of spawning the tasks. Both
   are regrid-frequency and orders of magnitude below the regrid's own
   data movement, so neither is worth a grain-size heuristic.
+
+  **Where the 64-thread efficiency goes: the process, not the pages**
+  (measured 2026-09-23 on Symmetry, `bench/symmetry_numa.sh`, jobs
+  562390–562402; a 64-core AMD EPYC 7543 node — two sockets of four
+  NUMA domains, distance 12 within a socket and 32 across, two DDR4
+  channels per domain, so about 410 GB/s for the node — same 960 blocks
+  of `32^3` as the M5 table, Julia 1.13). The question was how much of
+  the gap to 64x a domain-local layout could recover — one MPI rank per
+  NUMA domain, or the same block ownership imitated with pinned thread
+  groups in one process. Eight independent 8-thread copies of the
+  benchmark, each bound to one domain with its own memory and holding
+  an eighth of the blocks, have no cross-domain traffic at all and so
+  bound *any* such scheme from above. Nanoseconds per cell for the whole
+  node, the slowest copy's time over all cells; five repeats of the
+  first column spread 2.05–2.45 on the RHS:
+
+  | phase                 | 1 × 64, interleaved | 1 × 64, first touch | 2 × 32, socket-local | 8 × 8, domain-local | 8 × 8, interleaved |
+  |---|---|---|---|---|---|
+  | RHS evaluation        | 2.41 | 2.42 | 1.21 | **0.73** | 0.89 |
+  | ghost fill            | 0.92 | 1.00 | 0.36 | **0.29** | 0.36 |
+  | scatter               | 0.68 | 0.73 | 0.29 | **0.16** | 0.17 |
+  | initial data          | 0.46 | 0.46 | 0.45 | 0.39 | 0.41 |
+  | volume-weighted norm  | 0.27 | 0.44 | 0.28 | 0.26 | — |
+  | triad reference       | 0.71 | 0.92 | 0.34 | 0.28 | 0.18 |
+
+  Three things follow, in decreasing order of surprise.
+
+  - *The loss is not memory placement.* The last column is the control:
+    eight 8-thread processes whose pages are interleaved over the whole
+    node, the same non-local placement as the first column, run the
+    per-evaluation path 2.7–4x faster than the one 64-thread process
+    and within 20 % of the domain-local copies. Placement itself is
+    worth about 1.2x: the same 8-thread process on domain 0 runs the
+    RHS at 5.8 ns/cell with local pages, 5.9 interleaved over the node,
+    5.6 on a same-socket domain and 8.2 on a cross-socket one. First
+    touch is within 10 % of interleaving here, against 3.6x on the
+    Rome node of the M5 table; the benchmark's first touch is parallel,
+    and Milan's fabric is forgiving. The kernel's NUMA-balancing
+    counters did not move during the runs, so page migration plays no
+    part either.
+  - *One process stops scaling at 32 threads.* At fixed placement and
+    fixed problem the RHS costs 3.02, 2.34, 2.41 and 2.37 ns/cell at
+    16, 32, 48 and 64 threads; the ghost fill 1.64, 1.11, 0.86, 0.97;
+    scatter 0.74, 0.70, 0.63, 0.68 — while the compute-bound initial
+    data goes 1.55, 0.77, 0.56, 0.47. Every memory-streaming phase
+    saturates, and the compute-bound one does not. Not the garbage
+    collector (0 ms per call, 1.7 MB allocated per RHS evaluation, all
+    of it per-task bookkeeping), not the GC or interactive thread
+    counts (`--gcthreads=1` and `-t 64,0` change nothing), not the
+    footprint (an 8-thread process over all 960 blocks runs the RHS at
+    4.7 ns/cell, no slower than over 120). Pinning (`JULIA_EXCLUSIVE=1`)
+    helps scatter 1.5x and the ghost fill 1.15x and leaves the RHS
+    where it was.
+  - *The stream itself localizes it in the launch path.* `bench/stream.jl`
+    moves the same three 717 MB arrays through four mechanisms. In one
+    64-thread interleaved process: `Threads.@threads :static` over
+    per-thread chunks 205 GB/s; one `Threads.@spawn` per chunk under
+    `@sync`, which is what the KernelAbstractions CPU backend does,
+    96 GB/s; the KernelAbstractions triad kernel 62 GB/s; the same kernel
+    under the backend's static scheduling 69 GB/s. Pinned: 138, 123,
+    115 and 131. In an 8-thread process over the same arrays all four
+    are equal at 48 GB/s, bandwidth-bound; from eight 8-thread
+    processes the KernelAbstractions kernel aggregates about 290 GB/s
+    and the static loop about 385, the latter 94 % of the node. So the
+    per-thread streaming rate of a KernelAbstractions CPU kernel falls
+    from 4–6 GB/s in an 8-thread process to 1 GB/s in a 64-thread one
+    with the same node load and the same pages, and a plain loop falls
+    by half. The mechanism is not identified — the candidates are
+    thread wake-up cascades on spawn, migration of unpinned threads
+    across sockets between launches, and something in the backend's
+    per-workgroup loop that contends only at high thread counts — and
+    identifying it needs a profiler, not another job.
+
+  What this means for the plan (decided): NUMA-aware page placement
+  inside one process is not worth building; it buys 1.2x and
+  duplicates M7. One MPI rank per NUMA domain will recover the 3x, and
+  that is one more reason for M7 — but the same 3x is available without
+  MPI, since it is a per-process software limit that eight processes on
+  one node do not share, and finding it is worth a profiling session
+  before M7 is designed around it. The M5 finding that pages must be
+  interleaved stands as advice for Rome and is harmless on Milan. And
+  the host `triad reference` figures quoted in the tables below, taken
+  before 2026-09-23, are inflated: the benchmarks left the two input
+  arrays unwritten, and on Linux an untouched allocation reads from the
+  kernel's shared zero page, so the "triad" was a write stream reporting
+  three times its bandwidth. Both benchmarks now write their inputs
+  first; the device figures, whose memory is real, are unaffected, and
+  the time ratios stand.
 - **GPU:** all kernels (ghost fill, prolongation, restriction,
   application RHS) are written with **KernelAbstractions.jl** from the
   start, so the CPU implementation is already the GPU implementation.
@@ -1701,7 +1789,11 @@ entries per volume — documented here, implemented post-M3.
   | volume-weighted norm  | 0.0232 | 0.058 | 2.5 |
   | `firing_boxes`        | 0.0160 | 0.088 | 5.5 |
   | schedule build        | 0.1114 | 0.105 | 0.9 |
-  | triad reference       | 3842 GB/s | 205 GB/s | 18.7 |
+  | triad reference       | 3842 GB/s | 205 GB/s (inflated, see below) | 18.7 |
+
+  The host triad figure is the write-stream artefact described under
+  "Where the 64-thread efficiency goes" above and overstates the host by
+  up to 3x, which would make the last ratio larger, not smaller.
 
   The per-evaluation path — the only part that runs at every RHS
   evaluation — tracks the bandwidth ratio, which is what a mesh library
@@ -1750,7 +1842,9 @@ entries per volume — documented here, implemented post-M3.
   `Float32x2` plays for the type genericity. It is not a speedup: at
   3.9M cells the RHS takes 0.0187 s against the same chip's 8 CPU
   threads at 0.0217 s, and the two triad references agree (107 against
-  113 GB/s), because on that part it is one memory system either way.
+  113 GB/s, both taken with the unwritten inputs noted above; whether
+  macOS shares a zero page the same way was not checked), because on
+  that part it is one memory system either way.
 
   **Implemented: the two-launch device reduction and the global scalar
   form** (decided after M8, amended before implementation, implemented
@@ -1931,7 +2025,7 @@ entries per volume — documented here, implemented post-M3.
   | volume-weighted norm  | 23.2 ms | **0.459 ms** | 53.1 ms | **116** |
   | `firing_boxes`        | 16.0 ms | **0.970 ms** | 21.3 ms | **22.0** |
   | RHS evaluation        |  7.0 ms | 4.57 ms | 104 ms | 22.8 |
-  | triad reference       |  0.56 ms | 0.56 ms | 8.7 ms | 15.6 |
+  | triad reference       |  0.56 ms | 0.56 ms | 8.7 ms (inflated, as in the M6 table) | 15.6 |
 
   The norm is 51x faster than the one-item form and costs 10 % of an
   RHS evaluation (0.38 ms and 8.6 % in `Float32`); `firing_boxes` is 16x
@@ -2055,7 +2149,10 @@ design, see the M8 entry), and the list below is in execution order.
   59.5x on the compute-bound initial-data pass, with the table and the
   two findings that got it there — a phase must be one parallel loop,
   and pages must be interleaved — under [Parallelism](#parallelism).
-  `bench/scan.sh` reproduces the measurement. *(Done.)*
+  `bench/scan.sh` reproduces the measurement. Re-measured on a Milan
+  node on 2026-09-23 ("Where the 64-thread efficiency goes", same
+  section): the remaining gap is a per-process limit on the streaming
+  phases, not page placement. *(Done.)*
 - **M6 — GPU.** CUDA backend via KernelAbstractions; device-resident
   data. Floating-point-type genericity *(landed early, after M5)* is a
   prerequisite that is now in place: the geometry and the interpolation
