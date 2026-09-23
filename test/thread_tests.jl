@@ -12,7 +12,8 @@
 # if that fold is ever reassociated. Everything else must stay exact —
 # that is the race detector.
 
-using TreeAMR: threadchunks, threaded_foreach, TransferGroup, ntransfers
+using TreeAMR: threadchunks, threaded_foreach, threaded_chunks, TransferGroup, ntransfers
+using KernelAbstractions: @kernel, @index, CPU
 
 @testset "Thread chunks tile 1:n without gaps or overlap" begin
     # A chunking that dropped or repeated an index would corrupt a
@@ -120,6 +121,106 @@ end
         end
         @test identical
     end
+end
+
+@testset "Every transfer group lists its targets in block order: D=$D" for D in (1, 2, 3)
+    # The ghost fill, the interface fixup and the regrid transfer give
+    # each thread the transfers whose target block it owns, found by
+    # bisection in `targetblocks`. A group whose targets were out of
+    # order would have transfers silently skipped and their ghosts left
+    # stale, so the order every builder produces is asserted for all
+    # three kinds of schedule.
+    forest = nested_forest(Val(D))
+    ops = Operators(prolongation=2, restriction=2)
+    schedule = GhostSchedule(FieldSet(forest, 1; G=1), ops)
+    ghostgroups = vcat(schedule.phase1, schedule.phase2...)
+    @test length(ghostgroups) > 1
+    @test all(g -> issorted(g.targetblocks), ghostgroups)
+
+    isched = InterfaceSchedule(FieldSet(forest, 1; G=0, centering=facecentered(D, 1)))
+    facegroups = vcat(isched.phases...)
+    @test sum(ntransfers, facegroups; init=0) > 0
+    @test all(g -> issorted(g.targetblocks), facegroups)
+
+    finest = maxlevel(forest)
+    flags = [level(k) == finest ? Coarsen : level(k) == 0 ? Refine : Keep
+             for k in forest.leaves]
+    newleaves = complete_marks(forest, flags)
+    groups = TreeAMR.transfer_groups(Float64, forest, ntuple(_ -> 1, D),
+                                     ntuple(_ -> 0, D), copy(forest.leaves), newleaves,
+                                     ops, CPU())
+    @test Set(g.kind for g in groups) == Set((:copy, :prolong, :restrict))
+    @test all(g -> issorted(g.targetblocks), groups)
+end
+
+@kernel function threadid_kernel!(ids)
+    I = @index(Global, NTuple)
+    ids[I...] = Threads.threadid()
+end
+
+@testset "Every per-block pass runs a block on the thread that owns it" begin
+    # The block-ownership policy (CODE.md, "What one process loses"):
+    # block `b` belongs to the thread whose chunk of
+    # `threadchunks(nblocks)` contains it, and the host loops and the
+    # kernel launches must both put it there, since data that changes
+    # core from one pass to the next streams at a fraction of the rate
+    # on a many-core node. Only a threaded run can tell the difference;
+    # single-threaded, everything runs on the calling thread.
+    forest = nested_forest(Val(2))
+    fs = FieldSet(forest, 1; G=1)
+    nb = nblocks(fs)
+    owner = fill(Threads.threadid(), nb)
+    if Threads.nthreads() > 1
+        offset = Threads.threadpoolsize(:interactive)
+        for (c, range) in enumerate(threadchunks(nb))
+            owner[range] .= offset + c
+        end
+    end
+
+    seen = zeros(Int, nb)
+    threaded_chunks(nb) do _, range
+        for b in range
+            seen[b] = Threads.threadid()
+        end
+    end
+    @test seen == owner
+
+    N = forest.N
+    ids = zeros(Int, N, N, nb)
+    map_blocks!(threadid_kernel!, fs, ids)
+    @test all(b -> all(==(owner[b]), view(ids, :, :, b)), 1:nb)
+    ids = zeros(Int, size(fs.work, 1), size(fs.work, 2), nb)
+    map_blocks!(threadid_kernel!, fs, ids; stored=true)
+    @test all(b -> all(==(owner[b]), view(ids, :, :, b)), 1:nb)
+end
+
+@testset "Per-block passes still run inside a caller's own threaded loop" begin
+    # The static schedule behind `launch_by_owner!` is `@threads
+    # :static`, which refuses to run inside another threaded region, so
+    # there the launch has to fall back to the default schedule rather
+    # than throw; and `threaded_chunks` uses sticky tasks of its own
+    # precisely so that it nests. Both must give the same answer as the
+    # unnested call.
+    forest = nested_forest(Val(2))
+    fs = FieldSet(forest, 1; G=1)
+    schedule = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
+    step!() = (fill_by_coordinates!((x, v) -> x[1] + 2x[2], fs); fill_ghosts!(fs, schedule))
+    fs.work .= 0
+    step!()
+    expected = copy(fs.work)
+    fs.work .= 0
+    Threads.@threads :static for i in 1:Threads.nthreads()
+        i == 1 && step!()
+    end
+    @test fs.work == expected
+
+    visits = zeros(Int, 12, 12)
+    threaded_foreach(12) do i
+        threaded_foreach(12) do j
+            visits[i, j] += 1
+        end
+    end
+    @test all(==(1), visits)
 end
 
 @testset "Results are bit-identical across thread counts" begin
