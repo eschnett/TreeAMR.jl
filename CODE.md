@@ -1597,7 +1597,8 @@ entries per volume — documented here, implemented post-M3.
     step 2 dilates. One work item per block, each looping its own cells:
     integer min/max is order-independent and every item owns its output
     slots, so the M5 determinism discipline carries over with nothing
-    added.
+    added. (Amended after M8: it is now the two-launch reduction under
+    "**Implemented**" below, 256 lanes per block, and still exact.)
 
   **The coordinate callbacks got a third form, over the variable axis**
   (amended for TreeHydro). The two forms above are about *where* a
@@ -1761,35 +1762,42 @@ entries per volume — documented here, implemented post-M3.
     which is why the per-block form must survive as the local one. Only
     its contract changed, as stated above; its *device path* is what
     gets rewritten.
-  - **The device path becomes one workgroup per block, in two launches
-    and with no barrier** (amended before implementation; the first
-    version of this block said a tree in local memory, see below). The
-    first launch runs 256 lanes per block, an `ndrange` of lanes times
-    blocks. Lane `l` of block `b` strides over the block's
-    `N^D · nvars` cells in linear order, `l, l + 256, …`, converting
-    each linear index to a Cartesian one so that adjacent lanes read
-    adjacent cells, folds them from `init` into a private accumulator,
-    and writes its partial to a scratch array of shape lanes by blocks.
-    The second launch is one work item per block, folding that block's
-    256 partials in lane order into its slot — a few hundred thousand
-    operations at the table's size, so it costs nothing, and it keeps
-    the copy back at `nblocks` values. Each partial is a function of the
-    block's cells and the stride alone, and the lane fold has a fixed
-    order, so the result is reproducible from run to run and exact for
-    `max`, `min` and integer sums. The first launch is the
-    bandwidth-bound shape the RHS already has, and the acceptance is
-    that the norm row tracks the RHS row's ratio in the M6 table instead
-    of sitting at 2.5 — the norm reads the state vector once, a fraction
-    of a millisecond at the H200's triad rate, against 23.2 ms measured.
-    The kernels are KernelAbstractions, not an array library's
-    `mapreduce`: the package depends on KernelAbstractions alone. The
-    CPU keeps the threaded per-block `mapreduce` it has — that is what
-    M5 measured, and a workgroup on the CPU backend is one task looping
-    — and both paths stay reachable on `CPU()`, so the suite keeps
-    checking that they compute the same fold to roundoff. `firing_boxes`
-    gets the same two launches, its three order-independent accumulators
-    (count, low corner, high corner) folded the same way, and stays
-    bit-identical while doing so.
+  - **The device path becomes 256 lanes per block, in two launches and
+    with no barrier** (amended before implementation; the first version of
+    this block said a tree in local memory, see below; and amended after
+    review, see the end of this bullet). The first launch has an `ndrange`
+    of lanes times blocks, and reads block and lane off the global index.
+    Lane `l` of block `b` strides over the block's `N^D · nvars` entries —
+    cells fastest, then variables — in linear order, `l, l + 256, …`,
+    converting each linear index to a Cartesian one so that adjacent lanes
+    read adjacent cells, folds them from `init` into a private accumulator,
+    and writes its partial to a scratch array of shape lanes by blocks. The
+    second launch is one work item per block, folding that block's 256
+    partials in lane order into its slot — a few hundred thousand operations
+    at the table's size, so it costs nothing, and it keeps the copy back at
+    `nblocks` values. Each partial is a function of the block's cells and
+    the stride alone, and the lane fold has a fixed order, so the result is
+    reproducible from run to run and exact for `max`, `min` and integer
+    sums. *After review:* the lanes were first a static workgroup of 256 and
+    the stride restarted for each variable. Metal.jl launches a static
+    workgroup without checking the pipeline's own thread limit, so a
+    register-heavy `f` could have failed to launch; with no barrier the
+    lanes of a block need not share a workgroup, and now do not. And
+    restarting per variable left only `N^D` lanes at work below 256 cells,
+    whatever `nvars`; the stride now runs over cells and variables together,
+    as this bullet had said all along. The first launch is the
+    bandwidth-bound shape the RHS already has, and the acceptance is that
+    the norm row tracks the RHS row's ratio in the M6 table instead of
+    sitting at 2.5 — the norm reads the state vector once, a fraction of a
+    millisecond at the H200's triad rate, against 23.2 ms measured. The
+    kernels are KernelAbstractions, not an array library's `mapreduce`: the
+    package depends on KernelAbstractions alone. The CPU keeps the threaded
+    per-block `mapreduce` it has — that is what M5 measured, and a workgroup
+    on the CPU backend is one task looping — and both paths stay reachable
+    on `CPU()`, so the suite keeps checking that they compute the same fold
+    to roundoff. `firing_boxes` gets the same two launches, its three
+    order-independent accumulators (count, low corner, high corner) folded
+    the same way, and stays bit-identical while doing so.
 
     *Why not a tree in local memory.* The barrier is the problem, on
     the one backend where a tree gains nothing. KernelAbstractions
@@ -1804,13 +1812,18 @@ entries per volume — documented here, implemented post-M3.
     wrong; the second could be folded into local memory later if it ever
     showed in a profile, which at `nblocks` items of 256 values it will
     not.
-  - **`init` must be a neutral element for `op`.** The first launch
-    folds `init` into every lane, so it enters the result once per lane
-    rather than once. Base's `reduce` requires exactly this of its
-    `init`, and every `init` in the package and downstream is a zero;
-    but the docstring of `block_mapreduce` says the accumulator "starts
-    at `init`", which a one-item-per-block kernel made true and a
-    hierarchical one does not, so the docstring says neutral instead.
+  - **`init` must satisfy `op(init, init) == init`.** The first launch
+    starts every lane from `init`, so it enters the result once per
+    lane rather than once (the second launch starts from the first
+    lane's partial, so not once more). A neutral element satisfies
+    this, which is what Base's `reduce` asks of its `init`; so does any
+    `init` under an idempotent `op`, which matters because
+    `block_mapreduce(identity, max, zero(R), …)` over signed data —
+    which the downstream packages write — is not a neutral `init` and
+    was never wrong. The docstring of `block_mapreduce` said the
+    accumulator "starts at `init`", which a one-item-per-block kernel
+    made true and a hierarchical one does not; it states the condition
+    now.
   - **A global scalar form, `mesh_mapreduce`.** `mesh_mapreduce(f, op,
     init, fs[, u]; vars, weight = nothing)` returns one number: the
     per-block values of `block_mapreduce`, each scaled by `weight(key)`
@@ -1823,8 +1836,10 @@ entries per volume — documented here, implemented post-M3.
     `spacing(key)^D`) and is documented as such. `volume_weighted_norm`
     and `total_mass` become calls to it, which is how they turn global
     in M7 without changing signature; the M7 `Allreduce` lives in
-    `mesh_mapreduce` and nowhere else, since the mesh owns the
-    communicator and an application must not be asked to — `+`, `max`
+    `mesh_mapreduce`'s combination step and nowhere else — the norm's
+    domain volume goes through the same step (amended after review,
+    which found it summed separately) — since the mesh owns the
+    communicator and an application must not be asked to. `+`, `max`
     and `min` map to the builtin operations, anything else to a custom
     one. The name sits beside `block_mapreduce`: one returns a value per
     block, the other one value for the mesh.
@@ -1855,37 +1870,54 @@ entries per volume — documented here, implemented post-M3.
     `firing_boxes` matches the host sweep exactly at those sizes too.
 
   *Measured on the Apple M3 Pro under Metal, in `Float32`* (120 blocks
-  of `32^3`, 3.9M cells, two variables; `bench/gpu.jl`, best of 20,
-  before and after the change on the same day):
+  of `32^3`, 3.9M cells, two variables; `bench/gpu.jl`, best of 20 —
+  best of 5 for `firing_boxes`, as the benchmark times it — before and
+  after the change on the same day, the "after" column being the form
+  after review):
 
   | phase                 | one item per block | two launches | speedup |
   |---|---|---|---|
-  | RHS evaluation        | 13.0 ms | 11.7 ms | — |
-  | volume-weighted norm  | 16.3 ms | **0.67 ms** | **24x** |
-  | `firing_boxes`        |  9.2 ms | **1.84 ms** | **5.0x** |
-  | triad reference       |  1.24 ms | 1.40 ms | — |
+  | RHS evaluation        | 13.0 ms | 11.5 ms | — |
+  | volume-weighted norm  | 16.3 ms | **0.85 ms** | **19x** |
+  | `firing_boxes`        |  9.2 ms | **1.76 ms** | **5.2x** |
+  | triad reference       |  1.24 ms | 1.14 ms | — |
 
-  The norm went from 1.3 RHS evaluations to 6 % of one, and reads its
-  31 MB state vector at about half the triad rate once the two launch
-  latencies, the synchronization and the copy back are counted — the
-  bandwidth-bound shape the design asked for. `firing_boxes` is 5x
-  faster but still an order of magnitude above its own bandwidth floor
-  (16 MB in 1.8 ms); the suspect is the 64-bit integer division in the
-  linear-to-Cartesian conversion of every cell, which no GPU does
-  natively, and it is left as is because the sweep runs at regrid
-  frequency. The H200 row of the M6 table above is still the
-  one-item-per-block measurement; `bench/symmetry_gpu.sh` re-measures
-  it. Two things the implementation turned up are recorded here rather
-  than lost. The lane fold in `firing_boxes` first failed to compile on
-  Metal — a closure inside `ntuple` capturing the running corner, which
-  the loop reassigns, is boxed and becomes a dynamic call — which is
-  the trap `widen_lo`/`widen_hi` already exist for, so the fold goes
-  through them too. And `fill_by_coordinates!` evaluating `sin` on the
-  device gives a value one ulp from the host's at some points in
-  `Float32`, which the one-item form had never exposed because no test
-  compared per-block maxima at those positions; the device tests now
-  reduce a copy of the device's data on the host instead of recomputing
-  it, since the reduction is what is under test, not the transcendental.
+  The norm went from 1.3 RHS evaluations to 7 % of one. Its cost is half
+  fixed: the same call on blocks of `4^3`, with almost nothing to read,
+  takes 0.38 ms — two launches, two allocations, the synchronization and the
+  copy back — and the other 0.4 ms reads the 31 MB state vector at about two
+  thirds of the triad rate, the bandwidth-bound shape the design asked for.
+  (As a static workgroup, before the review, the norm measured 0.67 ms; the
+  consecutive-lane form with the flattened stride is slower by that much and
+  is kept for the reason given above.) `firing_boxes` is 5x faster and still
+  well above its bandwidth floor, and the same small-block measurement says
+  why: 0.79 ms at `4^3` against 1.76 ms at `32^3`, so nearly half of it is
+  per-call overhead — two uploads of the block origins and spacings, six
+  allocations, two launches, three copies back. That is what to trim if it
+  ever matters; it does not at regrid frequency, so it is left as is. The
+  review also found that on the *CPU backend* the one-item form had been
+  serial all along: an ndrange of up to 1024 items is a single workgroup
+  there, i.e. one task. Measured at 120 blocks of `32^3` in `Float64`,
+  `firing_boxes` took 67 ms at one thread and 68 ms at eight before; it
+  takes 78 ms and 14.9 ms now. So the `firing_boxes` row of the H200 table
+  above compares a device against one core, not sixteen, and its 5.5x was
+  against a serial sweep. The H200 row of the M6 table is still the
+  one-item-per-block measurement, and the two-launch kernels have so far
+  been compiled and run on the CPU backend and on Metal in `Float32` only;
+  `bench/symmetry_gpu.sh` re-measures the H200 row and is the CUDA run, in
+  both precisions, that the README's claim about CUDA now depends on. Two
+  things the implementation turned up are recorded here rather than lost.
+  The lane fold in `firing_boxes` first failed to compile on Metal — a
+  closure inside `ntuple` capturing the running corner, which the loop
+  reassigns, is boxed and becomes a dynamic call — which is the trap
+  `widen_lo`/`widen_hi` already exist for, so the fold goes through them
+  too. And `fill_by_coordinates!` evaluating `sin` on the device gives a
+  value one ulp from the host's at many points in `Float32` — 8.7 % of the
+  entries, in the review's count over 11M — which the one-item form had
+  never exposed because no test compared per-block maxima at those
+  positions; the device tests now reduce a copy of the device's data on the
+  host instead of recomputing it, since the reduction is what is under
+  test, not the transcendental.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
   ranks; prolongation/restriction happen on the owner of the finer data.
