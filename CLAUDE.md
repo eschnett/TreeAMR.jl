@@ -143,6 +143,16 @@ what the numbers in CODE.md were taken with:
 TREEAMR_BENCH_N=32 TREEAMR_BENCH_ROOTS=8 bench/scan.sh 1 2 4 8
 ```
 
+`bench/symmetry_numa.sh` is the SLURM job behind the 2026-09-23 NUMA
+measurement in CODE.md ("Where the 64-thread efficiency goes"): the
+same benchmark as one 64-thread process against eight domain-bound
+8-thread processes, plus placement and thread-count controls and the
+stream microbenchmark `bench/stream.jl`. Its finding is that the
+memory-streaming phases stop scaling inside one process at 32 threads
+for a reason that is not page placement; anyone working on CPU thread
+scaling should read that paragraph first. `bench/threads.jl` also
+prints allocation and GC cost per call for the per-evaluation path.
+
 There is no formatter or linter configured.
 
 ## Architecture

@@ -84,6 +84,17 @@ end
     c[i] = a[i] + 2 * b[i]
 end
 
+# The inputs must be written before they are read. An untouched
+# allocation on Linux is backed by the kernel's single shared zero page,
+# so reading it costs nothing and a "triad" over unwritten `a` and `b`
+# is a write stream that reports three times its bandwidth (found on
+# Symmetry, 2026-09-23, when eight NUMA domains of two DDR4 channels
+# each reported 130 GB/s apiece).
+@kernel function fill_kernel!(x, v)
+    i = @index(Global, Linear)
+    x[i] = v
+end
+
 """A two-level mesh: the middle half of the domain refined once."""
 function build_forest(::Val{DD}) where {DD}
     forest = Forest(ntuple(_ -> ROOTS, DD); N=N,
@@ -165,7 +176,9 @@ function main()
         triad_kernel!(BACKEND)(c, a, b; ndrange=n)
         synchronize(BACKEND)
     end
-    triad!()                                     # also the first touch
+    fill_kernel!(BACKEND)(a, one(eltype(a)); ndrange=n)      # the first touch, in
+    fill_kernel!(BACKEND)(b, one(eltype(a)); ndrange=n)      # the partition of the
+    triad!()                                     # kernel that reads them
     t_triad = best(triad!)
 
     cells = nleaves(forest) * N^D
