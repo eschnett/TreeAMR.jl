@@ -60,36 +60,45 @@ end
 # fired) and the application supplies the *verdict*, which is physics
 # the mesh cannot know.
 #
-# One work item per block, looping that block's own cells. Regridding is
-# a rare operation and the reduction is over `N^D` cells per block, so
-# the block count is enough parallelism; more importantly, each item
-# owns its output slots and integer min/max is order independent, so the
-# result is deterministic without a word of extra care. That is the same
-# discipline as every other loop in the package.
+# The same two launches as `block_mapreduce`'s device path (see
+# `state.jl`): `REDUCE_LANES` lanes per block, each striding over the
+# block's cells into a private count and box, then one work item per
+# block folding its lanes. One work item per block, the M6 form, was
+# enough parallelism for a rare operation but sat at 5.5x against the
+# RHS path's 35x on the H200 (`CODE.md`, "Parallelism"). Every lane owns
+# its output slots, and a count, a min and a max are order independent,
+# so the result is bit-identical to the one-item form whatever the lane
+# count and however the lanes are scheduled.
 # Widen a running bounding box by one cell. Ordinary functions rather
 # than closures written inline: `lo` and `hi` are reassigned inside the
 # loop below, and a closure capturing a reassigned local boxes it, which
 # on a device is a dynamic `getindex` and so does not compile at all.
 # (Found on Metal; it is invisible on the CPU backend, where the box
 # costs only a pointer chase.)
-@inline widen_lo(lo::NTuple{D,Int32}, i::NTuple{D,Int}) where {D} =
+# The fold over lanes below reuses them, with another lane's corner in
+# place of a cell index — the same boxing trap, in the same loop shape.
+@inline widen_lo(lo::NTuple{D,Int32}, i::NTuple{D,<:Integer}) where {D} =
     ntuple(d -> min(lo[d], Int32(i[d])), Val(D))
-@inline widen_hi(hi::NTuple{D,Int32}, i::NTuple{D,Int}) where {D} =
+@inline widen_hi(hi::NTuple{D,Int32}, i::NTuple{D,<:Integer}) where {D} =
     ntuple(d -> max(hi[d], Int32(i[d])), Val(D))
 
-@kernel function firing_kernel!(counts, los, his, @Const(work), fires,
-                                @Const(origins), @Const(spacings),
-                                ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}) where {D,G,C,N}
-    b = @index(Global)
+@kernel function firing_lanes_kernel!(counts, los, his, @Const(work), fires,
+                                      @Const(origins), @Const(spacings),
+                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
+                                      ::Val{W}) where {D,G,C,N,W}
+    b = @index(Group)
+    l = @index(Local)
     origin, h = origins[b], spacings[b]
     # The same expression `coordinates` forms, per centering.
     off = pointoffsets(h, C)
+    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
 
     n = 0
     lo = ntuple(_ -> Int32(N + 1), Val(D))
     hi = ntuple(_ -> Int32(0), Val(D))
-    for c in CartesianIndices(ntuple(_ -> N, Val(D)))
-        i = ntuple(d -> Tuple(c)[d], Val(D))           # owned index, 1:N
+    for k in l:W:length(cells)
+        c = Tuple(cells[k])
+        i = ntuple(d -> c[d], Val(D))                  # owned index, 1:N
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
         x = ntuple(d -> origin[d] + (i[d] - off[d]) * h, Val(D))
         if fires(work, idx, b, x)
@@ -98,7 +107,23 @@ end
             hi = widen_hi(hi, i)
         end
     end
-    counts[b] = Int32(n)
+    counts[l, b] = Int32(n)
+    los[l, b] = lo
+    his[l, b] = hi
+end
+
+@kernel function firing_fold_kernel!(counts, los, his, @Const(lcounts), @Const(llos),
+                                     @Const(lhis), ::Val{D}, ::Val{W}) where {D,W}
+    b = @index(Global)
+    n = lcounts[1, b]
+    lo = llos[1, b]
+    hi = lhis[1, b]
+    for l in 2:W
+        n += lcounts[l, b]
+        lo = widen_lo(lo, llos[l, b])
+        hi = widen_hi(hi, lhis[l, b])
+    end
+    counts[b] = n
     los[b] = lo
     his[b] = hi
 end
@@ -149,14 +174,20 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
     n = nblocks(fs)
+    W = REDUCE_LANES
+    lcounts = allocate(backend, Int32, (W, n))
+    llos = allocate(backend, NTuple{D,Int32}, (W, n))
+    lhis = allocate(backend, NTuple{D,Int32}, (W, n))
     counts = allocate(backend, Int32, (n,))
     los = allocate(backend, NTuple{D,Int32}, (n,))
     his = allocate(backend, NTuple{D,Int32}, (n,))
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    firing_kernel!(backend)(counts, los, his, fs.work, fires, origins, spacings,
-                            Val(D), Val(fs.G), Val(staggers(fs)), Val(forest.N);
-                            ndrange=n)
+    firing_lanes_kernel!(backend, W)(lcounts, llos, lhis, fs.work, fires, origins,
+                                     spacings, Val(D), Val(fs.G), Val(staggers(fs)),
+                                     Val(forest.N), Val(W); ndrange=W * n)
+    firing_fold_kernel!(backend)(counts, los, his, lcounts, llos, lhis, Val(D), Val(W);
+                                 ndrange=n)
     synchronize(backend)
 
     hc, hlo, hhi = tohost(counts), tohost(los), tohost(his)
@@ -628,14 +659,12 @@ What [`regrid!`](@ref) does to this depends on the operator family:
 function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest
     R = float(real(T))
-    # One value per block, summed afterwards in block order, so on the
-    # CPU the answer does not move when the thread count does (M5). That
-    # exactness is how it is written, not what is promised: a sum is
-    # guaranteed to roundoff only, and the suite asserts exactly that on
-    # a device, where the fold cannot reassociate.
-    partials = block_mapreduce(identity, +, zero(R), fs; vars=var)
-    for b in 1:nblocks(fs)
-        partials[b] *= spacing(R, forest, blockkey(fs, b))^D
-    end
-    return sum(partials)
+    # A volume-weighted `mesh_mapreduce`: one value per block, scaled by
+    # its cell volume and summed on the host, so on the CPU the answer
+    # does not move when the thread count does (M5). That exactness is
+    # how it is written, not what is promised: a sum is guaranteed to
+    # roundoff only, and the suite asserts exactly that on a device,
+    # where the lanes split the cells differently.
+    return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
+                          weight=key -> spacing(R, forest, key)^D)
 end

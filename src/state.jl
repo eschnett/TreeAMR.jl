@@ -183,26 +183,34 @@ end
 # Per-block reductions.
 #
 # Every diagnostic in the package has the same shape: one value per
-# block, then a serial pass over those values *in block order*. Each
-# block's value is bit-for-bit independent of the thread count (M5),
-# because it is computed from that block's cells alone; the ordered
-# pass over them keeps the sums exact across thread counts too, which
-# is how the code is written but, since M8, not what is promised — a
-# floating-point sum is guaranteed to roundoff only, so that the device
-# path may become a hierarchical reduction and M7 may `Allreduce`
-# (`CODE.md`, "Parallelism"). Only how the per-block values are
-# produced changes with the backend.
+# block, then a pass over those values on the host. Each block's value
+# is bit-for-bit independent of the thread count (M5), because it is
+# computed from that block's cells alone; a floating-point combination
+# of the values is promised to roundoff only (`CODE.md`, "Parallelism",
+# narrowed after M8), which is what lets the device path below be
+# hierarchical and lets M7 `Allreduce`. Only how the per-block values
+# are produced changes with the backend.
 #
 # On the CPU they are threaded host reductions over per-block views,
 # which is what M5 measured and what the recorded numbers were taken
 # with. On a device that same formulation would be one kernel launch and
 # one device-to-host synchronization *per block*, issued from several
-# host tasks at once — so there it becomes a single launch with one work
-# item per block, each looping over its own cells. Every work item owns
-# its output slot, so this is deterministic by construction. It is also
-# the weak row of the M6 table — 960 work items on a device that wants
-# tens of thousands — and is to be replaced by one workgroup per block
-# with a fixed-tree fold, as `CODE.md` specifies under "Planned".
+# host tasks at once; and the M6 form — one work item per block, each
+# looping its own cells — was the weak row of the M6 table, 960 work
+# items on a device that wants tens of thousands. So a device reduces
+# in two launches: `REDUCE_LANES` lanes per block, each striding over
+# the block's cells in linear order (adjacent lanes read adjacent cells)
+# into a private partial, then one work item per block folding its
+# lanes in order. There is no barrier and no local memory, deliberately:
+# KernelAbstractions realises a barrier on the CPU backend by splitting
+# the kernel into separate loops over the workgroup, so a local does not
+# survive a `@synchronize` unless it is `@private`, and the CPU backend
+# is exactly where the suite cross-checks this path. Every partial is a
+# function of the block's cells and the stride, and the lane fold has a
+# fixed order, so the device result is reproducible from run to run and
+# exact for an order-independent `op`. `init` is folded into every
+# lane, so it has to be a neutral element for `op` — which Base's
+# `reduce` requires of its `init` as well.
 #
 # The two paths share one specification of the reduction, `(f, op,
 # init)`. They did not always: an earlier version passed a host
@@ -217,28 +225,56 @@ end
 # skipped) or the state array (`g` all zeros). Neither helper below works
 # that out for itself; `block_mapreduce` does, which is why it and not
 # these is what an application calls.
-@kernel function block_reduce_kernel!(values, @Const(array), f, op, init,
-                                      firstvar::Int, lastvar::Int,
-                                      ::Val{D}, ::Val{G}, ::Val{N}) where {D,G,N}
-    b = @index(Global)
+
+# Lanes per block in the device reductions. A workgroup of this size is
+# available on every backend the package has run on; a block with fewer
+# cells than lanes simply leaves the surplus lanes at `init`.
+const REDUCE_LANES = 256
+
+# Launch one: lane `l` of block `b` folds cells `l, l + W, l + 2W, …` of
+# every selected variable, from `init`, into its own slot.
+@kernel function block_partials_kernel!(partials, @Const(array), f, op, init,
+                                        firstvar::Int, lastvar::Int,
+                                        ::Val{D}, ::Val{G}, ::Val{N},
+                                        ::Val{W}) where {D,G,N,W}
+    b = @index(Group)
+    l = @index(Local)
+    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
     acc = init
     for v in firstvar:lastvar
-        for c in CartesianIndices(ntuple(_ -> N, Val(D)))
-            acc = op(acc, f(array[ntuple(d -> Tuple(c)[d] + G[d], Val(D))..., v, b]))
+        for i in l:W:length(cells)
+            c = Tuple(cells[i])
+            acc = op(acc, f(array[ntuple(d -> c[d] + G[d], Val(D))..., v, b]))
         end
+    end
+    partials[l, b] = acc
+end
+
+# Launch two: one work item per block folds its lanes, in lane order.
+@kernel function fold_lanes_kernel!(values, @Const(partials), op, init,
+                                    ::Val{W}) where {W}
+    b = @index(Global)
+    acc = init
+    for l in 1:W
+        acc = op(acc, partials[l, b])
     end
     values[b] = acc
 end
 
-# The device path: one launch, one work item per block, one copy back.
+# The device path: two launches, one synchronization, one copy back.
 function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
                                  backend::Backend, g::NTuple{D,Int},
                                  vars::UnitRange{Int}) where {R,T,D}
     n = nblocks(fs)
+    n == 0 && return R[]
+    W = REDUCE_LANES
+    partials = allocate(backend, R, (W, n))
     values = allocate(backend, R, (n,))
-    block_reduce_kernel!(backend)(values, array, f, op, init,
-                                  first(vars), last(vars),
-                                  Val(D), Val(g), Val(fs.forest.N); ndrange=n)
+    block_partials_kernel!(backend, W)(partials, array, f, op, init,
+                                       first(vars), last(vars),
+                                       Val(D), Val(g), Val(fs.forest.N), Val(W);
+                                       ndrange=W * n)
+    fold_lanes_kernel!(backend)(values, partials, op, init, Val(W); ndrange=n)
     synchronize(backend)
     return tohost(values)
 end
@@ -285,9 +321,11 @@ end
     block_mapreduce(f, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars)
 
 Reduce each block's interior cells to one value: `f` transforms a cell
-value and `op` folds the transformed values into an accumulator that
-starts at `init`. The result is a host `Vector` of length
-`nblocks(fs)`, indexed by block, with element type taken from `init`.
+value and `op` folds the transformed values, starting from `init`. The
+result is a host `Vector` of length `nblocks(fs)`, indexed by block,
+with element type taken from `init`. `init` must be a neutral element
+for `op`, as Base's `reduce` requires of its `init`: on a device the
+fold starts from it once per lane, not once per block.
 
 The first form reads the working array's interiors, skipping the ghosts;
 the second reads a state vector, which has no ghosts to skip. `vars` is
@@ -295,11 +333,12 @@ an integer or a contiguous range of variable indices.
 
 This is the read-side counterpart of [`map_blocks!`](@ref), and it is
 the shape every diagnostic here has. Combining the values is left to the
-caller, because the useful combination usually weights each block by its
-own geometry first — see [`total_mass`](@ref). Each block's value is
-bit-identical whatever the thread count, since it is computed from that
-block's cells alone; a floating-point combination of them is promised
-to roundoff only, whichever way it is written.
+caller, because a refinement criterion wants them per block; for one
+number over the whole mesh, weighted or not, use
+[`mesh_mapreduce`](@ref). Each block's value is bit-identical whatever
+the thread count, since it is computed from that block's cells alone; a
+floating-point combination of them is promised to roundoff only,
+whichever way it is written.
 
 The largest value of each variable, which a refinement criterion needs
 for its scale:
@@ -310,16 +349,18 @@ scales = [maximum(block_mapreduce(abs, max, zero(eltype(fs.work)), fs; vars=v))
 ```
 
 It runs wherever the data lives: threaded host reductions over per-block
-views on the CPU, one kernel work item per block on a device. It
-synchronizes and copies back to the host, so it belongs at diagnostic or
-regrid frequency — not inside a right-hand side.
+views on the CPU; on a device, one workgroup per block in two launches,
+lanes striding over the block's cells and then one work item per block
+folding the lanes. It synchronizes and copies back to the host, so it
+belongs between steps and not inside a right-hand side.
 
 The fold is one specification on both backends, but its *association* is
-not: the host's `mapreduce` may reassociate `op` where the kernel's
-sequential loop cannot. The guarantee is per-block values that are
-bit-identical across thread counts and, for a floating-point `op`, agree
-to roundoff across backends — identical across backends is not claimed,
-and is not true.
+not: the host's `mapreduce` may reassociate `op`, and the lanes of the
+device fold split the cells differently again. The guarantee is
+per-block values that are bit-identical across thread counts and, for a
+floating-point `op`, agree to roundoff across backends — identical
+across backends is not claimed, and is not true. A device value is
+reproducible from run to run, since the lane fold has a fixed order.
 
 !!! note "Callbacks on a device"
     `f` and `op` become kernel arguments, so everything they close over
@@ -347,6 +388,68 @@ function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,
 end
 
 """
+    mesh_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars, weight=nothing)
+    mesh_mapreduce(f, op, init, fs::FieldSet, u::AbstractVector;
+                   vars=1:fs.nvars, weight=nothing)
+
+Reduce the whole mesh to one number: the per-block values of
+[`block_mapreduce`](@ref), each multiplied by `weight(key)` when a
+weight is given, combined with `op`. The two forms and `vars` are those
+of `block_mapreduce`; `init` is returned for a mesh with no blocks and
+must be a neutral element for `op`.
+
+`weight` is a function of a block's [`MortonKey`](@ref), evaluated on the
+host and converted to the type of `init` before it multiplies; it is
+meant for sums, where a block's contribution has to be scaled by its
+geometry — a cell volume, `spacing(T, forest, key)^D`, is what
+[`volume_weighted_norm`](@ref) and [`total_mass`](@ref) pass. A weight
+on a `max` means nothing and is not refused.
+
+This is the form a conserved total, a norm, or a CFL speed wants, and
+the one place a reduction crosses blocks: the per-block values are
+combined on the host, and under MPI (M7) across ranks as well, so an
+application never sees a communicator. The floating-point result is
+promised to roundoff across thread counts, rank counts and backends,
+not bit for bit; see [`block_mapreduce`](@ref) for what *is* exact.
+
+The peak of a variable over the mesh, and the mass of another:
+
+```julia
+peak = mesh_mapreduce(abs, max, zero(T), fs; vars=1)
+mass = mesh_mapreduce(identity, +, zero(T), fs; vars=2,
+                      weight=key -> spacing(T, fs.forest, key)^D)
+```
+"""
+function mesh_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars, weight=nothing)
+    values = block_mapreduce(f, op, init, fs; vars=vars)
+    return combine_blocks(op, init, fs, values, weight)
+end
+
+function mesh_mapreduce(f, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars,
+                        weight=nothing)
+    values = block_mapreduce(f, op, init, fs, u; vars=vars)
+    return combine_blocks(op, init, fs, values, weight)
+end
+
+# The host stage. Two details keep every recorded norm and mass exactly
+# where the M3 code left it. The weight multiplies in place, in the
+# order `total_mass` always used. And the combination is
+# `mapreduce(identity, op, values)` *without* `init`: `sum(v)` and
+# `mapreduce(identity, +, v)` are the same pairwise reduction bit for
+# bit, whereas `reduce(+, v; init)` is a sequential left fold — an
+# explicit `init` changes Base's association (measured, 2026-09-22). The
+# M7 `Allreduce` goes here and nowhere else.
+function combine_blocks(op, init::R, fs::FieldSet, values::Vector{R}, weight) where {R}
+    if weight !== nothing
+        for b in eachindex(values)
+            values[b] *= oftype(init, weight(blockkey(fs, b)))
+        end
+    end
+    isempty(values) && return init
+    return mapreduce(identity, op, values)
+end
+
+"""
     volume_weighted_norm(fs::FieldSet, u::AbstractVector; p=2)
 
 The `p`-norm of a state vector with each cell weighted by its volume,
@@ -359,41 +462,36 @@ norm silently emphasizes them. This is also the shape an adaptive
 integrator's `internalnorm` needs; through M3 only fixed-`dt`
 integrators are exercised, so it is used here for error measurement.
 
-Threaded over blocks. The value is reproducible to roundoff across
-thread counts and backends; on the CPU, where the partials are combined
-in block order, it is exact across thread counts as well.
+A [`mesh_mapreduce`](@ref) with the cell volume as the weight. The value
+is reproducible to roundoff across thread counts and backends; on the
+CPU, where the partials are combined in block order, it is exact across
+thread counts as well.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
     forest = fs.forest
     R = float(real(T))
 
-    # One partial per block, then a serial pass over them in block
-    # order: threaded, and on the CPU bit-for-bit independent of the
-    # thread count — which is how it is written, not what is promised
-    # (a sum is guaranteed to roundoff only; `CODE.md`, "Parallelism").
-    if isinf(p)
-        partials = block_mapreduce(abs, max, zero(R), fs, u)
-        return isempty(partials) ? zero(R) : maximum(partials)
-    end
+    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u)
 
     # An integer exponent stays an integer: `abs(x)^2` is a squaring,
     # while `abs(x)^2.0` would drag a `Float64` operand into the
     # innermost loop — fatal on a device with no hardware fp64, and the
     # exact leak the type-genericity work went after.
     q = p isa Integer ? Int(p) : R(p)
-    partials = block_mapreduce(x -> abs(x)^q, +, zero(R), fs, u)
-    volumes = Vector{R}(undef, nblocks(fs))
-    cells = fs.forest.N^D * fs.nvars
-    for b in 1:nblocks(fs)
-        cellvolume = spacing(R, forest, blockkey(fs, b))^D
-        partials[b] *= cellvolume
-        volumes[b] = cellvolume * cells
-    end
+    cellvolume(key) = spacing(R, forest, key)^D
+    total = mesh_mapreduce(x -> abs(x)^q, +, zero(R), fs, u; weight=cellvolume)
 
+    # The domain volume as the sum of the block volumes, in a vector so
+    # that `sum` associates as it did in M3; MPI will reduce it too.
+    cells = forest.N^D * fs.nvars
+    volumes = Vector{R}(undef, nblocks(fs))
+    for b in 1:nblocks(fs)
+        volumes[b] = cellvolume(blockkey(fs, b)) * cells
+    end
     volume = sum(volumes)
     volume == 0 && return zero(R)
     # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
     # promotes the whole result to Float64 and made this function return a
     # different type from the `isinf(p)` branch above.
-    return (sum(partials) / volume)^inv(R(p))
+    return (total / volume)^inv(R(p))
 end

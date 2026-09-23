@@ -29,7 +29,7 @@ export Operators, OperatorFamily, PointValue, Conservative, check_operators,
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
-       block_mapreduce, volume_weighted_norm
+       block_mapreduce, mesh_mapreduce, volume_weighted_norm
 
 # Regridding (M4)
 export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_marks,

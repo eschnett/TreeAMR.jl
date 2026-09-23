@@ -224,3 +224,63 @@ end
     # An empty selection is not an error: every block reduces to `init`.
     @test block_mapreduce(identity, +, 0.0, fs; vars=1:0) == zeros(nblocks(fs))
 end
+
+@testset "The device fold is reproducible and handles any block size: D=$D, N=$N" for
+        (D, N) in ((1, 4), (2, 12), (2, 20), (3, 8))
+    # The device path folds each block over `REDUCE_LANES` lanes. A block
+    # with fewer cells than lanes leaves the surplus lanes at `init`; one
+    # whose cell count is not a multiple of the lane count leaves some
+    # lanes a cell short; 512 is an exact multiple. All must agree with
+    # the host — exactly for `max` and an integer count, to roundoff for
+    # a sum — and two device calls must return identical bits, since the
+    # lane fold has a fixed order. Reachable on `CPU()`, so checked here.
+    fs = poisoned_fieldset(Val(D), 2; N=N)
+    G = fs.G
+    half = 0.5
+    for (f, op, init, exact) in ((identity, +, 0.0, false), (abs, max, 0.0, true),
+                                 (x -> abs(x) > half, +, 0, true))
+        host = _block_mapreduce_host(f, op, init, fs.work, fs, G, 1:2)
+        dev = _block_mapreduce_device(f, op, init, fs.work, fs, CPU(), G, 1:2)
+        @test dev == _block_mapreduce_device(f, op, init, fs.work, fs, CPU(), G, 1:2)
+        if exact
+            @test host == dev
+        else
+            @test host ≈ dev rtol = 1e-12
+        end
+    end
+end
+
+@testset "mesh_mapreduce combines the per-block values as M3 did: D=$D" for D in (1, 2, 3)
+    # The whole-mesh form must reproduce `sum` over the per-block vector
+    # bit for bit — `mapreduce(identity, +, v)` does, `reduce(+, v; init)`
+    # does not — or every recorded norm and mass moves in its last bits.
+    # The weight scales each block's value before the combination, in
+    # the order `total_mass` has always used.
+    fs = poisoned_fieldset(Val(D), 2)
+    forest = fs.forest
+    values = block_mapreduce(identity, +, 0.0, fs)
+    @test mesh_mapreduce(identity, +, 0.0, fs) === sum(values)
+    @test mesh_mapreduce(abs, max, 0.0, fs) ===
+          maximum(block_mapreduce(abs, max, 0.0, fs))
+    @test mesh_mapreduce(x -> abs(x) > 0.5, +, 0, fs; vars=1) ==
+          sum(block_mapreduce(x -> abs(x) > 0.5, +, 0, fs; vars=1))
+
+    vol(key) = spacing(Float64, forest, key)^D
+    weighted = copy(values)
+    for b in 1:nblocks(fs)
+        weighted[b] *= vol(blockkey(fs, b))
+    end
+    @test mesh_mapreduce(identity, +, 0.0, fs; weight=vol) === sum(weighted)
+    @test total_mass(fs) === mesh_mapreduce(identity, +, 0.0, fs; vars=1, weight=vol)
+
+    # The state-vector form, and the weight converted to the value type
+    # before it multiplies, so a Float64 weight does not widen a Float32
+    # reduction.
+    u = statevector(fs)
+    gather!(u, fs)
+    @test mesh_mapreduce(identity, +, 0.0, fs, u) ===
+          sum(block_mapreduce(identity, +, 0.0, fs, u))
+    fs32 = FieldSet{Float32}(forest, 1; G=2)
+    fill!(fs32.work, 1.0f0)
+    @test mesh_mapreduce(identity, +, 0.0f0, fs32; weight=key -> 0.5) isa Float32
+end

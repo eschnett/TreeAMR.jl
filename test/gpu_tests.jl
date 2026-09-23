@@ -360,9 +360,12 @@ end
     @test_throws "CellBoundary" fill_ghosts!(fs, schedule; boundary=region_form)
 end
 
-@testset "$bname: firing_boxes matches a host sweep: T=$T, D=$D" for
-        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
-    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
+@testset "$bname: firing_boxes matches a host sweep: T=$T, D=$D, N=$N" for
+        (bname, backend, types) in BACKENDS, T in types,
+        (D, N) in ((1, 8), (2, 8), (2, 20), (3, 8))
+    # The block sizes cover fewer cells than the reduction has lanes, a
+    # count that is not a multiple of the lane count, and one that is.
+    forest = Forest(ntuple(_ -> 3, D); N=N, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
     balance!(forest)
@@ -455,10 +458,14 @@ end
 @testset "$bname: block_mapreduce agrees with a host sweep: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The reduction an application builds its own diagnostics on. The
-    # device forms the per-block values in one launch and the host in
+    # device forms the per-block values in two launches and the host in
     # threaded `mapreduce`s over views; only the association of `op`
     # differs, so `max` and an integer count must agree exactly and a
-    # sum to the precision's roundoff.
+    # sum to the precision's roundoff. The host field set takes a *copy*
+    # of the device's values rather than evaluating `f` again: a
+    # device's `sin` may differ from the host's by an ulp (Metal does, in
+    # Float32, at some points), and that would be the data disagreeing,
+    # not the reduction.
     forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
                     extents=ntuple(_ -> (zero(T), one(T)), D))
     refine!(forest, forest.leaves[1])
@@ -469,7 +476,7 @@ end
     dev = FieldSet{T}(forest, 2; G=2, backend=backend)
     fill_by_coordinates!(f, dev)
     host = FieldSet{T}(forest, 2; G=2)
-    fill_by_coordinates!(f, host)
+    copyto!(host.work, Array(dev.work))
 
     half = T(1) / 2
     for vars in (1, 1:2)
@@ -489,6 +496,57 @@ end
     gather!(uh, host)
     @test block_mapreduce(abs, max, zero(T), dev, u) ==
           block_mapreduce(abs, max, zero(T), host, uh)
+end
+
+@testset "$bname: a device reduction returns the same bits twice: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # Two launches with a fixed lane fold and no atomics: the result may
+    # differ from the host's association, but never from itself.
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    four = T(4)
+    fs = FieldSet{T}(forest, 2; G=2, backend=backend)
+    fill_by_coordinates!((x, v) -> sin(four * x[1]) + oftype(x[1], v), fs)
+    half = T(1) / 2
+    for (f, op, init) in ((identity, +, zero(T)), (abs, max, zero(T)),
+                          (x -> abs(x) > half, +, 0))
+        @test block_mapreduce(f, op, init, fs) == block_mapreduce(f, op, init, fs)
+    end
+    @test mesh_mapreduce(identity, +, zero(T), fs) ===
+          mesh_mapreduce(identity, +, zero(T), fs)
+    fires(work, idx, b, x) = work[idx..., 1, b] > half
+    @test firing_boxes(fires, fs) == firing_boxes(fires, fs)
+end
+
+@testset "$bname: a device reduction handles blocks of any size: T=$T, D=$D, N=$N" for
+        (bname, backend, types) in BACKENDS, T in types,
+        (D, N) in ((1, 4), (2, 12), (2, 20), (3, 8))
+    # Fewer cells than lanes, a cell count that is not a multiple of the
+    # lane count, and an exact multiple, against the host on each. The
+    # host reduces a copy of the device's values, for the reason given
+    # in the previous testset — this is where the ulp was found.
+    forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    four = T(4)
+    f = (x, v) -> sin(four * x[1]) + oftype(x[1], v)
+    dev = FieldSet{T}(forest, 2; G=2, backend=backend)
+    fill_by_coordinates!(f, dev)
+    host = FieldSet{T}(forest, 2; G=2)
+    copyto!(host.work, Array(dev.work))
+    half = T(1) / 2
+    @test block_mapreduce(abs, max, zero(T), dev) ==
+          block_mapreduce(abs, max, zero(T), host)
+    @test block_mapreduce(x -> abs(x) > half, +, 0, dev) ==
+          block_mapreduce(x -> abs(x) > half, +, 0, host)
+    @test block_mapreduce(identity, +, zero(T), dev) ≈
+          block_mapreduce(identity, +, zero(T), host) rtol = gputol(T)
+    @test mesh_mapreduce(identity, +, zero(T), dev) ≈
+          mesh_mapreduce(identity, +, zero(T), host) rtol = gputol(T)
+    @test total_mass(dev) ≈ total_mass(host) rtol = gputol(T, 65536)
 end
 
 # --- the acceptance test -------------------------------------------------

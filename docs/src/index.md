@@ -324,10 +324,11 @@ that is not a floating-point sum: every parallel loop writes to its own
 slot, so the state, the mesh, the schedule and every max or integer
 reduction on 64 threads reproduce a run on one exactly. A floating-point
 sum — a norm, a total mass — is promised to roundoff only, so that a
-device may reduce hierarchically and MPI may `Allreduce`; today's CPU
-fold is per-block and so still exact. That is worth relying on when
-debugging: a difference between two runs beyond the last bits of a sum
-is never the thread count.
+device may reduce hierarchically (it does: 256 lanes per block, then one
+fold per block, in two launches with no barrier) and MPI may
+`Allreduce`; today's CPU fold is per-block and so still exact. That is
+worth relying on when debugging: a difference between two runs beyond
+the last bits of a sum is never the thread count.
 
 Two consequences for application code:
 
@@ -529,6 +530,7 @@ scatter!
 gather!
 map_blocks!
 block_mapreduce
+mesh_mapreduce
 volume_weighted_norm
 ```
 
