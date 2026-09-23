@@ -1,6 +1,6 @@
 name = "TreeAMR"
 uuid = "91bc416d-811c-44c1-9bc4-b9c8bbdbbd08"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
