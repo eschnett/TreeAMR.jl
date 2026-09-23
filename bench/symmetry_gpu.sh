@@ -37,8 +37,8 @@ julia --project="$ENVDIR" -e "
     using Pkg
     Pkg.develop(path = \"$REPO\")
     for p in (\"CUDA\", \"KernelAbstractions\", \"MultiFloats\",
-              \"OrdinaryDiffEqLowOrderRK\", \"SciMLBase\", \"Test\", \"Random\",
-              \"SHA\", \"Printf\")
+              \"OrdinaryDiffEqLowOrderRK\", \"OrdinaryDiffEqSSPRK\", \"SciMLBase\",
+              \"Test\", \"Random\", \"SHA\", \"Printf\")
         p in keys(Pkg.project().dependencies) || Pkg.add(p)
     end
     Pkg.instantiate()

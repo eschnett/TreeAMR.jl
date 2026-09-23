@@ -1731,7 +1731,9 @@ entries per volume — documented here, implemented post-M3.
     reduces an integer count and integer min/max, which are
     order-independent, so a hierarchical form of it is bit-identical
     anyway — it was one item per block by simplicity, not by necessity.
-    Both were rewritten as specified under "**Implemented**" below.
+    Both were rewritten as specified under "**Implemented**" below, and
+    re-measured on the H200 there: 0.459 ms and 0.970 ms against this
+    table's 23.2 and 16.0.
   - **Building the schedule does not speed up, and should not.** It is
     the host-side neighbor search, which M5 already measured as
     saturating below 3x; the device upload added to it is small enough
@@ -1901,12 +1903,8 @@ entries per volume — documented here, implemented post-M3.
   `firing_boxes` took 67 ms at one thread and 68 ms at eight before; it
   takes 78 ms and 14.9 ms now. So the `firing_boxes` row of the H200 table
   above compares a device against one core, not sixteen, and its 5.5x was
-  against a serial sweep. The H200 row of the M6 table is still the
-  one-item-per-block measurement, and the two-launch kernels have so far
-  been compiled and run on the CPU backend and on Metal in `Float32` only;
-  `bench/symmetry_gpu.sh` re-measures the H200 row and is the CUDA run, in
-  both precisions, that the README's claim about CUDA now depends on. Two
-  things the implementation turned up are recorded here rather than lost.
+  against a serial sweep. Two things the implementation turned up are
+  recorded here rather than lost.
   The lane fold in `firing_boxes` first failed to compile on Metal — a
   closure inside `ntuple` capturing the running corner, which the loop
   reassigns, is boxed and becomes a dynamic call — which is the trap
@@ -1918,6 +1916,39 @@ entries per volume — documented here, implemented post-M3.
   positions; the device tests now reduce a copy of the device's data on the
   host instead of recomputing it, since the reduction is what is under
   test, not the transcendental.
+
+  *Measured on the H200* (`bench/symmetry_gpu.sh`, job 562304 on
+  Symmetry, 2026-09-23, at release 0.1.2; the same 960 blocks of `32^3`,
+  31.5M cells, `Float64`, and the same node's 16 cores under
+  `numactl --interleave=all` as the M6 table). The suite passed on CUDA
+  first — 90202 tests in `Float64` and `Float32`, 7m58 on 8 threads — so
+  the two-launch kernels have now compiled and passed on every backend
+  the package runs on. The two rows the change was for, with the M6
+  one-item-per-block numbers beside them:
+
+  | phase                 | M6, one item | two launches | 16 cores | ratio |
+  |---|---|---|---|---|
+  | volume-weighted norm  | 23.2 ms | **0.459 ms** | 53.1 ms | **116** |
+  | `firing_boxes`        | 16.0 ms | **0.970 ms** | 21.3 ms | **22.0** |
+  | RHS evaluation        |  7.0 ms | 4.57 ms | 104 ms | 22.8 |
+  | triad reference       |  0.56 ms | 0.56 ms | 8.7 ms | 15.6 |
+
+  The norm is 51x faster than the one-item form and costs 10 % of an
+  RHS evaluation (0.38 ms and 8.6 % in `Float32`); `firing_boxes` is 16x
+  faster. The norm's ratio now exceeds the bandwidth ratio, which says
+  more about the host than the device: the host norm reads 503 MB in
+  53 ms, 26x above its own bandwidth floor, because a threaded
+  `mapreduce` over per-block `IndexCartesian` views is a sequential fold
+  per block — the other half of the M6 observation that the CPU numbers
+  were "what M5 measured". It is not on the per-evaluation path and is
+  left as is. Two rows moved for reasons that have nothing to do with
+  reductions and are recorded because this is their first H200
+  measurement: the RHS evaluation and the ghost fill went from 7.0 and
+  5.3 ms to 4.6 and 2.8 ms, which is the ghost-fill work under
+  [What the ghost fill costs](#what-the-ghost-fill-costs) arriving on
+  the device, and the host `firing_boxes` went from 88 to 21 ms, which
+  is the serial-workgroup finding above. The M6 table stays as the M6
+  measurement.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
   ranks; prolongation/restriction happen on the owner of the finer data.
@@ -1949,8 +1980,8 @@ Remaining, none blocking before their milestone:
 - Wiring `volume_weighted_norm` (implemented in M3) into adaptive
   integrators as `internalnorm` (post-M3). Its cost objection on a
   device — the norm at one work item per block cost three RHS
-  evaluations — went with the two-launch reduction: on Metal the norm
-  is 6 % of an RHS evaluation, measured under
+  evaluations — went with the two-launch reduction: the norm is 7 % of
+  an RHS evaluation on Metal and 10 % on the H200, measured under
   [Parallelism](#parallelism).
 - The one-dimensional operators of the conservative family along a
   vertex-like dimension: refused until an application needs them, with
