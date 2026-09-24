@@ -340,7 +340,7 @@ end
 # them up — and the second factor of `D` here is plain headroom. `umax` is
 # the *initial* maximum, which stays a bound: Burgers obeys a maximum
 # principle. One global step for the whole hierarchy — there is no
-# subcycling, ever.
+# subcycling.
 burgers_dt(forest, cfl::T, umax::T, D) where {T} =
     cfl * minimum_spacing(T, forest) / (D * D * umax)
 

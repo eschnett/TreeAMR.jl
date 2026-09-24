@@ -211,8 +211,7 @@ The ideas that span several files and are easy to violate:
   `map_blocks!`, with kernels writing `du` in state layout via `statearray`.
   `u` is never mutated; the working array is scratch. There is deliberately
   no `semidiscretize`-style wrapper.
-- **No subcycling, ever.** One global `dt` from `minimum_spacing`. This is a
-  permanent design commitment, not a simplification to remove later.
+- **No subcycling.** One global `dt` from `minimum_spacing`.
 - **A regrid moves a block by at most one level**, which is what makes
   parent/child-only transfer sufficient; the transfer asserts it. After
   `regrid!` the schedule is stale and the state vector has a new length, so

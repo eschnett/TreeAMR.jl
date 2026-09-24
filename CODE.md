@@ -22,9 +22,8 @@ equation, simple hydro), the Einstein equations, relativistic GRMHD.
 - **No physics.** The package provides the AMR mesh and its operations.
   Applications supply the equations, fluxes, and any physics-specific
   interpolation operators (see [Operators](#operators)).
-- **No subcycling, by design.** All cells advance with the same global
-  timestep, set by the finest level. This is a permanent commitment, not a
-  temporary simplification: it removes time interpolation from ghost
+- **No subcycling.** All cells advance with the same global
+  timestep, set by the finest level. This removes time interpolation from ghost
   filling, makes the entire hierarchy a single state vector for standard
   ODE integrators, and reduces conservation at coarse-fine faces to a
   purely spatial condition. The cost is wasted coarse-level work, which we
