@@ -122,9 +122,9 @@ section heading from spelling an exported name exactly (`## Forest` made
 
 CI (`.github/workflows/CI.yml`) tests on Julia **1.11** and latest, on Linux
 and macOS. `Project.toml` says `julia = "1.11"`, so no 1.12+ features. The
-floor was 1.10 (the LTS) through 0.1.1 and was raised to 1.11 on 2026-09-25
-across all the Tree* packages, so that unregistered dependencies can be
-located with `[sources]` entries, a 1.11 key. Your local Julia is newer. A
+floor was 1.10 (the LTS) through 0.1.2 and was raised to 1.11 for 0.1.3
+(2026-09-25) across all the Tree* packages, so that unregistered
+dependencies can be located with `[sources]` entries, a 1.11 key. Your local Julia is newer. A
 seeded RNG stream can differ across Julia versions, so a test whose
 *assertions* depend on a particular random draw can pass locally and fail on
 the floor: use a seeded RNG for the inputs, but make what the test asserts
@@ -431,7 +431,7 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. **Registered in General** since 2026-09-21; 0.1.1 is the current
+  only. **Registered in General** since 2026-09-21; 0.1.3 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
   key behind `DOCUMENTER_KEY` to push them — the file says why. Both
