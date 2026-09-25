@@ -133,6 +133,25 @@ function wave_exact(D, L::T, m, t::T) where {T}
 end
 
 """
+The even counterpart of [`wave_exact`](@ref): `cos` rather than `sin`
+along `x₁`, so the mode is even about `x₁ = 0` and `x₁ = L/2` where
+`wave_exact` is odd about both. Same frequency, so the same equation.
+It is exact on a box whose `x₁` faces are reflecting walls at `0` and
+`L/2`, with both variables even there (M10).
+"""
+function wave_exact_even(D, L::T, m, t::T) where {T}
+    ω = wave_omega(D, L, m)
+    k = 2 * T(π) * m / L
+    return function (x, var)
+        shape = cos(k * x[1])
+        for d in 2:D
+            shape *= sin(k * x[d])
+        end
+        return var == 1 ? cos(ω * t) * shape : -ω * sin(ω * t) * shape
+    end
+end
+
+"""
 A two-level hierarchy: a `roots^D` periodic box with the middle sub-box
 refined once, held fixed in physical space as `N` varies so that a
 convergence study really does just shrink `h`. With `refined=false` the
@@ -164,18 +183,27 @@ interface-order rule predicts: vertex-centered (the default from M8 on)
 restricts by injection, so only the prolongation order enters the rate
 and `G = 1` suffices at order 4; cell-centered is the M3 study and needs
 `G = 2` there.
+
+`forest`, `parity` and `exact` replace the periodic two-level box and
+its sine mode — how the reflecting study (M10) runs the same equation
+on a box with mirror walls, with [`wave_exact_even`](@ref) for the even
+mode.
 """
 function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction=2),
                      roots=4, L=1.0, m=1,
                      cfl=0.25, periods=0.25, alg=RK4(), refined=true,
                      centering=vertexcentered(D),
+                     forest=nothing, parity=nothing, exact=wave_exact,
                      T::Type=Float64, backend=CPU()) where {D}
-    forest = wave_forest(Val(D), N; roots=roots, L=L, refined=refined, T=T)
+    if forest === nothing
+        forest = wave_forest(Val(D), N; roots=roots, L=L, refined=refined, T=T)
+    end
     L = T(L)
-    fs = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
+    fs = FieldSet{T}(forest, 2; G=G, centering=centering, parity=parity,
+                     backend=backend)
     problem = WaveProblem(fs, GhostSchedule(fs, ops))
 
-    fill_by_coordinates!(wave_exact(D, L, m, zero(T)), fs)
+    fill_by_coordinates!(exact(D, L, m, zero(T)), fs)
     u0 = statevector(fs)
     gather!(u0, fs)
 
@@ -188,10 +216,11 @@ function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction
     prob = ODEProblem(wave_rhs!, u0, (zero(T), t_end), problem)
     sol = solve(prob, alg; dt=dt, adaptive=false, save_everystep=false)
 
-    exact = FieldSet{T}(forest, 2; G=G, centering=centering, backend=backend)
-    fill_by_coordinates!(wave_exact(D, L, m, t_end), exact)
-    uexact = statevector(exact)
-    gather!(uexact, exact)
+    final = FieldSet{T}(forest, 2; G=G, centering=centering, parity=parity,
+                        backend=backend)
+    fill_by_coordinates!(exact(D, L, m, t_end), final)
+    uexact = statevector(final)
+    gather!(uexact, final)
 
     err = sol.u[end] .- uexact
     return (l2=volume_weighted_norm(fs, err),

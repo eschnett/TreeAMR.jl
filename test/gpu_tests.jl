@@ -188,6 +188,22 @@ end
     end
 end
 
+@testset "$bname: reflecting faces are filled on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # Mirrored transfers are ordinary groups with a parity factor, so on
+    # a device they run in the same kernel as every other transfer, with
+    # the factor table uploaded beside the storage. The NaN-prefilled
+    # fill of `undefined_ghosts` over every combination of face kinds
+    # checks that nothing is left unwritten or read before it is
+    # written, in the device's own launch order.
+    for kinds in Iterators.product(ntuple(_ -> FACE_KINDS, D)...),
+        C in (cellcentered(D), vertexcentered(D))
+        nnan, worst = undefined_ghosts(kinds, C; T=T, backend=backend)
+        @test nnan == 0
+        @test worst < 16 * gputol(T)
+    end
+end
+
 @testset "$bname: the interface fixup runs on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2, 3)
     # M8b. The fixup adds no kernel of its own — it is the transfer

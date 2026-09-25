@@ -13,6 +13,15 @@ leaf-only linear octree.
 - `periodic[d]` selects whether dimension `d` wraps around the brick.
   Wraparound lives in the neighbor arithmetic, so periodic ghost filling
   needs no special-casing later.
+- `reflecting[d]` is a `(lo, hi)` pair selecting which faces of a
+  non-periodic dimension are **reflecting** (M10): the solution beyond
+  them is its own mirror image, with the parity each variable declares
+  on its [`FieldSet`](@ref). The tree does not see them — there is no
+  neighbor across a reflecting face, as across any other non-periodic
+  one — but the [`GhostSchedule`](@ref) does, and fills their ghosts by
+  mirrored transfers. The faces that are neither periodic nor reflecting
+  are *outer* faces, and belong to the boundary hook of
+  [`fill_ghosts!`](@ref).
 - `N` is the per-block interior size, and it is even: cells are the
   tree's geometry, so `N` belongs here. The ghost width `G` does **not**
   — it says how far a stencil reaches into a neighbor's data, which is a
@@ -27,7 +36,8 @@ leaf-only linear octree.
 Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
-    Forest(roots; N, periodic=all false, extents=one unit per root)
+    Forest(roots; N, periodic=all false, reflecting=all false,
+           extents=one unit per root)
     Forest{T}(roots; ...)                      # geometry in `T`
 
 # Examples
@@ -37,11 +47,14 @@ julia> forest = Forest((2, 2); N = 8, periodic = (true, true));
 
 julia> nleaves(forest)
 4
+
+julia> octant = Forest((1, 1, 1); N = 8, reflecting = ntuple(_ -> (true, false), 3));
 ```
 """
 struct Forest{D,T}
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
+    reflecting::NTuple{D,Tuple{Bool,Bool}}       # (lo, hi) per dimension
     extents::NTuple{D,Tuple{T,T}}
     N::Int
     leaves::Vector{MortonKey{D}}
@@ -70,6 +83,8 @@ const no_forest_ghosts = ArgumentError(
 function Forest{T}(roots::NTuple{D,Integer};
                    N::Integer,
                    periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
+                   reflecting::NTuple{D,Tuple{Bool,Bool}}=
+                       ntuple(_ -> (false, false), D),
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
                    G=nothing) where {T,D}
@@ -77,6 +92,13 @@ function Forest{T}(roots::NTuple{D,Integer};
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
     N > 0 || throw(ArgumentError("N must be positive, got $N"))
     iseven(N) || throw(ArgumentError("N must be even, got $N"))
+    for d in 1:D
+        periodic[d] && any(reflecting[d]) && throw(ArgumentError(
+            "dimension $d is both periodic and reflecting, got reflecting[$d] = " *
+            "$(reflecting[d]): a periodic dimension has no faces — its last block " *
+            "is the first block's neighbor — so there is nothing for a reflection " *
+            "to act on. Drop one of the two."))
+    end
 
     ext = ntuple(d -> (T(extents[d][1]), T(extents[d][2])), D)
     all(d -> ext[d][2] > ext[d][1], 1:D) ||
@@ -96,7 +118,7 @@ function Forest{T}(roots::NTuple{D,Integer};
     rootsI = map(Int, roots)
     leaves = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
     sort!(leaves)
-    return Forest{D,T}(rootsI, periodic, ext, Int(N), leaves, Ref(0))
+    return Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), leaves, Ref(0))
 end
 
 # Without an explicit `T`, the geometry type follows the extents the
@@ -105,15 +127,17 @@ end
 function Forest(roots::NTuple{D,Integer};
                 N::Integer,
                 periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
+                reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
                 G=nothing) where {D}
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
-        return Forest{Float64}(roots; N=N, periodic=periodic)
+        return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
-    return Forest{T}(roots; N=N, periodic=periodic, extents=extents)
+    return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
+                     extents=extents)
 end
 
 """
@@ -239,6 +263,35 @@ function neighbor_anchor(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) 
     end
     wrapped = ntuple(d -> mod(newrootpos[d], forest.roots[d]), D)
     return (root_index(forest, wrapped), newcoords)
+end
+
+# Whether the forest has any reflecting face at all — what decides
+# whether a field set over it must declare a parity.
+hasreflecting(forest::Forest) = any(r -> r[1] || r[2], forest.reflecting)
+
+# Split a ghost direction of block `k` at the reflecting faces it crosses
+# (M10). Returns `(δ′, mask)`: `mask[d]` says that stepping from `k` by
+# `δ[d]` leaves the domain through a reflecting face, and `δ′` is `δ`
+# with those components zeroed — the direction whose region, mirrored
+# along the masked dimensions, is the ghost region `δ`. So the mirrored
+# source of region `δ` is the block itself when `δ′` is zero and
+# whatever lies in direction `δ′` otherwise.
+#
+# Lives here rather than in the schedule because it is brick knowledge:
+# which faces are the domain's, and which of them reflect.
+function reflect_direction(forest::Forest{D}, k::MortonKey{D},
+                           δ::NTuple{D,Int}) where {D}
+    n = 1 << level(k)
+    rootpos = root_position(forest, k.root)
+    mask = ntuple(D) do d
+        δ[d] == 0 && return false
+        forest.periodic[d] && return false
+        stepped = Int(k.coords[d]) + δ[d]
+        exits = δ[d] < 0 ? (stepped < 0 && rootpos[d] == 0) :
+                           (stepped >= n && rootpos[d] == forest.roots[d] - 1)
+        return exits && forest.reflecting[d][δ[d] < 0 ? 1 : 2]
+    end
+    return ntuple(d -> mask[d] ? 0 : δ[d], D), mask
 end
 
 # The index of the leaf that covers the node (root, lvl, coords): either

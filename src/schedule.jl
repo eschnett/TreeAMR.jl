@@ -62,17 +62,23 @@ level — reduced to a list of `(targetblock, sourceblock)` index pairs.
 A group is a batch of work, not a unit of scheduling: a phase runs as
 one parallel loop over [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, and a
 big group is launched in several of them.
+
+`factorcol` is nonzero for the mirrored transfers at a reflecting face
+(M10): the column of the field set's parity-factor table the kernel
+multiplies each variable's result by. Zero means an ordinary transfer,
+which the kernel leaves unscaled.
 """
 struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     kind::Symbol                      # :copy, :restrict, or :prolong
     stencils::NTuple{D,S}
     targetblocks::VB
     sourceblocks::VB
+    factorcol::Int                    # 0, or the parity-factor column
 end
 
 TransferGroup{T,D}(kind::Symbol, stencils::NTuple{D,S},
-                   targetblocks::VB, sourceblocks::VB) where {T,D,S,VB} =
-    TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks)
+                   targetblocks::VB, sourceblocks::VB, factorcol::Int=0) where {T,D,S,VB} =
+    TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks, factorcol)
 
 boxsize(g::TransferGroup{T,D}) where {T,D} = ntuple(d -> ntarget(g.stencils[d]), D)
 ntransfers(g::TransferGroup) = length(g.targetblocks)
@@ -84,7 +90,7 @@ ntransfers(g::TransferGroup) = length(g.targetblocks)
 todevice(backend::Backend, g::TransferGroup{T,D}) where {T,D} =
     TransferGroup{T,D}(g.kind, ntuple(d -> todevice(backend, g.stencils[d]), D),
                        todevice(backend, g.targetblocks),
-                       todevice(backend, g.sourceblocks))
+                       todevice(backend, g.sourceblocks), g.factorcol)
 # The concrete group type on a given backend, so that a schedule's
 # `phase1`/`phase2` are concretely typed even when they are empty (a
 # uniform single-root forest has no restrictions and no prolongations).
@@ -98,9 +104,11 @@ end
 """
     BoundaryRegion{D}
 
-A ghost region of a block that faces outside a non-periodic domain, and
-so is filled by the user's boundary hook rather than by an inter-block
-transfer.
+A ghost region of a block that faces outside the domain through an
+outer face — neither periodic nor reflecting — and so is filled by the
+user's boundary hook rather than by an inter-block transfer. A corner
+or edge region crossing a reflecting face as well is one of these when
+its mirror image still lies outside through an outer face.
 """
 struct BoundaryRegion{D}
     block::Int32
@@ -253,8 +261,9 @@ The phasing follows `CODE.md`:
   prolongation stencil may read the coarse source's own ghosts, which
   may themselves have been prolongated from a still-coarser block —
   legal under 2:1 balance, where levels `l-2, l-1, l` can meet.
-- `boundaries` lists the ghost regions facing outside a non-periodic
-  domain, filled by the user hook after the inter-block phases;
+- `boundaries` lists the ghost regions facing outside the domain through
+  an *outer* face — neither periodic nor reflecting — filled by the user
+  hook between the two phases;
   `boundaryplan` is the same information batched by region shape and
   resident on the backend, which is what the cell-wise hook form
   ([`CellBoundary`](@ref)) is launched over.
@@ -263,7 +272,12 @@ The phasing follows `CODE.md`:
   parallel loop rather than as a sequence of separate launches.
 
 Periodic boundaries appear nowhere special here: the tree wraps around,
-so they are ordinary copies, restrictions, and prolongations.
+so they are ordinary copies, restrictions, and prolongations. Reflecting
+faces (M10) are ordinary transfers too, from mirrored sources: a copy,
+restriction or prolongation with its target rows remapped across the
+wall, whose result the kernel multiplies by each variable's parity
+sign. They sit in the same two phases as every other transfer, so the
+hook never sees them; see "Ghost filling" in `CODE.md`.
 
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
@@ -560,6 +574,63 @@ prolongation_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
 restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
     restrict_stencil(T, N, G, c, δd, od, ops.restriction)
 
+# --- Mirrored stencils (M10) ---------------------------------------------
+#
+# A ghost row `j` beyond a reflecting wall holds the value at its mirror
+# point `j*` inside the block, which is what the ordinary tangential
+# transfer writes at `j*`. So the mirrored stencil is that tangential
+# stencil with its *target rows* remapped: the source windows and the
+# weights are untouched, and the kernel does not change. The parity sign
+# is applied by the kernel, per variable, not here.
+#
+#   low wall   j* = 2G + 1 + c − j
+#   high wall  j* = 2(G + N) + 1 + c − j
+#
+# with `c = 1` along a vertex-like dimension, whose wall is a stored
+# point, and `0` along a cell-centered one, whose wall lies between two.
+
+# Target range of the mirrored rows: the whole ghost slab, less the wall
+# row itself on the high side of a vertex-like dimension (that row is
+# `wall_stencil`'s).
+mirror_range(N::Int, G::Int, c::Int, δd::Int) =
+    δd < 0 ? (1:G) : ((G + N + 1 + c):(N + 2G + c))
+
+mirror_index(N::Int, G::Int, c::Int, δd::Int, j::Int) =
+    δd < 0 ? 2G + 1 + c - j : 2(G + N) + 1 + c - j
+
+function mirror_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    rng = mirror_range(N, G, c, δd)
+    rows = Int[mirror_index(N, G, c, δd, j) - s.targetfirst + 1 for j in rng]
+    # Every mirror point lies inside the owned range, within the half on
+    # the wall side — `N ≥ 2G + 2c` is exactly what guarantees it — and
+    # so inside whatever range the tangential stencil covers, halved or
+    # not. A failure here is a bug in the schedule, not in the input.
+    all(r -> 1 <= r <= ntarget(s), rows) || error(
+        "mirror rows $rows fall outside the tangential stencil's " *
+        "$(ntarget(s)) targets (N=$N, G=$G, c=$c, δ=$δd)")
+    return Stencil1D{T}(first(rng), s.srcstart[rows], s.weights[:, rows])
+end
+
+# The derived upper wall row of a vertex-like dimension at a reflecting
+# face: the symmetric Lagrange interpolant at the wall through the `p`
+# points `±1, …, ±p/2` beside it, folded by symmetry onto the `p/2`
+# one-sided points with doubled weights — `(4u₁ − u₂)/3` at `p = 4`. The
+# parity factor is `(1 + σ)/2`, so an odd variable gets exactly zero.
+# Every source has its own wall at `G + N + 1` in its own frame, which
+# is why the row is the same whatever kind the transfer is. See "Ghost
+# filling" in CODE.md.
+function wall_stencil(::Type{T}, N::Int, G::Int, p::Int) where {T}
+    h = p ÷ 2
+    nodes = [Rational{Int}(i) for i in vcat(-h:-1, 1:h)]
+    w = lagrange_weights(nodes, 0//1)
+    weights = Matrix{T}(undef, h, 1)
+    for i in 1:h
+        weights[i, 1] = T(2 * w[i])                 # nodes -h … -1, ascending
+    end
+    wall = G + N + 1
+    return Stencil1D{T}(wall, Int32[wall - h], weights)
+end
+
 # --- Schedule construction -----------------------------------------------
 
 # A block's offset within its parent, per dimension.
@@ -578,12 +649,24 @@ childoffset(k::MortonKey{D}) where {D} = ntuple(d -> Int(k.coords[d]) & 1, D)
 # threading this loop; see `CODE.md`.) Phase 1 is order independent by
 # construction, so copies and restrictions carry `level = 0` and stay
 # batched across levels — one launch instead of one per level.
+#
+# `mirror` is the mirror state per dimension of a transfer across a
+# reflecting face (M10): 0 for an ordinary dimension, 1 for rows
+# mirrored across the wall, 2 for the derived upper wall row of a
+# vertex-like dimension. It changes the stencils, and — through the
+# parity factor — what the kernel does with their result, so it is part
+# of the key. Everything that is not a mirror transfer has all zeros.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
     offset::NTuple{D,Int}
     level::Int
+    mirror::NTuple{D,Int8}
 end
+
+GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
+            level::Int) where {D} =
+    GroupKey{D}(kind, direction, offset, level, ntuple(_ -> Int8(0), D))
 
 # The per-key transfer lists a schedule is assembled from: for each
 # group key, the target blocks and the source blocks of its transfers,
@@ -615,6 +698,11 @@ function block_sources!(pairs::TransferPairs{D},
         # cannot empty it, so testing the unhalved region covers every
         # kind.)
         isempty(region) && continue
+        δ′, mask = reflect_direction(forest, k, δ)
+        if any(mask)
+            mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, mask, region)
+            continue
+        end
         nbrs = neighbor_keys(forest, k, δ)
         if isempty(nbrs)
             push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
@@ -634,6 +722,67 @@ function block_sources!(pairs::TransferPairs{D},
             for nbr in nbrs
                 record!(:restrict, δ, childoffset(nbr), 0, find_leaf(forest, nbr))
             end
+        end
+    end
+    return nothing
+end
+
+# The sources of a ghost region that crosses a reflecting face (M10; see
+# "Ghost filling" in CODE.md). Mirrored along the masked dimensions, the
+# region lies inside the domain: in the block itself when `δ′` is zero,
+# and otherwise in the node adjacent to it in direction `δ′`, at the
+# block's own extent along every masked dimension. So the source is
+# whatever the ordinary search finds in `δ′`, and the transfer is
+# recorded under the original `δ`, which fixes the target range. A `δ′`
+# that leaves through an outer face makes the region the hook's.
+function mirror_sources!(pairs::TransferPairs{D},
+                         boundaries::Vector{BoundaryRegion{D}},
+                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
+                         b::Int, δ::NTuple{D,Int}, δ′::NTuple{D,Int},
+                         mask::NTuple{D,Bool}, region) where {D}
+    k = forest.leaves[b]
+    zerooffset = ntuple(_ -> 0, D)
+    # A masked vertex-like dimension on the high side splits its target
+    # into the derived wall row (state 2) and the mirrored rows beyond it
+    # (state 1), which are batched apart because their parity factors
+    # differ. Each part may be empty — at `G = 0` only the wall row is
+    # left — and an empty part records nothing.
+    choices = ntuple(D) do d
+        !mask[d] && return (Int8(0),)
+        c[d] == 1 && δ[d] == 1 || return (Int8(1),)
+        return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
+    end
+    states = vec(collect(Iterators.product(choices...)))
+    record!(kind, offset, lvl, s) =
+        for state in states
+            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state),
+                        (Int32[], Int32[])),
+                   (Int32(b), Int32(s)))
+        end
+
+    if δ′ == zerooffset
+        record!(:copy, zerooffset, 0, b)
+        return nothing
+    end
+    nbrs = neighbor_keys(forest, k, δ′)
+    if isempty(nbrs)
+        push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
+        return nothing
+    end
+    nblevel = level(first(nbrs))
+    if nblevel == level(k)
+        record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)))
+    elseif nblevel < level(k)
+        record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)))
+    else
+        # Only the children on the wall side along every masked dimension
+        # cover the mirror image; the others supply the half of the
+        # tangential extent it does not reach.
+        wallside = ntuple(d -> δ[d] < 0 ? 0 : 1, D)
+        for nbr in nbrs
+            o = childoffset(nbr)
+            all(d -> !mask[d] || o[d] == wallside[d], 1:D) || continue
+            record!(:restrict, o, 0, find_leaf(forest, nbr))
         end
     end
     return nothing
@@ -693,21 +842,29 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         append!(boundaries, perboundaries[c])
     end
 
-    build(key) =
-        key.kind === :copy ?
-        ntuple(d -> copy_stencil(T, N, ghosts[d], stags[d], key.direction[d]), D) :
-        key.kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, ghosts[d], stags[d], key.direction[d],
-                                        key.offset[d], operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, ghosts[d], stags[d], key.direction[d],
-                                         key.offset[d], operators), D)
+    # One dimension of a group's stencils. Along a masked dimension of a
+    # mirror transfer the stencil is the ordinary *tangential* one with
+    # its target rows remapped across the wall, or the derived wall row.
+    function build1(key, d)
+        δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
+        state == 2 && return wall_stencil(T, N, ghosts[d], operators.prolongation)
+        δs = state == 0 ? δd : 0
+        s = key.kind === :copy ? copy_stencil(T, N, ghosts[d], stags[d], δs) :
+            key.kind === :restrict ?
+            restriction_stencil(T, N, ghosts[d], stags[d], δs, od, operators) :
+            prolongation_stencil(T, N, ghosts[d], stags[d], δs, od, operators)
+        state == 0 && return s
+        return mirror_rows(s, N, ghosts[d], stags[d], δd)
+    end
+    build(key) = ntuple(d -> build1(key, d), D)
+    factorcol(key) = any(!iszero, key.mirror) ? mirrorcolumn(key.mirror) : 0
 
     GRP = grouptype(backend, T, Val(D))
     phase1 = GRP[]
     bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
         group = todevice(backend, TransferGroup{T,D}(key.kind, build(key),
-                                                     targets, sources))
+                                                     targets, sources, factorcol(key)))
         if key.kind === :prolong
             push!(get!(bylevel, key.level, GRP[]), group)
         else
@@ -728,7 +885,13 @@ function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
     ncopy = sum(ntransfers, filter(g -> g.kind === :copy, s.phase1); init=0)
     nrest = sum(ntransfers, filter(g -> g.kind === :restrict, s.phase1); init=0)
     nprol = sum(gs -> sum(ntransfers, gs; init=0), s.phase2; init=0)
+    # Of all of those, the ones mirrored across a reflecting face (M10),
+    # said only when there are any, so a schedule without reflecting
+    # faces prints as it always has.
+    groups = Iterators.flatten((s.phase1, Iterators.flatten(s.phase2)))
+    nmirror = sum(g -> g.factorcol == 0 ? 0 : ntransfers(g), groups; init=0)
     print(io, "GhostSchedule{", T, ",", D, "}(", ncopy, " copies, ", nrest,
           " restrictions, ", nprol, " prolongations over ", length(s.phase2),
-          " level(s), ", length(s.boundaries), " boundary regions)")
+          " level(s), ", nmirror == 0 ? "" : "$nmirror mirrored transfers, ",
+          length(s.boundaries), " boundary regions)")
 end

@@ -81,6 +81,27 @@ position, and the length a `closed` loop adds.
 staggers(C::NTuple{D,Symbol}) where {D} = ntuple(d -> C[d] === :vertex ? 1 : 0, D)
 
 """
+    Parity
+
+How a variable behaves under a mirror across a reflecting face (M10):
+`EvenParity` (a scalar, a tangential vector component: the value beyond
+the wall is the value at its mirror point) or `OddParity` (the normal
+component of a vector: the value changes sign). A product of components
+takes the product of their parities, so `T_xy` is odd across a wall
+normal to `x` and across one normal to `y`.
+
+`NoParity` is for dimensions without a reflecting face, where the
+question does not arise. It is refused in a dimension with one: a
+variable without a parity has no value beyond the wall, and ghosts
+without a value do not stay in the ghosts — the first regrid
+prolongation that reads them carries them into the interior.
+
+Declared per variable and per dimension through the `parity` keyword of
+[`FieldSet`](@ref); see "Domain and boundaries" in `CODE.md`.
+"""
+@enum Parity EvenParity OddParity NoParity
+
+"""
     FieldSet{T,D,R,A}
 
 Block storage for `nvars` variables over every leaf of a
@@ -140,6 +161,14 @@ with this field set must be built for the same backend. On a device with
 no hardware fp64 a `Float64` field set is rejected here, with a message,
 rather than failing later inside a kernel compilation.
 
+`parity` gives each variable its [`Parity`](@ref) under a mirror, and
+is **required** when the forest has a reflecting face (M10): whether a
+variable changes sign in a mirror is physics, which the mesh cannot
+know. It holds one entry per variable, each either a single `Parity` for
+every dimension or an `NTuple{D,Parity}`; every dimension with a
+reflecting face needs `EvenParity` or `OddParity`. Over a forest without
+reflecting faces it may be omitted, and is ignored if given.
+
 A field set is tied to the forest's *current* leaf array. Block indices
 are deliberately not stable across regridding (M4), which compacts the
 block slots and rebuilds the storage.
@@ -148,6 +177,10 @@ block slots and rebuilds the storage.
     FieldSet{Float32}(forest, nvars; G = (2, 0))
     FieldSet(forest, nvars; G = 0, centering = facecentered(3, 1))
     FieldSet{Float32}(forest, nvars; G = 2, backend = CUDABackend())
+    FieldSet(octant, 4; G = 2,          # ρ, and a vector (vx, vy, vz)
+             parity = [EvenParity, (OddParity, EvenParity, EvenParity),
+                       (EvenParity, OddParity, EvenParity),
+                       (EvenParity, EvenParity, OddParity)])
 
 # Examples
 
@@ -172,6 +205,14 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const nvars::Int
     const G::NTuple{D,Int}
     const centering::NTuple{D,Symbol}
+    const parity::Union{Nothing,Vector{NTuple{D,Parity}}}
+    # The per-variable factor each mirrored transfer multiplies by,
+    # `factors[v, col]` over the `3^D` mirror states of a transfer
+    # group, on the storage's backend (see `parityfactors`). `nothing`
+    # over a forest without reflecting faces. It lives here rather than
+    # in the schedule because parity belongs to the variables, while a
+    # schedule belongs to a layout and serves every field set of it.
+    const factors::Union{Nothing,AbstractMatrix{T}}
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
@@ -186,6 +227,7 @@ end
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D),
+                     parity=nothing,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
     G === nothing && throw(ArgumentError(
@@ -197,16 +239,84 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     ghosts = ghostwidths(G, Val(D))
     centers = centerings(centering, Val(D))
     stored = storedsize(forest.N, ghosts, staggers(centers))
+    parities = parities_of(parity, forest, Int(nvars))
+    factors = hasreflecting(forest) ?
+              todevice(backend, parityfactors(T, parities, Val(D))) : nothing
     work = allocate(backend, T, (stored..., Int(nvars), nleaves(forest)))
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
-    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, work)
+    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, parities,
+                                        factors, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
 
 staggers(fs::FieldSet) = staggers(fs.centering)
+
+# Validate a user-supplied `parity` into one `NTuple{D,Parity}` per
+# variable — the same shape `ghostwidths` gives `G` — against the faces
+# the forest actually reflects at.
+function parities_of(parity, forest::Forest{D}, nvars::Int) where {D}
+    if parity === nothing
+        hasreflecting(forest) && throw(ArgumentError(
+            "this forest has reflecting faces, so the field set needs `parity`: one " *
+            "entry per variable, EvenParity or OddParity in each dimension with a " *
+            "reflecting face. Whether a variable changes sign in a mirror is physics " *
+            "— a scalar is even, the d component of a vector is odd in d and even " *
+            "elsewhere — which the mesh cannot know."))
+        return nothing
+    end
+    (parity isa AbstractVector || parity isa Tuple) || throw(ArgumentError(
+        "parity must be a vector or tuple with one entry per variable, got a " *
+        "$(typeof(parity))"))
+    length(parity) == nvars || throw(ArgumentError(
+        "parity must have one entry per variable: got $(length(parity)) for " *
+        "nvars = $nvars"))
+    parities = map(collect(parity)) do p
+        p isa Parity && return ntuple(_ -> p, D)
+        (p isa Tuple && length(p) == D && all(q -> q isa Parity, p)) ||
+            throw(ArgumentError(
+                "each parity entry must be a Parity, for every dimension, or an " *
+                "NTuple{$D,Parity}, one per dimension; got $(repr(p))"))
+        return ntuple(d -> p[d], D)
+    end
+    for (v, p) in enumerate(parities), d in 1:D
+        any(forest.reflecting[d]) && p[d] === NoParity && throw(ArgumentError(
+            "variable $v has NoParity in dimension $d, which has a reflecting face. " *
+            "A variable without a parity has no value beyond the wall, and its " *
+            "ghosts there would not stay ghosts: the first prolongation that reads " *
+            "them carries them into the interior. Give it EvenParity or OddParity."))
+    end
+    return Vector{NTuple{D,Parity}}(parities)
+end
+
+# The per-variable factor table of the mirrored transfers: column `col`
+# is the mirror state `s` of a transfer group, `col = 1 + Σ_d s_d 3^(d-1)`
+# with `s_d` = 0 (not mirrored along `d`), 1 (mirrored rows) or 2 (the
+# derived upper wall row of a vertex-like dimension), and the entry is
+# the product over `d` of `1`, the sign `σ` of the variable's parity, or
+# `(1 + σ)/2` respectively — see "Ghost filling" in CODE.md. Every entry
+# is -1, 0 or 1, so the multiplication in the kernel is exact.
+function parityfactors(::Type{T}, parities::Vector{NTuple{D,Parity}},
+                       ::Val{D}) where {T,D}
+    nstates = 3^D
+    factors = Matrix{T}(undef, length(parities), nstates)
+    for (v, p) in enumerate(parities), col in 1:nstates
+        f = 1
+        for d in 1:D
+            state = ((col - 1) ÷ 3^(d - 1)) % 3
+            σ = p[d] === OddParity ? -1 : 1        # NoParity is never mirrored
+            f *= state == 0 ? 1 : state == 1 ? σ : (1 + σ) ÷ 2
+        end
+        factors[v, col] = T(f)
+    end
+    return factors
+end
+
+# The factor-table column of a mirror state (see `parityfactors`).
+mirrorcolumn(state::NTuple{D,<:Integer}) where {D} =
+    1 + sum(Int(state[d]) * 3^(d - 1) for d in 1:D)
 
 # The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d] +
 # 2c[d]` is what makes a block's high exchange region reachable from one
