@@ -204,6 +204,35 @@ end
     end
 end
 
+@testset "$bname: point interpolation agrees with the host: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # One kernel per batch, reading the leaves, the geometry, the parity
+    # table and the points where the data is. The device must give the
+    # host's numbers, including across a reflecting wall (the fold and
+    # the parity sign) and for the excluded-region flags, and must report
+    # an outside point from the host after the launch.
+    kinds = D == 1 ? (:reflect_lo,) : (:reflect_lo, :outer)
+    f, parity = parity_data(T, kinds, 4)
+    roots = D == 1 ? 3 : 2
+    xs = [ntuple(d -> T((13j + 5d) % 97 // 97) * (d == 1 ? T(roots + 1) : T(roots)) -
+                      (d == 1 ? one(T) : zero(T)), D) for j in 1:97]
+    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D))
+    ball = Ellipsoid(ntuple(_ -> T(1), D), ntuple(_ -> T(1) / 2, D))
+    results = map((CPU(), backend)) do bk
+        fs = FieldSet{T}(faces_forest(kinds; T=T), 2; G=2, parity=parity, backend=bk)
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                     boundary=boundary_by_coordinates(f))
+        r = interpolate(fs, TreeAMR.todevice(bk, xs), Lagrange(4); derivs=derivs, exclude=ball)
+        @test typeof(get_backend(r.values)) === typeof(bk)
+        bk === backend && @test_throws "outside the domain" interpolate(
+            fs, TreeAMR.todevice(bk, [ntuple(_ -> T(10), D)]), Lagrange(4))
+        (Array(r.values), Array(r.excluded))
+    end
+    @test maximum(abs, results[1][1] - results[2][1]) < gputol(T) * maximum(abs, results[1][1])
+    @test results[1][2] == results[2][2]
+end
+
 @testset "$bname: the interface fixup runs on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2, 3)
     # M8b. The fixup adds no kernel of its own — it is the transfer

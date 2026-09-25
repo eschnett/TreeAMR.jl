@@ -127,9 +127,20 @@ whose coordinates first differ at the highest bit and compares only
 that one — `D` cheap operations instead of `32D`.
 """
 function Base.isless(a::MortonKey{D}, b::MortonKey{D}) where {D}
-    a.root != b.root && return a.root < b.root
     pa = ntuple(d -> padded_coord(a.coords[d], a.level), D)
     pb = ntuple(d -> padded_coord(b.coords[d], b.level), D)
+    return curve_less(Int(a.root), pa, Int(a.level), Int(b.root), pb, Int(b.level))
+end
+
+# The curve order on a node given as (root, padded coordinates, level)
+# rather than as a key. `isless` is this on two keys; the point location
+# in `interpolate.jl` compares a query node against the leaves without
+# ever building it as a `MortonKey`, because the checking constructor
+# cannot run in a kernel — and one comparison is what keeps the two from
+# disagreeing about the order.
+@inline function curve_less(ra::Int, pa::NTuple{D,UInt64}, la::Int,
+                            rb::Int, pb::NTuple{D,UInt64}, lb::Int) where {D}
+    ra != rb && return ra < rb
     # Dimension 1 is most significant, so it wins ties in bit position.
     msd = 1
     xmax = pa[1] ⊻ pb[1]
@@ -141,6 +152,6 @@ function Base.isless(a::MortonKey{D}, b::MortonKey{D}) where {D}
         end
     end
     # Identical position: the coarser node (the ancestor) comes first.
-    xmax == 0 && return a.level < b.level
+    xmax == 0 && return la < lb
     return pa[msd] < pb[msd]
 end

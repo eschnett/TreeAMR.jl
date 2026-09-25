@@ -12,10 +12,10 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6, M8 and M10 are done (tree core, ghost
+Current state: milestones M0–M6, M8, M10 and M11 are done (tree core, ghost
 exchange, ODE coupling, regridding, multi-threading, GPU; then every
 centering, per-field-set ghost widths, and conservation at coarse-fine
-faces; then reflecting boundaries). Everything is `D`-generic and
+faces; then reflecting boundaries; then point interpolation). Everything is `D`-generic and
 floating-point-type generic. Next is MPI (M7), deliberately after M8 and
 M10 so the distributed exchange is built once over a layout-generic
 schedule that already holds the mirrored transfers; then I/O (M9).
@@ -112,7 +112,7 @@ gitignored. Check `git status` after running either and revert
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
 **Adding a documented function means adding it to the API page of its
-layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,internals}.md`.
+layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,internals}.md`.
 `docs/src/index.md` is the guide (prose and doctests, plus the status) and
 holds no `@docs` blocks. The split is there because Documenter's HTML writer
 fails the build on any page over 200 KiB (`size_threshold`), and the single
@@ -177,11 +177,16 @@ only in synchronized wall-clock windows (`bench/affinity.jl` explains
 why). Best-of timings of independent processes overstate what they get
 together.
 
+`bench/interpolate.jl` times point interpolation (M11) on the horizon
+finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
+cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
+on an H200. CODE.md's M11 entry has the numbers.
+
 There is no formatter or linter configured.
 
 ## Architecture
 
-Twelve source files, included in dependency order from `src/TreeAMR.jl`; each
+Thirteen source files, included in dependency order from `src/TreeAMR.jl`; each
 layer uses only the ones before it:
 
 | layer | files | what |
@@ -196,6 +201,7 @@ layer uses only the ones before it:
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number, where M7's Allreduce will go), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
+| interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
 
 The ideas that span several files and are easy to violate:
 
@@ -312,6 +318,17 @@ The ideas that span several files and are easy to violate:
   `Threads.@spawn` puts blocks on arbitrary cores and costs up to 2.4x
   on a many-core node (CODE.md, "What one process loses").
 
+- **Point interpolation reads one block** (M11, CODE.md "Point
+  interpolation"). A query's *stencil* is `n^D` consecutive stored
+  points of the block `locate_point` finds, ghosts included, so ghosts
+  must be current. The kernel sees a basis only through `stencilwidth`,
+  `stencilstart` and `basisweights` — the extension point for smooth
+  bases — and `derivs` are multi-indices with only `|m| ≤ 1` accepted
+  until higher orders are tested. Outside points are reported by the
+  host after the launch (no throwing in kernels), and `exclude` flags
+  rather than throws. `locate_point` and `isless` share `curve_less`
+  in `morton.jl`, so the search and the leaf order cannot disagree.
+
 Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 (`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
 **owned** range is `G_d+1:G_d+N` and the **closed** range `G_d+1:G_d+N+c_d`.
@@ -331,7 +348,7 @@ ghost slab.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`interface_tests.jl`,
+`interpolate_tests.jl` (M11), `interface_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
