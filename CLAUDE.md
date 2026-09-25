@@ -102,12 +102,12 @@ julia --project=docs docs/make.jl
 ```
 
 Both `Pkg.develop` lines above have a side effect on a current Julia: they
-write a `[sources]` entry into that environment's `Project.toml`. It is a
-1.11+ feature, so it is exactly what the compat bound below forbids, and it
-turns a local convenience into a build everyone else's 1.10 cannot parse.
-The `Manifest.toml` they also write is the part you want, and is
-gitignored. Check `git status` after running either and revert
-`test/Project.toml` or `docs/Project.toml` if it moved.
+write a `[sources]` entry into that environment's `Project.toml`. The floor
+is 1.11 now, so the key itself is legal, but the entry is a local
+convenience that should not be committed by accident. The `Manifest.toml`
+they also write is the part you want, and is gitignored. Check `git status`
+after running either and revert `test/Project.toml` or `docs/Project.toml`
+if it moved.
 
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
@@ -120,26 +120,28 @@ page had reached 178 KiB; the largest page is now about 40 KiB. Keep a
 section heading from spelling an exported name exactly (`## Forest` made
 `` [`Forest`](@ref) `` link to the heading, not the docstring).
 
-CI (`.github/workflows/CI.yml`) tests on Julia **1.10** and latest, on Linux
-and macOS. `Project.toml` says `julia = "1.10"`, so no 1.11+ features (no
-`public`, no `[sources]`). Your local Julia is newer. A seeded RNG stream can
-differ across Julia versions, so a test whose *assertions* depend on a
-particular random draw can pass locally and fail on 1.10: use a seeded RNG
-for the inputs, but make what the test asserts follow deterministically from
-the setup. `juliaup` has 1.10 installed, but checking a suspect test on it
-is not simply `Pkg.test()` in this checkout: 1.10 cannot read a
-`Manifest.toml` a newer Julia resolved, and even against fresh manifests
-its `Pkg.test()` dies with "can not merge projects" whenever
-`test/Manifest.toml` exists — which the setup command above creates.
-Copy the tree without any manifest and run the test file directly
-(measured: 97744 tests, ~2m55, after M10):
+CI (`.github/workflows/CI.yml`) tests on Julia **1.11** and latest, on Linux
+and macOS. `Project.toml` says `julia = "1.11"`, so no 1.12+ features. The
+floor was 1.10 (the LTS) through 0.1.1 and was raised to 1.11 on 2026-09-25
+across all the Tree* packages, so that unregistered dependencies can be
+located with `[sources]` entries, a 1.11 key. Your local Julia is newer. A
+seeded RNG stream can differ across Julia versions, so a test whose
+*assertions* depend on a particular random draw can pass locally and fail on
+the floor: use a seeded RNG for the inputs, but make what the test asserts
+follow deterministically from the setup. `juliaup` has 1.11 installed, but
+checking a suspect test on it is not simply `Pkg.test()` in this checkout:
+an older Julia may not read a `Manifest.toml` a newer one resolved. Copy the
+tree without any manifest and run the test file directly (the procedure was
+worked out, and measured at 97744 tests in ~2m55 after M10, on 1.10, whose
+`Pkg.test()` also died with "can not merge projects" whenever
+`test/Manifest.toml` existed):
 
 ```bash
-rm -rf /tmp/amr110 && mkdir /tmp/amr110 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr110
+rm -rf /tmp/amr111 && mkdir /tmp/amr111 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr111
 ```
 
 ```bash
-cd /tmp/amr110 && julia +1.10 --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()' && julia +1.10 --project=test test/runtests.jl
+cd /tmp/amr111 && julia +1.11 --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()' && julia +1.11 --project=test test/runtests.jl
 ```
 
 Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
@@ -454,7 +456,8 @@ of the *public API only*. Facts that matter here:
   under `[compat]`, and `bin/Project.toml` inherits that bound through
   its `TreeWave = {path = ".."}` source. The `[sources]` pins to `main`
   went when 0.1.1 was released, which is also what dropped its Julia
-  floor to 1.10. So neither a push to `main` nor an uncommitted change
+  floor to 1.10 (raised back to 1.11 on 2026-09-25 with all the Tree*
+  packages). So neither a push to `main` nor an uncommitted change
   here reaches it; a change arrives with the next release. Before
   tagging one that touches the API, run TreeWave's tests (`julia
   --project=. -e 'using Pkg; Pkg.test()'` there, about 1.5 min) against
