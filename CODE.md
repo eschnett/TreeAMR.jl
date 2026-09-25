@@ -1345,15 +1345,17 @@ Runge–Kutta schemes.
 
 Indicative only — names and signatures will evolve (updated for the M8
 design; through M6 `G` was a forest keyword and `regrid!` took bare
-field sets):
+field sets; `reflecting` and `parity` are M10's):
 
     # mesh: cells are the tree's geometry, ghosts are not
-    forest = Forest(roots; N, periodic, extents)
+    forest = Forest(roots; N, periodic, reflecting, extents)   # (lo, hi) walls
     refine!(forest, keys); coarsen!(forest, keys)  # with 2:1 completion
 
     # fields: block arrays over the forest; each carries its centering
     # and its per-dimension ghost width
     state  = FieldSet(forest, nvars; G = 2)                       # cell-centered
+    # over a forest with reflecting faces every set also says how each
+    # variable mirrors: parity = [EvenParity, (OddParity, EvenParity), …]
     fluxes = ntuple(d -> FieldSet(forest, nvars; G = 0,
                                   centering = facecentered(D, d)), D)
     ops    = Operators(family = Conservative, prolongation = 3, restriction = 2)
@@ -2297,7 +2299,7 @@ list below is in execution order.
     thread workload (bit-identical at 1 and 8 threads) and in the device
     suite, where Metal in `Float32` reproduces the CPU numbers bit for
     bit.
-- **M10 — Reflecting boundaries.** Done before M7, for M8's reason: M7
+- **M10 — Reflecting boundaries.** *(Done.)* Done before M7, for M8's reason: M7
   then distributes mirror transfers as the ordinary transfers they are,
   rather than retrofitting them. `reflecting` per face on the forest,
   `parity` per variable and dimension on the field set, and the mirror
@@ -2328,6 +2330,53 @@ list below is in execution order.
     domain agreeing with the full domain, and converging at the
     predicted rate at a vertex-centered upper wall;
   - a reflecting cycle in the thread workload and in the device suite.
+
+  *(All of this is measured; `test/reflect_tests.jl` is the study, with
+  its oracles at the end of `test/ghost_oracles.jl`.)* The design needed
+  no amendment: the mechanism above went in as specified, and every
+  mirror point landed inside the tangential stencil's range, as
+  `N ≥ 2G + 2c` promises. Four things are worth recording.
+
+  - **The doubled domain is reproduced to roundoff.** It is bit for bit
+    in `D = 1`, and within 4.4e-16 in `D = 2` and 1.6e-15 in `D = 3` over
+    up to 221184 stored values, on arbitrary data. That holds cell-centered
+    at either wall and vertex-centered at the low one. The residue is
+    summation order: a mirrored stencil adds the same terms as the
+    doubled domain's, reversed.
+  - **The `NaN` test catches the ordering bug it is there for.** It
+    covers 235 cases: 10 in `D = 1`, 100 in `D = 2`, and in `D = 3` the
+    125 face combinations with the centering rotating. All are clean, and
+    the values are exact to 1.2e-14. As a check that the test is not
+    vacuous, mirrored prolongations were moved into phase 1, where the
+    hook used to run: it then failed 39 to 41 of the 42 2D cases with a
+    reflecting face, and all 234 in 3D. 1D has no mirrored prolongation
+    to misplace. The 2D count varies between processes because the order
+    of the groups within a phase does: a misplaced prolongation reads its
+    source stale only if it runs before the group that fills it. That
+    order is free precisely because phase 1 is order independent. It costs about 11 s warm, most of it the 3D sweep.
+  - **The wave equation keeps its rate.** Order-4 operators on a box
+    with reflecting walls at `x₁ = 0` and `L/2`, `N = 8, 16, 32`, give
+    L2 rates **1.91 / 2.02** (vertex, odd / even) and **1.99 / 2.00**
+    (cell) in `D = 1`, and **1.96 / 1.99** and **1.99 / 2.00** in
+    `D = 2`. The periodic box with the same refinement gives 1.99–2.00.
+    The derived upper wall point therefore costs no order, as the
+    interface-order rule predicts. The lowest of the eight, vertex-odd in
+    1D at 1.91, is inside the 0.15 the periodic studies are held to; its
+    L∞ rate is 1.95. Why that one case sits lowest was not
+    investigated.
+
+    The half box also evolves as the periodic box it folds.
+    Cell-centered, at `N = 16`, the L∞ errors of the two agree to a
+    relative 3.0e-11 (`D = 1`) and 2.6e-13 (`D = 2`) after 128 and 91
+    RK4 steps, on half the blocks.
+  - **Cost.** The suite went from 89168 tests in 3m31 to 89961 in 4m49,
+    at 8 threads. The M10 testsets add up to about 42 s of that, and the
+    device subset (Float32 compilation on the CPU backend) and the two
+    reflecting cycles in each thread-workload subprocess about 8 s more.
+    The rest is inside the run-to-run noise at this length. On Julia 1.10,
+    in one thread, it was 97744 tests in 2m53. The 3D order-4 exactness
+    sweep was then dropped as a duplicate of the `NaN` test's, which left
+    89836 tests in 3m37 in one thread on the current Julia.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,

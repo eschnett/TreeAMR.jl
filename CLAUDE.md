@@ -12,19 +12,22 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6 and M8 are done (tree core, ghost
+Current state: milestones M0–M6, M8 and M10 are done (tree core, ghost
 exchange, ODE coupling, regridding, multi-threading, GPU; then every
 centering, per-field-set ghost widths, and conservation at coarse-fine
-faces). Everything is `D`-generic and floating-point-type generic. Next
-is MPI (M7), deliberately after M8 so the distributed exchange is built
-once over a layout-generic schedule; then I/O (M9).
+faces; then reflecting boundaries). Everything is `D`-generic and
+floating-point-type generic. Next is MPI (M7), deliberately after M8 and
+M10 so the distributed exchange is built once over a layout-generic
+schedule that already holds the mirrored transfers; then I/O (M9).
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
 ## Commands
 
-Full test suite (about 3 min — the thread-independence test spends ~50 s
-of that running `test/thread_workload.jl` in two subprocesses).
+Full test suite (about 3.5 min at one thread, 4–5 min at eight — the
+thread-independence test spends ~45 s of that running
+`test/thread_workload.jl` in two subprocesses, and M10's
+`reflect_tests.jl` about 45 s more).
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
 shorten it by making the kernels faster. Measured: annotating the test
@@ -123,7 +126,7 @@ is not simply `Pkg.test()` in this checkout: 1.10 cannot read a
 its `Pkg.test()` dies with "can not merge projects" whenever
 `test/Manifest.toml` exists — which the setup command above creates.
 Copy the tree without any manifest and run the test file directly
-(measured: 96474 tests, ~2m15):
+(measured: 97744 tests, ~2m55, after M10):
 
 ```bash
 rm -rf /tmp/amr110 && mkdir /tmp/amr110 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr110
@@ -195,6 +198,22 @@ The ideas that span several files and are easy to violate:
   sweep filled. The hook runs *between* the phases, not last: prolongation
   stencils at a domain edge reach tangentially into the source's outer
   ghosts.
+- **Reflecting faces are transfers, not hooks** (M10). `reflecting` is a
+  per-face `(lo, hi)` property of the `Forest`, `parity` a per-variable,
+  per-dimension property of the `FieldSet` (required when the forest has
+  a reflecting face; `NoParity` refused in a reflected dimension). The
+  tree does not see the walls — `neighbor_keys` finds nothing across
+  them — but `block_sources!` asks `reflect_direction` (in `forest.jl`,
+  since it is brick knowledge) for `δ′`, the direction with the masked
+  components zeroed, and takes the source that `δ′` finds. Along a
+  masked dimension the stencil is the *tangential* one with its target
+  rows remapped across the wall (`mirror_rows`), and the kernel
+  multiplies by a parity factor from `fs.factors` (column
+  `TransferGroup.factorcol`; 0 = an ordinary transfer, left unscaled).
+  So mirrored transfers sit in the ordinary phases and run on devices.
+  The unowned upper wall plane of a vertex-like dimension is derived by
+  `wall_stencil` (odd → 0, even → the folded order-`p` interpolant).
+  The boundary hook sees only *outer* faces.
 - **Neighbor finding is asymmetric across levels** (CODE.md, "Neighbor
   asymmetry"). Ghost filling is formulated as each block asking for its own
   sources, never as reversing a neighbor lookup.
@@ -267,7 +286,8 @@ ghost slab.
 ## Tests
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
-`ghost_tests.jl`, `centering_tests.jl`, `interface_tests.jl`,
+`ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
+`interface_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
@@ -281,6 +301,11 @@ tests:
   box geometry, analytic polynomials, Gauss–Legendre cell averages). Property
   tests compare the package against *these*, never against the package's own
   neighbor search or geometry. Keep that independence when adding oracles.
+  The M10 oracles live at the end of `ghost_oracles.jl`: `faces_forest`
+  (three levels against the walls), `parity_data` (polynomials of
+  definite parity), `undefined_ghosts` (the `NaN`-prefill check that
+  catches a ghost read before it is written) and `reflecting_vs_doubled`
+  (a half domain against the doubled domain it folds).
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.
