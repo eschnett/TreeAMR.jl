@@ -537,3 +537,20 @@ job rather than by `Pkg.test`.
 
 Mesh machinery belongs here; physics belongs there — the same rule as
 for TreeWave.
+
+## Downstream: TreeGeneralizedHarmonic
+
+`~/src/jl/TreeGeneralizedHarmonic` (github.com/eschnett/TreeGeneralizedHarmonic.jl)
+is the third application: the vacuum Einstein equations in the
+generalized harmonic formulation, a black hole on the octree. It pins
+TreeAMR to **GitHub `main`** through `[sources]` (with `TreeAMR = "0.1.2"`
+under `[compat]` from 2026-09-25), so a push here reaches its next resolve
+without a release. Every kernel it has goes through `map_blocks!`, and it
+calls `threaded_foreach` — unexported — for its horizon interpolator's
+batch; its `test/prerequisite_tests.jl` names that one, so renaming it
+breaks that suite at the top. On 2026-09-25 it measured the ownership
+policy from the outside, on Symmetry, and found the integrator's own
+passes to be what is left: see the last item of "Open questions" in
+`CODE.md` (the serial stage updates, the per-`solve` buffers, a
+first-touch anomaly that looks like NUMA balancing, why not Polyester,
+and an owner-aware state vector type as the suggestion).
