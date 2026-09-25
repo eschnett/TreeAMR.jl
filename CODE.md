@@ -1481,12 +1481,17 @@ entries per volume — documented here, implemented post-M3.
   ones with a single workgroup each, i.e. serial, which measured as a
   hard ceiling of ~2.5x on the ghost fill however many threads were
   available, while the single-launch parts of the same step scaled
-  fine. Each phase is therefore flattened into slices of roughly equal
+  fine. Each phase was therefore flattened into slices of roughly equal
   cell count, never crossing a batch, dealt out largest first, one task
   per thread, each slice launching as a single inline workgroup. The
   regrid transfer uses the same machinery for the same reason. A device
   backend keeps the plain per-batch launches: there a launch *is* the
-  parallel unit.
+  parallel unit. *(Amended 2026-09-23:* the phase is still one parallel
+  loop and every batch is still split across all threads, but by owner
+  rather than by size. Each thread takes the transfers whose target
+  blocks it owns, because slices dealt to whichever task was free moved
+  every block's ghosts to a new core in every fill; see "What one
+  process loses".)
 
   **Page placement dominates everything else on a NUMA node** (measured
   in M5, 64-core AMD EPYC 7532, 8 NUMA domains; 960 blocks of `32^3`,
@@ -1509,12 +1514,20 @@ entries per volume — documented here, implemented post-M3.
   Interleaving the pages (`numactl --interleave=all`) is thus worth
   2–6x at high thread counts, and is a process-level policy the library
   cannot set for itself — so it is documented as the way to run rather
-  than implemented. Pinning KernelAbstractions to its *static* schedule,
+  than implemented. *(Amended 2026-09-23:* since every per-block
+  pass now runs each block on its owner's thread, first touch lands a
+  block on the domain that computes on it, and with pinned threads that
+  beats interleaving; see "What one process loses".) Pinning KernelAbstractions to its *static* schedule,
   so that a chunk of an ndrange always lands on the same thread, was
   measured as the alternative and rejected: with first-touch placement
   it reproduced the left-hand column to within noise (RHS 10.0, scatter
   5.5, norm 19.3), for exactly the reason above — stability within one
   kernel does not make a page local to all the kernels that touch it.
+  *(Revisited 2026-09-23:* right for the reason given and for one kernel
+  alone, but most of what it was meant to fix was not placement. With
+  the ghost fill given the same block-to-thread map as the kernels, the
+  static schedule recovers 2.4x on the RHS; see "What one process
+  loses" below.)
 
   The compute-bound pass (initial data, a sine per cell) scales past the
   memory-bound ones, as it should. Two pieces do not scale, both by
@@ -1525,6 +1538,322 @@ entries per volume — documented here, implemented post-M3.
   because the pass is shorter than the cost of spawning the tasks. Both
   are regrid-frequency and orders of magnitude below the regrid's own
   data movement, so neither is worth a grain-size heuristic.
+
+  **Where the 64-thread efficiency goes: the process, not the pages**
+  (measured 2026-09-23 on Symmetry, `bench/symmetry_numa.sh`, jobs
+  562390–562402; a 64-core AMD EPYC 7543 node — two sockets of four
+  NUMA domains, distance 12 within a socket and 32 across, two DDR4
+  channels per domain, so about 410 GB/s for the node — same 960 blocks
+  of `32^3` as the M5 table, Julia 1.13). The question was how much of
+  the gap to 64x a domain-local layout could recover — one MPI rank per
+  NUMA domain, or the same block ownership imitated with pinned thread
+  groups in one process. Eight independent 8-thread copies of the
+  benchmark, each bound to one domain with its own memory and holding
+  an eighth of the blocks, have no cross-domain traffic at all and so
+  bound *any* such scheme from above. Nanoseconds per cell for the whole
+  node, the slowest copy's time over all cells; five repeats of the
+  first column spread 2.05–2.45 on the RHS:
+
+  | phase                 | 1 × 64, interleaved | 1 × 64, first touch | 2 × 32, socket-local | 8 × 8, domain-local | 8 × 8, interleaved |
+  |---|---|---|---|---|---|
+  | RHS evaluation        | 2.41 | 2.42 | 1.21 | **0.73** | 0.89 |
+  | ghost fill            | 0.92 | 1.00 | 0.36 | **0.29** | 0.36 |
+  | scatter               | 0.68 | 0.73 | 0.29 | **0.16** | 0.17 |
+  | initial data          | 0.46 | 0.46 | 0.45 | 0.39 | 0.41 |
+  | volume-weighted norm  | 0.27 | 0.44 | 0.28 | 0.26 | — |
+  | triad reference       | 0.71 | 0.92 | 0.34 | 0.28 | 0.18 |
+
+  *(Amended the same day.)* The copies of the last three columns were
+  started together but not synchronized, and each reports its own best
+  of twenty repetitions per phase, so a copy whose repetitions fell
+  while the others were compiling or in another phase reports bandwidth
+  the node never gave all of them at once. Re-measured in shared
+  wall-clock windows ("What one process loses", below), the RHS gap to
+  eight copies is 2.2x rather than 3x, and for a plain static loop the
+  stream gap between one process and eight disappears. The conclusions
+  below are amended where they depend on the difference.
+
+  Three things follow, in decreasing order of surprise.
+
+  - *The loss is not memory placement.* The last column is the control:
+    eight 8-thread processes whose pages are interleaved over the whole
+    node, the same non-local placement as the first column, run the
+    per-evaluation path 2.7–4x faster than the one 64-thread process
+    and within 20 % of the domain-local copies. Placement itself is
+    worth about 1.2x: the same 8-thread process on domain 0 runs the
+    RHS at 5.8 ns/cell with local pages, 5.9 interleaved over the node,
+    5.6 on a same-socket domain and 8.2 on a cross-socket one. First
+    touch is within 10 % of interleaving here, against 3.6x on the
+    Rome node of the M5 table; the benchmark's first touch is parallel,
+    and Milan's fabric is forgiving. The kernel's NUMA-balancing
+    counters did not move during the runs, so page migration plays no
+    part either.
+  - *One process stops scaling at 32 threads.* At fixed placement and
+    fixed problem the RHS costs 3.02, 2.34, 2.41 and 2.37 ns/cell at
+    16, 32, 48 and 64 threads; the ghost fill 1.64, 1.11, 0.86, 0.97;
+    scatter 0.74, 0.70, 0.63, 0.68 — while the compute-bound initial
+    data goes 1.55, 0.77, 0.56, 0.47. Every memory-streaming phase
+    saturates, and the compute-bound one does not. Not the garbage
+    collector (0 ms per call, 1.7 MB allocated per RHS evaluation, all
+    of it per-task bookkeeping), not the GC or interactive thread
+    counts (`--gcthreads=1` and `-t 64,0` change nothing), not the
+    footprint (an 8-thread process over all 960 blocks runs the RHS at
+    4.7 ns/cell, no slower than over 120). Pinning (`JULIA_EXCLUSIVE=1`)
+    helps scatter 1.5x and the ghost fill 1.15x and leaves the RHS
+    where it was.
+  - *The stream itself localizes it in the launch path.* `bench/stream.jl`
+    moves the same three 717 MB arrays through four mechanisms. In one
+    64-thread interleaved process: `Threads.@threads :static` over
+    per-thread chunks 205 GB/s; one `Threads.@spawn` per chunk under
+    `@sync`, which is what the KernelAbstractions CPU backend does,
+    96 GB/s; the KernelAbstractions triad kernel 62 GB/s; the same kernel
+    under the backend's static scheduling 69 GB/s. Pinned: 138, 123,
+    115 and 131. In an 8-thread process over the same arrays all four
+    are equal at 48 GB/s, bandwidth-bound; from eight 8-thread
+    processes the KernelAbstractions kernel aggregates about 290 GB/s
+    and the static loop about 385, the latter 94 % of the node
+    *(unsynchronized; in shared windows 169 and 224, the static loop
+    exactly what one process reaches)*. So the per-thread streaming
+    rate of a KernelAbstractions CPU kernel falls from 4–6 GB/s in an
+    8-thread process to 1 GB/s in a 64-thread one with the same node
+    load and the same pages, and a plain loop falls by half *(the
+    8-thread rates were taken on an otherwise idle node; at equal node
+    load the plain loop does not fall at all)*. The mechanism was not
+    identified here. The candidates were thread wake-up cascades on
+    spawn, migration of unpinned threads across sockets between
+    launches, and something in the backend's per-workgroup loop that
+    contends only at high thread counts. It is none of the three; the
+    next paragraph but one has it.
+
+  What this means for the plan (decided): NUMA-aware page placement
+  inside one process is not worth building; it buys 1.2x and
+  duplicates M7. One MPI rank per NUMA domain would recover the gap,
+  but so does one process: *(amended the same day)* the gap is 2.2x,
+  not 3x, and it is not a per-process limit but the loss of
+  data-to-core affinity between launches, which a block-ownership
+  launch policy recovers entirely inside one process (next paragraph).
+  M7 therefore gains no bandwidth argument from this, and loses none:
+  its partition of blocks over ranks and the ownership partition over
+  threads are the same contiguous Morton ranges, one level apart. The
+  M5 finding that pages must be interleaved stands as advice for Rome
+  and is harmless on Milan. And
+  the host `triad reference` figures quoted in the tables below, taken
+  before 2026-09-23, are inflated: the benchmarks left the two input
+  arrays unwritten, and on Linux an untouched allocation reads from the
+  kernel's shared zero page, so the "triad" was a write stream reporting
+  three times its bandwidth. Both benchmarks now write their inputs
+  first; the device figures, whose memory is real, are unaffected, and
+  the time ratios stand.
+
+  **What one process loses: data-to-core affinity** (measured
+  2026-09-23 on Symmetry, jobs 562406–562425 on nodes cn099–cn103, all
+  EPYC 7543; `bench/symmetry_affinity.sh` reproduces the comparisons
+  with `bench/affinity.jl`, `bench/affinity_mesh.jl` and
+  `bench/owner.jl`; the `perf` and IBS counters needed
+  `kernel.perf_event_paranoid=-1`, set by hand on cn099). The first step
+  was to repair the comparison: processes given one start time now run
+  each mode in the same wall-clock window and report what they moved
+  inside it. In shared windows eight domain-bound 8-thread processes
+  stream the static triad at 221–224 GB/s together, and one 64-thread
+  process at 174–218, pinned or not; the node's ceiling for the same
+  count is 244, eight processes on their own domains' memory. For a
+  plain static loop there is no per-process limit. What remains depends
+  on the launch path, and it is large (GB/s, chunks of 1.4M elements,
+  pages interleaved, ranges over the runs):
+
+  | launch                                   | 1 × 64 unpinned | 1 × 64 pinned | 8 × 8, shared windows |
+  |---|---|---|---|
+  | `@threads :static`, chunk t on thread t  | 200–218 | 174–207 | 221–224 |
+  | the same, chunk map rotated every launch |  90–99  |  80–86  | 160 |
+  | one `Threads.@spawn` per chunk           |  76–95  |  98–149 | 164–169 |
+  | KernelAbstractions, default schedule     |  46–60  |  84–126 | 166–172 |
+  | KernelAbstractions, static schedule      |  90–125 | 136–166 | 207–211 |
+
+  Everything the earlier paragraph suspected is ruled out:
+
+  - *Not the launch.* Long-lived tasks that spin on a counter, never
+    created or woken per launch, stream no faster than spawn (83–202
+    GB/s). Staggering their starts by 2 µs per thread brings them to
+    220–224, which `@threads :static` gets for free by waking its
+    threads one after another, about 9 µs apart. Setting
+    `JULIA_THREAD_SLEEP_THRESHOLD=0` changes nothing, and making idle
+    threads spin forever halves the static loop.
+  - *Not the thread being off its core.* Every chunk's thread CPU time
+    equals its wall time (99–100 %), with under 0.2 involuntary context
+    switches per chunk. `perf record` puts 97–99 % of all samples on
+    the loop's own loads and stores in every mode, and the scheduler
+    under 1 %.
+  - *Not the code.* A scalar loop the compiler may not vectorize
+    streams as fast as the SIMD one (196–210 against 207–218). Retired
+    instructions and DRAM fills per launch agree between the modes to
+    within 13 %, the KernelAbstractions kernel included.
+
+  The slow modes move the same bytes with the same instructions, and
+  every load simply waits longer. IBS puts the mean L1-miss latency at
+  1816 cycles in the static loop and at 3218–4256 in the spawned,
+  rotated and cross-socket ones, in proportion to the rate.
+
+  What differs is whether a chunk meets the core that streamed it the
+  launch before. With threads pinned (slot t on CPU t − 1; eight CPUs
+  per CCD, each CCD its own NUMA domain, 32 per socket) and chunk t
+  alternating between threads t and t + K on successive launches:
+
+  | K    | 0 | 1 | 4 | 8 | 16 | 32 |
+  |---|---|---|---|---|---|---|
+  | GB/s | 196 | 166 | 108 | 114 | 84 | 72 |
+
+  K = 1 moves one chunk in eight to the next CCD, K = 4 half of them,
+  K = 8 all of them within the socket, K = 32 all of them to the other
+  socket. The farther data travels between two launches, the slower it
+  streams. This is what "the process" stood for: an 8-thread process
+  bound to one NUMA domain is one CCD on this node, so however its
+  tasks are shuffled, its data never leaves that CCD.
+
+  Two more observations say what kind of cost this is. On an idle node
+  it does not exist: a core chasing pointers through, or streaming, a
+  buffer last written or read by itself, by a core of its own CCD, of
+  another CCD or of the other socket sees the same 74–79 ns and
+  27–29 GB/s with the buffer in its own domain (`bench/owner.jl`). And with interleaved pages it outlives the
+  scrambling: after one window of the rotated map the static loop runs
+  at 110, 137, 153 and 150 GB/s in the next four three-second windows,
+  against 195 before, while with first-touch pages it is back at 210
+  at once. Both fit coherence traffic in the data fabric. A line last
+  held by another CCX costs its home directory a probe to that CCX. A
+  lone reader never notices, which suggests the DRAM read goes out in
+  parallel with the probe. With 64 cores streaming, the probes and
+  their answers compete with the data for the same links, and a
+  directory entry left pointing at the wrong CCX stays until something
+  evicts it. The fabric's own counters would show this directly, but
+  the uncore PMU is not loaded on these nodes, so this step is
+  inferred, not counted.
+
+  *Where the package lost it.* Every per-evaluation phase broke
+  affinity. `map_blocks!` and `scatter!` launched on KernelAbstractions'
+  default CPU schedule, one `@spawn` per thread-chunk, so a chunk ran
+  on whichever thread took it. `run_phase!` dealt ghost slices largest
+  first to spawned tasks, so a thread's ghost targets lay in blocks
+  that other threads scattered into and computed on. And the phases
+  partitioned the blocks differently in any case. Three launch policies
+  on the 960-block mesh, in shared windows, nanoseconds per cell
+  averaged over the window (one-process columns on cn102, eight-process
+  columns on cn103; the V0 unpinned RHS on cn103 was 2.56, so the nodes
+  agree):
+
+  | phase          | V0 unpinned | V0 pinned | V1 pinned | V3 pinned | V3 pinned, first touch | V3 unpinned | 8 × 8 interleaved | 8 × 8 domain-local |
+  |---|---|---|---|---|---|---|---|---|
+  | RHS evaluation | 2.49 | 2.45 | 2.26 | **1.01** | **0.94** | 1.23 | 1.16 | 0.99 |
+  | ghost fill     | 1.01 | 0.92 | 0.95 | **0.39** | 0.42 | 0.51 | 0.44 | 0.40 |
+  | scatter        | 0.75 | 0.44 | 0.30 | **0.27** | 0.27 | 0.28 | 0.30 | 0.28 |
+  | RHS kernel     | 0.75 | 0.40 | 0.29 | **0.28** | 0.28 | 0.29 | 0.28 | 0.27 |
+
+  V0 is the package as it is. V1 puts every package launch on the
+  backend's static schedule, so repeated launches of one kernel give
+  thread t the same blocks. V3 adds the ghost fill by owner: each
+  group's transfers sorted by target block, and the task on thread c
+  filling the ghosts of exactly the blocks thread c owns under V1. Both
+  were installed by overwriting methods in the benchmark script (which
+  now compares the implemented policy against a `spawn` control
+  instead). V1 alone recovers each kernel repeated on its own, since
+  scatter and the RHS kernel reach the eight-process figures. It does
+  not recover the RHS evaluation (2.45 to 2.26), because the ghost fill
+  in the middle re-scrambles the working array every time; under V0 the
+  evaluation (77 ms) even costs more than its three phases run
+  separately (55). V3 recovers all of it: 1.01 ns/cell, as fast as
+  eight domain-local processes, and 0.94 with first-touch pages, which
+  the ownership makes domain-local without `numactl`. Unpinned, V3
+  still gains 2x (1.23), and pinning adds the rest.
+
+  *What changed (implemented the same day, measured below).* One
+  partition of blocks over threads, `threadchunks(nblocks)`, is used by
+  every per-block pass for the lifetime of a forest generation:
+
+  1. `map_blocks!`, `scatter!`/`gather!` (`run_over_interiors!`),
+     `fill_by_coordinates!` and `zerofill!`, the first touch of every
+     working array and state vector, go through `launch_by_owner!`. On
+     the CPU that is KernelAbstractions' static schedule with one block
+     per workgroup
+     (`workgroupsize` the whole ndrange except a 1 on the block axis;
+     no kernel in `src/` uses workgroup features). KernelAbstractions
+     then splits the blocks exactly as `threadchunks` does
+     (`divrem(nblocks, nthreads)`, the remainder to the first threads),
+     and `@threads :static` puts chunk t on thread t every time. The
+     package must substitute `CPU(; static = true)` itself, because
+     `get_backend(::Array)` returns the default `CPU()` and the flag
+     cannot travel on the storage. A device backend is untouched.
+     Nothing upstream is required. KernelAbstractions' default is
+     reasonable for a kernel run once and wrong for one run every step
+     over the same data, which is worth an issue there, not a
+     dependency.
+  2. `run_phase!` in `ghosts.jl`, on the CPU, goes by owner instead of
+     largest first, for the ghost fill, the interface fixup and the
+     regrid transfer alike. Every builder already collects a group's
+     transfers in block order, so `targetblocks` is non-decreasing (now
+     documented and tested), and each thread finds its share of every
+     group by bisection at fill time. `PhaseSlice` and `phase_plan` are
+     gone. M5's point survives, since every group, face slab or corner,
+     is still split across all threads, now by owner rather than by
+     size.
+  3. `threaded_chunks` in `threading.jl` puts chunk c on thread c on
+     every call, so that the host loops over blocks (the reductions,
+     the region boundary hook, the regrid bookkeeping) inherit the same
+     map. It does so with sticky tasks placed the way `@threads :static`
+     places its own, but without entering a threaded region, so unlike
+     `@threads :static` it nests and may be called from two tasks at
+     once.
+  4. Documented: pin the threads (`JULIA_EXCLUSIVE=1` or
+     ThreadPinning.jl) and then drop `numactl --interleave=all`, since
+     first touch now lands each block on its owner's domain.
+
+  None of this touches the M5 determinism rules: every work item still
+  owns its output slot, and only which thread runs it changes. The
+  thread-count digest test passes unchanged, on Julia 1.10 and 1.13.
+  Three constraints come with it. First, KernelAbstractions' static
+  schedule is `@threads :static`, which refuses to run nested inside
+  another threaded loop, so `launch_by_owner!` checks
+  `jl_in_threaded_region` and falls back to the default schedule there.
+  A caller launching `map_blocks!` from inside their own `@threads` loop
+  keeps working and only loses the affinity (tested). Second, a kernel
+  handed to `map_blocks!` sees one workgroup per block on the CPU, which
+  matters only to a kernel that uses local memory or `@groupsize`; the
+  docstring says so. Third, ownership by
+  block count balances cells, not ghost work, and ghost work
+  concentrates at level boundaries. At 15 blocks per thread the owner
+  fill was 2.3x faster than today's. A small in-cache smoke run at 7.5
+  blocks per thread (16 threads, 120 blocks of `16^3`) had it 1.7x
+  slower. If that case matters, the fix is a contiguous partition
+  weighted by per-block cost, which is the partition M7 needs across
+  ranks anyway. Ownership is by block index, so a multi-block forest
+  changes nothing here.
+
+  *Measured after the change* (job 562462, cn102, the same windows; the
+  "before" column is the previous `src/` on the same node). Nanoseconds
+  per cell, averaged over the window:
+
+  | phase          | before, pinned, interleaved | after, pinned, interleaved | after, pinned, first touch | before, unpinned, interleaved | after, unpinned, interleaved | after, unpinned, first touch | spawn control, pinned | 8 × 8 domain-local, after |
+  |---|---|---|---|---|---|---|---|---|
+  | RHS evaluation | 2.42 | 1.00 | **0.92** | 2.55 | 1.30 | 1.46 | 1.70 | 0.87 |
+  | ghost fill     | 0.91 | 0.39 | **0.36** | 1.02 | 0.56 | 0.60 | 0.57 | 0.32 |
+  | scatter        | 0.44 | 0.30 | **0.26** | 0.76 | 0.28 | 0.33 | 0.41 | 0.26 |
+  | RHS kernel     | 0.40 | 0.29 | **0.27** | 0.76 | 0.29 | 0.32 | 0.40 | 0.26 |
+
+  The implementation reproduces the V3 prototype: 2.4x on the RHS
+  evaluation pinned, and one pinned process with first-touch pages is
+  within 6 % of eight domain-local processes, which gained a little
+  themselves because ownership also helps inside a CCD. The spawn
+  control keeps the new partitions but lets every launch land anywhere,
+  and it gives back most of the gain. Unpinned, the policy still halves
+  the RHS, but first touch is then worse than interleaving (1.46
+  against 1.30), since an unpinned thread need not stay on the domain
+  where it first touched its pages. Hence the advice now reads: pin,
+  and then drop the interleaving; if you cannot pin, keep it.
+  `bench/threads.jl` (best of 20, pinned, first touch) puts the 64-thread
+  speedup over one thread bound to one domain at 38.6x on the RHS path,
+  36.8x on the ghost fill, 52x on scatter and 51x on the norm, and the
+  RHS at 0.81 ns/cell against 2.41 in the first table of "Where the
+  64-thread efficiency goes". The per-evaluation path allocates 2.3 MB
+  per RHS at 64 threads, against 1.7 MB before, for the sticky tasks and
+  closures, and the collector still spends no measurable time on it.
+
 - **GPU:** all kernels (ghost fill, prolongation, restriction,
   application RHS) are written with **KernelAbstractions.jl** from the
   start, so the CPU implementation is already the GPU implementation.
@@ -1700,7 +2029,11 @@ entries per volume — documented here, implemented post-M3.
   | volume-weighted norm  | 0.0232 | 0.058 | 2.5 |
   | `firing_boxes`        | 0.0160 | 0.088 | 5.5 |
   | schedule build        | 0.1114 | 0.105 | 0.9 |
-  | triad reference       | 3842 GB/s | 205 GB/s | 18.7 |
+  | triad reference       | 3842 GB/s | 205 GB/s (inflated, see below) | 18.7 |
+
+  The host triad figure is the write-stream artefact described under
+  "Where the 64-thread efficiency goes" above and overstates the host by
+  up to 3x, which would make the last ratio larger, not smaller.
 
   The per-evaluation path — the only part that runs at every RHS
   evaluation — tracks the bandwidth ratio, which is what a mesh library
@@ -1749,7 +2082,9 @@ entries per volume — documented here, implemented post-M3.
   `Float32x2` plays for the type genericity. It is not a speedup: at
   3.9M cells the RHS takes 0.0187 s against the same chip's 8 CPU
   threads at 0.0217 s, and the two triad references agree (107 against
-  113 GB/s), because on that part it is one memory system either way.
+  113 GB/s, both taken with the unwritten inputs noted above; whether
+  macOS shares a zero page the same way was not checked), because on
+  that part it is one memory system either way.
 
   **Implemented: the two-launch device reduction and the global scalar
   form** (decided after M8, amended before implementation, implemented
@@ -1930,7 +2265,7 @@ entries per volume — documented here, implemented post-M3.
   | volume-weighted norm  | 23.2 ms | **0.459 ms** | 53.1 ms | **116** |
   | `firing_boxes`        | 16.0 ms | **0.970 ms** | 21.3 ms | **22.0** |
   | RHS evaluation        |  7.0 ms | 4.57 ms | 104 ms | 22.8 |
-  | triad reference       |  0.56 ms | 0.56 ms | 8.7 ms | 15.6 |
+  | triad reference       |  0.56 ms | 0.56 ms | 8.7 ms (inflated, as in the M6 table) | 15.6 |
 
   The norm is 51x faster than the one-item form and costs 10 % of an
   RHS evaluation (0.38 ms and 8.6 % in `Float32`); `firing_boxes` is 16x
@@ -2054,7 +2389,13 @@ design, see the M8 entry), and the list below is in execution order.
   59.5x on the compute-bound initial-data pass, with the table and the
   two findings that got it there — a phase must be one parallel loop,
   and pages must be interleaved — under [Parallelism](#parallelism).
-  `bench/scan.sh` reproduces the measurement. *(Done.)*
+  `bench/scan.sh` reproduces the measurement. Re-measured on a Milan
+  node on 2026-09-23 ("Where the 64-thread efficiency goes" and "What
+  one process loses", same section): the remaining gap is not page
+  placement but the loss of data-to-core affinity between launches,
+  which the block-ownership launch policy recovers in one process
+  (implemented the same day: 38.6x on the RHS path at 64 threads,
+  pinned). *(Done.)*
 - **M6 — GPU.** CUDA backend via KernelAbstractions; device-resident
   data. Floating-point-type genericity *(landed early, after M5)* is a
   prerequisite that is now in place: the geometry and the interpolation

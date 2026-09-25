@@ -135,13 +135,38 @@ cd /tmp/amr110 && julia +1.10 --project=test -e 'using Pkg; Pkg.develop(path="."
 
 Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
 takes a list of thread counts and prints a speedup table). Sizes come
-from `TREEAMR_BENCH_{D,N,ROOTS,REPS}`. On a NUMA node, run it under
-`numactl --interleave=all` — that is worth 3–7x at 64 threads and is
-what the numbers in CODE.md were taken with:
+from `TREEAMR_BENCH_{D,N,ROOTS,REPS}`. On a NUMA node, pin the threads
+(`JULIA_EXCLUSIVE=1`) and leave placement to first touch, which the
+block-ownership policy makes domain-local (measured 2026-09-23, 0.92
+against 1.00 ns/cell interleaved). Unpinned, run it under `numactl
+--interleave=all` instead, which is what the M5 numbers in CODE.md were
+taken with and is worth 3–7x over unpinned first touch there:
 
 ```bash
 TREEAMR_BENCH_N=32 TREEAMR_BENCH_ROOTS=8 bench/scan.sh 1 2 4 8
 ```
+
+`bench/symmetry_numa.sh` is the SLURM job behind the 2026-09-23 NUMA
+measurement in CODE.md ("Where the 64-thread efficiency goes"): the
+same benchmark as one 64-thread process against eight domain-bound
+8-thread processes, plus placement and thread-count controls and the
+stream microbenchmark `bench/stream.jl`. Its finding is that the
+memory-streaming phases stop scaling inside one process at 32 threads
+for a reason that is not page placement; anyone working on CPU thread
+scaling should read that paragraph first. `bench/threads.jl` also
+prints allocation and GC cost per call for the per-evaluation path.
+
+`bench/symmetry_affinity.sh` is the same-day follow-up, and a later
+CODE.md paragraph ("What one process loses") records it. The reason is
+data-to-core affinity between launches. KernelAbstractions' default CPU
+schedule and `run_phase!`'s former largest-first slices put a block on
+a different core in every phase. The block-ownership policy that
+recovers it is implemented (see the Architecture bullet below).
+`bench/affinity_mesh.jl` compares it against a `spawn` control. Compare
+processes
+only in synchronized wall-clock windows (`bench/affinity.jl` explains
+why). Best-of timings of independent processes overstate what they get
+together.
 
 There is no formatter or linter configured.
 
@@ -152,7 +177,7 @@ layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
-| threading | `threading.jl` | `threadchunks` and the three host-side parallel-loop helpers everything else is built on |
+| threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
@@ -241,13 +266,26 @@ The ideas that span several files and are easy to violate:
   new parallel loop that races on a slot breaks it; a reassociated sum
   would move only its `l2` and `mass` lines, which are the ones to give
   a tolerance if that day comes.
-- **A ghost phase is one parallel loop.** `run_phase!` in `ghosts.jl`
-  flattens a phase's transfer batches into `PhaseSlice`s of roughly
-  equal cell count and deals them out largest first; a batch is *not*
-  the unit of parallelism, because batch sizes differ by orders of
-  magnitude (face slab vs corner) and per-batch launches capped the
-  ghost fill at ~2.5x. Only the CPU backend does this — `run_phase!`
-  has a generic method that keeps per-batch launches for devices.
+- **A ghost phase is one parallel loop, by owner.** `run_phase!` in
+  `ghosts.jl` gives each thread the part of *every* transfer batch
+  whose target blocks it owns; a batch is *not* the unit of
+  parallelism, because batch sizes differ by orders of magnitude (face
+  slab vs corner) and per-batch launches capped the ghost fill at
+  ~2.5x. That needs each group's `targetblocks` non-decreasing, which
+  every builder guarantees by collecting in block order and
+  `test/thread_tests.jl` asserts. Only the CPU backend does this —
+  `run_phase!` has a generic method that keeps per-batch launches for
+  devices.
+- **Every per-block pass runs a block on its owner's thread.** Block
+  `b` belongs to the thread whose chunk of `threadchunks(nblocks)`
+  contains it. `threaded_chunks` puts chunk `c` on thread `c` with
+  sticky tasks, and `launch_by_owner!` runs block-shaped kernels on
+  KernelAbstractions' static schedule with one block per workgroup,
+  which splits the blocks identically. A new block-shaped CPU launch
+  in `src/` goes through `launch_by_owner!`, and a new host loop over
+  blocks through `threaded_chunks`. A bare `kernel(backend)(…)` or
+  `Threads.@spawn` puts blocks on arbitrary cores and costs up to 2.4x
+  on a many-core node (CODE.md, "What one process loses").
 
 Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 (`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
