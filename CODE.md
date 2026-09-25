@@ -148,7 +148,11 @@ tie-breaking. Consequences:
   to nobody; they are the first plane of an outward-facing region and the
   boundary hook fills them, while the lower boundary points are owned and
   evolved. A vertex-centered application with physical boundaries sees
-  this asymmetry; a periodic domain has no boundary and none. Accepted
+  this asymmetry; a periodic domain has no boundary and none. At a
+  *reflecting* upper face the exchange derives the wall points instead
+  of the hook (M10; see [Ghost filling](#ghost-filling)), and the
+  asymmetry remains: the low wall evolves, the high one interpolates.
+  Accepted
   (decided): treating both boundary planes alike would have the lowest
   blocks own `N − 1` points in that dimension and the uniform state
   layout would be gone.
@@ -433,11 +437,37 @@ declared up front:
   ordinary copy/prolongation/restriction machinery with no special
   boundary code. With `M_i = 1` a block can be its own periodic
   neighbor; this is supported.
-- **Physical** (per face): ghost cells are filled by a user-supplied
-  boundary condition hook (which also covers e.g. reflection
-  symmetries). For a vertex-like dimension the domain's upper boundary
-  plane is the first plane of an outward-facing region and is filled by
-  the hook too (M8; see [Centerings](#centerings)).
+- **Reflecting** (per face; M10): a face across which the solution is
+  its own mirror image. That covers a symmetry plane and, equally, a
+  hydrodynamic solid wall, which does the same thing to the ghosts. It is
+  declared on the forest as `reflecting = ((lo, hi), …)`, one pair per
+  dimension, shaped like `extents`; a dimension cannot be both periodic
+  and reflecting. Every variable of a field set over such a forest has a
+  **parity** per dimension, `EvenParity` or `OddParity`: a scalar is
+  even everywhere, the `d` component of a vector is odd in `d` and even
+  elsewhere, and a product of components takes the product of their
+  parities. The parity is required, with no default, since it is physics.
+  `NoParity` exists for dimensions without a reflecting face and is
+  refused in one that has one (decided). A variable without a parity has
+  no value beyond the wall, and ghosts without a value do not stay in the
+  ghosts: the first regrid prolongation that reads them carries them into
+  the interior.
+
+  Like periodicity, reflection needs no boundary code, though it lives
+  one layer up. The tree is unchanged — `neighbor_keys` still finds
+  nothing across the face — and the *schedule* turns every ghost region
+  crossing a reflecting face into an ordinary copy, restriction or
+  prolongation from a mirrored source (see [Ghost filling](#ghost-filling)).
+  So reflection runs on every backend, in the same kernel and the same
+  phases as every other transfer, and the boundary hook never sees a
+  reflecting face.
+- **Physical** (per face, neither periodic nor reflecting): ghost cells
+  are filled by a user-supplied boundary condition hook. For a
+  vertex-like dimension the domain's upper boundary plane is the first
+  plane of an outward-facing region and is filled by the hook too (M8;
+  see [Centerings](#centerings)). Until M10 the hook was also the only
+  way to express a reflection, which it could not do correctly at every
+  edge and corner; see [Ghost filling](#ghost-filling).
 
 ### Data layout
 
@@ -597,9 +627,79 @@ invoked per outward-facing ghost region (faces, edges, and corners)
 at the domain edge has prolongation stencils that reach *tangentially*
 past the edge into the coarse source's own outer ghosts, so running the
 hook last would feed unwritten memory into the interpolation. The hook
-may therefore read its block's interior (as reflecting and extrapolating
-conditions do) but not other blocks' ghosts, and not ghosts that
-prolongation has yet to fill.
+may therefore read its block's interior (as extrapolating conditions
+do) but not other blocks' ghosts, and not ghosts that prolongation has
+yet to fill.
+
+**Reflecting faces** (M10) are transfers, not hook calls. A ghost region
+in direction `δ` that crosses reflecting faces in the dimensions of a
+mask `m` is the mirror image of a region that lies inside the domain.
+Zero the masked components of `δ` to get `δ′`. The mirror image is then
+the block's own interior next to the wall when `δ′ = 0`, and otherwise
+it lies in the node adjacent to the block in direction `δ′`, at the
+block's own extent along every masked dimension. The source is whatever
+the ordinary search finds in `δ′`:
+
+- the block itself (a copy);
+- a same-level neighbor (a copy);
+- a coarser one (a prolongation);
+- finer ones (a restriction, from the children on the wall side only:
+  the others cover the half of the tangential extent that the mirror
+  image does not reach).
+
+If `δ′` leaves the domain through an outer face, the region is the
+hook's, as before.
+
+Along each masked dimension, the one-dimensional stencil is the ordinary
+*tangential* one (the `δ_d = 0` stencil of the same kind and child
+offset) with its **target rows remapped** by the mirror `j ↦ j*`:
+
+| | low wall | high wall |
+|---|---|---|
+| cell-centered | `j* = 2G + 1 − j` | `j* = 2(G + N) + 1 − j` |
+| vertex-like | `j* = 2(G + 1) − j` | `j* = 2(G + N + 1) − j` |
+
+The source windows and weights are the ordinary ones, so `Stencil1D`
+and the transfer kernel do not change. The kernel only multiplies the
+result by a per-variable factor, the product of the variable's parities
+over the masked dimensions. It keeps a table of these factors on the
+field set, not in the schedule: a schedule still belongs to a layout,
+and parity belongs to the variables. The mirror image of a ghost slab
+lies inside the owned range and within its wall-side half, since
+`G ≤ N/2`, and `G + 1 ≤ N/2` along a stagger, which is exactly
+`N ≥ 2G + 2c`. That is asserted when the schedule is built.
+
+Phasing needs no new rule. A mirror copy or restriction reads interiors
+only and joins phase 1; a mirror prolongation targets the block's own
+level and joins the sweep at that level. This is what the hook could not
+do. At a mixed edge or corner region whose tangential neighbor is
+coarser, the mirrored values are the block's *own* prolongated ghosts,
+and the hook, which runs before the sweep, would have read them stale.
+
+**The upper wall point in a vertex-like dimension** (decided in the M10
+design). On a high reflecting face the wall plane `G + N + 1` belongs to
+nobody (see [Centerings](#centerings)), and the mirror maps it onto
+itself, so reflection alone does not determine it. It is derived:
+
+- An odd variable is exactly zero there.
+- An even variable takes the symmetric Lagrange interpolant at the wall
+  through the `p` points `±1, …, ±p/2` beside it. By symmetry that folds
+  to the `p/2` one-sided points with weights `2w_k`, which at `p = 4` is
+  `(4u₁ − u₂)/3`.
+
+`p` is the prolongation order, so the error is `O(h^p)`, the same as a
+prolongated ghost's, and the interface-order rule covers the point. Every
+source has its own wall at `G + N + 1` in its own frame, so the row is
+the same whatever kind the transfer is, and it reads the source's own
+points beside the wall. A coarser source's points are further apart,
+`O(H^p)`, as prolongation's are. The row is its own batch, because its
+parity factor is `(1 + s)/2` where the mirrored rows' is `s`. The low
+wall point is owned and evolved, as on any face. So a vertex-centered
+reflecting box is not symmetric under exchanging its two walls: the low
+wall evolves, the high one interpolates. Nor is an odd variable's low
+wall point forced to zero. It stays zero if the right-hand side respects
+the parity, as a centered stencil does, since the mirrored ghosts give
+`u(−h) = −u(h)` exactly.
 
 Edge and corner ghost regions are always filled — some stencils don't
 need them, but filling unconditionally is simpler, and cross-derivative
@@ -607,8 +707,9 @@ stencils do. Application kernels are strictly block-local: neighbor data
 is visible only through ghost cells.
 
 Transfers are **batched by stencil**: everything sharing a kind, a
-direction and a child offset shares one set of one-dimensional stencils
-and so one kernel launch. Prolongations are additionally batched by
+direction, a child offset and (M10) a mirror state per dimension — none,
+mirrored rows, or the vertex-like upper wall row — shares one set of
+one-dimensional stencils and so one kernel launch. Prolongations are additionally batched by
 *target level* (amended in M5): the batch is the unit the phase-2 sweep
 schedules, so a batch spanning two levels would be filed under one of
 them and the coarsest-target-first order would be quietly lost wherever
@@ -1582,7 +1683,11 @@ entries per volume — documented here, implemented post-M3.
     is CPU-only, which it says if handed a device field set. That
     limitation is real and is not papered over: outer boundaries that
     read their own interior are a CPU-only capability until the cell
-    form grows an interior accessor.
+    form grows an interior accessor. *(Amended in M10: reflection has
+    left this list. It is a property of the domain and a transfer in
+    the schedule, so it runs on every backend; see
+    [Ghost filling](#ghost-filling). Extrapolating outflow, and anything
+    else that reads the interior, is what remains CPU-only.)*
   - The **flagging function** received `(b, key)` and no data, so an
     application closed over its field set and read it on the host.
     `firing_boxes(fires, fs)` is the device form: `fires(work, idx, b, x)`
@@ -1995,7 +2100,8 @@ Remaining, none blocking before their milestone:
 Each milestone has a concrete acceptance test; serial correctness is
 established before any parallelism. The numbers are the order the
 milestones were planned in; **M8 is done before M7** (decided in the M8
-design, see the M8 entry), and the list below is in execution order.
+design, see the M8 entry), and so is M10, which was added after M8. The
+list below is in execution order.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -2191,6 +2297,37 @@ design, see the M8 entry), and the list below is in execution order.
     thread workload (bit-identical at 1 and 8 threads) and in the device
     suite, where Metal in `Float32` reproduces the CPU numbers bit for
     bit.
+- **M10 — Reflecting boundaries.** Done before M7, for M8's reason: M7
+  then distributes mirror transfers as the ordinary transfers they are,
+  rather than retrofitting them. `reflecting` per face on the forest,
+  `parity` per variable and dimension on the field set, and the mirror
+  transfers and the derived upper wall point under
+  [Ghost filling](#ghost-filling). Until now a reflection could only be
+  written as a region-form boundary hook. That form is CPU-only, has to
+  repeat the mirror index arithmetic per centering, and reads stale
+  ghosts at a mixed edge or corner region whose tangential neighbor is
+  coarser. *Accept:*
+  - refusals, each saying why: periodic and reflecting in one dimension,
+    a missing parity, `NoParity` in a reflected dimension;
+  - the M2 exactness test with data even or odd about the wall, of
+    per-dimension degree `p − 1`, over three levels touching the wall,
+    at `p = 2, 4`, for every centering. It covers the derived upper wall
+    point: zero for odd data, exact for even. The conservative family
+    is tested on cell averages;
+  - a reflecting domain reproducing the mirrored doubled domain on
+    arbitrary data, to roundoff, including a coarser tangential neighbor
+    at the wall;
+  - every ghost written exactly once, the hook never handed a
+    reflecting region;
+  - **no ghost undefined, and none read before it is defined**, for
+    every combination of periodic, outer and reflecting faces in
+    `D = 1, 2, 3` and every centering: `NaN`-prefilled storage with
+    finite owned data, checked for `NaN` after one fill;
+  - the regrid transfer exact at a wall;
+  - the wave equation with odd and with even data on a reflecting half
+    domain agreeing with the full domain, and converging at the
+    predicted rate at a vertex-centered upper wall;
+  - a reflecting cycle in the thread workload and in the device suite.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
