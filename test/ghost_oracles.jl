@@ -485,3 +485,222 @@ function interface_touches(isched::InterfaceSchedule{T,D}) where {T,D}
     end
     return targets, sources
 end
+
+# --- Reflecting faces (M10) ----------------------------------------------
+
+"""
+What the two faces of one dimension can be: wrapped onto each other,
+both outer (the hook's), one of the two reflecting, or both reflecting.
+"""
+const FACE_KINDS = (:periodic, :outer, :reflect_lo, :reflect_hi, :reflect_both)
+
+face_periodic(kind::Symbol) = kind === :periodic
+face_reflecting(kind::Symbol) = (kind === :reflect_lo || kind === :reflect_both,
+                                 kind === :reflect_hi || kind === :reflect_both)
+
+"""
+A brick of side `roots` (3 in 1D, 2 otherwise) whose faces are `kinds`,
+refined twice at the low and at the high corner.
+
+That puts all three levels against the walls, with the coarse-fine faces
+meeting a wall *tangentially* — a level-2 block, a level-1 block and a
+level-0 block in a row along it — which is the case where a mirrored
+ghost is the block's own prolongated ghost, and where filling it at the
+wrong time reads it undefined.
+"""
+function faces_forest(kinds::NTuple{D,Symbol}; T::Type=Float64, N=8) where {D}
+    roots = D == 1 ? 3 : 2
+    forest = Forest{T}(ntuple(_ -> roots, D); N=N,
+                       periodic=map(face_periodic, kinds),
+                       reflecting=map(face_reflecting, kinds),
+                       extents=ntuple(_ -> (0, roots), D))
+    corner(c, r) = all(d -> c[d] < r, 1:D) || all(d -> c[d] > roots - r, 1:D)
+    refine_where!(forest, (c, lvl) -> (lvl == 0 && corner(c, 1.0)) ||
+                                      (lvl == 1 && corner(c, 0.5)), 2)
+    return forest
+end
+
+"""
+Data with a definite parity about every reflecting wall, polynomial of
+degree `< p` along every dimension so that operators of order `p`
+reproduce it exactly — together with the `parity` declaring it.
+
+Along each dimension the data is a cubic `c₀ + c₁y + c₂y² + c₃y³` in
+`y = x - w`, with the coefficients chosen by the kind of the two faces:
+
+- one reflecting wall at `w`: even (`c₀ + c₂y²`) for variable 1, odd
+  (`c₁y + c₃y³`) for variable 2;
+- reflecting at both ends: constant, since no nonconstant polynomial is
+  even about two points, and so both variables are even there;
+- periodic: constant, since no nonconstant polynomial is periodic;
+- outer at both ends: a general polynomial, and the hook supplies it.
+
+Terms of degree `≥ p` are dropped. The parity is `NoParity` wherever
+the dimension has no reflecting face, which is the only place the
+package accepts it.
+
+The coefficients are captured as `T` values, so the callback is a pure
+`T` function and can be launched on a device without fp64.
+"""
+function parity_data(::Type{T}, kinds::NTuple{D,Symbol}, p::Int;
+                     flip::Bool=false) where {T,D}
+    roots = D == 1 ? 3 : 2
+    walls = ntuple(d -> T(kinds[d] === :reflect_hi ? roots : 0), D)
+    keep(e) = e < p ? 1 : 0
+    coef(v, d) = begin
+        kind = kinds[d]
+        if kind === :periodic || kind === :reflect_both
+            (1 + d / 10, 0, 0, 0)
+        elseif kind === :outer
+            (0.3 + (d + v) / 10, 0.2, 0.1 * keep(2), 0.05 * keep(3))
+        elseif v == 1
+            (0.5, 0, 0.3 * keep(2), 0)
+        else
+            (0, 0.7, 0, 0.2 * keep(3))
+        end
+    end
+    cs = ntuple(v -> ntuple(d -> map(T, coef(v, d)), D), 2)
+    f = function (x, v)
+        acc = one(eltype(x))
+        for d in 1:D
+            c = cs[v][d]
+            y = x[d] - walls[d]
+            acc *= ((c[4] * y + c[3]) * y + c[2]) * y + c[1]
+        end
+        return acc
+    end
+    single(kind) = kind === :reflect_lo || kind === :reflect_hi
+    parity = [ntuple(D) do d
+                  kind = kinds[d]
+                  kind === :reflect_both && return EvenParity
+                  single(kind) || return NoParity
+                  odd = (v == 2) ⊻ flip
+                  return odd ? OddParity : EvenParity
+              end for v in 1:2]
+    return f, parity
+end
+
+"""
+The ghost width order-`p` operators need along each dimension of
+centering `C`: `p/2` in a cell-centered dimension, `p/2 − 1` along a
+stagger (see [`check_operators`](@ref)), and at least one.
+"""
+ghosts_for(C::NTuple{D,Symbol}, p::Int) where {D} =
+    ntuple(d -> max(1, C[d] === :vertex ? p ÷ 2 - 1 : cld(p, 2)), D)
+
+"""
+Fill a [`faces_forest`](@ref) with [`parity_data`](@ref) after first
+setting **every stored value to `NaN`**, exchange ghosts once, and
+report `(nnan, worst)`: how many values are still `NaN`, and the worst
+deviation of any stored value from the data.
+
+`NaN` is what makes the fill's *order* visible. A ghost the schedule
+never writes stays `NaN`; one it writes from a ghost that has not been
+written yet becomes `NaN`, since every stencil weight is nonzero and
+`NaN` survives any finite combination. A zero-initialized field set shows
+neither: a stale zero is just a wrong number, and may even be the right
+one.
+"""
+function undefined_ghosts(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
+                          T::Type=Float64, p::Int=4, N::Int=8,
+                          family=PointValue, backend=CPU()) where {D}
+    forest = faces_forest(kinds; T=T, N=N)
+    f, parity = parity_data(T, kinds, p)
+    ops = family === Conservative ?
+          Operators(prolongation=p, restriction=2, family=Conservative) :
+          Operators(prolongation=p, restriction=p)
+    fs = FieldSet{T}(forest, 2; G=ghosts_for(C, p), centering=C, parity=parity,
+                     backend=backend)
+    fill!(fs.work, T(NaN))
+    fill_by_coordinates!(f, fs)
+    fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+    work = Array(fs.work)
+    nnan = count(isnan, work)
+    worst = 0.0
+    for b in 1:nblocks(fs), v in 1:2
+        for idx in CartesianIndices(size(work)[1:D])
+            x = coordinates(fs, b, Tuple(idx))
+            worst = max(worst, Float64(abs(work[idx, v, b] - f(x, v))))
+        end
+    end
+    return nnan, worst
+end
+
+"""
+How many transfers of each kind the schedule *mirrors* across a
+reflecting face — so a test can show that each kind actually occurs.
+"""
+function mirror_counts(s::GhostSchedule)
+    counts = Dict(:copy => 0, :restrict => 0, :prolong => 0)
+    for g in Iterators.flatten((s.phase1, Iterators.flatten(s.phase2)))
+        g.factorcol == 0 || (counts[g.kind] += ntransfers(g))
+    end
+    return counts
+end
+
+"""
+Compare a domain with a reflecting face at `x₁ = 0` against the doubled
+domain it is the half of, holding the mirrored data explicitly.
+
+The mirror *is* the doubled domain folded onto itself, so this is the
+definitional test, as [`periodic_vs_tiled`](@ref) is for periodicity,
+and it works for data with no polynomial structure. The refinement is
+mirror symmetric and runs into the wall, with a coarse-fine face meeting
+it tangentially, so mirrored copies, restrictions and prolongations all
+occur. The remaining dimensions are periodic on both domains.
+`side = :lo` puts the half domain on `[0, 2]` with its wall below,
+`:hi` on `[-2, 0]` with its wall above.
+
+Returns `(maxdiff, ncells)`, or `nothing` if the two refinement patterns
+failed to correspond.
+"""
+function reflecting_vs_doubled(::Val{D}; side::Symbol, centering::NTuple{D,Symbol},
+                               N=8, p=4) where {D}
+    ops = Operators(prolongation=p, restriction=p)
+    G = ghosts_for(centering, p)
+    others = ntuple(d -> d == 1 ? false : true, D)
+    xext = side === :lo ? (0.0, 2.0) : (-2.0, 0.0)
+    half = Forest(ntuple(_ -> 2, D); N=N, periodic=others,
+                  reflecting=ntuple(d -> d == 1 ? (side === :lo, side === :hi) :
+                                                  (false, false), D),
+                  extents=ntuple(d -> d == 1 ? xext : (0.0, 2.0), D))
+    full = Forest(ntuple(d -> d == 1 ? 4 : 2, D); N=N, periodic=others,
+                  extents=ntuple(d -> d == 1 ? (-2.0, 2.0) : (0.0, 2.0), D))
+    # Symmetric under x₁ -> -x₁, and reaching the wall at x₁ = 0.
+    pred(c, lvl) = (lvl == 0 && abs(c[1]) < 1 && (D == 1 || c[2] < 1)) ||
+                   (lvl == 1 && abs(c[1]) < 0.5 && (D == 1 || c[2] < 0.5))
+    refine_where!(half, pred, 2)
+    refine_where!(full, pred, 2)
+
+    # Even and odd about x₁ = 0, periodic in the rest, and no polynomial.
+    shape(x, v) = sin(3.1 * abs(x[1]) + 0.7v) *
+                  prod((1 + 0.3 * sin(π * x[d] + 0.2d) for d in 2:D); init=1.0)
+    data(x, v) = v == 1 ? shape(x, v) : sign(x[1]) * shape(x, v)
+    parity = [ntuple(d -> d == 1 ? EvenParity : NoParity, D),
+              ntuple(d -> d == 1 ? OddParity : NoParity, D)]
+
+    fsh = FieldSet(half, 2; G=G, centering=centering, parity=parity)
+    fill_by_coordinates!(data, fsh)
+    fill_ghosts!(fsh, GhostSchedule(fsh, ops); boundary=boundary_by_coordinates(data))
+
+    fsf = FieldSet(full, 2; G=G, centering=centering)
+    fill_by_coordinates!(data, fsf)
+    fill_ghosts!(fsf, GhostSchedule(fsf, ops); boundary=boundary_by_coordinates(data))
+
+    lower(forest, k) = ntuple(d -> block_extent(forest, k)[d][1], D)
+    index = Dict((level(k), lower(full, k)) => b for (b, k) in enumerate(full.leaves))
+    worst = 0.0
+    ncells = 0
+    for (b, k) in enumerate(half.leaves)
+        fb = get(index, (level(k), lower(half, k)), nothing)
+        fb === nothing && return nothing
+        for v in 1:2
+            a, c = blockview(fsh, b, v), blockview(fsf, fb, v)
+            for i in CartesianIndices(a)
+                worst = max(worst, abs(a[i] - c[i]))
+                ncells += 1
+            end
+        end
+    end
+    return (worst, ncells)
+end

@@ -76,10 +76,20 @@ end
 # one axis and unflattening it here cost an integer `div` and `rem` per
 # dimension per ghost point per variable: 9 % of a copy-dominated fill's
 # self time, and the single largest entry after the bounds checks.
+#
+# `factors` is `nothing` for every ordinary transfer, and then `scaled`
+# is the identity and the kernel is exactly what it was before M10. A
+# mirrored transfer at a reflecting face passes the field set's
+# parity-factor table and its own column of it: each variable's result
+# is multiplied by -1, 0 or 1, which is exact.
+@inline scaled(acc, ::Nothing, v, col) = acc
+@inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
+
 @kernel function transfer_kernel!(dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
                                   srcstarts, weights,
                                   targetfirst::NTuple{D,Int}, toffset::Int,
+                                  factors, fcol::Int,
                                   ::Val{Ps}, ::Val{D}) where {Ps,D}
     I = @index(Global, NTuple)
     # `I[1:D]` is the position within the target region, one-based.
@@ -94,7 +104,7 @@ end
     @inbounds base = ntuple(d -> Int(srcstarts[d][I[d]]), Val(D))
 
     acc = stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
-    @inbounds dest[tidx..., v, tblock] = acc
+    @inbounds dest[tidx..., v, tblock] = scaled(acc, factors, v, fcol)
 end
 
 # Launch one group's transfers `range` — the whole group by default.
@@ -102,10 +112,19 @@ end
 # launch runs inline on the calling task instead of spawning its own:
 # that is what lets a phase be one parallel loop over slices rather than
 # a nest of parallel loops.
+#
+# `factors` is the field set's parity-factor table, or `nothing`; only a
+# mirrored group reads it (see `scaled`).
 function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backend;
-                    range=1:ntransfers(group), single::Bool=false) where {T,D}
+                    range=1:ntransfers(group), single::Bool=false,
+                    factors=nothing) where {T,D}
     n = length(range)
     n == 0 && return nothing
+    group.factorcol == 0 || factors !== nothing || throw(ArgumentError(
+        "this schedule mirrors ghosts across a reflecting face, but the field set " *
+        "has no parity to mirror them with. Build the field set over the same " *
+        "forest as the schedule, with `parity`."))
+    gfactors = group.factorcol == 0 ? nothing : factors
     blen = boxsize(group)
     prod(blen) == 0 && return nothing
     tfirst = ntuple(d -> group.stencils[d].targetfirst, Val(D))
@@ -123,13 +142,14 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # it does not.
     kernel! = transfer_kernel!(backend)
     kernel!(dest, src, group.targetblocks, group.sourceblocks,
-            srcstarts, weights, tfirst, first(range) - 1, Val(orders), Val(D);
+            srcstarts, weights, tfirst, first(range) - 1, gfactors, group.factorcol,
+            Val(orders), Val(D);
             ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
     return nothing
 end
 
 run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D} =
-    run_group!(fs.work, fs.work, group, fs.nvars, backend)
+    run_group!(fs.work, fs.work, group, fs.nvars, backend; factors=fs.factors)
 
 # One phase of the exchange — all the copies and restrictions, or all
 # the prolongations onto one level — as a single parallel loop.
@@ -157,18 +177,19 @@ run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D} =
 # a group is one contiguous run found by bisection. A device backend has
 # neither problem — there a launch *is* the parallel unit — and takes
 # the plain per-group path below.
-function run_phase!(dest, src, groups, nvars::Integer, backend)
+function run_phase!(dest, src, groups, nvars::Integer, backend; factors=nothing)
     for group in groups
-        run_group!(dest, src, group, nvars, backend)
+        run_group!(dest, src, group, nvars, backend; factors=factors)
     end
     return nothing
 end
 
-function run_phase!(dest, src, groups, nvars::Integer, backend::CPU)
+function run_phase!(dest, src, groups, nvars::Integer, backend::CPU;
+                    factors=nothing)
     nb = size(dest, ndims(dest))
     if length(threadchunks(nb)) <= 1
         for group in groups
-            run_group!(dest, src, group, nvars, backend)
+            run_group!(dest, src, group, nvars, backend; factors=factors)
         end
         return nothing
     end
@@ -178,14 +199,14 @@ function run_phase!(dest, src, groups, nvars::Integer, backend::CPU)
             lo = searchsortedfirst(targets, first(owned))
             hi = searchsortedlast(targets, last(owned))
             lo <= hi && run_group!(dest, src, group, nvars, backend;
-                                   range=lo:hi, single=true)
+                                   range=lo:hi, single=true, factors=factors)
         end
     end
     return nothing
 end
 
 run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
-    run_phase!(fs.work, fs.work, groups, fs.nvars, backend)
+    run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors)
 
 # The cell-wise boundary form (M6).
 #
@@ -266,9 +287,11 @@ the block's interior.
 
 That is the trade. Conditions defined by position alone — Dirichlet
 data, a manufactured solution, an analytic exterior — are exactly this
-shape. Conditions that read the interior (reflecting, extrapolating
-outflow) are not, and stay with the region form
-[`fill_ghosts!`](@ref) also accepts, which is CPU-only.
+shape. Conditions that read the interior (extrapolating outflow) are
+not, and stay with the region form [`fill_ghosts!`](@ref) also accepts,
+which is CPU-only. A reflection needs no hook at all: declare the face
+`reflecting` on the [`Forest`](@ref) and the schedule fills it, on every
+backend (M10).
 
 Wrapping `g` in [`AllVariables`](@ref) selects the once-per-cell form,
 `g(x, δ) -> vals`, which drops the variable index and returns all
@@ -391,10 +414,15 @@ CPU each thread fills the ghosts of the blocks it owns (see
 [`threadchunks`](@ref TreeAMR.threadchunks)).
 
 Periodic boundaries need nothing special; the tree wraps around, so they
-are ordinary transfers.
+are ordinary transfers. Reflecting faces need nothing either (M10): the
+schedule fills their ghosts by mirrored transfers in the same phases,
+with the parity each variable declares on the field set, and the hook
+never sees them. That includes the upper wall plane of a vertex-like
+dimension, which is derived — zero for an odd variable, the symmetric
+interpolant of the prolongation order for an even one.
 
-`boundary` is called once per ghost region facing outside a non-periodic
-domain, as
+`boundary` is called once per ghost region facing outside the domain
+through an *outer* face — neither periodic nor reflecting — as
 
     boundary(fs, blockindex, key, δ, region)
 
@@ -419,8 +447,7 @@ the price of a uniform `N^D` state layout for every centering; see
     *tangentially* past that edge, into the coarse source's own outer
     ghosts; filling those last would feed unwritten memory into the
     interpolation. The hook may therefore read the block's interior
-    (as reflecting and extrapolating conditions do) but not other
-    blocks' ghosts.
+    (as an extrapolating condition does) but not other blocks' ghosts.
 
 !!! note "The hook is called concurrently"
     The boundary regions are a parallel loop like every other phase

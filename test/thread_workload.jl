@@ -83,15 +83,20 @@ One full cycle — initial-data adaptation, evolution, a regrid with data
 transfer, more evolution — reduced to a handful of printed lines.
 """
 function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
-                  centering=cellcentered(D)) where {D}
+                  centering=cellcentered(D), reflecting=nothing, x0=0.35) where {D}
     L = 1.0
-    x0 = 0.35
+    walls = reflecting === nothing ? ntuple(_ -> (false, false), D) : reflecting
     forest = Forest(ntuple(_ -> roots, D); N=N,
-                    periodic=ntuple(_ -> periodic, D),
+                    periodic=ntuple(_ -> periodic, D), reflecting=walls,
                     extents=ntuple(_ -> (0.0, L), D))
-    fs = FieldSet(forest, 2; G=G, centering=centering)
+    # A wall normal to x₁ that the pulse runs into: odd along x₁, even
+    # along the rest, for both variables.
+    parity = reflecting === nothing ? nothing :
+             [ntuple(d -> d == 1 ? OddParity : EvenParity, D) for _ in 1:2]
+    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity)
     initial = workload_pulse(D, L, x0, σ, 0.0)
-    boundary = periodic ? nothing : boundary_by_coordinates(initial)
+    outer = !periodic && !all(w -> w[1] && w[2], walls)
+    boundary = outer ? boundary_by_coordinates(initial) : nothing
 
     # Flags that report a box, so the buffer dilation runs too.
     function flag(b, k)
@@ -121,7 +126,8 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     gather!(u, fs)
     rk4!(u, fs, schedule, dt, steps, Val(D), Val(fs.G), boundary)
 
-    tag = "D$(D)$(periodic ? "p" : "o")$(all(==(:cell), centering) ? "c" : "v")"
+    tag = "D$(D)$(periodic ? "p" : "o")$(all(==(:cell), centering) ? "c" : "v")" *
+          (reflecting === nothing ? "" : "r")
     println(tag, " passes ", passes, " ", converged, " changed ", changed)
     println(tag, " leaves ", nleaves(forest), " ", digest(string(forest.leaves)))
     println(tag, " schedule ", length(schedule.phase1), " ", schedule.levels, " ",
@@ -151,6 +157,17 @@ workload(Val(1); roots=8, N=8, G=1, ops=OPS4, periodic=true, σ=0.04, steps=24, 
          centering=vertexcentered(1))
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2))
+
+# Reflecting faces (M10): the mirrored transfers are ordinary groups in
+# the same phases, so a slice dealt out of order would show here as it
+# would anywhere. The pulse starts beside the low x₁ wall, so the
+# refinement reaches it and mirrored restrictions and prolongations
+# occur. The vertex-centered cycle is walled at both ends of every
+# dimension, which brings in the derived upper wall row.
+workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         reflecting=((true, false), (true, false)), x0=0.12)
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2), reflecting=((true, true), (true, true)), x0=0.12)
 
 # --- the conservative cycle (M8b) ----------------------------------------
 #

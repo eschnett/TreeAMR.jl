@@ -381,8 +381,8 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector;
     end
 
     # Balance the candidate tree without disturbing the live one.
-    scratch = typeof(forest)(forest.roots, forest.periodic, forest.extents,
-                             forest.N, candidate, Ref(0))
+    scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
+                             forest.extents, forest.N, candidate, Ref(0))
     balance!(scratch)
     return scratch.leaves
 end
@@ -491,7 +491,8 @@ first.
 
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
-if the domain has non-periodic faces. Write `fs => nothing` for a set
+if the domain has outer faces (neither periodic nor reflecting —
+reflecting faces are filled by the schedule itself). Write `fs => nothing` for a set
 that should only be **resized** — a computed quantity such as a flux,
 which the next right-hand side overwrites anyway, and whose ghost-free
 layout has no schedule to fill it from. Afterwards every schedule is

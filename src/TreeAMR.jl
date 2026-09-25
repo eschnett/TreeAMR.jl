@@ -44,6 +44,9 @@ export InterfaceSchedule, restrict_interfaces!
 # The all-variables form of the coordinate callbacks (for TreeHydro)
 export AllVariables
 
+# Reflecting boundaries (M10)
+export Parity, EvenParity, OddParity, NoParity
+
 include("threading.jl")
 include("device.jl")
 include("morton.jl")

@@ -9,8 +9,9 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M8** (every centering,
-per-field-set ghost widths, conservation at coarse-fine faces).
+The package is currently at milestone **M10** (after M8's every
+centering, per-field-set ghost widths and conservation at coarse-fine
+faces, reflecting boundaries as a property of the domain).
 
 This package is still under development. It is ready for experimental use.
 
@@ -30,8 +31,11 @@ edges, and corners. Only the leaves of the tree store data, there is
 no coarse data underneath refined regions. The leaves are kept as a
 sorted vector of Morton keys, so neighbour finding is just arithmetic
 on keys rather than pointer chasing, and periodic directions are built
-into that arithmetic. Other physical boundaries need to go through a
-per-cell hook that the application needs to define. The dimension `D`
+into that arithmetic. Reflecting faces (symmetry planes, solid walls)
+are declared on the domain too, with an even or odd parity per
+variable, and the ghost exchange fills them itself. Other physical
+boundaries need to go through a per-cell hook that the application
+needs to define. The dimension `D`
 is a type parameter, and the same code runs in 1D, 2D, and 3D, and the
 tests cover all three.
 

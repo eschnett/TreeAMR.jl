@@ -7,7 +7,7 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M8**: the tree core (Morton keys over a
+The package is at milestone **M10**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -25,6 +25,10 @@ or [`edgecentered`](@ref) — so a [`GhostSchedule`](@ref) belongs to a
 [`restrict_interfaces!`](@ref) then make a finite-volume scheme
 conservative across coarse-fine faces, which under one global `dt` needs
 nothing but a spatial flux fixup within each right-hand side.
+
+M10 added reflecting boundaries: a face declared `reflecting` on the
+forest is filled by the ghost exchange itself, with the parity each
+variable declares on its field set (see [Reflecting boundaries](@ref)).
 
 Next is MPI (M7), so that the distributed exchange is built once over a
 layout-generic schedule.
@@ -206,6 +210,42 @@ constrained by the block geometry, per dimension and per centering: order
 enforces when the schedule is built. It is also constrained by your
 discretization — see the warning in [`Operators`](@ref), which is worth
 reading before picking an order.
+
+## Reflecting boundaries
+
+A face can be declared **reflecting** on the forest, one `(lo, hi)` pair
+per dimension, much as a dimension is declared periodic. The solution
+beyond it is its own mirror image — a symmetry plane, or a solid wall —
+so every variable says how it behaves under the mirror, through the
+field set's `parity`: [`EvenParity`](@ref Parity) values are copied
+across the wall and [`OddParity`](@ref Parity) values change sign. The
+parity is required on a forest with a reflecting face, since it is
+physics. The schedule then fills those ghosts itself, as mirrored copies,
+restrictions and prolongations, on every backend, and the boundary hook
+only sees the faces that are neither periodic nor reflecting.
+
+```jldoctest reflecting
+julia> using TreeAMR
+
+julia> line = Forest((1,); N = 4, reflecting = ((true, false),));
+
+julia> fs = FieldSet(line, 2; G = 1, parity = [EvenParity, OddParity]);
+
+julia> fill_by_coordinates!((x, v) -> x[1], fs);
+
+julia> fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=2, restriction=2)));
+
+julia> fs.work[1, :, 1]        # the low ghost, mirroring the first cell at x = 1/8
+2-element Vector{Float64}:
+  0.125
+ -0.125
+```
+
+In a vertex-like dimension the upper wall point is shared with nobody,
+and a mirror maps it onto itself; the exchange derives it — zero for an
+odd variable, the symmetric interpolant of the prolongation order for an
+even one. See "Domain and boundaries" and "Ghost filling" in the design
+document.
 
 ## Conservation at coarse-fine faces
 
@@ -507,6 +547,7 @@ interiorview
 closedview
 fill_by_coordinates!
 AllVariables
+Parity
 KernelAbstractions.get_backend(::FieldSet)
 ```
 
