@@ -33,6 +33,13 @@ variable declares on its field set (see [Reflecting boundaries](@ref)).
 Next is MPI (M7), so that the distributed exchange is built once over a
 layout-generic schedule.
 
+This page is a guide to the package. The docstrings are in the API
+reference, one page per layer — [Tree and geometry](api/tree.md),
+[Storage](api/storage.md), [Ghost exchange and conservation](api/exchange.md),
+[ODE coupling](api/ode.md), [Regridding](api/regrid.md) and
+[Internals](api/internals.md) — with an [Index](api/genindex.md) of every
+documented name.
+
 ## Overview
 
 The domain is a brick of `M₁ × … × M_D` octree roots. Refinement is
@@ -478,161 +485,3 @@ device path feeds the same machinery the host one does.
 `bench/gpu.jl` times the per-evaluation phases on a chosen backend, in
 the format `bench/threads.jl` prints, so a device run and a host run can
 be read side by side.
-
-## Module
-
-```@docs
-TreeAMR
-```
-
-## Tree core
-
-```@docs
-MortonKey
-Base.isless(::MortonKey{D}, ::MortonKey{D}) where {D}
-MAX_LEVEL
-level
-parentkey
-childkeys
-sortedchildkeys
-isancestor
-```
-
-## Forest
-
-```@docs
-Forest
-nleaves
-maxlevel
-root_position
-root_index
-alldirections
-find_leaf
-isleaf
-neighbor_keys
-refine!
-coarsen!
-balance!
-isbalanced
-generation
-floattype
-```
-
-## Geometry
-
-```@docs
-root_spacing
-spacing
-minimum_spacing
-block_origin
-block_extent
-block_spacings
-block_origins
-```
-
-## Storage
-
-```@docs
-FieldSet
-cellcentered
-vertexcentered
-facecentered
-edgecentered
-staggers
-coordinates
-nblocks
-blockkey
-blockview
-interiorview
-closedview
-fill_by_coordinates!
-AllVariables
-Parity
-KernelAbstractions.get_backend(::FieldSet)
-```
-
-## Ghost exchange and operators
-
-```@docs
-Operators
-OperatorFamily
-check_operators
-GhostSchedule
-isstale
-fill_ghosts!
-boundary_by_coordinates
-CellBoundary
-```
-
-## Conservation at coarse-fine faces
-
-```@docs
-InterfaceSchedule
-restrict_interfaces!
-```
-
-## ODE coupling
-
-```@docs
-statelength
-statevector
-statearray
-scatter!
-gather!
-map_blocks!
-block_mapreduce
-mesh_mapreduce
-volume_weighted_norm
-```
-
-## Regridding
-
-```@docs
-RegridFlag
-flag_blocks
-buffered_flags
-complete_marks
-regrid!
-adapt_to_initial_data!
-total_mass
-firing_boxes
-```
-
-## Internals
-
-Not exported, and not part of the public interface, but documented
-because they define the shape of the schedule.
-
-```@docs
-TreeAMR.Stencil1D
-TreeAMR.TransferGroup
-TreeAMR.BoundaryRegion
-TreeAMR.BoundaryBatch
-TreeAMR.BoundaryPlan
-TreeAMR.lagrange_weights
-TreeAMR.unit_lagrange_weights
-TreeAMR.ghost_layers_read
-```
-
-The host-side threading primitives, for the same reason — the shape of
-every parallel pass over blocks in the package:
-
-```@docs
-TreeAMR.threadchunks
-TreeAMR.threaded_foreach
-TreeAMR.threaded_chunks
-TreeAMR.threaded_collect
-TreeAMR.launch_by_owner!
-```
-
-The device-residency helpers behind the `backend` keyword:
-
-```@docs
-TreeAMR.todevice
-TreeAMR.tohost
-```
-
-## Index
-
-```@index
-```

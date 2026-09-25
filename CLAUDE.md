@@ -91,7 +91,7 @@ find src -name '*.cov' -delete
 ```
 
 Docs build. This is also the **only place doctests run** — `Pkg.test` does
-not run the `jldoctest` blocks in docstrings and `docs/src/index.md`:
+not run the `jldoctest` blocks in docstrings and `docs/src/`:
 
 ```bash
 julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
@@ -110,9 +110,15 @@ gitignored. Check `git status` after running either and revert
 `test/Project.toml` or `docs/Project.toml` if it moved.
 
 Documenter is strict: every docstring in the module must appear in a `@docs`
-block in `docs/src/index.md`, and every `` [`name`](@ref) `` must resolve, or
-the build errors out. **Adding a documented function means adding it to
-`docs/src/index.md`.**
+block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
+**Adding a documented function means adding it to the API page of its
+layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,internals}.md`.
+`docs/src/index.md` is the guide (prose and doctests, plus the status) and
+holds no `@docs` blocks. The split is there because Documenter's HTML writer
+fails the build on any page over 200 KiB (`size_threshold`), and the single
+page had reached 178 KiB; the largest page is now about 40 KiB. Keep a
+section heading from spelling an exported name exactly (`## Forest` made
+`` [`Forest`](@ref) `` link to the heading, not the docstring).
 
 CI (`.github/workflows/CI.yml`) tests on Julia **1.10** and latest, on Linux
 and macOS. `Project.toml` says `julia = "1.10"`, so no 1.11+ features (no
