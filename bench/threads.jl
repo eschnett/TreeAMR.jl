@@ -56,6 +56,17 @@ end
     c[i] = a[i] + 2 * b[i]
 end
 
+# The inputs must be written before they are read. An untouched
+# allocation on Linux is backed by the kernel's single shared zero page,
+# so reading it costs nothing and a "triad" over unwritten `a` and `b`
+# is a write stream that reports three times its bandwidth (found on
+# Symmetry, 2026-09-23, when eight NUMA domains of two DDR4 channels
+# each reported 130 GB/s apiece).
+@kernel function fill_kernel!(x, v)
+    i = @index(Global, Linear)
+    x[i] = v
+end
+
 """A two-level mesh: the middle eighth of the domain refined once."""
 function build_forest(::Val{DD}) where {DD}
     forest = Forest(ntuple(_ -> ROOTS, DD); N=N,
@@ -121,7 +132,9 @@ function main()
         triad_kernel!(backend)(c, a, b; ndrange=n)
         synchronize(backend)
     end
-    triad!()                                     # also the first touch
+    fill_kernel!(backend)(a, one(eltype(a)); ndrange=n)      # the first touch, in
+    fill_kernel!(backend)(b, one(eltype(a)); ndrange=n)      # the partition of the
+    triad!()                                     # kernel that reads them
     t_triad = best(triad!)
 
     cells = nleaves(forest) * N^D
@@ -135,6 +148,21 @@ function main()
     end
     @printf("# triad %.1f GB/s at %d thread(s)\n", 3 * n * 8 / t_triad / 1e9,
             Threads.nthreads())
+    # Allocation and garbage-collection cost of the per-evaluation path,
+    # as comment lines (bench/scan.sh reads only the three-column lines).
+    # A phase that allocates per call pays for it in GC pauses that stop
+    # every thread, a cost that grows with the thread count and that a
+    # best-of-REPS timing can hide only if the pauses are rare.
+    for (name, f) in (("rhs", rhs!), ("fill_ghosts", () -> fill_ghosts!(fs, schedule)),
+                      ("scatter", () -> scatter!(fs, u)))
+        GC.gc()
+        gc0 = Base.gc_time_ns()
+        allocs = @allocated for _ in 1:REPS; f(); end
+        @printf("# %s allocates %.1f kB per call, GC %.3f ms per call over %d calls\n",
+                name, allocs / REPS / 1e3, (Base.gc_time_ns() - gc0) / REPS / 1e6, REPS)
+    end
+    @printf("# %d GC thread(s), %d interactive thread(s)\n",
+            Threads.ngcthreads(), Threads.nthreads(:interactive))
     return nothing
 end
 

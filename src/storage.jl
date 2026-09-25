@@ -621,10 +621,9 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     # the upload is not worth caching.
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    coordinates_kernel!(backend)(fs.work, f, origins, spacings,
-                                 Val(D), Val(fs.G), Val(staggers(fs));
-                                 ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars,
-                                          nblocks(fs)))
+    launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings,
+                     Val(D), Val(fs.G), Val(staggers(fs));
+                     ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
     return fs
 end
@@ -635,11 +634,9 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    coordinates_all_kernel!(backend)(fs.work, w.f, origins, spacings,
-                                     Val(D), Val(fs.G), Val(staggers(fs)),
-                                     Val(fs.nvars);
-                                     ndrange=(ntuple(_ -> forest.N, D)...,
-                                              nblocks(fs)))
+    launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins, spacings,
+                     Val(D), Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
+                     ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     synchronize(backend)
     return fs
 end
@@ -653,10 +650,12 @@ end
 # not about speed: on a multi-socket node it is the *first touch* that
 # decides which NUMA domain each page lands in, and a serial `fill!`
 # would park the whole array on whichever domain the driver thread sits
-# on. The kernel touches each block from the same chunk of the ndrange
-# that will later compute on it.
+# on. `work` is block-shaped (last axis the block), and the launch is by
+# owner, so each block's pages land on the domain of the thread that
+# will compute on it — which is what makes first-touch placement
+# domain-local without `numactl` (`CODE.md`, "What one process loses").
 function zerofill!(work, backend)
-    zero_kernel!(backend)(work; ndrange=size(work))
+    launch_by_owner!(zero_kernel!, backend, work; ndrange=size(work))
     synchronize(backend)
     return work
 end

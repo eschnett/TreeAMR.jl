@@ -97,7 +97,6 @@ struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D}}
     backend::BK
     dimensions::Vector{Int}                      # face dimension of each phase
     phases::Vector{Vector{GRP}}
-    plans::Vector{Vector{PhaseSlice}}
 end
 
 isstale(s::InterfaceSchedule) = generation(s.forest) != s.generation
@@ -167,8 +166,7 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     dims = sort!(collect(keys(byface)))
     phases = [byface[d] for d in dims]
     return InterfaceSchedule{T,D,floattype(forest),typeof(backend),GRP}(
-        forest, generation(forest), ghosts, fs.centering, backend, dims, phases,
-        [phase_plan(groups) for groups in phases])
+        forest, generation(forest), ghosts, fs.centering, backend, dims, phases)
 end
 
 function Base.show(io::IO, s::InterfaceSchedule{T,D}) where {T,D}
@@ -222,8 +220,8 @@ function restrict_interfaces!(fs::FieldSet{T,D},
         "are in the wrong memory. Build it with `InterfaceSchedule(fs)` from a " *
         "field set on the backend you mean to run on."))
 
-    for (groups, plan) in zip(isched.phases, isched.plans)
-        run_phase!(fs, groups, plan, backend)
+    for groups in isched.phases
+        run_phase!(fs, groups, backend)
         synchronize(backend)
     end
     return fs

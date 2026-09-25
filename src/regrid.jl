@@ -564,8 +564,10 @@ function regrid!(forest::Forest{D}, pairs;
                                      oldleaves, newleaves, sched.operators, backend)
             # The transfer moves every cell in the domain, so it is
             # threaded the same way a ghost phase is — its groups are
-            # just as uneven, a whole block against a single child.
-            run_phase!(fresh, fs.work, groups, phase_plan(groups), fs.nvars, backend)
+            # just as uneven, a whole block against a single child — and
+            # by owner of the *new* block, which is also the thread that
+            # zeroed it above and will compute on it next.
+            run_phase!(fresh, fs.work, groups, fs.nvars, backend)
             synchronize(backend)
         end
         fs.work = fresh

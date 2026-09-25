@@ -163,43 +163,50 @@ run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D} =
 # 2.5x on the ghost fill however many threads were available, while the
 # single-launch parts of the same step scaled fine.
 #
-# So the phase is flattened into `PhaseSlice`s of roughly equal cell
-# count and the slices are dealt out largest first, one task per thread,
-# each slice launching as a single inline workgroup. A device backend
-# has no such problem — there a launch *is* the parallel unit — and
-# takes the plain per-group path below.
-function run_phase!(dest, src, groups, plan, nvars::Integer, backend;
-                    factors=nothing)
+# So on the CPU the phase is one parallel loop over threads, and each
+# thread takes its share of *every* group: the transfers whose target
+# block it owns (see `threadchunks`), launched as single inline
+# workgroups. A thread therefore fills the ghosts of the blocks it
+# scatters into and computes on, which is the other half of the reason
+# for the loop: a block whose ghosts were written by a different core
+# than the one about to read them streams at a fraction of the rate on
+# a many-core node (`CODE.md`, "What one process loses"; the M5 form,
+# slices of equal cell count dealt largest first to spawned tasks,
+# balanced better and moved every block to a new core in every phase).
+# Every group's `targetblocks` is non-decreasing, so a thread's share of
+# a group is one contiguous run found by bisection. A device backend has
+# neither problem — there a launch *is* the parallel unit — and takes
+# the plain per-group path below.
+function run_phase!(dest, src, groups, nvars::Integer, backend; factors=nothing)
     for group in groups
         run_group!(dest, src, group, nvars, backend; factors=factors)
     end
     return nothing
 end
 
-function run_phase!(dest, src, groups, plan, nvars::Integer, backend::CPU;
+function run_phase!(dest, src, groups, nvars::Integer, backend::CPU;
                     factors=nothing)
-    ntasks = length(threadchunks(length(plan)))
-    if ntasks <= 1
+    nb = size(dest, ndims(dest))
+    if length(threadchunks(nb)) <= 1
         for group in groups
             run_group!(dest, src, group, nvars, backend; factors=factors)
         end
         return nothing
     end
-    threaded_foreach(ntasks) do c
-        i = c
-        while i <= length(plan)
-            slice = plan[i]
-            run_group!(dest, src, groups[slice.group], nvars, backend;
-                       range=Int(slice.first):Int(slice.last), single=true,
-                       factors=factors)
-            i += ntasks
+    threaded_chunks(nb) do _, owned
+        for group in groups
+            targets = group.targetblocks
+            lo = searchsortedfirst(targets, first(owned))
+            hi = searchsortedlast(targets, last(owned))
+            lo <= hi && run_group!(dest, src, group, nvars, backend;
+                                   range=lo:hi, single=true, factors=factors)
         end
     end
     return nothing
 end
 
-run_phase!(fs::FieldSet{T,D}, groups, plan, backend) where {T,D} =
-    run_phase!(fs.work, fs.work, groups, plan, fs.nvars, backend; factors=fs.factors)
+run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
+    run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors)
 
 # The cell-wise boundary form (M6).
 #
@@ -402,9 +409,9 @@ The three cases — same-level copy, restriction from finer neighbors,
 prolongation from a coarser neighbor — run in the phases described in
 [`GhostSchedule`](@ref): copies and restrictions together first, then
 prolongations swept coarsest target first, then the physical boundary
-hook. Each phase is one parallel loop with a barrier after it; how the
-phase is cut up for the threads is an implementation detail of that
-loop (see `PhaseSlice`).
+hook. Each phase is one parallel loop with a barrier after it; on the
+CPU each thread fills the ghosts of the blocks it owns (see
+[`threadchunks`](@ref TreeAMR.threadchunks)).
 
 Periodic boundaries need nothing special; the tree wraps around, so they
 are ordinary transfers. Reflecting faces need nothing either (M10): the
@@ -480,7 +487,7 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
 
     # Phase 1: same-level copies and restrictions. Both read interiors
     # only, so they cannot race with each other.
-    run_phase!(fs, schedule.phase1, schedule.phase1plan, backend)
+    run_phase!(fs, schedule.phase1, backend)
     synchronize(backend)
 
     # Physical boundaries, before prolongation rather than after
@@ -493,8 +500,8 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
 
     # Phase 2: prolongations, coarsest targets first. A prolongation may
     # read its coarse source's ghosts, which the earlier sweeps filled.
-    for (groups, plan) in zip(schedule.phase2, schedule.phase2plans)
-        run_phase!(fs, groups, plan, backend)
+    for groups in schedule.phase2
+        run_phase!(fs, groups, backend)
         synchronize(backend)
     end
     return fs

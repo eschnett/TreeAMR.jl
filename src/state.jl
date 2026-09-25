@@ -34,7 +34,8 @@ host memory (M6).
 function statevector(fs::FieldSet{T}) where {T}
     backend = get_backend(fs.work)
     u = allocate(backend, T, (statelength(fs),))
-    return zerofill!(u, backend)
+    zerofill!(statearray(u, fs), backend)          # first touch by block owner
+    return u
 end
 
 """
@@ -63,8 +64,8 @@ end
 
 function run_over_interiors!(kernel, fs::FieldSet{T,D}, a, b) where {T,D}
     backend = get_backend(fs.work)
-    kernel(backend)(a, b, Val(D), Val(fs.G);
-                    ndrange=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
+    launch_by_owner!(kernel, backend, a, b, Val(D), Val(fs.G);
+                     ndrange=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
     return nothing
 end
@@ -137,10 +138,14 @@ application's, so the launch says `stored = true` rather than the
 application spelling out `N + 2G + c` for itself (see `CODE.md`,
 "Application interface").
 
-Blocks are uniform work units, so this is one flat parallel loop. The
-CPU backend spreads it over `Threads.nthreads()` as it stands (M5), and
-the same launch runs on a device in M6; every work item writes its own
-output cell, so the result does not depend on how the loop was split.
+Blocks are uniform work units, so this is one flat parallel loop. On
+the CPU it runs *by owner* (see [`launch_by_owner!`](@ref TreeAMR.launch_by_owner!)):
+every block on the same thread as in every other per-block pass of the
+package, which is worth up to 2.4x on a many-core node, and one
+workgroup per block — so a kernel handed to `map_blocks!` must not
+depend on the workgroup size. The same launch runs on a device; every
+work item writes its own output cell, so the result does not depend on
+how the loop was split.
 
 ```julia
 @kernel function rhs!(du, @Const(work), @Const(h), ::Val{D}, ::Val{G}) where {D,G}
@@ -175,7 +180,7 @@ function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
     c = staggers(fs)
     extent = stored ? ntuple(d -> size(fs.work, d), D) :
              ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
-    kernel!(backend)(args...; ndrange=(extent..., nblocks(fs)))
+    launch_by_owner!(kernel!, backend, args...; ndrange=(extent..., nblocks(fs)))
     synchronize(backend)
     return nothing
 end

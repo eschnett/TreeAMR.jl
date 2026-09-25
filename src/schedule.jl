@@ -59,9 +59,12 @@ All transfers that share one set of 1D stencils — same kind, same
 direction, same child offset, and for prolongations the same target
 level — reduced to a list of `(targetblock, sourceblock)` index pairs.
 
-A group is a batch of work, not a unit of scheduling: a phase runs as
-one parallel loop over [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, and a
-big group is launched in several of them.
+A group is a batch of work, not a unit of scheduling. On the CPU a phase
+runs as one parallel loop over threads, and each thread launches the
+part of every group whose target blocks it owns (see
+[`threadchunks`](@ref TreeAMR.threadchunks)); that is why `targetblocks`
+is **non-decreasing**, which every builder guarantees by collecting
+transfers in block order, so that a thread's part is one contiguous run.
 
 `factorcol` is nonzero for the mirrored transfers at a reflecting face
 (M10): the column of the field set's parity-factor table the kernel
@@ -200,51 +203,6 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
 end
 
 """
-    PhaseSlice
-
-A contiguous run of one [`TransferGroup`](@ref TransferGroup)'s
-transfers — the unit of work one thread takes when a whole phase is run
-as a single parallel loop, and the reason `cells` is carried: the
-slices are dealt out largest first, so a phase made of one enormous face
-group and a hundred tiny corner ones still balances.
-"""
-struct PhaseSlice
-    group::Int32
-    first::Int32
-    last::Int32
-    cells::Int32                      # target cells, the cost of the slice
-end
-
-# Cells per slice. Big enough that a slice is worth a kernel launch (a
-# few microseconds of work), small enough that a hundred-odd threads
-# each get several slices of the largest group.
-const SLICE_CELLS = 4096
-
-# Cut a phase's groups into slices of about `SLICE_CELLS` target cells,
-# never crossing a group boundary (a group is one set of stencils, hence
-# one kernel), and order them largest first so that dealing them round
-# robin balances the phase.
-function phase_plan(groups::AbstractVector{<:TransferGroup})
-    slices = PhaseSlice[]
-    for (g, group) in enumerate(groups)
-        n = ntransfers(group)
-        n == 0 && continue
-        box = prod(boxsize(group))
-        per = max(1, cld(SLICE_CELLS, max(box, 1)))
-        lo = 1
-        while lo <= n
-            hi = min(n, lo + per - 1)
-            push!(slices, PhaseSlice(Int32(g), Int32(lo), Int32(hi),
-                                     Int32(min(box * (hi - lo + 1), typemax(Int32)))))
-            lo = hi + 1
-        end
-    end
-    # `sort!` is stable, so equal-cost slices keep their group order and
-    # the plan is a function of the schedule alone.
-    return sort!(slices; by=s -> -s.cells)
-end
-
-"""
     GhostSchedule{T,D,R}
 
 The precomputed ghost exchange for one forest, replayed by
@@ -267,9 +225,6 @@ The phasing follows `CODE.md`:
   `boundaryplan` is the same information batched by region shape and
   resident on the backend, which is what the cell-wise hook form
   ([`CellBoundary`](@ref)) is launched over.
-- `phase1plan` and `phase2plans` cut each phase into balanced
-  [`PhaseSlice`](@ref TreeAMR.PhaseSlice)s, so that a phase runs as one
-  parallel loop rather than as a sequence of separate launches.
 
 Periodic boundaries appear nowhere special here: the tree wraps around,
 so they are ordinary copies, restrictions, and prolongations. Reflecting
@@ -316,10 +271,6 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     levels::Vector{Int}                          # target level of each phase2 entry
     boundaries::Vector{BoundaryRegion{D}}
     boundaryplan::BP
-    # How each phase is cut up for the threads, precomputed here rather
-    # than at every ghost fill (see `PhaseSlice`).
-    phase1plan::Vector{PhaseSlice}
-    phase2plans::Vector{Vector{PhaseSlice}}
 end
 
 """
@@ -877,8 +828,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     bplan = BoundaryPlan(backend, T, forest, boundaries)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan)}(
         forest, generation(forest), ghosts, centers, operators, backend, phase1,
-        phase2, levels, boundaries, bplan, phase_plan(phase1),
-        [phase_plan(groups) for groups in phase2])
+        phase2, levels, boundaries, bplan)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

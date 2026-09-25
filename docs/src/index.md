@@ -382,21 +382,31 @@ Two consequences for application code:
   blocks than threads — a few dozen blocks per thread is comfortable,
   a handful is not.
 
-On a multi-socket machine, **interleave the pages**:
+On the CPU every per-block pass — scatter, ghost fill, your
+[`map_blocks!`](@ref) kernels, the reductions, the zeroing that first
+touches fresh storage — runs each block on the same thread, the one
+that owns it. On a many-core machine that is worth up to 2.4× on a
+right-hand side, because data that stays on one core streams far faster
+than data that changes core from one pass to the next. To get all of
+it, **pin the threads**, so that a thread is also a core:
+
+```bash
+JULIA_EXCLUSIVE=1 julia -t 64 --project=. my_run.jl
+```
+
+(or ThreadPinning.jl). Pinned, the default first-touch placement puts
+each block's pages on the NUMA domain of the core that computes on it,
+and nothing more is needed. If you cannot pin, interleave the pages
+instead, which is the better of the two for threads the operating
+system is free to move:
 
 ```bash
 numactl --interleave=all julia -t 64 --project=. my_run.jl
 ```
 
-This is worth 2–6× at high thread counts and is not something the
-library can do for you — it is a policy for the whole process. The
-reason it helps rather than first-touch placement is that the same
-arrays are partitioned differently by different kernels (the working
-array by stored cell, the state vector by interior cell, a ghost region
-by target slab), so no single first-touch pattern serves them all.
 Measured numbers are in
 [CODE.md](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md#parallelism);
-`bench/scan.sh` reproduces them.
+`bench/affinity_mesh.jl` and `bench/scan.sh` reproduce them.
 
 ## Devices
 
@@ -599,7 +609,6 @@ TreeAMR.TransferGroup
 TreeAMR.BoundaryRegion
 TreeAMR.BoundaryBatch
 TreeAMR.BoundaryPlan
-TreeAMR.PhaseSlice
 TreeAMR.lagrange_weights
 TreeAMR.unit_lagrange_weights
 TreeAMR.ghost_layers_read
@@ -613,6 +622,7 @@ TreeAMR.threadchunks
 TreeAMR.threaded_foreach
 TreeAMR.threaded_chunks
 TreeAMR.threaded_collect
+TreeAMR.launch_by_owner!
 ```
 
 The device-residency helpers behind the `backend` keyword:
