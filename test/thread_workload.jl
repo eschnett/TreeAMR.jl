@@ -136,6 +136,20 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     println(tag, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
     println(tag, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
     println(tag, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
+
+    # Point interpolation over the final mesh, value and gradient, with an
+    # excluded ball: a fixed low-discrepancy set of points, reaching
+    # across the wall where there is one so the fold runs too.
+    scatter!(fs, u)
+    fill_ghosts!(fs, schedule; boundary=boundary)
+    below = walls[1][1] ? 0.2 : 0.0
+    xs = [ntuple(d -> mod(0.6180339887498949 * j * (d + 1) + 0.1d, 1.0) *
+                      (d == 1 ? L + below : L) - (d == 1 ? below : 0.0), D)
+          for j in 1:257]
+    derivs = (ntuple(_ -> 0, D), ntuple(a -> ntuple(d -> Int(d == a), D), D)...)
+    r = interpolate(fs, xs, Lagrange(4); derivs=derivs,
+                    exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
+    println(tag, " interp ", digest(vec(r.values)), " ", count(r.excluded))
     return nothing
 end
 

@@ -276,6 +276,35 @@ end
     @test isconcretetype(fieldtype(typeof(fs), :forest))
 end
 
+@testset "Point interpolation is exact and stays in T: T=$T, D=$D" for
+        T in FLOATTYPES, D in (1, 2)
+    # The weights are formed in the field set's type from integers, and
+    # the stencil start is a floor that `Float32x2` cannot convert to an
+    # integer directly; either going through `Float64` would be a
+    # widening, and either getting the floor wrong would be a wrong
+    # stencil and a lost polynomial.
+    forest = nested_forest(Val(D); T=T, N=8)
+    poly = makepoly(D, 3)
+    dpoly(x, v, a) = sum(0.11 * (a + v) * e * x[a]^(e - 1) for e in 1:3)
+    fs = FieldSet(forest, 2; G=2)
+    fill_by_coordinates!(poly, fs)
+    fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                 boundary=boundary_by_coordinates(poly))
+    xs = [ntuple(d -> T((7j + 3d) % 64 // 16), D) for j in 1:40]
+    push!(xs, ntuple(_ -> T(3 // 2), D), ntuple(_ -> T(1 // 8), D))  # in the ball, far
+    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D))
+    r = interpolate(fs, xs, Lagrange(4); derivs=derivs,
+                    exclude=Ellipsoid(ntuple(_ -> 1.5, D), ntuple(_ -> 0.5, D)))
+    @test eltype(r.values) === T
+    scale = maximum(abs(T(poly(x, 2))) for x in xs)
+    @test maximum(abs(r.values[v, 1, j] - T(poly(xs[j], v)))
+                  for j in eachindex(xs), v in 1:2) < reltol(T, 4096) * scale
+    @test maximum(abs(r.values[v, 2, j] - T(dpoly(xs[j], v, 1)))
+                  for j in eachindex(xs), v in 1:2) < reltol(T, 65536) * scale
+    @test any(r.excluded) && !all(r.excluded)
+    @test (@inferred Union{Int,Nothing} locate_point(forest, xs[1])) isa Int
+end
+
 @testset "Conservative regridding conserves mass in any precision: T=$T, D=$D" for
         T in FLOATTYPES, D in (1, 2)
     # Assert properties, never values: a seeded RNG gives a different

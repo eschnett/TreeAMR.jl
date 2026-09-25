@@ -418,6 +418,7 @@ end
 include("ghost_tests.jl")
 include("centering_tests.jl")
 include("reflect_tests.jl")
+include("interpolate_tests.jl")
 include("interface_tests.jl")
 include("allvariables_tests.jl")
 include("state_tests.jl")

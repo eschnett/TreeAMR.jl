@@ -47,6 +47,10 @@ export AllVariables
 # Reflecting boundaries (M10)
 export Parity, EvenParity, OddParity, NoParity
 
+# Point interpolation
+export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
+       Region, Ellipsoid
+
 include("threading.jl")
 include("device.jl")
 include("morton.jl")
@@ -59,5 +63,6 @@ include("ghosts.jl")
 include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
+include("interpolate.jl")
 
 end

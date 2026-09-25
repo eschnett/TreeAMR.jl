@@ -7,7 +7,7 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M10**: the tree core (Morton keys over a
+The package is at milestone **M11**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -30,14 +30,19 @@ M10 added reflecting boundaries: a face declared `reflecting` on the
 forest is filled by the ghost exchange itself, with the parity each
 variable declares on its field set (see [Reflecting boundaries](@ref)).
 
+M11 added point interpolation: [`interpolate`](@ref) evaluates a field
+set, and its first derivatives, at an arbitrary batch of points, for a
+horizon finder or any other analysis that asks for values where the mesh
+has none (see [Interpolating to points](@ref)).
+
 Next is MPI (M7), so that the distributed exchange is built once over a
 layout-generic schedule.
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
 [Storage](api/storage.md), [Ghost exchange and conservation](api/exchange.md),
-[ODE coupling](api/ode.md), [Regridding](api/regrid.md) and
-[Internals](api/internals.md) — with an [Index](api/genindex.md) of every
+[ODE coupling](api/ode.md), [Regridding](api/regrid.md),
+[Point interpolation](api/interpolate.md) and [Internals](api/internals.md) — with an [Index](api/genindex.md) of every
 documented name.
 
 ## Overview
@@ -349,6 +354,56 @@ not locally conservative. Coarsening alone conserves either way.
 
 ```julia
 ops = Operators(prolongation = 3, restriction = 2, family = Conservative)
+```
+
+## Interpolating to points
+
+[`interpolate`](@ref) answers "what is the field *here*" for a batch of
+points the mesh did not choose, by tensor-product interpolation in a
+basis — today [`Lagrange`](@ref)`(n)`, through `n` stored points per
+dimension, exact on polynomials of degree `n − 1`. Each query reads one
+block, the one [`locate_point`](@ref) finds, ghosts included, so the
+ghosts must be current:
+
+```jldoctest interpolate
+julia> using TreeAMR
+
+julia> forest = Forest((2, 2); N = 8, extents = ((0, 1), (0, 1)));
+
+julia> fs = FieldSet(forest, 1; G = 2, centering = vertexcentered(2));
+
+julia> f(x, v) = 1 + 2x[1] - x[1] * x[2]^2;
+
+julia> fill_by_coordinates!(f, fs);
+
+julia> schedule = GhostSchedule(fs, Operators(prolongation = 4, restriction = 4));
+
+julia> fill_ghosts!(fs, schedule; boundary = boundary_by_coordinates(f));
+
+julia> r = interpolate(fs, [(0.3, 0.7), (1.0, 1.0)], Lagrange(4);
+                       derivs = ((0, 0), (1, 0), (0, 1)));
+
+julia> round.(r.values[1, :, 1]; digits = 12)    # f, ∂ₓf, ∂ᵧf at (0.3, 0.7)
+3-element Vector{Float64}:
+  1.453
+  1.51
+ -0.42
+```
+
+`derivs` names the derivatives as multi-indices; values and first
+derivatives are implemented. A point is wrapped along a periodic
+dimension and mirrored across a reflecting face, with the variable's
+parity; one outside the domain after that is refused. An `exclude`
+region — an [`Ellipsoid`](@ref) — flags every query whose stencil reaches
+into it, which is how a caller keeps data that is not a solution (a black
+hole's interior) out of its answers without the mesh knowing why:
+
+```jldoctest interpolate
+julia> interpolate(fs, [(0.3, 0.7), (0.6, 0.6)], Lagrange(4);
+                   exclude = Ellipsoid((0.7, 0.7), (0.1, 0.1))).excluded
+2-element Vector{Bool}:
+ 0
+ 1
 ```
 
 ## Threading
