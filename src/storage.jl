@@ -430,12 +430,16 @@ end
 
 # The offset from a stored index to a position, per dimension: half a
 # cell in a cell-centered dimension (the value sits at the center), a
-# whole one in a vertex-like dimension (it sits on the boundary). `1//2`
-# and `1//1` rather than `0.5` and `1.0`: a floating-point literal would
-# be an fp64 operand and would drag the whole position into fp64. The
-# conversions are exact and fold away at compile time.
+# whole one in a vertex-like dimension (it sits on the boundary). `one(h)
+# / 2` rather than `0.5`: a floating-point literal would be an fp64
+# operand and would drag the whole position into fp64. And rather than
+# `oftype(h, 1//2)`, which it was until M11: that folds away for a
+# hardware float, but a `Float32x2` converts a `Rational` through
+# `BigFloat`, at run time, in every kernel that forms a position — 530
+# bytes and some 15 µs per point, measured on the point interpolator.
+# Halving one is exact in any binary type, so the value is the same.
 @inline pointoffsets(h, c::NTuple{D,Int}) where {D} =
-    ntuple(d -> c[d] == 1 ? oftype(h, 1//1) : oftype(h, 1//2), Val(D))
+    ntuple(d -> c[d] == 1 ? one(h) : one(h) / 2, Val(D))
 
 """
     coordinates([S], fs::FieldSet, b::Integer, idx::NTuple{D,Integer})
