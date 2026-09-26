@@ -1,4 +1,5 @@
 [deps]
+IMEXRungeKutta = "6f46d5f7-e15e-41aa-a098-eed9d1a63ad8"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MultiFloats = "bdf0d083-296b-4888-a5b6-7498122e68a5"
 OrdinaryDiffEqLowOrderRK = "1344f307-1e59-4825-a18e-ace9aa3fa4c6"
@@ -11,4 +12,9 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TreeAMR = "91bc416d-811c-44c1-9bc4-b9c8bbdbbd08"
 
 [compat]
+IMEXRungeKutta = "1.1"
 MultiFloats = "3"
+
+[sources]
+IMEXRungeKutta = {url = "https://github.com/eschnett/IMEXRungeKutta.jl", rev = "main"}
+TreeAMR = {path = ".."}

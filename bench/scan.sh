@@ -7,8 +7,12 @@
 #     TREEAMR_BENCH_N=32 bench/scan.sh 1 8 64
 #
 # scans a realistic block size at three thread counts.
+# TREEAMR_BENCH_SCRIPT and TREEAMR_BENCH_PROJECT choose another script
+# in the same output format, e.g. bench/stepping.jl with project test.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+script=${TREEAMR_BENCH_SCRIPT:-bench/threads.jl}
+project=${TREEAMR_BENCH_PROJECT:-.}
 
 counts=("$@")
 if [ ${#counts[@]} -eq 0 ]; then
@@ -18,7 +22,7 @@ fi
 out=$(mktemp)
 for t in "${counts[@]}"; do
     echo "# threads=$t" >&2
-    julia -t "$t" --project=. bench/threads.jl >>"$out"
+    julia -t "$t" --project="$project" "$script" >>"$out"
 done
 
 awk -F'\t' '
@@ -31,15 +35,15 @@ awk -F'\t' '
   }
   END {
     print header
-    printf "%-22s", "phase"
+    printf "%-30s", "phase"
     for (i = 1; i <= nt; i++) printf "%10s", tc[i] "t"
     printf "   |"
     for (i = 1; i <= nt; i++) printf "%10s", tc[i] "t"
     printf "\n"
-    printf "%-22s%*s   |%*s\n", "", nt * 10, "speedup", nt * 10, "seconds"
+    printf "%-30s%*s   |%*s\n", "", nt * 10, "speedup", nt * 10, "seconds"
     for (j = 1; j <= np; j++) {
       p = phase[j]
-      printf "%-22s", p
+      printf "%-30s", p
       for (i = 1; i <= nt; i++)
         printf "%10.2f", sec[p SUBSEP tc[1]] / sec[p SUBSEP tc[i]]
       printf "   |"
