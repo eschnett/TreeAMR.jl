@@ -18,6 +18,7 @@ makedocs(;
             "Ghost exchange and conservation" => "api/exchange.md",
             "ODE coupling" => "api/ode.md",
             "Regridding" => "api/regrid.md",
+            "Point interpolation" => "api/interpolate.md",
             "Internals" => "api/internals.md",
             "Index" => "api/genindex.md",
         ],

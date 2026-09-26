@@ -12,10 +12,10 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6, M8 and M10 are done (tree core, ghost
+Current state: milestones M0–M6, M8, M10 and M11 are done (tree core, ghost
 exchange, ODE coupling, regridding, multi-threading, GPU; then every
 centering, per-field-set ghost widths, and conservation at coarse-fine
-faces; then reflecting boundaries). Everything is `D`-generic and
+faces; then reflecting boundaries; then point interpolation). Everything is `D`-generic and
 floating-point-type generic. Next is MPI (M7), deliberately after M8 and
 M10 so the distributed exchange is built once over a layout-generic
 schedule that already holds the mirrored transfers; then I/O (M9).
@@ -102,17 +102,17 @@ julia --project=docs docs/make.jl
 ```
 
 Both `Pkg.develop` lines above have a side effect on a current Julia: they
-write a `[sources]` entry into that environment's `Project.toml`. It is a
-1.11+ feature, so it is exactly what the compat bound below forbids, and it
-turns a local convenience into a build everyone else's 1.10 cannot parse.
-The `Manifest.toml` they also write is the part you want, and is
-gitignored. Check `git status` after running either and revert
-`test/Project.toml` or `docs/Project.toml` if it moved.
+write a `[sources]` entry into that environment's `Project.toml`. The floor
+is 1.11 now, so the key itself is legal, but the entry is a local
+convenience that should not be committed by accident. The `Manifest.toml`
+they also write is the part you want, and is gitignored. Check `git status`
+after running either and revert `test/Project.toml` or `docs/Project.toml`
+if it moved.
 
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
 **Adding a documented function means adding it to the API page of its
-layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,internals}.md`.
+layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,internals}.md`.
 `docs/src/index.md` is the guide (prose and doctests, plus the status) and
 holds no `@docs` blocks. The split is there because Documenter's HTML writer
 fails the build on any page over 200 KiB (`size_threshold`), and the single
@@ -120,26 +120,28 @@ page had reached 178 KiB; the largest page is now about 40 KiB. Keep a
 section heading from spelling an exported name exactly (`## Forest` made
 `` [`Forest`](@ref) `` link to the heading, not the docstring).
 
-CI (`.github/workflows/CI.yml`) tests on Julia **1.10** and latest, on Linux
-and macOS. `Project.toml` says `julia = "1.10"`, so no 1.11+ features (no
-`public`, no `[sources]`). Your local Julia is newer. A seeded RNG stream can
-differ across Julia versions, so a test whose *assertions* depend on a
-particular random draw can pass locally and fail on 1.10: use a seeded RNG
-for the inputs, but make what the test asserts follow deterministically from
-the setup. `juliaup` has 1.10 installed, but checking a suspect test on it
-is not simply `Pkg.test()` in this checkout: 1.10 cannot read a
-`Manifest.toml` a newer Julia resolved, and even against fresh manifests
-its `Pkg.test()` dies with "can not merge projects" whenever
-`test/Manifest.toml` exists — which the setup command above creates.
-Copy the tree without any manifest and run the test file directly
-(measured: 97744 tests, ~2m55, after M10):
+CI (`.github/workflows/CI.yml`) tests on Julia **1.11** and latest, on Linux
+and macOS. `Project.toml` says `julia = "1.11"`, so no 1.12+ features. The
+floor was 1.10 (the LTS) through 0.1.2 and was raised to 1.11 for 0.1.3
+(2026-09-25) across all the Tree* packages, so that unregistered
+dependencies can be located with `[sources]` entries, a 1.11 key. Your local Julia is newer. A
+seeded RNG stream can differ across Julia versions, so a test whose
+*assertions* depend on a particular random draw can pass locally and fail on
+the floor: use a seeded RNG for the inputs, but make what the test asserts
+follow deterministically from the setup. `juliaup` has 1.11 installed, but
+checking a suspect test on it is not simply `Pkg.test()` in this checkout:
+an older Julia may not read a `Manifest.toml` a newer one resolved. Copy the
+tree without any manifest and run the test file directly (the procedure was
+worked out, and measured at 97744 tests in ~2m55 after M10, on 1.10, whose
+`Pkg.test()` also died with "can not merge projects" whenever
+`test/Manifest.toml` existed):
 
 ```bash
-rm -rf /tmp/amr110 && mkdir /tmp/amr110 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr110
+rm -rf /tmp/amr111 && mkdir /tmp/amr111 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr111
 ```
 
 ```bash
-cd /tmp/amr110 && julia +1.10 --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()' && julia +1.10 --project=test test/runtests.jl
+cd /tmp/amr111 && julia +1.11 --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()' && julia +1.11 --project=test test/runtests.jl
 ```
 
 Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
@@ -177,11 +179,16 @@ only in synchronized wall-clock windows (`bench/affinity.jl` explains
 why). Best-of timings of independent processes overstate what they get
 together.
 
+`bench/interpolate.jl` times point interpolation (M11) on the horizon
+finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
+cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
+on an H200. CODE.md's M11 entry has the numbers.
+
 There is no formatter or linter configured.
 
 ## Architecture
 
-Twelve source files, included in dependency order from `src/TreeAMR.jl`; each
+Thirteen source files, included in dependency order from `src/TreeAMR.jl`; each
 layer uses only the ones before it:
 
 | layer | files | what |
@@ -196,6 +203,7 @@ layer uses only the ones before it:
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number, where M7's Allreduce will go), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
+| interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
 
 The ideas that span several files and are easy to violate:
 
@@ -312,6 +320,17 @@ The ideas that span several files and are easy to violate:
   `Threads.@spawn` puts blocks on arbitrary cores and costs up to 2.4x
   on a many-core node (CODE.md, "What one process loses").
 
+- **Point interpolation reads one block** (M11, CODE.md "Point
+  interpolation"). A query's *stencil* is `n^D` consecutive stored
+  points of the block `locate_point` finds, ghosts included, so ghosts
+  must be current. The kernel sees a basis only through `stencilwidth`,
+  `stencilstart` and `basisweights` — the extension point for smooth
+  bases — and `derivs` are multi-indices with only `|m| ≤ 1` accepted
+  until higher orders are tested. Outside points are reported by the
+  host after the launch (no throwing in kernels), and `exclude` flags
+  rather than throws. `locate_point` and `isless` share `curve_less`
+  in `morton.jl`, so the search and the leaf order cannot disagree.
+
 Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 (`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
 **owned** range is `G_d+1:G_d+N` and the **closed** range `G_d+1:G_d+N+c_d`.
@@ -331,7 +350,7 @@ ghost slab.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`interface_tests.jl`,
+`interpolate_tests.jl` (M11), `interface_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
@@ -412,7 +431,7 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. **Registered in General** since 2026-09-21; 0.1.1 is the current
+  only. **Registered in General** since 2026-09-21; 0.1.3 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
   key behind `DOCUMENTER_KEY` to push them — the file says why. Both
@@ -437,7 +456,8 @@ of the *public API only*. Facts that matter here:
   under `[compat]`, and `bin/Project.toml` inherits that bound through
   its `TreeWave = {path = ".."}` source. The `[sources]` pins to `main`
   went when 0.1.1 was released, which is also what dropped its Julia
-  floor to 1.10. So neither a push to `main` nor an uncommitted change
+  floor to 1.10 (raised back to 1.11 on 2026-09-25 with all the Tree*
+  packages). So neither a push to `main` nor an uncommitted change
   here reaches it; a change arrives with the next release. Before
   tagging one that touches the API, run TreeWave's tests (`julia
   --project=. -e 'using Pkg; Pkg.test()'` there, about 1.5 min) against

@@ -9,9 +9,10 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M10** (after M8's every
+The package is currently at milestone **M11** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
-faces, reflecting boundaries as a property of the domain).
+faces, M10's reflecting boundaries as a property of the domain, and
+M11's interpolation to arbitrary points).
 
 This package is still under development. It is ready for experimental use.
 

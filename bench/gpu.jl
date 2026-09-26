@@ -160,12 +160,15 @@ function main()
     # move, with the host driver logic (marks, balance, key rebuild)
     # excluded, since that is not what a backend changes.
     oldleaves = copy(forest.leaves)
+    # The calls are the ones `regrid!` makes: `run_phase!` on the CPU is
+    # one loop by block owner over every group, on a device one launch
+    # per group, and `fresh` gets its first touch by owner as there.
     groups = TreeAMR.transfer_groups(T, forest, fs.G, staggers(fs),
                                      oldleaves, oldleaves, OPS, BACKEND)
-    plan = TreeAMR.phase_plan(groups)
     fresh = similar(fs.work)
+    TreeAMR.zerofill!(fresh, BACKEND)
     transfer!() = begin
-        TreeAMR.run_phase!(fresh, fs.work, groups, plan, fs.nvars, BACKEND)
+        TreeAMR.run_phase!(fresh, fs.work, groups, fs.nvars, BACKEND)
         synchronize(BACKEND)
     end
     t_transfer = best(transfer!)

@@ -1341,6 +1341,123 @@ reinterpreted, and `u_modified!` must be signaled; in practice
 regridding means stop → rebuild → `reinit!` for anything beyond simple
 Runge–Kutta schemes.
 
+### Point interpolation
+
+(Added in M11, for the horizon finder of TreeGeneralizedHarmonic, which
+carried a stopgap of its own; `src/interpolate.jl`.) Everything above
+moves data between the mesh's own points. An analysis needs the other
+direction as well — the field, and its gradient, at points the mesh did
+not choose: a horizon finder's trial surface, asked for some 500 points
+about 55 times per find; a tracer; a sampled ray. `interpolate(fs, xs,
+basis; derivs, vars, exclude)` answers that for a whole batch in one
+launch on the field set's backend, and `locate_point(forest, x)` is its
+first step on its own. Decided:
+
+- **The stencil of a query** is the `n^D` stored points of one block the
+  interpolant reads: `n` consecutive stored indices per dimension, in the
+  block containing the point, **ghosts included**. It never crosses into
+  another block's array, which keeps a query a gather from one block, so
+  the ghosts must be current, filled with the boundary hook, as for any
+  stencil. Every stored point is exchange- or hook-filled (see
+  [Blocks](#blocks)), so a stencil may use all of `1 : N + 2G_d + c_d`.
+- **Location is one binary search.** The point is mapped to the node at
+  the finest level present that contains it — the root brick position,
+  then the node's coordinates bit by bit from the fraction within the
+  root, doubling being exact in any binary type, so `2^L` never has to be
+  an integer in `T` — and the covering leaf is the *last leaf not after
+  that node* in curve order. That is correct because the leaves tile the
+  domain and an ancestor sorts immediately before its contiguous subtree,
+  so no leaf lies between the covering leaf and the node. The stopgap
+  searched each ancestor in turn, `maxlevel` searches per point. The
+  comparison is `curve_less` on `(root, padded coordinates, level)`, the
+  same function `isless` on keys now calls, because the checking key
+  constructor cannot run in a kernel.
+- **Folding at faces.** Along a periodic dimension the point is wrapped
+  into the domain — and the *wrapped* point is what the stencil is built
+  from (the stopgap wrapped for location only, a latent bug no Dirichlet
+  case could see). Beyond a reflecting face it is mirrored once, `x →
+  2w − x` (decided with Erik: a symmetric run's horizon finder queries
+  across the wall), and the value takes the variable's parity sign from
+  `fs.factors` — the table the mirrored transfers already multiply by —
+  and each derivative across the wall one sign more. A point outside the
+  domain after that is refused rather than taken from the nearest block,
+  which would extrapolate without saying so.
+- **The basis is the extension point.** `Lagrange(n)` is the one
+  implemented. The kernel knows a basis only through `stencilwidth`,
+  `stencilstart` (which `n` points, from the query's continuous stored
+  index) and `basisweights` (the weights and their first `M` derivatives
+  at the offset `ξ`), so a smooth basis built from the same nodal data —
+  Lagrange interpolation is only `C⁰` — is a new type and three methods.
+- **Lagrange's stencil changes only at stored points.** It starts at
+  `floor(s) − floor((n−1)/2)`: centered for even `n`, half a point off for
+  odd `n`. The naive centering `floor(s − (n−1)/2)` switches between
+  nodes for even `n`, where the two stencils disagree, and the
+  interpolant jumps there; switching *at* a node, where every stencil
+  interpolates the same value, makes it continuous inside a block. The
+  start is then clamped into the stored array, which moves the stencil
+  *toward* the point, so it never extrapolates and only goes off center
+  at the array's edge — never when `G ≥ n/2` (cell) or `G ≥ n/2 − 1`
+  (vertex), and exact on the same polynomials either way, which is what
+  makes a `G = 0` field set interpolable at all. The same idea as
+  point-value restriction's shift.
+- **Weights by truncated Taylor products.** The numerator `∏_{j≠k}(ξ −
+  j)` is carried as a series in `ε`, `∏_{j≠k}((ξ − j) + ε)` to order `M`,
+  so derivatives come with it; the denominators are integers. Nothing
+  divides by `ξ − j`, so a query on a node is exact (the barycentric
+  form's `0/0` there is the first thing an exactness test hits). The
+  schedule's exact rational weights do not serve: they are cached per
+  offset, and a stream of arbitrary offsets would grow the cache without
+  bound.
+- **Derivatives as multi-indices, first order for now.** `derivs` is a
+  tuple of `D`-component multi-indices in physical units. The weights,
+  the contraction, the `h^{|m|}` scaling and the mirror signs are all
+  written for any order; one check refuses `|m| ≥ 2` until tests claim
+  it, so second derivatives need no change of interface.
+- **Sum factorization along dimension 1.** Each row of `n` points is
+  contracted once per derivative order in `x₁`, and only the partial
+  sums meet the other dimensions' weights, whose products — one per row
+  and requested derivative — are formed once per point rather than once
+  per variable. For the value and gradient in 3D at `n = 6` that is 16
+  multiplications per row and variable instead of 72. Both were
+  measured to matter, on the M11 benchmark below: forming the outer
+  products per variable took 1.9 ms per batch against 1.2, and a
+  reassigned tuple captured by an `ntuple` closure (boxed, so one
+  allocation per update, and not compilable for a device) made the first
+  version take 505 ms.
+- **Excluded regions flag, they do not throw.** An optional `exclude`
+  region marks every query whose stencil has a point inside it; the
+  value is computed either way and the caller decides. The stopgap's
+  guard threw, because a horizon inside the damping layer is a bug
+  there; a sampler may want to ignore the flag. The region is an
+  axis-aligned `Ellipsoid` (a ball is the round case), and its test is
+  exact and `O(D·n)` rather than `O(n^D)`: the scaled distance is a sum
+  of per-dimension terms, so the stencil point nearest the center is the
+  per-dimension nearest, and the stencil reaches inside iff that point
+  does. It agrees bit for bit with enumerating the stencil, since the
+  sum at the nearest point adds the same terms in the same order.
+  `Region` is abstract, with enumeration as the default for other
+  shapes. Stencil positions are those `coordinates` gives, evaluated by
+  the same expression.
+- **Errors after the launch.** A point outside the domain writes block
+  `0` into its own slot, and the host reports the first such point once
+  the batch is done. A device kernel cannot throw, and on the CPU an
+  exception would arrive wrapped in a `TaskFailedException` — the
+  stopgap moved to `threaded_foreach` precisely so that its refusal
+  reached the caller readable.
+- **One launch over points.** Points are not blocks, so this is a plain
+  launch, not a by-owner one; on the CPU the workgroup is sized to give
+  every thread a share, since a batch of a few hundred points would
+  otherwise fit one default workgroup and run on one thread. Every query
+  writes only its own slots, so the result is bit-identical across
+  thread counts (a line of `test/thread_workload.jl` says so). The
+  leaves, origins and spacings are uploaded per call, which at analysis
+  cadence costs nothing that matters.
+
+Under M7 the leaves a rank holds are its own, so a query must first be
+routed to the rank that owns its block — the one place this design will
+change. The location already produces exactly the block index that
+routing needs.
+
 ## Application interface (sketch)
 
 Indicative only — names and signatures will evolve (updated for the M8
@@ -2516,8 +2633,9 @@ Remaining, none blocking before their milestone:
 Each milestone has a concrete acceptance test; serial correctness is
 established before any parallelism. The numbers are the order the
 milestones were planned in; **M8 is done before M7** (decided in the M8
-design, see the M8 entry), and so is M10, which was added after M8. The
-list below is in execution order.
+design, see the M8 entry), and so are M10, which was added after M8,
+and M11, added after M10 for a downstream horizon finder. The list below
+is in execution order.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -2797,6 +2915,127 @@ list below is in execution order.
     in one thread, it was 97744 tests in 2m53. The 3D order-4 exactness
     sweep was then dropped as a duplicate of the `NaN` test's, which left
     89836 tests in 3m37 in one thread on the current Julia.
+- **M11 — Point interpolation.** *(Done.)* `interpolate` and
+  `locate_point`, as specified under [Point
+  interpolation](#point-interpolation). Asked for by
+  TreeGeneralizedHarmonic, whose apparent-horizon provider carried a
+  stopgap — 3D, vertex-centered, host-only, `maxlevel` searches per
+  point — and listed it as its first upstream prerequisite; porting it
+  onto this is that package's next step. *Accept:*
+  - `locate_point` agreeing with exact rational leaf boxes (half-open,
+    the upper domain face to the last leaf, a periodic upper face to the
+    first) on random forests in `D = 1, 2, 3`, on the finest lattice as
+    well as at random;
+  - exactness on tensor polynomials of degree `n − 1`, value and every
+    first derivative, through three levels, at nodes, on block faces and
+    at the domain's corners, for `n = 2…6` in `D = 1, 2` and `n = 3, 4`
+    in `D = 3`, for cell, vertex and face centering; and at `G = 0` and
+    `G = 1`, where the stencil shifts;
+  - not exact one degree higher, and converging at rate `n` (value) and
+    `n − 1` (gradient);
+  - continuity inside a block on random data, across nodes and
+    midpoints;
+  - a point one period away agreeing to roundoff; beyond a reflecting
+    face the parity-signed mirror, gradients included, exactly for data
+    of definite parity, over six combinations of face kinds and
+    centerings;
+  - the ellipsoid test agreeing with enumeration bit for bit, and the
+    flags through `interpolate` agreeing with the stencils
+    `query_stencil` names;
+  - the kernel's value equal to the contraction, with exact rational
+    weights, of the block's own stored points over that stencil, on
+    random data;
+  - refusals with reasons; `Float32` and `Float32x2` exact and never
+    widened; device agreement with the host; a line in the thread
+    workload.
+
+  *(Measured 2026-09-25; `test/interpolate_tests.jl`, `bench/interpolate.jl`.)*
+  The design needed no amendment. Five things are worth recording.
+
+  - **Allocation and hidden arithmetic, audited.** For `Float64` and
+    `Float32` a batch allocates a fixed ~3 KB of host setup (the origins
+    and spacings vectors, the variable list) plus the 4-byte block index
+    per point, and nothing per point in the kernel; the kernel's LLVM
+    IR calls no `Rational`, `BigInt` or `BigFloat` code and no generic
+    dispatch. `Float32x2` did not pass at first: 535 bytes and 15 µs per
+    point, from `pointoffsets` (`storage.jl`) converting `1//2` through
+    `BigFloat` at run time — which every position-forming kernel in the
+    package shares, `fill_by_coordinates!` included. It is now `one(h) /
+    2`, the same value in every binary type, and `Float32x2` allocates
+    what `Float64` does; with the innermost closures marked `@inline` it
+    takes 12 µs per point, 14 times `Float64`, against 10.5 times for a
+    bare double-float multiply-add loop.
+
+  - **Rates.** A smooth 2D field, `N = 8 → 16`, over a three-level
+    mesh: value **2.96 / 3.20** at `n = 3` (cell / vertex), **3.97 /
+    4.08** at `n = 4`, **5.04 / 5.11** at `n = 5`; gradient **1.79 /
+    2.06**, **3.05 / 3.27** and **3.86 / 4.01**. The suite holds them to
+    `n − 0.4` and `n − 1.4`.
+  - **Cost against the stopgap** (`bench/interpolate.jl`,
+    `bench/symmetry_interpolate.sh`; the stopgap is a verbatim copy of
+    TreeGeneralizedHarmonic's core run on the same batches). The
+    horizon finder's workload: points in a shell through three levels,
+    20 variables, value and gradient, `Lagrange(4)`, vertex-centered with
+    `G = 2`, 176 leaves, a 249 MiB working array; best of 50 whole
+    `interpolate!` calls. On a Symmetry AMD EPYC 7532 node (64 cores, 8
+    NUMA domains, threads pinned), in ns per point:
+
+    | threads | 496 points | stopgap | 49600 points | stopgap |
+    |---|---|---|---|---|
+    | 1 | 2083 | 1926 | 2214 | 1904 |
+    | 8 | 356 | 312 | 267 | 258 |
+    | 16 | 256 | | 135 | |
+    | 64 | 288 | 643 | 42.1 | 43.9 |
+
+    So the finder's own batch takes **0.13–0.14 ms from 16 threads up**,
+    against the stopgap's 0.32 ms at 64; a large batch scales 53-fold
+    to 64 threads. Serially this is 8–16 % behind the stopgap on the
+    EPYC, and 25 % ahead on an Apple laptop (781 against 1042 ns): the
+    stopgap accumulates all 20 variables in one `SVector`, which AVX2
+    vectorizes across the variables, where this contracts one variable
+    at a time. Contracting the variables in static chunks is the
+    recorded way to close that if it ever matters; at eight threads the
+    gap is 3 %, and at 64 it has reversed. Three measured causes were
+    fixed on the way: a `Val` for the derivative multi-indices (run-time
+    ones made the selections dynamic tuple indexing, 21 % serially), the
+    closure boxing above, and a floor of 32 points per CPU task (the
+    496-point batch took 0.29 ms at 64 threads without it, 0.14 at 16).
+
+    **NUMA does not matter here.** A point is not owned by any thread,
+    so a query reads its block from wherever first touch put it — and
+    eight threads bound to one domain with their memory there run at
+    the pinned eight-thread rate (264 against 267 ns), and 64 pinned
+    threads beat `numactl --interleave=all` (42.1 against 49.7). A batch
+    touches too little of the array for remote reads to show.
+
+    `locate_point` is 113 ns per point on the laptop and 125 on the
+    EPYC, against 249 for the per-level descent. The allocation is a
+    fixed ~10–20 KB of host setup per batch plus four bytes per point,
+    against the stopgap's 890 bytes per point.
+  - **Suite cost.** 92054 tests in 4m35–4m54 at eight threads after M11,
+    against 4m49 for M10 (within the run-to-run noise at this length);
+    the new file takes about 20 s on its own, almost all of it
+    compiling one kernel per (dimension, order, centering) case, and
+    the thread-workload subprocesses about 2 s each. On Julia 1.10, in
+    one thread, 99962 tests in 3m10. The device suite passes on Metal
+    (`Float32`) and on an H200 (`bench/symmetry_gpu.sh`: 93348 tests,
+    `Float64` and `Float32`, in 10m09), the interpolation's agreement
+    with the host included.
+  - **On a device** (one H200, `bench/symmetry_interpolate.sh cuda`), the
+    same batches: 496 points in **0.26 ms** (`Float64`) and 0.28
+    (`Float32`), which is latency — the small uploads of the leaves and
+    the geometry, the launch, the on-device check for outside points,
+    the synchronization — and so no better than the node's 16 host
+    cores (0.12 ms). Large batches are throughput: **6.4 ns per point**
+    in `Float64` and 4.7 in `Float32` at 496000 points, against 178 on
+    the 16 cores. For a device-resident run the comparison that matters
+    is with the stopgap's `hostcopy` of the whole field set per find;
+    caching the uploads per forest generation would take the small
+    batch down further, and is not done. The host allocates a constant
+    17 KB per batch: the outside check is reduced on the device, so only
+    a batch with an outside point copies its block indices back (the
+    first version copied them always, 2 MB at 496000 points, and ran at
+    12.2 ns per point before the `Val` for the multi-indices).
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
