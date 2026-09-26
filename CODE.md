@@ -2433,7 +2433,8 @@ Remaining, none blocking before their milestone:
   application that needs it (constrained-transport MHD).
 - **The integrator's own passes are not owner-based** (raised by
   TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
-  policy of [Parallelism](#parallelism); not decided here). An external
+  policy of [Parallelism](#parallelism); decided the same day not to
+  optimise it further, below). An external
   integrator forms its stage vectors itself, and OrdinaryDiffEq's `RK4()`
   does so with FastBroadcast's `@..` on one thread (`thread = Serial()`),
   over the whole state, between every two `map_blocks!` launches — so on
@@ -2475,7 +2476,8 @@ Remaining, none blocking before their milestone:
   settle it; if it holds, the first-touch advice needs "and nothing serial
   touches the state" attached.
 
-  *Polyester is not the way out*, measured in the same job. Its stage
+  *Polyester: not pursued further* (decided 2026-09-25), for what the
+  same job measured. Its stage
   update is no faster than the owner-mapped kernel (6.0 ms against 6.2),
   and it does not compose with this package's launches: after every
   `@batch`, ThreadingUtilities' workers spin for `2²⁰` `pause`s before
@@ -2490,29 +2492,21 @@ Remaining, none blocking before their milestone:
   matches the block ownership only by coincidence (when every block has
   the same size).
 
-  *The suggestion is an owner-aware state vector type, here.* FastBroadcast
-  handles only `DefaultArrayStyle` itself and hands every other style to
-  `Base.materialize!`, which ends in `copyto!(dest, bc::Broadcasted)` —
-  the hook `CuArray` uses. A wrapper around the flat vector that carries
-  the block shape `(N…, nvars, nblocks)`, with its own `BroadcastStyle`,
-  a `copyto!` that runs `dest[I] = bc[I]` through `launch_by_owner!` over
-  the block-shaped view, and a `similar` that allocates and zero-fills by
-  owner as `statevector` does, would make every stage update *and* every
-  integrator buffer owner-based with no change to the integrator. A
-  host-side prototype (`ownedstate.jl` in the directory below: a plain
-  loop in `copyto!`, not yet a kernel) confirms the routing:
-  OrdinaryDiffEq's `RK4` accepts it, returns it, sends exactly its four
-  combinations a step through the overridden `copyto!`, allocates its
-  thirteen buffers through its `similar` (once per `solve`, never per
-  step), and gives bit for bit the answer of a plain `Vector`. What it
-  leaves open: `statearray`, `scatter!` and `gather!` would accept it (or
-  its parent); host reductions over it fall back to the generic
-  `AbstractVector` methods; on a device the `Broadcasted` has to be
-  adapted with its arrays; and TreeWave and TreeHydro, which have the
-  same serial updates, would pass it to `solve` too. The per-`solve`
-  allocation stays either way: that one is the application's, whose fix
-  is to keep one integrator per mesh generation rather than call `solve`
-  per chunk. The script, its log and the prototype are in
+  *Not pursued further* (decided 2026-09-25). The integrator's passes
+  stay as measured above: no Polyester (`thread = True()`), no
+  owner-aware state vector type to route OrdinaryDiffEq's broadcasts
+  through `launch_by_owner!` (the suggestion this item first made,
+  dropped), and no further work on OrdinaryDiffEq's performance. What the
+  time integration has to get right is
+  correctness, and above all that limiters are applied where the
+  method's stability argument puts them. That is the part still open.
+  OrdinaryDiffEq's `SSPRK33`, which TreeHydro and `test/burgers.jl` use,
+  is written in Shu–Osher form: it limits every stage value and carries
+  the limited value into the next stage, so each stage is a convex
+  combination of forward Euler steps from limited states. IMEXRungeKutta
+  limits a stage value only where `f_exp!` reads it, and builds the next
+  stage from `uⁿ` and the tendencies, so for an explicit SSP method the
+  convexity is lost. The script and its log are in
   `/mnt/beegfs/eschnetter/claude/TreeGeneralizedHarmonic/threading-bench`
   on Symmetry (`threadbench.jl`, `threadbench.sbatch`,
   `out/threadbench-563749.log`).

@@ -552,5 +552,7 @@ breaks that suite at the top. On 2026-09-25 it measured the ownership
 policy from the outside, on Symmetry, and found the integrator's own
 passes to be what is left: see the last item of "Open questions" in
 `CODE.md` (the serial stage updates, the per-`solve` buffers, a
-first-touch anomaly that looks like NUMA balancing, why not Polyester,
-and an owner-aware state vector type as the suggestion).
+first-touch anomaly that looks like NUMA balancing, and why not
+Polyester). Erik decided the same day not to optimise the
+OrdinaryDiffEq path further, Polyester included; what is left open there
+is where limiters go (Shu–Osher against Butcher form).
