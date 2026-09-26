@@ -1,15 +1,8 @@
-# TreeAMR under IMEXRungeKutta's explicit tableaus: an opt-in suite.
-#
-# Not part of `Pkg.test`. IMEXRungeKutta is not in the General registry,
-# and the main suite runs on Julia 1.10, where `test/Project.toml` cannot
-# name an unregistered package (`[sources]` is 1.11+). This directory is
-# an environment of its own that takes IMEXRungeKutta from GitHub `main`
-# and TreeAMR from this checkout. Set it up once, then run it — at more
-# than one thread, or the by-owner path is a plain loop and the placement
-# test has nothing to check:
-#
-#     julia --project=test/imex -e 'using Pkg; Pkg.instantiate()'
-#     julia --project=test/imex -t 4 test/imex/runtests.jl
+# TreeAMR under IMEXRungeKutta's explicit tableaus (M3 and M8b through a
+# second integrator). IMEXRungeKutta is not in the General registry;
+# `test/Project.toml` locates it by `[sources]`, which is why the floor
+# is Julia 1.11. The by-owner checks need more than one thread to say
+# anything, so run the suite threaded too (see CLAUDE.md, "Commands").
 #
 # What it claims (see "Open questions" in `CODE.md`): the stage
 # arithmetic can run by owner with the partition TreeAMR's block
@@ -19,16 +12,8 @@
 # state, so that with a conservative right-hand side the drift of a
 # conserved total *is* the step limiter's injection.
 
-using Test, Random, TreeAMR
 using TreeAMR: threadchunks
 import IMEXRungeKutta as IRK
-using KernelAbstractions: @kernel, @index
-
-const TESTDIR = dirname(@__DIR__)
-include(joinpath(TESTDIR, "oracles.jl"))
-include(joinpath(TESTDIR, "ghost_oracles.jl"))
-include(joinpath(TESTDIR, "wave.jl"))        # also brings OrdinaryDiffEq's RK4
-include(joinpath(TESTDIR, "burgers.jl"))     # and its SSPRK33
 
 @info "TreeAMR with IMEXRungeKutta $(pkgversion(IRK)), $(Threads.nthreads()) thread(s)"
 

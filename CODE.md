@@ -2628,6 +2628,37 @@ Remaining, none blocking before their milestone:
   on Symmetry (`threadbench.jl`, `threadbench.sbatch`,
   `out/threadbench-563749.log`).
 
+  *IMEXRungeKutta as the second integrator* (measured 2026-09-25, in
+  `test/imex_tests.jl`; its 1.1 has explicit tableaus, `Euler`, `RK4` and
+  `SSPRK33`, with `solve_imp! = nothing`). With both limiters passed —
+  the stage limiter for what `f_exp!` reads, the step limiter for what
+  persists — and the initial data and every regrid's output limited by
+  the application, every right-hand side sees a limited state and every
+  stored state is limited. What the Butcher form gives up is the
+  Shu–Osher carry-forward, which only a positivity proof built on
+  limited stage values needs; neither TreeHydro's atmosphere nor
+  TreeGRRMHD's has one. What it gains is exact bookkeeping: a stage
+  correction never enters the state, so with a conservative right-hand
+  side the drift of a conserved total *is* the step limiter's injection.
+  On Burgers with a cap below the initial maximum and an unlimited
+  reconstruction, that holds to 6e-16 in `D = 1` and 4e-15 in `D = 2`;
+  through OrdinaryDiffEq's `SSPRK33` with the same two limiters the step
+  limiter injects nothing (its last stage-limiter call already capped
+  the result) and the drift is the weighted stage injections instead —
+  TreeHydro's "a bound, not an equality" under `:stage`. The rest of the
+  file: `RK4` by owner, with a partition from `threadchunks`, is bitwise
+  its broadcast and within 7e-14 of OrdinaryDiffEq's `RK4` on the wave;
+  the vertex-centered wave keeps its rates (1.99 in `D = 1, 2`); Burgers
+  conserves mass to 0.0 through `SSPRK33` across coarse-fine faces, against
+  a leak of 1e-3 without the fixup; and each block's state entries are
+  handled by the thread `map_blocks!` runs the block on. The partition
+  function itself stays open (IMEXRungeKutta's `CODE.md` asks TreeAMR
+  for it); `state_partition` in the test file is the candidate.
+  `bench/stepping.jl` times a step by integrator. On the development
+  machine at 6 threads (960 blocks of `16³`, a 63 MB state) the RHS is
+  most of a step and the two integrators are within 6 %; it is the
+  Symmetry run that will say what the serial passes cost there.
+
 ## Milestones
 
 Each milestone has a concrete acceptance test; serial correctness is

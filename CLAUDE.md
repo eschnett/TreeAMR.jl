@@ -52,16 +52,20 @@ julia --project=. -e 'using Pkg; Pkg.test(; julia_args = ["--threads=8"])'
 
 A single test file. The `test/*_tests.jl` files are `include`d by
 `runtests.jl` and rely on the helper files, so include those first.
-`test/Project.toml` devs TreeAMR from `..`:
+`test/Project.toml` locates TreeAMR (`..`) and the unregistered
+IMEXRungeKutta (GitHub `main`) through `[sources]`:
 
 ```bash
 julia --project=test -e 'using Test, Random, TreeAMR; include("test/oracles.jl"); include("test/ghost_oracles.jl"); include("test/wave.jl"); include("test/regrid_tests.jl")'
 ```
 
-On a fresh clone the test environment has no Manifest; run this once first:
+On a fresh clone the test environment has no Manifest; run this once
+first (`Pkg.test` needs nothing, it resolves an environment of its own).
+The same line with `docs` sets up the docs environment, which locates
+TreeAMR the same way:
 
 ```bash
-julia --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+julia --project=test -e 'using Pkg; Pkg.instantiate()'
 ```
 
 Coverage, the way CI's single-threaded cells measure it. Note that
@@ -94,20 +98,18 @@ Docs build. This is also the **only place doctests run** — `Pkg.test` does
 not run the `jldoctest` blocks in docstrings and `docs/src/`:
 
 ```bash
-julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+julia --project=docs -e 'using Pkg; Pkg.instantiate()'
 ```
 
 ```bash
 julia --project=docs docs/make.jl
 ```
 
-Both `Pkg.develop` lines above have a side effect on a current Julia: they
-write a `[sources]` entry into that environment's `Project.toml`. The floor
-is 1.11 now, so the key itself is legal, but the entry is a local
-convenience that should not be committed by accident. The `Manifest.toml`
-they also write is the part you want, and is gitignored. Check `git status`
-after running either and revert `test/Project.toml` or `docs/Project.toml`
-if it moved.
+The `[sources]` entries in `test/Project.toml` and `docs/Project.toml` are
+committed and meant to be (a 1.11 key, the reason for the floor). Do not
+`Pkg.develop` TreeAMR into either any more: that is what they replace.
+IMEXRungeKutta is taken from `main`, so its next push reaches the next
+resolve here; `Pkg.update` in `test/` picks it up locally.
 
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
@@ -141,7 +143,7 @@ rm -rf /tmp/amr111 && mkdir /tmp/amr111 && tar -cf - --exclude=Manifest.toml --e
 ```
 
 ```bash
-cd /tmp/amr111 && julia +1.11 --project=test -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()' && julia +1.11 --project=test test/runtests.jl
+cd /tmp/amr111 && julia +1.11 --project=test -e 'using Pkg; Pkg.instantiate()' && julia +1.11 --project=test test/runtests.jl
 ```
 
 Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
@@ -183,6 +185,14 @@ together.
 finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
 cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
 on an H200. CODE.md's M11 entry has the numbers.
+
+`bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
+RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
+runs in the test environment, which has both:
+
+```bash
+TREEAMR_BENCH_ROOTS=8 TREEAMR_BENCH_SCRIPT=bench/stepping.jl TREEAMR_BENCH_PROJECT=test bench/scan.sh 1 8
+```
 
 There is no formatter or linter configured.
 
@@ -356,8 +366,15 @@ ghost slab.
 `thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
 study comes in two halves: `wave_tests.jl` is the **vertex-centered**
 one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
-verbatim so its numbers stay under test. Five helper files are not
-tests:
+verbatim so its numbers stay under test. `imex_tests.jl` runs the wave
+and Burgers studies a second time through IMEXRungeKutta's explicit
+`RK4` and `SSPRK33`, by owner, with a `state_partition` helper built
+from `threadchunks`; it also asserts that a stage limiter's correction
+never reaches the state (the drift of a conserved total is the step
+limiter's injection) and that OrdinaryDiffEq's Shu–Osher SSPRK33 is
+different there. Its names clash with OrdinaryDiffEq's (`RK4`,
+`SSPRK33`), so it uses `import IMEXRungeKutta as IRK`. Five helper
+files are not tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
   reference implementations (bit-plane Morton comparison, exact `Rational`
