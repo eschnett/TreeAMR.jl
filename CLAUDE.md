@@ -28,8 +28,8 @@ before they need MPI.
 
 ## Commands
 
-Full test suite (about 5 min at one thread and at eight — 93677 tests
-in 4m51 and 93729 in 5m08 after M9a — the thread-independence test
+Full test suite (about 4–5 min at one thread and at eight — 93686 tests
+in 4m16 and 93738 in 4m47 after M9a — the thread-independence test
 spends ~45 s of that running `test/thread_workload.jl` in two
 subprocesses, M10's `reflect_tests.jl` about 45 s more, and M9a's
 `checkpoint_tests.jl` about 30 s).

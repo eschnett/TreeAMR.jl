@@ -3660,11 +3660,12 @@ M7's benchmarks. The list below is in execution order.
     recommendation is no filter, and `Shuffle()` with `ZstdFilter(1)`
     when size matters: 6.1-fold at 1.0 GB/s on a state that is mostly
     atmosphere, and 1.3-fold on a smooth one.
-  - **Suite cost.** 93677 tests in 4m51 at one thread and 93729 in 5m08
+  - **Suite cost.** 93686 tests in 4m16 at one thread and 93738 in 4m47
     at eight threads, against 92054 in 4m35–4m54 at eight after M11;
-    93677 in 4m14 on Julia 1.11.9. `checkpoint_tests.jl` (532 tests)
-    adds about 30 s at one thread inside the suite, and takes about
-    55 s on its own, most of it compilation.
+    93686 in 3m48 on Julia 1.11.9 (with `sync`, 2026-09-29; 93677,
+    93729 and 93677 before it). `checkpoint_tests.jl` (541 tests) adds
+    about 30 s at one thread inside the suite, and takes about 57 s on
+    its own, most of it compilation.
   - **The downstreams are green.** Against the M9a checkout, developed
     into scratch copies, at one thread: TreeWave 310 tests in 1m12, and
     TreeHydro 11893 in 4m16. Neither calls the new functions yet; each
