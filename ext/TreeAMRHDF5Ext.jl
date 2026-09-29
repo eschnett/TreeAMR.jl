@@ -643,7 +643,7 @@ save_checkpoint(path::AbstractString, forest::Forest; kwargs...) =
     save_checkpoint(nothing, path, forest; kwargs...)
 
 function save_checkpoint(f, path::AbstractString, forest::Forest; fieldsets=nothing,
-                         application=nothing, data=(;), filters=())
+                         application=nothing, data=(;), filters=(), sync::Bool=true)
     fieldsets === nothing && throw(ArgumentError(
         "save_checkpoint has no default `fieldsets`: pass the field sets the " *
         "application evolves, as `name => (fs, u)` pairs, or `()` for none. Which sets " *
@@ -677,12 +677,45 @@ function save_checkpoint(f, path::AbstractString, forest::Forest; fieldsets=noth
             f === nothing || f(app)
             return nothing
         end
+        # The data first, then the rename, then the directory entry the
+        # rename wrote: a rename that reaches the disk before the data it
+        # points to would replace the previous checkpoint with a
+        # truncated file.
+        sync && flush_to_storage(partial)
         Base.Filesystem.rename(partial, path)
+        sync && flush_to_storage(dirname(abspath(path)); directory=true)
     catch
         rm(partial; force=true)
         rethrow()
     end
     return path
+end
+
+# Flush the file, or the directory, at `path` from the operating system's
+# cache to stable storage. Closing a file hands its data to the page
+# cache only, which survives the process and not a power loss. On macOS
+# `fsync` hands the data to the drive without waiting for the drive's own
+# cache, and `fcntl(F_FULLFSYNC)` waits (measured: 1 ms against 125 ms
+# for 540 MB); a file system without it — some network and FUSE ones —
+# falls back to `fsync`, as SQLite and libuv do. A directory that cannot
+# be synced (`EINVAL` on some file systems) is accepted, since there is
+# nothing further to ask of it. On Windows this does nothing.
+const O_RDONLY = Cint(0)            # the same on Linux and macOS
+const F_FULLFSYNC = Cint(51)        # macOS
+
+function flush_to_storage(path::AbstractString; directory::Bool=false)
+    Sys.iswindows() && return nothing
+    fd = ccall(:open, Cint, (Cstring, Cint), path, O_RDONLY)
+    fd < 0 && systemerror("opening $(repr(path)) to flush it to stable storage")
+    try
+        full = Sys.isapple() && ccall(:fcntl, Cint, (Cint, Cint), fd, F_FULLFSYNC) == 0
+        full || ccall(:fsync, Cint, (Cint,), fd) == 0 ||
+            (directory && Libc.errno() == Libc.EINVAL) ||
+            systemerror("flushing $(repr(path)) to stable storage")
+    finally
+        ccall(:close, Cint, (Cint,), fd)
+    end
+    return nothing
 end
 
 # Open `path` as a TreeAMR checkpoint and call `f(file, root, context)`,

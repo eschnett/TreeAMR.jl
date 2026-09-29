@@ -211,10 +211,11 @@ TREEAMR_BENCH_ROOTS=8 TREEAMR_BENCH_SCRIPT=bench/stepping.jl TREEAMR_BENCH_PROJE
 `bench/checkpoint.jl` times `save_checkpoint` and `load_checkpoint` (M9a)
 for each HDF5 filter setting, on a smooth wave pulse and a blast wave
 with a uniform atmosphere, and prints the file size, the ratio and GB/s
-for save, save plus the flush to stable storage (`fsync`, or
-`F_FULLFSYNC` on macOS, where `fsync` does not wait), and load. It
+for a save with `sync = false`, one with the default `sync = true`
+(which adds the flush to stable storage: `fsync`, or `F_FULLFSYNC` on
+macOS, where `fsync` does not wait), and a load. It
 runs in the test environment with the built-in filters only; the
-filter packages (H5Zzstd, H5Zlz4, H5Zbitshuffle, H5Zblosc) are used
+filter packages (H5Zzstd, H5Zlz4, H5Zbitshuffle) are used
 where the environment has them, which means a scratch environment that
 develops this checkout — never add them to `test/Project.toml`.
 `TREEAMR_BENCH_DIR` puts the files on the file system under test. A
@@ -390,7 +391,11 @@ The ideas that span several files and are easy to violate:
   leaving the root free for M9b's sidecars. The write goes to
   `path * ".partial"` and is renamed over `path` with
   `Base.Filesystem.rename` — not `mv(…; force = true)`, which on 1.11
-  removes the target first. Element types are HDF5 natives or *limbs*
+  removes the target first — and, under the default `sync = true`, the
+  partial file is flushed to stable storage before the rename and its
+  directory after (`F_FULLFSYNC` on macOS, `fsync` elsewhere), since
+  closing a file ends in the page cache and a rename can reach the disk
+  before the data it names. Element types are HDF5 natives or *limbs*
   (`Float32x2` as two `Float32`), named as a Base-only module prints
   them and matched against the loader's `types`. No Julia type
   definition reaches the file, so a converter can read an old file
