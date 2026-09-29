@@ -1458,6 +1458,353 @@ routed to the rank that owns its block — the one place this design will
 change. The location already produces exactly the block index that
 routing needs.
 
+### Checkpoint and restart
+
+*(Designed 2026-09-29 as M9a, before implementation, and decided with
+Erik the same day except where marked. Nothing here is measured yet.)*
+Long runs outlast a queue's day: TreeHydro's showcase on an H200 at
+10–20 levels, and TreeGeneralizedHarmonic's production runs, estimated
+at 38–149 h. An application calls one function at a chunk boundary to
+save the forest, its evolved field sets and its own plain data; a fresh
+process loads them exactly, on any thread count and any backend, and
+continues **bit-identically** at any thread count (across backends,
+see "Loading" below). A file this version cannot interpret is refused
+with the reason, and with a way to recreate the environment that wrote
+it.
+
+**What is saved and what is rebuilt** (decided). A checkpoint holds
+what cannot be recomputed, and nothing else:
+
+| Item | Handling | Why |
+|---|---|---|
+| Forest: `D`, the geometry type, `roots`, `periodic`, `reflecting`, `extents` (bitwise, in the geometry type), `N` | saved | the inputs the forest was built from |
+| Forest: the leaf list | saved | the only record of the mesh's history |
+| Forest: `generation` | not saved | a staleness counter, meaningless in another process |
+| Field set: element type, `nvars`, `G`, `centering`, `parity` | saved | its layout |
+| Field set: the **owned** points, in state-vector layout `(N, …, N, nvars, nblocks)` | saved | the authoritative data |
+| Ghosts, shared vertex planes, the derived wall plane | rebuilt by `scatter!` and `fill_ghosts!` with the application's hook | derived from the owned points |
+| `GhostSchedule`, `InterfaceSchedule`, `Operators`, the parity factors | rebuilt | derived, or the application's inputs |
+| Regridding | nothing to save | it keeps no state between calls |
+| Scratch field sets (fluxes, primitives) | the application's choice | it passes only the sets it evolves |
+
+The flat state vector is the authoritative data and the working array
+is scratch (see [Time integration](#time-integration)), so what is
+stored is what an integrator holds, and restoring it is `scatter!`
+followed by the ordinary ghost fill. Ghosts are a function of the owned
+points, the operators and the boundary hook; all three are back after a
+load, and a stored copy of the ghosts could only disagree with the one
+the fill produces. The leaf list is the one thing that cannot be
+recomputed, since a mesh is the product of every regrid since the
+start. Regridding itself keeps nothing between calls — the buffer, the
+marks and their completion are recomputed from the flags each time —
+so there is no hidden mesh state to lose. (Parthenon, by contrast,
+warns that an AMR run restarted without its per-block derefinement
+counters may not be bitwise exact.)
+
+**File layout, format version 1** (decided). One HDF5 file. Everything
+TreeAMR writes lives under one top-level group, `/TreeAMR.jl`, and the
+application gets a top-level group of its own, named after it:
+
+    /TreeAMR.jl/         attrs: format = "TreeAMR checkpoint",
+                                format_version = 1,
+                                features = ["brick"]  (must understand),
+                                application = "<app name>"
+      provenance/        treeamr_version, julia_version, created (UTC),
+                         hostname, nthreads,
+                         project (Project.toml text),
+                         manifest (Manifest.toml text)
+      forest/            attrs: D, N, connectivity = "brick", roots,
+                                periodic, reflecting (lo, hi per
+                                dimension), geometry_type
+        extents          (limbs?, 2, D), in the geometry type, bitwise
+        root             Int32[nleaves]
+        level            Int8[nleaves]
+        coords           UInt32[D, nleaves]
+      fieldsets/<name>/  attrs: eltype, nvars, G (per dimension),
+                                centering ("cell" | "vertex" per
+                                dimension), parity ("even" | "odd" |
+                                "none" per variable and dimension;
+                                absent without reflecting faces),
+                                range = "owned"
+        data             (limbs?, N, …, N, nvars, nblocks)
+    /<app name>/         attr: format_version (the application's own)
+      data/…             the plain-data tree, and whatever the
+                         do-block writes
+    /                    otherwise free, for sidecars (M9b)
+
+- **One top-level group per package.** Neither TreeAMR nor the
+  application writes at the root or into the other's group, so the two
+  layouts, and their format versions, evolve independently. The
+  `application` attribute names the application's group; a name that
+  would collide with `TreeAMR.jl` is refused.
+- **The root stays free for sidecars** (M9b). A visualization view can
+  be added to the same file and point at these datasets without copying
+  them: an HDF5 hard or soft link where the layout already matches, a
+  virtual dataset where it has to be remapped (VTKHDF's per-level
+  arrays, say). An external link from a separate file is the fallback.
+- **Leaves are stored as columns, in global curve order** — the order
+  of `forest.leaves` — so block `b` of every dataset is leaf `b`, and
+  any contiguous range of blocks, such as an M7 rank's, is one
+  hyperslab of every dataset.
+- **No coordinates, and no partition.** Coordinates follow exactly from
+  the key, the extents, `N` and the centering (see
+  [Precision](#precision)), so a stored copy could only disagree. The
+  partition belongs to the process that wrote the file; a reader on
+  another thread or rank count chooses its own.
+- **The view from C.** HDF5.jl reverses dimensions, so a C or Python
+  reader sees a field set as `(nblocks, nvars, N_D, …, N_1)`, slowest
+  index first, as Parthenon stores its variables, and the coordinates
+  as `(nleaves, D)`.
+- **Contiguous when unfiltered; with filters, one chunk per block and
+  variable**, `(limbs?, N, …, N, 1, 1)`, so that reading a block
+  decompresses that block and no other. The filters are the caller's
+  HDF5.jl filter objects, none by default, and TreeAMR depends on no
+  filter package. Which filter to recommend is chosen from M9a's
+  measurements.
+- `range = "owned"` says the data are the owned points only, and leaves
+  room for a file that stores more, which a version-1 reader would
+  refuse by value. How a `Bool` or a `(lo, hi)` pair is spelled in an
+  attribute is the implementation's to fix, and it will be recorded
+  here.
+
+**Element types** (decided).
+
+- **Native types** — `Float16`, `Float32`, `Float64`, the signed and
+  unsigned integers, `Bool`, and `Complex` of the floats — are stored as
+  themselves, bit for bit.
+- **An `isbits` type made of one native type throughout**, with no
+  padding, is stored as **limbs**: a leading dimension of that native
+  type, with `eltype` naming the type (`string(T)`) and a limb count
+  beside it. MultiFloats' `Float32x2`, which the test suite uses (see
+  [Precision](#precision)), is two `Float32` limbs. The loader cannot
+  name such a type without its package, so the caller passes it —
+  `load_checkpoint(path; types = (Float32x2,))` — and the loader matches
+  it by name and checks `sizeof`. The name is a label to match against,
+  not a recipe: without the type the data still read as plain `Float32`
+  limbs, which is what a converter or a Python reader needs. The
+  geometry type is treated the same way, for `extents`.
+- **No conversion on load** in version 1. A field set comes back in the
+  type it was saved in, since exactness is the point of a checkpoint;
+  loading into a narrower type is an open question.
+
+**Versioning** (decided). This is also the answer to how files from
+older versions are treated: what cannot be interpreted is rejected,
+with the reason, and defaults are supplied where they are obvious.
+
+- **Compatibility is decided by the file's `format_version` and its
+  `features`, never by package versions.** Two releases may write the
+  same format, and a release reads every format version it knows,
+  whichever release wrote the file.
+- **An additive change with an obvious default needs no bump**; the
+  reader supplies the default. Had the format existed before M10, its
+  files would have had no `reflecting`, and "no reflecting faces" is
+  the only reading of that.
+- **A change of meaning bumps `format_version`**, and a reader refuses
+  a version newer than it knows.
+- **A new capability that an old reader must not silently ignore** — a
+  multi-block connectivity, say — adds a name to `features`, and a
+  reader refuses a file that names a feature it does not know. This is
+  Zarr v3's `must_understand` idea, with every listed feature
+  must-understand: what may be ignored is simply not listed. Version 1
+  lists one, `brick`.
+- **Refusals are `ArgumentError`s that say why.** They name the TreeAMR
+  version that wrote the file, from `provenance`, and point to
+  `checkpoint_environment(path, dir)`. That writes the stored
+  `Project.toml` and `Manifest.toml` into `dir`, so that `julia
+  --project=dir` recreates the writer's environment, and "use the older
+  version" is one command.
+- **Why the layout is plain and documented.** Two versions of TreeAMR
+  cannot be loaded into one Julia process, so a converter from an old
+  format cannot call the old package: it reads the old *file*. That
+  works only if the file is plain HDF5 described here, with no Julia
+  type a reader has to resolve. It is also why the format is neither
+  JLD2 nor `Serialization`, both of which tie a file to the definitions
+  of the types that wrote it.
+- **The application's group carries its own `format_version`.** TreeAMR
+  stores it and returns it and does not interpret it; the application
+  checks it. Plain data written as NamedTuples come back as
+  NamedTuples, so keyword defaults on the application's side are the
+  good-default path for a field it adds later.
+
+**Writing** (decided).
+
+- **Atomically.** The file is written to `path * ".partial"` and moved
+  over `path` when it is complete; on any error the partial file is
+  removed and the error rethrown. A crash while writing then cannot
+  destroy the previous checkpoint, which is the one a restart needs.
+- **Two forms per field set.** `name => (fs, u)` writes the state
+  vector `u`, and is the recommended form: after `solve` the working
+  array holds whatever the last right-hand side scattered, which is a
+  stage, not the solution. `name => fs` gathers the owned points from
+  `fs.work` first, which is right for a set whose working array is
+  current by construction — an auxiliary set filled by
+  `fill_by_coordinates!`, say.
+- **Through the host.** Device data are copied to the host (`tohost`,
+  in `src/device.jl`) before they are written.
+- **One forest.** Every field set must be over the forest being saved
+  (`===`), as for `regrid!`.
+- **Filters are the caller's**, as above.
+
+**Loading** (decided).
+
+1. The forest is built through the validated leaves path,
+   `Forest{R}(roots; N, periodic, reflecting, extents, leaves)`, which
+   refuses a list that does not tile the brick exactly or is not
+   balanced, so that a damaged or hand-edited file cannot yield a mesh
+   the schedule would silently get wrong.
+2. `FieldSet{T}(forest, nvars; G, centering, parity, backend)`.
+3. `u = statevector(fs)`: allocated on the backend and first-touched by
+   the block owners, so NUMA placement is right although the HDF5 read
+   that fills it is serial — placement is decided at the first touch,
+   not by the later write. (Whether automatic NUMA balancing then moves
+   pages that one thread touches is the unproven candidate in the
+   [Open questions](#open-questions) item on the integrator's own
+   passes; a load touches them once.)
+   The read goes into `u`, through a host buffer on a device.
+4. `scatter!(fs, u)`.
+
+Ghosts are left to the application's `fill_ghosts!(fs,
+GhostSchedule(fs, ops); boundary)`, with its own operators and hook.
+The file does not hold those because they are the application's
+inputs, the hook often a closure. Nothing stored depends on the thread
+count or the backend, so a checkpoint loads on any of them, and the
+load itself is exact everywhere. What follows is bit-identical at any
+thread count, by the invariant under [Parallelism](#parallelism);
+across backends it is as close as a host run and a device run ever are
+— bit for bit in the Burgers study on Metal, not promised in general.
+
+**Parallel I/O and M7** (the facts checked 2026-09-29 against the HDF
+Group's "Collective Calling Requirements in Parallel HDF5
+Applications", "A Brief Introduction to Parallel HDF5" and "HDF5
+Parallel Compression", and HDF5.jl's MPI page; the design is not
+decided).
+
+- In parallel HDF5 only raw data transfers — `H5Dwrite`, `H5Dread` —
+  may run independently per rank, and any number of them. Every call
+  that creates or changes the file's structure or metadata is
+  collective: creating, opening, flushing and closing the file;
+  creating groups, datasets and attributes; writing an attribute;
+  extending a dataset. All ranks make the same call with the same
+  arguments, so every rank pays for every object, and that cost does
+  not fall as ranks are added. A layout whose object count grows with
+  the blocks or the ranks — one dataset per variable, level and
+  component, as in CarpetIOHDF5 — makes metadata the part that does not
+  scale.
+- Writing a filtered (compressed) dataset in parallel needs HDF5 ≥
+  1.10.2 and collective writes. A chunk that several ranks write is
+  given one owner, and the others send it their parts.
+- This layout keeps the object count fixed: about a dozen, two more per
+  field set, plus the application's plain data, and none of it depends
+  on the number of blocks or ranks. Each rank's blocks are one
+  contiguous hyperslab of every dataset, since an M7 rank holds a
+  contiguous range of the curve and the curve is the block axis. And a
+  chunk is one block, so under compression every chunk has one writer
+  and none moves between ranks.
+- The alternative many codes use is one file per I/O process plus a
+  wrapper file (CarpetIOHDF5's per-process output, AthenaK's per-rank
+  restart, a Conduit Blueprint root file). It is easy to write and
+  needs no collective metadata, but it is awkward to read back on a
+  different rank count, where each reader must find the files that
+  hold its range; SAMRAI's restart requires the same process count
+  unless a separate redistribution tool is run.
+- **Decided:** M9a is serial. Which parallel design M7 uses is
+  benchmarked first, on Symmetry and other HPC systems; this layout is
+  the candidate, not a commitment. If the shared file does not hold up,
+  M7 bumps `format_version`, and that is accepted.
+
+**Multi-block** (checked). Keys are relative to their root,
+`connectivity = "brick"` is a tagged record rather than an assumption,
+and no coordinates are stored. A conforming multi-block forest, the
+likely route to spherical domains, is then a new connectivity kind,
+with whatever describes its roots stored beside the leaves, plus a
+feature name. Nothing in the format obstructs it. Parthenon's layout
+would: it stores global tree locations in one virtual tree over the
+root grid, which a multi-block forest cannot express.
+
+**Formats considered** (a survey, 2026-09-29). No existing standard
+fits a leaf-only octree checkpoint. VTKHDF has no non-overlapping AMR
+type: its `OverlappingAMR` must be sorted by level, and VTK's
+non-overlapping AMR exists only in the XML `.vthb` format. Conduit
+Blueprint associates fields with vertices or elements only, so it has
+no face or edge centering. openPMD's mesh-refinement extension is still
+an open pull request. AMReX, Chombo and Carpet store overlapping
+hierarchies, with coarse data under fine. For checkpoints the norm is a
+code's own versioned HDF5 schema — Parthenon, FLASH, Athena++,
+CarpetIOHDF5 — or its own binary format (AMReX, AthenaK, p4est).
+Parthenon's `.rhdf` is the closest model, and the one followed here:
+one dataset per variable over all blocks in Z-order, a block table,
+collective hyperslab writes with one block per chunk, restart on any
+rank count, and one integer format version. What is done differently
+is keys relative to their root, no stored coordinates, and a features
+list beside the version. JLD2 is set aside because it records Julia
+type names, which ties a file to the definitions that wrote it, and
+because it has no MPI.
+
+**The API in brief** (indicative: the implementation may refine names,
+and will reconcile this). HDF5 is a **package extension**,
+`TreeAMRHDF5Ext` over the weak dependency HDF5 (`[compat]` 0.17),
+because the only hard dependency today is KernelAbstractions, and an
+application that never checkpoints should not load HDF5 and its
+binaries. The core, `src/checkpoint.jl`, holds the docstrings, stubs,
+and an error hint that says to load HDF5.
+
+    # core: a forest from a validated leaf list
+    Forest{T}(roots; N, periodic, reflecting, extents, leaves)
+
+    # the extension, loaded by `using HDF5`
+    save_checkpoint(path, forest;
+                    fieldsets   = ("U" => (U, u), "aux" => aux),
+                    application = "TreeHydro" => 1,  # name => its version
+                    data = (; t, chunk, recipe), filters = ())
+    save_checkpoint(path, forest; …) do app::HDF5.Group
+        # further datasets in the application's group
+    end
+    ck = load_checkpoint(path; backend = CPU(), types = (),
+                         fieldsets = nothing)        # or names, a subset
+        # ck.forest, ck.fieldsets["U"].fieldset, ck.fieldsets["U"].state,
+        # ck.application, ck.data, ck.provenance
+    load_checkpoint(path; …) do app … end        # result in ck.result
+    write_plain(parent, name, value); read_plain(parent, name)
+    checkpoint_environment(path, dir)
+
+- **The `leaves` keyword validates**, in the tone of the other
+  refusals: every root index is below `prod(roots)`; the keys are
+  strictly sorted, which also refuses duplicates; the leaves tile the
+  brick exactly, checked by one walk along the curve (each leaf starts
+  where the previous leaf's subtree ends, and every root is covered);
+  and the list is balanced (`isbalanced`). An unbalanced list is
+  refused rather than rebalanced, because it cannot have come from a
+  forest, and `block_sources!` would silently build wrong prolongations
+  from it. `MortonKey`'s own checks cover each key.
+- **Plain data are a closed, documented set of types**: `Bool`, `Int8`
+  to `Int64` and `UInt8` to `UInt64`, `Float16`, `Float32`, `Float64`,
+  `Complex` of those, `Rational{<:Integer}`, `String`, `Symbol`,
+  `VersionNumber` and `Nothing`; tuples, NamedTuples, and
+  `AbstractDict`s with `String` or `Symbol` keys; and arrays of native
+  numbers or strings. Every item is a dataset or group with a `type`
+  attribute from that closed vocabulary, and groups keep their order
+  (`track_order`). Anything else is an `ArgumentError` that says to
+  convert it to a NamedTuple: structs are the application's to convert
+  (`to_plain`, `from_plain` on its side), so no type name reaches the
+  file. Rationals store exactly, and TreeHydro already states its
+  parameters as Rationals, so a case recipe round-trips exactly.
+
+**Where a checkpoint belongs in a chunked driver** (decided). The
+downstream drivers integrate in chunks: `solve` over a fixed number of
+steps, then flag, regrid, rebuild the schedules and restart the
+integrator (see [Regridding](#regridding)). A checkpoint goes at a
+chunk boundary, *after* the regrid. There the integrator holds nothing
+but `(t, u)`, for the fixed-step explicit methods every downstream
+application uses, so restoring `t` and `u` restores the integrator —
+a step size computed from the forest or the state comes out the same —
+and a restarted run begins the next chunk with exactly what the
+uninterrupted one began it with. Mid-chunk, the integrator's own state
+(its stages and cached derivatives) would have to be saved too; before
+the regrid, a restart would have to replay the regrid and whatever the
+application does after it, such as TreeHydro's atmosphere reset. The
+application's run state — the time or chunk index, histories, trackers
+— goes in its plain data.
+
 ## Application interface (sketch)
 
 Indicative only — names and signatures will evolve (updated for the M8
@@ -2526,9 +2873,15 @@ entries per volume — documented here, implemented post-M3.
   ghost/operator infrastructure suffices to build composite-grid
   operators. (Multigrid on the tree hierarchy would require overlapping
   coarse data, which leaf-only storage does not provide — out of scope.)
-- **I/O:** HDF5.jl output and checkpoint/restart; possibly ADIOS2 later.
-- **Visualization:** VTK export (non-overlapping AMR / multiblock
-  formats) via WriteVTK.jl or similar.
+- **I/O:** checkpoint and restart through HDF5.jl, as a package
+  extension — M9a, specified under
+  [Checkpoint and restart](#checkpoint-and-restart). Visualization
+  export is M9b; an ADIOS2 backend only if parallel HDF5 does not scale
+  at M7 (see [Open questions](#open-questions)).
+- **Visualization:** export is M9b, after M7, with its candidates
+  listed under [Milestones](#milestones). The original plan here, VTK's
+  non-overlapping AMR format, does not exist in VTKHDF (see "Formats
+  considered" under [Checkpoint and restart](#checkpoint-and-restart)).
 
 ## Open questions
 
@@ -2548,6 +2901,21 @@ Remaining, none blocking before their milestone:
 - A state vector spanning several field sets: specified under
   [Time integration](#time-integration), implemented with the first
   application that needs it (constrained-transport MHD).
+- **What M9a leaves open** (2026-09-29; see
+  [Checkpoint and restart](#checkpoint-and-restart)). None of it is
+  needed to restart a run.
+  - Conversion on load, such as `Float64` into `Float32` for a device
+    without fp64. Version 1 loads the saved type only, since exactness
+    is the point of a checkpoint.
+  - Partial loads: a subset of a field set's variables, or a range of
+    blocks.
+  - Appendable time series: several states in one file.
+  - The parallel I/O design for M7: one shared file, as the version-1
+    layout allows, against one file per I/O process plus a wrapper
+    file. It is benchmarked on Symmetry and other HPC systems first.
+  - An ADIOS2 backend, if parallel HDF5 does not scale at M7. The data
+    model maps one-to-one onto ADIOS2 variables (the datasets) and
+    attributes.
 - **The integrator's own passes are not owner-based** (raised by
   TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
   policy of [Parallelism](#parallelism); decided the same day not to
@@ -2665,8 +3033,12 @@ Each milestone has a concrete acceptance test; serial correctness is
 established before any parallelism. The numbers are the order the
 milestones were planned in; **M8 is done before M7** (decided in the M8
 design, see the M8 entry), and so are M10, which was added after M8,
-and M11, added after M10 for a downstream horizon finder. The list below
-is in execution order.
+and M11, added after M10 for a downstream horizon finder. **So is M9a,
+checkpoint and restart** (decided 2026-09-29), because the downstream
+applications need to restart long runs before they need MPI. M9 is
+split for it: its second half, M9b (visualization export), stays after
+M7. M9a's layout was chosen so that M7 need not change it, subject to
+M7's benchmarks. The list below is in execution order.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -3067,6 +3439,51 @@ is in execution order.
     a batch with an outside point copies its block indices back (the
     first version copied them always, 2 MB at 496000 points, and ran at
     12.2 ns per point before the `Val` for the multi-indices).
+- **M9a — Checkpoint and restart.** *(Specified 2026-09-29; not
+  implemented.)* Done before M7 (decided): TreeHydro's long runs and
+  TreeGeneralizedHarmonic's production runs, estimated at 38–149 h,
+  outlast any queue's day and need to stop and resume before they need
+  MPI, and TreeGeneralizedHarmonic and TreeGRRMHD were waiting for M9.
+  Serial. A forest from a validated leaf list, and `save_checkpoint`,
+  `load_checkpoint`, `write_plain` / `read_plain` and
+  `checkpoint_environment` in the package extension `TreeAMRHDF5Ext`,
+  as specified under [Checkpoint and restart](#checkpoint-and-restart).
+  *Accept:*
+  - the forest from a leaf list: random refinement patterns round-trip,
+    checked against the oracles, and a gap, an overlap, a duplicate, an
+    unsorted list, an unbalanced list and a root out of range are each
+    refused with the reason;
+  - **the round trip is bitwise**, in `D = 1, 2, 3`, for cell, vertex,
+    face and edge centering, in `Float64`, `Float32` and `Float32x2`,
+    with periodic, reflecting (with parity) and outer faces: after
+    `scatter!` and `fill_ghosts!`, the leaves, the forest's parameters,
+    the field-set metadata, the state vector byte for byte and the
+    working arrays all equal the saved ones;
+  - **a restart continues bit-identically through regrids**: a chunked
+    driver saves after chunk `k`, drops every object, loads into fresh
+    ones and continues, and its leaves and state vector equal an
+    uninterrupted run's byte for byte. This is checked for the
+    vertex-centered wave study (`test/wave.jl`, RK4) and for the
+    conservative Burgers study (`test/burgers.jl`, `SSPRK33`, the
+    interface fixup), whose face flux sets with `G = 0` are not saved.
+    The time is part of the plain data;
+  - refusals, each saying why: a newer `format_version`, an unknown
+    feature, a `Float32x2` file loaded without `types`, a field set
+    over another forest, a value outside the plain-data types;
+  - an atomic write: a do-block that throws leaves the earlier file
+    intact and no `.partial` file behind;
+  - plain data round-tripped exactly (`Rational`s, `Symbol`s, nested
+    NamedTuples and Dicts, tuples, arrays, `nothing`,
+    `VersionNumber`s), and `checkpoint_environment` writing the
+    `Project.toml` and `Manifest.toml` that were stored;
+  - a device round trip in the device suite;
+  - **throughput measured** (`bench/checkpoint.jl`): save and load rates
+    and file sizes, uncompressed and with `Shuffle` + `Deflate(1)`, and
+    with zstd and bitshuffle where those packages are available, on a
+    smooth wave pulse and on a Burgers shock, recorded here with the
+    recommended filter chosen from them;
+  - TreeWave and TreeHydro still green against it, the change being
+    additive.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
@@ -3076,5 +3493,20 @@ is in execution order.
   to roundoff — bit-identical for everything but floating-point sums,
   as [Parallelism](#parallelism) states; weak-scaling smoke test; then
   MPI+GPU with CUDA-aware MPI.
-- **M9 — I/O and visualization.** HDF5 output, checkpoint/restart, VTK
-  export.
+- **M9b — Visualization export.** *(Split from M9, "I/O and
+  visualization", on 2026-09-29, when its checkpoint half became M9a;
+  not designed.)* After M7. The candidates:
+  - an XDMF sidecar that describes the checkpoint's own datasets as
+    hyperslabs, for ParaView and VisIt (it grows by one grid per block);
+  - VTKHDF `OverlappingAMR` with restricted parents added, which turns
+    leaf-only data into a real overlapping hierarchy and gives level of
+    detail for about 1/7 more storage in 3D (ParaView only);
+  - Conduit Blueprint through Conduit.jl, for VisIt;
+  - a Parthenon-compatible export, which yt reads directly;
+  - sampling onto output grids (slices, a uniform box) through M11's
+    `interpolate`.
+
+  An in-file view goes in a top-level group of its own and points at
+  the checkpoint's datasets without copying them, through links or
+  virtual datasets, as the layout under
+  [Checkpoint and restart](#checkpoint-and-restart) leaves room for.
