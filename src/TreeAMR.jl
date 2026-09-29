@@ -51,6 +51,9 @@ export Parity, EvenParity, OddParity, NoParity
 export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
        Region, Ellipsoid
 
+# Checkpoint and restart (M9a)
+export save_checkpoint, load_checkpoint, write_plain, read_plain, checkpoint_environment
+
 include("threading.jl")
 include("device.jl")
 include("morton.jl")
@@ -64,5 +67,6 @@ include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
 include("interpolate.jl")
+include("checkpoint.jl")
 
 end
