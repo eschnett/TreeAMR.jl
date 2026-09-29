@@ -37,8 +37,18 @@ Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
     Forest(roots; N, periodic=all false, reflecting=all false,
-           extents=one unit per root)
+           extents=one unit per root, leaves=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
+
+Without `leaves` the forest starts as its unrefined roots. With it, it
+starts from that leaf list instead — keys in curve order, as
+`forest.leaves` holds them — which is copied rather than aliased, and
+the new forest is at [`generation`](@ref) 0. That is how a checkpoint
+is restored, and how M7's ranks will build their forests. Everything
+built over a forest trusts its leaves, so the list is refused unless
+every key lies in the brick, the keys strictly increase, they tile the
+brick exactly — no gap, no overlap — and they are 2:1 balanced (see
+[`balance!`](@ref)).
 
 # Examples
 
@@ -87,6 +97,7 @@ function Forest{T}(roots::NTuple{D,Integer};
                        ntuple(_ -> (false, false), D),
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
+                   leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
                    G=nothing) where {T,D}
     G === nothing || throw(no_forest_ghosts)
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
@@ -116,9 +127,17 @@ function Forest{T}(roots::NTuple{D,Integer};
                             "anisotropic root spacings $h"))
 
     rootsI = map(Int, roots)
-    leaves = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
-    sort!(leaves)
-    return Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), leaves, Ref(0))
+    if leaves === nothing
+        list = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
+        sort!(list)
+    else
+        # Always a copy: `refine!` and friends rewrite the forest's leaf
+        # array in place, which must never reach the caller's vector.
+        list = collect(MortonKey{D}, leaves)
+    end
+    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, Ref(0))
+    leaves === nothing || check_leaves(forest)
+    return forest
 end
 
 # Without an explicit `T`, the geometry type follows the extents the
@@ -129,15 +148,138 @@ function Forest(roots::NTuple{D,Integer};
                 periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
                 reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
+                leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
                 G=nothing) where {D}
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
-        return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting)
+        return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting,
+                               leaves=leaves)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
     return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                     extents=extents)
+                     extents=extents, leaves=leaves)
+end
+
+# Validate a caller's leaf list (the `leaves` keyword), already copied
+# into the candidate `forest`. The storage, the ghost schedule and the
+# regrid all trust `forest.leaves` without looking at it again — that is
+# what lets them be built once per tree change — so a list read from a
+# file, or received from another rank, is checked here instead: every
+# key in the brick, strictly increasing in curve order, tiling the brick
+# exactly, and 2:1 balanced. Each refusal names the first leaf at which
+# the list goes wrong.
+function check_leaves(forest::Forest{D}) where {D}
+    leaves = forest.leaves
+    nroots = prod(forest.roots)
+    isempty(leaves) && throw(ArgumentError(
+        "the leaf list is empty: the leaves tile the brick, so there is at least one " *
+        "per root, and the brick $(forest.roots) has $nroots roots"))
+    # The key constructor checks the level and the coordinates, but it
+    # cannot check the root, which is an index into a brick it never sees.
+    for (i, k) in enumerate(leaves)
+        k.root < nroots || throw(ArgumentError(
+            "leaf $i, $k, is in root $(k.root), but the brick $(forest.roots) has " *
+            "roots 0:$(nroots - 1): a root index counts through the brick, dimension " *
+            "1 fastest, so this key belongs to a larger one"))
+    end
+    for i in 2:length(leaves)
+        a, b = leaves[i - 1], leaves[i]
+        a == b && throw(ArgumentError(
+            "leaves $(i - 1) and $i are both $a: a duplicate leaf would be two blocks " *
+            "for one region of space"))
+        isless(a, b) || throw(ArgumentError(
+            "leaves $(i - 1) and $i, $a and $b, are out of curve order: the list must " *
+            "be strictly increasing, as `forest.leaves` is, because block `b` of every " *
+            "field set is leaf `b`, and sorting the list here would silently reorder " *
+            "whatever data were stored with it"))
+    end
+    # One walk along the curve. `next` is the node at which the part of
+    # the brick not yet covered begins, and each leaf must begin there
+    # too: be `next` or one of its first-corner descendants, the only
+    # nodes that start where it starts. Then the leaves tile the brick
+    # exactly, and a strictly increasing list that does not has either a
+    # leaf inside the one before it, or a gap.
+    next = MortonKey{D}(0, 0, ntuple(_ -> 0, D))
+    for (i, k) in enumerate(leaves)
+        if next === nothing || !begins_at(k, next)
+            # The leaves before `k` tile exactly up to `next`, and `k`
+            # comes after its predecessor in curve order. So `k` either
+            # lies inside that predecessor, or begins beyond `next`,
+            # leaving a gap. (Once the last root is covered, `next` is
+            # `nothing`, and a later leaf in the brick can only be the
+            # former.)
+            i > 1 && isancestor(leaves[i - 1], k) && throw(ArgumentError(
+                "leaf $i, $k, overlaps leaf $(i - 1), $(leaves[i - 1]), which contains " *
+                "it: the leaves tile the brick with no overlap, since a node is either " *
+                "a block or refined into its 2^$D children, never both"))
+            place = i == 1 ? "the brick begins, and leaf 1, $k, does not" :
+                             "leaf $(i - 1), $(leaves[i - 1]), ends, and leaf $i, $k, " *
+                             "begins further on"
+            throw(ArgumentError(
+                "the leaves leave a gap: no leaf covers the beginning of $next, which " *
+                "is where $place. The leaves tile the brick exactly, and a region " *
+                "without a leaf has no block to hold its data"))
+        end
+        next = curve_successor(k, nroots)
+    end
+    next === nothing || throw(ArgumentError(
+        "the leaves leave a gap at the end of the brick: the last leaf, " *
+        "$(length(leaves)), $(leaves[end]), ends where $next begins, and no leaf " *
+        "covers anything from there through the last root, $(nroots - 1). The leaves " *
+        "tile the brick exactly, and a region without a leaf has no block to hold " *
+        "its data"))
+    # Balance is the threaded check; the serial search that names the
+    # offending pair runs only once it has failed.
+    isbalanced(forest) && return nothing
+    dirs = alldirections(Val(D))
+    for (i, k) in enumerate(leaves), δ in dirs, nb in neighbor_keys(forest, k, δ)
+        abs(level(nb) - level(k)) > 1 && throw(ArgumentError(
+            "the leaves are not 2:1 balanced: leaf $i, $k, touches $nb, and their " *
+            "levels differ by more than one. The list is refused rather than " *
+            "rebalanced, because a balanced forest can only ever produce a balanced " *
+            "list, so this one was damaged or made by hand; and because the ghost " *
+            "schedule assumes the balance, and would silently build wrong " *
+            "prolongations from an unbalanced mesh"))
+    end
+    return nothing
+end
+
+# Whether leaf `k` begins where node `e` begins, as `e` itself or one of
+# its first-corner descendants: same root, no coarser, and its
+# coordinates are `e`'s scaled to its level, with nothing added. Exact
+# in `UInt32`: the scaled coordinates stay below `2^level(k)`, and a
+# shift by the full 32 bits (from level 0 to MAX_LEVEL) is defined, as 0.
+function begins_at(k::MortonKey{D}, e::MortonKey{D}) where {D}
+    (k.root == e.root && k.level >= e.level) || return false
+    shift = Int(k.level) - Int(e.level)
+    return all(d -> k.coords[d] == e.coords[d] << shift, 1:D)
+end
+
+# The node at which the curve continues after the subtree of `k`: `k`'s
+# next sibling, else that of its nearest ancestor that has one, else the
+# next root; `nothing` after the last root. Level by level, so exact at
+# any depth and in any `D`, with no packed curve index to overflow.
+function curve_successor(k::MortonKey{D}, nroots::Int) where {D}
+    lvl = Int(k.level)
+    coords = k.coords
+    while lvl > 0
+        # A node's position among its siblings is the bits `coords .& 1`,
+        # dimension 1 most significant. The next sibling adds one: it sets
+        # the least significant clear bit and clears the set ones below it.
+        d = findlast(d -> iseven(coords[d]), 1:D)
+        if d !== nothing
+            sibling = ntuple(D) do e
+                e < d ? coords[e] : e == d ? coords[e] | 0x1 : coords[e] & ~UInt32(1)
+            end
+            return MortonKey{D}(k.root, lvl, sibling)
+        end
+        # The last sibling: the parent's subtree ends here too.
+        lvl -= 1
+        coords = map(c -> c >> 1, coords)
+    end
+    k.root + 1 < nroots || return nothing
+    return MortonKey{D}(k.root + 1, 0, ntuple(_ -> 0, D))
 end
 
 """
