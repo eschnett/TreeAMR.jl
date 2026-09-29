@@ -42,8 +42,9 @@ This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
 [Storage](api/storage.md), [Ghost exchange and conservation](api/exchange.md),
 [ODE coupling](api/ode.md), [Regridding](api/regrid.md),
-[Point interpolation](api/interpolate.md) and [Internals](api/internals.md) — with an [Index](api/genindex.md) of every
-documented name.
+[Point interpolation](api/interpolate.md),
+[Checkpoint and restart](api/io.md) and [Internals](api/internals.md) — with an
+[Index](api/genindex.md) of every documented name.
 
 ## Overview
 
@@ -405,6 +406,79 @@ julia> interpolate(fs, [(0.3, 0.7), (0.6, 0.6)], Lagrange(4);
  0
  1
 ```
+
+## Checkpoints and restarts
+
+A long run stops and resumes through a checkpoint: [`save_checkpoint`](@ref)
+writes the forest, the field sets the application evolves and its own
+run state to one HDF5 file, and [`load_checkpoint`](@ref) reads them into
+fresh objects in a new process — on any thread count and any backend —
+exactly. HDF5 is a weak dependency, so the two come with `using HDF5`.
+
+What is stored is what cannot be recomputed: the forest's parameters and
+leaf list, and each field set's layout and **owned** points. The ghosts
+are not stored, since they follow from the owned points, the operators
+and the boundary hook, and the last two are the application's own; after
+a load it fills them as it would at any right-hand side. The run state —
+the time, the chunk index, histories — goes in `data`, as plain data
+(see [`write_plain`](@ref)), and comes back as it went in:
+
+```jldoctest checkpoint
+julia> using TreeAMR, HDF5
+
+julia> forest = Forest((2, 2); N = 8, periodic = (true, true));
+
+julia> refine!(forest, forest.leaves[1]); balance!(forest);
+
+julia> fs = FieldSet(forest, 1; G = 2);
+
+julia> fill_by_coordinates!((x, v) -> sinpi(x[1]) * cospi(x[2]), fs);
+
+julia> u = statevector(fs); gather!(u, fs);
+
+julia> path = joinpath(mktempdir(), "run.h5");
+
+julia> save_checkpoint(path, forest; fieldsets = ("u" => (fs, u),),
+                       application = "MyApp" => 1, data = (; t = 0.25, chunk = 3));
+
+julia> ck = load_checkpoint(path);
+
+julia> ck.forest.leaves == forest.leaves
+true
+
+julia> ck.application, ck.data
+("MyApp" => 1, (t = 0.25, chunk = 3))
+
+julia> restored = ck.fieldsets["u"].fieldset;
+
+julia> ck.fieldsets["u"].state == u
+true
+
+julia> ops = Operators(prolongation = 4, restriction = 4);
+
+julia> fill_ghosts!(restored, GhostSchedule(restored, ops));
+
+julia> fill_ghosts!(fs, GhostSchedule(fs, ops));
+
+julia> restored.work == fs.work
+true
+```
+
+A checkpoint belongs at a chunk boundary, *after* the regrid, where a
+fixed-step integrator holds nothing but `(t, u)`: a restart then begins
+the next chunk with exactly what the uninterrupted run began it with.
+Pass `name => (fs, u)` for an evolved set — after `solve` its working
+array holds a stage, not the solution — and leave scratch sets such as
+fluxes out. The file is written beside `path` and renamed over it only
+when complete, so a failed write never destroys the previous checkpoint.
+
+A software element type such as MultiFloats' `Float32x2` is stored as
+its limbs, and a load names it through `types = (Float32x2,)`. A file
+this version cannot interpret — a newer format version, an unknown
+feature — is refused with the reason and the TreeAMR version that wrote
+it, and [`checkpoint_environment`](@ref) writes out that version's
+`Project.toml` and `Manifest.toml`, so that `julia --project=dir` can
+read it.
 
 ## Threading
 

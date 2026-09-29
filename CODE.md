@@ -1509,26 +1509,27 @@ application gets a top-level group of its own, named after it:
                                 format_version = 1,
                                 features = ["brick"]  (must understand),
                                 application = "<app name>"
-      provenance/        treeamr_version, julia_version, created (UTC),
+      provenance/        scalar datasets: treeamr_version,
+                         julia_version, created (UTC, ISO 8601),
                          hostname, nthreads,
-                         project (Project.toml text),
-                         manifest (Manifest.toml text)
-      forest/            attrs: D, N, connectivity = "brick", roots,
-                                periodic, reflecting (lo, hi per
-                                dimension), geometry_type
+                         project (Project.toml text, or ""),
+                         manifest (Manifest.toml text, or "")
+      forest/            attrs: D, N, connectivity = "brick",
+                                roots (D), periodic (D),
+                                reflecting (2, D), geometry_type
+                                [, geometry_limbtype, geometry_nlimbs]
         extents          (limbs?, 2, D), in the geometry type, bitwise
         root             Int32[nleaves]
         level            Int8[nleaves]
         coords           UInt32[D, nleaves]
-      fieldsets/<name>/  attrs: eltype, nvars, G (per dimension),
-                                centering ("cell" | "vertex" per
-                                dimension), parity ("even" | "odd" |
-                                "none" per variable and dimension;
-                                absent without reflecting faces),
+      fieldsets/<name>/  attrs: eltype [, limbtype, nlimbs], nvars,
+                                G (D), centering (D: "cell" | "vertex"),
+                                parity ((D, nvars): "even" | "odd" |
+                                "none"; absent when the set has none),
                                 range = "owned"
         data             (limbs?, N, …, N, nvars, nblocks)
     /<app name>/         attr: format_version (the application's own)
-      data/…             the plain-data tree, and whatever the
+      data               the plain-data tree; beside it, whatever the
                          do-block writes
     /                    otherwise free, for sidecars (M9b)
 
@@ -1563,23 +1564,36 @@ application gets a top-level group of its own, named after it:
   measurements.
 - `range = "owned"` says the data are the owned points only, and leaves
   room for a file that stores more, which a version-1 reader would
-  refuse by value. How a `Bool` or a `(lo, hi)` pair is spelled in an
-  attribute is the implementation's to fix, and it will be recorded
-  here.
+  refuse by value.
+- **Spellings** (fixed by the implementation). Shapes above are in
+  Julia's order, which C sees reversed. Every `Bool` in the file —
+  `periodic`, `reflecting`, a plain-data `Bool` — is a `UInt8`, 0 or 1,
+  because HDF5.jl would write an HDF5 bitfield, which other readers
+  handle poorly. A `(lo, hi)` pair per dimension is a `(2, D)` array,
+  which C sees as `(D, 2)`. The other scalars and small arrays are
+  `Int64`, the leaf columns excepted. A `Float16`, which HDF5.jl does
+  not predefine, is the IEEE half type built as h5py builds it, and a
+  `Complex` is the compound `(r, i)`, as HDF5.jl and h5py spell it.
 
 **Element types** (decided).
 
 - **Native types** — `Float16`, `Float32`, `Float64`, the signed and
-  unsigned integers, `Bool`, and `Complex` of the floats — are stored as
+  unsigned integers, `Bool`, and `Complex` of those — are stored as
   themselves, bit for bit.
 - **An `isbits` type made of one native type throughout**, with no
   padding, is stored as **limbs**: a leading dimension of that native
-  type, with `eltype` naming the type (`string(T)`) and a limb count
-  beside it. MultiFloats' `Float32x2`, which the test suite uses (see
-  [Precision](#precision)), is two `Float32` limbs. The loader cannot
-  name such a type without its package, so the caller passes it —
-  `load_checkpoint(path; types = (Float32x2,))` — and the loader matches
-  it by name and checks `sizeof`. The name is a label to match against,
+  type, with `eltype` naming the type, `limbtype` the native type and
+  `nlimbs` the count. MultiFloats' `Float32x2`, which the test suite
+  uses (see [Precision](#precision)), is two `Float32` limbs. The name
+  is the type as a module importing nothing but Base prints it,
+  `MultiFloats.MultiFloat{Float32, 2}` (amended in the implementation:
+  the design said `string(T)`, which qualifies a name or not according
+  to what the writer had imported into `Main`, so one type would be
+  recorded under two names depending on how the run was started). The
+  loader cannot name such a type without its package, so the caller
+  passes it — `load_checkpoint(path; types = (Float32x2,))` — and the
+  loader matches it by name and checks its size and its limbs against
+  the file's. The name is a label to match against,
   not a recipe: without the type the data still read as plain `Float32`
   limbs, which is what a converter or a Python reader needs. The
   geometry type is treated the same way, for `extents`.
@@ -1740,24 +1754,25 @@ list beside the version. JLD2 is set aside because it records Julia
 type names, which ties a file to the definitions that wrote it, and
 because it has no MPI.
 
-**The API in brief** (indicative: the implementation may refine names,
-and will reconcile this). HDF5 is a **package extension**,
-`TreeAMRHDF5Ext` over the weak dependency HDF5 (`[compat]` 0.17),
-because the only hard dependency today is KernelAbstractions, and an
-application that never checkpoints should not load HDF5 and its
-binaries. The core, `src/checkpoint.jl`, holds the docstrings, stubs,
-and an error hint that says to load HDF5.
+**The API in brief** (as implemented). HDF5 is a **package extension**,
+`TreeAMRHDF5Ext` (`ext/TreeAMRHDF5Ext.jl`) over the weak dependency
+HDF5 (`[compat]` 0.17), because the only hard dependency today is
+KernelAbstractions, and an application that never checkpoints should
+not load HDF5 and its binaries. The core, `src/checkpoint.jl`, holds
+the docstrings, stubs without methods, and an error hint that says to
+load HDF5 while the extension is not loaded. `fieldsets` and
+`application` have no defaults, and the refusals say why.
 
     # core: a forest from a validated leaf list
     Forest{T}(roots; N, periodic, reflecting, extents, leaves)
 
     # the extension, loaded by `using HDF5`
-    save_checkpoint(path, forest;
-                    fieldsets   = ("U" => (U, u), "aux" => aux),
+    save_checkpoint(path, forest;                    # returns path
+                    fieldsets   = ("U" => (U, u), "aux" => aux),  # or ()
                     application = "TreeHydro" => 1,  # name => its version
                     data = (; t, chunk, recipe), filters = ())
     save_checkpoint(path, forest; …) do app::HDF5.Group
-        # further datasets in the application's group
+        # further datasets in the application's group, beside `data`
     end
     ck = load_checkpoint(path; backend = CPU(), types = (),
                          fieldsets = nothing)        # or names, a subset
@@ -1765,7 +1780,7 @@ and an error hint that says to load HDF5.
         # ck.application, ck.data, ck.provenance
     load_checkpoint(path; …) do app … end        # result in ck.result
     write_plain(parent, name, value); read_plain(parent, name)
-    checkpoint_environment(path, dir)
+    checkpoint_environment(path, dir; force = false)  # returns dir
 
 - **The `leaves` keyword validates**, in the tone of the other
   refusals: every root index is below `prod(roots)`; the keys are
@@ -1778,16 +1793,25 @@ and an error hint that says to load HDF5.
   from it. `MortonKey`'s own checks cover each key.
 - **Plain data are a closed, documented set of types**: `Bool`, `Int8`
   to `Int64` and `UInt8` to `UInt64`, `Float16`, `Float32`, `Float64`,
-  `Complex` of those, `Rational{<:Integer}`, `String`, `Symbol`,
-  `VersionNumber` and `Nothing`; tuples, NamedTuples, and
+  `Complex` of those, `Rational`s of the native integers, `String`,
+  `Symbol`, `VersionNumber` and `Nothing`; tuples, NamedTuples, and
   `AbstractDict`s with `String` or `Symbol` keys; and arrays of native
   numbers or strings. Every item is a dataset or group with a `type`
-  attribute from that closed vocabulary, and groups keep their order
-  (`track_order`). Anything else is an `ArgumentError` that says to
-  convert it to a NamedTuple: structs are the application's to convert
-  (`to_plain`, `from_plain` on its side), so no type name reaches the
-  file. Rationals store exactly, and TreeHydro already states its
-  parameters as Rationals, so a case recipe round-trips exactly.
+  attribute from a closed vocabulary — `number`, `rational`, `string`,
+  `symbol`, `version`, `nothing`, `array`, `tuple`, `namedtuple`,
+  `dict` — with `eltype` naming a number's or an array's element type
+  (`"String"` for strings) and `keytype` (`"String"` or `"Symbol"`) on
+  a dict. A Rational is the dataset `[numerator, denominator]` in its
+  integer type; a nonempty tuple of one native number type is one
+  array, and any other tuple a group of the items `"1"`, `"2"`, …; and
+  groups keep their order (`track_order`), so a NamedTuple keeps its
+  field order. A NamedTuple comes back as a NamedTuple and a Dict as a
+  `Dict{String,Any}` or `Dict{Symbol,Any}`, an array as an `Array`.
+  Anything else is an `ArgumentError` that says to convert it to a
+  NamedTuple: structs are the application's to convert (`to_plain`,
+  `from_plain` on its side), so no type name reaches the file.
+  Rationals store exactly, and TreeHydro already states its parameters
+  as Rationals, so a case recipe round-trips exactly.
 
 **Where a checkpoint belongs in a chunked driver** (decided). The
 downstream drivers integrate in chunks: `solve` over a fixed number of
@@ -3439,11 +3463,12 @@ M7's benchmarks. The list below is in execution order.
     a batch with an outside point copies its block indices back (the
     first version copied them always, 2 MB at 496000 points, and ran at
     12.2 ns per point before the `Val` for the multi-indices).
-- **M9a — Checkpoint and restart.** *(Specified 2026-09-29; not
-  implemented.)* Done before M7 (decided): TreeHydro's long runs and
-  TreeGeneralizedHarmonic's production runs, estimated at 38–149 h,
-  outlast any queue's day and need to stop and resume before they need
-  MPI, and TreeGeneralizedHarmonic and TreeGRRMHD were waiting for M9.
+- **M9a — Checkpoint and restart.** *(Specified and implemented
+  2026-09-29; the throughput measurement is pending.)* Done before M7
+  (decided): TreeHydro's long runs and TreeGeneralizedHarmonic's
+  production runs, estimated at 38–149 h, outlast any queue's day and
+  need to stop and resume before they need MPI, and
+  TreeGeneralizedHarmonic and TreeGRRMHD were waiting for M9.
   Serial. A forest from a validated leaf list, and `save_checkpoint`,
   `load_checkpoint`, `write_plain` / `read_plain` and
   `checkpoint_environment` in the package extension `TreeAMRHDF5Ext`,
