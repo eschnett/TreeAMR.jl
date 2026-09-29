@@ -514,7 +514,7 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. **Registered in General** since 2026-09-21; 0.1.3 is the current
+  only. **Registered in General** since 2026-09-21; 0.1.4 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
   key behind `DOCUMENTER_KEY` to push them — the file says why. All
@@ -566,7 +566,7 @@ of the *public API only*. Facts that matter here:
   its tests add `buffered_flags`, `complete_marks` and `block_origin`.
   `hostcopy` is its own, in its `device.jl`, and it does not use
   `todevice`. Renaming or re-signaturing any of these breaks it.
-- **Checkpointing reaches it with the next release**: `using HDF5`
+- **Checkpointing reaches it with 0.1.4**: `using HDF5`
   beside TreeAMR loads the extension, and nothing else is needed. It
   calls none of the checkpoint functions yet. Against the M9a checkout
   its suite is unchanged, 310 tests in 1m12 (2026-09-29).
@@ -644,8 +644,7 @@ nothing here. Its `bin/`, like TreeWave's, is run by its CI's `viewer`
 job rather than by `Pkg.test`.
 
 **Checkpointing (M9a) is what its long runs were waiting for**, and it
-reaches TreeHydro with the next release, through `using HDF5`; tagging
-is Erik's call. The restart itself is TreeHydro's to write, and is not
+reaches TreeHydro with 0.1.4, through `using HDF5`. The restart itself is TreeHydro's to write, and is not
 started. The plan (2026-09-29) saves at the start of a chunk, *after*
 the regrid and the atmosphere reset — its observer fires before the
 regrid, so saving there would mean replaying both — with the chunk
@@ -664,8 +663,8 @@ pinned TreeAMR to GitHub `main` through `[sources]` until 2026-09-26,
 when it retired its stopgap interpolator for M11's `interpolate`; since
 then it takes TreeAMR from **General**, `TreeAMR = "0.1.3"` under
 `[compat]`, like the other two, so a change here reaches it only with a
-release. That includes M9a: checkpointing reaches it with the next
-release, through `using HDF5`, together with TreeAMR's new `__init__`
+release. That includes M9a: checkpointing reaches it with 0.1.4,
+through `using HDF5`, together with TreeAMR's new `__init__`
 and the five new exports (none of which clashes with a name of its
 own). Its production runs, estimated at 38–149 h, are one of the
 reasons M9a went before M7; beyond `(t, u)` its restart has to store
