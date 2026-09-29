@@ -36,6 +36,37 @@ function leafbox(forest::Forest{D}, k::MortonKey{D}) where {D}
     return lo, hi
 end
 
+"""
+Whether `leaves` tile `forest`'s brick exactly, by volume in exact
+`Rational` arithmetic: no two overlap, and together they fill it. Takes
+the list separately so that it can judge one the forest was not built
+from. Rationals overflow past about level 20 in 3D, so keep it shallow.
+"""
+function tiles_brick(forest::Forest{D}, leaves) where {D}
+    n = length(leaves)
+    any(((i, j),) -> i < j && overlaps(forest, leaves[i], leaves[j]),
+        Iterators.product(1:n, 1:n)) && return false
+    volume = sum(leaves; init=0//1) do k
+        lo, hi = leafbox(forest, k)
+        prod(hi .- lo)
+    end
+    return volume == prod(forest.roots)
+end
+
+"""
+Whether `leaves` are 2:1 balanced over `forest`'s brick, by brute-force
+geometry: no two leaves that touch, periodic wraparound included,
+differ by more than one level.
+"""
+function balanced_by_geometry(forest::Forest{D}, leaves) where {D}
+    n = length(leaves)
+    return all(Iterators.product(1:n, 1:n)) do (i, j)
+        i < j || return true
+        adjacent(forest, leaves[i], leaves[j]) || return true
+        return abs(level(leaves[i]) - level(leaves[j])) <= 1
+    end
+end
+
 """All brick translations that a periodic dimension identifies."""
 periodic_shifts(forest::Forest{D}) where {D} =
     Iterators.product(ntuple(d -> forest.periodic[d] ?
@@ -93,10 +124,14 @@ end
 """
 A random forest built by repeatedly refining and coarsening at random.
 Deliberately left unbalanced, so `balance!` has real work to do.
+
+The brick is drawn too unless `roots` and `periodic` are given. The
+defaults draw in the order they always did, so a caller that gives
+neither sees the same stream.
 """
-function random_forest(rng, ::Val{D}; nsteps, maxlvl, maxroot=2) where {D}
-    roots = ntuple(_ -> rand(rng, 1:maxroot), D)
-    periodic = ntuple(_ -> rand(rng, Bool), D)
+function random_forest(rng, ::Val{D}; nsteps, maxlvl, maxroot=2,
+                       roots=ntuple(_ -> rand(rng, 1:maxroot), D),
+                       periodic=ntuple(_ -> rand(rng, Bool), D)) where {D}
     forest = Forest(roots; N=4, periodic=periodic)
     for _ in 1:nsteps
         k = rand(rng, forest.leaves)

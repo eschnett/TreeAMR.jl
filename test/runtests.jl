@@ -323,6 +323,163 @@ end
     @test count(k -> level(k) == 2, forest.leaves) > 0
 end
 
+@testset "A forest rebuilt from its own leaves is the same forest: D=$D" for D in (1, 2, 3)
+    # Guards the restore path (a checkpoint now, M7's ranks later): a
+    # valid list refused or altered, a forest aliasing the caller's
+    # vector, a check that accepts a list the geometric oracle says does
+    # not tile the brick, and a balance verdict that disagrees with the
+    # oracle's, periodic seams included.
+    rng = MersenneTwister(3000 + D)
+    shapes = D == 1 ? (((1,), (false,)), ((1,), (true,)), ((3,), (false,)),
+                       ((2,), (true,))) :
+             D == 2 ? (((1, 1), (true, true)), ((2, 3), (false, true)),
+                       ((3, 1), (false, false))) :
+                      (((1, 1, 1), (false, false, false)), ((2, 1, 2), (true, false, true)))
+    ntrials, nsteps, maxlvl = D == 3 ? (3, 12, 2) : (6, 25, 3)
+
+    for (roots, periodic) in shapes, _trial in 1:ntrials
+        forest = random_forest(rng, Val(D); nsteps=nsteps, maxlvl=maxlvl,
+                               roots=roots, periodic=periodic)
+        rebuild(leaves) = Forest(roots; N=forest.N, periodic=periodic, leaves=leaves)
+
+        # Unbalanced as drawn, or not: accepted exactly when the oracle
+        # finds the list balanced, whichever way the draw went.
+        if balanced_by_geometry(forest, forest.leaves)
+            @test rebuild(forest.leaves).leaves == forest.leaves
+        else
+            @test_throws "not 2:1 balanced" rebuild(forest.leaves)
+        end
+
+        balance!(forest)
+        leaves = copy(forest.leaves)
+        n = length(leaves)
+        rebuilt = rebuild(leaves)
+        @test rebuilt.leaves == leaves
+        @test tiles_brick(rebuilt, rebuilt.leaves)
+        @test balanced_by_geometry(rebuilt, rebuilt.leaves)
+        @test generation(rebuilt) == 0
+        @test (rebuilt.roots, rebuilt.periodic, rebuilt.reflecting, rebuilt.extents,
+               rebuilt.N) ==
+              (forest.roots, forest.periodic, forest.reflecting, forest.extents, forest.N)
+        @test floattype(rebuilt) == floattype(forest)
+
+        # A copy, never the caller's vector: refining the new forest
+        # leaves the list it was built from alone.
+        @test rebuilt.leaves !== leaves
+        refine!(rebuilt, rebuilt.leaves[1])
+        @test leaves == forest.leaves
+
+        # Each defect refused for its reason, wherever along the list it
+        # is put. Dropping a leaf from an exact tiling always leaves a
+        # gap, and so on, so none of this depends on the draw.
+        for i in unique((1, cld(n, 2), n))
+            if n > 1
+                @test_throws "leave a gap" rebuild(deleteat!(copy(leaves), i))
+            end
+            @test_throws "are both" rebuild(insert!(copy(leaves), i, leaves[i]))
+            @test_throws "overlaps leaf $i," rebuild(insert!(copy(leaves), i + 1,
+                                                             sortedchildkeys(leaves[i])[1]))
+            if i < n
+                @test_throws "out of curve order" rebuild(leaves[[1:(i - 1); i + 1; i;
+                                                                  (i + 2):n]])
+            end
+        end
+        @test_throws "is in root $(prod(roots))" rebuild(
+            [leaves; MortonKey{D}(prod(roots), 0, ntuple(_ -> 0, D))])
+    end
+end
+
+@testset "A leaf list that is not a balanced tiling of the brick is refused" begin
+    # Guards a damaged or hand-made list becoming a mesh that the ghost
+    # schedule trusts and silently gets wrong: each defect is refused,
+    # for its own reason, and a valid list beside them is accepted.
+    forest = Forest((2, 1); N=4)
+    refine!(forest, forest.leaves[1])
+    L = copy(forest.leaves)                 # root 0's four children, then root 1
+    build(leaves) = Forest((2, 1); N=4, leaves=leaves)
+    @test build(L).leaves == L
+    @test build(view(L, :)).leaves == L     # any AbstractVector
+    @test Forest{Float32}((2, 1); N=4, leaves=L).leaves == L
+    withext = Forest((2, 1); N=4, extents=((0.0f0, 2.0f0), (0.0f0, 1.0f0)), leaves=L)
+    @test withext.leaves == L && floattype(withext) == Float32
+
+    @test_throws "the leaf list is empty" build(MortonKey{2}[])
+    @test_throws "is in root 2, but the brick (2, 1) has roots 0:1" build(
+        [L; MortonKey{2}(2, 0, (0, 0))])
+    @test_throws "leaves 2 and 3 are both" build(L[[1, 2, 2, 3, 4, 5]])
+    @test_throws "leaves 2 and 3" build(L[[1, 3, 2, 4, 5]])
+    @test_throws "out of curve order" build(L[[1, 3, 2, 4, 5]])
+    # A gap: a leaf dropped in the middle, at the start, and at the end,
+    # where the last root is then covered by nothing.
+    @test_throws "where leaf 1, $(L[1]), ends, and leaf 2" build(L[[1, 3, 4, 5]])
+    @test_throws "where the brick begins" build(L[2:5])
+    @test_throws "gap at the end of the brick" build(L[1:4])
+    @test_throws "through the last root, 1" build(L[1:4])
+    # An overlap: a leaf followed by one of its own children, and a
+    # parent listed together with all of them.
+    @test_throws "leaf 4, $(sortedchildkeys(L[3])[1]), overlaps leaf 3" build(
+        [L[1:3]; sortedchildkeys(L[3])[1]; L[4:5]])
+    @test_throws "overlaps leaf 1," build([MortonKey{2}(0, 0, (0, 0)); L])
+
+    # Unbalanced: refinement driven into the corner that root 0 shares
+    # with the rest of the brick, without balance! (as in "Balance
+    # ripples outward"). The same leaves once balanced are accepted.
+    deep = Forest((2, 2); N=4)
+    for _ in 1:3
+        refine!(deep, last(filter(k -> k.root == 0, deep.leaves)))
+    end
+    @test !isbalanced(deep)
+    @test_throws "not 2:1 balanced" Forest((2, 2); N=4, leaves=deep.leaves)
+    @test_throws "refused rather than rebalanced" Forest((2, 2); N=4, leaves=deep.leaves)
+    @test_throws "wrong prolongations" Forest((2, 2); N=4, leaves=deep.leaves)
+    balance!(deep)
+    @test Forest((2, 2); N=4, leaves=deep.leaves).leaves == deep.leaves
+
+    # Balance is judged with the forest's own periodicity: a chain into
+    # the low end of one root is balanced, but not once that end wraps
+    # onto the coarse leaf at the high end.
+    chain = Forest((1,); N=4)
+    for _ in 1:3
+        refine!(chain, first(chain.leaves))
+    end
+    @test Forest((1,); N=4, leaves=chain.leaves).leaves == chain.leaves
+    @test_throws "not 2:1 balanced" Forest((1,); N=4, periodic=(true,),
+                                           leaves=chain.leaves)
+end
+
+@testset "Leaf lists are checked exactly down to MAX_LEVEL: D=$D" for D in (1, 2, 3)
+    # Guards the curve walk losing a bit, or overflowing, at the deepest
+    # level a key can hold, where a coordinate uses all 32 bits and the
+    # scale from a root to a leaf is 2^32.
+    roots = ntuple(_ -> 1, D)
+    forest = Forest(roots; N=4)
+    for _ in 1:MAX_LEVEL
+        refine!(forest, first(forest.leaves))
+    end
+    leaves = forest.leaves
+    @test maxlevel(forest) == MAX_LEVEL && isbalanced(forest)
+    @test Forest(roots; N=4, leaves=leaves).leaves == leaves
+    # Every leaf dropped leaves a gap, and every refinable one followed
+    # by its last child is an overlap.
+    @test all(eachindex(leaves)) do i
+        try
+            Forest(roots; N=4, leaves=deleteat!(copy(leaves), i))
+            return false
+        catch err
+            return err isa ArgumentError && occursin("leave a gap", err.msg)
+        end
+    end
+    @test all(filter(i -> level(leaves[i]) < MAX_LEVEL, eachindex(leaves))) do i
+        try
+            Forest(roots; N=4, leaves=insert!(copy(leaves), i + 1,
+                                              sortedchildkeys(leaves[i])[end]))
+            return false
+        catch err
+            return err isa ArgumentError && occursin("overlaps leaf $i,", err.msg)
+        end
+    end
+end
+
 @testset "Geometry: D=$D" for D in (1, 2, 3)
     forest = Forest(ntuple(_ -> 2, D); N=4,
                     extents=ntuple(_ -> (-1.0, 1.0), D))
