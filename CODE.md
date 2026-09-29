@@ -1461,7 +1461,8 @@ routing needs.
 ### Checkpoint and restart
 
 *(Designed 2026-09-29 as M9a, before implementation, and decided with
-Erik the same day except where marked. Nothing here is measured yet.)*
+Erik the same day except where marked; implemented, and its throughput
+measured, the same day — see "Throughput and filters" below.)*
 Long runs outlast a queue's day: TreeHydro's showcase on an H200 at
 10–20 levels, and TreeGeneralizedHarmonic's production runs, estimated
 at 38–149 h. An application calls one function at a chunk boundary to
@@ -1560,8 +1561,10 @@ application gets a top-level group of its own, named after it:
   variable**, `(limbs?, N, …, N, 1, 1)`, so that reading a block
   decompresses that block and no other. The filters are the caller's
   HDF5.jl filter objects, none by default, and TreeAMR depends on no
-  filter package. Which filter to recommend is chosen from M9a's
-  measurements.
+  filter package. **None is also the recommendation, and `Shuffle()`
+  followed by H5Zzstd's `ZstdFilter(1)` the one filter to name when
+  size matters** (measured 2026-09-29; the numbers and the reasons are
+  under "Throughput and filters" below).
 - `range = "owned"` says the data are the owned points only, and leaves
   room for a file that stores more, which a version-1 reader would
   refuse by value.
@@ -1686,6 +1689,96 @@ load itself is exact everywhere. What follows is bit-identical at any
 thread count, by the invariant under [Parallelism](#parallelism);
 across backends it is as close as a host run and a device run ever are
 — bit for bit in the Burgers study on Metal, not promised in general.
+
+**Throughput and filters** (measured 2026-09-29, `bench/checkpoint.jl`).
+The machine is the development laptop — an Apple M3 Pro, 6 performance
+and 6 efficiency cores, 36 GB, its internal SSD under APFS — with Julia
+1.13.1 and HDF5.jl 0.17.4 over libhdf5 2.2.2. The mesh is 3D, 3296
+blocks of `16³`, refined twice around the sphere `r = 1/2` (56, 1000
+and 2240 blocks on levels 0, 1 and 2). It carries two `Float64` states,
+each with its feature on the refined shell:
+
+- `pulse`, a smooth outgoing spherical Gaussian `(u, ∂ₜu)`,
+  vertex-centered, 216 MB — TreeWave's and TreeGeneralizedHarmonic's
+  kind of data;
+- `blast`, a blast wave in the five conserved variables,
+  cell-centered, 540 MB: a smooth interior behind a discontinuity and a
+  uniform atmosphere outside it, the same bits everywhere — TreeHydro's
+  kind.
+
+Throughput is in GB/s of state data (owned points, 1 GB = 10⁹ bytes),
+the best of five calls after one that compiles. `save` ends in the page
+cache. `sync` is a save followed by `fcntl(F_FULLFSYNC)`, macOS's flush
+to stable storage; a plain `fsync` there returned in 1 ms for 540 MB,
+against 125 ms for the full flush, so it proves nothing. `load` is all
+of `load_checkpoint`, at one thread and at six; the saves are the
+one-thread run's. One chunk is one block and variable, 32 KB. The
+ratio is the state's size over the file's.
+
+| data | filter | ratio | save | sync | load, 1 thread | load, 6 threads |
+|---|---|---|---|---|---|---|
+| pulse | none | 1.00 | 7.1 | 4.6 | 1.12 | 2.83 |
+| pulse | `Shuffle` + `Deflate(1)` | 1.34 | 0.10 | 0.10 | 0.25 | 0.30 |
+| pulse | `Shuffle` + zstd 1 | 1.32 | 0.63 | 0.62 | 0.72 | 1.33 |
+| pulse | `Shuffle` + zstd 3 | 1.34 | 0.45 | 0.43 | 0.71 | 1.26 |
+| pulse | `Shuffle` + LZ4 | 1.30 | 0.83 | 0.82 | 0.77 | 1.49 |
+| pulse | bitshuffle + LZ4 | 1.19 | 0.59 | 0.58 | 0.51 | 0.74 |
+| blast | none | 1.00 | 7.2 | 4.9 | 1.16 | 3.59 |
+| blast | `Shuffle` + `Deflate(1)` | 6.00 | 0.33 | 0.31 | 0.45 | 0.68 |
+| blast | `Shuffle` + zstd 1 | 6.14 | 1.04 | 1.00 | 0.73 | 1.36 |
+| blast | `Shuffle` + zstd 3 | 6.23 | 0.88 | 0.84 | 0.65 | 1.39 |
+| blast | `Shuffle` + LZ4 | 5.68 | 1.16 | 1.15 | 0.80 | 1.69 |
+| blast | bitshuffle + LZ4 | 4.85 | 0.62 | 0.59 | 0.50 | 0.74 |
+
+zstd is H5Zzstd's `ZstdFilter(level)`, LZ4 H5Zlz4's `Lz4Filter()`, and
+bitshuffle H5Zbitshuffle's `BitshuffleFilter(compressor = :lz4)`; Blosc
+was not measured, since H5Zblosc was not installed. Across four runs,
+two at each thread count, the unfiltered save varied between 4.6 and
+7.2 GB/s and its sync between 2.9 and 5.4, while a filtered save
+agreed within 15 %, with no trend in the thread count. The laptop was
+in use, with a video call and an endpoint-security agent that scans
+written files taking about a core, so these are its numbers, not a
+quiet node's.
+
+- **No filter is the recommendation.** Unfiltered, a save reaches the
+  page cache at 5–7 GB/s and stable storage at 3–5, and a load runs at
+  2.7–3.6 GB/s on six threads. A smooth field compresses 1.3-fold at
+  best, because the low mantissa bits of smooth data are noise to a
+  lossless coder, and every filter buys that with 9 to 70 times the
+  save time. A checkpoint is written to be read once, if at all.
+- **When size matters, `Shuffle()` then `ZstdFilter(1)`.** Data that
+  are mostly a uniform atmosphere are where a filter pays: 6.1-fold at
+  1.0 GB/s saved, within 1.5 % of level 3's ratio and 1.2 times its
+  speed. `Shuffle` with LZ4 is 12 % faster at 8 % less ratio, the
+  choice if time matters more. The built-in `Deflate(1)`, the only
+  filter every HDF5 has, gets less ratio at a third of the speed on
+  such data, and on smooth data it is six times slower than zstd, at
+  0.10 GB/s. Bitshuffle with LZ4 loses to byte shuffle with LZ4 on both
+  counts at this chunk size.
+- **A filtered file needs its filter to be read.** In Julia the
+  filter's package is loaded before `load_checkpoint` (`using
+  H5Zzstd`), and in C or Python the HDF5 plugin is installed (h5py's
+  through hdf5plugin). Without it the read fails with HDF5's own error,
+  a plugin it cannot find, and not with a refusal that says why (an
+  open question).
+- **Compression is serial.** HDF5 runs the filter pipeline chunk by
+  chunk on the calling thread, so a filtered save gains nothing from
+  threads, and a filtered load gains only the part of it that is not
+  HDF5's. Under M7 each rank compresses its own chunks, which is where
+  a filter parallelizes.
+- **Where an unfiltered load goes.** For the 540 MB state at one
+  thread, 470 ms: the field set's allocation and zero fill 157, the
+  state vector's first touch 84, the HDF5 read 87, `scatter!` 134, the
+  validated forest 20. At six threads the threaded parts fall to 27,
+  13, 30 and 6 ms, and the read, 82 ms, is half of the 156.
+- **The loads read the page cache.** A load right after a save reads
+  the file the save just wrote, so the load numbers are decompression
+  and memory bandwidth, not the SSD's read rate. A cold-cache load
+  needs the cache dropped first (`purge` on macOS, `drop_caches` on
+  Linux, both root-only) and was not measured. The numbers that matter
+  for a production run are the cluster file system's, which
+  `TREEAMR_BENCH_DIR` points the benchmark at, and belong to M7's
+  parallel-I/O measurement.
 
 **Parallel I/O and M7** (the facts checked 2026-09-29 against the HDF
 Group's "Collective Calling Requirements in Parallel HDF5
@@ -2940,6 +3033,21 @@ Remaining, none blocking before their milestone:
   - An ADIOS2 backend, if parallel HDF5 does not scale at M7. The data
     model maps one-to-one onto ADIOS2 variables (the datasets) and
     attributes.
+  - A refusal for a missing filter (found 2026-09-29, measuring M9a). A
+    file saved with H5Zzstd's filter and loaded without `using H5Zzstd`
+    fails with HDF5's `H5Error`, a plugin it cannot find in a build
+    directory, rather than with a reason. The loader could read the
+    data set's filter pipeline first and name the filter and the
+    package that provides it.
+  - Durability across a power loss. The rename makes the write atomic
+    for the process: a run killed while writing leaves the previous
+    checkpoint intact. But nothing syncs the partial file before the
+    rename, so after an operating-system crash or a power loss a file
+    system may hold the new name over incomplete data. An `fsync` of
+    the file before the rename (`F_FULLFSYNC` on macOS) and of the
+    directory after would close that; on the development laptop the
+    flush took an unfiltered save of 540 MB from 7.2 to 4.9 GB/s and
+    cost a filtered one nothing measurable ("Throughput and filters").
 - **The integrator's own passes are not owner-based** (raised by
   TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
   policy of [Parallelism](#parallelism); decided the same day not to
