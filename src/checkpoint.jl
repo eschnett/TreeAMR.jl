@@ -13,7 +13,8 @@
 # "Checkpoint and restart". This file holds no HDF5 code.
 
 """
-    save_checkpoint(path, forest; fieldsets, application, data = (;), filters = ())
+    save_checkpoint(path, forest; fieldsets, application, data = (;), filters = (),
+                    sync = true)
     save_checkpoint(f, path, forest; ...)        # do-block: f(app::HDF5.Group)
 
 Write a checkpoint of `forest`, of the field sets over it that the
@@ -60,6 +61,11 @@ run began it with. Put `t`, the chunk index and any other run state in
   one chunk per block and variable, so that reading a block decompresses
   that block and no other; without, contiguously. TreeAMR depends on no
   filter package.
+- `sync` — whether to flush the file to stable storage before it
+  replaces `path` (see "Atomicity"). On by default, since a checkpoint
+  that a power loss can take with it is not one; `sync = false` is for
+  files that need not survive the machine, such as a test's or a
+  scratch file system's.
 
 The do-block form calls `f` with the application's group open for
 writing, after everything else is written, for datasets of the
@@ -90,6 +96,16 @@ The file is written to `path * ".partial"` and renamed over `path` only
 once it is complete. On any error, one thrown by the do-block included,
 the partial file is removed and the error rethrown, so a failed or
 interrupted write never destroys the previous checkpoint at `path`.
+
+Closing a file only hands its data to the operating system, which
+survives the process but not a power loss or a kernel crash — and after
+one of those the rename, a separate update of the directory, can have
+reached the disk before the data it points to, leaving `path` naming a
+truncated file with the previous checkpoint already gone. So with
+`sync = true` the partial file is flushed to stable storage before the
+rename (`fsync`; on macOS `fcntl(F_FULLFSYNC)`, since `fsync` there does
+not wait for the drive's own cache), and the directory after it, so
+that the rename is durable too. On Windows `sync` does nothing.
 
 Returns `path`. See `CODE.md`, "Checkpoint and restart", for the file
 layout and the reasons behind it.

@@ -462,6 +462,38 @@ end
     @test readdir(dir) == ["run.h5"]
 end
 
+@testset "A synced write and an unsynced one store the same checkpoint" begin
+    # The failure: the flush to stable storage that `sync` adds changing
+    # what is written, failing on an ordinary file or directory, or
+    # passing over an error in silence. That the data then survive a
+    # power loss is the operating system's promise, and not testable
+    # here.
+    dir = mktempdir()
+    forest = Forest((2, 2); N=4, periodic=(true, false))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    fs = FieldSet(forest, 2; G=1)
+    fill_by_coordinates!((x, v) -> v * x[1] - x[2], fs)
+    paths = map((true, false)) do sync
+        path = joinpath(dir, "sync-$sync.h5")
+        @test save_checkpoint(path, forest; fieldsets=("u" => fs,),
+                              application="Sync" => 1, data=(; sync), sync) == path
+        return path
+    end
+    synced, unsynced = load_checkpoint.(paths)
+    @test synced.forest.leaves == unsynced.forest.leaves == forest.leaves
+    @test bytes(synced.fieldsets["u"].state) == bytes(unsynced.fieldsets["u"].state)
+    @test (synced.data.sync, unsynced.data.sync) == (true, false)
+    @test sort(readdir(dir)) == ["sync-false.h5", "sync-true.h5"]
+    # The flush itself, on a file, on a directory, and refusing a path
+    # that is not there rather than skipping it.
+    ext = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
+    @test ext.flush_to_storage(paths[1]) === nothing
+    @test ext.flush_to_storage(dir; directory=true) === nothing
+    Sys.iswindows() ||
+        @test_throws SystemError ext.flush_to_storage(joinpath(dir, "missing.h5"))
+end
+
 # --- plain data ----------------------------------------------------------------
 
 @testset "Plain data round-trip exactly" begin

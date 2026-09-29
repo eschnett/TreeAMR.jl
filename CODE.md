@@ -1649,6 +1649,23 @@ with the reason, and defaults are supplied where they are obvious.
   over `path` when it is complete; on any error the partial file is
   removed and the error rethrown. A crash while writing then cannot
   destroy the previous checkpoint, which is the one a restart needs.
+- **Durably, by default** (`sync = true`; added 2026-09-29, after the
+  first implementation, which left it as an open question). Closing a
+  file only hands its data to the operating system's page cache, which
+  survives the process but not a power loss or a kernel crash; and the
+  rename is a separate update of the directory, which can reach the
+  disk before the data it points to, leaving `path` naming a truncated
+  file with the previous checkpoint already gone. So the partial file
+  is flushed to stable storage before the rename, and its directory
+  after it, so that the rename is durable too. On Linux the flush is
+  `fsync`; on macOS it is `fcntl(F_FULLFSYNC)`, because `fsync` there
+  hands the data to the drive without waiting for the drive's own
+  cache (1 ms against 125 ms for 540 MB), falling back to `fsync` on a
+  file system without it; a directory that refuses an `fsync`
+  (`EINVAL`) is accepted. HDF5 cannot do this itself: its flush, too,
+  ends in the page cache. `sync = false` is for files that need not
+  outlive the machine, such as a test's. What the flush costs is under
+  "Throughput and filters" below.
 - **Two forms per field set.** `name => (fs, u)` writes the state
   vector `u`, and is the recommended form: after `solve` the working
   array holds whatever the last right-hand side scattered, which is a
@@ -1707,42 +1724,53 @@ each with its feature on the refined shell:
   kind.
 
 Throughput is in GB/s of state data (owned points, 1 GB = 10⁹ bytes),
-the best of five calls after one that compiles. `save` ends in the page
-cache. `sync` is a save followed by `fcntl(F_FULLFSYNC)`, macOS's flush
-to stable storage; a plain `fsync` there returned in 1 ms for 540 MB,
-against 125 ms for the full flush, so it proves nothing. `load` is all
-of `load_checkpoint`, at one thread and at six; the saves are the
+the best of five calls after one that compiles. `save` is
+`save_checkpoint(…; sync = false)`, which ends in the page cache;
+`sync` is the default, `sync = true`, which adds the flushes of the
+file and of its directory to stable storage (on macOS
+`fcntl(F_FULLFSYNC)`: a plain `fsync` there returned in 1 ms for 540
+MB, against 125 ms for the full flush, so it proves nothing). `load` is
+all of `load_checkpoint`, at one thread and at six; the saves are the
 one-thread run's. One chunk is one block and variable, 32 KB. The
 ratio is the state's size over the file's.
 
 | data | filter | ratio | save | sync | load, 1 thread | load, 6 threads |
 |---|---|---|---|---|---|---|
-| pulse | none | 1.00 | 7.1 | 4.6 | 1.12 | 2.83 |
+| pulse | none | 1.00 | 5.3 | 4.0 | 1.11 | 3.65 |
 | pulse | `Shuffle` + `Deflate(1)` | 1.34 | 0.10 | 0.10 | 0.25 | 0.30 |
-| pulse | `Shuffle` + zstd 1 | 1.32 | 0.63 | 0.62 | 0.72 | 1.33 |
-| pulse | `Shuffle` + zstd 3 | 1.34 | 0.45 | 0.43 | 0.71 | 1.26 |
-| pulse | `Shuffle` + LZ4 | 1.30 | 0.83 | 0.82 | 0.77 | 1.49 |
-| pulse | bitshuffle + LZ4 | 1.19 | 0.59 | 0.58 | 0.51 | 0.74 |
-| blast | none | 1.00 | 7.2 | 4.9 | 1.16 | 3.59 |
-| blast | `Shuffle` + `Deflate(1)` | 6.00 | 0.33 | 0.31 | 0.45 | 0.68 |
-| blast | `Shuffle` + zstd 1 | 6.14 | 1.04 | 1.00 | 0.73 | 1.36 |
-| blast | `Shuffle` + zstd 3 | 6.23 | 0.88 | 0.84 | 0.65 | 1.39 |
-| blast | `Shuffle` + LZ4 | 5.68 | 1.16 | 1.15 | 0.80 | 1.69 |
-| blast | bitshuffle + LZ4 | 4.85 | 0.62 | 0.59 | 0.50 | 0.74 |
+| pulse | `Shuffle` + zstd 1 | 1.32 | 0.62 | 0.61 | 0.73 | 1.37 |
+| pulse | `Shuffle` + zstd 3 | 1.34 | 0.45 | 0.44 | 0.72 | 1.34 |
+| pulse | `Shuffle` + LZ4 | 1.30 | 0.82 | 0.80 | 0.74 | 1.55 |
+| pulse | bitshuffle + LZ4 | 1.19 | 0.58 | 0.59 | 0.52 | 0.77 |
+| blast | none | 1.00 | 6.4 | 3.9 | 1.20 | 3.98 |
+| blast | `Shuffle` + `Deflate(1)` | 6.00 | 0.32 | 0.32 | 0.49 | 0.68 |
+| blast | `Shuffle` + zstd 1 | 6.14 | 1.06 | 1.02 | 0.76 | 1.36 |
+| blast | `Shuffle` + zstd 3 | 6.23 | 0.90 | 0.88 | 0.76 | 1.37 |
+| blast | `Shuffle` + LZ4 | 5.68 | 1.20 | 1.18 | 0.86 | 1.75 |
+| blast | bitshuffle + LZ4 | 4.85 | 0.64 | 0.63 | 0.52 | 0.76 |
 
 zstd is H5Zzstd's `ZstdFilter(level)`, LZ4 H5Zlz4's `Lz4Filter()`, and
-bitshuffle H5Zbitshuffle's `BitshuffleFilter(compressor = :lz4)`; Blosc
-was not measured, since H5Zblosc was not installed. Across four runs,
-two at each thread count, the unfiltered save varied between 4.6 and
-7.2 GB/s and its sync between 2.9 and 5.4, while a filtered save
-agreed within 15 %, with no trend in the thread count. The laptop was
-in use, with a video call and an endpoint-security agent that scans
-written files taking about a core, so these are its numbers, not a
-quiet node's.
+bitshuffle H5Zbitshuffle's `BitshuffleFilter(compressor = :lz4)`. Blosc
+was not measured. **Bitshuffle with zstd cannot be measured with the
+registered H5Zbitshuffle** (0.1.3): it calls `bshuf_compress_zstd`
+without its last argument, `comp_lvl`, so zstd compresses at whatever
+level the argument register happens to hold. The same data and the
+same `comp_level = 1` came out 175.3 MB at 0.02 GB/s in one process and
+181.6 MB at 0.35 GB/s in another — though bit for bit readable in both.
+HDF5.jl's unreleased 0.18, where the filter moves into an extension,
+passes the level. This table is the second of two measurements the
+same day; across the six runs, the unfiltered save varied between 4.6
+and 7.3 GB/s and its flush to stable storage between 2.9 and 5.4, while
+a filtered save agreed within 15 %, with no trend in the thread count.
+The laptop was in use, with a video call and an endpoint-security
+agent that scans written files taking about a core, so these are its
+numbers, not a quiet node's. The flush costs an unfiltered save of
+540 MB about 50 ms here, and a filtered one nothing measurable, which
+is why `sync = true` is the default.
 
 - **No filter is the recommendation.** Unfiltered, a save reaches the
   page cache at 5–7 GB/s and stable storage at 3–5, and a load runs at
-  2.7–3.6 GB/s on six threads. A smooth field compresses 1.3-fold at
+  2.8–4.0 GB/s on six threads. A smooth field compresses 1.3-fold at
   best, because the low mantissa bits of smooth data are noise to a
   lossless coder, and every filter buys that with 9 to 70 times the
   save time. A checkpoint is written to be read once, if at all.
@@ -1863,7 +1891,8 @@ load HDF5 while the extension is not loaded. `fieldsets` and
     save_checkpoint(path, forest;                    # returns path
                     fieldsets   = ("U" => (U, u), "aux" => aux),  # or ()
                     application = "TreeHydro" => 1,  # name => its version
-                    data = (; t, chunk, recipe), filters = ())
+                    data = (; t, chunk, recipe), filters = (),
+                    sync = true)                     # flush to stable storage
     save_checkpoint(path, forest; …) do app::HDF5.Group
         # further datasets in the application's group, beside `data`
     end
@@ -3039,15 +3068,6 @@ Remaining, none blocking before their milestone:
     directory, rather than with a reason. The loader could read the
     data set's filter pipeline first and name the filter and the
     package that provides it.
-  - Durability across a power loss. The rename makes the write atomic
-    for the process: a run killed while writing leaves the previous
-    checkpoint intact. But nothing syncs the partial file before the
-    rename, so after an operating-system crash or a power loss a file
-    system may hold the new name over incomplete data. An `fsync` of
-    the file before the rename (`F_FULLFSYNC` on macOS) and of the
-    directory after would close that; on the development laptop the
-    flush took an unfiltered save of 540 MB from 7.2 to 4.9 GB/s and
-    cost a filtered one nothing measurable ("Throughput and filters").
 - **The integrator's own passes are not owner-based** (raised by
   TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
   policy of [Parallelism](#parallelism); decided the same day not to

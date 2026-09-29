@@ -11,15 +11,15 @@
 # filters") are the defaults at `-t 1` and `-t 6`.
 #
 # The environment needs TreeAMR and HDF5; the test environment has both
-# (`--project=test`). The filter packages H5Zzstd, H5Zlz4, H5Zbitshuffle
-# and H5Zblosc are used where they can be loaded — from the active
+# (`--project=test`). The filter packages H5Zzstd, H5Zlz4 and H5Zbitshuffle
+# are used where they can be loaded — from the active
 # environment, or from the default one Julia stacks under it — and
 # skipped otherwise. They are not test dependencies, so the numbers with
 # them come from a scratch environment that develops this checkout and
 # adds them:
 #
 #     julia --project=<scratch> -e 'using Pkg; Pkg.develop(path="<this checkout>");
-#         Pkg.add(["HDF5", "H5Zzstd", "H5Zlz4", "H5Zbitshuffle", "H5Zblosc"])'
+#         Pkg.add(["HDF5", "H5Zzstd", "H5Zlz4", "H5Zbitshuffle"])'
 #
 # The two states are the two kinds of data the downstream applications
 # checkpoint. The mesh is refined twice around the sphere `r = 1/2` in
@@ -38,11 +38,11 @@
 # with a garbage collection before each call so that none runs inside
 # one. What the numbers are and are not:
 #
-# - **A save ends in the page cache.** HDF5 closes the file without
-#   syncing it, so `save` is the rate at which the data reach the
-#   operating system; `sync` adds the flush that writes them to stable
-#   storage (`fsync`, or `F_FULLFSYNC` on macOS, below), which is what a
-#   job about to hit its wall-clock limit needs.
+# - **`save` ends in the page cache.** It is `save_checkpoint(…; sync =
+#   false)`, the rate at which the data reach the operating system;
+#   `sync` is the default, `sync = true`, which adds the flushes of the
+#   file and its directory to stable storage (`fsync`, or `F_FULLFSYNC`
+#   on macOS, where `fsync` does not wait for the drive's cache).
 # - **A load right after a save reads from the page cache**, since the
 #   file was just written, so `load` is decompression and memory
 #   bandwidth, not the device's read rate. A cold-cache load needs the
@@ -79,7 +79,7 @@ const DIR = get(ENV, "TREEAMR_BENCH_DIR", "")
 # with HDF5 when loaded; the constructors are called only from `main`,
 # which runs after the imports are visible.
 const OPTIONAL = filter(p -> Base.find_package(p) !== nothing,
-                        ["H5Zzstd", "H5Zlz4", "H5Zbitshuffle", "H5Zblosc"])
+                        ["H5Zzstd", "H5Zlz4", "H5Zbitshuffle"])
 for p in OPTIONAL
     Core.eval(Main, :(import $(Symbol(p))))
 end
@@ -98,10 +98,9 @@ function filter_settings()
     if "H5Zbitshuffle" in OPTIONAL
         push!(settings, ("bitshuffle+lz4",
                          (H5Zbitshuffle.BitshuffleFilter(; compressor=:lz4),)))
-    end
-    if "H5Zblosc" in OPTIONAL
-        push!(settings, ("blosc(lz4,shuffle)",
-                         (H5Zblosc.BloscFilter(; level=5, compressor="lz4"),)))
+        push!(settings, ("bitshuffle+zstd(1)",
+                         (H5Zbitshuffle.BitshuffleFilter(; compressor=:zstd,
+                                                          comp_level=1),)))
     end
     return settings
 end
@@ -175,22 +174,6 @@ function best(f, reps=REPS)
     return t
 end
 
-# On macOS `fsync` only hands the data to the drive, and returned in 1 ms
-# for 540 MB on the machine the numbers in CODE.md come from; the flush
-# to stable storage is `fcntl(F_FULLFSYNC)`, which took 125 ms there. So
-# that is what `sync` means on macOS, and `fsync` elsewhere.
-const F_FULLFSYNC = Cint(51)
-
-function fsync_file(path)
-    open(path) do io
-        status = Sys.isapple() ?
-                 ccall(:fcntl, Cint, (Cint, Cint, Cint...), fd(io), F_FULLFSYNC, 0) :
-                 ccall(:fsync, Cint, (Cint,), fd(io))
-        status == 0 || error("syncing $path failed")
-    end
-    return nothing
-end
-
 function main()
     dir = isempty(DIR) ? mktempdir() : DIR
     r₀ = 0.5
@@ -214,11 +197,11 @@ function main()
         bytes = sizeof(u)
         for (fname, filters) in settings
             path = joinpath(dir, "checkpoint-$dname.h5")
-            save() = save_checkpoint(path, forest; fieldsets=("U" => (fs, u),),
-                                     application="bench" => 1, data=(; t=0.0),
-                                     filters=filters)
-            t_save = best(save)
-            t_sync = best(() -> (save(); fsync_file(path)))
+            save(sync) = save_checkpoint(path, forest; fieldsets=("U" => (fs, u),),
+                                         application="bench" => 1, data=(; t=0.0),
+                                         filters=filters, sync=sync)
+            t_save = best(() -> save(false))
+            t_sync = best(() -> save(true))
             fsize = filesize(path)
             t_load = best(() -> load_checkpoint(path))
             ck = load_checkpoint(path)
