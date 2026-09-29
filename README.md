@@ -9,10 +9,11 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M11** (after M8's every
+The package is currently at milestone **M9a** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
-faces, M10's reflecting boundaries as a property of the domain, and
-M11's interpolation to arbitrary points).
+faces, M10's reflecting boundaries as a property of the domain, M11's
+interpolation to arbitrary points, and M9a's checkpoint and restart).
+Next is MPI (M7), then visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
 
@@ -108,11 +109,20 @@ steps. A standalone sample application,
 [TreeWave.jl](https://github.com/eschnett/TreeWave.jl), solves the
 wave equation with a Löhner refinement criterion.
 
+**Checkpoints.** A long run can stop and resume. `save_checkpoint`
+writes the mesh, the evolved fields and the application's own run state
+to one HDF5 file, and `load_checkpoint` reads them back exactly in a
+new process, on any thread count or backend; at any thread count the
+run then continues bit for bit. Only what cannot be recomputed is
+stored: the leaves, and the fields without their ghost zones. HDF5 is
+an optional dependency, so these functions become available with
+`using HDF5`.
+
 **Still missing.** There is no MPI parallelism yet. The code runs on a
 single node, either on its CPU cores or on one GPU. MPI is the next
-milestone. There is no I/O or visualization output yet either. The
-leaf-only storage also rules out multigrid algorithms on the mesh
-hierarchy.
+milestone. There is no visualization output yet either; that comes
+after MPI. The leaf-only storage also rules out multigrid algorithms on
+the mesh hierarchy.
 
 ## Installing
 

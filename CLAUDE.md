@@ -12,22 +12,27 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6, M8, M10 and M11 are done (tree core, ghost
-exchange, ODE coupling, regridding, multi-threading, GPU; then every
+Current state: milestones M0–M6, M8, M10, M11 and M9a are done (tree core,
+ghost exchange, ODE coupling, regridding, multi-threading, GPU; then every
 centering, per-field-set ghost widths, and conservation at coarse-fine
-faces; then reflecting boundaries; then point interpolation). Everything is `D`-generic and
-floating-point-type generic. Next is MPI (M7), deliberately after M8 and
-M10 so the distributed exchange is built once over a layout-generic
-schedule that already holds the mirrored transfers; then I/O (M9).
+faces; then reflecting boundaries; then point interpolation; then
+checkpoint and restart, through an HDF5 package extension). Everything
+is `D`-generic and floating-point-type generic. Next is MPI (M7),
+deliberately after M8 and M10 so the distributed exchange is built once
+over a layout-generic schedule that already holds the mirrored
+transfers; then visualization export (M9b), the other half of the old
+M9. M9a went before M7 because the downstream runs need to restart
+before they need MPI.
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
 ## Commands
 
-Full test suite (about 3.5 min at one thread, 4–5 min at eight — the
-thread-independence test spends ~45 s of that running
-`test/thread_workload.jl` in two subprocesses, and M10's
-`reflect_tests.jl` about 45 s more).
+Full test suite (about 5 min at one thread and at eight — 93677 tests
+in 4m51 and 93729 in 5m08 after M9a — the thread-independence test
+spends ~45 s of that running `test/thread_workload.jl` in two
+subprocesses, M10's `reflect_tests.jl` about 45 s more, and M9a's
+`checkpoint_tests.jl` about 30 s).
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
 shorten it by making the kernels faster. Measured: annotating the test
@@ -111,10 +116,19 @@ committed and meant to be (a 1.11 key, the reason for the floor). Do not
 IMEXRungeKutta is taken from `main`, so its next push reaches the next
 resolve here; `Pkg.update` in `test/` picks it up locally.
 
+HDF5 is a **weak dependency** (`[weakdeps]`, `[compat]` 0.17): the
+checkpoint implementation is the package extension `TreeAMRHDF5Ext`,
+which Julia loads only once HDF5 is loaded beside TreeAMR. The test and
+docs environments list HDF5, and `docs/make.jl` does `using HDF5`, so
+the suite and the checkpoint doctest see the extension. Without it the
+five checkpoint functions have no methods, and an error hint registered
+in TreeAMR's `__init__` says to load HDF5. Do not make HDF5 a hard
+dependency: an application that never checkpoints should not load it.
+
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
 **Adding a documented function means adding it to the API page of its
-layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,internals}.md`.
+layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,io,internals}.md`.
 `docs/src/index.md` is the guide (prose and doctests, plus the status) and
 holds no `@docs` blocks. The split is there because Documenter's HTML writer
 fails the build on any page over 200 KiB (`size_threshold`), and the single
@@ -194,12 +208,30 @@ runs in the test environment, which has both:
 TREEAMR_BENCH_ROOTS=8 TREEAMR_BENCH_SCRIPT=bench/stepping.jl TREEAMR_BENCH_PROJECT=test bench/scan.sh 1 8
 ```
 
+`bench/checkpoint.jl` times `save_checkpoint` and `load_checkpoint` (M9a)
+for each HDF5 filter setting, on a smooth wave pulse and a blast wave
+with a uniform atmosphere, and prints the file size, the ratio and GB/s
+for save, save plus the flush to stable storage (`fsync`, or
+`F_FULLFSYNC` on macOS, where `fsync` does not wait), and load. It
+runs in the test environment with the built-in filters only; the
+filter packages (H5Zzstd, H5Zlz4, H5Zbitshuffle, H5Zblosc) are used
+where the environment has them, which means a scratch environment that
+develops this checkout — never add them to `test/Project.toml`.
+`TREEAMR_BENCH_DIR` puts the files on the file system under test. A
+load right after a save reads the page cache; CODE.md's "Throughput and
+filters" under "Checkpoint and restart" has the numbers and that
+caveat:
+
+```bash
+julia --project=test bench/checkpoint.jl
+```
+
 There is no formatter or linter configured.
 
 ## Architecture
 
-Thirteen source files, included in dependency order from `src/TreeAMR.jl`; each
-layer uses only the ones before it:
+Fourteen source files, included in dependency order from `src/TreeAMR.jl`, plus
+one package extension in `ext/`; each layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
@@ -214,6 +246,7 @@ layer uses only the ones before it:
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number, where M7's Allreduce will go), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 | interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
+| checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension |
 
 The ideas that span several files and are easy to violate:
 
@@ -341,6 +374,28 @@ The ideas that span several files and are easy to violate:
   rather than throws. `locate_point` and `isless` share `curve_less`
   in `morton.jl`, so the search and the leaf order cannot disagree.
 
+- **A checkpoint stores what cannot be recomputed** (M9a, CODE.md
+  "Checkpoint and restart"): the forest's parameters and its leaves, in
+  curve order, and each field set's layout and **owned points only**,
+  in state-vector layout. Ghosts, shared planes and schedules are the
+  application's to rebuild with its own operators and hook. A load
+  builds the forest through the validated `leaves` path
+  (`Forest(roots; …, leaves)`, which refuses a list that does not tile
+  the brick or is not balanced) and the field set through its
+  constructor, so nothing read is trusted before they check it.
+  Compatibility is the file's `format_version` plus a must-understand
+  `features` list, never package versions; each refusal says why and
+  points to `checkpoint_environment`. TreeAMR writes only under
+  `/TreeAMR.jl` and the application only under its own top-level group,
+  leaving the root free for M9b's sidecars. The write goes to
+  `path * ".partial"` and is renamed over `path` with
+  `Base.Filesystem.rename` — not `mv(…; force = true)`, which on 1.11
+  removes the target first. Element types are HDF5 natives or *limbs*
+  (`Float32x2` as two `Float32`), named as a Base-only module prints
+  them and matched against the loader's `types`. No Julia type
+  definition reaches the file, so a converter can read an old file
+  without the old package; do not add JLD2 or `Serialization`.
+
 Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 (`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
 **owned** range is `G_d+1:G_d+N` and the **closed** range `G_d+1:G_d+N+c_d`.
@@ -363,7 +418,13 @@ ghost slab.
 `interpolate_tests.jl` (M11), `interface_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
-`thread_tests.jl`, `gpu_tests.jl` (M2–M8). The wave
+`checkpoint_tests.jl` (M9a), `thread_tests.jl`, `gpu_tests.jl` (M2–M8).
+`checkpoint_tests.jl` checks a bitwise round trip over every centering,
+`Float64`/`Float32`/`Float32x2` and every face kind, restarts of the
+wave and Burgers studies that continue byte for byte through regrids,
+the refusals with their reasons, the atomic write, plain data and
+`checkpoint_environment`; the leaf-list `Forest` it loads through is
+tested inline in `runtests.jl`, against the oracles. The wave
 study comes in two halves: `wave_tests.jl` is the **vertex-centered**
 one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
 verbatim so its numbers stay under test. `imex_tests.jl` runs the wave
@@ -451,8 +512,8 @@ When a milestone lands, update the status in `README.md` and
   only. **Registered in General** since 2026-09-21; 0.1.3 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
-  key behind `DOCUMENTER_KEY` to push them — the file says why. Both
-  downstreams bound TreeAMR by `[compat]` over the `0.1` series, so a
+  key behind `DOCUMENTER_KEY` to push them — the file says why. All
+  three downstreams bound TreeAMR by `[compat]` over the `0.1` series, so a
   `0.1.x` release lands on their next resolve, and an API break has to go
   to `0.2`.
 - All `Manifest.toml` files (root, `test/`, `docs/`) and `docs/build/` are
@@ -500,6 +561,10 @@ of the *public API only*. Facts that matter here:
   its tests add `buffered_flags`, `complete_marks` and `block_origin`.
   `hostcopy` is its own, in its `device.jl`, and it does not use
   `todevice`. Renaming or re-signaturing any of these breaks it.
+- **Checkpointing reaches it with the next release**: `using HDF5`
+  beside TreeAMR loads the extension, and nothing else is needed. It
+  calls none of the checkpoint functions yet. Against the M9a checkout
+  its suite is unchanged, 310 tests in 1m12 (2026-09-29).
 - Its `CLAUDE.md` and `CODE.md` record API sharp edges found from the
   outside — a keyword named `maxlevel` shadows the exported
   `maxlevel(forest)` inside a function body; `coordinates` taking stored
@@ -525,16 +590,17 @@ satisfied and released, so that section of its `CODE.md` is history.
 
 It pins **neither `main` nor this checkout**: since TreeAMR 0.1.1 reached
 the General registry, its `Project.toml` and `bin/Project.toml` have no
-`[sources]` entry for TreeAMR, only `TreeAMR = "0.1.1"` under `[compat]`.
+`[sources]` entry for TreeAMR, only `TreeAMR = "0.1.3"` under `[compat]`.
 A change here reaches its tests only once it is tagged and registered,
 a higher bar than a push; to try one sooner, `Pkg.develop` this checkout
 into a scratch copy of TreeHydro, never the real one. Its suite is much
-longer than TreeWave's — 11622 tests in 3.5 to 4.5 minutes at one
-thread, against TreeWave's 310 in 1.5 — so TreeWave stays the cheap
-downstream check and this is the thorough one. It is worth the minutes
-for anything that touches the exchange, the interface restriction or
-the operators, because it is the only place conservation at coarse-fine
-faces is exercised by a real scheme rather than by Burgers in `test/`.
+longer than TreeWave's — 11893 tests in 4m16 at one thread against the
+M9a checkout (2026-09-29), against TreeWave's 310 in 1m12 — so TreeWave
+stays the cheap downstream check and this is the thorough one. It is
+worth the minutes for anything that touches the exchange, the interface
+restriction or the operators, because it is the only place conservation
+at coarse-fine faces is exercised by a real scheme rather than by
+Burgers in `test/`.
 
 It is the only caller of several things, which makes it the only test
 of them outside this repo: `InterfaceSchedule` / `restrict_interfaces!`,
@@ -572,6 +638,15 @@ through the right-hand side and the reset). `eos_`, `riemann_`,
 nothing here. Its `bin/`, like TreeWave's, is run by its CI's `viewer`
 job rather than by `Pkg.test`.
 
+**Checkpointing (M9a) is what its long runs were waiting for**, and it
+reaches TreeHydro with the next release, through `using HDF5`; tagging
+is Erik's call. The restart itself is TreeHydro's to write, and is not
+started. The plan (2026-09-29) saves at the start of a chunk, *after*
+the regrid and the atmosphere reset — its observer fires before the
+regrid, so saving there would mean replaying both — with the chunk
+index, the case recipe as Rationals, the `evolve!` keywords and the run
+histories as plain data.
+
 Mesh machinery belongs here; physics belongs there — the same rule as
 for TreeWave.
 
@@ -579,17 +654,27 @@ for TreeWave.
 
 `~/src/jl/TreeGeneralizedHarmonic` (github.com/eschnett/TreeGeneralizedHarmonic.jl)
 is the third application: the vacuum Einstein equations in the
-generalized harmonic formulation, a black hole on the octree. It pins
-TreeAMR to **GitHub `main`** through `[sources]` (with `TreeAMR = "0.1.2"`
-under `[compat]` from 2026-09-25), so a push here reaches its next resolve
-without a release. Every kernel it has goes through `map_blocks!`, and it
-calls `threaded_foreach` — unexported — for its horizon interpolator's
-batch; its `test/prerequisite_tests.jl` names that one, so renaming it
-breaks that suite at the top. On 2026-09-25 it measured the ownership
-policy from the outside, on Symmetry, and found the integrator's own
-passes to be what is left: see the last item of "Open questions" in
-`CODE.md` (the serial stage updates, the per-`solve` buffers, a
-first-touch anomaly that looks like NUMA balancing, and why not
-Polyester). Erik decided the same day not to optimise the
+generalized harmonic formulation, a black hole on the octree. It
+pinned TreeAMR to GitHub `main` through `[sources]` until 2026-09-26,
+when it retired its stopgap interpolator for M11's `interpolate`; since
+then it takes TreeAMR from **General**, `TreeAMR = "0.1.3"` under
+`[compat]`, like the other two, so a change here reaches it only with a
+release. That includes M9a: checkpointing reaches it with the next
+release, through `using HDF5`, together with TreeAMR's new `__init__`
+and the five new exports (none of which clashes with a name of its
+own). Its production runs, estimated at 38–149 h, are one of the
+reasons M9a went before M7; beyond `(t, u)` its restart has to store
+its horizon tracking and interior fits, which is its own work. Every
+kernel it has goes through `map_blocks!`. Its
+`test/prerequisite_tests.jl` names the four unexported TreeAMR names it
+relies on — `threadchunks` (its integrator's partition) and M11's
+`Region` extension points `inside`, `stencil_hits` and
+`stencil_position` — so renaming one breaks that suite at the top; the
+stopgap's `threaded_foreach` left with the stopgap. On 2026-09-25 it
+measured the ownership policy from the outside, on Symmetry, and found
+the integrator's own passes to be what is left: see the last item of
+"Open questions" in `CODE.md` (the serial stage updates, the
+per-`solve` buffers, a first-touch anomaly that looks like NUMA
+balancing, and why not Polyester). Erik decided the same day not to optimise the
 OrdinaryDiffEq path further, Polyester included; what is left open there
 is where limiters go (Shu–Osher against Butcher form).
