@@ -7,7 +7,7 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M11**: the tree core (Morton keys over a
+The package is at milestone **M9a**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -35,8 +35,16 @@ set, and its first derivatives, at an arbitrary batch of points, for a
 horizon finder or any other analysis that asks for values where the mesh
 has none (see [Interpolating to points](@ref)).
 
+M9a added checkpoint and restart, ahead of MPI because long runs need to
+resume before they need more nodes: [`save_checkpoint`](@ref) writes the
+forest, the evolved field sets and the application's own plain data to
+one HDF5 file, and [`load_checkpoint`](@ref) reads them into a fresh
+process, which continues bit for bit at any thread count. HDF5 is a
+weak dependency, loaded with `using HDF5` (see
+[Checkpoints and restarts](@ref)).
+
 Next is MPI (M7), so that the distributed exchange is built once over a
-layout-generic schedule.
+layout-generic schedule; then visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -471,6 +479,14 @@ Pass `name => (fs, u)` for an evolved set — after `solve` its working
 array holds a stage, not the solution — and leave scratch sets such as
 fluxes out. The file is written beside `path` and renamed over it only
 when complete, so a failed write never destroys the previous checkpoint.
+
+Compression is HDF5's, through `filters`. None is the default and, by
+the measurements in the design document, the recommendation: smooth
+data compress only about 1.3-fold, at many times the cost. When size
+matters, `filters = (HDF5.Filters.Shuffle(), H5Zzstd.ZstdFilter(1))`,
+after `using H5Zzstd`, shrinks a state that is mostly uniform
+atmosphere about six-fold. A filtered file can be read only where its
+filter is loaded too.
 
 A software element type such as MultiFloats' `Float32x2` is stored as
 its limbs, and a load names it through `types = (Float32x2,)`. A file

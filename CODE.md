@@ -2991,7 +2991,7 @@ entries per volume — documented here, implemented post-M3.
   operators. (Multigrid on the tree hierarchy would require overlapping
   coarse data, which leaf-only storage does not provide — out of scope.)
 - **I/O:** checkpoint and restart through HDF5.jl, as a package
-  extension — M9a, specified under
+  extension — M9a, done, as specified under
   [Checkpoint and restart](#checkpoint-and-restart). Visualization
   export is M9b; an ADIOS2 backend only if parallel HDF5 does not scale
   at M7 (see [Open questions](#open-questions)).
@@ -3571,8 +3571,7 @@ M7's benchmarks. The list below is in execution order.
     a batch with an outside point copies its block indices back (the
     first version copied them always, 2 MB at 496000 points, and ran at
     12.2 ns per point before the `Val` for the multi-indices).
-- **M9a — Checkpoint and restart.** *(Specified and implemented
-  2026-09-29; the throughput measurement is pending.)* Done before M7
+- **M9a — Checkpoint and restart.** *(Done.)* Done before M7
   (decided): TreeHydro's long runs and TreeGeneralizedHarmonic's
   production runs, estimated at 38–149 h, outlast any queue's day and
   need to stop and resume before they need MPI, and
@@ -3617,6 +3616,39 @@ M7's benchmarks. The list below is in execution order.
     recommended filter chosen from them;
   - TreeWave and TreeHydro still green against it, the change being
     additive.
+
+  *(Measured 2026-09-29; `test/checkpoint_tests.jl`,
+  `bench/checkpoint.jl`.)* The design needed one amendment, the name a
+  limb type is recorded under (see "Element types" under
+  [Checkpoint and restart](#checkpoint-and-restart)); the
+  implementation fixed the spellings the design had left to it, and
+  chose `rename` over `mv(…; force = true)`, which on Julia 1.11 removes
+  the old file before the new one is in place. Four things are worth
+  recording.
+
+  - **Restarts are bit-identical, and the test would see it if they
+    were not.** Both studies continue byte for byte through regrids
+    after the restart point, and both fail on a one-ulp error in the
+    restored time, which was checked. The device round trip passes on
+    the CPU backend in the suite, and on Metal in `Float32` (the testset
+    run on its own).
+  - **Throughput** (the table and the reasons are under "Throughput and
+    filters" in [Checkpoint and restart](#checkpoint-and-restart)). On
+    the development laptop an unfiltered save reaches the page cache at
+    5–7 GB/s and stable storage at 3–5, and a load of the 540 MB state
+    runs at 3.6 GB/s on six threads, half of that time the HDF5 read. The
+    recommendation is no filter, and `Shuffle()` with `ZstdFilter(1)`
+    when size matters: 6.1-fold at 1.0 GB/s on a state that is mostly
+    atmosphere, and 1.3-fold on a smooth one.
+  - **Suite cost.** 93677 tests in 4m51 at one thread and 93729 in 5m08
+    at eight threads, against 92054 in 4m35–4m54 at eight after M11;
+    93677 in 4m14 on Julia 1.11.9. `checkpoint_tests.jl` (532 tests)
+    adds about 30 s at one thread inside the suite, and takes about
+    55 s on its own, most of it compilation.
+  - **The downstreams are green.** Against the M9a checkout, developed
+    into scratch copies, at one thread: TreeWave 310 tests in 1m12, and
+    TreeHydro 11893 in 4m16. Neither calls the new functions yet; each
+    gains them with `using HDF5` once a release carries them.
 - **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
