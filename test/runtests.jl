@@ -1,6 +1,7 @@
 using Test
 using Random
 using TreeAMR
+using HDF5
 
 include("oracles.jl")
 include("ghost_oracles.jl")
@@ -585,6 +586,7 @@ include("wave_cell_tests.jl")
 include("burgers_tests.jl")
 include("imex_tests.jl")
 include("type_tests.jl")
+include("checkpoint_tests.jl")
 include("thread_tests.jl")
 include("gpu_tests.jl")
 
