@@ -28,8 +28,8 @@ before they need MPI.
 
 ## Commands
 
-Full test suite (about 4–5 min at one thread and at eight — 93686 tests
-in 4m16 and 93738 in 4m47 after M9a — the thread-independence test
+Full test suite (about 4–5 min at one thread and at eight — 98818 tests
+in 4m44 and 98870 in 4m51 after M7 step 1 — the thread-independence test
 spends ~45 s of that running `test/thread_workload.jl` in two
 subprocesses, M10's `reflect_tests.jl` about 45 s more, and M9a's
 `checkpoint_tests.jl` about 30 s).
@@ -128,7 +128,7 @@ dependency: an application that never checkpoints should not load it.
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
 **Adding a documented function means adding it to the API page of its
-layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,io,internals}.md`.
+layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,io,distributed,internals}.md`.
 `docs/src/index.md` is the guide (prose and doctests, plus the status) and
 holds no `@docs` blocks. The split is there because Documenter's HTML writer
 fails the build on any page over 200 KiB (`size_threshold`), and the single
@@ -231,20 +231,21 @@ There is no formatter or linter configured.
 
 ## Architecture
 
-Fourteen source files, included in dependency order from `src/TreeAMR.jl`, plus
+Fifteen source files, included in dependency order from `src/TreeAMR.jl`, plus
 one package extension in `ext/`; each layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
 | threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
+| communicator | `communicator.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `isend`/`irecv`/`waitall`), each with a serial method; MPI's come with `TreeAMRMPIExt` in step 3 |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
-| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number, where M7's Allreduce will go), `volume_weighted_norm` |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 | interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
 | checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension |
@@ -253,7 +254,13 @@ The ideas that span several files and are easy to violate:
 
 - **Linear octree, leaf-only data.** `forest.leaves` *is* the tree: no node
   objects, no pointers, no coarse data under refined regions. Block `b` of
-  any `FieldSet` is `forest.leaves[b]`. Block indices are **not** stable
+  any `FieldSet` is `blockkey(fs, b)`, leaf `first(blockrange(forest)) + b
+  - 1`: since M7 step 1 every block index is **local to the rank**, while
+  tree queries (`nleaves`, `find_leaf`, `locate_point`, `neighbor_keys`)
+  stay global. Serially the two coincide, so a site that indexes
+  `forest.leaves` by a block index, or sizes a per-block array by
+  `nleaves`, passes every serial test and is wrong under MPI; walk
+  `blockrange` and size by `nblocks`. Block indices are **not** stable
   across a regrid (slots are compacted), and `FieldSet` is a `mutable struct`
   precisely so that `regrid!` can swap `fs.work` wholesale while callers keep
   their reference.
@@ -420,7 +427,9 @@ ghost slab.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`interpolate_tests.jl` (M11), `interface_tests.jl`,
+`interpolate_tests.jl` (M11), `interface_tests.jl`, `partition_tests.jl`
+(M7 step 1: the rank split and local block indices, through a test-only
+`PartitionCommunicator(rank, size)` that answers only those two verbs),
 `allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
 `checkpoint_tests.jl` (M9a), `thread_tests.jl`, `gpu_tests.jl` (M2–M8).

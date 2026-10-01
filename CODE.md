@@ -4266,7 +4266,61 @@ M7's benchmarks. The list below is in execution order.
     size and sends nothing, check the partition: the ranges tile
     `1:nleaves` in order and differ in length by at most one, ranks
     beyond `nleaves` are empty, and `blockkey` on every rank names the
-    leaf that rank owns.
+    leaf that rank owns. *(Done, 2026-10-01.)* What it settled, and
+    where it went beyond the plan:
+    - *The split.* `equalsplit(n, p, i)` in `threading.jl`, the closed
+      form of `threadchunks`' old loop, is the one helper:
+      `threadchunks` returns its parts, and `blockrange(forest)` is part
+      `commrank + 1` of `commsize`. The test compares it against the old
+      loop for every `n ≤ 40` and `p ≤ 9`, and `threadchunks` against it
+      at the suite's thread count.
+    - *The keyword.* `Forest(…; comm = nothing)`, and
+      `communicator(nothing)` is the `SerialCommunicator`, so the default
+      is spelled the same way the MPI case will be. A `Communicator`
+      subtype lacking a verb is refused at that verb by name, through a
+      fallback method on the abstract type, rather than with a
+      `MethodError` inside a reduction; that is what lets the test-only
+      communicator answer rank and size alone. The serial `isend` and
+      `irecv` refuse any peer, since a serial rank has none, and the
+      serial `waitall` accepts only an empty list.
+    - *The geometry per local block.* `block_origins(forest)` and
+      `block_spacings(forest)` take the forest, not a field set, and are
+      per local block through `blockrange`, so every kernel that reads
+      them is unchanged. Tree queries — `nleaves`, `find_leaf`,
+      `neighbor_keys`, `locate_point` — stay global, and `flag_blocks`
+      walks the local range and passes the local index.
+    - *The schedules build their local part* (amended: the plan had them
+      untouched until step 2). `GhostSchedule` and `InterfaceSchedule`
+      walk the rank's own targets in global leaf indices and then keep
+      the transfers with both ends on the rank, shifted to local
+      indices, together with the boundary regions of the rank's blocks.
+      That is step 2's *local* class already; the test checks it against
+      the serial schedule restricted to each rank's range, mirrored
+      transfers and three levels included, over 2 and 3 fake ranks.
+    - *What refuses a distributed forest until its step*: `fill_ghosts!`
+      and `restrict_interfaces!` (step 3), `regrid!` (step 4),
+      `interpolate` (step 5) and `save_checkpoint` (step 6), each with an
+      `ArgumentError` naming the step; a reduction is refused by the
+      missing `allgather` of a communicator that lacks one.
+    - *The reduction is already written* (amended: the plan put it in
+      step 3). `combine_blocks` gathers `(hasvalue, partial)` per rank
+      and folds the ranks that have a value, in rank order, as
+      "Reductions" above specifies — but at one rank it returns its own
+      fold without calling `allgather`, so the serial value is unchanged
+      by construction and a serial reduction keeps accepting a
+      non-`isbits` partial, which `allgather` refuses. The multi-rank
+      fold is first exercised by step 3's workload.
+    - *Empty ranks.* `launch_by_owner!` skips an empty `ndrange` on a
+      device too, `firing_boxes` returns an empty vector, and the
+      `AllVariables` fill returns before checking its callback at a
+      block that does not exist.
+    - *Docs.* The `docs/src/api/distributed.md` page that step 9 was to
+      add exists now, with `communicator`, `blockrange` and the internal
+      verbs, since Documenter refuses a docstring that is on no page.
+    - *Suite cost.* 98818 tests in 4m44 at one thread and 98870 in 4m51
+      at eight; the difference from M9a's 93686 and 93738 is exactly
+      `partition_tests.jl`'s 5132, so no existing test moved. The docs
+      build.
   - **Step 2 — the distributed schedule.** The candidate remote targets,
     the three classes, the sorted layouts, the stages, and the
     packed-buffer accessors. *Accept,* in process, over 1–5 fake ranks,
