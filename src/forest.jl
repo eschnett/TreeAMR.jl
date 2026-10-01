@@ -37,7 +37,7 @@ Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
     Forest(roots; N, periodic=all false, reflecting=all false,
-           extents=one unit per root, leaves=nothing)
+           extents=one unit per root, leaves=nothing, comm=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
 
 Without `leaves` the forest starts as its unrefined roots. With it, it
@@ -49,6 +49,14 @@ built over a forest trusts its leaves, so the list is refused unless
 every key lies in the brick, the keys strictly increase, they tile the
 brick exactly — no gap, no overlap — and they are 2:1 balanced (see
 [`balance!`](@ref)).
+
+`comm` is the communicator the forest is distributed over (M7), as
+[`communicator`](@ref) converts it; `nothing`, the default, is a serial
+forest. Every rank holds the whole forest, and the field data of a
+[`FieldSet`](@ref) over it are split by [`blockrange`](@ref): each rank
+stores the blocks of one contiguous run of the leaves. Every forest
+mutation is then collective — the same call with the same arguments on
+every rank. See "Distributed meshes" in `CODE.md`.
 
 # Examples
 
@@ -73,6 +81,12 @@ struct Forest{D,T}
     # stale — a same-size refine-then-coarsen would otherwise slip past
     # a leaf-count check and silently transfer the wrong data.
     generation::Base.RefValue{Int}
+    # The processes the field data are split over (M7). Abstract-typed
+    # on purpose, so that `Forest{D,T}` keeps its two parameters and no
+    # `FieldSet` or schedule signature downstream changes; the price is
+    # a dynamic dispatch per verb, a few per ghost fill and none in a
+    # kernel ("Distributed meshes" in CODE.md).
+    comm::Communicator
 end
 
 # `G` is still accepted as a keyword so that the move can be reported
@@ -98,7 +112,7 @@ function Forest{T}(roots::NTuple{D,Integer};
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
                    leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
-                   G=nothing) where {T,D}
+                   comm=nothing, G=nothing) where {T,D}
     G === nothing || throw(no_forest_ghosts)
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
     N > 0 || throw(ArgumentError("N must be positive, got $N"))
@@ -135,7 +149,8 @@ function Forest{T}(roots::NTuple{D,Integer};
         # array in place, which must never reach the caller's vector.
         list = collect(MortonKey{D}, leaves)
     end
-    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, Ref(0))
+    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, Ref(0),
+                         communicator(comm))
     leaves === nothing || check_leaves(forest)
     return forest
 end
@@ -149,16 +164,16 @@ function Forest(roots::NTuple{D,Integer};
                 reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
                 leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
-                G=nothing) where {D}
+                comm=nothing, G=nothing) where {D}
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
         return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                               leaves=leaves)
+                               leaves=leaves, comm=comm)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
     return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                     extents=extents, leaves=leaves)
+                     extents=extents, leaves=leaves, comm=comm)
 end
 
 # Validate a caller's leaf list (the `leaves` keyword), already copied
@@ -304,10 +319,48 @@ generation(forest::Forest) = forest.generation[]
 """
     nleaves(forest::Forest)
 
-The number of leaves currently tiling `forest`; equivalently the number
-of blocks a [`FieldSet`](@ref) over it stores.
+The number of leaves currently tiling `forest` — all of them, on every
+rank. Serially that is also the number of blocks a [`FieldSet`](@ref)
+over it stores; over a distributed forest a field set stores the
+`length(blockrange(forest))` blocks of this rank (see
+[`blockrange`](@ref)), so a per-block array is sized by
+[`nblocks`](@ref), never by `nleaves`.
 """
 nleaves(forest::Forest) = length(forest.leaves)
+
+"""
+    blockrange(forest::Forest) -> UnitRange{Int}
+
+The leaves whose blocks this rank stores: a contiguous range of
+`1:nleaves(forest)`, in curve order. Local block `b` of every
+[`FieldSet`](@ref) over `forest` is leaf `first(blockrange(forest)) + b - 1`,
+which is what [`blockkey`](@ref) returns.
+
+The ranges of the ranks tile `1:nleaves(forest)` in rank order, and their
+lengths differ by at most one, the longer ones first — the same
+equal-count arithmetic that splits a rank's blocks over its threads
+(`CODE.md`, "Distributed meshes"). Every block costs the same under one
+global time step, so equal counts are equal work. A rank beyond the
+number of leaves owns none, which is allowed. Serially this is
+`1:nleaves(forest)`, and local and global block indices coincide.
+"""
+blockrange(forest::Forest) =
+    equalsplit(nleaves(forest), commsize(forest.comm), commrank(forest.comm) + 1)
+
+# Whether the forest's field data are split over more than one rank —
+# what an operation that still needs messages, and does not have them
+# yet, refuses (M7 brings them step by step; "Distributed meshes" in
+# CODE.md).
+isdistributed(forest::Forest) = commsize(forest.comm) > 1
+
+function refuse_distributed(forest::Forest, what::AbstractString, why::AbstractString)
+    isdistributed(forest) || return nothing
+    throw(ArgumentError(
+        "$what over a forest distributed over $(commsize(forest.comm)) ranks is not " *
+        "implemented yet: $why. It arrives with M7 (see \"Distributed meshes\" in " *
+        "CODE.md); until then a distributed forest supports the partition, the " *
+        "field set storage, the geometry and the local schedule build."))
+end
 
 """
     maxlevel(forest::Forest)

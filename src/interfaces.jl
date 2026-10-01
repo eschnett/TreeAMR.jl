@@ -135,7 +135,10 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
         "centering is vertex-like in the face dimension (`facecentered($D, d)`), " *
         "not over the cell-centered state."))
     backend = get_backend(fs.work)
-    nb = nleaves(forest)
+    # This rank's blocks, in global leaf indices, as in `GhostSchedule`.
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    nb = length(owned)
 
     # Threaded over blocks and merged in chunk order, so the schedule is
     # a function of the tree alone — the same argument as in
@@ -144,13 +147,14 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     perpairs = [TransferPairs{D}() for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            interface_sources!(perpairs[c], forest, faces, b)
+            interface_sources!(perpairs[c], forest, faces, offset + b)
         end
     end
     pairs = TransferPairs{D}()
     for c in eachindex(chunks)
         merge_pairs!(pairs, perpairs[c])
     end
+    localize_pairs!(pairs, owned, nleaves(forest))
 
     GRP = grouptype(backend, T, Val(D))
     byface = Dict{Int,Vector{GRP}}()
@@ -200,9 +204,13 @@ function restrict_interfaces!(fs::FieldSet{T,D},
     isstale(isched) && throw(ArgumentError(
         "the forest changed since this interface schedule was built (generation " *
         "$(isched.generation) -> $(generation(isched.forest))); rebuild it"))
-    nblocks(fs) == nleaves(isched.forest) || throw(ArgumentError(
+    nblocks(fs) == length(blockrange(isched.forest)) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
-        "$(nleaves(isched.forest)) leaves; rebuild both"))
+        "$(length(blockrange(isched.forest))) on this rank; rebuild both"))
+    refuse_distributed(isched.forest, "restrict_interfaces!",
+                       "a coarse-fine face whose two sides lie on different ranks " *
+                       "needs the fine side's planes as a message, and the staged " *
+                       "exchange is step 3")
     fs.G == isched.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this interface schedule was " *
         "built for G=$(isched.G); every target plane in it is wrong for this " *

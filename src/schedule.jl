@@ -750,6 +750,37 @@ function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
     return into
 end
 
+# The transfers of `pairs`, collected in global leaf indices, in this
+# rank's local block indices (M7): those whose target and source both lie
+# in `range = blockrange(forest)`, with both shifted to local blocks, and
+# the boundary regions of the local targets likewise. Serially `range` is
+# every leaf and nothing changes. A transfer whose source is on another
+# rank is dropped here: it is a message, which step 2 of M7 classifies
+# into receives and sends, and until then the schedule of a distributed
+# forest is its local part only, which `fill_ghosts!` refuses to replay.
+function localize_pairs!(pairs::TransferPairs{D}, range::UnitRange{Int},
+                         n::Int) where {D}
+    range == 1:n && return pairs
+    offset = Int32(first(range) - 1)
+    for key in collect(keys(pairs))
+        targets, sources = pairs[key]
+        keep = [i for i in eachindex(targets) if sources[i] in range]
+        if isempty(keep)
+            delete!(pairs, key)
+        else
+            pairs[key] = (targets[keep] .- offset, sources[keep] .- offset)
+        end
+    end
+    return pairs
+end
+
+function localize_boundaries(boundaries::Vector{BoundaryRegion{D}},
+                             range::UnitRange{Int}) where {D}
+    offset = Int32(first(range) - 1)
+    iszero(offset) && return boundaries
+    return [BoundaryRegion{D}(r.block - offset, r.direction, r.region) for r in boundaries]
+end
+
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, T=T,
                   backend=get_backend(fs.work))
@@ -766,7 +797,12 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     check_operators(N, ghosts, stags, operators)
     check_floattype(T, backend)
     dirs = alldirections(Val(D))
-    nb = nleaves(forest)
+    # The targets are this rank's blocks (M7), walked in global leaf
+    # indices, since that is what the tree answers in; `localize_pairs!`
+    # turns them into local block indices below.
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    nb = length(owned)
 
     # Neighbor finding, threaded over blocks: it reads nothing but the
     # tree, and each task collects into buffers of its own. Those are
@@ -777,8 +813,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags, b,
-                           dirs)
+            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
+                           offset + b, dirs)
         end
     end
 
@@ -792,6 +828,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         merge_pairs!(pairs, perpairs[c])
         append!(boundaries, perboundaries[c])
     end
+    localize_pairs!(pairs, owned, nleaves(forest))
+    boundaries = localize_boundaries(boundaries, owned)
 
     # One dimension of a group's stencils. Along a masked dimension of a
     # mirror transfer the stencil is the ordinary *tangential* one with

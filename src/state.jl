@@ -455,16 +455,37 @@ end
 # `mapreduce(identity, op, values)` *without* `init`: `sum(v)` and
 # `mapreduce(identity, +, v)` are the same pairwise reduction bit for
 # bit, whereas `reduce(+, v; init)` is a sequential left fold — an
-# explicit `init` changes Base's association (measured, 2026-09-22). The
-# M7 `Allreduce` goes here and nowhere else.
+# explicit `init` changes Base's association (measured, 2026-09-22).
+#
+# The values are this rank's blocks, and the one cross-rank step of any
+# reduction is here and nowhere else (M7): every rank gathers each
+# rank's partial and folds them in rank order, so that the association
+# is the package's and the result the same on every rank. A rank with
+# no blocks contributes no partial rather than `init`, which need only
+# satisfy `op(init, init) == init` (`max` from 0 over negative data);
+# `init` comes back only when every rank is empty. At one rank the
+# partial is the result, exactly the serial value, and nothing is
+# gathered. See "Reductions" under "Distributed meshes" in CODE.md.
 function combine_blocks(op, init::R, fs::FieldSet, values::Vector{R}, weight) where {R}
     if weight !== nothing
         for b in eachindex(values)
             values[b] *= oftype(init, weight(blockkey(fs, b)))
         end
     end
-    isempty(values) && return init
-    return mapreduce(identity, op, values)
+    comm = fs.forest.comm
+    if commsize(comm) == 1
+        isempty(values) && return init
+        return mapreduce(identity, op, values)
+    end
+    partial = isempty(values) ? (false, init) : (true, mapreduce(identity, op, values))
+    partials = allgather(comm, partial)
+    acc, found = init, false
+    for (hasvalue, value) in partials
+        hasvalue || continue
+        acc = found ? op(acc, value) : value
+        found = true
+    end
+    return acc
 end
 
 """

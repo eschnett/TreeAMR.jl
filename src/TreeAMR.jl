@@ -54,8 +54,12 @@ export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
 # Checkpoint and restart (M9a)
 export save_checkpoint, load_checkpoint, write_plain, read_plain, checkpoint_environment
 
+# Distributed meshes (M7)
+export communicator, blockrange
+
 include("threading.jl")
 include("device.jl")
+include("communicator.jl")
 include("morton.jl")
 include("forest.jl")
 include("geometry.jl")

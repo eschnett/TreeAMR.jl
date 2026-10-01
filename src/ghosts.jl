@@ -394,7 +394,7 @@ function apply_boundary!(fs::FieldSet{T,D}, hook,
                          schedule::GhostSchedule{T,D}, backend::CPU) where {T,D}
     threaded_foreach(length(schedule.boundaries)) do i
         region = schedule.boundaries[i]
-        hook(fs, Int(region.block), fs.forest.leaves[region.block],
+        hook(fs, Int(region.block), blockkey(fs, region.block),
              region.direction, region.region)
     end
     return nothing
@@ -463,9 +463,13 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     isstale(schedule) && throw(ArgumentError(
         "the forest changed since this schedule was built (generation " *
         "$(schedule.generation) -> $(generation(schedule.forest))); rebuild it"))
-    nblocks(fs) == nleaves(schedule.forest) || throw(ArgumentError(
+    nblocks(fs) == length(blockrange(schedule.forest)) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
-        "$(nleaves(schedule.forest)) leaves; rebuild both"))
+        "$(length(blockrange(schedule.forest))) on this rank; rebuild both"))
+    refuse_distributed(schedule.forest, "fill_ghosts!",
+                       "a ghost whose source block lies on another rank needs a " *
+                       "message, and the schedule built here holds only the " *
+                       "transfers local to this rank; the staged exchange is step 3")
     fs.G == schedule.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this schedule was built for " *
         "G=$(schedule.G); every target range and stencil in it is wrong for this " *

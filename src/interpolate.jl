@@ -356,9 +356,11 @@ end
 """
     locate_point(forest, x) -> Union{Int,Nothing}
 
-The index into `forest.leaves` — and so the block index of every
-[`FieldSet`](@ref) over `forest` — of the leaf containing the point `x`,
-or `nothing` when `x` is outside the domain.
+The index into `forest.leaves` of the leaf containing the point `x`, or
+`nothing` when `x` is outside the domain. It is a global leaf index, as
+every tree query's is: serially it is also the block index of every
+[`FieldSet`](@ref) over `forest`, and over a distributed forest the
+block is stored by the rank whose [`blockrange`](@ref) contains it.
 
 Leaves own half-open boxes, so a point on a face shared by two leaves
 belongs to the upper one; a point on the domain's upper face belongs to
@@ -688,6 +690,9 @@ function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldS
             "a point in a $D-dimensional field set has $D coordinates, got " *
             "$(length(first(xs)))"))
     end
+    refuse_distributed(fs.forest, "interpolate",
+                       "a point whose block lies on another rank has to be routed to " *
+                       "that rank and its values back, which is step 5")
     npts == 0 && return values, excluded
 
     forest = fs.forest

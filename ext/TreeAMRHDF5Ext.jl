@@ -31,7 +31,7 @@ using HDF5: HDF5, API, h5open, create_group, create_dataset, dataspace, attribut
             read_attribute, write_attribute, write_dataset
 using KernelAbstractions: CPU, Backend, get_backend
 using TreeAMR
-using TreeAMR: threaded_foreach, tohost, samebackend
+using TreeAMR: threaded_foreach, tohost, samebackend, refuse_distributed
 import TreeAMR: save_checkpoint, load_checkpoint, write_plain, read_plain,
                 checkpoint_environment
 
@@ -649,6 +649,9 @@ function save_checkpoint(f, path::AbstractString, forest::Forest; fieldsets=noth
         "application evolves, as `name => (fs, u)` pairs, or `()` for none. Which sets " *
         "are state and which are scratch, rebuilt every step, is the application's to " *
         "say."))
+    refuse_distributed(forest, "save_checkpoint",
+                       "each rank holds only its own blocks, and writing them into one " *
+                       "shared file needs parallel HDF5, which is step 6")
     appname, appversion = check_application(application)
     sets = collect_fieldsets(fieldsets, forest)
     storage_of(floattype(forest), "the forest's geometry")

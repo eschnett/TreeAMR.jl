@@ -52,15 +52,21 @@ function threadchunks(n::Integer)
     n <= 0 && return UnitRange{Int}[]
     ntasks = min(Threads.nthreads(), n)
     ntasks <= 1 && return [1:n]
-    len, extra = divrem(n, ntasks)
-    ranges = Vector{UnitRange{Int}}(undef, ntasks)
-    lo = 1
-    for t in 1:ntasks
-        hi = lo + len - 1 + (t <= extra)
-        ranges[t] = lo:hi
-        lo = hi + 1
-    end
-    return ranges
+    return [equalsplit(n, ntasks, t) for t in 1:ntasks]
+end
+
+# `1:n` split into `p` contiguous ranges whose lengths differ by at most
+# one, the longer ones first: `divrem`, with the remainder going to the
+# first parts, and part `i` returned in O(1) for `i in 1:p` without the
+# others being formed. A part beyond `n` is empty. This is the one piece
+# of arithmetic behind both the thread split (`threadchunks`) and the
+# rank split (`blockrange`, M7), so that the two are the same contiguous
+# curve ranges one level apart (`CODE.md`, "Distributed meshes"); a
+# cost-weighted split would change only this function.
+function equalsplit(n::Int, p::Int, i::Int)
+    len, extra = divrem(n, p)
+    lo = 1 + (i - 1) * len + min(i - 1, extra)
+    return lo:(lo + len - 1 + (i <= extra))
 end
 
 """
@@ -159,6 +165,8 @@ launch falls back to the default schedule and simply loses the affinity.
 A device backend is launched as it always was.
 """
 function launch_by_owner!(kernel, backend::Backend, args...; ndrange)
+    # A rank without blocks (M7) launches nothing.
+    any(iszero, ndrange) && return nothing
     kernel(backend)(args...; ndrange=ndrange)
     return nothing
 end

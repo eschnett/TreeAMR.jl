@@ -22,8 +22,9 @@ siblings ask for it *and* balance still permits — see
 """
     flag_blocks(f, forest) -> Vector
 
-Build a flag vector by calling `f(b, key)` for every leaf, with `b` the
-block index and `key` its [`MortonKey`](@ref).
+Build a flag vector by calling `f(b, key)` for every block this rank
+stores, with `b` the local block index and `key` its [`MortonKey`](@ref)
+— serially, for every leaf (see [`blockrange`](@ref)).
 
 `f` may return either a bare [`RegridFlag`](@ref) or a
 `(flag, box)` pair, where `box::NTuple{D,UnitRange{Int}}` is the
@@ -41,9 +42,11 @@ the vector any other way, which is what will let the flagging kernel run
 on the device in M6 while the completion logic stays on the host.
 """
 function flag_blocks(f, forest::Forest)
-    out = Vector{Any}(undef, nleaves(forest))
-    threaded_foreach(nleaves(forest)) do b
-        out[b] = f(b, forest.leaves[b])
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    out = Vector{Any}(undef, length(owned))
+    threaded_foreach(length(owned)) do b
+        out[b] = f(b, forest.leaves[offset + b])
     end
     # The element type has to come from the values, not from `f`: the
     # bare and `(flag, box)` forms may be mixed within one vector.
@@ -154,7 +157,7 @@ refinement level reads
 ```julia
 flags = map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
     n == 0 && return Coarsen
-    level(forest.leaves[b]) < lmax ? (Refine, box) : (Keep, box)
+    level(blockkey(fs, b)) < lmax ? (Refine, box) : (Keep, box)
 end
 ```
 
@@ -177,6 +180,7 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
     n = nblocks(fs)
+    n == 0 && return Tuple{Int,NTuple{D,UnitRange{Int}}}[]   # a rank without blocks
     W = REDUCE_LANES
     lcounts = allocate(backend, Int32, (W, n))
     llos = allocate(backend, NTuple{D,Int32}, (W, n))
@@ -380,9 +384,12 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector;
         end
     end
 
-    # Balance the candidate tree without disturbing the live one.
+    # Balance the candidate tree without disturbing the live one. It
+    # carries the live forest's communicator, so that it is the forest
+    # the ranks will hold; balancing sends nothing, since every rank
+    # holds the whole tree and arrives at the same leaves.
     scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
-                             forest.extents, forest.N, candidate, Ref(0))
+                             forest.extents, forest.N, candidate, Ref(0), forest.comm)
     balance!(scratch)
     return scratch.leaves
 end
@@ -480,8 +487,8 @@ over `forest` and each schedule the current one *for that field set*
 layout, so a bare field set no longer says which schedule moves it).
 Every set's storage is replaced in place, so references an application
 already holds stay valid, but **block indices do not survive**: slots
-are compacted, and `forest.leaves[b]` is the only way to say which block
-is which.
+are compacted, and [`blockkey`](@ref)`(fs, b)` is the only way to say
+which block is which.
 
 The target of every transfer is the new block's **owned** range, whatever
 the centering: a fresh block's shared boundary plane and its ghosts are
@@ -524,9 +531,9 @@ function regrid!(forest::Forest{D}, pairs;
         fs, sched = p
         fs.forest === forest || throw(ArgumentError(
             "every field set must be over the forest being regridded"))
-        nblocks(fs) == nleaves(forest) || throw(ArgumentError(
+        nblocks(fs) == length(blockrange(forest)) || throw(ArgumentError(
             "field set has $(nblocks(fs)) blocks but the forest has " *
-            "$(nleaves(forest)) leaves"))
+            "$(length(blockrange(forest))) on this rank"))
         sched === nothing && continue
         sched.forest === forest || throw(ArgumentError(
             "schedule was built for a different forest"))
@@ -540,6 +547,11 @@ function regrid!(forest::Forest{D}, pairs;
             "built for $(sched.centering); pair each field set with its own " *
             "schedule"))
     end
+
+    refuse_distributed(forest, "regrid!",
+                       "the flags are per local block and have to be gathered into " *
+                       "the global vector, and a block that changes owner moves as a " *
+                       "message; the distributed regrid is step 4")
 
     oldleaves = copy(forest.leaves)
     newleaves = complete_marks(forest, flags; buffer=buffer)
