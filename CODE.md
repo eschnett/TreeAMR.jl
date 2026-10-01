@@ -3474,8 +3474,9 @@ included, which is what "No coordinates, and no partition" was for.
   [Checkpoint and restart](#checkpoint-and-restart)). Attribute values
   must agree, so the provenance is formed on rank 0 and broadcast,
   since `created`, `hostname` and `nthreads` differ between ranks. It
-  gains `nranks`, an additive field whose obvious default for an older
-  file is 1, so the format does not change.
+  gains `nranks` (decided 2026-10-01 with Erik), an additive field
+  whose obvious default for an older file is 1, so the format does not
+  change.
 - *Raw data by hyperslab.* Each rank writes and reads the last-axis
   hyperslab of its own blocks, `blockrange`, in every dataset: the leaf
   columns `root`, `level` and `coords`, and each field set's `data`.
