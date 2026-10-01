@@ -21,6 +21,11 @@ struct PartitionCommunicator <: TreeAMR.Communicator
 end
 TreeAMR.commrank(c::PartitionCommunicator) = c.rank
 TreeAMR.commsize(c::PartitionCommunicator) = c.size
+# A schedule build gathers every rank's forest digest (step 3). The
+# ranks simulated here are copies of one serial forest, built through
+# `rank_forest`, so every rank's digest is the one this rank holds: the
+# fake answers that one gather, and only it.
+TreeAMR.allgather(c::PartitionCommunicator, d::TreeAMR.ForestDigest) = fill(d, c.size)
 
 # The forest `serial` as rank `r` of `P` holds it: the same leaves, the
 # same brick, through the validated `leaves` path.
@@ -202,21 +207,19 @@ end
 end
 
 @testset "What needs a message refuses a distributed forest, and says why" begin
-    # Until the exchange, the regrid, the routing and the parallel file
-    # exist, an operation that needs one must refuse rather than act on
-    # this rank's blocks as if they were the whole mesh — a ghost fill
-    # that silently skipped every remote source would look like a fill.
+    # Until the regrid, the routing and the parallel file exist, an
+    # operation that needs one must refuse rather than act on this rank's
+    # blocks as if they were the whole mesh — a regrid that silently
+    # skipped every remote source would look like a regrid. The exchange
+    # exists from step 3 on, so a ghost fill gets as far as its first
+    # message, which a communicator answering only rank and size refuses
+    # by verb.
     serial = nested_forest(Val(2); N=8)
     forest = rank_forest(serial, 1, 3)
     fs = FieldSet(forest, 1; G=2)
     ops = Operators(prolongation=4, restriction=4)
     sched = GhostSchedule(fs, ops)
-    @test_throws "fill_ghosts! over a forest distributed over 3 ranks" fill_ghosts!(fs,
-                                                                                  sched)
-    @test_throws "step 3" fill_ghosts!(fs, sched)
-    flux = FieldSet(forest, 1; G=0, centering=facecentered(2, 1))
-    @test_throws "restrict_interfaces! over a forest distributed" restrict_interfaces!(
-        flux, InterfaceSchedule(flux))
+    @test_throws "does not implement `irecv`" fill_ghosts!(fs, sched)
     flags = fill(Keep, nblocks(fs))
     @test_throws "regrid! over a forest distributed" regrid!(forest, fs => sched;
                                                              flags=flags)

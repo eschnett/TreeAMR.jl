@@ -3101,7 +3101,13 @@ Three details follow from this:
   a test that builds a thousand forests over `COMM_WORLD` holds one
   duplicate and not a thousand. MPICH_jll 5.0.2 gives a process 2046
   duplicates and then fails (measured 2026-10-01, on Julia 1.11 and
-  1.13).
+  1.13). *(Step 3: MPI.jl's own `Comm_dup` attaches a finalizer that
+  frees the duplicate, so the extension calls `MPI_Comm_dup` through
+  `MPI.API` and attaches none. The cache is keyed by the handle; since
+  MPI may reuse a handle once the application frees its communicator, a
+  hit is used only while `MPI_Comm_compare` still finds the duplicate
+  `CONGRUENT` with the communicator passed — a local call whose answer
+  is the same on every rank of the group.)*
 - *MPI is called from the calling task only*, never inside a threaded
   loop or a kernel. A Julia task may still migrate between OS threads
   between two calls, so the extension requires
@@ -3127,6 +3133,36 @@ from the fields. A forest whose digest differs between ranks is
 refused, naming the ranks and saying that every forest mutation is
 collective. At regrid frequency that is one `O(nleaves)` pass and one
 collective.
+
+*(Amended in step 3, where the check was implemented.)*
+
+- *Not `hash(forest.leaves)`.* Base's hash of a long vector samples its
+  elements rather than reading them all: on Julia 1.11 and 1.13 alike,
+  zeroing element 50001 of `collect(1:100_000)` leaves the hash
+  unchanged (checked). So the digest folds `hash(key, h)` over every
+  leaf.
+- *It carries the brick and the layout too.* The brick (roots, `N`,
+  the periodic and reflecting faces, the extents) is hashed through its
+  printed form. Beside it goes a hash of the layout the schedule is
+  built for — the ghost widths, the centering, the operator family and
+  orders, the element type and the backend's name — since a rank that
+  built its stencils for other operators would deliver wrong ghosts as
+  silently as a diverged forest. Every hash is of integers and strings,
+  never of a `Symbol` or an object identity, which differ between
+  processes. A layout that differs is refused with a reason of its own.
+- *A refusal on some ranks is a refusal on all.* A schedule's argument
+  checks run before the gather; a rank whose checks refuse sets a flag
+  in its digest instead of throwing at once, and after the gather it
+  throws its own error while every other rank throws one naming the
+  ranks that refused. Without that, one rank's `ArgumentError` would
+  leave the others waiting in the gather, or in their first exchange.
+  Only `ArgumentError`s are agreed this way; anything else is a bug and
+  is rethrown at once.
+- *Serially nothing is gathered*: a forest over one rank skips the
+  digest and its `O(nleaves)` pass, so a serial build is unchanged.
+- *The verdict is the same on every rank* because it is computed from
+  the same gathered digests: the message names rank 0's forest and the
+  ranks that differ from it, whichever rank prints it.
 
 **The partition** (decided). Rank `r` owns the contiguous leaf range
 `blockrange(forest)`, an equal-count split of `1:nleaves(forest)` over
@@ -3405,6 +3441,14 @@ Three consequences:
   `init = 0` is right serially, and would be wrong if an empty rank's
   `0` entered the fold. Each rank therefore gathers `(hasvalue, value)`, and the fold
   skips the empty ones; `init` is returned only if every rank is empty.
+  *(Amended in step 3: the example is wrong. `init` starts every
+  block's fold, so with an associative `op` and `op(init, init) ==
+  init`, one more `init` cannot change the result: `max` from 0 over
+  negative data is 0 on every rank count. What an empty rank's `init`
+  would change is a weighted reduction, since the weight scales a
+  block's value and not `init`: `max` from 1 over values below 1,
+  weight ½, is ½, and 1 with an empty rank's `init` in the fold. The
+  workload checks exactly that, at a rank count with an empty rank.)*
 - **What is exact.** Max, min and integer reductions are bit-identical
   across rank counts. A floating-point sum is reproducible to roundoff,
   since each rank's partial is associated differently when the
@@ -4482,6 +4526,114 @@ M7's benchmarks. The list below is in execution order.
     the digest check refuses a forest mutated on one rank only, on
     every rank; and what the subprocesses add to the suite is measured,
     with the rank counts trimmed if it is large.
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan:
+    - *The extension.* `ext/TreeAMRMPIExt.jl` defines `MPICommunicator`
+      (the duplicate, with its rank and size read once) and one method
+      per verb, each a single MPI.jl call: `MPI.Allgather` of the
+      `isbits` value, `Allgatherv!` after a gather of the lengths,
+      `Alltoallv!` after an `Alltoall` of the counts, `Isend`, `Irecv!`
+      and `Waitall`. `communicator(::MPI.Comm)` refuses MPI not
+      initialized (or finalized), `COMM_NULL` and a thread level below
+      `THREAD_SERIALIZED`, each saying what to do; the duplicate and its
+      cache are as amended under "The communicator layer". A message
+      buffer must be an `Array` or a `UnitRange` view of one, which
+      MPI.jl passes as a pointer and a count: the exchange's per-peer
+      segments are exactly such views, and anything else is refused
+      rather than sent as a derived datatype. The fill and the
+      interface restriction lose their refusals and run through
+      `run_stage!` unchanged from step 2; the reduction needed nothing,
+      since step 1 had written it.
+    - *The digest*, in `forest.jl` (`ForestDigest`, `agree_on_forest`,
+      `digest_verdict`, `collective_checks`), as amended under "Every
+      forest mutation is collective": a fold over every leaf, the brick,
+      the layout, and a refusal flag, so that a refusal on some ranks is
+      raised on all. `GhostSchedule` and `InterfaceSchedule` run their
+      argument checks through `collective_checks`; `regrid!` will in
+      step 4. The in-process fakes of steps 1 and 2 answer the digest
+      gather alone, by replication — their ranks are copies of one
+      forest — so they still refuse every other verb they lack.
+    - *The workload.* `test/mpi_workload.jl` prints, on rank 0, lines
+      that do not depend on the rank count: per case the leaf count, the
+      maximum level and a digest of the leaves; the serial transfer
+      count, as the sum over ranks of local and received transfers, and
+      whether the totals sent and received agree; digests, gathered to
+      every rank in block order, of the working arrays *with their
+      ghosts* after a fill, of the state after the steps, and of the
+      working arrays after a last fill; and the reductions — a count,
+      `linf`, `min`, a `max` of negative data and a weighted `max` from a
+      non-neutral `init` exactly, the norm and the mass on `sum` lines.
+      The cases: the cell-centered wave in 1D on two periodic leaves,
+      which leaves a rank empty at `-n 3`, and on three levels against
+      outer faces; the vertex-centered wave in 2D on three levels with
+      the hook; the cell-centered wave in 3D, periodic, three levels; a
+      reflecting box in 2D, vertex-centered with walls at both ends
+      (the derived wall plane) and cell-centered with low walls, the
+      first variable odd across x₁; Burgers in 2D on three levels with
+      the fixup, the fluxes digested after it and mass conservation
+      asserted; and every centering through one fill and, where a
+      dimension is vertex-like, one interface restriction — cell,
+      vertex and both faces in 2D, vertex, a face and an edge in 3D —
+      over pseudo-random data that is a function of the global leaf and
+      the stored index, so that no stencil reproduces it by accident
+      and the injection at a vertex-like face is not a no-op. Lines
+      starting with `#` depend on the rank count and are checked on
+      their own: the refusals, the duplicate cache, `alltoallv` and
+      `allgatherv` with empty contributions, and the negative control.
+      Without the argument `mpi` the forests are serial.
+    - *The test.* `test/mpi_tests.jl` runs the serial reference in
+      process (the script in a module of its own, printing into a
+      buffer), then `MPI.mpiexec()` at `-n 2` and `-n 3`, one thread a
+      rank, with `Base.julia_cmd()` and the active project, under a
+      deadline, and compares: every line byte for byte except the `sum`
+      lines, within `rtol = 1e-12`. It checks the comparison itself on
+      the serial output (a flipped digest character is caught, a sum
+      moved by `10⁻⁹` is caught, one moved by three ulps is not). The
+      negative control rewrites one rank's received ghosts from its last
+      receive buffer with one value moved by an ulp, and asserts that
+      the gathered digest changes. The refusals are a `refine!` on rank
+      1 only (`GhostSchedule`) and on rank 0 only
+      (`InterfaceSchedule`), other operators on rank 1, and an argument
+      only rank 1's checks refuse; each is raised on every rank, and the
+      test asserts the reasons. In process, the verdict is tested on
+      digests of real forests, and a forest over `COMM_WORLD` in a
+      process without `MPI.Init` is refused.
+    - *The launcher's environment.* `MPI.mpiexec()` returns a `Cmd`
+      carrying an environment — the library paths of the MPI binary —
+      which interpolating it into a larger command drops. The test
+      launches `setenv(cmd, mpiexec().env)`.
+    - *What was measured.* At `-n 2`, `-n 3` and `-n 4` with one thread
+      a rank, and at `-n 3` with two, every line agrees with the serial
+      run byte for byte except the `sum` lines, which differ in the last
+      one or two digits of 17 where they differ at all (`l2`, `mass`;
+      Burgers' mass 16 against 15.999999999999998); at `-n 1` the output
+      is the serial output exactly. Each `mpiexec` run of the workload
+      takes 27–29 s of wall clock at any of these rank counts, and the
+      serial run 25 s, nearly all of it compilation. Inside the suite
+      `mpi_tests.jl` takes 58.4 s at one thread and 58.9 s at eight
+      (timed around its `include`): the serial reference in process,
+      which reuses the suite's compiled kernels, and the two `mpiexec`
+      runs. That is the minute "What an MPI test costs" predicted, so the
+      rank counts were not trimmed.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 resolves
+      MPI.jl 0.20.27 with MPICH_jll (its global environment's preference),
+      against MPIABI_jll on 1.13.1 here, where the global v1.13
+      `LocalPreferences.toml` selects it; `Pkg.test` copies the merged
+      preferences of the load path into its sandbox (Pkg's
+      `Operations.jl`, read, not measured), so the suite's ranks run the
+      same binary as its `MPI.mpiexec()` either way. `mpi_tests.jl` alone
+      passes there (32 tests, 1m04), and so does the whole suite, 108376
+      tests in 5m08.
+    - *Suite cost.* 108376 tests at one thread, in 6m10 and 6m00 over
+      two runs, and 108428 at eight, in 6m01. The increase over step 2's
+      108338 and 108390 is 38: the 32 of `mpi_tests.jl` and the 16 of the
+      in-process verdict test, less a net 10 in the refusal assertions
+      steps 1 and 2 made of `fill_ghosts!` and `restrict_interfaces!`
+      over a distributed forest (11 removed, and one added: a fill over
+      a communicator that answers rank and size alone now stops at
+      `irecv`, by name). The thread-independence digests are
+      unchanged. The docs build.
   - **Step 4 — the distributed regrid.** The flag gather, the transfer
     stage with the repartitioning, and `adapt_to_initial_data!`.
     *Accept:* the tracked pulse and the Burgers shock through regrid

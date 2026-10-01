@@ -10,8 +10,8 @@
 # branches on whether MPI is loaded, and a serial run takes the
 # distributed code path with every message empty.
 #
-# The MPI methods will live in a package extension, `TreeAMRMPIExt`,
-# for the reason HDF5 does: an application that never runs distributed
+# The MPI methods live in a package extension, `ext/TreeAMRMPIExt.jl`,
+# for the reason HDF5's do: an application that never runs distributed
 # should not load MPI.
 
 """
@@ -55,9 +55,23 @@ The package's view of an application's communicator: what a
 and `nothing` — the keyword's default — is a
 [`SerialCommunicator`](@ref TreeAMR.SerialCommunicator).
 With MPI.jl loaded beside TreeAMR, an `MPI.Comm` such as
-`MPI.COMM_WORLD` is converted by the MPI extension (M7, from its step 3
-on), which duplicates it once per communicator so that the package's
-messages can never match the application's.
+`MPI.COMM_WORLD` is converted by the MPI extension, which loads with
+MPI. Three things hold for it (see "Distributed meshes" in `CODE.md`):
+
+- The package's messages travel over a *duplicate* of the communicator,
+  so they can never match the application's. `MPI_Comm_dup` is
+  collective, so the duplicate is made once per communicator and cached
+  for the life of the process: every forest over `MPI.COMM_WORLD` shares
+  one. It is never freed, since `MPI_Comm_free` is collective too and a
+  finalizer runs at a different moment on each rank.
+- MPI must be initialized, at `MPI.THREAD_SERIALIZED` or better, which
+  is what `MPI.Init()` asks for by default. The package calls MPI from
+  the calling task only, never from a threaded loop or a kernel, but a
+  Julia task can move between OS threads between two calls.
+- Everything over such a forest that communicates is collective: every
+  rank makes the same calls, in the same order, from one task at a time.
+  That covers the forest mutations, the schedule builds, the ghost fill,
+  the interface restriction and the reductions.
 """
 communicator(comm::Communicator) = comm
 communicator(::Nothing) = SerialCommunicator()

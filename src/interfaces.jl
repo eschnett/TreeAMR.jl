@@ -127,15 +127,19 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     N = forest.N
     ghosts = fs.G
     stags = staggers(fs)
-    faces = filter(d -> stags[d] == 1, collect(1:D))
-    isempty(faces) && throw(ArgumentError(
-        "a cell-centered field set has no coarse-fine interface to restrict: the " *
-        "fixup replaces the values lying *on* a block's boundary face, and a " *
-        "cell-centered field has none — its values sit half a cell in from every " *
-        "face. Build it over the field set that holds the face quantity, whose " *
-        "centering is vertex-like in the face dimension (`facecentered($D, d)`), " *
-        "not over the cell-centered state."))
     backend = get_backend(fs.work)
+    # Collective over a distributed forest (M7), as `GhostSchedule` is.
+    faces::Vector{Int} = collective_checks(forest, "InterfaceSchedule") do
+        fd = filter(d -> stags[d] == 1, collect(1:D))
+        isempty(fd) && throw(ArgumentError(
+            "a cell-centered field set has no coarse-fine interface to restrict: the " *
+            "fixup replaces the values lying *on* a block's boundary face, and a " *
+            "cell-centered field has none — its values sit half a cell in from every " *
+            "face. Build it over the field set that holds the face quantity, whose " *
+            "centering is vertex-like in the face dimension (`facecentered($D, d)`), " *
+            "not over the cell-centered state."))
+        return fd, layouthash(ghosts, fs.centering, T, nameof(typeof(backend)))
+    end
     # This rank's blocks, in global leaf indices, as in `GhostSchedule`.
     owned = blockrange(forest)
     offset = first(owned) - 1
@@ -210,6 +214,12 @@ The phases (one per face dimension) run in ascending order with a barrier
 between them, exactly as [`fill_ghosts!`](@ref)'s do. It touches neither
 ghosts nor interior values away from a coarse-fine face, so the field set
 it runs over may have `G = 0`.
+
+Over a distributed forest it is collective, as `fill_ghosts!` is: a fine
+side on another rank computes its restricted plane there and sends it,
+and the result is bit for bit the serial one. Building the
+[`InterfaceSchedule`](@ref) is collective too, and refuses a forest or a
+layout that differs between ranks, on every rank.
 """
 function restrict_interfaces!(fs::FieldSet{T,D},
                               isched::InterfaceSchedule{T,D}) where {T,D}
@@ -221,11 +231,6 @@ function restrict_interfaces!(fs::FieldSet{T,D},
     nblocks(fs) == length(blockrange(isched.forest)) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
         "$(length(blockrange(isched.forest))) on this rank; rebuild both"))
-    refuse_distributed(isched.forest, "restrict_interfaces!",
-                       "a coarse-fine face whose two sides lie on different ranks " *
-                       "needs the fine side's planes as a message; the schedule holds " *
-                       "the stages and their buffers, but the messages between ranks " *
-                       "are step 3")
     fs.G == isched.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this interface schedule was " *
         "built for G=$(isched.G); every target plane in it is wrong for this " *

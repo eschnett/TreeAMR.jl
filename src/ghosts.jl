@@ -632,6 +632,15 @@ the price of a uniform `N^D` state layout for every centering; see
     interpolation. The hook may therefore read the block's interior
     (as an extrapolating condition does) but not other blocks' ghosts.
 
+!!! note "Over a distributed forest"
+    The fill is collective (M7): every rank calls it, with its own field
+    set over its own blocks, in the same order relative to the other
+    collective calls. A ghost whose source block lives on another rank is
+    computed there and sent; the hook runs on each rank for its own
+    blocks, in the same place as serially. The ghosts come out bit for
+    bit as a serial fill writes them, whatever the number of ranks. Two
+    fills over one forest must not run concurrently from two tasks.
+
 !!! note "The hook is called concurrently"
     The boundary regions are a parallel loop like every other phase
     (M5): the hook runs on several threads at once, once per region.
@@ -649,11 +658,6 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     nblocks(fs) == length(blockrange(schedule.forest)) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
         "$(length(blockrange(schedule.forest))) on this rank; rebuild both"))
-    refuse_distributed(schedule.forest, "fill_ghosts!",
-                       "a ghost whose source block lies on another rank needs a " *
-                       "message; the schedule holds the stages, what this rank packs " *
-                       "and unpacks in each, and their buffers, but the messages " *
-                       "between ranks are step 3")
     fs.G == schedule.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this schedule was built for " *
         "G=$(schedule.G); every target range and stencil in it is wrong for this " *

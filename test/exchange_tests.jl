@@ -566,6 +566,10 @@ struct MailboxCommunicator <: TreeAMR.Communicator
 end
 TreeAMR.commrank(c::MailboxCommunicator) = c.rank
 TreeAMR.commsize(c::MailboxCommunicator) = c.size
+# The schedules are built one rank after another, so the digest gather
+# cannot be a real collective here; the forests are copies of one, as in
+# `PartitionCommunicator`'s.
+TreeAMR.allgather(c::MailboxCommunicator, d::TreeAMR.ForestDigest) = fill(d, c.size)
 
 mailbox_channel(box, from, to, tag) =
     lock(box.lock) do
@@ -633,10 +637,10 @@ end
             fs
         end
         scheds = [GhostSchedule(fs, XOPS4) for fs in sets]
-        # `fill_ghosts!` itself still refuses: the messages are step 3.
-        @test_throws "step 3" fill_ghosts!(sets[1], scheds[1]; boundary=hook)
+        # Through `fill_ghosts!` itself, which runs a distributed forest
+        # from step 3 on.
         @sync for r in 1:P
-            @async exchange_ghosts!(sets[r], scheds[r], hook, CPU())
+            @async fill_ghosts!(sets[r], scheds[r]; boundary=hook)
         end
         @test box.nmessages > 0
         @test all(isempty ∘ last, box.channels)          # every message consumed
@@ -658,7 +662,7 @@ end
         ischeds = [InterfaceSchedule(fs) for fs in fluxes]
         before = box.nmessages
         @sync for r in 1:P
-            @async exchange_interfaces!(fluxes[r], ischeds[r], CPU())
+            @async restrict_interfaces!(fluxes[r], ischeds[r])
         end
         @test box.nmessages > before
         @test all(r -> bitwise_equal(fluxes[r].work,
@@ -683,4 +687,56 @@ end
     distributed = GhostSchedule(FieldSet(rank_forest(forest, 0, 3), 1; G=2,
                                          parity=[OddParity]), XOPS4)
     @test occursin("transfers sent and", sprint(show, distributed))
+end
+
+using TreeAMR: ForestDigest, digest_verdict, layouthash
+
+@testset "A forest or layout that differs between ranks is refused on every rank" begin
+    # Every forest mutation is collective, and the ranks' forests agree
+    # without a message only if the application kept that contract. A
+    # schedule over forests that diverged would exchange the wrong data
+    # silently, so the build gathers each rank's digest and every rank
+    # reaches the same verdict from the same gathered values. The verdict
+    # is checked here on digests of real forests; `mpi_tests.jl` checks
+    # it over MPI, where one rank refines on its own.
+    forest = faces_forest((:outer, :outer); N=8)
+    other = faces_forest((:outer, :outer); N=8)
+    refine!(other, [other.leaves[1]])
+    balance!(other)
+    layout = layouthash((2, 2), (:cell, :cell))
+    same = ForestDigest(forest, layout, false)
+    @test digest_verdict(fill(same, 3), "GhostSchedule", 1) === nothing
+    # The fold covers every leaf, not the samples `hash(::Vector)` takes.
+    @test ForestDigest(other, layout, false).leaves != same.leaves
+    diverged = [same, same, ForestDigest(other, layout, false)]
+    for r in 0:2
+        @test_throws "the forest differs between ranks" digest_verdict(diverged,
+                                                                       "GhostSchedule", r)
+        @test_throws "rank(s) 2 hold a different one" digest_verdict(diverged,
+                                                                     "GhostSchedule", r)
+        @test_throws "is collective" digest_verdict(diverged, "GhostSchedule", r)
+    end
+    # Every rank throws the same message, whichever rank it is.
+    message(r) = try
+        digest_verdict(diverged, "GhostSchedule", r)
+    catch err
+        err.msg
+    end
+    @test message(0) == message(1) == message(2)
+    # A generation differs even when the leaves agree: a refine undone by
+    # a coarsen on one rank only.
+    bumped = ForestDigest(same.generation + 1, same.nleaves, same.leaves, same.brick,
+                          same.layout, false)
+    @test_throws "generation" digest_verdict([same, bumped], "GhostSchedule", 0)
+    # Another layout on one rank.
+    odd = ForestDigest(forest, layouthash((1, 1), (:cell, :cell)), false)
+    @test_throws "different layout on rank(s) 1" digest_verdict([same, odd, same],
+                                                                "GhostSchedule", 2)
+    # A rank whose own checks refused: it raises its own error, the others
+    # say which rank refused.
+    refused = ForestDigest(forest, UInt(0), true)
+    own = ArgumentError("its own reason")
+    @test_throws "its own reason" digest_verdict([same, refused], "GhostSchedule", 1, own)
+    @test_throws "refused on rank(s) 1 of 2" digest_verdict([same, refused],
+                                                            "GhostSchedule", 0)
 end

@@ -385,7 +385,123 @@ function refuse_distributed(forest::Forest, what::AbstractString, why::AbstractS
         "$what over a forest distributed over $(commsize(forest.comm)) ranks is not " *
         "implemented yet: $why. It arrives with M7 (see \"Distributed meshes\" in " *
         "CODE.md); until then a distributed forest supports the partition, the " *
-        "field set storage, the geometry and the local schedule build."))
+        "field set storage, the geometry, the ghost exchange, the interface " *
+        "restriction and the reductions."))
+end
+
+# --- The forest digest (M7) ----------------------------------------------
+#
+# Every forest mutation is collective, and every host pass is a
+# deterministic function of its inputs, so the ranks' forests agree
+# without a message — as long as the application kept the contract.
+# What would go wrong *silently* on a forest that diverged is checked:
+# a schedule build gathers every rank's digest and refuses, on every
+# rank together, if any differs ("Every forest mutation is collective"
+# in CODE.md). The digest is the generation, the leaf count, a fold of
+# every leaf's hash — not `hash(forest.leaves)`, which for a long
+# vector samples only some of the elements — and the brick. Beside it
+# goes a hash of the layout the build is for, since a rank that built
+# its stencils from other operators would deliver wrong ghosts as
+# silently, and a flag saying whether this rank's own argument checks
+# refused. Every hash here is of integers and strings, never of a
+# `Symbol` or an object identity, which differ between processes.
+struct ForestDigest
+    generation::Int
+    nleaves::Int
+    leaves::UInt
+    brick::UInt
+    layout::UInt
+    refused::Bool
+end
+
+function ForestDigest(forest::Forest, layout::UInt, refused::Bool)
+    h = hash(nleaves(forest))
+    for k in forest.leaves
+        h = hash(k, h)
+    end
+    brick = hash(string((forest.roots, forest.N, forest.periodic, forest.reflecting,
+                         forest.extents)))
+    return ForestDigest(generation(forest), nleaves(forest), h, brick, layout, refused)
+end
+
+sameforest(a::ForestDigest, b::ForestDigest) =
+    (a.generation, a.nleaves, a.leaves, a.brick) == (b.generation, b.nleaves, b.leaves,
+                                                     b.brick)
+
+# A hash of the values a build's layout is made of, for the digest.
+layouthash(values...) = hash(string(values))
+
+# Agree, across the ranks, that `what` may go ahead: one `allgather` of
+# the digest, then the same verdict on every rank. `refusal` is this
+# rank's own argument error, if its checks refused; a rank that refused
+# throws its own, and every other rank says which ranks refused, so no
+# rank goes on to wait in an exchange the others never enter. Serially
+# nothing is gathered and the refusal, if any, is thrown as it is.
+function agree_on_forest(forest::Forest, what::AbstractString;
+                         layout::UInt=UInt(0), refusal=nothing)
+    comm = forest.comm
+    if commsize(comm) == 1
+        refusal === nothing || throw(refusal)
+        return nothing
+    end
+    digests = allgather(comm, ForestDigest(forest, layout, refusal !== nothing))
+    return digest_verdict(digests, what, commrank(comm), refusal)
+end
+
+# The verdict on the gathered digests, apart from the gathering so that
+# it can be tested in one process.
+function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
+                        rank::Integer, refusal=nothing)
+    nranks = length(digests)
+    refused = [r - 1 for r in 1:nranks if digests[r].refused]
+    if !isempty(refused)
+        refusal === nothing || throw(refusal)
+        throw(ArgumentError(
+            "$what was refused on rank(s) $(join(refused, ", ")) of $nranks, and so " *
+            "on this one (rank $rank) too: the build is collective, and a rank that " *
+            "went on would wait for the others in its first exchange. The reason is " *
+            "in the error on rank $(first(refused)); the arguments evidently differ " *
+            "between ranks, which they must not."))
+    end
+    first_ = digests[1]
+    diverged = [r - 1 for r in 2:nranks if !sameforest(digests[r], first_)]
+    if !isempty(diverged)
+        describe(r) = (d = digests[r + 1];
+                       "rank $r has generation $(d.generation) and $(d.nleaves) leaves")
+        throw(ArgumentError(
+            "the forest differs between ranks, so $what is refused on every rank: " *
+            "$(describe(0)), but rank(s) $(join(diverged, ", ")) hold a different " *
+            "one ($(join(describe.(diverged), "; "))). Every forest mutation — the " *
+            "constructors, refine!, coarsen!, balance! and regrid! — is collective: " *
+            "the same call with the same arguments on every rank. Over forests that " *
+            "differ, the ranks would exchange the wrong data without noticing."))
+    end
+    mismatched = [r - 1 for r in 2:nranks if digests[r].layout != first_.layout]
+    isempty(mismatched) || throw(ArgumentError(
+        "$what was called for a different layout on rank(s) " *
+        "$(join(mismatched, ", ")) than on rank 0, so it is refused on every rank: " *
+        "the ghost widths, the centering, the operators and the element type must " *
+        "be the same everywhere, since a rank computes the ghosts it sends with its " *
+        "own stencils and lays out what it receives by its own."))
+    return nothing
+end
+
+# A collective build's argument checks: run `check`, which returns the
+# checked values and their `layouthash`, and agree on the forest and
+# the layout across the ranks before going on. A refusal on some ranks
+# only is raised on all of them (see `agree_on_forest`).
+function collective_checks(check, forest::Forest, what::AbstractString)
+    distributed = isdistributed(forest)
+    checked, refusal = try
+        check(), nothing
+    catch err
+        (distributed && err isa ArgumentError) || rethrow()
+        nothing, err
+    end
+    distributed || return first(checked)
+    agree_on_forest(forest, what; layout=checked === nothing ? UInt(0) : last(checked),
+                    refusal=refusal)
+    return first(checked)
 end
 
 """

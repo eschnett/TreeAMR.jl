@@ -435,6 +435,16 @@ are built on the host in exact rational arithmetic and uploaded once,
 here, rather than at every ghost fill. That is the same argument that
 put the exchange in a cached schedule in the first place, applied one
 level down.
+
+Over a distributed forest (M7) the build is collective. The ranks
+gather a digest of their forests — generation, leaf count, every leaf
+and the brick — and of the layout and operators asked for, and a forest
+that differs between ranks, or a layout, is refused on every rank
+together, saying which ranks differ: every forest mutation must be the
+same call on every rank, and over forests that differ the exchange would
+deliver the wrong data without noticing. An argument that one rank's
+checks refuse is refused on every rank too, so that no rank goes on to
+wait in an exchange the others never enter.
 """
 struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{D},
                      ST<:ExchangeStage{GRP}}
@@ -1119,12 +1129,21 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        centering=cellcentered(D),
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
-    ghosts = ghostwidths(G, Val(D))
-    centers = centerings(centering, Val(D))
-    stags = staggers(centers)
-    storedsize(N, ghosts, stags)                 # the N >= 2G[d] + 2c[d] invariant
-    check_operators(N, ghosts, stags, operators)
-    check_floattype(T, backend)
+    # The build is collective over a distributed forest (M7): the ranks
+    # agree that their forests and layouts are the same, and a refusal
+    # on any of them is raised on all of them.
+    checked = collective_checks(forest, "GhostSchedule") do
+        gs = ghostwidths(G, Val(D))
+        cs = centerings(centering, Val(D))
+        ss = staggers(cs)
+        storedsize(N, gs, ss)                    # the N >= 2G[d] + 2c[d] invariant
+        check_operators(N, gs, ss, operators)
+        check_floattype(T, backend)
+        layout = layouthash(gs, cs, Int(operators.family), operators.prolongation,
+                            operators.restriction, T, nameof(typeof(backend)))
+        return (gs, cs, ss), layout
+    end
+    ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int} = checked
     dirs = alldirections(Val(D))
     # The targets are this rank's blocks (M7), walked in global leaf
     # indices, since that is what the tree answers in; `split_received!`

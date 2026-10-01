@@ -590,6 +590,7 @@ include("imex_tests.jl")
 include("type_tests.jl")
 include("checkpoint_tests.jl")
 include("thread_tests.jl")
+include("mpi_tests.jl")
 include("gpu_tests.jl")
 
 end
