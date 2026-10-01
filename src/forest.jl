@@ -347,6 +347,32 @@ number of leaves owns none, which is allowed. Serially this is
 blockrange(forest::Forest) =
     equalsplit(nleaves(forest), commsize(forest.comm), commrank(forest.comm) + 1)
 
+# The rank whose blocks include global leaf `i` (M7): the inverse of
+# `blockrange`, from the same split arithmetic.
+leafowner(forest::Forest, i::Integer) =
+    equalsplit_part(nleaves(forest), commsize(forest.comm), Int(i)) - 1
+
+# The leaves outside `range` that touch a leaf inside it, as ascending
+# global leaf indices: the union of `neighbor_keys` over every direction
+# around the leaves of `range`. These are the *candidate remote targets*
+# of a distributed schedule (M7): adjacency is mutually discoverable, so
+# a leaf of another rank whose ghosts read one of this rank's blocks is
+# found from that block across some direction. Kept here because it is
+# brick knowledge, as `neighbor_keys` is. Empty when `range` is every
+# leaf, which is the serial case, without a search.
+function remote_neighbors(forest::Forest{D}, range::UnitRange{Int}) where {D}
+    length(range) == nleaves(forest) && return Int[]
+    dirs = alldirections(Val(D))
+    found = threaded_collect(Int, length(range)) do hits, i
+        k = forest.leaves[first(range) + i - 1]
+        for δ in dirs, nbr in neighbor_keys(forest, k, δ)
+            j = find_leaf(forest, nbr)::Int
+            j in range || push!(hits, j)
+        end
+    end
+    return unique!(sort!(found))
+end
+
 # Whether the forest's field data are split over more than one rank —
 # what an operation that still needs messages, and does not have them
 # yet, refuses (M7 brings them step by step; "Distributed meshes" in

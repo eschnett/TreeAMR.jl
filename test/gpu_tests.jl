@@ -276,6 +276,31 @@ end
     @test Array(fs.work) == hostfs.work
 end
 
+@testset "$bname: packing and unpacking on the device reproduce the serial fill: T=$T" for
+        (bname, backend, types) in BACKENDS, T in types
+    # M7's exchange on a device. A pack's destination and an unpack's
+    # source are a message buffer, which reaches the transfer kernel as a
+    # `NamedTuple` that KernelAbstractions must adapt to device memory;
+    # the buffers and slot offsets live on the backend; and the generic
+    # per-group `run_phase!` drives the packs, which on the CPU are split
+    # by source owner instead. Over simulated ranks in one process
+    # (`exchange_tests.jl`), every rank's array must equal the serial
+    # fill on the same backend bit for bit, mirrored transfers and the
+    # interface restriction included.
+    for (kinds, C) in (((:outer, :reflect_both), vertexcentered(2)),
+                       ((:reflect_lo, :periodic), cellcentered(2)))
+        same, _, nmirror, bad = lockstep_ghost_fill(faces_forest(kinds; T=T, N=8), 3, C,
+                                                    PointValue, T; backend=backend)
+        @test same
+        @test bad == 0
+        @test nmirror > 0
+    end
+    same, nremote, bad = lockstep_interfaces(faces_forest((:outer, :periodic); T=T, N=8),
+                                             3, facecentered(2, 2), (1, 0), T;
+                                             backend=backend)
+    @test same && bad == 0 && nremote > 0
+end
+
 @testset "$bname: the conservative cycle conserves on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # M8b's acceptance claim, on whatever backend: the three-step

@@ -89,7 +89,7 @@ Unlike a [`GhostSchedule`](@ref) this takes no [`Operators`](@ref). The
 transfer is not interpolation: it is injection and the exact two-cell
 average, fixed by the geometry, so there is no order to choose.
 """
-struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D}}
+struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},ST<:ExchangeStage{GRP}}
     forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
     G::NTuple{D,Int}                             # ghost width it was built for
@@ -97,6 +97,7 @@ struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D}}
     backend::BK
     dimensions::Vector{Int}                      # face dimension of each phase
     phases::Vector{Vector{GRP}}
+    stages::Vector{ST}                           # one per face dimension (M7)
 end
 
 isstale(s::InterfaceSchedule) = generation(s.forest) != s.generation
@@ -154,29 +155,42 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     for c in eachindex(chunks)
         merge_pairs!(pairs, perpairs[c])
     end
-    localize_pairs!(pairs, owned, nleaves(forest))
+    # The three classes of a distributed forest (M7), as in `GhostSchedule`.
+    received = split_received!(pairs, owned, nleaves(forest))
+    sent = sent_transfers(forest, owned) do into, j
+        interface_sources!(into, forest, faces, j)
+    end
 
+    build(key) = ntuple(d -> interface_stencil(T, N, ghosts[d], stags[d],
+                                               key.direction[d], key.offset[d]), D)
+    facedim(key) = findfirst(!=(0), key.direction)::Int
     GRP = grouptype(backend, T, Val(D))
     byface = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
-        stencils = ntuple(d -> interface_stencil(T, N, ghosts[d], stags[d],
-                                                 key.direction[d], key.offset[d]), D)
-        d = findfirst(!=(0), key.direction)::Int
-        push!(get!(byface, d, GRP[]),
-              todevice(backend, TransferGroup{T,D}(:restrict, stencils, targets,
+        push!(get!(byface, facedim(key), GRP[]),
+              todevice(backend, TransferGroup{T,D}(:restrict, build(key), targets,
                                                    sources)))
     end
 
     dims = sort!(collect(keys(byface)))
     phases = [byface[d] for d in dims]
-    return InterfaceSchedule{T,D,floattype(forest),typeof(backend),GRP}(
-        forest, generation(forest), ghosts, fs.centering, backend, dims, phases)
+
+    # One stage per face dimension, which serially is one of the phases.
+    stageof(key) = interface_tag(facedim(key))
+    localsof(tag) = get(byface, tag - interface_tag(0), GRP[])
+    ST = stagetype(backend, T, Val(D))
+    stages = build_stages(ST, T, backend, interface_tag.(dims), localsof,
+                          bystage(stageof, sent), bystage(stageof, received), build,
+                          key -> 0, forest)
+    return InterfaceSchedule{T,D,floattype(forest),typeof(backend),GRP,ST}(
+        forest, generation(forest), ghosts, fs.centering, backend, dims, phases, stages)
 end
 
 function Base.show(io::IO, s::InterfaceSchedule{T,D}) where {T,D}
     n = sum(gs -> sum(ntransfers, gs; init=0), s.phases; init=0)
     print(io, "InterfaceSchedule{", T, ",", D, "}(", n, " restrictions over ",
-          length(s.phases), " face dimension(s) ", Tuple(s.dimensions), ")")
+          length(s.phases), " face dimension(s) ", Tuple(s.dimensions),
+          messages_summary(s.stages), ")")
 end
 
 """
@@ -209,8 +223,9 @@ function restrict_interfaces!(fs::FieldSet{T,D},
         "$(length(blockrange(isched.forest))) on this rank; rebuild both"))
     refuse_distributed(isched.forest, "restrict_interfaces!",
                        "a coarse-fine face whose two sides lie on different ranks " *
-                       "needs the fine side's planes as a message, and the staged " *
-                       "exchange is step 3")
+                       "needs the fine side's planes as a message; the schedule holds " *
+                       "the stages and their buffers, but the messages between ranks " *
+                       "are step 3")
     fs.G == isched.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this interface schedule was " *
         "built for G=$(isched.G); every target plane in it is wrong for this " *
@@ -228,10 +243,19 @@ function restrict_interfaces!(fs::FieldSet{T,D},
         "are in the wrong memory. Build it with `InterfaceSchedule(fs)` from a " *
         "field set on the backend you mean to run on."))
 
-    for groups in isched.phases
-        run_phase!(fs, groups, backend)
-        synchronize(backend)
+    return exchange_interfaces!(fs, isched, backend)
+end
+
+# The staged interface restriction, once its checks have passed: one
+# stage per face dimension, ascending (M7). Serially each stage is one
+# of the phases and nothing is sent.
+function exchange_interfaces!(fs::FieldSet, isched::InterfaceSchedule, backend)
+    forest = isched.forest
+    sends = nothing
+    for stage in isched.stages
+        sends = run_stage!(fs, stage, forest, backend, sends)
     end
+    sends === nothing || waitall(forest.comm, sends)
     return fs
 end
 

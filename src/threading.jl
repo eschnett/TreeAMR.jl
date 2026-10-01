@@ -69,6 +69,16 @@ function equalsplit(n::Int, p::Int, i::Int)
     return lo:(lo + len - 1 + (i <= extra))
 end
 
+# The part of `equalsplit(n, p, ·)` that contains item `i in 1:n`, in
+# O(1): the inverse of the split, which is how a rank names the owner of
+# a leaf (M7) without forming every rank's range.
+function equalsplit_part(n::Int, p::Int, i::Int)
+    len, extra = divrem(n, p)
+    long = extra * (len + 1)                # the items of the longer parts
+    i <= long && return (i - 1) ÷ (len + 1) + 1
+    return extra + (i - long - 1) ÷ len + 1
+end
+
 """
     threaded_foreach(f, n)
 

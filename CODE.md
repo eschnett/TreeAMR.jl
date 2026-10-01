@@ -3241,7 +3241,9 @@ A stage runs in five steps:
 5. `waitall` on the receives, then unpack.
 
 The sends are waited on at the end of the call, before any buffer is
-reused. Within a stage, nothing a pack or a local group reads is
+reused. *(Step 2: `run_stage!` in `ghosts.jl` runs these five steps
+through the communicator verbs. A stage without messages is the serial
+phase, the same launch and the same barrier.)* Within a stage, nothing a pack or a local group reads is
 written by an unpack:
 
 - phase 1 reads interiors and writes ghosts;
@@ -3295,7 +3297,14 @@ which keeps "one kernel for every transfer" true.
 - *The packed buffer is a kernel argument.* It is passed in place of
   the working array as a small `NamedTuple` — the flat buffer and each
   transfer's offset into it — which KernelAbstractions adapts to a
-  device without a new dependency.
+  device without a new dependency. *(Amended in step 2: the kernel's
+  tuple has a third field, `dims`, the target box times `nvars`, since
+  a slot's linear index needs the box's shape. The offsets are stored
+  in points, not elements, and multiplied by `nvars` when the buffer is
+  addressed, because a schedule belongs to a layout and serves field
+  sets of any variable count. A driver passes `(buf, offsets)`, and
+  `run_group!` adds the group's `dims`. The "block" index the kernel
+  hands the accessor is the slot.)*
 - *Three accessor methods, not two.* The kernel reaches `dest` and
   `src` through a load, a store and the element type that
   `stencil_sum` starts its accumulator from, `zero(eltype(src))` today.
@@ -3325,7 +3334,15 @@ which keeps "one kernel for every transfer" true.
   `scaled(0 + 1·acc) == scaled(acc)`, bit for bit what the serial
   kernel writes. Step 2's round trip checks this bitwise, `Float32x2`
   included, for which it also needs `0 + 1·x` to be the identity on
-  normalized limbs.
+  normalized limbs. *(Measured in step 2. With the factor moved to the
+  pack, the `Float64` round trip fails in every 2D case tried, as
+  argued. `Float32x2` cannot tell the two apart: MultiFloats' product
+  returns `+0` for `0 · (−1)`, so its serial fill has no `−0` to lose.
+  Nor is `0 + 1·x` the identity on every limb pair — it maps `(−0, −0)`
+  to `(+0, +0)` — but it held on every value a pack produced in the
+  round trip, which is a check over the tested cases and not a proof.
+  In 1D every mirrored transfer is the block's own reflection,
+  so the remote `−0` case exists from 2D on.)*
 - **Why the ghosts are bit-identical.** Every ghost is written once, by
   the same kernel, from the same source values and the same stencil,
   summed in the same order as in the serial fill; the unpack adds an
@@ -3338,7 +3355,9 @@ which keeps "one kernel for every transfer" true.
   costs" fixed its summation order.
 
 **MPI+GPU.** The pack and receive buffers live on the field set's
-backend and are allocated once per schedule. They go to MPI directly
+backend and are allocated once per schedule (amended in step 2: once
+per schedule *and variable count*, on first use, for the reason the
+offsets are in points). They go to MPI directly
 when MPI is device-aware (`MPI.has_cuda()` for CUDA). Otherwise they
 are staged through host buffers of the same layout, which is the path
 Metal always takes and the one the suite tests. The synchronization
@@ -4336,6 +4355,118 @@ M7's benchmarks. The list below is in execution order.
       directly in one process, reproduces the serial `fill_ghosts!`
       bitwise, in `Float64`, `Float32` and `Float32x2`, including an
       odd variable that is zero at a reflecting wall (the `−0` case).
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan:
+    - *The data structures.* `GhostSchedule` keeps `phase1`, `phase2`
+      and `levels`, which now hold the transfers *local* to the rank,
+      and gains `stages`, a vector of `ExchangeStage`s in tag order:
+      phase 1, then one per phase-2 target level. A stage holds its
+      `tag`, its local groups and a `remote` part, which is `nothing`
+      when the stage has no messages on this rank. Serially every stage
+      is `nothing`-remote and its local groups *are* the phase (the same
+      vector). `InterfaceSchedule` gains `stages` the same way, one per
+      face dimension. A `RemoteStage` holds, per direction, the peers
+      ascending with their segment lengths in points; one `LayoutEntry`
+      per buffer slot (peer, `GroupKey`, global target and source,
+      offset and size in points), kept on the host; the pack and unpack
+      groups; the slot offsets on the backend; and the buffers. A
+      `GroupKey` has an explicit total order (`keyorder`: kind ranked,
+      then direction, offset, level, mirror state), so a layout never
+      depends on `Dict` order.
+    - *The tags*: phase 1 is 1, the level-`ℓ` stage `2 + ℓ`, interface
+      dimension `d` is `40 + d`, and 50 is reserved for the regrid.
+      They ascend in the order the stages run.
+    - *The classification.* `split_received!` splits the transfers
+      found for the rank's own targets into local ones, which are
+      shifted to local indices, and received ones, kept global.
+      `sent_transfers` runs the builder's own search (`block_sources!`
+      or `interface_sources!`) for every candidate remote target,
+      `remote_neighbors` in `forest.jl`, and keeps those with a local
+      source. `leafowner` inverts the split in `O(1)`, through
+      `equalsplit_part` beside `equalsplit`. `remote_stage` builds one
+      stage's messages. It takes the target and source owners and
+      ranges separately, so that step 4's regrid stage — targets in the
+      new partition, sources in the old — is a call of it, and is not
+      built here.
+    - *Packs and unpacks.* A pack is the serial group's stencils with
+      every target range moved to start at 1, `targetblocks` the slots,
+      `sourceblocks` the local sources, sorted by (source, slot), and
+      no parity column. An unpack is a width-1, weight-1 group from the
+      slot into the serial target box, sorted by (target, slot), with
+      the parity column. On the CPU, `run_phase!` bisects
+      `sourceblocks` when the destination is a packed buffer, through
+      `ownerblocks` and `ownercount`; the device path is the per-group
+      one, unchanged.
+    - *The driver.* `run_stage!` runs the five steps through the
+      communicator verbs. `exchange_ghosts!` and `exchange_interfaces!`
+      are the bodies of `fill_ghosts!` and `restrict_interfaces!` after
+      their checks, and a serial fill now goes through them. The two
+      public functions still refuse a distributed forest, so step 3
+      removes the refusal and adds the MPI methods of the verbs.
+      `run_stage!` takes the forest rather than its communicator: the
+      `comm` field is abstractly typed, and passing it made every stage
+      of a serial fill a run-time dispatch of 48 bytes (measured, then
+      removed).
+    - *Tests*, in `test/exchange_tests.jl`. They cover 1–5 simulated
+      ranks (and `nleaves + 1` in 1D, which leaves a rank empty), `D =
+      1, 2, 3`, periodic, outer and reflecting faces, `faces_forest`'s
+      three levels, every centering, both operator families, and the
+      interface schedule over every centering with a face dimension.
+      They check the candidates against the serial schedule's readers.
+      They check the union of the local transfers and the matched
+      sent and received halves against the serial set, per stage, with
+      every slot consistent with its layout entry. They check both
+      ends' layouts entry by entry and the per-stage write counts
+      against the serial ones, at most one write per point. They run
+      the bitwise lockstep round trip, the boundary hook between the
+      stages included: `Float64` over every centering, `Float32` and
+      `Float32x2` over a subset, and the interface restriction in
+      `Float64` and `Float32x2`. Finally the staged driver itself runs
+      over an in-process mailbox communicator, one task per rank, in
+      `D = 2, 3` at 3 and 5 ranks, for the ghosts and the interfaces,
+      bitwise against serial. `gpu_tests.jl` runs the lockstep round
+      trip on every backend; on Metal (Float32) it passes, with the
+      rest of that file.
+    - *Serial cost* (`bench/ghosts.jl` at its defaults: `D = 3`,
+      `N = 8`, 4³ roots, 10 variables, order 4; best of 400 fills and 40
+      builds, HEAD before and after, alternated). The fill is unchanged
+      at one thread: 2.71–2.78 ms against 2.71–2.73 ms on the uniform
+      mesh, 11.8–14.5 ms against 12.0–15.0 ms on the two-level one, with
+      identical allocations (10912 and 97536 bytes). At four threads
+      the uniform fill measured 0.51–0.52 ms against 0.64–0.65 ms; the
+      cause was not traced. The schedule build is within noise,
+      0.40–0.43 ms against 0.41 ms and 3.0–3.3 ms against 3.0–3.2 ms.
+      It allocates 2.8 % more on the uniform mesh (389 KB against 379 KB)
+      and 3.1 % more on the two-level one (4.65 MB against 4.51 MB),
+      nearly all of it the per-key stencil memo below.
+    - *Distributed build cost* (one thread, `D = 3`, `N = 8`, `G = 2`,
+      order 4, the bench's two-level periodic mesh, slowest rank of `P`
+      fake ranks). At 120 leaves the serial build is 3.4 ms and a rank's
+      is 3.6, 3.1 and 2.6 ms at `P = 2`, 4 and 8. At 960 leaves (8³
+      roots) the serial build is 9.7 ms and a rank's 11.0, 9.2 and
+      7.3 ms. So at these sizes a rank's build costs about the serial
+      one, not `1/P` of it. A profile of one of the eight ranks at 960
+      leaves puts a third of the time in the search for the sent
+      transfers and another third in building the remote stages. At
+      120 blocks a rank, a 3D halo is about as many blocks as the
+      rank's own, so that is the `O(local + halo)` the spec predicts,
+      not a defect. It is a regrid-frequency cost, about 1,300–2,100
+      sent transfers a rank here. The host stencils are memoized per
+      group key, which the stage builder asks for again (10 % of the
+      rank build).
+    - *What was not done.* The regrid's stage, which is step 4, has
+      only its builder's interface, as above.
+    - *Suite cost.* 108338 tests at one thread, in 5m29 and 5m51 over
+      two runs, and 108390 at eight, in 5m35 and 5m54. The increase over
+      step 1's 98818 and 98870 is exactly the 9506 tests of
+      `exchange_tests.jl` and the 14 of the CPU entry of the new
+      `gpu_tests.jl` testset (7380 of the 9506 check the owner inverse),
+      so no existing test moved. The thread-independence digests are
+      unchanged. The new file takes about 50 s standalone, almost all of
+      it compilation of the `Float32` and `Float32x2` kernels and of the
+      3D centerings; that is most of the 45–65 s the suite grew by, and
+      what to trim first if the suite has to shrink. The docs build.
   - **Step 3 — the MPI extension and the exchange.** `TreeAMRMPIExt`,
     the staged `fill_ghosts!` and `restrict_interfaces!`, the
     `combine_blocks` allgather, and the forest digest check; MPI in
