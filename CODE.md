@@ -3086,7 +3086,10 @@ number of blocks per rank, and of the replicated passes two grow to
 dominate a rank's regrid — the buffer's neighbour search when many
 blocks report boxes, and the classification of every new leaf — both of
 which can be made `O(local)` without changing a result; see step 7 under
-[Milestones](#milestones).)*
+[Milestones](#milestones). Both were, the same day: each rank now
+searches the buffer from its own sources and classifies only the new
+leaves it needs, and a rank's regrid stayed at its 1408-leaf cost up to
+180224 leaves.)*
 
 **The communicator layer** (MPI a weak dependency, decided 2026-10-01
 with Erik). A new file, `src/communicator.jl`, sits after `device.jl`
@@ -3562,7 +3565,12 @@ Three consequences:
    `O(nleaves)` per rank, as AMReX and Parthenon do. Every rank arrives
    at the same new leaves, so `regrid!` returns the same `Bool`
    everywhere. `buffered_flags` and `complete_marks` remain public over
-   the *global* flag vector, which serially is the only one.
+   the *global* flag vector, which serially is the only one. *(Amended
+   after step 7: the buffer's neighbour search is not replicated. Each
+   rank searches from its own sources, and the recruits are gathered in
+   a second `allgatherv` and applied on every rank, which gives the
+   marks the replicated search gives; the rest of the completion is
+   replicated as described.)*
 4. The ghost fill before the transfer is the distributed fill, so a
    parent's ghosts are current on its owner.
 5. The transfer is one stage over the new partition. `transfer_groups`
@@ -3576,7 +3584,9 @@ Three consequences:
    is one child's part of it, and a coarsened block's children may have
    had up to `2^D` different owners.)* Sender computes is what makes this
    simple: the prolongation reads the parent's ghost layers, which only
-   the parent's old owner holds.
+   the parent's old owner holds. *(Amended after step 7: a rank
+   classifies only the new leaves it will own and those whose sources
+   it owns, not every new leaf.)*
 6. That stage is also the repartitioning: a kept block whose owner
    changes is a copy between ranks. When `k` blocks are added near the
    start of the curve, an equal-count split shifts every later rank's
@@ -3613,7 +3623,8 @@ is a loop of collective calls, the second a `mesh_mapreduce`.
   `allgatherv` only once all ranks have passed. Serially nothing is
   gathered and every refusal keeps its serial type and message.
 - *The stage is `remote_stage`'s*, as step 2 left it to be.
-  `regrid_sources` classifies every new leaf once per regrid, not once
+  `regrid_sources` classifies every new leaf once per regrid (amended
+  after step 7: only the new leaves this rank needs), not once
   per field set as before, into a `TransferPairs` under `GroupKey`s
   with direction zero and level 0 — targets new leaves, sources old,
   both global — and `regrid_stage` splits it by the new partition for
@@ -5437,8 +5448,9 @@ M7's benchmarks. The list below is in execution order.
       `complete_marks` and
       7 % in the transfer stage.
     - *The replicated regrid bookkeeping, and what to do about it*
-      (proposed, not implemented). Two passes become the regrid's cost
-      long before the forest's memory does:
+      (proposed here, and the first two implemented the same day; what
+      was done, and measured, is the next item). Two passes become the
+      regrid's cost long before the forest's memory does:
       1. **The buffer's recruit search** in `buffered_flags`, about
          5.8–7.8 µs per source leaf at one thread and 1.6–2.4 at four,
          over every source of the whole forest on every rank. With
@@ -5476,6 +5488,123 @@ M7's benchmarks. The list below is in execution order.
          and the marks' `allgatherv`, 32 bytes a leaf to every rank,
          which a gather of the marks that are not a bare `Keep` would
          shrink when it matters.
+    - *What was done about it* (2026-10-02, after the measurement; the
+      results are unchanged, bit for bit):
+      1. **The recruits.** `buffered_flags` is now two passes, both
+         internal: `buffer_recruits`, the neighbour search over a run of
+         sources, which returns `Recruit(leaf, level)` pairs in source
+         order, and `apply_recruits!`, the serial rewrite of the marks.
+         The public function runs both over every leaf, as before.
+         `regrid!` runs `regrid_marks` instead: each rank searches from
+         its own sources, reduces its recruits with
+         `strongest_recruits`, gathers them in a second `allgatherv`,
+         and applies the union to the gathered marks; then the
+         completion, which is `complete_marks` after the buffer
+         (`completed_leaves`). Serially nothing is gathered and the
+         recruits are applied as found, which is `buffered_flags`.
+         *Why the order does not matter*, checked against the code
+         rather than assumed: the rewrite is two statements per recruit
+         `(j, L)` at a leaf of level `l` — a `Coarsen` with `l ≤ L`
+         becomes `Keep`, then anything with `l < L` becomes `Refine`.
+         `Refine` is never undone, and a `Keep` made from `Coarsen` is
+         only ever raised to `Refine`. So a leaf ends as `Refine` if any
+         recruit asks it for more than its level, as `Keep` if it was
+         `Coarsen` and some recruit asks for its level exactly, and as
+         it was otherwise: a function of its own reported mark and of
+         the largest level asked of it, whatever the order of the
+         recruits and however often one repeats. Recruitment reads the
+         *reported* marks, never the rewritten ones, so the search
+         itself does not depend on the order either. That is also what
+         lets a rank keep, per leaf, only its largest request, and drop
+         a request at a leaf already finer, which changes no mark; so
+         gathering in global source order, the fallback had the rewrite
+         been order-dependent, was not needed. *Why a second gather and
+         not the marks' own*: merging the two would need a
+         byte-level encoding of a vector of padded structs with its
+         per-rank counts, to save one collective whose cost is below
+         the marks' gather. Measured over MPI on this laptop (one tile
+         a rank, one thread, every block a `(Keep, box)` source, buffer
+         4), at 2, 4 and 8 ranks: the recruits' `allgatherv` 0.015,
+         0.034 and 0.078 ms with 1600 bytes from a rank, the marks'
+         0.021, 0.074 and 0.188 ms with 5632; the whole `regrid_marks`
+         0.97, 1.12 and 1.93 ms against the replicated `buffered_flags`
+         1.88, 4.11 and 11.8 ms, with the same leaves at every count.
+      2. **`regrid_sources`** takes `oldrange` and `newrange` and
+         classifies `newrange` and `overlapping_leaves(oldrange)`: the
+         new leaves from the one that covers the start of the rank's
+         first old leaf (that leaf or an ancestor, at or before it in the
+         curve's pre-order, else its first descendant, directly after
+         it) through the last one at or before the deepest last
+         descendant of its last old leaf. Without the ranges it
+         classifies every leaf, as before, which is what the serial
+         `regrid!`, `transfer_groups` and the tests use. A plain
+         `searchsortedfirst` in place of the `Dict` was *slower* for the
+         full classification — 14.1 against 11.6 ms at 90112 leaves,
+         30.9 against 29.6 at 180224 — so the serial regrid would have
+         paid for the distributed one. The search therefore starts at the
+         previous target's sources (`findfrom`: four steps along the
+         curve, then a binary search over the rest), since the sources
+         of ascending new leaves are non-decreasing old leaves; that
+         made the full classification faster than the `Dict`. The
+         in-process lockstep test now builds every rank's stage from its
+         own classification and checks that `split_regrid` keeps the
+         same transfers from it as from the full one.
+      3. **The digest's fold is not cached.** A cache per forest and
+         generation goes stale whenever the leaves change without
+         `rebuild_leaves!`, and nothing prevents that: `forest.leaves`
+         is a public `Vector`, and `test/regrid_tests.jl` itself
+         empties and refills one at generation 0. The digest exists to
+         catch a forest that changed outside the collective contract,
+         so it should not trust the generation to say the leaves are
+         unchanged. Where to keep the cache is a second problem:
+         `Forest` is immutable, and its positional constructor is called
+         from `complete_marks`. The saving would be at most 1.1 ms a
+         build at 90112 leaves.
+
+      `bench/replicated.jl` (rank `P÷2`, 176 blocks a rank, ms, best of
+      3–5) now also times the rank's own buffer and classification.
+      Before and after on the same machine, run back to back, a stale
+      copy of the tree for the "before":
+
+      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
+      |---|---|---|---|---|
+      | every block a source, buffer 4: replicated `complete_marks`, 1 thread | 7.6 | 71 | 650 | 1365 |
+      | on the rank: `regrid_marks` / with the completion, 1 thread | 1.0 / 1.1 | 1.1 / 1.6 | 1.4 / 5.4 | 1.6 / 9.6 |
+      | replicated, 4 threads | 2.3 | 21.7 | 212 | 422 |
+      | on the rank, 4 threads | 0.45 / 0.52 | 0.53 / 0.93 | 0.64 / 3.8 | 0.78 / 7.5 |
+      | `regrid_sources`, every leaf, `Dict` (before), 1 thread | 0.165 | 1.26 | 11.6 | 29.6 |
+      | the same by `findfrom` | 0.134 | 0.99 | 8.1 | 18.1 |
+      | the rank's own (what `regrid!` runs) | 0.021 | 0.019 | 0.017 | 0.016 |
+      | `regrid!` on the rank, refine / coarsen, 1 thread, before | 21.6 / 22.7 | 22.4 / 23.0 | 33.6 / 42.6 | 73.1 / 68.1 |
+      | after | 21.9 / 22.9 | 22.7 / 22.8 | 20.7 / 21.0 | 23.2 / 23.6 |
+      | the same, 4 threads, before | 11.1 / 11.0 | 11.4 / 11.7 | 22.5 / 17.4 | 35.7 / 41.4 |
+      | after | 11.3 / 9.9 | 9.8 / 11.4 | 17.0 / 9.4 | 15.4 / 11.4 |
+
+      So a rank's regrid no longer grows with the forest here: at
+      180224 leaves it costs what it costs at 1408, within the noise
+      the four-thread column shows. What remains replicated is the
+      completion. It is the 4–8 ms above at 90112–180224 leaves when
+      every block is a source, since these marks then refine every
+      coarse leaf beside a fine one and `balance!` has a level 2 to
+      check; with the slab's marks it is the 0.9–2.0 ms of item 3. A
+      recruit gathers as 8 bytes, 0.82 MB a rank at 90112 leaves in
+      that case, against 2.9 MB of marks.
+
+      *Tests.* A new in-process testset in
+      `test/regrid_exchange_tests.jl` runs `regrid_marks`, the
+      completion and `regrid!` itself (one task per simulated rank, over
+      the rendezvous communicator) on random forests with random bare and
+      boxed flags, `D = 1, 2, 3`, buffer 0–4 and 1–7 ranks, a roots-only
+      forest among them so that most ranks are empty, and requires every
+      rank's marks and leaves to be the serial `buffered_flags` and
+      `complete_marks` ones. Each of four deliberate breakages fails it
+      or the lockstep test: skipping the gather, dropping a recruit at a
+      leaf of the requested level, and moving either end of
+      `overlapping_leaves`. The suite passes at one thread (110511
+      tests, 8m08) and at eight (110563, 7m57), and the MPI workload at
+      2, 3 and 4 ranks prints the serial lines byte for byte, apart from
+      the 20 `sum` lines, which agree to roundoff (11, 11 and 9 of them
+      byte for byte).
     - *A device.* `TREEAMR_BENCH_BACKEND=metal TREEAMR_BENCH_N=8
       TREEAMR_BENCH_REPS=3 TREEAMR_BENCH_PROJECT=<env> bench/mpiscan.sh
       1 2` (a scratch environment that develops this checkout and adds
@@ -5497,7 +5626,9 @@ M7's benchmarks. The list below is in execution order.
       process loses" found that the ownership policy recovers inside
       one process what one rank per domain was expected to, so the
       same-mesh table is a check of that, not an expected win.
-    - *What was not done.* No `src/` change, so the suite was not rerun.
+    - *What was not done.* The benchmark itself changed nothing in
+      `src/`, so the suite was not rerun for it; the follow-up above
+      did, and it was.
       The fill's overlap is read from the difference of its parts, not
       traced inside `run_stage!`. The benchmark's mesh is periodic, so
       the boundary hook is not timed.
