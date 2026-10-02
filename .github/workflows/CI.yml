@@ -15,14 +15,22 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
     runs-on: ${{ matrix.os }}
+    # The MPI tests (M7) launch `mpiexec` subprocesses of MPICH_jll, the
+    # default binary of MPI.jl, which needs nothing installed or set
+    # here; each launch has a deadline of its own in `mpi_tests.jl`, but
+    # a rank stuck outside it would otherwise hold the runner for the
+    # default six hours.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         version: ["1.11", "1"]
         os: [ubuntu-latest, macOS-latest]
         # The suite must pass threaded as well as serial. The
-        # thread-independence test spawns its own subprocesses either
-        # way; this is what runs the rest of the suite on threads.
+        # thread-independence test and the MPI test spawn their own
+        # subprocesses either way (the MPI ranks at one thread each,
+        # whatever this says); this is what runs the rest of the suite
+        # on threads.
         threads: [1, 4]
     # Coverage exactly on the single-threaded cells. Turning coverage
     # off on the `threads: 4` cells makes CI faster, because those are
