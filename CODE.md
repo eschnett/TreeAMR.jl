@@ -3526,6 +3526,64 @@ amends the paragraph above:)*
   nothing, Metal's memory being unified. A regrid stage is built per
   regrid, so its mirrors are too, and CUDA unpins them when they are
   collected. No weak dependency on a device package was needed.
+  *(Amended after step 8: a regrid stage's buffers and mirrors, and those
+  of the schedules rebuilt after a regrid, now come from the forest's
+  buffer pool, the next bullet, so they are allocated and page-locked
+  once rather than at every regrid.)*
+- *The buffer pool* (added after step 8, 2026-10-02, for the staged
+  regrid Symmetry measured at 48 ms against 8.7 ms direct; see step 8).
+  Every regrid built its transfer stage afresh, and the schedules an
+  application rebuilds after it start without buffers, so every
+  distributed regrid allocated and zero-filled the device buffers of
+  its own stage and of the next schedule's first fill, and, staged,
+  allocated and page-locked their host mirrors. The pool keeps them.
+  - *Where it lives.* In the forest, whose leaves every schedule and
+    regrid is over and which `run_stage!` already has: a mutable
+    `ForestState` holds the generation, which was a `Ref` of its own
+    before, and the pool, made on first use. One object for both keeps
+    `Forest` the size it was. A ninth field made the schedule build
+    allocate 80 and 4816 bytes more in `bench/ghosts.jl` (presumably
+    closures that capture a `Forest` by value growing by a word; not
+    traced), and with the fold its 392832 and 4656880 are unchanged. A
+    serial forest never makes a pool.
+  - *What it hands out.* A *lease* of at least the length asked for, as
+    an object of exactly that length over pooled memory, keyed by role
+    (buffer or mirror), array type and backend type. A host vector — a
+    CPU stage buffer or any mirror — is an `Array` made by `Base.wrap`
+    over the pooled `Memory`, so `hoststaging`'s test for an `Array` and
+    the MPI extension's contiguous-host-vector check see what they saw
+    before; a device buffer is a contiguous `view`, which CUDA and Metal
+    (and every GPUArrays backend) return as an array of the parent's own
+    type, so the kernels and the device-aware path see a `CuArray` or an
+    `MtlArray` as before. A backend whose view is of another type gets
+    an ordinary allocation. A pooled mirror is page-locked once, when it
+    is allocated.
+  - *When a lease comes back.* The regrid stage gives its leases back
+    after its sends have been waited on, at the end of the field set's
+    transfer. A schedule's leases are reclaimed at the next lease after
+    the forest's generation has moved past the one they were taken at,
+    or after their holder has been collected: a stale schedule can never
+    run again, since every entry point refuses one, and every message of
+    the call it last ran in was waited on in that call. Reclaiming also
+    deletes the lease from the stale stage's dictionary, so that a stale
+    stage asked for its buffers through the internals takes new ones
+    rather than memory another stage holds. So no buffer is held by two
+    leases, and none is reused while a message is in flight; the
+    in-process test checks that the live schedule's buffers and mirrors
+    never overlap.
+  - *Sizes.* Best fit: the smallest free buffer that is long enough. If
+    none is, the smallest free one is dropped and a new one allocated
+    with a quarter's headroom, so the number of buffers per key is
+    bounded by the most leased at once and their sizes follow the
+    largest requests. Nothing shrinks otherwise: what a forest keeps is
+    about the buffers of one live schedule plus one regrid stage, free
+    between regrids. That is the memory a staged regrid on CUDA would
+    otherwise allocate and pin again each time.
+  - *Zeros.* A fresh buffer is zero-filled, as before; a reused one holds
+    an earlier stage's bytes, which nothing reads, since every element
+    of a send buffer is packed and every element of a receive buffer
+    received before it is unpacked. The suite's bitwise comparisons
+    run through reused buffers.
 - *The order of a staged stage*: post the receives into the receive
   mirror; pack and synchronize; copy the send buffer down (`copyto!`
   into an `Array`, which returns once the host holds the data — CUDA.jl
@@ -4089,6 +4147,42 @@ would add about a minute to the suite, and the serial reference can run
 in-process. CI runners have three or four cores, while `-n 3` at two
 threads wants six, and MPICH polls while it waits; on CI the ranks
 should therefore run one thread each.
+
+**Performance work left for later** (to do, recorded 2026-10-02 after
+the buffer pool; none of it blocks M7, and each item is to be measured
+before it is built):
+
+- *The H200 re-measurement of the staged regrid with the pool* is
+  pending: `bench/symmetry_mpi_gpu.sh`'s `bench/mpi.jl` over CUDA at 2
+  and 4 ranks, staged against direct, against step 8's 25.4 / 48.0 ms
+  staged and 7.1 / 8.7 ms direct. The pool's local effect (step 8) says
+  nothing about `cuMemHostRegister`, which neither the CPU nor Metal
+  calls, so whether the 40 ms were the page-locking is still the
+  untraced guess it was.
+- *The pool's own rules.* It never shrinks: a forest keeps about one
+  live schedule's and one regrid stage's buffers, free between regrids.
+  A rule that drops buffers unused for some regrids, or a pool shared
+  between forests over one communicator, waits for a run where the
+  memory matters.
+- *Fewer copies and launches.* Packing straight into page-locked host
+  memory (or, on Metal, into the shared buffer the mirror copies to)
+  would drop the staging copies; one launch per stage for all its packs,
+  and one for its unpacks, would drop most of the 0.95 ms of launches in
+  a 2.5 ms H200 fill (step 8); a copy between same-shaped boxes could be
+  an MPI subarray datatype with no pack at all, on the host path.
+- *One-sided and persistent communication.* A fill repeats the same
+  messages until the next regrid, so persistent requests
+  (`MPI_Send_init` / `MPI_Recv_init`) built with the schedule would
+  save the matching, and RMA (`MPI_Put` into a window over the peer's
+  receive buffer, exposed once per schedule) or GPU-initiated transfers
+  (NVSHMEM, NCCL) would let the sender write into the peer's memory
+  without a receive.
+- *What only many more ranks will show.* Measured to 32 ranks on four
+  nodes and 4 GPUs on one: the replicated forest's memory and its
+  `O(nleaves)` completion (20 ms at 32 ranks when every block is a
+  source, step 7), the flags' `allgatherv`, the forest digest gathered
+  by every checked call, the number of peers and messages per rank on
+  a deeper hierarchy, and GPUs across nodes, which no run has used.
 
 **The multi-block check** (the standing instruction, checked
 2026-10-01). Nothing here obstructs a conforming multi-block forest.
@@ -6249,7 +6343,70 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
         traced), and MPICH_jll's staging (job 567852) shows the same
         48.4 ms. A regrid that staged through pageable memory, or kept
         its mirrors, would not pay it; left open, since a regrid runs at
-        regrid frequency and the direct path exists.
+        regrid frequency and the direct path exists. *(Followed up the
+        same day with the buffer pool, the next bullet; the H200
+        re-measurement is pending.)*
+    - *The buffer pool* (the follow-up, 2026-10-02; the design is "The
+      buffer pool" under "MPI+GPU" in
+      [Distributed meshes](#distributed-meshes)). Stage buffers and host
+      mirrors are leased from the forest's pool, the regrid stage's
+      returned at the end of its transfer and a stale schedule's
+      reclaimed at the next lease, so that a regrid reuses what the
+      earlier ones allocated and, on CUDA, page-locked. Measured locally
+      only (Apple M3 Pro, MPICH_jll 5.0.2, one thread a rank, Symmetry
+      being in use by another job):
+      - *Reuse.* In process, `regrid_exchange_tests.jl`'s new test runs
+        a refine-and-coarsen cycle three times at 3 ranks with every
+        message staged on the CPU, schedules rebuilt after each regrid
+        and filled, with the serial bits throughout and no buffer
+        allocated in the third cycle. A script running five cycles of
+        the same setup shows the three ranks' pools allocating 8, 10
+        and 8 buffers in the first cycle (half of them mirrors) and none
+        in the four after it. `mpi_device_workload.jl` runs its
+        moving-blocks cycle twice and prints the ranks' pool counts after
+        each: on Metal at `-n 3`, 42 buffers (21 mirrors) and 48 (24)
+        after the first cycles of its two meshes, the same after the
+        second, and `mpi_device_tests.jl` now asserts that, 52 tests
+        passing on Metal (staged) and on the CPU (direct, no mirrors).
+        `bench/mpi.jl` over its six regrid cycles at `N = 16`: rank 0's
+        pool allocates 20 buffers at 2 ranks and 18 at 4 in the first
+        cycle, staged on Metal or forced-staged on the CPU, 10 and 9
+        direct on the CPU, and nothing after.
+      - *Negative controls.* With reclaiming disabled, the pool's unit
+        test fails 4 of its 9 tests; with a leased buffer left on the
+        free list, the unit test fails 2 and the cycle test's overlap
+        check fails on all 3 ranks — while its bits stayed serial,
+        since the in-process mailbox copies a message when it is sent,
+        which is why the overlap is checked directly.
+      - *Host allocation per regrid*, rank 0, `bench/mpi.jl`'s last
+        refine / coarsen (`@allocated`, `N = 16`, `ROOTS = 4`, 2 / 4
+        ranks), before and after: forced staging on the CPU 57.0 / 48.4
+        and 55.2 / 52.2 MB to 46.8 / 35.5 and 41.4 / 35.6; direct on the
+        CPU 51.9 / 42.0 and 48.3 / 43.9 to 46.8 / 35.5 and 41.3 / 35.6;
+        staged on Metal (Float32) 5.3 / 6.5 and 6.3 / 7.4 to 2.7 / 3.2
+        and 2.8 / 3.2. What remains on the CPU is mostly the new
+        working arrays, which a regrid allocates by design.
+      - *Time: no change that the noise lets one see* — the cost the
+        pool removes is not one this machine has. Two runs each,
+        alternated, minimum ms, refine / coarsen at 2 and 4 ranks:
+        forced staging on the CPU 61.2–62.8 / 50.2–50.9 and
+        69.1–72.6 / 48.4–48.7 before, 61.5–63.8 / 49.6–54.5 and
+        71.3–71.6 / 44.0–44.5 after; Metal 40.2–51.1 / 40.0–42.4 and
+        51.4–56.0 / 50.5–50.8 before, 47.9–50.3 / 40.7 and 51.2–52.8 /
+        48.2–49.9 after (the ranks share one GPU, so the Metal
+        distributed numbers are not weak scaling). Neither backend
+        page-locks, and the allocation and zero-filling the pool does
+        save here are evidently lost in a 40–70 ms regrid.
+        So the local runs show that the pool works and is safe, not
+        what it buys on CUDA: whether step 8's 40 ms were the pinning
+        is still to be measured on Symmetry (pending; see "Performance
+        work left for later" under
+        [Distributed meshes](#distributed-meshes)).
+      - *Unchanged elsewhere.* `bench/ghosts.jl` at one thread: the
+        serial fill allocates 10896 and 97504 bytes and the schedule
+        build 392832 and 4656880, as in step 8; the distributed CPU
+        fill of step 8 allocates 130320 bytes a rank at `-n 2` and
+        151856 / 189168 / 151856 at `-n 3`, as before.
     - *What was not checked* (before the Symmetry run, which checked the
       direct path on CUDA). The direct path on any device: Metal has no
       device-aware MPI, and the CPU's direct path is not the device's
