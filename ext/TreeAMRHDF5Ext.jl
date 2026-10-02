@@ -296,9 +296,12 @@ end
 
 # An HDF5 file in memory only (the core driver without a backing store):
 # the image of an index that rank 0 broadcasts, and the scratch file in
-# which the other ranks run a save's do-block. No file is created.
-memory_file() = h5open("TreeAMR in-memory $(objectid(Ref(0)))", "w";
-                       driver=HDF5.Drivers.Core(; backing_store=false))
+# which the other ranks run a save's do-block. No file is created. Each
+# gets a name of its own, since HDF5 tells open files apart by name.
+const MEMORY_FILES = Threads.Atomic{Int}(0)
+
+memory_file() = h5open("TreeAMR in-memory file $(Threads.atomic_add!(MEMORY_FILES, 1))",
+                       "w"; driver=HDF5.Drivers.Core(; backing_store=false))
 
 # --- agreement (M7) ------------------------------------------------------------
 #
