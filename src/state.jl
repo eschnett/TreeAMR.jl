@@ -356,11 +356,15 @@ the thread count, since it is computed from that block's cells alone; a
 floating-point combination of them is promised to roundoff only,
 whichever way it is written.
 
-The largest value of each variable, which a refinement criterion needs
-for its scale:
+The values are per **local** block (M7): over a distributed forest they
+are this rank's blocks only, so a number combined from them — the
+largest value of a variable, which a refinement criterion needs for its
+scale, or a signal speed for a time step — is this rank's number, not
+the mesh's, and would differ between ranks. Such a number is a
+[`mesh_mapreduce`](@ref), the same on every rank:
 
 ```julia
-scales = [maximum(block_mapreduce(abs, max, zero(eltype(fs.work)), fs; vars=v))
+scales = [mesh_mapreduce(abs, max, zero(eltype(fs.work)), fs; vars=v)
           for v in 1:fs.nvars]
 ```
 

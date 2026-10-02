@@ -318,11 +318,27 @@ Recruitment is a single pass over the original marks: a block pulled
 into the buffer does not itself recruit further neighbours. `buffer` is
 therefore limited to `N` cells, one block width, so that the dilated
 box cannot reach past the first ring of neighbours.
+
+`flags` has one entry per leaf of the whole forest, in leaf order, and a
+vector of another length is refused. Serially that is one per block.
+Over a distributed forest (M7) a rank's [`flag_blocks`](@ref) are its
+own blocks' only; pass those to [`regrid!`](@ref) with its `buffer`
+keyword, which searches the buffer from each rank's own sources and
+gathers the result.
 """
 function buffered_flags(forest::Forest{D}, flags::AbstractVector,
                         buffer::Integer) where {D}
     N = forest.N
     check_buffer(buffer, N)
+    # One flag per leaf of the whole forest, as `complete_marks` asks: the
+    # recruits it writes are global leaves. Over a distributed forest a
+    # rank's flags are its local blocks' only, which without this check
+    # would buffer around the wrong leaves (step 9 of M7 found a
+    # downstream calling it that way); `regrid!` buffers those itself.
+    length(flags) == nleaves(forest) || throw(DimensionMismatch(
+        "got $(length(flags)) flags for $(nleaves(forest)) leaves: buffered_flags " *
+        "takes one flag per leaf of the whole forest; over a distributed forest, " *
+        "pass the local flags to regrid! with its buffer keyword instead"))
 
     # Validate every box even when there is no buffering to do, so that a
     # malformed box is reported the same way either way.
