@@ -51,9 +51,10 @@ reductions, the regrid, point interpolation and checkpoints all work
 across ranks. Results are bit-identical to a serial run at any rank
 count, except floating-point sums, which agree to roundoff. MPI is a
 weak dependency, loaded with `using MPI` (see
-[Running distributed](@ref)). The weak-scaling measurements on a
-cluster and the run on CUDA GPUs are still open. Next is visualization
-export (M9b).
+[Running distributed](@ref)). It is measured on a cluster: weak
+scaling to four nodes, and the distributed run on CUDA GPUs with and
+without a CUDA-aware MPI; the parallel checkpoint's throughput on more
+than one node is still open. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -795,11 +796,14 @@ library that MPI.jl uses. MPI.jl's wrapper `mpiexecjl` (installed with
 mpiexecjl --project=. -n 4 julia -t 8 my_run.jl
 ```
 
-On a cluster, select the system MPI through MPIPreferences and launch
-with the batch system's launcher (`srun`). Ranks and threads combine: a
-rank per NUMA domain, each with a thread per core of its domain, pinned
-as under [Threading](@ref), is the layout the design document's
-benchmarks use.
+On a cluster, select the system MPI through MPIPreferences — between
+nodes it is not optional, since MPI.jl's default binary may not use the
+fast interconnect — and launch with the batch system's launcher
+(`srun`), or with that MPI's own `mpiexec` inside the allocation where
+it is not built for `srun`. Ranks and threads combine. Within one node,
+one process with a thread per core, pinned as under [Threading](@ref),
+measured faster than a rank per NUMA domain, since ranks pay for
+packing their halos; so use a rank per node and threads within it.
 Every rank should be able to compile on its own core; while a rank waits
 for a message, MPI usually spins rather than sleeps, so oversubscribing
 the cores slows every rank down.

@@ -2366,7 +2366,11 @@ entries per volume — documented here, implemented post-M3.
   not 3x, and it is not a per-process limit but the loss of
   data-to-core affinity between launches, which a block-ownership
   launch policy recovers entirely inside one process (next paragraph).
-  M7 therefore gains no bandwidth argument from this, and loses none:
+  M7 therefore gains no bandwidth argument from this, and loses none
+  *(confirmed in M7's step 7: on one Symmetry node one pinned 64-thread
+  process runs the RHS 1.5–1.6 times as fast as 8 ranks of 8 threads
+  over the same mesh, the ranks paying the packs and unpacks of their
+  halos)*:
   its partition of blocks over ranks and the ownership partition over
   threads are the same contiguous Morton ranges, one level apart. The
   M5 finding that pages must be interleaved stands as advice for Rome
@@ -3048,8 +3052,9 @@ decided with Erik that day and are marked so; the rest follows from
 them and from the sections cited, and is open to amendment as the
 implementation measures it. The steps are in the M7 entry under
 [Milestones](#milestones). Implemented in them by 2026-10-02, the
-amendments marked where they were made; the cluster measurements of
-steps 6–8 are open.)* M7 runs one forest over several
+amendments marked where they were made. Measured on Symmetry the same
+day: steps 7 and 8 in full, step 6 on one node; the findings are in
+the steps, and amend the bullets below where marked.)* M7 runs one forest over several
 processes. It came after M8 and M10 on purpose: every centering, the
 interface restriction and the mirrored transfers at reflecting faces
 are now entries of one schedule, so distributing the schedule
@@ -3091,7 +3096,11 @@ which can be made `O(local)` without changing a result; see step 7 under
 [Milestones](#milestones). Both were, the same day: each rank now
 searches the buffer from its own sources and classifies only the new
 leaves it needs, and a rank's regrid stayed at its 1408-leaf cost up to
-180224 leaves.)*
+180224 leaves.)* *(On Symmetry, step 7: at up to 32 ranks on four nodes
+the schedule build and the refining regrid are flat from 2 ranks on, and
+`bench/replicated.jl` on a rank's domain reproduces the flat regrid to
+180224 leaves; the replicated completion after the buffer, 20 ms there
+when every block is a source, is what still grows.)*
 
 **The communicator layer** (MPI a weak dependency, decided 2026-10-01
 with Erik). A new file, `src/communicator.jl`, sits after `device.jl`
@@ -3428,7 +3437,10 @@ Spectrum MPI); for any MPICH it is `false` unless the environment
 variable `JULIA_MPI_HAS_CUDA` says otherwise (MPI.jl 0.20.27's
 `environment.jl`). So on a CUDA-aware MPICH the direct path is opted
 into by that variable, and step 8 records whether the MPI on
-Symmetry's H200 nodes is CUDA-aware at all.
+Symmetry's H200 nodes is CUDA-aware at all. *(It is: HPC-X 2.20's Open
+MPI 4.1.7, for which `MPI.has_cuda()` is `true`; both paths pass there,
+and the direct one saves the two copies, 0.16–0.2 ms of a 2.5 ms fill
+on four H200s. See step 8.)*
 
 *(Step 8, where this was implemented; what it settled, and where it
 amends the paragraph above:)*
@@ -3906,7 +3918,8 @@ amends the bullets above:)*
   do-block that reads on rank 0 alone legal. At thousands of ranks the
   independent reads of one small object header may become the cost
   (`H5Pset_all_coll_metadata_ops` is the remedy); the Symmetry
-  measurement is where that would show.
+  measurement is where that would show. *(At up to 8 ranks on one node,
+  step 6, it did not; the multi-node run is open.)*
 - *Errors inside a collective call* remain fatal, as above. A
   `write_plain` refused in the do-block is agreed, so every rank leaves
   the block together and closes the file collectively, and the partial
@@ -4632,8 +4645,11 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
     into scratch copies, at one thread: TreeWave 310 tests in 1m12, and
     TreeHydro 11893 in 4m16. Neither calls the new functions yet; each
     gains them with `using HDF5` once a release carries them.
-- **M7 — MPI.** *(Implemented 2026-10-02; the Symmetry measurements of
-  steps 6–8 are open.)* Curve partitioning, distributed ghost exchange (for
+- **M7 — MPI.** *(Implemented 2026-10-02. Measured on Symmetry the same
+  day: the weak-scaling table of step 7 at up to four nodes and the H200
+  run of step 8, both paths, pass; the checkpoint throughput of step 6
+  ran on one node, and its multi-node part is open, so M7 is not yet
+  marked done.)* Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
   and the `Allreduce` inside `mesh_mapreduce` (the planned global
@@ -5184,8 +5200,9 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
     benchmark "Parallel I/O and M7" asked for. The per-process files
     are revisited only if the shared file does not hold up.
 
-    *(Done, 2026-10-01, except the Symmetry measurement, which is
-    scripted and not run.)* What it settled, and where it went beyond the
+    *(Done, 2026-10-01, except the Symmetry measurement, which ran on
+    one node on 2026-10-02 and not yet on several; see the last items.)*
+    What it settled, and where it went beyond the
     plan (the design decisions are recorded under "Parallel checkpoints"
     in [Distributed meshes](#distributed-meshes)):
     - *The code.* `ext/TreeAMRHDF5MPIExt.jl` (`[extensions]`
@@ -5280,15 +5297,64 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
       MPICH 5.0's sources (the chain is under "Parallel checkpoints"),
       not by tracing a run: the call is made, but no test here can see
       a write reach stable storage, and macOS's `fsync` does not.
-    - *Symmetry, not run.* `bench/symmetry_checkpoint_mpi.sh` (SLURM,
-      `amddebugq`) runs the benchmark on one node at 1, 2, 4 and 8 ranks
-      and on every node of the allocation at the given ranks per node
-      (default 8, one per NUMA domain at 8 threads), over the default
-      mesh and one with 2³ times the blocks, with the files on BeeGFS
-      through `TREEAMR_BENCH_DIR`, in a scratch environment that adds
-      the filter packages. It launches MPICH_jll through `srun
-      --mpi=pmi2` by default, or a system MPI through MPIPreferences
-      (`TREEAMR_MPI=system`); neither has run on the cluster.
+    - *Symmetry, one node only* (measured 2026-10-02, job 567854 on
+      cn106, AMD EPYC 7543, 64 cores, 8 NUMA domains; Julia 1.13.1,
+      MPICH_jll 5.0.2 through `srun --mpi=pmi2`, HDF5_jll's MPICH build
+      of libhdf5 2.2.0 with `HDF5.has_parallel()`; the files on BeeGFS
+      under `/mnt/beegfs/eschnetter/claude`; `bench/symmetry_checkpoint_mpi.sh`
+      as amended in the step's script commit, `TREEAMR_BENCH_REPS = 3`,
+      `64 / P` threads a rank, ranks in blocks so that 8 are one per
+      domain). GB/s of state, aggregate, the slowest rank's time, save
+      (`sync = false`) / sync / load; the default mesh, 3296 blocks,
+      216 MB of `pulse` and 540 MB of `blast`; `-n 1` is the serial
+      path over a one-rank communicator:
+
+      | data | filter | `-n 1` | `-n 2` | `-n 4` | `-n 8` |
+      |---|---|---|---|---|---|
+      | blast | none | 1.53 / 1.60 / 1.52 | 1.56 / 1.26 / 2.82 | 1.44 / 0.96 / 4.03 | 1.37 / 0.84 / 4.56 |
+      | blast | `Shuffle` + `Deflate(1)` | 0.22 / 0.22 / 0.42 | 0.40 / 0.38 / 0.70 | 0.52 / 0.52 / 1.40 | 0.81 / 0.77 / 2.51 |
+      | blast | shuffle + zstd(1) | 0.64 / 0.64 / 0.70 | 0.89 / 0.85 / 1.02 | 1.18 / 1.01 / 2.50 | 1.46 / 1.28 / 3.83 |
+      | blast | bitshuffle + zstd(1) | 0.51 / 0.51 / 0.68 | 0.77 / 0.74 / 1.28 | 1.01 / 0.96 / 2.41 | 1.15 / 1.06 / 3.65 |
+      | pulse | none | 1.26 / 1.34 / 1.20 | 1.35 / 1.11 / 2.31 | 1.34 / 0.90 / 2.36 | 1.15 / 0.77 / 3.27 |
+      | pulse | `Shuffle` + `Deflate(1)` | 0.07 / 0.07 / 0.19 | 0.12 / 0.12 / 0.45 | 0.19 / 0.18 / 0.74 | 0.25 / 0.23 / 1.33 |
+      | pulse | shuffle + zstd(1) | 0.30 / 0.30 / 0.42 | 0.35 / 0.34 / 1.05 | 0.42 / 0.36 / 1.79 | 0.42 / 0.34 / 2.43 |
+
+      File sizes are the serial ones (blast 89.9 MB with Deflate, 87.9
+      with zstd(1); pulse 161–164 MB). The mesh with 6³ → 12³ roots has
+      12648 blocks (the refinement follows a surface, so 3.8 times the
+      blocks, not 8; 829 MB of pulse and 2.07 GB of blast): at `-n 1`
+      pulse unfiltered 1.25 / 1.48 / 1.35, blast zstd(1) 0.62 / 0.63 /
+      0.69; at `-n 2` pulse unfiltered 1.48 / 1.32 / 2.55, blast
+      unfiltered 1.48 / 1.13 / 2.96 — the default mesh's rates, so the
+      table is not a small-file effect. What it shows:
+      1. **An unfiltered save from one node is 1.2–1.6 GB/s at every
+         rank count**, and the flush costs more with more ranks (blast
+         sync 1.60 → 0.84 GB/s from 1 to 8), every rank's
+         `MPI_File_sync` being a BeeGFS client round trip. One node's
+         client, or the servers, set that rate; which, only the
+         multi-node run can say.
+      2. **A filter parallelizes**, as "Compression is serial"
+         predicted: blast with zstd(1) saves at 1.46 GB/s at 8 ranks,
+         2.3 times its one-rank rate and about the unfiltered rate,
+         for a file 6.1 times smaller; Deflate 3.7 times faster. Pulse,
+         whose data compress to 1.3 only, gains less (zstd(1) 1.4
+         times).
+      3. **The load scales** (blast unfiltered 1.52 → 4.56 GB/s), but it
+         reads a file the node just wrote, so this is the client's
+         cache and the per-rank allocation and `scatter!`, not BeeGFS's
+         read rate.
+      4. Collective metadata reads were not needed at these counts.
+
+      **Not run: the multi-node part.** Job 567855 (4 nodes, 8 ranks a
+      node, `TREEAMR_CKPT_ONENODE=0`, so 2 and 4 nodes) was queued
+      behind 567854, and the tunnel to the cluster went down before
+      either finished, so their logs were not copied; the table above is
+      read from 567854's log while it ran, its 4- and 8-rank rows on the
+      larger mesh and the shuffle + LZ4 and bitshuffle + LZ4 rows above
+      one rank not included. Whether the shared file's aggregate rate
+      grows with nodes past the one-node 1.5 GB/s — the question
+      "Parallel I/O and M7" asked — therefore stays open, and with it
+      whether the per-process files need revisiting.
     - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
       `partition_tests.jl`, `checkpoint_tests.jl` and `mpi_tests.jl`
       (2m53 together), the parallel checkpoints and every cross load
@@ -5311,8 +5377,9 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
     what limits it named, the replicated regrid bookkeeping and the
     overlap of the exchange with the local groups among them.
 
-    *(Built and run locally, 2026-10-02; the Symmetry table is scripted
-    and not run, so the acceptance stays open.)* What it settled:
+    *(Done, 2026-10-02: built and run locally, then on Symmetry at up to
+    four nodes, 32 ranks; the table and what limits it are the
+    "Symmetry" items below.)* What it settled:
     - *The benchmark.* `bench/mpi.jl` (under `mpiexec` with the
       argument `mpi`, in the test environment) builds a mesh of `TILES`
       identical tiles of `ROOTS^D` roots stacked along `x_D`, periodic,
@@ -5615,21 +5682,166 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
       Metal, MPI and KernelAbstractions) runs in Float32 through the
       staging path at 2 ranks, every phase included; its numbers, two
       ranks sharing one GPU, say only that the path works.
-    - *Symmetry, not run.* `bench/symmetry_mpi.sh` (SLURM, `amddebugq`,
-      4 nodes by default) builds a scratch environment (MPICH_jll and
-      `srun --mpi=pmi2` by default, or a system MPI through
-      MPIPreferences with `TREEAMR_MPI=system`), then per block size
-      (`N = 16` and 32) runs one node at 1, 2, 4 and 8 ranks — rank `i`
-      of `R` on a node bound by `numactl` to NUMA domain `i · 8 / R`,
-      cores and memory, 8 threads — then 2 and 4 nodes at 8 ranks a
-      node, and the single-process controls over the 8-rank mesh: 64
-      threads pinned with first touch, and interleaved. It prints the
-      weak-scaling table against one rank on one domain and the
-      same-mesh table of the 8-rank run against the controls, and
-      `bench/replicated.jl` on one domain at 8 threads. "What one
-      process loses" found that the ownership policy recovers inside
-      one process what one rank per domain was expected to, so the
-      same-mesh table is a check of that, not an expected win.
+    - *Symmetry* (measured 2026-10-02, job 567847 on cn092–cn095: AMD
+      EPYC 7532, the Rome nodes of `amdq`, 64 cores and 8 NUMA domains
+      each, ConnectX-6 HDR100 InfiniBand; Julia 1.13.1; HPC-X 2.20's Open
+      MPI 4.1.7 over UCX 1.17, `nvhpc-hpcx-cuda12/24.9`, through
+      MPIPreferences' system binary). `bench/symmetry_mpi.sh` as amended
+      in the same step's script commit: one rank per NUMA domain bound by
+      `numactl`, 8 threads, `D = 3`, `ROOTS = 4`, 2 variables, Float64,
+      10 windows, the minimum over them. Launching took four fixes to
+      the script and none to the package: `amddebugq` takes one node a
+      job, so the job ran on `amdq`; SLURM 21.08 ignores
+      `--ntasks-per-node` in a step unless `--ntasks` is given;
+      MPICH_jll starts under `srun --mpi=pmi2` but runs TCP over IPoIB,
+      2.1 GB/s and 40 µs ping-pong between nodes (job 567845), while
+      HPC-X runs 12.0 GB/s and 2.2 µs (job 567846) and is not built with
+      SLURM's PMI, so it is launched by its own `mpiexec`; and Open MPI
+      hands each rank a pseudo-terminal, into which the juliaup launcher
+      writes a terminal title, so the ranks run the julia binary itself.
+      Minimum ms, two-level mesh (176 blocks a rank), one node at 1–8
+      ranks, then 2 and 4 nodes at 8 a node; efficiency `t(1)/t(P)`:
+
+      | `N = 16` | 1 | 2 | 4 | 8 | 16 | 32 | eff. 32 |
+      |---|---|---|---|---|---|---|---|
+      | rhs | 7.75 | 11.98 | 12.99 | 12.78 | 13.59 | 14.41 | 0.54 |
+      | fill_ghosts | 4.37 | 8.40 | 8.86 | 8.87 | 8.93 | 9.64 | 0.45 |
+      | — its local groups | 4.33 | 5.18 | 3.90 | 5.29 | 5.31 | 5.55 | |
+      | — its packs | – | 2.73 | 2.97 | 2.98 | 2.95 | 2.93 | |
+      | — its unpacks | – | 0.51 | 0.78 | 0.80 | 0.79 | 0.80 | |
+      | scatter | 1.84 | 1.84 | 1.84 | 1.95 | 1.91 | 1.91 | 0.97 |
+      | norm | 2.96 | 2.09 | 2.09 | 2.08 | 3.34 | 3.00 | 0.99 |
+      | interfaces | 0.13 | 0.70 | 0.62 | 0.74 | 0.72 | 0.52 | |
+      | interpolate (1000 pts/rank) | 0.24 | 0.77 | 0.83 | 0.61 | 0.69 | 10.24 | 0.02 |
+      | ghost_schedule | 8.38 | 11.79 | 11.65 | 12.10 | 11.70 | 11.73 | 0.71 |
+      | interface_schedule | 0.33 | 1.54 | 1.23 | 1.63 | 1.36 | 1.36 | |
+      | regrid, refine | 25.6 | 28.9 | 26.4 | 27.0 | 24.9 | 32.5 | 0.79 |
+      | regrid, coarsen | 21.9 | 28.9 | 33.9 | 30.5 | 33.7 | 38.8 | 0.56 |
+      | triad reference | 1.70 | 1.74 | 2.13 | 2.18 | 2.26 | 2.15 | 0.79 |
+
+      | `N = 32` | 1 | 2 | 4 | 8 | 16 | 32 | eff. 32 |
+      |---|---|---|---|---|---|---|---|
+      | rhs | 37.9 | 47.7 | 49.4 | 58.2 | 55.0 | 55.9 | 0.68 |
+      | fill_ghosts | 18.7 | 29.2 | 28.6 | 27.7 | 29.8 | 30.1 | 0.62 |
+      | — its local groups | 18.7 | 17.0 | 17.0 | 17.0 | 16.9 | 17.1 | |
+      | — its packs | – | 8.58 | 8.58 | 8.55 | 8.96 | 9.07 | |
+      | — its unpacks | – | 2.04 | 1.73 | 1.77 | 1.99 | 2.09 | |
+      | scatter | 8.02 | 8.69 | 8.71 | 9.38 | 9.96 | 11.98 | 0.67 |
+      | norm | 15.5 | 15.2 | 15.9 | 16.2 | 16.0 | 16.9 | 0.92 |
+      | interpolate | 0.19 | 0.78 | 0.94 | 0.63 | 0.86 | 8.28 | 0.02 |
+      | ghost_schedule | 13.2 | 16.0 | 16.4 | 16.2 | 16.2 | 16.3 | 0.81 |
+      | regrid, refine | 162 | 174 | 192 | 163 | 154 | 162 | 1.00 |
+      | regrid, coarsen | 134 | 172 | 224 | 225 | 217 | 217 | 0.62 |
+      | triad reference | 13.3 | 13.6 | 13.8 | 14.5 | 14.4 | 13.8 | 0.96 |
+
+      A fill sends, per rank, 2 messages at 2 ranks and 3 from 4 on
+      (716800 bytes each way at `N = 16`, 2.3 MB at 32; 560 transfers
+      sent and 560 received against 4224 local); the regrid makes ranks
+      take 0/50/108 blocks from another (min/mean/max) at 32 ranks. The
+      uniform mesh (64 blocks a rank, one stage): rhs 2.05 / 3.75 / 2.62 /
+      3.92 / 3.85 / 3.83 ms at `N = 16` (efficiency 0.53 at 32) and 9.84
+      / 13.4 / 15.3 / 16.3 / 16.2 / 16.9 at 32 (0.58). What it shows:
+      1. **The step from one rank to two is the whole loss, and the
+         network is not in it.** From 2 to 32 ranks, across one, two and
+         four nodes, the two-level rhs grows by 20 % at `N = 16` (12.0 →
+         14.4 ms) and 17 % at 32 (47.7 → 55.9): efficiency 0.83 and 0.85
+         against 2 ranks. The fill less its local groups, packs and
+         unpacks — what the messages left unhidden — is −0.2 to 0.4 ms
+         at `N = 16` and 0.4 to 2.0 ms at 32 at every count, inside the
+         error of subtracting separately measured minima; 2.3 MB over
+         UCX at 12 GB/s is 0.2 ms. The overlap does its job, and
+         between nodes too.
+      2. **The packs are the cost**: 2.7–3.0 ms of an 8.9 ms fill at
+         `N = 16`, 8.6–9.1 of 30 at 32, against local groups of 5.3 and
+         17.0 ms for 7.5 times as many transfers. So a packed transfer
+         costs about 4 times a local one. The likely reason, not
+         measured: pack groups run by the owner of the *source* block
+         ("Ownership" under "Pack and unpack are transfers"), and the
+         sources of a rank's halo are the bottom and top layers of its
+         tile, which sit at the two ends of its curve range and so in
+         the first and last thread chunks: at 8 threads the packs for
+         the rank below run on one thread, those for the rank above on
+         about four. The sender-computes rule moves the halo's
+         arithmetic to the sender, as designed; what costs is that the
+         block-ownership partition then gives it to a few threads. A
+         pack split over all threads by transfer, not by owner, would
+         trade affinity for balance, which is a design question.
+      3. **The schedule build and the regrid are flat from 2 ranks on**,
+         as `bench/replicated.jl` predicted: the build 11.7–12.1 ms at
+         `N = 16` and 16.0–16.4 at 32 at every count from 2 to 32; the
+         refining regrid 25–33 ms and 154–192 ms. The coarsening regrid
+         rises from 1 to 4 ranks, by 55 % at `N = 16` and 67 % at 32,
+         and is flat after at `N = 32`; at 16 it rises again at 32 ranks
+         (not traced).
+      4. **`interpolate!` at 32 ranks jumps to 8–10 ms**, from 0.6–0.9
+         ms at 2–16 ranks; at 16 ranks (two nodes) its *median* is
+         already 9.9 ms. Nothing else in the table does this, and
+         MPICH_jll over TCP at 16 ranks takes 2.0 ms (below), so it is
+         the collectives — an `allgather` and four `alltoallv` — inside
+         this Open MPI at that scale, not the work. A job that repeats
+         the 16- and 32-rank runs with HPC-X's HCOLL collectives on and
+         off (567858) was queued and its result not collected; the cause
+         is open.
+      5. **Phases without messages slow by the slowest of 32 ranks**:
+         `scatter` 8.0 → 12.0 ms at `N = 32` and the uniform mesh's
+         local groups 2.5 → 4.3, while the triad stays at 0.96. The
+         window is the slowest rank's.
+    - *One node, the same mesh: 8 ranks against one process* (the same
+      job; the control is 64 threads over the 8-tile mesh in one
+      process). The one process wins the per-evaluation phases. Minimum
+      ms, two-level, 8 ranks / one process pinned with first touch
+      (`JULIA_EXCLUSIVE=1`) / one process interleaved:
+
+      | | `N = 16` | `N = 32` |
+      |---|---|---|
+      | rhs | 12.78 / 7.98 / 11.97 | 58.2 / 39.4 / 50.5 |
+      | fill_ghosts | 8.87 / 4.78 / 7.82 | 27.7 / 19.8 / 28.2 |
+      | ghost_schedule | 12.1 / 16.7 / 17.1 | 16.2 / 23.0 / 19.9 |
+      | regrid, refine | 27.0 / 48.1 / 44.3 | 163 / 233 / 245 |
+      | regrid, coarsen | 30.5 / 48.9 / 41.4 | 225 / 221 / 218 |
+
+      One pinned process runs the rhs 1.6 times as fast at `N = 16` and
+      1.5 times at 32 (the uniform mesh 1.3 and 1.6), because the 8-rank
+      run pays the packs and unpacks of item 2 and the one process pays
+      nothing for the same halo: its local groups are the 8 ranks' local
+      groups plus the halo, at about the same time (4.95 against 5.29
+      ms at `N = 16`). That settles what "What one process loses" left
+      for this step: the ownership policy recovers inside one process
+      everything one rank per domain was expected to, and on one node
+      ranks are a loss for the rhs. The replicated host passes go the
+      other way — the schedule build and the refining regrid are
+      1.4–1.8 times faster over 8 ranks, being per rank `O(local)` work
+      on fewer threads — but they run at regrid frequency. So the
+      layout to recommend is one process per node, its threads pinned,
+      and ranks between nodes.
+    - *The default binary between nodes* (job 567857, cn109–cn110, the
+      Milan EPYC 7543 nodes, MPICH_jll 5.0.2 through `srun --mpi=pmi2`,
+      `N = 16`; compare within the job only). On one node it matches
+      HPC-X's shape (two-level rhs 6.32 / 11.83 / 12.31 / 13.66 ms at
+      1–8 ranks); on two nodes the rhs is 18.52 ms and the fill 13.42,
+      against 13.66 and 9.48 at 8 ranks, so TCP over IPoIB adds 4 ms a
+      fill that UCX does not (efficiency 0.34 at 16 ranks, against 0.57
+      for HPC-X at 16 in job 567847). Between nodes the system MPI is
+      not optional.
+    - *The replicated costs on a rank's domain* (`bench/replicated.jl`
+      in job 567847, one domain of cn092, 8 threads, 176 blocks a rank;
+      ms):
+
+      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
+      |---|---|---|---|---|
+      | digest | 0.036 | 0.19 | 1.40 | 2.79 |
+      | `GhostSchedule` on the rank | 11.9 | 11.7 | 13.0 | 14.3 |
+      | `regrid_sources`, every leaf / the rank's own | 0.40 / 0.17 | 1.94 / 0.18 | 15.8 / 0.16 | 32.3 / 0.17 |
+      | every block a source: replicated `complete_marks` | 3.6 | 33 | 290 | 596 |
+      | on the rank: `regrid_marks` / the completion | 0.78 / 1.04 | 0.84 / 2.15 | 0.89 / 12.2 | 1.26 / 20.4 |
+      | `regrid!` on the rank, refine / coarsen | 23.1 / 18.5 | 19.2 / 22.8 | 19.5 / 19.4 | 22.4 / 23.9 |
+
+      So the laptop's finding holds on the cluster: a rank's regrid
+      costs at 180224 leaves what it costs at 1408. What remains
+      replicated and grows is the completion after the buffer, 20 ms at
+      180224 leaves when every block is a source, about a regrid's
+      worth; the build grows by 2.4 ms over 128 times the leaves, the
+      digest most of it.
     - *What was not done.* The benchmark itself changed nothing in
       `src/`, so the suite was not rerun for it; the follow-up above
       did, and it was.
@@ -5641,7 +5853,8 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
     staging path, and on an H200 on Symmetry, agreeing with the serial
     device run as [Parallelism](#parallelism) states for a device.
 
-    *(Done locally, 2026-10-01; the H200 run is scripted and not run.)*
+    *(Done locally, 2026-10-01, and on Symmetry's H200s, both paths, on
+    2026-10-02.)*
     What it settled, and where it went beyond the plan (the design
     decisions are recorded under "MPI+GPU" in
     [Distributed meshes](#distributed-meshes)):
@@ -5741,19 +5954,69 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
       the serial run (before the inference fix above, which changes no
       value): every line but the `sum` lines and the `#` lines identical,
       the sums agreeing to the last one or two of 17 digits, as in step 6.
-    - *Symmetry, not run.* `bench/symmetry_mpi_gpu.sh` (SLURM,
-      `h200debugq`, one node, 4 GPUs by default) runs
-      `test/mpi_device_tests.jl` on CUDA at 2, 3 and as many ranks as
-      GPUs, in Float64 and Float32, through the staging path, and through
-      the direct path too when `MPI.has_cuda()` says the MPI is
-      CUDA-aware (or `TREEAMR_DEVICEAWARE=1` says so). With the default
-      binary, MPICH_jll, it is not, so the direct path needs a CUDA-aware
-      system MPI through `TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`;
-      whether Symmetry has one is the open question the paragraph above
-      left for this step, and it stays open until the job runs. No timing
-      is taken there: the cost of the two paths belongs with step 7's
-      benchmark, which does not exist yet.
-    - *What was not checked.* The direct path on any device: Metal has no
+    - *Symmetry* (measured 2026-10-02 on cn111, one node of 8 H200s
+      with 4 of them allocated, NVLink between every pair; Julia 1.13.1,
+      CUDA.jl's CUDACore 6.4.1; `bench/symmetry_mpi_gpu.sh` as amended
+      in the step's script commit, on `h200q`, since `h200debugq`'s QOS
+      allows a group 2 GPUs and 24 CPUs). One rank per GPU, one thread a
+      rank, `TREEAMR_TEST_RANKS = "2 3 4"`:
+      - **Host staging, MPICH_jll 5.0.2** (job 567852):
+        `test/mpi_device_tests.jl` passes in Float64 and in Float32, 52
+        tests each, every line of every distributed run the serial CUDA
+        run's but the sums, every stage with messages staged. The first
+        job (567850) had failed at `-n 2`: CUDA refuses to page-lock an
+        empty range, and a stage this rank only sends in, or only
+        receives in, has an empty mirror, which Metal and the CPU never
+        refused. `pagelock_mirror!` now skips an empty mirror (the
+        step's fix commit), and nothing else changed between the jobs.
+      - **Symmetry has a CUDA-aware MPI**: HPC-X 2.20's Open MPI 4.1.7
+        (`nvhpc-hpcx-cuda12/24.9`, through MPIPreferences' system
+        binary), whose `ompi_info` says `opal_built_with_cuda_support`
+        and for which `MPI.has_cuda()` is `true`. Over it (job 567856)
+        the test passes through host staging and through the direct
+        path, `communicator(COMM_WORLD; deviceaware = true)`, in
+        Float64 and in Float32: four times 52 tests, the direct runs
+        with no stage staged. So the direct path, which no device here
+        could run, is checked — MPI.jl hands the `CuArray` views to the
+        library by device pointer, and UCX moves them. The probe of
+        `MPI.has_cuda()` has to run under `mpiexec -n 1`: a singleton
+        `MPI.Init()` of this Open MPI inside a SLURM job waits forever
+        for the daemon it spawns (job 567853, cancelled).
+      - **What the two paths cost** (`bench/mpi.jl` on CUDA through
+        `bench/mpiscan.sh 1 2 4`, `N = 32`, `ROOTS = 4`, Float64, 5.8 M
+        cells a rank, the four GPUs of one node, HPC-X; minimum ms,
+        staged / direct):
+
+        | phase | 1 rank | 2 ranks | 4 ranks |
+        |---|---|---|---|
+        | two-level rhs | 2.07 / 2.06 | 2.89 / 2.72 | 2.92 / 2.76 |
+        | two-level fill_ghosts | 1.71 / 1.70 | 2.49 / 2.29 | 2.52 / 2.35 |
+        | — its local groups | 1.69 / 1.67 | 1.44 / 1.41 | 1.44 / 1.43 |
+        | — its packs | – | 0.52 / 0.51 | 0.51 / 0.50 |
+        | — its unpacks | – | 0.44 / 0.44 | 0.44 / 0.44 |
+        | uniform rhs | 0.31 / 0.31 | 0.63 / 0.61 | 0.71 / 0.63 |
+        | two-level regrid, refine | 5.2 / 5.2 | 25.4 / 7.1 | 48.0 / 8.7 |
+        | two-level regrid, coarsen | 3.6 / 3.6 | 26.1 / 7.3 | 52.6 / 8.2 |
+        | interpolate (1000 pts/rank) | 0.11 / 0.11 | 0.55 / 0.55 | 0.47 / 0.50 |
+
+        The rhs weak-scales at 0.71 staged and 0.74 direct to 4 GPUs.
+        As on the CPU, the messages are not the cost: the fill less its
+        parts is under 0.2 ms either way. The packs and unpacks are,
+        0.95 ms of a 2.5 ms fill, and on a device that is launches —
+        one per group, for groups of a few thousand points (the
+        uniform mesh's single stage has 0.12 + 0.12 ms of them for a
+        fill of 0.16 ms serially). The direct path saves 0.16–0.2 ms a
+        fill, the two copies. **The staged regrid is the surprise**: 48
+        ms at 4 ranks against 8.7 direct and 5.2 serially. A regrid
+        stage is built per regrid, so its host mirrors are allocated,
+        zero-filled and page-locked afresh each time, for up to 84
+        blocks of `32³ × 2` values; that is the likely cost (not
+        traced), and MPICH_jll's staging (job 567852) shows the same
+        48.4 ms. A regrid that staged through pageable memory, or kept
+        its mirrors, would not pay it; left open, since a regrid runs at
+        regrid frequency and the direct path exists.
+    - *What was not checked* (before the Symmetry run, which checked the
+      direct path on CUDA). The direct path on any device: Metal has no
       device-aware MPI, and the CPU's direct path is not the device's
       code path for MPI.jl, which hands a `CuArray` over through its
       own CUDA extension. A checkpoint or an interpolation from a device
@@ -5875,6 +6138,16 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
       ranks of about 2 GB each, which may swap; and the time of the
       coverage cells, whose ranks are instrumented too (the deadline is
       900 s a launch, against about 55 s uninstrumented here).
+      *(Linux, 2026-10-02: in a fresh clone of the branch at 12a6cd6 on
+      one Symmetry node each — jobs 567843 on cn106 and 567844 on cn109,
+      AMD EPYC 7543 — `Pkg.test()` at one thread passes on Julia 1.11.9,
+      110484 tests in 13m34 (`--check-bounds=yes`, which 1.11's
+      `Pkg.test` sets), and on 1.13.1, 110484 in 11m18, the MPI jobs
+      started early on both, with MPICH_jll 5.0.2 resolved by default.
+      `HYDRA_LAUNCHER=fork` was set, so that MPICH's launcher forked its
+      ranks as on a runner without SLURM, rather than starting them
+      through `srun`. So the MPI tests work on Linux; GitHub's runners
+      are what CI is for.)*
     - *Docs.* A guide section, "Running distributed", in
       `docs/src/index.md`; the status there and in `README.md`; the
       distributed API page pointing at the guide. Two examples that

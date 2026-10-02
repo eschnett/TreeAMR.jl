@@ -13,8 +13,10 @@ The package is currently at milestone **M7** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, and
-M7's distribution over MPI). M7 is implemented; its weak-scaling
-measurements on a cluster and its run on CUDA GPUs are still open.
+M7's distribution over MPI). M7 is implemented, and measured on a
+cluster: weak scaling to four nodes and the distributed run on CUDA
+GPUs, with and without a CUDA-aware MPI. The parallel checkpoint's
+throughput on more than one node is still open.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
