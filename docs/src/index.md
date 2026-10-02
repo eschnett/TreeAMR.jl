@@ -790,7 +790,9 @@ and continues bit for bit. The plain data must be the same on every
 rank; data that differ are refused on every rank before anything is
 written. Keep the index and its parts together: the next save to the
 same path removes the parts of the one it replaces, and any other file
-named like one of its parts.
+named like one of its parts. One part per node keeps the number of
+files small; one per rank was faster on the cluster measured, most of
+all with a filter, which each I/O process runs for its group alone.
 
 ```julia
 save_checkpoint("run.h5", forest; fieldsets = ("u" => (fs, u),),

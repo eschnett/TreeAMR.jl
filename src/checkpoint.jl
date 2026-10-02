@@ -70,7 +70,10 @@ run began it with. Put `t`, the chunk index and any other run state in
   "Over a distributed forest" below): `:node`, the default, for one per
   shared-memory node; `:all` for every rank; or an integer, at most the
   number of ranks (a larger one counts as that). Serially there is one
-  whatever it says.
+  whatever it says. `:node` keeps the number of files at the number of
+  nodes; `:all` was the faster setting on a cluster's BeeGFS, most of
+  all with a filter, since each I/O process compresses its group's
+  blocks on its own (`CODE.md`, M7 step 6b).
 
 The do-block form calls `f` with the application's group open for
 writing, after everything else is written, for datasets of the
