@@ -528,7 +528,8 @@ struct AllVariables{F}
 end
 
 # The sample point the host-side length check evaluates at: the first
-# owned point of block 1, which every field set has. Any point would do
+# owned point of block 1. Under MPI a rank may hold no blocks, so every
+# caller returns before this on such a rank. Any point would do
 # — the check is about how many values come back, and a callback whose
 # tuple length varies with position is broken in a way no single
 # evaluation could catch.

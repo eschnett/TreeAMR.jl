@@ -10,7 +10,8 @@
 # regrids that move blocks between ranks both ways and coarsen siblings
 # that had different owners, in three element types; then (step 5) point
 # interpolation, each rank asking for its own slice of a global point
-# list, and an outside point on one rank refused on all; then (steps 6
+# list, and an outside point on one rank refused on all; a rank without
+# blocks through every operation (added after 0.1.5); then (steps 6
 # and 6b) a run checkpointed after a regrid, with a part file per rank,
 # per I/O group and per node, and continued from each, and the files of
 # the earlier runs, written at other rank counts, loaded and continued —
@@ -111,7 +112,7 @@ end
     @test any(l -> startswith(l, "B2 conserved true"), lines)
     # The regrid cycles (step 4) changed the mesh every time, Burgers'
     # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 12
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 14
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
     @test count(l -> occursin(" unchanged false", l), lines) == 3
@@ -137,7 +138,13 @@ end
     @test words("C1 loaded")[3] == words("C1 saved")[3]
     # Three levels wherever they were asked for.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
-                                                    !startswith(l, "W1p"), lines))
+                                                    !startswith(l, "W1p") &&
+                                                    !startswith(l, "E2"), lines))
+    # The ranks without blocks (E2): everything ran, the checkpoint came
+    # back as saved, and both initial-data cycles refined and converged.
+    @test words("E2 checkpoint")[3:4] == ["2", "true"]
+    @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
+              filter(startswith("E2 adapted "), lines))
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.
@@ -185,6 +192,10 @@ end
         @test "# C restarted-filtered nranks $n nparts 2" in hashes
         @test "# C restarted-node nranks $n nparts 1" in hashes
         @test "# C1 empty ranks $(n == 3 ? 1 : 0)" in hashes
+        # E2's two leaves leave one of three ranks without a block, before
+        # its regrids and after them.
+        @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
+        @test "# E2 empty ranks after the regrids $(n == 3 ? 1 : 0)" in hashes
         for from in (n == 3 ? (1,) : (1, 3)), at in (n, 1)
             crossed(hashes, from, at)
         end

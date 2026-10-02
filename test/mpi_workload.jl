@@ -635,6 +635,87 @@ function interpolate_case(tag)
     return nothing
 end
 
+# --- ranks without blocks ---------------------------------------------------
+
+# Two leaves, so that at three ranks one rank holds no block, through
+# every operation an application makes on it: the all-variables forms of
+# the fill and the boundary hook, the wave equation, the interface
+# restriction, interpolation, regrids that give the empty rank blocks
+# and take them away again, the initial-data cycle and a checkpoint. A
+# step that assumed a rank has a block 1 throws there while the others
+# wait, which `main` turns into an abort: the all-variables hook's length
+# check did, until it was guarded after 0.1.5.
+const EMPTY_PARITY = [(OddParity, EvenParity), (EvenParity, EvenParity)]
+const EMPTY_DATA = AllVariables(x -> (sin(2x[1]) + x[2] / 3, x[1] * x[2] - 1))
+const EMPTY_HOOK = CellBoundary(AllVariables((x, δ) -> EMPTY_DATA.f(x)))
+
+function empty_rank_case(tag)
+    D = 2
+    forest = forest_of((2, 1), 8; reflecting=((true, false), (false, false)))
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    empties() = count(iszero, TreeAMR.allgather(forest.comm, length(blockrange(forest))))
+    emit("#", tag, "empty ranks", empties())
+    fs = FieldSet(forest, 2; G=2, parity=EMPTY_PARITY)
+    fill_by_coordinates!(EMPTY_DATA, fs)
+    sched = GhostSchedule(fs, OPS4)
+    fill_ghosts!(fs, sched; boundary=EMPTY_HOOK)
+    emit(tag, "filled", digest(gathered(forest, fs.work)))
+    u = statevector(fs)
+    gather!(u, fs)
+    rk4!(u, fs, sched, 0.2 * minimum_spacing(forest), 3, Val(D), Val(fs.G), EMPTY_HOOK)
+    emit(tag, "state", digest(gathered(forest, u)))
+    scatter!(fs, u)
+    reductions(tag, fs, u)
+
+    vfs = FieldSet(forest, 2; G=0, centering=vertexcentered(D), parity=EMPTY_PARITY)
+    pseudorandom!(vfs)
+    restrict_interfaces!(vfs, InterfaceSchedule(vfs))
+    emit(tag, "restricted", digest(gathered(forest, vfs.work)))
+
+    # Rank 0 asks for every point, beyond the wall too; the others for none.
+    fill_ghosts!(fs, sched; boundary=EMPTY_HOOK)
+    pts = [(-0.4 + 2.35 * mod(j * 0.618034, 1.0), 0.97 * mod(j * 0.381966, 1.0))
+           for j in 1:23]
+    r = interpolate(fs, RANK == 0 ? pts : similar(pts, 0), Lagrange(4);
+                    derivs=((0, 0), (1, 0)))
+    emit(tag, "interpolated", digest(gathered(forest, r.values)))
+
+    # Refined, every rank has blocks; coarsened again, the third has none.
+    regridded("$tag.refine", forest, (fs => sched, vfs => nothing);
+              flags=fill(Refine, length(blockrange(forest))), boundary=EMPTY_HOOK)
+    sched = GhostSchedule(fs, OPS4)
+    fill_ghosts!(fs, sched; boundary=EMPTY_HOOK)
+    emit(tag, "refined", digest(gathered(forest, fs.work)))
+    regridded("$tag.coarsen", forest, (fs => sched,);
+              flags=fill(Coarsen, length(blockrange(forest))), boundary=EMPTY_HOOK)
+    sched = GhostSchedule(fs, OPS4)
+    fill_ghosts!(fs, sched; boundary=EMPTY_HOOK)
+    emit(tag, "coarsened", digest(gathered(forest, fs.work)))
+    emit("#", tag, "empty ranks after the regrids", empties())
+
+    path = joinpath(checkpoint_dir(), "$tag-n$NRANKS.h5")
+    save_checkpoint(path, forest; fieldsets=("u" => fs,), application="Empty" => 1)
+    ck = load_checkpoint(path; comm=COMM)
+    back = ck.fieldsets["u"].fieldset
+    v = statevector(back)
+    gather!(v, back)
+    gather!(u, fs)
+    emit(tag, "checkpoint", nleaves(ck.forest), gathered(forest, u) == gathered(forest, v))
+
+    # The initial-data cycle from the two leaves, in both callback forms.
+    for (name, initial) in (("all", EMPTY_DATA), ("each", (x, v) -> EMPTY_DATA.f(x)[v]))
+        forest = forest_of((2, 1), 8; reflecting=((true, false), (false, false)))
+        fs = FieldSet(forest, 2; G=2, parity=EMPTY_PARITY)
+        _, passes, converged = adapt_to_initial_data!(
+            fs, OPS4; initial=initial, boundary=EMPTY_HOOK,
+            flag=(b, k) -> level(k) < 1 && block_extent(forest, k)[1][1] < 0.5 ?
+                           Refine : Keep)
+        emit(tag, "adapted", name, passes, converged, nleaves(forest),
+             digest(gathered(forest, fs.work)))
+    end
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -1189,6 +1270,8 @@ function main()
     moving_blocks_case("M32x2-", Float32x2; full=false)
     # Point interpolation, routed to the owners and back.
     interpolate_case("I2")
+    # A rank without blocks through everything, at three ranks.
+    empty_rank_case("E2")
     # Checkpoints: saved and loaded at this rank count, and the files of
     # the runs before this one loaded at it.
     checkpoint_case("C")

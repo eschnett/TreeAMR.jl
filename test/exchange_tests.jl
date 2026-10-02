@@ -678,6 +678,46 @@ end
     end
 end
 
+@testset "An AllVariables boundary hook runs on a rank with no blocks: D=$D" for D in (2, 3)
+    # The all-variables hook's length check evaluates the callback at a
+    # point of block 1, and a rank of a forest with fewer leaves than
+    # ranks has no block 1: it threw there while its peers went on to
+    # the next collective, which under MPI is a hang. The empty rank must
+    # skip the hook, and the others must still match the serial fill
+    # with the per-variable hook bit for bit.
+    kinds = D == 2 ? (:outer, :reflect_both) : (:reflect_lo, :outer, :periodic)
+    serial = faces_forest(kinds; N=8)
+    nvars = length(EXCHANGE_PARITY)
+    P = nleaves(serial) + 1
+    C = cellcentered(D)
+    G = exchange_ghosts(C, PointValue)
+    sfs = FieldSet(serial, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
+    data = exchange_data(MersenneTwister(9), Float64, size(sfs.work))
+    copyto!(sfs.work, data)
+    fill_ghosts!(sfs, GhostSchedule(sfs, XOPS4); boundary=exchange_hook())
+    whole = CellBoundary(AllVariables((x, δ) -> ntuple(v -> exchange_hook().g(x, v, δ),
+                                                       Val(nvars))))
+    box = Mailbox()
+    forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                      reflecting=serial.reflecting, extents=serial.extents,
+                      leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
+               for r in 0:(P - 1)]
+    @test count(f -> isempty(blockrange(f)), forests) == 1
+    sets = map(forests) do forest
+        fs = FieldSet(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
+        copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+        fs
+    end
+    scheds = [GhostSchedule(fs, XOPS4) for fs in sets]
+    @sync for r in 1:P
+        @async fill_ghosts!(sets[r], scheds[r]; boundary=whole)
+    end
+    @test all(isempty ∘ last, box.channels)
+    @test all(r -> bitwise_equal(sets[r].work,
+                                 sfs.work[ntuple(_ -> :, D + 1)...,
+                                          blockrange(forests[r])]), 1:P)
+end
+
 @testset "A serial schedule's stages are its phases, and send nothing" begin
     # The serial path must stay what it was: one stage per phase, the
     # phase's own groups, no messages and no buffers, so a serial fill
