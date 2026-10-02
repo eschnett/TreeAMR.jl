@@ -11,7 +11,7 @@
 # that had different owners, in three element types; then (step 5) point
 # interpolation, each rank asking for its own slice of a global point
 # list, and an outside point on one rank refused on all; a rank without
-# blocks through every operation (added after 0.1.5); then (steps 6
+# blocks through every operation (added in 0.1.6); then (steps 6
 # and 6b) a run checkpointed after a regrid, with a part file per rank,
 # per I/O group and per node, and continued from each, and the files of
 # the earlier runs, written at other rank counts, loaded and continued —

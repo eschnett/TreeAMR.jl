@@ -3353,7 +3353,7 @@ change only the helper, at both levels.
   reduction (below). Every launch guards an empty `ndrange`. Empty
   ranks occur whenever ranks outnumber leaves, which a coarse initial
   mesh on many ranks does for a while, and the workload tests one.
-  *(Amended after 0.1.5.)* One host-side step did not guard: the
+  *(Amended in 0.1.6.)* One host-side step did not guard: the
   `AllVariables` boundary hook checks its callback's tuple length at a
   point of block 1, and an empty rank has none, so it threw there while
   the other ranks went on to the next collective. TreeHydro, the only

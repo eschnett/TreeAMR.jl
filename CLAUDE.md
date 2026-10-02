@@ -749,7 +749,7 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. **Registered in General** since 2026-09-21; 0.1.5 is the current
+  only. **Registered in General** since 2026-09-21; 0.1.6 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
   key behind `DOCUMENTER_KEY` to push them — the file says why. All
@@ -915,6 +915,10 @@ rank. The diagnostics (`tracked_share`, `reduce_to_grid`,
 `mode_amplitude`, `shock_radius`, …) are rank-local, and
 `src/kelvinhelmholtz.jl:544` records `nblocks` for the mesh's block
 count. The fixes are `mesh_mapreduce`, and an agreed trigger.
+Its own MPI port (2026-10-02) found the one TreeAMR bug so far on a
+rank without blocks — the `AllVariables` boundary hook's length check,
+of which it is the only caller (CODE.md, "Ranks without blocks are
+allowed") — so it needs TreeAMR 0.1.6, which has the fix.
 
 Mesh machinery belongs here; physics belongs there — the same rule as
 for TreeWave.

@@ -644,7 +644,7 @@ end
 # and take them away again, the initial-data cycle and a checkpoint. A
 # step that assumed a rank has a block 1 throws there while the others
 # wait, which `main` turns into an abort: the all-variables hook's length
-# check did, until it was guarded after 0.1.5.
+# check did, until it was guarded in 0.1.6.
 const EMPTY_PARITY = [(OddParity, EvenParity), (EvenParity, EvenParity)]
 const EMPTY_DATA = AllVariables(x -> (sin(2x[1]) + x[2] / 3, x[1] * x[2] - 1))
 const EMPTY_HOOK = CellBoundary(AllVariables((x, δ) -> EMPTY_DATA.f(x)))
