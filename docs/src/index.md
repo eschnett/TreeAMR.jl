@@ -7,7 +7,7 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M7**: the tree core (Morton keys over a
+The package has completed milestone **M7**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -43,7 +43,7 @@ process, which continues bit for bit at any thread count. HDF5 is a
 weak dependency, loaded with `using HDF5` (see
 [Checkpoints and restarts](@ref)).
 
-M7 adds MPI, and is implemented: one forest runs over many processes,
+M7 added MPI: one forest runs over many processes,
 `Forest(…; comm = MPI.COMM_WORLD)`, with the forest replicated on every
 rank and the blocks distributed in contiguous runs of the curve. The
 ghost exchange for every centering, the interface restriction, the
@@ -52,13 +52,13 @@ across ranks. Results are bit-identical to a serial run at any rank
 count, except floating-point sums, which agree to roundoff. MPI is a
 weak dependency, loaded with `using MPI` (see
 [Running distributed](@ref)). It is measured on a cluster: weak
-scaling to four nodes, and the distributed run on CUDA GPUs with and
-without a CUDA-aware MPI. The parallel checkpoint, one shared file
-written through MPI-IO, lost data on more than one node of the
-cluster's BeeGFS until ROMIO's read-modify-write was turned off; it is
-to be replaced by one file per I/O process, and every checkpoint now
-carries checksums that a load verifies. Next is visualization export
-(M9b).
+scaling to four nodes, the distributed run on CUDA GPUs with and
+without a CUDA-aware MPI, and checkpoints. A first checkpoint, one
+shared file written through MPI-IO, lost data between nodes on the
+cluster's BeeGFS, so a distributed checkpoint is now an index and one
+part file per I/O process, none of them written or opened by more than
+one process, and every checkpoint carries checksums that a load
+verifies. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -494,6 +494,8 @@ Pass `name => (fs, u)` for an evolved set — after `solve` its working
 array holds a stage, not the solution — and leave scratch sets such as
 fluxes out. The file is written beside `path` and renamed over it only
 when complete, so a failed write never destroys the previous checkpoint.
+A serial checkpoint is one file; a distributed one adds a part file per
+I/O process beside it (see [Running distributed](@ref)).
 
 Compression is HDF5's, through `filters`. None is the default and, by
 the measurements in the design document, the recommendation: smooth
@@ -775,12 +777,26 @@ than calling them yourself.
 rank's points to the ranks that own them and the values back: every
 rank passes the same field set and arguments and its own points, any
 number of them or none, and gets the values of its own points in its
-own order. A checkpoint is one shared file, written and read by every
-rank in parallel through parallel HDF5, which loads with HDF5 and MPI
-together. A file written at any rank count loads at any other, or
-serially, and continues bit for bit. The plain data must be the same on
-every rank; data that differ are refused on every rank before the file
-is created.
+own order. A checkpoint never has two processes write or open one file,
+so it depends on no parallel I/O: the ranks form groups of consecutive
+ranks, one per node by default (`io = :node`; `io = :all` gives every
+rank its own, or pass a number), and each group's first rank receives
+the group's blocks and writes them into a part file of its own,
+`path.<saveid>.<j>.h5`, beside the index that rank 0 writes at `path`
+last. Loading, rank 0 alone opens the index and shares it, and each part
+is read by one rank, which sends the blocks to their owners. A
+checkpoint written at any rank count loads at any other, or serially,
+and continues bit for bit. The plain data must be the same on every
+rank; data that differ are refused on every rank before anything is
+written. Keep the index and its parts together: the next save to the
+same path removes the parts of the one it replaces, and any other file
+named like one of its parts.
+
+```julia
+save_checkpoint("run.h5", forest; fieldsets = ("u" => (fs, u),),
+                application = "MyApp" => 1, data = (; t, chunk))   # io = :node
+# run.h5, run.h5.<saveid>.0.h5, run.h5.<saveid>.1.h5, … one part per node
+```
 
 **Devices.** Field sets on a device work the same way. Their message
 buffers live on the device and are staged through page-locked host

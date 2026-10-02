@@ -12,22 +12,22 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6, M8, M10, M11 and M9a are done (tree core,
+Current state: milestones M0–M8, M10, M11 and M9a are done (tree core,
 ghost exchange, ODE coupling, regridding, multi-threading, GPU; then every
 centering, per-field-set ghost widths, and conservation at coarse-fine
 faces; then reflecting boundaries; then point interpolation; then
-checkpoint and restart, through an HDF5 package extension), and M7, MPI,
-is implemented (2026-10-02): the forest replicated on every rank, the
-blocks distributed in contiguous curve ranges, and the ghost exchange,
-interface restriction, reductions, regrid, interpolation and parallel
+checkpoint and restart, through an HDF5 package extension; then MPI).
+M7 (done 2026-10-02): the forest replicated on every rank, the blocks
+distributed in contiguous curve ranges, and the ghost exchange,
+interface restriction, reductions, regrid, interpolation and
 checkpoints across ranks, bit-identical to serial but for floating-point
-sums, through an MPI package extension (and an HDF5+MPI one). Its
-cluster measurements ran on Symmetry on 2026-10-02 (CODE.md, steps 6–8).
-What M7 leaves open is its checkpoint: the shared file, written by every
-rank through MPI-IO, lost data between nodes on BeeGFS until ROMIO's
-read-modify-write was turned off, and is to be replaced by one without
-parallel I/O — files per I/O process and an index file — decided with
-Erik that day. It came after
+sums, through an MPI package extension. Its cluster measurements ran on
+Symmetry on 2026-10-02 (CODE.md, steps 6–8). Its checkpoint was first a
+shared file written through MPI-IO, which lost data between nodes on
+BeeGFS; it was replaced the same day (step 6b, decided with Erik) by
+one without parallel I/O — part files per I/O process and an index,
+each file with one writer and one opener. What M7 leaves for later is
+listed under "Performance work left for later" in CODE.md. It came after
 M8 and M10 so the distributed exchange was built once over a
 layout-generic schedule that already held the mirrored transfers, and
 after M9a because the downstream runs needed to restart before they
@@ -38,8 +38,9 @@ Next is visualization export (M9b), the other half of the old M9.
 
 ## Commands
 
-Full test suite (about 6½ min at one thread and at eight — 110484 tests
-in 6m25 and 110536 in 6m21 after M7, against M9a's 93686 in 4m16 — of
+Full test suite (about 6½ min at one thread and at eight — 110606 tests
+in 6m32 and 110658 in 6m28 after M7's step 6b, against M9a's 93686 in
+4m16 — of
 which the thread-independence test spends ~50 s running
 `test/thread_workload.jl` in two subprocesses, `exchange_tests.jl` ~33 s,
 M10's `reflect_tests.jl` ~30 s, and M9a's `checkpoint_tests.jl` ~28 s).
@@ -273,16 +274,20 @@ julia -t 4 --project=test bench/replicated.jl 8 64 512
 Three SLURM jobs hold the M7 measurements, all run on 2026-10-02:
 `bench/symmetry_mpi.sh` (weak scaling, one rank per NUMA domain at 8
 threads, 1–4 nodes, plus single-process controls),
-`bench/symmetry_checkpoint_mpi.sh` (shared-file checkpoint throughput on
-BeeGFS) and `bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
+`bench/symmetry_checkpoint_mpi.sh` (checkpoint throughput on BeeGFS: the
+shared file of step 6, then the part files of step 6b, once per `io` in
+`TREEAMR_CKPT_IO`) and `bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
 staged and, with a CUDA-aware system MPI, direct). Each launches
 MPICH_jll through `srun --mpi=pmi2` by default or a system MPI through
 MPIPreferences (`TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`).
 `bench/symmetry_checkpoint_stress.sh` runs `bench/checkpoint_stress.jl`,
 the reproducers of the multi-node checkpoint loss, from
-`save_checkpoint` down to plain `pwrite`; `bench/checkpoint_inspect.jl`
-and `bench/checkpoint_layout.jl` read a damaged file. Anything that
-writes one file from several nodes is to be checked with them first.
+`save_checkpoint` (now the part-file writer, verified by serial loads on
+two nodes; `STRESS_IO`) down to plain `pwrite`;
+`bench/checkpoint_inspect.jl` and `bench/checkpoint_layout.jl` read a
+damaged shared file of step 6. Nothing in the package writes one file
+from several processes any more; anything that would must be checked
+with them first.
 
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
@@ -316,13 +321,13 @@ There is no formatter or linter configured.
 ## Architecture
 
 Fifteen source files, included in dependency order from `src/TreeAMR.jl`, plus
-three package extensions in `ext/`; each layer uses only the ones before it:
+two package extensions in `ext/`; each layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
 | threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
-| communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method, plus the `librarycomm` stub; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
+| communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest |
@@ -332,7 +337,7 @@ three package extensions in `ext/`; each layer uses only the ones before it:
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 | interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
-| checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl`, `ext/TreeAMRHDF5MPIExt.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension — serial and parallel, chosen by an `Access` (`Alone` / `Ranked`) from `commsize` — and in the HDF5+MPI extension the one call that needs both, `open_parallel_file` |
+| checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension — serial HDF5 only, over a distributed forest the I/O groups, part files and index of M7 step 6b, the data moved by the communicator verbs |
 
 The ideas that span several files and are easy to violate:
 
@@ -493,12 +498,28 @@ The ideas that span several files and are easy to violate:
   definition reaches the file, so a converter can read an old file
   without the old package; do not add JLD2 or `Serialization`. Every
   file carries CRC-32C checksums — the leaf list's (`leaves_crc32c`)
-  and one per block of each field set (`data_crc32c`) — verified on
-  load, an additive change with `format_version` still 1. A parallel
-  file is opened with ROMIO's data sieving and collective buffering for
-  writes disabled, since either rewrote other nodes' bytes on BeeGFS
-  (CODE.md, "Parallel checkpoints"); Open MPI's OMPIO ignores those
-  hints and was not tested.
+  and one per block of each field set (`data_crc32c`), and the index
+  one per part and field set over those — verified on load; HDF5's own
+  Fletcher-32 is deliberately not used (it accepts an all-zero chunk).
+- **No file of a checkpoint has two writers or two openers** (M7 step
+  6b, CODE.md "Checkpoints without parallel I/O"). A shared file
+  written from several nodes through MPI-IO lost data on Symmetry's
+  BeeGFS (step 6), so HDF5 is used serially only and the data travel
+  as messages: the ranks form `k` contiguous I/O groups (`io = :node`,
+  the default, by `commnodes`; `:all`; or a number), each group's first
+  rank writes a part file `path.<saveid>.<j>.h5` from its members'
+  streamed blocks, and rank 0 writes the index (format version 2) last;
+  its rename is the commit point, after which rank 0 removes the
+  previous parts and orphans. Loading, only rank 0 opens the index and
+  broadcasts an in-memory image of it without the data (`bcast`), each
+  part is read by one rank, which sends the blocks to their owners, and
+  every step that runs on some ranks only ends in `agree_errors`, so a
+  failure anywhere throws everywhere and nobody waits on a message. The
+  index's external links to the parts are for tools; the loader must
+  never follow them (that opens the target). One part lives inside the
+  index, so a serial checkpoint is one file; version-1 files (the
+  fixtures in `test/fixtures/`) still load. Do not reintroduce parallel
+  HDF5 or MPI-IO.
 - **The forest is replicated, the blocks are distributed** (M7, CODE.md
   "Distributed meshes"). Every rank holds `forest.leaves` whole; rank
   `r` stores the contiguous curve range `blockrange(forest)`
@@ -626,9 +647,15 @@ its device counterpart, run by hand (see Commands), never by
 `checkpoint_tests.jl` checks a bitwise round trip over every centering,
 `Float64`/`Float32`/`Float32x2` and every face kind, restarts of the
 wave and Burgers studies that continue byte for byte through regrids,
-the refusals with their reasons, the atomic write, plain data and
-`checkpoint_environment`; the leaf-list `Forest` it loads through is
-tested inline in `runtests.jl`, against the oracles. The wave
+the refusals with their reasons, the checksums (a damaged block, a
+recomputed one, missing ones), the atomic write and a failing I/O
+process, plain data and `checkpoint_environment`, and that the
+version-1 files in `test/fixtures/` (written by the step-6 writer)
+still load; the leaf-list `Forest` it loads through is tested inline in
+`runtests.jl`, against the oracles. The part files themselves are
+`mpi_workload.jl`'s: saves with `io = :all`, `2` and `:node`, a part
+from another save, a missing part, orphans, a failed I/O process, and
+the `OPEN_LOG` hook showing that no file is opened by two processes. The wave
 study comes in two halves: `wave_tests.jl` is the **vertex-centered**
 one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
 verbatim so its numbers stay under test. `imex_tests.jl` runs the wave

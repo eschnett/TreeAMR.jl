@@ -13,13 +13,14 @@ The package is currently at milestone **M7** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, and
-M7's distribution over MPI). M7 is implemented, and measured on a
-cluster: weak scaling to four nodes and the distributed run on CUDA
-GPUs, with and without a CUDA-aware MPI. The parallel checkpoint, one
-shared file written through MPI-IO, lost data on more than one node of
-the cluster's BeeGFS until ROMIO's read-modify-write was turned off; it
-is to be replaced by one file per I/O process, and every checkpoint now
-carries checksums that a load verifies.
+M7's distribution over MPI). M7 is done, and measured on a cluster:
+weak scaling to four nodes, the distributed run on CUDA GPUs with and
+without a CUDA-aware MPI, and checkpoints. A first checkpoint, one
+shared file written through MPI-IO, lost data between nodes on the
+cluster's BeeGFS, so a distributed checkpoint is now an index and one
+part file per I/O process, none written or opened by more than one
+process, and every checkpoint carries checksums that a load verifies;
+a thousand verified saves on four nodes lost nothing.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
@@ -134,8 +135,10 @@ blocks between ranks), point interpolation and checkpoints all work
 across ranks, on the CPU or on GPUs. The results are bit-identical to a
 serial run at any rank count, except floating-point sums, which agree
 to roundoff. MPI is an optional dependency too: the distributed
-methods load with `using MPI`, and a checkpoint is then one shared file
-written in parallel, which loads at any rank count or serially.
+methods load with `using MPI`. A distributed checkpoint is an index file
+and one part file per node (or per rank, or per any number of I/O
+processes), each written and read by a single process, so it needs no
+parallel I/O; it loads at any rank count or serially.
 
 **Still missing.** There is no visualization output yet; that is the
 next milestone. The leaf-only storage also rules out multigrid
