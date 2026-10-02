@@ -12,6 +12,9 @@
 #                                                             # one node only
 #     TREEAMR_CKPT_ONENODE_RANKS=8 …                          # only 8 ranks on it
 #
+# TREEAMR_CKPT_ROOTS (default "6 12") picks the meshes, and the
+# benchmark's own TREEAMR_BENCH_FILTERS the filter settings.
+#
 # The argument is the ranks per node (default 8, one per NUMA domain of
 # an AMD node, at 64 / ranks threads each). The job runs
 # `bench/checkpoint.jl mpi` first on one node at 1, 2, 4, … up to that
@@ -125,7 +128,7 @@ if [ -z "$ONENODE_RANKS" ]; then
         r=$((r * 2))
     done
 fi
-for roots in 6 12; do
+for roots in ${TREEAMR_CKPT_ROOTS:-6 12}; do
     if [ "${TREEAMR_CKPT_ONENODE:-1}" = 1 ]; then
         for r in $ONENODE_RANKS; do
             run 1 "$r" "$roots"

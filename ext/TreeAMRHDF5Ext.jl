@@ -274,12 +274,13 @@ const TAG_LOAD = 62
 #   purpose after its first write, so that the test can check what a
 #   failed save leaves behind.
 # - `MAX_MESSAGE`: the largest message, in bytes, that the gathering of a
-#   save and the scattering of a load send, short of one block; 1 GiB, and
-#   small in the tests, so that a rank's blocks travel in several
-#   messages.
+#   save and the scattering of a load send, short of one block. 64 MiB,
+#   well under the 1 GiB the design allows, so that the next message
+#   arrives while the current one is written or read; small in the tests,
+#   so that a rank's blocks travel in several messages.
 const OPEN_LOG = Ref{Union{Nothing,Vector{String}}}(nothing)
 const FAIL_PART = Ref(-1)
-const MAX_MESSAGE = Ref(2^30)
+const MAX_MESSAGE = Ref(64 * 2^20)
 
 function note_open(path)
     log = OPEN_LOG[]
@@ -1077,6 +1078,37 @@ function write_blocks!(pg, err, r::Ranks, plan::IOPlan, forest, sets, filters)
         own = length(rankblocks(n, P, r.rank))
         prep = nothing
         err = attempt(() -> (prep = prepared(set)), err)
+        # The members' checksums, which each sends first, and from them
+        # the queue of every member's pieces in curve order.
+        members = plan.ranks[2:end]
+        heads = [Vector{UInt32}(undef, 1 + length(rankblocks(n, P, q))) for q in members]
+        waitall(r.comm, [irecv(r.comm, heads[i], q, TAG_HEAD) for (i, q) in enumerate(members)])
+        queue = Tuple{Int,Int,UnitRange{Int},Int}[]       # (rank, offset, piece, member)
+        offset = own
+        for (i, q) in enumerate(members)
+            head = heads[i]
+            m = length(head) - 1
+            if head[1] != 0
+                err === nothing && (err = ErrorException(
+                    "rank $q could not prepare its blocks of field set $(repr(name)) for " *
+                    "its I/O process, rank $(r.rank); rank $q's own error says why"))
+            else
+                sums[offset .+ (1:m)] = view(head, 2:(m + 1))
+                for piece in pieces(1:m, per * sizeof(T))
+                    push!(queue, (q, offset, piece, i))
+                end
+            end
+            offset += m
+        end
+        # The next piece is always on its way while the current one is
+        # written: the first while the I/O process writes its own blocks,
+        # and each later one while the one before it is checked and
+        # written, across the members' boundaries too.
+        longest = maximum(e -> length(e[3]), queue; init=0) * per
+        buffers = (Vector{T}(undef, longest), Vector{T}(undef, longest))
+        post(j) = irecv(r.comm, view(buffers[mod1(j, 2)], 1:(length(queue[j][3]) * per)),
+                        queue[j][1], TAG_SAVE)
+        request = isempty(queue) ? nothing : post(1)
         if prep !== nothing
             host, _, mine = prep
             sums[1:own] = mine
@@ -1090,52 +1122,26 @@ function write_blocks!(pg, err, r::Ranks, plan::IOPlan, forest, sets, filters)
                     "first write (TreeAMRHDF5Ext.FAIL_PART, a test hook)")
             end
         end
-        # Each member's, in curve order.
-        offset = own
-        buffers = (Vector{T}(undef, 0), Vector{T}(undef, 0))
-        for q in plan.ranks[2:end]
-            m = length(rankblocks(n, P, q))
-            head = Vector{UInt32}(undef, 1 + m)
-            waitall(r.comm, [irecv(r.comm, head, q, TAG_HEAD)])
-            if head[1] != 0
-                err === nothing && (err = ErrorException(
-                    "rank $q could not prepare its blocks of field set $(repr(name)) for " *
-                    "its I/O process, rank $(r.rank); rank $q's own error says why"))
-                offset += m
+        for (j, (q, offset, piece, i)) in enumerate(queue)
+            waitall(r.comm, [request])
+            j < length(queue) && (request = post(j + 1))
+            err === nothing || continue
+            buf = buffers[mod1(j, 2)]
+            got = block_checksums(buf, length(piece), per)
+            bad = findfirst(x -> got[x] != heads[i][1 + piece[x]], eachindex(got))
+            if bad !== nothing
+                b = first(groupblocks(n, P, plan.k, plan.group)) + offset + piece[bad] - 1
+                err = ErrorException(
+                    "block $b of field set $(repr(name)) arrived at its I/O process, " *
+                    "rank $(r.rank), from rank $q damaged: its CRC-32C does not match " *
+                    "the one rank $q computed before sending it, so it was not " *
+                    "written, and the checkpoint is not saved")
                 continue
             end
-            sums[offset .+ (1:m)] = view(head, 2:(m + 1))
-            ps = pieces(1:m, per * sizeof(T))
-            longest = isempty(ps) ? 0 : maximum(length, ps) * per
-            for buf in buffers
-                length(buf) < longest && resize!(buf, longest)
+            err = attempt(err) do
+                GC.@preserve buf block_slab(API.h5d_write, dset, F, dims, offset .+ piece,
+                                            pointer(buf))
             end
-            post(i) = irecv(r.comm, view(buffers[mod1(i, 2)], 1:(length(ps[i]) * per)), q,
-                            TAG_SAVE)
-            request = isempty(ps) ? nothing : post(1)
-            for (i, piece) in enumerate(ps)
-                waitall(r.comm, [request])
-                i < length(ps) && (request = post(i + 1))
-                err === nothing || continue
-                buf = buffers[mod1(i, 2)]
-                got = block_checksums(buf, length(piece), per)
-                bad = findfirst(j -> got[j] != head[1 + piece[j]], eachindex(got))
-                if bad !== nothing
-                    b = first(groupblocks(n, P, plan.k, plan.group)) + offset +
-                        piece[bad] - 1
-                    err = ErrorException(
-                        "block $b of field set $(repr(name)) arrived at its I/O process, " *
-                        "rank $(r.rank), from rank $q damaged: its CRC-32C does not match " *
-                        "the one rank $q computed before sending it, so it was not " *
-                        "written, and the checkpoint is not saved")
-                    continue
-                end
-                err = attempt(err) do
-                    GC.@preserve buf block_slab(API.h5d_write, dset, F, dims,
-                                                offset .+ piece, pointer(buf))
-                end
-            end
-            offset += m
         end
         err = attempt(() -> write_array(g, "data_crc32c", UInt32, (nb,), sums), err)
         push!(summaries, crc_of(sums))

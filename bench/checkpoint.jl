@@ -86,6 +86,8 @@
 #                           one); on a cluster, the file system under test
 #     TREEAMR_BENCH_IO      the `io` of save_checkpoint: node (default), all, or
 #                           a number of I/O processes
+#     TREEAMR_BENCH_FILTERS the filter settings to run, by name, separated by
+#                           commas (default all that can be loaded)
 
 const USE_MPI = "mpi" in ARGS
 if USE_MPI
@@ -138,7 +140,10 @@ function filter_settings()
                          (H5Zbitshuffle.BitshuffleFilter(; compressor=:zstd,
                                                           comp_level=1),)))
     end
-    return settings
+    wanted = get(ENV, "TREEAMR_BENCH_FILTERS", "")
+    isempty(wanted) && return settings
+    names = split(wanted, ',')
+    return filter(s -> first(s) in names, settings)
 end
 
 """

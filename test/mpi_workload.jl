@@ -55,7 +55,7 @@ const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 const OUT = isdefined(@__MODULE__, :WORKLOAD_IO) ? WORKLOAD_IO : stdout
 # Under MPI the checkpoints' messages are cut at 4 KiB (a test hook of
-# the HDF5 extension; 1 GiB otherwise), so that a rank's blocks travel to
+# the HDF5 extension; 64 MiB otherwise), so that a rank's blocks travel to
 # its I/O process, and a part's from its reader, in several messages.
 const CKPT = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
 USE_MPI && (CKPT.MAX_MESSAGE[] = 4096)
