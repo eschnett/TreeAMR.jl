@@ -7,14 +7,14 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package is at milestone **M9a**: the tree core (Morton keys over a
+The package is at milestone **M7**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
 that lets a standard ODE integrator drive the whole hierarchy, adaptive
 regridding, multi-threading throughout, and GPU support: the storage,
 the exchange schedule and every kernel follow a KernelAbstractions
-backend of the caller's choosing.
+backend of the caller's choosing. M7 distributes all of it over MPI.
 
 M8 added the layout and the conservation. The ghost width `G` is a
 [`FieldSet`](@ref) keyword, one per dimension, rather than a
@@ -43,15 +43,25 @@ process, which continues bit for bit at any thread count. HDF5 is a
 weak dependency, loaded with `using HDF5` (see
 [Checkpoints and restarts](@ref)).
 
-Next is MPI (M7), so that the distributed exchange is built once over a
-layout-generic schedule; then visualization export (M9b).
+M7 adds MPI, and is implemented: one forest runs over many processes,
+`Forest(…; comm = MPI.COMM_WORLD)`, with the forest replicated on every
+rank and the blocks distributed in contiguous runs of the curve. The
+ghost exchange for every centering, the interface restriction, the
+reductions, the regrid, point interpolation and checkpoints all work
+across ranks. Results are bit-identical to a serial run at any rank
+count, except floating-point sums, which agree to roundoff. MPI is a
+weak dependency, loaded with `using MPI` (see
+[Running distributed](@ref)). The weak-scaling measurements on a
+cluster and the run on CUDA GPUs are still open. Next is visualization
+export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
 [Storage](api/storage.md), [Ghost exchange and conservation](api/exchange.md),
 [ODE coupling](api/ode.md), [Regridding](api/regrid.md),
 [Point interpolation](api/interpolate.md),
-[Checkpoint and restart](api/io.md) and [Internals](api/internals.md) — with an
+[Checkpoint and restart](api/io.md), [Distributed meshes](api/distributed.md)
+and [Internals](api/internals.md) — with an
 [Index](api/genindex.md) of every documented name.
 
 ## Overview
@@ -343,8 +353,8 @@ end
 Regridding changes both the size and the meaning of the state vector, so
 in practice it means stop → rebuild → `reinit!` for anything beyond a
 one-step method. Block indices are not stable across a regrid: slots are
-compacted, and `forest.leaves[b]` is the only way to say which block is
-which.
+compacted, and [`blockkey`](@ref)`(fs, b)` is the only way to say which
+block is which.
 
 Building initial data iterates the same machinery, *re-evaluating* the
 data on each new mesh rather than interpolating it — otherwise a newly
@@ -517,8 +527,9 @@ slot, so the state, the mesh, the schedule and every max or integer
 reduction on 64 threads reproduce a run on one exactly. A floating-point
 sum — a norm, a total mass — is promised to roundoff only, so that a
 device may reduce hierarchically (it does: 256 lanes per block, then one
-fold per block, in two launches with no barrier) and MPI may
-`Allreduce`; today's CPU fold is per-block and so still exact. That is
+fold per block, in two launches with no barrier) and so that ranks may
+each fold their own blocks; the CPU fold is per block and so still
+exact at any thread count. That is
 worth relying on when debugging: a difference between two runs beyond
 the last bits of a sum is never the thread count.
 
@@ -617,7 +628,7 @@ fires(work, idx, b, x) = abs(work[idx..., 1, b]) > threshold
 
 flags = map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
     n == 0 && return Coarsen
-    level(forest.leaves[b]) < lmax ? (Refine, box) : (Keep, box)
+    level(blockkey(fs, b)) < lmax ? (Refine, box) : (Keep, box)
 end
 regrid!(forest, fs => schedule; flags = flags, buffer = 4)
 ```
@@ -630,3 +641,165 @@ device path feeds the same machinery the host one does.
 `bench/gpu.jl` times the per-evaluation phases on a chosen backend, in
 the format `bench/threads.jl` prints, so a device run and a host run can
 be read side by side.
+
+## Running distributed
+
+One forest can run over many processes through MPI. Load MPI.jl beside
+TreeAMR, which loads the package's MPI extension, initialize it, and
+hand the forest your communicator:
+
+```julia
+using MPI, TreeAMR
+MPI.Init()
+
+forest = Forest((8, 8, 8); N = 16, periodic = (true, true, true),
+                comm = MPI.COMM_WORLD)
+fs     = FieldSet(forest, 2; G = 2)
+```
+
+Everything else is the code you would write for one process. MPI is a
+weak dependency, like HDF5: an application that never runs distributed
+never loads it.
+
+**What is distributed.** Every rank holds the whole forest —
+`forest.leaves`, [`nleaves`](@ref), [`maxlevel`](@ref),
+[`minimum_spacing`](@ref), [`find_leaf`](@ref), [`locate_point`](@ref)
+are the same on every rank and answer for the whole mesh. A leaf is
+about 20 bytes, so this costs little until the mesh has millions of
+blocks, and it keeps every tree query a local call. Only the field data
+are distributed: rank `r` stores the blocks of one contiguous run of
+the curve, [`blockrange`](@ref)`(forest)`, of equal length on every
+rank up to one block. Ranks with no blocks at all are allowed.
+
+**Block indices are local.** A [`FieldSet`](@ref) stores this rank's
+blocks, and every block index `b` — of [`map_blocks!`](@ref)'s kernels,
+[`flag_blocks`](@ref)'s callback, [`block_mapreduce`](@ref) and
+[`firing_boxes`](@ref)'s results, [`block_spacings`](@ref), the state
+vector — counts this rank's blocks from 1. Serially a local index *is*
+the leaf index, which is why serial code that mixes the two still works
+and will silently go wrong over MPI. Two rules cover it:
+
+- the key of block `b` is [`blockkey`](@ref)`(fs, b)`, never
+  `forest.leaves[b]`;
+- a per-block array has [`nblocks`](@ref)`(fs)` entries, never
+  `nleaves(forest)`.
+
+```jldoctest blocks
+julia> using TreeAMR
+
+julia> forest = Forest((4, 4); N = 8);
+
+julia> blockrange(forest) == 1:nleaves(forest)   # serially, every leaf
+true
+
+julia> fs = FieldSet(forest, 1; G = 1);
+
+julia> blockkey(fs, 3) == forest.leaves[first(blockrange(forest)) + 3 - 1]
+true
+```
+
+**What is collective.** Anything that communicates must be called on
+every rank, with the same arguments, in the same order, from one task
+at a time:
+
+- every forest mutation — the constructors, [`refine!`](@ref),
+  [`coarsen!`](@ref), [`balance!`](@ref) — since each rank applies it
+  to its own copy;
+- the schedule builds, [`GhostSchedule`](@ref) and
+  [`InterfaceSchedule`](@ref), and their use, [`fill_ghosts!`](@ref)
+  and [`restrict_interfaces!`](@ref);
+- the reductions, [`mesh_mapreduce`](@ref),
+  [`volume_weighted_norm`](@ref) and [`total_mass`](@ref);
+- [`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref);
+- [`interpolate`](@ref) and [`interpolate!`](@ref);
+- [`save_checkpoint`](@ref), [`write_plain`](@ref) in its do-block, and
+  `load_checkpoint(path; comm)`.
+
+What touches only this rank's blocks is local: [`fill_by_coordinates!`](@ref),
+[`statevector`](@ref), [`scatter!`](@ref) and [`gather!`](@ref),
+[`map_blocks!`](@ref), [`block_mapreduce`](@ref), [`firing_boxes`](@ref)
+and [`flag_blocks`](@ref).
+
+The schedule builds and `regrid!` check that the forest is still the
+same on every rank, and refuse on every rank together if it is not — a
+`refine!` made on one rank only, say. An argument that one rank refuses
+is refused on all of them, with the reason. What the package cannot
+agree on for you is an exception thrown by your own code on one rank,
+which leaves the others waiting in their next collective; wrap the run
+so that such a rank takes the job down:
+
+```julia
+try
+    main()
+catch err
+    showerror(stderr, err, catch_backtrace())
+    MPI.Abort(MPI.COMM_WORLD, 1)
+end
+```
+
+**Reductions are global.** [`mesh_mapreduce`](@ref) and the norms built
+on it gather one partial per rank and fold them in rank order, so every
+rank gets the same value — which a time step or a stopping test needs.
+Max, min and integer reductions are bit-identical to a serial run at any
+rank count; a floating-point sum agrees to roundoff, and at one rank
+exactly. [`block_mapreduce`](@ref) stays per block, and so per rank:
+a value you combine from it yourself — a CFL speed, the scale of a
+refinement criterion — is this rank's value, not the mesh's. Reduce it
+with [`mesh_mapreduce`](@ref) instead:
+
+```julia
+λ  = mesh_mapreduce(abs, max, zero(T), fs; vars = 2)    # the same on every rank
+dt = cfl * minimum_spacing(forest) / λ
+```
+
+The same goes for any decision that gates a collective call. A
+checkpoint taken when a rank's own wall clock says so, or a step
+rejected by a norm of the local state vector, sends some ranks into
+the call and the others past it.
+
+**Regridding.** Flag your own blocks as before: `regrid!` takes one flag
+per local block, gathers them, and every rank completes the marks and
+arrives at the same new forest. The data move with the regrid, between
+ranks where the partition shifts, so a refinement near the start of the
+curve rebalances the whole run. [`buffered_flags`](@ref) and
+[`complete_marks`](@ref) take the *global* flag vector, one per leaf;
+over MPI let `regrid!` buffer the flags (its `buffer` keyword) rather
+than calling them yourself.
+
+**Interpolation and checkpoints.** [`interpolate`](@ref) routes each
+rank's points to the ranks that own them and the values back: every
+rank passes the same field set and arguments and its own points, any
+number of them or none, and gets the values of its own points in its
+own order. A checkpoint is one shared file, written and read by every
+rank in parallel through parallel HDF5, which loads with HDF5 and MPI
+together. A file written at any rank count loads at any other, or
+serially, and continues bit for bit. The plain data must be the same on
+every rank; data that differ are refused on every rank before the file
+is created.
+
+**Devices.** Field sets on a device work the same way. Their message
+buffers live on the device and are staged through page-locked host
+mirrors, which any MPI can send. An MPI that reads device memory — a
+CUDA-aware one, for CUDA — can be handed the device buffers directly:
+
+```julia
+forest = Forest((8, 8, 8); N = 16,
+                comm = communicator(MPI.COMM_WORLD; deviceaware = MPI.has_cuda()))
+```
+
+**Launching.** Start one process per rank with the `mpiexec` of the MPI
+library that MPI.jl uses. MPI.jl's wrapper `mpiexecjl` (installed with
+`MPI.install_mpiexecjl()`) finds the right one for a project:
+
+```bash
+mpiexecjl --project=. -n 4 julia -t 8 my_run.jl
+```
+
+On a cluster, select the system MPI through MPIPreferences and launch
+with the batch system's launcher (`srun`). Ranks and threads combine: a
+rank per NUMA domain, each with a thread per core of its domain, pinned
+as under [Threading](@ref), is the layout the design document's
+benchmarks use.
+Every rank should be able to compile on its own core; while a rank waits
+for a message, MPI usually spins rather than sleeps, so oversubscribing
+the cores slows every rank down.

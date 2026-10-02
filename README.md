@@ -9,11 +9,13 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M9a** (after M8's every
+The package is currently at milestone **M7** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
-interpolation to arbitrary points, and M9a's checkpoint and restart).
-Next is MPI (M7), then visualization output (M9b).
+interpolation to arbitrary points, M9a's checkpoint and restart, and
+M7's distribution over MPI). M7 is implemented; its weak-scaling
+measurements on a cluster and its run on CUDA GPUs are still open.
+Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
 
@@ -89,8 +91,8 @@ multi-threaded on the CPU and efficiently on a GPU. If you start Julia
 with `--threads=auto` then everything is multi-threaded, with results
 that are bit-identical across thread counts except for floating-point
 sums such as norms and totals, which are promised to roundoff only (so
-that a device may reduce hierarchically, as it does, and MPI may
-`Allreduce`). If you allocate the state vector storage with
+that a device may reduce hierarchically, as it does, and ranks may each
+fold their own blocks). If you allocate the state vector storage with
 `backend=CUDABackend()`, then the data and the exchange schedule live
 on the device, and every kernel, the reductions included, runs on the
 device. Both Float64 and Float32 are supported, and
@@ -118,11 +120,21 @@ stored: the leaves, and the fields without their ghost zones. HDF5 is
 an optional dependency, so these functions become available with
 `using HDF5`.
 
-**Still missing.** There is no MPI parallelism yet. The code runs on a
-single node, either on its CPU cores or on one GPU. MPI is the next
-milestone. There is no visualization output yet either; that comes
-after MPI. The leaf-only storage also rules out multigrid algorithms on
-the mesh hierarchy.
+**MPI.** One forest runs over many processes when it is built with
+`comm = MPI.COMM_WORLD`. Every rank holds the whole tree, which keeps
+every tree query a local call, and stores the blocks of one contiguous
+run of the space-filling curve. The ghost exchange, the interface
+restriction, the reductions, the regrid (which also rebalances the
+blocks between ranks), point interpolation and checkpoints all work
+across ranks, on the CPU or on GPUs. The results are bit-identical to a
+serial run at any rank count, except floating-point sums, which agree
+to roundoff. MPI is an optional dependency too: the distributed
+methods load with `using MPI`, and a checkpoint is then one shared file
+written in parallel, which loads at any rank count or serially.
+
+**Still missing.** There is no visualization output yet; that is the
+next milestone. The leaf-only storage also rules out multigrid
+algorithms on the mesh hierarchy.
 
 ## Installing
 

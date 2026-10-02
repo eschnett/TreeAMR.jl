@@ -3,11 +3,13 @@
 M7 runs one forest over several processes. Every rank holds the whole
 forest, and only field data are distributed: each rank stores the blocks
 of one contiguous run of the leaves, and every block index is local to
-the rank. The design is "Distributed meshes" in `CODE.md`; M7 is being
-implemented in steps, and so far the partition, the local block
-indexing, the distributed schedule, the ghost exchange and the interface
-restriction over MPI, the reductions across ranks, the regrid, point
-interpolation and parallel checkpoints are in place.
+the rank. The design is "Distributed meshes" in `CODE.md`, and the guide
+to writing a distributed application is
+[Running distributed](@ref) on the home page. Everything a serial run
+does works across ranks: the ghost exchange for every centering, the
+interface restriction, the reductions, the regrid with the
+repartitioning it implies, point interpolation and parallel
+checkpoints.
 
 A distributed run loads MPI.jl beside TreeAMR, which loads the package's
 MPI extension, and passes its communicator to the forest:
@@ -18,7 +20,10 @@ MPI.Init()
 forest = Forest((4, 4); N = 8, comm = MPI.COMM_WORLD)
 ```
 
-Every forest mutation and every schedule build is then collective. A
+Every forest mutation and every schedule build is then collective, and
+every block index of a field set is local: [`blockkey`](@ref)`(fs, b)`
+names block `b`'s leaf, and [`nblocks`](@ref)`(fs)` sizes a per-block
+array, while [`nleaves`](@ref) and `forest.leaves` are the whole mesh. A
 [`GhostSchedule`](@ref) or [`InterfaceSchedule`](@ref) built over forests
 that differ between ranks — a `refine!` made on one rank only, say — is
 refused on every rank together, with the reason, as is one built for a
