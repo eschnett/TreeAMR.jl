@@ -654,9 +654,12 @@ end
 # The all-variables form. The length check runs here rather than in
 # `AllVariables` because only the field set knows `nvars`; it costs one
 # host call per ghost fill, against a launch over every outward-facing
-# ghost cell.
+# ghost cell. A rank without blocks has no point to check the callback
+# at, and no boundary to fill; the hook is not collective, so returning
+# alone is safe.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
                         schedule::GhostSchedule{T,D}, backend) where {T,D}
+    nblocks(fs) == 0 && return nothing
     g = hook.g.f
     δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
     check_allvariables(g(allvariables_sample(fs), δ), fs, "boundary hook")
