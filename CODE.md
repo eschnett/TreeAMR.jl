@@ -3353,6 +3353,21 @@ change only the helper, at both levels.
   reduction (below). Every launch guards an empty `ndrange`. Empty
   ranks occur whenever ranks outnumber leaves, which a coarse initial
   mesh on many ranks does for a while, and the workload tests one.
+  *(Amended after 0.1.5.)* One host-side step did not guard: the
+  `AllVariables` boundary hook checks its callback's tuple length at a
+  point of block 1, and an empty rank has none, so it threw there while
+  the other ranks went on to the next collective. TreeHydro, the only
+  caller of that form, found it when it first ran over MPI; the
+  workload's empty rank had been on a periodic line, where no hook runs.
+  The check now returns early on an empty rank, as
+  `fill_by_coordinates!` already did. A search of `src/` for any other
+  step that assumes a block 1, and a scratch run of every public
+  operation at four ranks over two leaves (CPU and Metal), found
+  nothing else. The workload gained a case, `E2`, with the same reach
+  at three ranks: two leaves against a wall and outer faces, through
+  both all-variables forms, the wave equation, the interface
+  restriction, interpolation, regrids that give the empty rank blocks
+  and take them away, the initial-data cycle and a checkpoint.
 - **What an application must make global itself.** `block_mapreduce`
   stays local by design, so a value an application combines from it —
   TreeHydro's CFL signal speed, TreeWave's per-variable refinement
