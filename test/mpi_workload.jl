@@ -24,13 +24,16 @@
 # reference; `mpi_tests.jl` runs it in its own process, into an
 # `IOBuffer` it defines as `WORKLOAD_IO`. Deliberately self-contained —
 # its own RK4 and SSPRK3, no ODE package, no test helpers — so that a
-# rank starts in seconds. No regrid: that is step 4 of M7.
+# rank starts in seconds. From step 4 of M7 on it regrids too: the
+# leaves and the transferred arrays after every regrid are digested
+# before any ghost fill, so the transfer itself is checked bit for bit.
 
 using TreeAMR
 using MPI: MPI
 using KernelAbstractions: @kernel, @index, @Const
 using Printf: @sprintf
 using SHA: sha256
+using MultiFloats: Float32x2
 
 const USE_MPI = "mpi" in ARGS
 USE_MPI && MPI.Init()
@@ -42,7 +45,7 @@ const OUT = isdefined(@__MODULE__, :WORKLOAD_IO) ? WORKLOAD_IO : stdout
 emit(words...) = (RANK == 0 && println(OUT, join(words, " ")); nothing)
 
 digest(bytes::AbstractVector{UInt8}) = bytes2hex(sha256(bytes))[1:32]
-digest(v::Vector{Float64}) = digest(reinterpret(UInt8, v))
+digest(v::Vector{<:AbstractFloat}) = digest(reinterpret(UInt8, v))
 digest(s::AbstractString) = digest(codeunits(s))
 
 # Every rank's part of a per-block vector, in rank order, which is block
@@ -344,6 +347,233 @@ function burgers_case(tag, forest::Forest{D}; G, ops, steps) where {D}
     return nothing
 end
 
+# --- regridding (step 4 of M7) ---------------------------------------------
+
+# How a regrid moved blocks between ranks, from the leaves before and
+# after: kept blocks whose owner rose and fell, and coarsened blocks
+# whose `2^D` children had more than one owner. A function of the rank
+# count, so it goes on `#` lines.
+function migration(forest::Forest{D}, old, new) where {D}
+    P = NRANKS
+    owner(n, i) = TreeAMR.equalsplit_part(n, P, i) - 1
+    oldindex = Dict(k => i for (i, k) in enumerate(old))
+    up, down, straddling = 0, 0, 0
+    for (j, k) in enumerate(new)
+        i = get(oldindex, k, nothing)
+        if i !== nothing
+            up += owner(length(new), j) > owner(length(old), i)
+            down += owner(length(new), j) < owner(length(old), i)
+        elseif level(k) < TreeAMR.MAX_LEVEL &&
+               all(c -> haskey(oldindex, c), TreeAMR.childkeys(k))
+            owners = Set(owner(length(old), oldindex[c]) for c in TreeAMR.childkeys(k))
+            straddling += length(owners) > 1
+        end
+    end
+    return up, down, straddling
+end
+
+# A regrid of every pair, followed by the digests that do not depend on
+# the rank count — the leaves, and each field set's arrays as the
+# transfer left them, ghosts zero — and the `#` line that does.
+function regridded(tag, forest, pairs; flags, buffer=0, boundary=nothing)
+    old = copy(forest.leaves)
+    changed = regrid!(forest, pairs; flags=flags, buffer=buffer, boundary=boundary)
+    emit(tag, "regrid", changed, nleaves(forest), maxlevel(forest),
+         digest(string(forest.leaves)))
+    for (i, (fs, sched)) in enumerate(pairs)
+        sched === nothing && continue
+        emit(tag, "transferred$i", digest(gathered(forest, fs.work)))
+    end
+    up, down, straddling = migration(forest, old, forest.leaves)
+    emit("#", tag, "migrated", up, "up", down, "down", straddling, "straddling")
+    return changed
+end
+
+# The tracked pulse: a right-moving Gaussian, vertex-centered, against
+# outer faces with the hook, refined where it is large through
+# `firing_boxes` (local) and regridded between RK4 steps.
+pulse_fires(work, idx, b, x) = abs(work[idx..., 1, b]) > 0.2
+
+function moving_pulse(x0, σ)
+    return (x, v) -> begin
+        g = exp(-sum(d -> (x[d] - x0[d])^2, 1:length(x)) / (2σ^2))
+        v == 1 ? g : (x[1] - x0[1]) / σ^2 * g
+    end
+end
+
+function pulse_flags(fs, lmax)
+    return map(enumerate(firing_boxes(pulse_fires, fs))) do (b, (n, box))
+        k = blockkey(fs, b)
+        n == 0 && return level(k) > 0 ? Coarsen : Keep
+        return level(k) < lmax ? (Refine, box) : (Keep, box)
+    end
+end
+
+function tracked_pulse_case(tag; cycles, steps)
+    forest = forest_of((4, 3), 8)
+    D = 2
+    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
+    initial = moving_pulse((1.3, 1.4), 0.35)
+    boundary = boundary_by_coordinates(initial)
+    fill_by_coordinates!(initial, fs)
+    sched = GhostSchedule(fs, OPS4)
+    for cycle in 1:cycles
+        fill_ghosts!(fs, sched; boundary=boundary)
+        regridded("$tag.$cycle", forest, (fs => sched,); flags=pulse_flags(fs, 2),
+                  buffer=2, boundary=boundary)
+        sched = GhostSchedule(fs, OPS4)
+        u = statevector(fs)
+        gather!(u, fs)
+        rk4!(u, fs, sched, 0.2 * minimum_spacing(forest), steps, Val(D), Val(fs.G),
+             boundary)
+        emit("$tag.$cycle", "state", digest(gathered(forest, u)))
+        scatter!(fs, u)
+        emit("$tag.$cycle", "sum l2", @sprintf("%.17g", volume_weighted_norm(fs, u)))
+    end
+    return nothing
+end
+
+# Burgers' shock through regrid cycles, with the fixup: conservative
+# operators, so the regrid conserves mass as the steps do, and the flux
+# sets are only resized (`fs => nothing`).
+function burgers_fires(work, idx, b, x)
+    m = 0.0
+    for d in 1:length(idx)
+        hi = Base.setindex(idx, idx[d] + 1, d)
+        lo = Base.setindex(idx, idx[d] - 1, d)
+        m = max(m, abs(work[hi..., 1, b] - work[lo..., 1, b]))
+    end
+    return m > 0.25
+end
+
+function burgers_regrid_case(tag; cycles, steps)
+    D = 2
+    forest = forest_of((4, 4), 8; periodic=(true, true))
+    state = FieldSet(forest, 1; G=2)
+    initial = (x, v) -> 1.0 + 0.5 * tanh((sin(π * x[1] / 2) + 0.3 * sin(π * x[2] / 2)) / 0.1)
+    fill_by_coordinates!(initial, state)
+    fluxes = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d)), D)
+    mass0 = total_mass(state, 1)
+    conserved = true
+    sched = GhostSchedule(state, OPSC)
+    for cycle in 1:cycles
+        fill_ghosts!(state, sched)
+        flags = map(enumerate(firing_boxes(burgers_fires, state))) do (b, (n, box))
+            k = blockkey(state, b)
+            n == 0 && return level(k) > 0 ? Coarsen : Keep
+            return level(k) < 2 ? (Refine, box) : (Keep, box)
+        end
+        before = total_mass(state, 1)
+        pairs = (state => sched, map(f -> f => nothing, fluxes)...)
+        regridded("$tag.$cycle", forest, pairs; flags=flags, buffer=3)
+        after = total_mass(state, 1)
+        conserved &= abs(after - before) <= 1e-13 * abs(before)
+        sched = GhostSchedule(state, OPSC)
+        ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+        u = statevector(state)
+        gather!(u, state)
+        spacings = block_spacings(forest)
+        dt = 0.2 * minimum_spacing(forest) / (D * 1.5)
+        args = (state, fluxes, sched, ischeds, spacings, Val(D), Val(state.G),
+                Val(first(fluxes).G))
+        k, u1, u2 = (similar(u) for _ in 1:3)
+        for _ in 1:steps
+            burgers_rhs!(k, u, args...)
+            @. u1 = u + dt * k
+            burgers_rhs!(k, u1, args...)
+            @. u2 = (3 * u + u1 + dt * k) / 4
+            burgers_rhs!(k, u2, args...)
+            @. u = (u + 2 * (u2 + dt * k)) / 3
+        end
+        scatter!(state, u)
+        emit("$tag.$cycle", "state", digest(gathered(forest, u)))
+        emit("$tag.$cycle", "sum mass", @sprintf("%.17g", total_mass(state, 1)))
+    end
+    mass = total_mass(state, 1)
+    emit(tag, "conserved", conserved && abs(mass - mass0) <= 1e-13 * abs(mass0))
+    return nothing
+end
+
+# The initial-data cycle from a single leaf, so that at three ranks two
+# start without blocks: once with the host flag callback, vertex-
+# centered, and once with a flag vector from `firing_boxes`,
+# cell-centered.
+function adapt_case(tag)
+    D = 2
+    ring = (x, v) -> tanh((sqrt((x[1] - 0.45)^2 + (x[2] - 0.55)^2) - 0.25) / 0.05) + v
+    forest = forest_of((1, 1), 8)
+    fs = FieldSet(forest, 1; G=1, centering=vertexcentered(D))
+    flag = (b, k) -> begin
+        ext = block_extent(forest, k)
+        c = ntuple(d -> (ext[d][1] + ext[d][2]) / 2, D)
+        r = sqrt((c[1] - 0.45)^2 + (c[2] - 0.55)^2)
+        abs(r - 0.25) < 0.75 / 2^level(k) && level(k) < 3 ? Refine : Keep
+    end
+    sched, passes, converged = adapt_to_initial_data!(fs, OPS2; initial=ring, flag=flag,
+                                                      boundary=boundary_by_coordinates(ring))
+    emit(tag, "flag", passes, converged, nleaves(forest), maxlevel(forest),
+         digest(string(forest.leaves)), digest(gathered(forest, fs.work)))
+
+    forest = forest_of((1, 1), 8)
+    fs = FieldSet(forest, 1; G=2)
+    fires(work, idx, b, x) = abs(work[idx..., 1, b]) < 0.9
+    flags = fs -> map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
+        n == 0 && return Keep
+        return level(blockkey(fs, b)) < 3 ? (Refine, box) : (Keep, box)
+    end
+    sched, passes, converged = adapt_to_initial_data!(fs, OPS4; initial=ring, flags=flags,
+                                                      buffer=2,
+                                                      boundary=boundary_by_coordinates(ring))
+    emit(tag, "flags", passes, converged, nleaves(forest), maxlevel(forest),
+         digest(string(forest.leaves)), digest(gathered(forest, fs.work)))
+    return nothing
+end
+
+# Blocks moving between ranks in both directions, and coarsenings whose
+# siblings had different owners, over several field sets of different
+# variable counts, ghost widths and centerings at once. 2×2 roots with
+# three of them refined are 13 leaves, so at 2, 3 and 4 ranks a sibling
+# group straddles a rank boundary; refining the first blocks of a
+# uniform mesh moves every later block up the ranks, and coarsening them
+# again moves them back. In another element type (`full = false`) only
+# the cell-centered set over the 13 leaves, whose kernels are what each
+# element type compiles anew.
+function moving_blocks_case(tag, ::Type{T}; full=true) where {T}
+    D = 2
+    sets(forest) = full ?
+                   (FieldSet{T}(forest, 2; G=2) => OPS4,
+                    FieldSet{T}(forest, 1; G=1, centering=vertexcentered(D)) => OPS2,
+                    FieldSet{T}(forest, 3; G=2, centering=facecentered(D, 2)) => OPS4) :
+                   (FieldSet{T}(forest, 2; G=2) => OPS4,)
+    first_blocks(forest, n, flag) = begin
+        offset = first(blockrange(forest)) - 1
+        RegridFlag[offset + b <= n ? flag : Keep for b in 1:length(blockrange(forest))]
+    end
+    for (shape, refined) in (full ? (((4, 4), 2), ((2, 2), 3)) : (((2, 2), 3),))
+        forest = forest_of(shape, 8; periodic=(true, true))
+        made = sets(forest)
+        fss = map(first, made)
+        foreach(pseudorandom!, fss)
+        scheds() = map(p -> GhostSchedule(p.first, p.second), made)
+        name = "$tag$(shape[1])"
+        pairs = map(=>, fss, scheds())
+        regridded("$name.refine", forest, pairs; flags=first_blocks(forest, refined, Refine))
+        # Every child of the refined roots asks to coarsen.
+        offset = first(blockrange(forest)) - 1
+        flags = RegridFlag[level(forest.leaves[offset + b]) > 0 ? Coarsen : Keep
+                           for b in 1:length(blockrange(forest))]
+        pairs = map(=>, fss, scheds())
+        foreach(p -> fill_ghosts!(p...), pairs)
+        emit(name, "filled", join((digest(gathered(forest, fs.work)) for fs in fss), " "))
+        regridded("$name.coarsen", forest, pairs; flags=flags)
+        # Nothing asked for: no change, on every rank.
+        pairs = map(=>, fss, scheds())
+        emit(name, "unchanged",
+             regrid!(forest, pairs; flags=fill(Keep, length(blockrange(forest)))))
+    end
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -357,7 +587,7 @@ function refusals()
             f()
             ""
         catch err
-            err isa ArgumentError || rethrow()
+            err isa Union{ArgumentError,DimensionMismatch} || rethrow()
             err.msg
         end
         refused = TreeAMR.allgather(world, !isempty(msg))
@@ -390,6 +620,34 @@ function refusals()
     n, msg = attempt(() -> InterfaceSchedule(FieldSet(forest, 1; G=0,
                                                       centering=facecentered(2, 1))))
     emit("# interface diverged refused on", n, "of", NRANKS, "ranks:", msg)
+
+    # regrid!'s argument checks are agreed the same way (step 4): a flag
+    # box out of range on rank 1 only, a flag vector of the wrong length
+    # on rank 0 only (a `DimensionMismatch` there, as serially), another
+    # `buffer` on rank 1, and a forest refined on rank 1 only, with a
+    # field set that rank 1's own checks accept.
+    forest = Forest((4, 4); N=8, comm=COMM)
+    fs = FieldSet(forest, 1; G=2)
+    sched = GhostSchedule(fs, ops4)
+    nb = length(blockrange(forest))
+    flags = Any[RANK == 1 && b == 1 ? (Refine, (1:9, 1:8)) : Keep for b in 1:nb]
+    n, msg = attempt(() -> regrid!(forest, fs => sched; flags=flags))
+    emit("# regrid box refused on", n, "of", NRANKS, "ranks:", msg)
+    n, msg = attempt(() -> regrid!(forest, fs => sched; flags=fill(Keep, nb + (RANK == 0))))
+    emit("# regrid length refused on", n, "of", NRANKS, "ranks:", msg)
+    n, msg = attempt(() -> regrid!(forest, fs => sched; flags=fill(Refine, nb),
+                                   buffer=RANK == 1 ? 1 : 0))
+    emit("# regrid buffer refused on", n, "of", NRANKS, "ranks:", msg)
+    emit("# regrid refusals left the forest alone", all(TreeAMR.allgather(world,
+                                                                          nleaves(forest) == 16)))
+    if RANK == 1
+        refine!(forest, [forest.leaves[end]])
+        balance!(forest)
+        fs = FieldSet(forest, 1; G=2)
+    end
+    n, msg = attempt(() -> regrid!(forest, fs => nothing;
+                                   flags=fill(Keep, length(blockrange(forest)))))
+    emit("# regrid diverged refused on", n, "of", NRANKS, "ranks:", msg)
     return nothing
 end
 
@@ -465,6 +723,15 @@ function main()
               ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
                "edge1" => edgecentered(3, 1));
               G=1, ops=OPS2)
+    # Regridding: the tracked pulse, Burgers' shock with mass conserved,
+    # the initial-data cycle from one leaf, and blocks moving between
+    # ranks over several field sets, in Float64, Float32 and Float32x2.
+    tracked_pulse_case("TP"; cycles=3, steps=4)
+    burgers_regrid_case("BR"; cycles=3, steps=3)
+    adapt_case("A2")
+    moving_blocks_case("M", Float64)
+    moving_blocks_case("M32-", Float32; full=false)
+    moving_blocks_case("M32x2-", Float32x2; full=false)
     refusals()
     verbs()
     return nothing

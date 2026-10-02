@@ -386,7 +386,7 @@ function refuse_distributed(forest::Forest, what::AbstractString, why::AbstractS
         "implemented yet: $why. It arrives with M7 (see \"Distributed meshes\" in " *
         "CODE.md); until then a distributed forest supports the partition, the " *
         "field set storage, the geometry, the ghost exchange, the interface " *
-        "restriction and the reductions."))
+        "restriction, the reductions and the regrid."))
 end
 
 # --- The forest digest (M7) ----------------------------------------------
@@ -458,7 +458,7 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         refusal === nothing || throw(refusal)
         throw(ArgumentError(
             "$what was refused on rank(s) $(join(refused, ", ")) of $nranks, and so " *
-            "on this one (rank $rank) too: the build is collective, and a rank that " *
+            "on this one (rank $rank) too: the call is collective, and a rank that " *
             "went on would wait for the others in its first exchange. The reason is " *
             "in the error on rank $(first(refused)); the arguments evidently differ " *
             "between ranks, which they must not."))
@@ -481,21 +481,25 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "$what was called for a different layout on rank(s) " *
         "$(join(mismatched, ", ")) than on rank 0, so it is refused on every rank: " *
         "the ghost widths, the centering, the operators and the element type must " *
-        "be the same everywhere, since a rank computes the ghosts it sends with its " *
-        "own stencils and lays out what it receives by its own."))
+        "be the same everywhere (for regrid!, so must the field sets passed, their " *
+        "variable counts, `buffer` and `transfer`), since a rank computes the data " *
+        "it sends with its own stencils and lays out what it receives by its own."))
     return nothing
 end
 
 # A collective build's argument checks: run `check`, which returns the
 # checked values and their `layouthash`, and agree on the forest and
 # the layout across the ranks before going on. A refusal on some ranks
-# only is raised on all of them (see `agree_on_forest`).
+# only is raised on all of them (see `agree_on_forest`). A refusal is an
+# `ArgumentError`, or the `DimensionMismatch` `regrid!` raises for a flag
+# vector of the wrong length (step 4 of M7); anything else is a bug and
+# is rethrown at once.
 function collective_checks(check, forest::Forest, what::AbstractString)
     distributed = isdistributed(forest)
     checked, refusal = try
         check(), nothing
     catch err
-        (distributed && err isa ArgumentError) || rethrow()
+        (distributed && err isa Union{ArgumentError,DimensionMismatch}) || rethrow()
         nothing, err
     end
     distributed || return first(checked)

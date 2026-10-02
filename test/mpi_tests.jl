@@ -1,13 +1,17 @@
 # Distributed meshes over MPI (M7, from step 3 on).
 #
-# The acceptance test of the exchange: `test/mpi_workload.jl` runs a set
-# of distributed cases — the vertex- and cell-centered wave equation on
-# three-level meshes in D = 1, 2, 3, Burgers' equation with the
-# interface fixup, a reflecting box with odd and even variables, every
-# centering through one fill and one interface restriction, and a rank
-# with no blocks — and prints digests of the leaves, of the state and of
-# the working arrays *with their ghosts*, gathered in block order, the
-# exact reductions and the floating-point sums. Run serially in this
+# The acceptance test of the exchange and the regrid: `test/mpi_workload.jl`
+# runs a set of distributed cases — the vertex- and cell-centered wave
+# equation on three-level meshes in D = 1, 2, 3, Burgers' equation with
+# the interface fixup, a reflecting box with odd and even variables,
+# every centering through one fill and one interface restriction, and a
+# rank with no blocks; then (step 4) the tracked pulse and Burgers' shock
+# through regrid cycles, the initial-data cycle from a single leaf, and
+# regrids that move blocks between ranks both ways and coarsen siblings
+# that had different owners, in three element types — and prints
+# digests of the leaves, of the state and of the working arrays *with
+# their ghosts*, gathered in block order, after every regrid, the exact
+# reductions and the floating-point sums. Run serially in this
 # process it is the reference; run under `mpiexec` at two and three
 # ranks it must print the same lines, byte for byte, except the sums,
 # which are promised to roundoff only ("Reductions" under "Distributed
@@ -88,6 +92,12 @@ end
     @test count(l -> occursin(" state ", l), lines) >= 7
     @test count(l -> occursin(" filled ", l), lines) >= 13
     @test any(l -> startswith(l, "B2 conserved true"), lines)
+    # The regrid cycles (step 4) changed the mesh every time, Burgers'
+    # conserved mass through them, and both initial-data cycles converged.
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 14
+    @test "BR conserved true" in lines
+    @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
+    @test count(l -> occursin(" unchanged false", l), lines) == 4
     # Three levels wherever they were asked for.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p"), lines))
@@ -133,6 +143,30 @@ end
         @test startswith(refused("interface diverged"),
                          "# interface diverged refused on $n of $n ranks: the forest " *
                          "differs between ranks, so InterfaceSchedule is refused")
+        # regrid!'s checks are agreed in the digest gather (step 4): a bad
+        # flag box on rank 1, a flag vector of the wrong length on rank 0,
+        # another `buffer` on rank 1, a forest refined on rank 1.
+        @test startswith(refused("regrid box"), "# regrid box refused on $n of $n " *
+                                                "ranks: regrid! was refused on rank(s) 1")
+        @test startswith(refused("regrid length"), "# regrid length refused on $n of " *
+                                                   "$n ranks: got ")
+        @test occursin("one per local block", refused("regrid length"))
+        @test startswith(refused("regrid buffer"), "# regrid buffer refused on $n of " *
+                                                   "$n ranks: regrid! was called for a " *
+                                                   "different layout on rank(s) 1")
+        @test startswith(refused("regrid diverged"),
+                         "# regrid diverged refused on $n of $n ranks: the forest differs " *
+                         "between ranks, so regrid! is refused")
+        @test "# regrid refusals left the forest alone true" in hashes
+        # What the regrid acceptance asks for actually happened at this
+        # rank count: blocks moved up the ranks when the first ones were
+        # refined and down again when they were coarsened, and a coarsened
+        # block's children had more than one owner, in every element type.
+        migrated(what) = parse.(Int, split(only(filter(startswith("# $what migrated"),
+                                                     hashes)))[[4, 6, 8]])
+        @test migrated("M4.refine")[1] > 0
+        @test migrated("M4.coarsen")[2] > 0
+        @test all(t -> migrated("$t.coarsen")[3] > 0, ("M2", "M32-2", "M32x2-2"))
     end
 end
 

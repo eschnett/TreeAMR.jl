@@ -3157,7 +3157,10 @@ collective.
   ranks that refused. Without that, one rank's `ArgumentError` would
   leave the others waiting in the gather, or in their first exchange.
   Only `ArgumentError`s are agreed this way; anything else is a bug and
-  is rethrown at once.
+  is rethrown at once. *(Amended in step 4: `regrid!`'s checks run
+  through the same gather, and the `DimensionMismatch` it raises
+  serially for a flag vector of the wrong length is agreed too, so that
+  error keeps its type on the rank that raised it.)*
 - *Serially nothing is gathered*: a forest over one rank skips the
   digest and its `O(nleaves)` pass, so a serial build is unchanged.
 - *The verdict is the same on every rank* because it is computed from
@@ -3499,6 +3502,63 @@ Three consequences:
 
 `adapt_to_initial_data!` and `total_mass` follow unchanged: the first
 is a loop of collective calls, the second a `mesh_mapreduce`.
+
+*(Step 4, where this was implemented; what it settled:)*
+
+- *The canonical mark* is `RegridMark{D}`: the flag, whether the caller
+  reported a box (`explicit`, which decides whether a `Keep` is a
+  dilation source), and the box as two `NTuple{D,Int32}` corners,
+  validated by `markbox` when the mark is made. `buffered_flags` reads
+  it through methods of `markflag`, `markbox` and `issource`, so the
+  public functions keep taking either caller form, and a gathered
+  vector is concretely typed. `regrid!` makes the marks serially too:
+  one code path, and a serial regrid measures the same (below).
+- *The checks ride the digest gather.* `regrid!`'s argument checks —
+  the pairs, each field set's forest and block count, each schedule's
+  forest, staleness, ghost width, centering, element type and backend,
+  `buffer`'s limits, the flag count and every flag's box — run inside
+  `collective_checks`, with a layout hash of what the ranks must also
+  agree on: each pair's variable count, ghost width, centering, element
+  type, backend and operators, in order, `buffer`, `transfer`, and
+  whether there is a hook. A rank that passed other field sets, or the
+  same ones in another order, would match its regrid messages — all
+  under tag 50 — to the wrong field set's. So one `allgather` of the
+  digest carries every refusal, and the flags follow in an
+  `allgatherv` only once all ranks have passed. Serially nothing is
+  gathered and every refusal keeps its serial type and message.
+- *The stage is `remote_stage`'s*, as step 2 left it to be.
+  `regrid_sources` classifies every new leaf once per regrid, not once
+  per field set as before, into a `TransferPairs` under `GroupKey`s
+  with direction zero and level 0 — targets new leaves, sources old,
+  both global — and `regrid_stage` splits it by the new partition for
+  the targets and the old for the sources, builds the local groups and
+  calls `remote_stage` with the two owners and ranges. A coarsened
+  block's `2^D` restrictions are `2^D` transfers with one target and
+  their own sources, so children with different owners are simply
+  received from different peers; nothing about them is special. Over
+  one rank both ranges are every leaf, nothing is split, and the stage
+  is the serial groups with no messages. `run_stage!` gained a form
+  over a separate `dest` and `src` — the new mesh's array and the old
+  one's — which the exchange's form now calls with `fs.work` twice.
+  `transfer_groups` keeps its signature, as the serial stage's groups,
+  for `thread_tests.jl` and `bench/gpu.jl`.
+- *The ghost fill's checks stay rank-local* (decided in step 4).
+  `fill_ghosts!` refuses a stale schedule, a field set over another
+  forest, a block count that does not match, another layout or
+  backend, each on the rank that sees it, and does not agree. Two
+  reasons. Each check is a function of objects the collective contract
+  keeps identical on every rank — the forest's generation and leaves,
+  a schedule whose build was digest-checked, a field set's layout — so
+  under the contract they agree without a message, and a check that
+  fires on one rank only means the contract was already broken, which
+  the digest catches at the next schedule build or regrid. And agreeing
+  would cost a collective per fill, which is per right-hand-side
+  evaluation: a global synchronization of every rank on the path "Two
+  time scales" keeps free of everything but the neighbour messages.
+  What a one-rank refusal does is make that rank throw before it posts
+  a message, so the others wait in their first stage: a hang, never
+  wrong data. An MPI application turns it into a job failure the usual
+  way — `MPI.Abort` from a handler, as `test/mpi_workload.jl` does.
 
 **Point interpolation.** `interpolate` becomes collective. Each rank
 passes its own points, possibly none.
@@ -4641,6 +4701,107 @@ M7's benchmarks. The list below is in execution order.
     serial and mass conserved to roundoff across ranks; a regrid that
     migrates blocks between ranks, and one that coarsens a block whose
     children had different owners.
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan (the design decisions are recorded under "Regridding" in
+    [Distributed meshes](#distributed-meshes)):
+    - *The driver.* `regrid!` runs its checks through
+      `collective_checks`, gathers the canonical marks with one
+      `allgatherv`, completes them replicated, and per field set fills
+      the old mesh's ghosts (the distributed fill), zero-fills the new
+      local array and runs the regrid stage through `run_stage!` from
+      the old array into the new one, waiting for its sends before the
+      next field set; then `rebuild_leaves!`. `fs => nothing`
+      reallocates to the new local count, `transfer = false` moves
+      nothing, and "nothing changed" returns `false` on every rank,
+      since every rank decides it from the same gathered marks. The
+      step-1 refusal is gone; `adapt_to_initial_data!`, `firing_boxes`
+      and `total_mass` needed no change.
+    - *The workload.* `test/mpi_workload.jl` gains the tracked pulse (a
+      right-moving Gaussian, vertex-centered, outer faces with the hook,
+      flagged through `firing_boxes` with a buffer, three regrids with
+      RK4 steps between), Burgers' shock through three regrids with the
+      fixup (conservative operators, the fluxes `=> nothing`; mass
+      conserved across each regrid and the run, and on `sum` lines),
+      `adapt_to_initial_data!` from a single leaf with the host callback
+      and with a `firing_boxes` flag vector (two of three ranks start
+      empty at `-n 3`), and a case that refines the first blocks of a
+      uniform mesh and coarsens them back, and refines three of four
+      roots and coarsens them back, over three field sets at once (cell,
+      `nvars = 2`, `G = 2`, order 4; vertex, `nvars = 1`, `G = 1`,
+      order 2; a face, `nvars = 3`, `G = 2`, order 4), then a regrid
+      that changes nothing. The second half runs again in `Float32` and
+      `Float32x2` over the cell-centered set, so both types cross MPI in
+      the regrid stage and the exchange. After each regrid the leaves
+      and every moved field set's array, ghosts zero, are digested
+      before any fill, so the transfer itself is compared bit for bit.
+      `#` lines count the blocks that moved up and down the ranks and
+      the coarsened blocks whose children had more than one owner, and
+      the test asserts at each rank count that both directions and the
+      straddling case occur. Four more refusals: a bad flag box on rank
+      1, a flag vector of the wrong length on rank 0, another `buffer`
+      on rank 1, and a forest refined on rank 1, each refused on every
+      rank, the forest untouched by the first three.
+    - *In process*, `test/regrid_exchange_tests.jl`. The lockstep test
+      builds the regrid stage of every simulated rank, packs from its
+      slice of the old array, delivers every segment, runs the local
+      groups and unpacks, and requires the result bit for bit equal to
+      the serial `regrid!` on every rank's new blocks; the union of the
+      local and received transfers equal to the serial transfer set;
+      both ends' layouts entry for entry; and every sent transfer naming
+      its source's old owner and its target's new one. It covers `D =
+      1, 2, 3`, every centering, the periodic, outer and reflecting
+      faces of `exchange_tests.jl`, PointValue and Conservative, 1–5
+      ranks and one more than the leaves in 1D (empty ranks), and, in
+      3D, 7 ranks, which is the first count at which a coarsened group
+      of that mesh straddles a rank boundary; `Float32` and `Float32x2`
+      over a 2D subset. Then `regrid!` and `adapt_to_initial_data!`
+      themselves run with one task per rank over a communicator whose
+      collectives are rendezvous between the tasks and whose messages
+      go through step 2's mailbox: two field sets and a flux `=> nothing`
+      with mixed bare and boxed flags and a buffer, in 2D and 3D at 3
+      and 5 ranks, bitwise against serial, and `transfer = false`; both
+      criterion forms from a single leaf at 3 ranks, with the serial
+      passes and data; and the refusals.
+    - *Measured.* The workload at `-n 2`, `3` and `4` with one thread a
+      rank, and at `-n 3` with two, prints the serial lines byte for
+      byte except the `sum` lines, which differ in the last one or two
+      of 17 digits where they differ (`l2`; Burgers' mass 16 against
+      15.999999999999998 and 16.000000000000004); 39–42 s of wall clock
+      per run, against 27–29 s in step 3. Blocks moved up and down at
+      every rank count (the uniform mesh: 3, 6 and 5 up on the refine,
+      as many down on the coarsen, at 2, 3 and 4 ranks), and 1, 2 and
+      2 coarsened blocks had children of more than one owner.
+    - *Serial cost* (a scratch script, best of 15: `D = 3`, `N = 16`,
+      the 4³-root mesh of `bench/threads.jl` with its middle refined, a
+      field set of 2 variables, `G = 2`, order 4, and a face-centered
+      flux `=> nothing`, refining a slab of 128 blocks and coarsening it
+      back; HEAD before and after, alternated). At one thread the
+      refine took 37.1–38.4 ms before and 37.2–38.3 ms after, the
+      coarsening 23.2–23.7 against 23.4–23.7; at four threads the
+      refine 12.6–13.2 ms against 12.7–14.3 and the coarsening 7.4–7.9
+      against 7.5–7.9. On a host-heavier mesh (`N = 6`, 8³ roots, 1856
+      leaves after the refine) 26.3–27.0 ms against 26.4–27.2 and
+      28.2–28.3 against 28.0–30.7. A regrid allocates 0.1–0.8 % more
+      (38.55 MB against 38.50, 34.86 against 34.57): the marks and the
+      layout hash. `bench/ghosts.jl`'s fill is unchanged, 2.57–2.59 ms
+      against 2.57–2.58 and 11.45–11.46 against 11.48, with 16 and 32
+      bytes less allocated per fill.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
+      `partition_tests.jl`, `exchange_tests.jl`,
+      `regrid_exchange_tests.jl`, `regrid_tests.jl` and `mpi_tests.jl`
+      (2m38 together); the whole suite was not run there.
+    - *Suite cost.* 108827 tests at one thread in 6m57 (7m02 in a
+      second run, timed by file) and 108879 at eight in 6m57: 451 more
+      than step 3 at each — the 430 of `regrid_exchange_tests.jl`, 22
+      more in `mpi_tests.jl`, and one fewer in `partition_tests.jl`,
+      whose two regrid refusals became one. `mpi_tests.jl` now takes
+      96.6 s inside the suite, against step 3's 58.4 s, and
+      `regrid_exchange_tests.jl` 12.4 s: about 50 s more in all. The
+      `Float32x2` and `Float32` workload cases cost about 2 s each per
+      run and the three-field-set case the most compilation; those are
+      what to trim first. The thread-independence digests are
+      unchanged. The docs build.
   - **Step 5 — interpolation routing.** *Accept:* an interpolation line
     in the workload, bit-identical to serial; a rank that passes no
     points; and an outside point refused on every rank with the same

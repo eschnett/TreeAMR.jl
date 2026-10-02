@@ -367,7 +367,7 @@ end
 const PHASE1_TAG = 1
 prolongation_tag(level::Integer) = 2 + Int(level)       # 2 … 2 + MAX_LEVEL
 interface_tag(d::Integer) = 40 + Int(d)                  # one per face dimension
-const REGRID_TAG = 50                                     # step 4 of M7
+const REGRID_TAG = 50                                     # the regrid transfer
 
 """
     GhostSchedule{T,D,R}
@@ -1036,7 +1036,7 @@ end
 # `sourceowner(s)` are the ranks of a global target and source, and
 # `targetrange` / `sourcerange` this rank's own leaves in the partitions
 # the targets and the sources are local to. For the ghost and interface
-# exchanges both are `blockrange(forest)`; the regrid transfer (step 4)
+# exchanges both are `blockrange(forest)`; the regrid transfer (`regrid_stage`)
 # has its targets in the new partition and its sources in the old.
 # Returns `nothing` when the stage has no messages here.
 function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,

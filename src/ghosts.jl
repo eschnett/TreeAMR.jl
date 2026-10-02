@@ -317,51 +317,68 @@ end
 
 # Evaluate every send transfer of the stage into its slot of the send
 # buffer, then synchronize: a device buffer is safe to hand to MPI only
-# once the kernels writing it have finished.
-function pack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend)
-    run_phase!((buf=bufs[1], offsets=remote.sendoffsets), fs.work, remote.packs,
-               fs.nvars, backend)
+# once the kernels writing it have finished. `src` is the array the
+# transfers read: a field set's working array in an exchange, the old
+# mesh's in the regrid transfer.
+function pack_stage!(src::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
+                     backend)
+    run_phase!((buf=bufs[1], offsets=remote.sendoffsets), src, remote.packs, nvars,
+               backend)
     synchronize(backend)
     return nothing
 end
+pack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
+    pack_stage!(fs.work, remote, bufs, fs.nvars, backend)
 
-# Copy every received slot into its target box, applying the parity
-# factor of a mirrored transfer here, where the serial kernel applies it.
-function unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend)
-    run_phase!(fs.work, (buf=bufs[2], offsets=remote.recvoffsets), remote.unpacks,
-               fs.nvars, backend; factors=fs.factors)
+# Copy every received slot into its target box in `dest`, applying the
+# parity factor of a mirrored transfer here, where the serial kernel
+# applies it.
+function unpack_stage!(dest::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
+                       factors, backend)
+    run_phase!(dest, (buf=bufs[2], offsets=remote.recvoffsets), remote.unpacks, nvars,
+               backend; factors=factors)
     return nothing
 end
+unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
+    unpack_stage!(fs.work, remote, bufs, fs.nvars, fs.factors, backend)
 
-# Run one stage on this rank through the forest's communicator. `sends`
-# collects the send requests of the call so far — `nothing` until the
-# first one — and is returned, to be waited on at the end of the call.
-# The communicator is fetched only where a stage has messages: the field
-# is abstractly typed, and a call that took it as an argument would be
-# dispatched at run time on every stage of a serial fill too.
-function run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends)
+# Run one stage on this rank through the forest's communicator, from
+# `src` into `dest`: the same working array in an exchange, since its
+# targets are ghosts and its sources interiors, and the old and the new
+# mesh's arrays in the regrid transfer (step 4 of M7), whose packs read
+# the old blocks and whose local groups and unpacks write the new ones.
+# `sends` collects the send requests of the call so far — `nothing`
+# until the first one — and is returned, to be waited on at the end of
+# the call. The communicator is fetched only where a stage has
+# messages: the field is abstractly typed, and a call that took it as an
+# argument would be dispatched at run time on every stage of a serial
+# fill too.
+function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
+                    stage::ExchangeStage, forest::Forest, backend, sends)
     remote = stage.remote
     if remote === nothing
-        run_phase!(fs, stage.locals, backend)
+        run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
         synchronize(backend)
         return sends
     end
     comm = forest.comm
-    bufs = stagebuffers(remote, fs.nvars, backend)
+    bufs = stagebuffers(remote, nvars, backend)
     recvs = Any[irecv(comm, view(bufs[2], r), peer, stage.tag)
                 for (peer, r) in zip(remote.recvpeers,
-                                     segment_ranges(remote.recvcounts, fs.nvars))]
-    pack_stage!(fs, remote, bufs, backend)
+                                     segment_ranges(remote.recvcounts, nvars))]
+    pack_stage!(src, remote, bufs, nvars, backend)
     sends === nothing && (sends = Any[])
-    for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, fs.nvars))
+    for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
         push!(sends, isend(comm, view(bufs[1], r), peer, stage.tag))
     end
-    run_phase!(fs, stage.locals, backend)
+    run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
     waitall(comm, recvs)
-    unpack_stage!(fs, remote, bufs, backend)
+    unpack_stage!(dest, remote, bufs, nvars, factors, backend)
     synchronize(backend)
     return sends
 end
+run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
+    run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends)
 
 # A whole staged ghost fill: phase 1, the boundary hook on this rank's
 # own blocks, then phase 2 by target level. This is `fill_ghosts!` once
