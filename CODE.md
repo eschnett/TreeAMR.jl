@@ -1511,7 +1511,9 @@ so there is no hidden mesh state to lose. (Parthenon, by contrast,
 warns that an AMR run restarted without its per-block derefinement
 counters may not be bitwise exact.)
 
-**File layout, format version 1** (decided). One HDF5 file. Everything
+**File layout, format version 1** (decided; written through M7's step
+6, and read by every later version — version 2, the files per I/O
+process of step 6b, follows the version-1 bullets). One HDF5 file. Everything
 TreeAMR writes lives under one top-level group, `/TreeAMR.jl`, and the
 application gets a top-level group of its own, named after it:
 
@@ -1598,6 +1600,8 @@ application gets a top-level group of its own, named after it:
     exactly as before. A feature would have made every file M7 writes
     unreadable to 0.1.4 for nothing a reader must understand. The 0.1.4
     reader was checked to load files with them, filtered and not.
+    *(Step 6b bumps the version to 2 after all, for the part files,
+    which a reader must understand; the checksums alone would not have.)*
   - *CRC-32C*, because it is in Julia's standard library (`CRC32c`,
     which TreeAMR now depends on), runs in hardware on x86-64 and
     AArch64 (13.7 GB/s on one thread of the development laptop, against
@@ -1608,6 +1612,26 @@ application gets a top-level group of its own, named after it:
     the same slab. The leaf list, which every rank reads whole, has one.
   - *Not covered*: the extents, the provenance and the plain data, which
     are small and written by rank 0 alone, and HDF5's own metadata.
+  - *Not HDF5's own checksums* (decided 2026-10-02 with Erik, checked
+    the same day). HDF5's Fletcher-32 filter was considered and is not
+    used, for four reasons. It accepts an all-zero chunk, trailer
+    included: on libhdf5 2.2.0 a chunk overwritten with zeros through
+    `H5Dwrite_chunk` read back without an error, while one nonzero byte
+    with a zero trailer was refused — and whole zeroed slabs are exactly
+    the loss seen on BeeGFS, whereas the CRC-32C of zeros is not zero. Its
+    checksum lives inside the chunk, so an intact chunk in the wrong
+    place, or one left from an earlier write, verifies; ours are stored
+    apart from the data and indexed by block. It needs chunked storage,
+    which would leave the contiguous, unfiltered datasets uncovered. And
+    it is weaker: 16-bit words, with 0x0000 and 0xFFFF ambiguous. HDF5's
+    checksums of its own metadata, which the newer format structures
+    carry (through the library-version bounds), are not enabled either.
+  - *Over the parts* (step 6b). A part file stores each field set's
+    `data_crc32c` for its blocks, and the index's part table stores a
+    CRC-32C of each of those arrays, so the index vouches for the
+    per-block checksums and they for the data: a part from another save,
+    or one whose checksums were damaged, is refused before its data are
+    read.
 - **Spellings** (fixed by the implementation). Shapes above are in
   Julia's order, which C sees reversed. Every `Bool` in the file —
   `periodic`, `reflecting`, a plain-data `Bool` — is a `UInt8`, 0 or 1,
@@ -1617,6 +1641,50 @@ application gets a top-level group of its own, named after it:
   `Int64`, the leaf columns excepted. A `Float16`, which HDF5.jl does
   not predefine, is the IEEE half type built as h5py builds it, and a
   `Complex` is the compound `(r, i)`, as HDF5.jl and h5py spell it.
+
+**File layout, format version 2** (M7 step 6b, decided 2026-10-02 with
+Erik; the design is "Checkpoints without parallel I/O" under
+[Distributed meshes](#distributed-meshes)). A checkpoint is an *index
+file* `path` and one *part file* per I/O process, `path.<saveid>.<j>.h5`;
+with one I/O process the single part lives inside the index, so a
+serial checkpoint is one file. The index is the version-1 file with the
+field data moved out:
+
+    path:
+    /TreeAMR.jl/         attrs: format = "TreeAMR checkpoint",
+                                format_version = 2, features = ["brick"],
+                                application, save_id (32 hex digits)
+      provenance/        as in version 1, and nparts (1 if absent)
+      forest/            as in version 1, leaves_crc32c included
+      fieldsets/<name>/  the layout attributes of version 1; no datasets
+      parttable/         file        String[k]  (relative; "" for the
+                                                 part inside the index)
+                         first_block Int64[k]   (global leaf index, from 1)
+                         last_block  Int64[k]   (first_block − 1 if empty)
+                         bytes       Int64[k]   (the part file's size; 0
+                                                 for the inline part)
+                         fieldsets   String[s]  (the field sets, in order)
+                         data_crc32c UInt32[s, k] (CRC-32C of each part's
+                                                 data_crc32c, per set)
+      parts/<jjjj>       an external link to `<file>:/TreeAMR.jl` per part
+                         file, for tools; with one part, the part group
+                         itself, inline (`jjjj` zero-padded to 4 digits)
+    /<app name>/         as in version 1
+
+    path.<saveid>.<j>.h5:
+    /TreeAMR.jl/         attrs: format = "TreeAMR checkpoint part",
+                                format_version = 2, save_id, part = j,
+                                first_block, last_block
+      fieldsets/<name>/
+        data             (limbs?, N, …, N, nvars, last − first + 1)
+        data_crc32c      UInt32[last − first + 1]
+
+The inline part, `/TreeAMR.jl/parts/0000` of the index, has the part
+file's `/TreeAMR.jl` attributes and contents. The datasets keep version
+1's spellings, chunking and filters; a part's block axis is its own
+range, so block `b` of the forest is entry `b − first_block + 1` of the
+part that holds it. The parts tile `1:nleaves` in order, as the ranks'
+ranges do.
 
 **Element types** (decided).
 
@@ -1689,6 +1757,10 @@ with the reason, and defaults are supplied where they are obvious.
   over `path` when it is complete; on any error the partial file is
   removed and the error rethrown. A crash while writing then cannot
   destroy the previous checkpoint, which is the one a restart needs.
+  *(Step 6b: with part files, the parts are written and flushed first,
+  under a fresh save id that no index names, and the rename of the index
+  is the commit point; the previous index's parts are deleted only after
+  it. See "Checkpoints without parallel I/O".)*
 - **Durably, by default** (`sync = true`; added 2026-09-29, after the
   first implementation, which left it as an open question). Closing a
   file only hands its data to the operating system's page cache, which
@@ -1900,7 +1972,14 @@ decided).
   nodes until ROMIO's read-modify-write was turned off, and its rate
   did not grow with nodes; it is to be replaced by files per I/O
   process, decided that day with Erik. The account is under "Parallel
-  checkpoints".)*
+  checkpoints".)* *(Step 6b, decided 2026-10-02 with Erik: the shared
+  file is replaced by one file per I/O process and an index — the
+  alternative of the fourth bullet — with every file written by one
+  process and opened by one, and `format_version` becomes 2. The
+  awkwardness that bullet names is met by an index that lists every
+  part's block range, so a reader on any rank count knows which part
+  holds which blocks; the design is "Checkpoints without parallel I/O"
+  in [Distributed meshes](#distributed-meshes).)*
 
 **Multi-block** (checked). Keys are relative to their root,
 `connectivity = "brick"` is a tagged record rather than an assumption,
@@ -1947,7 +2026,8 @@ load HDF5 while the extension is not loaded. `fieldsets` and
                     fieldsets   = ("U" => (U, u), "aux" => aux),  # or ()
                     application = "TreeHydro" => 1,  # name => its version
                     data = (; t, chunk, recipe), filters = (),
-                    sync = true)                     # flush to stable storage
+                    sync = true,                     # flush to stable storage
+                    io = :node)                      # I/O processes (M7 step 6b)
     save_checkpoint(path, forest; …) do app::HDF5.Group
         # further datasets in the application's group, beside `data`
     end
@@ -3090,7 +3170,9 @@ implementation measures it. The steps are in the M7 entry under
 amendments marked where they were made. Measured on Symmetry the same
 day: steps 7 and 8 in full, and step 6, whose multi-node run lost data
 and led to the decision to replace the shared-file checkpoint; the
-findings are in the steps, and amend the bullets below where marked.)* M7 runs one forest over several
+findings are in the steps, and amend the bullets below where marked.
+The replacement, checkpoints without parallel I/O, was specified the
+same day as step 6b.)* M7 runs one forest over several
 processes. It came after M8 and M10 on purpose: every centering, the
 interface restriction and the mirrored transfers at reflecting faces
 are now entries of one schedule, so distributing the schedule
@@ -3147,7 +3229,9 @@ in the layer order.
 - The package talks to it through a few internal verbs: `commrank`,
   `commsize`, `allgather` of one `isbits` value, `allgatherv` of a
   vector, `alltoallv`, and nonblocking `isend` / `irecv` with
-  `waitall` over flat buffers.
+  `waitall` over flat buffers. *(Amended in step 6b: two more,
+  `commnodes`, the number of shared-memory nodes, and `bcast` of one
+  rank's vector, for the checkpoints without parallel I/O.)*
 - Every verb has a serial method, so `src/` never branches on whether
   MPI is there. A serial run takes the distributed code path with every
   message empty, and the existing suite is its test.
@@ -3863,7 +3947,11 @@ amends the four steps above:)*
   above, every point writing only its own slot.
 
 **Parallel checkpoints** (parallel HDF5 in M7, decided 2026-10-01 with
-Erik). One shared file, with the version-1 layout unchanged:
+Erik; *superseded 2026-10-02*, decided with Erik, by "Checkpoints
+without parallel I/O" below, after the four-node account at the end of
+this item. What follows is kept as the record of the design that was
+built in step 6 and measured, and as the reason for its replacement.)
+One shared file, with the version-1 layout unchanged:
 `format_version` stays 1, and a file restarts on any rank count, serial
 included, which is what "No coordinates, and no partition" was for.
 
@@ -4104,6 +4192,194 @@ shared-file layout need not.
   on BeeGFS the same `pwrite`s were exact in 200 of 200. Neither file
   system is coherent between nodes; they fail differently, and a
   shared file is safe only when the MPI-IO layer knows how each fails.
+
+**Checkpoints without parallel I/O** (decided 2026-10-02 with Erik; it
+replaces the shared file of "Parallel checkpoints" above, whose
+four-node account is the reason, and is M7's step 6b). Writing one file
+from several nodes was not reliable on Symmetry, and the remedy found
+there — two ROMIO hints — is specific to one MPI-IO implementation on
+one file system, while the same measurement showed NFS losing whole
+pages to plain `pwrite`s from several nodes. Smaller clusters may fail
+in ways of their own, and a checkpoint that can be lost is not one. So
+no file of a checkpoint is ever shared between processes:
+
+- **One writer and one opener per file** (decided). Every file a
+  checkpoint consists of is created and written by exactly one process,
+  and on reading opened by exactly one process. HDF5 is used serially
+  only, so nothing depends on MPI-IO, its hints, or a file system's
+  coherence between clients. `TreeAMRHDF5MPIExt`, `open_parallel_file`,
+  `librarycomm` and the hints are removed (decided), and HDF5_jll need
+  no longer be a parallel build or match the MPI: the stock one still
+  is, which is harmless, and any other serves.
+- **I/O groups.** The ranks are split into `k` contiguous groups in rank
+  order, by the equal-count split that partitions the blocks
+  (`equalsplit`); the first rank of each group is its *I/O process*, and
+  the others its members. The ranks own contiguous runs of the curve in
+  rank order, so a group's blocks are one contiguous run of the curve,
+  and its part of every field set is one range of blocks. The keyword
+  `io` of `save_checkpoint` chooses `k`:
+  - `io = :node`, the default (decided): one per shared-memory node.
+    `k` is the number of nodes, which a new verb, `commnodes`, counts
+    from `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)`; its serial method
+    answers 1. A node's client is the unit a cluster file system caches
+    and is fed by, and one file per node keeps the number of files, and
+    the metadata server's load, at the number of nodes.
+  - `io = :all`: every rank writes its own part, and nothing is sent.
+  - An integer `k ≥ 1`, used as it is up to the rank count and clamped
+    to it beyond (decided here: an I/O process with no member is a rank
+    writing its own part, so a larger `k` can mean nothing else).
+  - *Nodes whose ranks are not contiguous* (decided here). The groups
+    are always contiguous, equal-count rank ranges; `:node` sets `k`
+    only. Under the usual block placement of ranks (SLURM's `block`
+    distribution, `mpiexec`'s by-slot default) the groups are then
+    exactly the nodes and every message stays on its node. Under a
+    round-robin placement, or with unequal counts per node, a group
+    spans nodes and its messages cross the network, which costs time
+    and nothing else. Contiguity is worth more than locality: it is what
+    makes a part one range of blocks, which one reader can send back
+    out as contiguous ranges at any other rank count.
+- **Files** (decided). Beside the *index file* `path`, which rank 0
+  writes, each I/O process writes one *part file*,
+  `path.<saveid>.<j>.h5` for its group `j in 0:k-1`, in the index's
+  directory. The save id is 128 random bits drawn by rank 0
+  (`RandomDevice`) and written as 32 lowercase hex digits; it is
+  recorded in the index and in every part, with the part's number and
+  block range, so that a part from another save — the previous one, or
+  one that crashed — is refused rather than read. With one I/O process
+  (a serial run, `io = 1`, or one node under `:node`) the single part
+  lives inside the index file, so a serial checkpoint is still one
+  file. The layout is format version 2, under "File layout, format
+  version 2" in [Checkpoint and restart](#checkpoint-and-restart).
+- **Writing.**
+  1. Every refusal is decided before anything is created and agreed
+     across the ranks, as in step 6.
+  2. Rank 0 draws the save id and broadcasts it (a new verb, `bcast`,
+     with a serial method).
+  3. Each member sends its owned data — the state vector, on the host;
+     a device field set through `tohost` as before — to its I/O
+     process: the members in curve order, a member's per-block
+     CRC-32Cs first and then its blocks, in messages of whole blocks of
+     at most 1 GiB each (one block if a block is larger). The I/O
+     process writes each message as it arrives, by hyperslab, with the
+     next receive already posted, so it holds at most two messages and
+     never its group's data whole. It checks every block it receives
+     against the member's CRC before writing it, so a block damaged in
+     transit is refused rather than written.
+  4. The I/O process writes its part's `data_crc32c`, closes the part
+     and, under `sync = true`, flushes it and then its directory to
+     stable storage (`flush_to_storage`). It reports success, the
+     part's size in bytes, and a checksum of each field set's
+     `data_crc32c` to every rank, in one `allgatherv`, which is also the
+     verdict: if any I/O process failed, every rank throws and each I/O
+     process removes its new part. Nothing is committed.
+  5. Rank 0 writes `path * ".partial"`: the format attributes, the
+     provenance, the forest, the field sets' layouts, the part table,
+     the external links, and the application's group, the do-block's
+     writes included. Under `sync = true` it flushes the file, renames
+     it over `path` (`Base.Filesystem.rename`), which is the commit
+     point, and flushes the directory; the verdict on that is agreed.
+  6. Only then does rank 0 delete the parts the previous index named,
+     read from it before the commit, and every *orphan*: a file in the
+     index's directory whose name is exactly `basename(path)`, a dot,
+     32 lowercase hex digits, a dot, decimal digits and `.h5`, with a
+     save id other than this one. A failure to delete is a warning, not
+     an error, since the checkpoint is in place.
+
+  A crash at any point before the rename leaves the previous index and
+  every part it names intact, plus at worst new parts that no index
+  names, which the next save removes; a crash after it leaves the new
+  checkpoint complete and at worst old parts, removed the same way. An
+  I/O process whose writing fails goes on receiving everything its
+  members send, without writing it, so that no member waits forever in
+  a send, and the failure arrives in the verdict. An error of the MPI
+  library itself remains fatal to the job. The cost of the cleanup rule
+  is that a copy of the index under another name in the same directory
+  does not keep its parts: an earlier checkpoint is kept by saving to
+  another path, or by moving the index and its parts to another
+  directory together, which keeps their relative names valid.
+- **Reading.**
+  1. The arguments are agreed, and only rank 0 opens the index. With
+     one rank it reads it directly. Otherwise it copies everything but
+     the part data — the `/TreeAMR.jl` group's attributes, the
+     provenance, the forest, the field sets' layouts, the part table
+     and the application's group — into an in-memory HDF5 file (the
+     core driver, without a backing store) and broadcasts its bytes,
+     and every rank opens that image (HDF5.jl's `h5open(bytes)`, which
+     sets the file image). HDF5 itself serializes the forest and the
+     plain data, so no serializer is needed. A refusal of the file
+     itself — it is missing, or is not a checkpoint — is rank 0's, and
+     is broadcast in place of the image, so it is raised on every rank;
+     what the image holds is the same everywhere, so a refusal of its
+     contents comes on every rank at the same point without a message.
+  2. Each part is read by exactly one rank: the owner, under the new
+     partition, of the part's first block, moved on to the next rank
+     while that one already reads `cld(k, P)` parts, so that no rank
+     reads more than its share when that is possible. The assignment is
+     a function of the replicated part table, the same on every rank.
+  3. Each reading rank opens its parts and checks each against the
+     index: that it is a part, its save id, its number and block range,
+     its size in bytes, and the checksum of each field set's
+     `data_crc32c`. The verdict is agreed before any data move, so a
+     missing part, a part from another save, or a truncated one is
+     refused on every rank.
+  4. Each owner posts its receives, straight into its state vector. The
+     reader reads, for each field set, the part's blocks in the range
+     each owner needs — contiguous, so a part goes to a contiguous run
+     of ranks — by hyperslab, in pieces of at most 1 GiB, checks each
+     block's CRC-32C, and sends it, with at most two pieces in flight; a
+     piece for itself it reads in place. A reader whose read fails goes
+     on sending, so no owner waits forever, and the damage and failure
+     verdict is agreed afterwards: a block that fails its checksum is
+     refused on every rank, as in step 6.
+
+  A version-1 file is read as one inline part covering every block, by
+  rank 0, which already has it open; so a file written before step 6b,
+  serially or by the shared-file writer, loads on any rank count.
+  Loading on a different rank count, and serially, works for every
+  combination, as it did.
+- **The do-block runs on every rank**, as it did. Rank 0's application
+  group is the index's; every other rank gets the same group in an
+  in-memory scratch file, discarded afterwards, so that a block that
+  calls collective operations still runs on every rank. `write_plain`
+  in it still agrees its value across the ranks, so what rank 0 writes
+  is what every rank passed; a dataset the block writes through HDF5
+  itself is kept from rank 0 alone and must be the same on every rank.
+  On loading, each rank's block gets the application group of its
+  image.
+- **External links for tools** (recommended to Erik, included). For
+  each part file the index holds an HDF5 external link,
+  `/TreeAMR.jl/parts/0003` → `ckpt.h5.<saveid>.3.h5:/TreeAMR.jl`, so
+  that `h5dump`, h5py and HDFView navigate from the index into every
+  part. TreeAMR's loader never traverses them: traversing an external
+  link opens its target, which would have rank 0 open every part, and
+  the other ranks hold the index only as an image. It takes the part
+  names from the part table and resolves them against the index's
+  directory itself. *The shadowing caveat*, for external tools: HDF5
+  resolves a relative external link by trying a prefix
+  (`HDF5_EXT_PREFIX`, or the link access property), the current
+  working directory and the directory of the file holding the link, and
+  HDF5's documentation lists the working directory before the parent's
+  directory — so a tool started in another directory may open a
+  same-named file there instead of the part. (Checked 2026-10-02:
+  libhdf5 2.2.0, HDF5_jll's, and h5dump 2.1.1 resolved the parent's
+  directory first, and fell back to the working directory only when the
+  part was missing there; older libraries may not.) TreeAMR's own
+  reader cannot be misled either way.
+- **Format version 2; the reader reads 1 and 2.** The parts change what
+  a file is, so the version is bumped, as "If the shared file does not
+  hold up, M7 bumps `format_version`" accepted. 0.1.4 refuses a
+  version-2 file with its format-version refusal, saying it was written
+  by a newer TreeAMR and naming `checkpoint_environment` (accepted, by
+  the versioning rules).
+- **What carries over from step 6**: the CRC-32C checksums per block and
+  of the leaf list, now with a checksum per part and field set in the
+  index above them; the refusals agreed before anything is created; the
+  plain-data agreement; the self-checking benchmark, which loads every
+  save it times; and the BeeGFS reproducers, whose `save_checkpoint`
+  modes now exercise this writer and whose MPI-IO and POSIX modes
+  remain as regression jobs for the file system. The shared-file
+  layout, the collective transfers, the fixed-length string arrays
+  (parallel HDF5 wrote no variable-length data) and the hints do not.
 
 **What the feasibility check found** (2026-10-01, in a scratch
 environment on the development machine: Apple M3 Pro, HDF5.jl 0.17.4,
@@ -4872,7 +5148,7 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
   read-modify-write was turned off, and is to be replaced by one
   without parallel I/O — files per I/O process and an index file —
   decided with Erik that day, so M7 is not yet marked done: its
-  checkpoint is open again.)* Curve partitioning, distributed ghost exchange (for
+  checkpoint is open again, as step 6b.)* Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
   and the `Allreduce` inside `mesh_mapreduce` (the planned global
@@ -5698,6 +5974,28 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
       compiled in each `mpiexec` run and the in-process loads; at one
       thread the suite grew by about 20 s. The thread-independence
       digests are unchanged. The docs build.
+  - **Step 6b — checkpoints without parallel I/O.** The design under
+    "Checkpoints without parallel I/O" in
+    [Distributed meshes](#distributed-meshes), decided 2026-10-02 with
+    Erik, replacing step 6's shared file: I/O groups and the `io`
+    keyword, part files and an index (format version 2, the reader
+    reading 1 and 2), the verbs `commnodes` and `bcast`, and the removal
+    of `TreeAMRHDF5MPIExt`. *Accept:* serially, the single file with its
+    inline part round-trips as before, and version-1 files written by
+    the old writer (fixtures committed under `test/fixtures/`) still
+    load; under MPI, saves at `-n 3` with `io = :all`, `io = 1` (or
+    `:node` on one node) and an `io` between, loaded at `-n 2`, at one
+    rank and serially, each continuation byte-identical, and the
+    version-1 fixtures loaded at every rank count; refused on every
+    rank: a part from another save, a block damaged in a part, a missing
+    part; orphans removed and nothing else; an I/O process failing
+    mid-save, after which the previous checkpoint loads and no new part
+    is left; and no file opened by more than one process, by a test hook
+    that records every open. Then `bench/checkpoint.jl` under MPI with
+    `io = :node` and `io = :all` on one, two and four nodes of Symmetry,
+    on BeeGFS, every save verified, compared with step 6's shared file;
+    and the stress reproducer's `save_checkpoint` modes on four nodes,
+    hundreds of verified saves, with no damage.
   - **Step 7 — weak-scaling smoke test.** `bench/mpi.jl` holds the
     blocks per rank fixed and times the RHS, the ghost fill, a regrid
     and the norm; `bench/symmetry_mpi.sh` runs one rank per NUMA domain
