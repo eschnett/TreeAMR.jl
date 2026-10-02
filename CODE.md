@@ -3080,7 +3080,13 @@ only field data are distributed.
 
 What replication costs at thousands of ranks — the replicated regrid
 bookkeeping above all — is for the weak-scaling smoke test (step 7) to
-measure, not for this section to assume.
+measure, not for this section to assume. *(Measured in step 7, in one
+process at up to 180224 leaves: the schedule build stays flat at a fixed
+number of blocks per rank, and of the replicated passes two grow to
+dominate a rank's regrid — the buffer's neighbour search when many
+blocks report boxes, and the classification of every new leaf — both of
+which can be made `O(local)` without changing a result; see step 7 under
+[Milestones](#milestones).)*
 
 **The communicator layer** (MPI a weak dependency, decided 2026-10-01
 with Erik). A new file, `src/communicator.jl`, sits after `device.jl`
@@ -5289,6 +5295,212 @@ M7's benchmarks. The list below is in execution order.
     through MPIPreferences. *Accept:* the table recorded here, with
     what limits it named, the replicated regrid bookkeeping and the
     overlap of the exchange with the local groups among them.
+
+    *(Built and run locally, 2026-10-02; the Symmetry table is scripted
+    and not run, so the acceptance stays open.)* What it settled:
+    - *The benchmark.* `bench/mpi.jl` (under `mpiexec` with the
+      argument `mpi`, in the test environment) builds a mesh of `TILES`
+      identical tiles of `ROOTS^D` roots stacked along `x_D`, periodic,
+      `TILES` the rank count unless set. The roots are numbered with
+      `x_D` slowest and every tile has the same leaves, so the
+      equal-count split gives rank `r` exactly tile `r`: the blocks per
+      rank are fixed by construction, and the halo per rank is constant
+      from three ranks on. Two tiles: *two-level*, the leaves with `x₁`
+      in the lower half and `x_D` in the upper half of the tile refined
+      once (176 blocks at `ROOTS = 4` in 3D), so a coarse-fine face
+      crosses every rank boundary and phase 1, the prolongation stage
+      and the interface restriction all carry messages; and *uniform*
+      (64 blocks), copies only. Timed in synchronized windows — an
+      `MPI.Barrier`, the call, the slowest rank's time by `allgather` —
+      as the minimum and the median over the repetitions: the wave RHS
+      (`scatter!` → `fill_ghosts!` → `map_blocks!`), the fill alone and
+      its three parts run separately through the internals (the stages'
+      local groups, the packs, the unpacks), `scatter!`, the norm, a
+      `mesh_mapreduce` max, `restrict_interfaces!` on a set
+      face-centered along `x_D`, `interpolate!` of 1000 points a rank
+      spread over the whole domain, the two schedule builds, a regrid
+      that refines the lowest layer of roots of tile 0 — the start of
+      the curve, so every later rank's range shifts and blocks migrate
+      — and one that coarsens it back, and the triad. `#` lines give per
+      rank, as min/mean/max, the messages, bytes, transfers and peers of
+      a fill and of an interface restriction (read from the stages),
+      the blocks a regrid made a rank take from another, and ns per cell
+      of the whole job. `TREEAMR_BENCH_BACKEND` and
+      `TREEAMR_BENCH_DEVICEAWARE` choose a device and its message path,
+      `TREEAMR_BENCH_TILES` the mesh of a `P`-rank run for a serial
+      control, `TREEAMR_BENCH_LABEL` the column name. The tab-separated
+      lines carry the minimum *and* the median, so `bench/scan.sh`'s
+      awk does not read them; `bench/mpitable.awk` is the matching
+      parser (efficiency against the first run, then both times) and
+      `bench/mpiscan.sh P…` launches each count through
+      `MPI.mpiexec()` and prints the table.
+    - *Laptop smoke run, not a scaling result* (Apple M3 Pro, 6
+      performance and 6 efficiency cores, one memory system; MPIABI_jll
+      through the global preference; `D = 3`, `N = 16`, `ROOTS = 4`, 2
+      variables, `G = 2`, order 4, Float64, 10 windows; `bench/mpiscan.sh
+      1 2 4`, one thread a rank). Minimum ms, two-level mesh, with the
+      weak-scaling efficiency `t(1)/t(P)`:
+
+      | phase | 1 rank | 2 ranks | 4 ranks | eff. 2 | eff. 4 |
+      |---|---|---|---|---|---|
+      | rhs | 16.65 | 20.12 | 22.56 | 0.83 | 0.74 |
+      | fill_ghosts | 10.22 | 14.00 | 16.38 | 0.73 | 0.62 |
+      | — its local groups | 9.91 | 11.43 | 14.16 | | |
+      | — its packs | – | 1.63 | 1.68 | | |
+      | — its unpacks | – | 0.29 | 0.30 | | |
+      | scatter | 2.56 | 2.61 | 2.69 | 0.98 | 0.95 |
+      | norm | 6.15 | 6.25 | 6.46 | 0.98 | 0.95 |
+      | interfaces | 0.025 | 0.046 | 0.073 | | |
+      | interpolate (1000 pts/rank) | 0.148 | 0.272 | 0.396 | 0.54 | 0.37 |
+      | ghost_schedule | 3.82 | 6.30 | 6.57 | 0.61 | 0.58 |
+      | interface_schedule | 0.13 | 1.23 | 1.35 | | |
+      | regrid, refine | 46.0 | 57.4 | 65.5 | 0.80 | 0.70 |
+      | regrid, coarsen | 30.4 | 45.5 | 44.7 | 0.67 | 0.68 |
+      | triad reference | 0.61 | 1.22 | 2.20 | 0.50 | 0.28 |
+
+      A fill sends, per rank, 2 messages at 2 ranks and 3 at 4 (phase 1
+      to both neighbours, the prolongation stage to one), 717 KB each way
+      in both cases, 560 transfers sent and 560 received against 4224
+      local (4784 serially); the interface restriction one message of
+      32 KB, 32 transfers. The uniform mesh: one stage, 410 KB, 288
+      transfers; its rhs 3.26 / 4.25 / 4.56 ms, fill 1.19 / 1.70 / 2.51,
+      build 0.40 / 1.20 / 1.26, refine 32.2 / 39.1 / 46.1. The refine
+      makes ranks take 0/28/56 blocks from another (min/mean/max) at 2
+      ranks and 0/42/84 at 4, the coarsening as many. At two threads a
+      rank the two-level rhs is 8.72 / 11.53 / 22.47 ms (efficiency 0.76
+      and 0.39) — eight threads on this machine reach its efficiency
+      cores, and the window is the slowest rank's.
+    - *What limits it here, named.* (1) **Memory bandwidth is shared**:
+      the triad's aggregate is about 120 GB/s at any rank count, one
+      core nearly saturates it, and so the per-rank triad halves with
+      each doubling. Whatever streams memory cannot weak-scale on this
+      machine, and the local groups of the fill do not (9.9 → 14.2 ms
+      for *fewer* transfers); only the phases bound by one core's
+      arithmetic do (`scatter`, the norm, 0.95). That is the reason the
+      numbers are not a scaling result. (2) **The sender computes**: the
+      packs are 1.6–1.7 ms, about a tenth of the fill. They are the
+      halo's copies, restrictions and prolongations, evaluated into the
+      send buffer rather than into ghosts, and the unpacks (0.3 ms) are
+      the extra pass that copies them into place. (3) **The overlap**: the fill less its local groups, packs
+      and unpacks is 0.7 ms at 2 ranks and 0.2 ms at 4, so over shared
+      memory almost nothing of the messages is left unhidden behind the
+      local groups; between nodes is what Symmetry will show. (4)
+      **Per-call collectives on small work**: an interpolation of 1000
+      points a rank costs an `allgather` and four `alltoallv`, 0.40 ms
+      at 4 ranks against 0.06 ms in one 4-thread process over the same
+      4-tile mesh (`TREEAMR_BENCH_TILES=4`); there the rhs and fill were
+      within 5 % of the 4-rank run (22.1 against 22.7 ms, 15.9 against
+      16.8), the schedule build 3.9 against 6.7 ms, the interface
+      schedule 0.14 against 1.35 ms and the refine 48.8 against 65.4 ms.
+      The interface schedule's growth is `remote_neighbors`, which
+      searches all `3^D − 1` directions of every local leaf (about 1 ms
+      here) for a builder that needs only faces, and which each
+      schedule build repeats.
+    - *Does the schedule build stay flat with `P`?* Yes. Step 2's
+      finding — a rank's build costs about the serial one at 120 blocks
+      a rank — was strong scaling: the halo is as large as the local
+      part, so the build does not shrink with `P`. At a *fixed* number
+      of blocks per rank it does not grow either. `bench/replicated.jl`
+      simulates rank `P÷2` of `P` in one process, over a communicator
+      that answers the digest gather by replication, hands `regrid!` the
+      global marks and makes every message a no-op, over this tile mesh
+      (176 blocks a rank, `N = 16`); best of 3–5, ms, at one thread and
+      at four:
+
+      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
+      |---|---|---|---|---|
+      | digest, fold over every leaf | 0.024 | 0.15 | 1.14 | 2.27 |
+      | `GhostSchedule` on the rank, 1 thread | 6.3 | 6.7 | 8.1 | 9.1 |
+      | the same, 4 threads | 4.3 | 4.4 | 5.6 | 6.8 |
+      | `remote_neighbors`, 1 thread | 1.04 | 1.19 | 1.29 | 1.34 |
+      | `complete_marks`, the slab, no buffer | 0.025 | 0.13 | 1.01 | 1.90 |
+      | `balance!` alone | 0.005 | 0.033 | 0.26 | 0.52 |
+      | `regrid_sources`, 1 thread | 0.17 | 1.27 | 12.1 | 29.0 |
+      | the same, 4 threads | 0.17 | 1.01 | 8.7 | 19.4 |
+      | `split_regrid` | 0.015 | 0.026 | 0.11 | 0.21 |
+      | `complete_marks`, every block a `(Keep, box)` source, buffer 4, 1 thread | 8.2 | 74 | 672 | 1407 |
+      | the same, 4 threads | 2.3 | 21 | 204 | 436 |
+      | `regrid!` on the rank, refine, 1 thread | 21.7 | 21.9 | 51.7 | 67.2 |
+      | `regrid!` on the rank, refine, 4 threads | 11.4 | 12.7 | 17.7 | 44.0 |
+      | marks gathered per rank and regrid | 0.05 MB | 0.36 MB | 2.9 MB | 5.8 MB |
+
+      Over 128 times the leaves the rank's build grows by 2.8 ms at one
+      thread, 2.2 ms of it the digest, the rest the `log n` of the
+      searches; so it is weak-scaling-flat, and the digest is the only
+      `O(nleaves)` part of it (13 ns a leaf, single-threaded, folded up
+      to three times per generation: `regrid!`, each `GhostSchedule`,
+      each `InterfaceSchedule`). The `regrid!` times are noisy, the
+      garbage collector's share included; a profile of one rank at 90112
+      leaves (one thread, 20 regrids, 29 ms each) put 38 % in
+      `regrid_sources`, 25 % in the fill before the transfer, 22 % in
+      allocating and zeroing the new array (local, first touch), 7 % in
+      `complete_marks` and
+      7 % in the transfer stage.
+    - *The replicated regrid bookkeeping, and what to do about it*
+      (proposed, not implemented). Two passes become the regrid's cost
+      long before the forest's memory does:
+      1. **The buffer's recruit search** in `buffered_flags`, about
+         5.8–7.8 µs per source leaf at one thread and 1.6–2.4 at four,
+         over every source of the whole forest on every rank. With
+         every block a source it overtakes the whole local regrid
+         between 1408 and 11264 leaves (8.2 and 74 ms against 22) and
+         is 13 times it at 90112 (672 against 52); at 32 ranks
+         of 176 blocks (four Symmetry nodes) it would be some 35–40 ms
+         at one thread, by the 1408- and 11264-leaf points, against a
+         local regrid of 11–22 ms — an extrapolation, not measured
+         there. The share of sources is the share of blocks whose
+         criterion fired (`firing_boxes`), so a run with a wide feature
+         pays it. *Remedy:* the recruits of a source are found from the
+         tree alone, so each rank can search for its own sources only
+         and gather the `(leaf, level)` pairs beside the marks; applying
+         them only raises a mark to `Refine` below a level or lifts a
+         `Coarsen` at or below one, which does not depend on their
+         order, so the result is bit for bit the replicated one, at
+         `O(local sources)` per rank and one `allgatherv` of the pairs.
+      2. **`regrid_sources`** classifies every new leaf on every rank,
+         with a `Dict` of every old leaf and a vector per new one: 12 ms
+         at 90112 leaves, 29 ms at 180224, 38 % of a rank's regrid at
+         512 ranks. *Remedy:* a rank needs only the new leaves it will
+         own and those whose sources it owns now. Refinement and
+         coarsening keep the curve order, so the second set is one
+         contiguous range of new indices, found by two binary searches
+         over the new leaves at the keys of the rank's first and last
+         old leaf, and an old leaf is found by `searchsortedfirst`
+         instead of the `Dict`: `O(local · log n)`. The layouts are
+         sorted explicitly (`stage_layout`), so restricting the list
+         changes no message.
+      3. Smaller and left as they are: the digest (cache its leaf fold
+         per generation if it ever shows; 1.1 ms at 90112 leaves is
+         14 % of a build), `complete_marks`' own passes and `balance!`
+         (1–2 ms at 10⁵ leaves, replicated in AMReX and Parthenon too),
+         and the marks' `allgatherv`, 32 bytes a leaf to every rank,
+         which a gather of the marks that are not a bare `Keep` would
+         shrink when it matters.
+    - *A device.* `TREEAMR_BENCH_BACKEND=metal TREEAMR_BENCH_N=8
+      TREEAMR_BENCH_REPS=3 TREEAMR_BENCH_PROJECT=<env> bench/mpiscan.sh
+      1 2` (a scratch environment that develops this checkout and adds
+      Metal, MPI and KernelAbstractions) runs in Float32 through the
+      staging path at 2 ranks, every phase included; its numbers, two
+      ranks sharing one GPU, say only that the path works.
+    - *Symmetry, not run.* `bench/symmetry_mpi.sh` (SLURM, `amddebugq`,
+      4 nodes by default) builds a scratch environment (MPICH_jll and
+      `srun --mpi=pmi2` by default, or a system MPI through
+      MPIPreferences with `TREEAMR_MPI=system`), then per block size
+      (`N = 16` and 32) runs one node at 1, 2, 4 and 8 ranks — rank `i`
+      of `R` on a node bound by `numactl` to NUMA domain `i · 8 / R`,
+      cores and memory, 8 threads — then 2 and 4 nodes at 8 ranks a
+      node, and the single-process controls over the 8-rank mesh: 64
+      threads pinned with first touch, and interleaved. It prints the
+      weak-scaling table against one rank on one domain and the
+      same-mesh table of the 8-rank run against the controls, and
+      `bench/replicated.jl` on one domain at 8 threads. "What one
+      process loses" found that the ownership policy recovers inside
+      one process what one rank per domain was expected to, so the
+      same-mesh table is a check of that, not an expected win.
+    - *What was not done.* No `src/` change, so the suite was not rerun.
+      The fill's overlap is read from the difference of its parts, not
+      traced inside `run_stage!`. The benchmark's mesh is periodic, so
+      the boundary hook is not timed.
   - **Step 8 — MPI+GPU.** Device-resident buffers, the device-aware
     check and host staging. *Accept:* the workload on Metal through the
     staging path, and on an H200 on Symmetry, agreeing with the serial
