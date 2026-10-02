@@ -107,8 +107,32 @@ rename (`fsync`; on macOS `fcntl(F_FULLFSYNC)`, since `fsync` there does
 not wait for the drive's own cache), and the directory after it, so
 that the rename is durable too. On Windows `sync` does nothing.
 
-Returns `path`. See `CODE.md`, "Checkpoint and restart", for the file
-layout and the reasons behind it.
+# Over a distributed forest (M7)
+
+Over a forest distributed over MPI ranks, `save_checkpoint` is
+collective: every rank calls it with the same `path`, the same field
+sets — each rank's own blocks of them — and the same keywords, `data`
+included, and every rank writes its own blocks into the one shared file
+through parallel HDF5 (the extension `TreeAMRHDF5MPIExt`, which loads
+with HDF5 and MPI together). The file is the serial one: the same
+layout and format version, the blocks in curve order, so it loads on
+any rank count, and serially. Everything that can be refused is checked
+on every rank before the file is created, and the verdict is agreed, so
+a refusal — an argument or a value of `data` that differs between ranks
+included — is raised on every rank together. The do-block runs on every
+rank, and what it writes is collective: [`write_plain`](@ref) agrees on
+its value across the ranks the same way, and a dataset the block writes
+through HDF5 itself is created by every rank and must hold the same
+values on each. An error inside a collective HDF5 call on some ranks
+only cannot be recovered from, since the others wait in it; it is fatal
+to the job, as in any MPI program. With `sync = true` every rank flushes
+its writes to stable storage (a collective `H5Fflush`, which is an
+`MPI_File_sync`) before the file is closed, and rank 0 then flushes the
+file as in a serial save, renames it and flushes the directory, while
+the others wait, so no rank returns before the checkpoint is in place.
+
+Returns `path`. See `CODE.md`, "Checkpoint and restart" and "Parallel
+checkpoints", for the file layout and the reasons behind it.
 
 ```julia
 using HDF5
@@ -119,7 +143,8 @@ save_checkpoint("run.h5", forest; fieldsets = ("U" => (U, u),),
 function save_checkpoint end
 
 """
-    load_checkpoint(path; backend = CPU(), types = (), fieldsets = nothing)
+    load_checkpoint(path; backend = CPU(), types = (), fieldsets = nothing,
+                    comm = nothing)
     load_checkpoint(f, path; ...)                # do-block: f(app::HDF5.Group)
 
 Read a checkpoint written by [`save_checkpoint`](@ref) into fresh
@@ -142,9 +167,11 @@ with `using HDF5`. Returns a NamedTuple with
 - `data` — the application's plain data, as [`read_plain`](@ref)
   returns it;
 - `provenance` — `(; treeamr_version, julia_version, created, hostname,
-  nthreads, project, manifest)`: who wrote the file, when (UTC), on how
-  many threads, and the texts of the writer's `Project.toml` and
-  `Manifest.toml` (see [`checkpoint_environment`](@ref));
+  nthreads, nranks, project, manifest)`: who wrote the file, when (UTC),
+  on how many threads (of rank 0) and ranks, and the texts of the
+  writer's `Project.toml` and `Manifest.toml` (see
+  [`checkpoint_environment`](@ref)). A file from before M7 has no
+  `nranks`, which reads as 1;
 - `result` — what the do-block returned, or `nothing`. The do-block is
   called with the application's group open, for whatever it wrote there
   beside `data`.
@@ -161,6 +188,13 @@ with `using HDF5`. Returns a NamedTuple with
   entry.
 - `fieldsets` — `nothing` for every field set in the file, or a
   collection of names for a subset.
+- `comm` — the communicator to distribute the loaded forest over, as for
+  [`Forest`](@ref): `nothing` for a serial forest, or an `MPI.Comm` such
+  as `MPI.COMM_WORLD`. The call is then collective, with the same
+  arguments on every rank: each rank reads the whole leaf list, builds
+  the replicated forest over `comm` and reads only its own blocks of
+  each field set. A file written on any number of ranks loads on any
+  other, or serially, since it stores no partition.
 
 # Refusals
 
@@ -227,6 +261,16 @@ layout can only read the old *file*. The same holds for JLD2 and
 `Serialization`, which is why neither is used. An item name must be
 nonempty, cannot be `"."`, and cannot contain `/`.
 
+In the application's group of a checkpoint being saved over a
+distributed forest (the do-block of [`save_checkpoint`](@ref)),
+`write_plain` is collective: every rank passes the same `name` and the
+same `value`, which is checked by a digest of what would be written,
+gathered from every rank before anything is, and refused on every rank
+if it differs. Parallel HDF5 cannot write variable-length data, so an
+array of strings is stored there as fixed-length, NUL-padded UTF-8 —
+read back as the same `Array{String}` — and a string in it that holds a
+NUL character is refused.
+
 See `CODE.md`, "Checkpoint and restart".
 """
 function write_plain end
@@ -264,9 +308,26 @@ project file at all, stored an empty text; the file that is missing is
 then not written, and a warning says so. A path in them — a `[sources]`
 entry, a developed package — still names the writer's disk.
 
-Existing files in `dir` are not overwritten unless `force = true`.
+Existing files in `dir` are not overwritten unless `force = true`. It
+is not collective: it reads the file serially, on whichever process
+calls it.
 """
 function checkpoint_environment end
+
+# The parallel file of a checkpoint over a distributed forest (step 6 of
+# M7): `path` opened in `mode` through HDF5's MPI-IO driver over the
+# library communicator `comm` (`librarycomm`). Its method for an
+# `MPI.Comm` is the extension `TreeAMRHDF5MPIExt`, which loads with HDF5
+# and MPI together, since the MPI-IO driver is HDF5.jl's own MPI
+# extension; everything else about a parallel checkpoint is in
+# `TreeAMRHDF5Ext`. Collective.
+function open_parallel_file end
+
+open_parallel_file(comm, path, mode) = throw(ArgumentError(
+    "a checkpoint of a distributed forest is written and read through parallel HDF5, " *
+    "which needs HDF5.jl and MPI.jl both loaded (that loads TreeAMR's extension " *
+    "TreeAMRHDF5MPIExt) and a communicator that is an MPI.Comm; got a " *
+    "$(typeof(comm))"))
 
 # The error hint. Without the extension the functions above have no
 # methods, and the bare `MethodError` would say nothing about why; the

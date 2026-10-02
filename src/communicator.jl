@@ -195,3 +195,13 @@ function waitall(::SerialCommunicator, requests::AbstractVector)
     return nothing
 end
 waitall(comm::Communicator, requests::AbstractVector) = missing_verb(comm, :waitall)
+
+# The library communicator underneath, for a library that has to be
+# handed one itself: parallel HDF5 opens a checkpoint over it (step 6 of
+# M7). The MPI extension returns its duplicate; no other communicator has
+# one, and the refusal says what the caller needs instead.
+librarycomm(comm::Communicator) = throw(ArgumentError(
+    "$(typeof(comm)) has no MPI communicator underneath it, and a checkpoint of a " *
+    "forest distributed over it would need one: every rank opens the one file " *
+    "through parallel HDF5, over MPI. Build the forest with `comm = " *
+    "MPI.COMM_WORLD` (or another MPI.Comm), with MPI.jl and HDF5.jl loaded."))

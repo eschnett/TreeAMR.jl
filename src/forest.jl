@@ -373,21 +373,9 @@ function remote_neighbors(forest::Forest{D}, range::UnitRange{Int}) where {D}
     return unique!(sort!(found))
 end
 
-# Whether the forest's field data are split over more than one rank —
-# what an operation that still needs messages, and does not have them
-# yet, refuses (M7 brings them step by step; "Distributed meshes" in
-# CODE.md).
+# Whether the forest's field data are split over more than one rank:
+# what takes the distributed path of an operation that has one.
 isdistributed(forest::Forest) = commsize(forest.comm) > 1
-
-function refuse_distributed(forest::Forest, what::AbstractString, why::AbstractString)
-    isdistributed(forest) || return nothing
-    throw(ArgumentError(
-        "$what over a forest distributed over $(commsize(forest.comm)) ranks is not " *
-        "implemented yet: $why. It arrives with M7 (see \"Distributed meshes\" in " *
-        "CODE.md); until then a distributed forest supports the partition, the " *
-        "field set storage, the geometry, the ghost exchange, the interface " *
-        "restriction, the reductions, the regrid and point interpolation."))
-end
 
 # --- The forest digest (M7) ----------------------------------------------
 #
@@ -483,8 +471,11 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "the ghost widths, the centering, the operators and the element type must " *
         "be the same everywhere (for regrid!, so must the field sets passed, their " *
         "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
-        "`derivs`, `vars` and `exclude`), since a rank computes the data it sends " *
-        "with its own stencils and lays out what it receives by its own."))
+        "`derivs`, `vars` and `exclude`; for save_checkpoint and load_checkpoint, " *
+        "the path and every keyword but `data`, and for write_plain the item's " *
+        "name), since a rank computes the data it sends with its own stencils and " *
+        "lays out what it receives by its own, and every rank makes the same " *
+        "collective calls into a checkpoint file."))
     return nothing
 end
 

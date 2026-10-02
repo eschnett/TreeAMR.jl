@@ -1,6 +1,7 @@
-# Checkpoint throughput (M9a).
+# Checkpoint throughput (M9a; in parallel, M7 step 6).
 #
 #     julia -t N --project=<env> bench/checkpoint.jl
+#     mpiexec -n P julia -t N --project=<env> bench/checkpoint.jl mpi
 #
 # Times `save_checkpoint` and `load_checkpoint` on two states over one
 # refined mesh, for each HDF5 filter setting available, and prints one
@@ -55,6 +56,17 @@
 #
 # Every load is checked to return the saved state bit for bit.
 #
+# **Under MPI** (the argument `mpi`, launched by `mpiexec`; the test
+# environment has MPI) the forest is distributed over `MPI.COMM_WORLD`,
+# every rank writes its own blocks into the one shared file through
+# parallel HDF5, and every rank loads its own blocks back
+# (`load_checkpoint(path; comm)`). Each call is timed between two
+# barriers, as the slowest rank's time, and the rates are the aggregate
+# over all ranks: the whole state over that time. Rank 0 prints, and adds
+# each rank's share of the state, the largest one. `TREEAMR_BENCH_DIR` is
+# then a directory every rank sees — on a cluster, the parallel file
+# system under test (`bench/symmetry_checkpoint_mpi.sh`).
+#
 #     TREEAMR_BENCH_D       dimension (default 3)
 #     TREEAMR_BENCH_N       cells per block edge (default 16)
 #     TREEAMR_BENCH_ROOTS   roots per edge (default 6)
@@ -63,10 +75,19 @@
 #     TREEAMR_BENCH_DIR     directory for the files (default a fresh temporary
 #                           one); on a cluster, the file system under test
 
+const USE_MPI = "mpi" in ARGS
+if USE_MPI
+    using MPI
+    MPI.Init()
+end
 using TreeAMR
 using HDF5
 using HDF5.Filters: Shuffle, Deflate
-using Printf: @printf
+using Printf: Printf
+
+const COMM = USE_MPI ? MPI.COMM_WORLD : nothing
+const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
+const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 
 const D = parse(Int, get(ENV, "TREEAMR_BENCH_D", "3"))
 const N = parse(Int, get(ENV, "TREEAMR_BENCH_N", "16"))
@@ -110,7 +131,8 @@ Refined `LEVELS` times around the sphere `r = r₀`: a leaf is refined
 when the sphere passes within half a block width of it, then balanced.
 """
 function build_forest(r₀)
-    forest = Forest(ntuple(_ -> ROOTS, D); N=N, extents=ntuple(_ -> (-1.0, 1.0), D))
+    forest = Forest(ntuple(_ -> ROOTS, D); N=N, extents=ntuple(_ -> (-1.0, 1.0), D),
+                    comm=COMM)
     for lvl in 0:LEVELS-1
         targets = filter(forest.leaves) do k
             level(k) == lvl || return false
@@ -163,58 +185,79 @@ function blast(forest, r₀)
     return fs
 end
 
-function best(f, reps=REPS)
+# Over several ranks a call takes as long as its slowest rank, between a
+# barrier before it and one after: the `allgather` of every rank's time.
+function timed(f, comm)
+    TreeAMR.allgather(comm, true)                    # a barrier
+    t = @elapsed f()
+    return maximum(TreeAMR.allgather(comm, t))
+end
+
+function best(f, comm, reps=REPS)
     GC.gc()
     f()
     t = Inf
     for _ in 1:reps
         GC.gc()
-        t = min(t, @elapsed f())
+        t = min(t, timed(f, comm))
     end
     return t
 end
 
+# A line printed by rank 0 alone.
+say(fmt, args...) = (RANK == 0 && print(Printf.format(Printf.Format(fmt), args...)); nothing)
+
 function main()
-    dir = isempty(DIR) ? mktempdir() : DIR
     r₀ = 0.5
     forest = build_forest(r₀)
+    comm = forest.comm
+    # One directory for every rank: rank 0's, named to the others.
+    dir = !isempty(DIR) ? DIR :
+          String(TreeAMR.allgatherv(comm, RANK == 0 ? collect(codeunits(mktempdir())) :
+                                          UInt8[]))
     datasets = (("pulse", pulse(forest, r₀)), ("blast", blast(forest, r₀)))
     settings = filter_settings()
 
-    @printf("threads=%d D=%d N=%d roots=%d levels=%d blocks=%d REPS=%d Julia %s\n",
-            Threads.nthreads(), D, N, ROOTS, LEVELS, nleaves(forest), REPS, VERSION)
-    @printf("# blocks per level: %s\n",
-            join([count(k -> level(k) == l, forest.leaves) for l in 0:LEVELS], ", "))
-    @printf("# filter packages: %s\n", isempty(OPTIONAL) ? "none" : join(OPTIONAL, ", "))
-    @printf("# files in %s\n", dir)
-    @printf("%-6s %-20s %9s %9s %7s %8s %8s %8s\n", "data", "filter", "state MB",
-            "file MB", "ratio", "save", "sync", "load")
-    @printf("%-6s %-20s %9s %9s %7s %8s %8s %8s\n", "", "", "", "", "", "GB/s", "GB/s",
-            "GB/s")
+    say("ranks=%d threads=%d D=%d N=%d roots=%d levels=%d blocks=%d REPS=%d Julia %s\n",
+        NRANKS, Threads.nthreads(), D, N, ROOTS, LEVELS, nleaves(forest), REPS, VERSION)
+    say("# blocks per level: %s\n",
+        join([count(k -> level(k) == l, forest.leaves) for l in 0:LEVELS], ", "))
+    say("# blocks per rank: %s\n",
+        join(TreeAMR.allgather(comm, length(blockrange(forest))), ", "))
+    say("# filter packages: %s\n", isempty(OPTIONAL) ? "none" : join(OPTIONAL, ", "))
+    say("# files in %s\n", dir)
+    say("%-6s %-20s %9s %9s %9s %7s %8s %8s %8s\n", "data", "filter", "state MB",
+        "rank MB", "file MB", "ratio", "save", "sync", "load")
+    say("%-6s %-20s %9s %9s %9s %7s %8s %8s %8s\n", "", "", "", "max", "", "", "GB/s",
+        "GB/s", "GB/s")
     for (dname, fs) in datasets
         u = statevector(fs)
         gather!(u, fs)
-        bytes = sizeof(u)
+        shares = TreeAMR.allgather(comm, sizeof(u))
+        bytes = sum(shares)
         for (fname, filters) in settings
             path = joinpath(dir, "checkpoint-$dname.h5")
             save(sync) = save_checkpoint(path, forest; fieldsets=("U" => (fs, u),),
                                          application="bench" => 1, data=(; t=0.0),
                                          filters=filters, sync=sync)
-            t_save = best(() -> save(false))
-            t_sync = best(() -> save(true))
+            t_save = best(() -> save(false), comm)
+            t_sync = best(() -> save(true), comm)
             fsize = filesize(path)
-            t_load = best(() -> load_checkpoint(path))
-            ck = load_checkpoint(path)
-            ck.forest.leaves == forest.leaves &&
-                reinterpret(UInt8, ck.fieldsets["U"].state) == reinterpret(UInt8, u) ||
+            t_load = best(() -> load_checkpoint(path; comm=COMM), comm)
+            ck = load_checkpoint(path; comm=COMM)
+            exact = ck.forest.leaves == forest.leaves &&
+                    reinterpret(UInt8, ck.fieldsets["U"].state) == reinterpret(UInt8, u)
+            all(TreeAMR.allgather(comm, exact)) ||
                 error("$dname with $fname did not round-trip bit for bit")
-            @printf("%-6s %-20s %9.1f %9.1f %7.2f %8.2f %8.2f %8.2f\n", dname, fname,
-                    bytes / 1e6, fsize / 1e6, bytes / fsize, bytes / t_save / 1e9,
-                    bytes / t_sync / 1e9, bytes / t_load / 1e9)
-            rm(path)
+            say("%-6s %-20s %9.1f %9.1f %9.1f %7.2f %8.2f %8.2f %8.2f\n", dname, fname,
+                bytes / 1e6, maximum(shares) / 1e6, fsize / 1e6, bytes / fsize,
+                bytes / t_save / 1e9, bytes / t_sync / 1e9, bytes / t_load / 1e9)
+            TreeAMR.allgather(comm, true)
+            RANK == 0 && rm(path)
         end
     end
-    isempty(DIR) && rm(dir; recursive=true)
+    TreeAMR.allgather(comm, true)
+    isempty(DIR) && RANK == 0 && rm(dir; recursive=true)
     return nothing
 end
 

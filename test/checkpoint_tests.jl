@@ -582,6 +582,13 @@ end
     @test p.treeamr_version == pkgversion(TreeAMR)
     @test p.julia_version == VERSION
     @test p.nthreads == Threads.nthreads()
+    # The rank count, added by M7 (an additive field): a serial file says
+    # 1, and a file written before there was one reads as 1 too.
+    @test p.nranks == 1
+    older = edited_copy(path, "older.h5") do file
+        delete_object(file, "TreeAMR.jl/provenance/nranks")
+    end
+    @test load_checkpoint(older).provenance.nranks == 1
     @test p.hostname == gethostname()
     @test occursin(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", p.created)
 

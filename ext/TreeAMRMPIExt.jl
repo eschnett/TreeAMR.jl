@@ -33,7 +33,7 @@ using MPI: MPI
 using TreeAMR
 using TreeAMR: Communicator
 import TreeAMR: communicator, commrank, commsize, allgather, allgatherv, alltoallv,
-                isend, irecv, waitall
+                isend, irecv, waitall, librarycomm
 
 # A forest's communicator over MPI: the duplicate, with its rank and size
 # read once, since neither can change.
@@ -91,6 +91,10 @@ end
 
 commrank(c::MPICommunicator) = c.rank
 commsize(c::MPICommunicator) = c.size
+
+# The duplicate, for parallel HDF5, which opens a checkpoint over it and
+# duplicates it once more itself (`TreeAMRHDF5MPIExt`).
+librarycomm(c::MPICommunicator) = c.comm
 
 function allgather(c::MPICommunicator, x)
     isbits(x) || throw(ArgumentError(

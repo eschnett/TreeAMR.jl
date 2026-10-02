@@ -1521,7 +1521,7 @@ application gets a top-level group of its own, named after it:
                                 application = "<app name>"
       provenance/        scalar datasets: treeamr_version,
                          julia_version, created (UTC, ISO 8601),
-                         hostname, nthreads,
+                         hostname, nthreads, nranks (M7; 1 if absent),
                          project (Project.toml text, or ""),
                          manifest (Manifest.toml text, or "")
       forest/            attrs: D, N, connectivity = "brick",
@@ -1861,7 +1861,11 @@ decided).
   measured, and the per-process files remain the fallback if it does
   not hold up. The design, and the check that the stock HDF5_jll is
   already a parallel build, are under
-  [Distributed meshes](#distributed-meshes).)*
+  [Distributed meshes](#distributed-meshes).)* *(Step 6 of M7 built it:
+  the version-1 layout written and read by every rank of a distributed
+  forest at once, a file loading on any rank count; what it settled is
+  under "Parallel checkpoints" there. The throughput on Symmetry's
+  parallel file system is still to be measured.)*
 
 **Multi-block** (checked). Keys are relative to their root,
 `connectivity = "brick"` is a tagged record rather than an assumption,
@@ -1913,7 +1917,8 @@ load HDF5 while the extension is not loaded. `fieldsets` and
         # further datasets in the application's group, beside `data`
     end
     ck = load_checkpoint(path; backend = CPU(), types = (),
-                         fieldsets = nothing)        # or names, a subset
+                         fieldsets = nothing,        # or names, a subset
+                         comm = nothing)             # or an MPI.Comm (M7)
         # ck.forest, ck.fieldsets["U"].fieldset, ck.fieldsets["U"].state,
         # ck.application, ck.data, ck.provenance
     load_checkpoint(path; …) do app … end        # result in ck.result
@@ -3696,8 +3701,8 @@ included, which is what "No coordinates, and no partition" was for.
   rank 0's: on a parallel file system each client caches its own, and
   an `fsync` on rank 0 flushes none of the others'. So the ranks make a
   collective `H5Fflush`, which the MPI-IO driver turns into
-  `MPI_File_sync` on every rank (to be confirmed in step 6 against
-  libhdf5 2.2), and then close the file collectively. Rank 0 then
+  `MPI_File_sync` on every rank (confirmed in step 6 against libhdf5
+  2.2.0's source, below), and then close the file collectively. Rank 0 then
   flushes the file itself as today (`F_FULLFSYNC` on macOS, where a
   plain `fsync` does not reach the drive), renames it and flushes the
   directory. A barrier follows, so that no rank returns before the
@@ -3718,6 +3723,106 @@ included, which is what "No coordinates, and no partition" was for.
   is replicated, builds the forest with `comm` through the validated
   `leaves` path, and reads its own slab of each field set into its
   state vector.
+
+*(Step 6, where this was implemented; what it settled, and where it
+amends the bullets above:)*
+
+- *Where the code goes* (amended). `TreeAMRHDF5MPIExt` holds one call,
+  `open_parallel_file(::MPI.Comm, path, mode)`, which is HDF5.jl's
+  `h5open(path, mode, comm, info)`. The collective transfer property is
+  HDF5.jl's own `dxpl_mpio = :collective`, which needs no MPI, and
+  everything else is in `TreeAMRHDF5Ext` beside the serial code. The
+  hooks dispatch not on the communicator type, which the HDF5 extension
+  cannot name (it is `TreeAMRMPIExt`'s, and the load order of two
+  extensions is not defined), but on an `Access` chosen by `commsize`:
+  `Alone` for one rank, whose methods are M9a's calls unchanged, and
+  `Ranked` otherwise. The extension reaches MPI through two stubs in
+  `src/`: `librarycomm(comm)`, whose method in `TreeAMRMPIExt` returns
+  the duplicate, and `open_parallel_file`, whose fallback refuses with
+  the reason. A forest over a one-rank MPI communicator takes the
+  serial path, and its file is a serial file with `nranks = 1`.
+- *Who writes what.* Every rank creates every group, dataset and
+  attribute with the same arguments, and writes every attribute. A
+  dataset over the blocks — `root`, `level`, `coords` and each `data` —
+  is written by last-axis hyperslab in one collective transfer, an
+  empty rank with an empty selection (`H5Sselect_none`, which HDF5.jl
+  does not wrap). Every other dataset — the extents, the provenance,
+  the plain data — is written by rank 0 alone with an independent
+  transfer, and read by every rank. That is legal because parallel
+  HDF5 allocates an unfiltered dataset's storage when it creates it
+  (`H5D__create` in `H5Dint.c`), and it keeps a value from being written
+  `P` times over to the same bytes.
+- *No variable-length data in a parallel file* (found in step 6).
+  libhdf5 refuses to write variable-length data through the MPI-IO
+  driver (`H5D__write`: "Parallel IO does not support writing VL or
+  region reference datatypes yet"), from any number of ranks, and
+  HDF5.jl stores an array of strings as variable-length. Attributes are
+  not affected (the `features`, `centering` and `parity` arrays wrote
+  and read back), nor are scalar strings, which HDF5.jl stores at a
+  fixed length. So in a parallel file a plain-data array of strings is
+  fixed-length UTF-8, NUL-padded to its longest string; `read` returns
+  the same `Array{String}`, so the item reads back the same, with the
+  same `type` and `eltype`, and the format version is unchanged. A
+  string in such an array that holds a NUL is refused before anything
+  is written, since the padding would lose it. The M9a reader (0.1.4)
+  reads a parallel file, fixed-length strings and filtered data
+  included (checked).
+- *Provenance* is rank 0's, gathered to every rank by an `allgatherv` to
+  which the other ranks contribute nothing, so no broadcast verb was
+  added. `nranks` follows `nthreads`; a serial file carries `nranks = 1`
+  (decided here: the field is then in every file M7 writes, and a file
+  without it is from before M7, which `read_provenance` reads as 1).
+- *The agreement.* Before the file is created every rank runs the
+  serial checks — the field sets, `application`, the geometry type —
+  and walks `data` the way `write_plain` will write it, refusing what it
+  would refuse, with the same messages, and folding a hash of every
+  item's name, type and bits. One `allgather` carries a `ForestDigest`
+  (the full one: a forest that differs would write a corrupt leaf
+  list), the hash of the path and every keyword but `data` as its
+  layout, and the data hash, and `digest_verdict` gives the verdict, the
+  data a message of its own. A load agrees on its arguments the same
+  way, with rank 0 alone checking that the file exists and is HDF5;
+  what the file holds is the same for every rank, so a refusal of its
+  contents comes on every rank at the same point without a message.
+  Serially the walk runs too, so a value outside the plain-data types is
+  now refused before the file is created rather than while it is
+  written, with the same message.
+- *How much of the plain data is checked* (decided here): all of it, by
+  that hash, once per `save_checkpoint` and once per `write_plain` in
+  the do-block. Two reasons. Under the collective contract a value that
+  differs between ranks need not fail: an attribute written with
+  different values is undefined in parallel HDF5, which does not check
+  it, and a dataset that rank 0 writes alone would silently record rank
+  0's value, so a restart would read one rank's run state as
+  everyone's. And the
+  cost is a walk over values that are small next to the field data, plus
+  one collective per call. What the do-block writes through HDF5 itself
+  is not checked; the docstring says it must be the same on every rank.
+- *Durability, confirmed.* In libhdf5 2.2.0, `H5Fflush` reaches
+  `H5F__flush` (`H5VLnative_file.c`), which calls `H5F__flush_phase2`
+  with `closing = false` and so `H5FD_flush` and the driver's
+  `H5FD__mpio_flush`, which calls `MPI_File_sync` unless the file is
+  closing (`H5FDmpio.c`). So a flush as the file closes does not sync,
+  and the explicit collective flush before the close is needed. In
+  MPICH's ROMIO, `MPI_File_sync` is `ADIOI_GEN_Flush`, an `fsync` on
+  each rank that wrote through its own descriptor, which under
+  collective buffering are the aggregators that did the writing. Then
+  rank 0 does what a serial save does — `F_FULLFSYNC` on macOS, where
+  the ranks' `fsync` stops short of the drive, then the rename, then the
+  directory — and an `allgather` of whether it succeeded is the barrier,
+  so every rank returns once the checkpoint is in place, or throws.
+  Whether BeeGFS honours each client's `fsync` is the file system's,
+  and is not something a test here can see.
+- *Collective metadata reads are not enabled.* Each rank reads the
+  file's metadata independently, which is always correct, and keeps a
+  do-block that reads on rank 0 alone legal. At thousands of ranks the
+  independent reads of one small object header may become the cost
+  (`H5Pset_all_coll_metadata_ops` is the remedy); the Symmetry
+  measurement is where that would show.
+- *Errors inside a collective call* remain fatal, as above. A
+  `write_plain` refused in the do-block is agreed, so every rank leaves
+  the block together and closes the file collectively, and the partial
+  file is removed (tested).
 
 **What the feasibility check found** (2026-10-01, in a scratch
 environment on the development machine: Apple M3 Pro, HDF5.jl 0.17.4,
@@ -4988,6 +5093,126 @@ M7's benchmarks. The list below is in execution order.
     file's throughput recorded on its parallel file system — the
     benchmark "Parallel I/O and M7" asked for. The per-process files
     are revisited only if the shared file does not hold up.
+
+    *(Done, 2026-10-01, except the Symmetry measurement, which is
+    scripted and not run.)* What it settled, and where it went beyond the
+    plan (the design decisions are recorded under "Parallel checkpoints"
+    in [Distributed meshes](#distributed-meshes)):
+    - *The code.* `ext/TreeAMRHDF5MPIExt.jl` (`[extensions]`
+      `TreeAMRHDF5MPIExt = ["HDF5", "MPI"]`) opens the shared file;
+      `TreeAMRHDF5Ext` gains the `Access` hooks (`open_file`,
+      `write_whole`, `write_slab` / `read_slab`, `put_value`,
+      `agree_values`, `flush_ranks`, `publish`), the agreement
+      (`agreed`), the plain-data walk (`plain_hash`) and the
+      fixed-length string arrays; `src/` gains the stubs `librarycomm`
+      and `open_parallel_file`, `load_checkpoint`'s `comm` keyword, and
+      the docstrings' collective contract. `refuse_distributed` is gone,
+      its last caller with it.
+    - *The serial file is unchanged but for `nranks`.* A scratch script
+      wrote the same checkpoint — two field sets, `Float64` with parity
+      and a `Float32x2` vertex set, a reflecting face, every kind of
+      plain data and a do-block `write_plain` — with HEAD before the step
+      and after it, unfiltered and with `Shuffle` + `Deflate(1)`; `h5dump`
+      of the two files differs in `created` and the new `nranks = 1`
+      only, and `h5dump -p` also in the storage offsets, which the 8-byte
+      dataset shifts.
+    - *The workload.* `test/mpi_workload.jl` gains `checkpoint_case`:
+      the tracked pulse as a chunked driver (RK4 steps, the flags and a
+      regrid per chunk), run uninterrupted for three chunks, then saved
+      after the first — the bare `name => fs` form, plain data with a
+      Rational and an array of strings including an empty one —
+      unfiltered and with `Shuffle` + `Deflate(1)`, dropped, loaded at
+      the same rank count and continued; the mesh refines again after
+      the save (39 leaves, then 87). Its lines must be the serial
+      run's, and the continued digests the uninterrupted run's. A 1D
+      forest of two leaves is saved and loaded too, which at three ranks
+      leaves one rank without blocks both times. `checkpoint_cross` then
+      loads every file the earlier runs wrote at another rank count, at
+      this one and, under MPI, a second time over `MPI.COMM_SELF`, on
+      `#` lines. `mpi_tests.jl` runs the serial reference, `-n 3` and
+      `-n 2` (in that order now) over one `TREEAMR_CHECKPOINT_DIR`, then
+      the serial loads in process: so the serial file loads at 3 ranks
+      and at one; the 3-rank files at 2, at one inside the 2-rank job
+      (a one-rank MPI communicator — what a separate `mpiexec -n 1`
+      would test, without a third launch) and serially; the 2-rank files
+      serially. Every load reproduces the saved digests and every
+      continuation the uninterrupted ones. The refusals, at every rank
+      count: plain data that differ between ranks; an `application` only
+      rank 1 refuses; filters that differ on rank 1; a `write_plain` in
+      the do-block of a value that differs, after which the earlier file
+      is intact and no partial file is left; a load whose `fieldsets`
+      differ on rank 1; a load of a missing file, which rank 0 alone
+      looks for. Each is raised on every rank.
+    - *In process*: `checkpoint_tests.jl` passes unchanged but for two
+      deliberate assertions, `nranks == 1` and a file without `nranks`
+      reading as 1; `partition_tests.jl`'s save over the test-only
+      communicator now stops at its missing `allgather`, by name, like
+      the interpolation.
+    - *Measured by hand.* The workload at `-n 2`, `3` and `4`, one thread
+      a rank, prints the serial lines byte for byte except the `sum`
+      lines, which agree to roundoff, as in step 5; every cross load at
+      every count reproduces the digests. 53–57 s of wall clock per run,
+      against 44–47 s in step 5, and the serial run 44 s, against 38;
+      most of the difference is compiling HDF5.jl's paths in each rank.
+      `mpi_tests.jl` alone takes 2m34, against step 5's 125 s.
+    - *Throughput, locally only* (`bench/checkpoint.jl`, now runnable
+      under `mpiexec` with the argument `mpi`; the development laptop of
+      "Throughput and filters", its internal SSD, one thread a rank,
+      MPICH_jll 5.0.2, the same day and the same in-use conditions).
+      GB/s of state, aggregate over the ranks, the slowest rank's time;
+      `-n 1` is the serial path over a one-rank communicator:
+
+      | data | filter | serial | `-n 1` | `-n 2` | `-n 4` |
+      |---|---|---|---|---|---|
+      | blast, save | none | 7.49 | 7.50 | 6.66 | 6.90 |
+      | blast, sync | none | 4.58 | 4.66 | 4.52 | 4.47 |
+      | blast, load | none | 1.24 | 1.28 | 2.28 | 3.89 |
+      | blast, save | `Shuffle` + `Deflate(1)` | 0.34 | 0.34 | 0.67 | 0.92 |
+      | blast, load | `Shuffle` + `Deflate(1)` | 0.51 | 0.51 | 0.96 | 1.57 |
+      | pulse, save | none | 5.66 | 7.46 | 6.51 | 4.55 |
+      | pulse, load | none | 1.20 | 1.21 | 2.03 | 3.09 |
+      | pulse, save | `Shuffle` + `Deflate(1)` | 0.11 | 0.11 | 0.21 | 0.38 |
+      | pulse, save | bitshuffle + LZ4 | 0.62 | 0.62 | 1.12 | 1.80 |
+
+      So on one SSD the unfiltered save stays at the page cache's rate
+      and the flush at the drive's whatever the rank count, while what
+      is per rank — compression, the load's allocation, first touch and
+      `scatter!` — divides among the ranks: the filtered save 2.7 times
+      faster at 4 ranks, the unfiltered load 3.1 times. This is the
+      point "Compression is serial" made, that under M7 a filter
+      parallelizes. File sizes are the serial ones (90.0 MB for blast
+      with Deflate). H5Zzstd and H5Zlz4 were not in the environment, so
+      their rows are missing; H5Zbitshuffle was, from the default
+      environment. One run each; the M9a table varied by 15–60 % run to
+      run on this machine. These are not the parallel file system's
+      numbers, which are the point of the measurement.
+    - *`MPI_File_sync`* is confirmed by reading libhdf5 2.2.0's and
+      MPICH 5.0's sources (the chain is under "Parallel checkpoints"),
+      not by tracing a run: the call is made, but no test here can see
+      a write reach stable storage, and macOS's `fsync` does not.
+    - *Symmetry, not run.* `bench/symmetry_checkpoint_mpi.sh` (SLURM,
+      `amddebugq`) runs the benchmark on one node at 1, 2, 4 and 8 ranks
+      and on every node of the allocation at the given ranks per node
+      (default 8, one per NUMA domain at 8 threads), over the default
+      mesh and one with 2³ times the blocks, with the files on BeeGFS
+      through `TREEAMR_BENCH_DIR`, in a scratch environment that adds
+      the filter packages. It launches MPICH_jll through `srun
+      --mpi=pmi2` by default, or a system MPI through MPIPreferences
+      (`TREEAMR_MPI=system`); neither has run on the cluster.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
+      `partition_tests.jl`, `checkpoint_tests.jl` and `mpi_tests.jl`
+      (2m53 together), the parallel checkpoints and every cross load
+      included; the whole suite was not run there.
+    - *Suite cost.* 109107 tests at one thread in 8m10 and 109159 at
+      eight in 8m02, against step 5's 109038 in 7m49 and 109090 in 8m09:
+      69 more at each — 67 in `mpi_tests.jl` (the checkpoint lines, the
+      cross loads at each rank count and in process, the refusals, and
+      the extension's presence) and the two `nranks` assertions of
+      `checkpoint_tests.jl`. `mpi_tests.jl` takes about 28 s more than in
+      step 5 standalone (2m34 against 125 s), which is the HDF5 code
+      compiled in each `mpiexec` run and the in-process loads; at one
+      thread the suite grew by about 20 s. The thread-independence
+      digests are unchanged. The docs build.
   - **Step 7 — weak-scaling smoke test.** `bench/mpi.jl` holds the
     blocks per rank fixed and times the RHS, the ghost fill, a regrid
     and the norm; `bench/symmetry_mpi.sh` runs one rank per NUMA domain
