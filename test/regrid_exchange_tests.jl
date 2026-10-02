@@ -12,7 +12,7 @@
 # `adapt_to_initial_data!` themselves, one task per rank, over a
 # communicator whose collectives are real rendezvous between the tasks.
 
-using TreeAMR: regrid_sources, regrid_stage, equalsplit, MAX_LEVEL
+using TreeAMR: regrid_sources, regrid_stage, split_regrid, equalsplit, MAX_LEVEL
 
 # Refine the coarsest leaves and coarsen the finest, so that a regrid
 # has copies, prolongations and restrictions at once.
@@ -38,8 +38,9 @@ end
 # unpacks into a fresh array of its new blocks. Returns whether every
 # rank's new array equals the serial one on its blocks bit for bit; the
 # transfers as `(kind, target, source)` over all ranks, local and
-# received; the number of mismatched layout entries and segments; and
-# the number of transfers that crossed a rank boundary.
+# received; the number of mismatched layout entries and segments, and of
+# ranks whose own classification kept other transfers than the whole
+# one; and the number of transfers that crossed a rank boundary.
 function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
     ops = exchange_operators(C, family)
     G = exchange_ghosts(C, family)
@@ -64,7 +65,14 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
 
     oldranges = [equalsplit(nold, P, r) for r in 1:P]
     newranges = [equalsplit(nnew, P, r) for r in 1:P]
-    stages = [regrid_stage(T, serial.N, fs.G, staggers(fs), ops, CPU(), pairs;
+    # Each rank classifies only the new leaves it owns and those whose
+    # sources it owns, as `regrid!` does; what it keeps of them must be
+    # what it keeps of the whole classification.
+    rpairs = [regrid_sources(oldleaves, newleaves; oldrange=oldranges[r],
+                             newrange=newranges[r]) for r in 1:P]
+    bad = count(r -> split_regrid(rpairs[r], oldranges[r], newranges[r]) !=
+                     split_regrid(pairs, oldranges[r], newranges[r]), 1:P)
+    stages = [regrid_stage(T, serial.N, fs.G, staggers(fs), ops, CPU(), rpairs[r];
                            oldrange=oldranges[r], newrange=newranges[r], nold=nold,
                            nnew=nnew, oldowner=i -> equalsplit_part(nold, P, i) - 1,
                            newowner=j -> equalsplit_part(nnew, P, j) - 1)
@@ -77,7 +85,6 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
         stages[r].remote === nothing && continue
         pack_stage!(olds[r], stages[r].remote, bufs(r), nvars, CPU())
     end
-    bad = 0
     for r in 1:P
         remote = stages[r].remote
         remote === nothing && continue
@@ -265,6 +272,68 @@ function on_ranks(f, P)
         @async results[r] = f(r)
     end
     return results
+end
+
+@testset "Searching the buffer from each rank's own sources gives the serial marks: D=$D" for
+        D in (1, 2, 3)
+    # Each rank runs the buffer's neighbour search for its own sources
+    # only and gathers its strongest recruits; every rank then applies
+    # the union. A recruit lost at a rank boundary, one dropped as a
+    # no-op that was not, or an application that depended on the order
+    # of the recruits would make some rank's marks — and so its new
+    # leaves — differ from the serial `buffered_flags` and
+    # `complete_marks`. So on random forests with random flags, bare and
+    # boxed, every buffer from 0 to 4 cells and 1–7 ranks (some without
+    # blocks), every rank's marks and leaves must be the serial ones, and
+    # so must `regrid!`'s mesh.
+    rng = MersenneTwister(70 + D)
+    N = 8
+    function randomflag(rng)
+        f = rand(rng, (Coarsen, Keep, Keep, Refine))
+        rand(rng) < 0.5 && return f
+        box = ntuple(D) do _
+            lo, hi = minmax(rand(rng, 1:N), rand(rng, 1:N))
+            lo:hi
+        end
+        return (f, box)
+    end
+    ncases = D == 3 ? 3 : 5
+    nempty = nrecruits = 0
+    for case in 1:ncases
+        drawn = random_forest(rng, Val(D); nsteps=(D == 3 ? 6 : 12) * case, maxlvl=3,
+                              maxroot=3)
+        balance!(drawn)
+        # The first case is tiny, so that most ranks hold no blocks.
+        leaves = case == 1 ? Forest(drawn.roots; N=N).leaves : drawn.leaves
+        serial = Forest(drawn.roots; N=N, periodic=drawn.periodic, leaves=leaves)
+        flags = Any[randomflag(rng) for _ in serial.leaves]
+        for buffer in 0:4
+            smarks = buffered_flags(serial, flags, buffer)
+            sleaves = complete_marks(serial, flags; buffer=buffer)
+            nrecruits += count(smarks .!= TreeAMR.markflag.(flags))
+            for P in 1:7
+                comms = gather_ranks(P)
+                results = on_ranks(P) do r
+                    forest = Forest(serial.roots; N=N, periodic=serial.periodic,
+                                    leaves=serial.leaves, comm=comms[r])
+                    owned = blockrange(forest)
+                    mine = [TreeAMR.RegridMark{D}(flags[i], N) for i in owned]
+                    all_ = TreeAMR.allgatherv(forest.comm, mine)
+                    marks = TreeAMR.regrid_marks(forest, all_, mine, buffer)
+                    planned = TreeAMR.completed_leaves(forest, marks)
+                    fs = FieldSet(forest, 1; G=0)
+                    regrid!(forest, fs => nothing; flags=flags[owned], buffer=buffer)
+                    (isempty(owned), marks, planned, copy(forest.leaves))
+                end
+                nempty += count(first, results)
+                @test all(res -> res[2] == smarks, results)
+                @test all(res -> res[3] == sleaves, results)
+                @test all(res -> res[4] == sleaves, results)
+            end
+        end
+    end
+    @test nempty > 0
+    @test nrecruits > 0
 end
 
 @testset "regrid! over a distributed forest is the serial regrid, block for block: D=$D" for

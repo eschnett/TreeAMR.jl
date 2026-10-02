@@ -6,35 +6,42 @@
 #     julia -t T --project=test bench/replicated.jl [P ...]   (default 1 8 64 512)
 #
 # The fake answers the forest-digest gather by replication, `allgatherv`
-# with the global marks the caller stored, and its messages are no-ops,
-# so a whole `regrid!` runs on one rank's blocks with every replicated
-# pass at the size of the whole forest and no communication time; the
-# data it "receives" are not meaningful, only the time. Per P it prints,
-# in ms, best of 3–5: the digest's fold over every leaf; the rank's
-# `GhostSchedule` build (digest included) and its candidate search
-# `remote_neighbors`; the regrid's replicated passes over the global
-# marks of bench/mpi.jl's slab refinement — `buffered_flags` with a
-# buffer, `complete_marks` (which balances a scratch forest), `balance!`
-# alone, the classification `regrid_sources` and its split
-# `split_regrid`, and the comparison of the leaf arrays — then the whole
-# `regrid!` refining and coarsening on the rank, and as `#` lines
-# `complete_marks` when *every* block is a `(Keep, box)` source of a
-# 4-cell buffer, and the bytes the marks' `allgatherv` brings every rank.
-# CODE.md's M7 step 7 entry has the numbers.
+# with the global marks or the recruits of every rank that the caller
+# stored, and its messages are no-ops, so a whole `regrid!` runs on one
+# rank's blocks with every replicated pass at the size of the whole
+# forest and no communication time; the data it "receives" are not
+# meaningful, only the time. Per P it prints, in ms, best of 3–5: the
+# digest's fold over every leaf; the rank's `GhostSchedule` build (digest
+# included) and its candidate search `remote_neighbors`; the regrid's
+# passes over the global marks of bench/mpi.jl's slab refinement —
+# `buffered_flags` with a buffer, `complete_marks` (which balances a
+# scratch forest), `balance!` alone, the classification `regrid_sources`
+# of every new leaf and of the rank's own (what `regrid!` runs since the
+# step-7 follow-up), and its split `split_regrid`, and the comparison of
+# the leaf arrays — then the whole `regrid!` refining and coarsening on
+# the rank, and as `#` lines the buffer when *every* block is a `(Keep,
+# box)` source of a 4-cell buffer — the replicated `complete_marks`, and
+# the rank's share as `regrid!` runs it, its own search with the
+# gathered recruits applied (`regrid_marks`) and then the completion —
+# with the recruits gathered, and the bytes the marks' `allgatherv`
+# brings every rank. CODE.md's M7 step 7 entry has the numbers.
 using TreeAMR
 using TreeAMR: ForestDigest, buffered_flags, complete_marks, regrid_sources,
-               split_regrid, remote_neighbors, equalsplit, RegridMark
+               split_regrid, remote_neighbors, equalsplit, RegridMark, Recruit,
+               buffer_recruits, strongest_recruits, regrid_marks, completed_leaves
 using Printf
 
 mutable struct FakeComm <: TreeAMR.Communicator
     rank::Int
     size::Int
     marks::Any
+    recruits::Vector{Recruit}
 end
 TreeAMR.commrank(c::FakeComm) = c.rank
 TreeAMR.commsize(c::FakeComm) = c.size
 TreeAMR.allgather(c::FakeComm, d::ForestDigest) = fill(d, c.size)
-TreeAMR.allgatherv(c::FakeComm, v::AbstractVector) = c.marks
+TreeAMR.allgatherv(c::FakeComm, v::AbstractVector{<:RegridMark}) = c.marks
+TreeAMR.allgatherv(c::FakeComm, v::AbstractVector{Recruit}) = c.recruits
 TreeAMR.isend(::FakeComm, buf::AbstractVector, peer::Integer, tag::Integer) = nothing
 TreeAMR.irecv(::FakeComm, buf::AbstractVector, peer::Integer, tag::Integer) = nothing
 TreeAMR.waitall(::FakeComm, requests::AbstractVector) = nothing
@@ -66,12 +73,12 @@ function main(Ps)
             Threads.nthreads(), D, N, R, D)
     println("# ms; the schedule and regrid! on rank P÷2")
     println("     P  nleaves | digest  sched  remnbr | buffd  compl balnce  rsrcs  " *
-            "split   eq   | regrid↑ regrid↓")
+            "rsrc·r  split   eq   | regrid↑ regrid↓")
     for P in Ps
         serial = tile_forest(P)
         nl = nleaves(serial)
         rank = P ÷ 2
-        comm = FakeComm(rank, P, nothing)
+        comm = FakeComm(rank, P, nothing, Recruit[])
         forest = tile_forest(P; comm=comm, leaves=serial.leaves)
         reps = nl > 50_000 ? 3 : 5
 
@@ -85,6 +92,18 @@ function main(Ps)
         t_complete = best(() -> complete_marks(forest, marks), reps)
         boxed = [RegridMark{D}((Keep, ntuple(_ -> 1:N, D)), N) for _ in serial.leaves]
         t_allsrc = best(() -> complete_marks(forest, boxed; buffer=4), reps)
+        # The same buffer as `regrid!` runs it on this rank: its own
+        # sources searched, every rank's strongest recruits applied.
+        comm.recruits = reduce(vcat, (strongest_recruits(serial,
+                                                         buffer_recruits(serial, boxed[r],
+                                                                         first(r) - 1, 4))
+                                      for r in (equalsplit(nl, P, q) for q in 1:P)))
+        mine = boxed[blockrange(forest)]
+        t_ownsrc = best(() -> regrid_marks(forest, boxed, mine, 4), reps)
+        t_owncompl = best(() -> completed_leaves(forest, regrid_marks(forest, boxed, mine, 4)),
+                          reps)
+        completed_leaves(forest, regrid_marks(forest, boxed, mine, 4)) ==
+            complete_marks(forest, boxed; buffer=4) || error("the rank's buffer differs")
         newleaves = complete_marks(forest, marks)
         # balance! alone, on the candidate complete_marks balances.
         cand = Forest(serial.roots; N=N, periodic=serial.periodic, extents=serial.extents,
@@ -94,6 +113,8 @@ function main(Ps)
         pairs = regrid_sources(serial.leaves, newleaves)
         oldrange = blockrange(forest)
         newrange = equalsplit(length(newleaves), P, rank + 1)
+        t_ownsources = best(() -> regrid_sources(serial.leaves, newleaves; oldrange=oldrange,
+                                                 newrange=newrange), reps)
         t_split = best(() -> split_regrid(pairs, oldrange, newrange), reps)
         t_eq = best(() -> newleaves == serial.leaves, 10)
 
@@ -118,10 +139,15 @@ function main(Ps)
             rep > 1 && (tc = min(tc, t))
             forest.leaves == serial.leaves || error("cycle did not return")
         end
-        @printf("%6d %8d | %s %s %s | %s %s %s %s %s %s | %s %s\n", P, nl, ms(t_digest),
+        @printf("%6d %8d | %s %s %s | %s %s %s %s %s %s %s | %s %s\n", P, nl, ms(t_digest),
                 ms(t_sched), ms(t_nbr), ms(t_buffered), ms(t_complete), ms(t_balance),
-                ms(t_sources), ms(t_split), ms(t_eq), ms(tr), ms(tc))
-        @printf("#   complete_marks, every block a (Keep, box) source, buffer 4: %s ms\n", ms(t_allsrc))
+                ms(t_sources), ms(t_ownsources), ms(t_split), ms(t_eq), ms(tr), ms(tc))
+        @printf("#   every block a (Keep, box) source, buffer 4: complete_marks %s ms\n",
+                ms(t_allsrc))
+        @printf("#   the same on the rank: regrid_marks %s ms, then completed %s ms\n",
+                ms(t_ownsrc), ms(t_owncompl))
+        @printf("#   recruits gathered: %d, %.2f MB per rank\n", length(comm.recruits),
+                length(comm.recruits) * sizeof(Recruit) / 1e6)
         @printf("#   marks gathered per regrid: %.2f MB per rank (%d B a mark)\n",
                 nl * sizeof(RegridMark{D}) / 1e6, sizeof(RegridMark{D}))
         flush(stdout)
