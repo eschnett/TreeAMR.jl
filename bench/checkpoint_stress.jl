@@ -1,6 +1,8 @@
 # The multi-node checkpoint corruption of M7 step 6, reproduced at every
 # layer from TreeAMR down to POSIX (CODE.md, "Parallel checkpoints" under
-# "Distributed meshes", which has the jobs and the numbers).
+# "Distributed meshes", which has the jobs and the numbers); and, since
+# step 6b replaced the shared file, the regression job for the writer
+# that replaced it, whose files each have one writer and one opener.
 #
 #     srun ... julia --project=<env> bench/checkpoint_stress.jl <mode> <iters> <dir>
 #
@@ -17,8 +19,13 @@
 # The modes, from the top down:
 #
 # - `treeamr`, `treeamr-filt`: `save_checkpoint` of a field set over the
-#   forest, unfiltered and with Shuffle + Deflate(1); the readers check
-#   the leaf columns and the data.
+#   forest, unfiltered and with Shuffle + Deflate(1), with the part files
+#   of step 6b, `STRESS_IO` (`node`, the default, `all` or a number)
+#   choosing the I/O processes. The readers load each save serially,
+#   one after the other, so that each file still has one opener at a
+#   time, and check the leaves and the data; a load the checksums refuse
+#   is a `BAD` line too. (Until step 6b these modes wrote the shared file
+#   and read its datasets directly.)
 # - `hdf5`: the leaf columns and a data column as contiguous datasets,
 #   each rank its hyperslab, collectively, through HDF5.jl alone.
 # - `sieve-ind`, `sieve-coll`: the checkpoint's pattern below HDF5. The
@@ -41,8 +48,8 @@
 # `STRESS_SYNC=1` adds `fsync` or `MPI_File_sync` on every rank before
 # the close (in `sieve-*`, MPI's sync-barrier-sync between the two
 # writes; in `treeamr*`, `sync = true`). ROMIO's hints come from the
-# file `ROMIO_HINTS` names, which the job script sets; TreeAMR's own
-# hints (`TreeAMRHDF5MPIExt`) override it for the `treeamr` modes.
+# file `ROMIO_HINTS` names, which the job script sets; the `treeamr`
+# modes use no MPI-IO since step 6b, so the hints do not reach them.
 
 using MPI
 MPI.Init()
@@ -61,6 +68,9 @@ end
 ROOTS = parse(Int, get(ENV, "STRESS_ROOTS", "12"))
 NB = parse(Int, get(ENV, "STRESS_N", "4"))
 SYNC = get(ENV, "STRESS_SYNC", "0") == "1"
+IOSET = let io = get(ENV, "STRESS_IO", "node")
+    io in ("node", "all") ? Symbol(io) : parse(Int, io)
+end
 const D = 3
 
 function build_forest(r₀; comm)
@@ -90,7 +100,7 @@ rankof(b) = searchsortedlast(starts, b - 1) - 1
 nodeof(r) = names[r + 1]
 readers = (0, P - 1)
 rank == 0 && println("# ranks $P on ", join(unique(names), ","), " mode $mode iters $iters ",
-                     "sync=$SYNC hints=", get(ENV, "ROMIO_HINTS", "-"), " ",
+                     "sync=$SYNC io=$IOSET hints=", get(ENV, "ROMIO_HINTS", "-"), " ",
                      isfile(get(ENV, "ROMIO_HINTS", "")) ? replace(read(ENV["ROMIO_HINTS"], String), "\n" => "; ") : "",
                      " leaves $n readers on ", nodeof.(readers))
 want_root = Int32[k.root for k in forest.leaves]
@@ -146,7 +156,7 @@ for it in 1:iters
     if mode in ("treeamr", "treeamr-filt")
         filters = mode == "treeamr" ? () : (Shuffle(), Deflate(1))
         save_checkpoint(path, forest; fieldsets=("U" => (fs, u),), application="s" => 1,
-                        filters=filters, sync=SYNC)
+                        filters=filters, sync=SYNC, io=IOSET)
     elseif mode == "hdf5"
         h5open(path, "w", comm, info) do f
             for (name, w, T) in (("root", 1, Int32), ("level", 1, Int8),
@@ -234,25 +244,40 @@ for it in 1:iters
         end
     end
     MPI.Barrier(comm)
-    if rank in readers
-        local bad = 0
-        if mode in ("treeamr", "treeamr-filt")
-            h5open(path, "r") do f
-                g = f["TreeAMR.jl/forest"]
-                for (name, want, el) in (("root", want_root, 4), ("level", want_level, 1),
-                                         ("coords", want_coords, 12))
-                    got = read(g[name])
-                    b = name == "coords" ? findall(i -> got[:, i] != want[:, i], 1:n) :
-                        findall(i -> got[i] != want[i], 1:n)
-                    bad += report(it, name, b, API.h5d_get_offset(g[name]), el)
+    if mode in ("treeamr", "treeamr-filt")
+        # A serial load on each reader in turn: the index and every part,
+        # their checksums verified, then the leaves and the data compared
+        # with what was written. Byte offsets mean nothing across parts,
+        # so the `BAD` lines give 0.
+        for reader in readers
+            if rank == reader
+                local bad = 0
+                ck = try
+                    load_checkpoint(path)
+                catch err
+                    err isa ArgumentError || rethrow()
+                    println("BAD reader=$rank it=$it refused: ",
+                            first(split(err.msg, ". The file was written")))
+                    flush(stdout)
+                    nothing
                 end
-                dset = f["TreeAMR.jl/fieldsets/U/data"]
-                got = reshape(read(dset), per, n)
-                b = findall(j -> any(i -> got[i, j] != value(j, i), 1:per), 1:n)
-                off = mode == "treeamr" ? Int(API.h5d_get_offset(dset)) : 0
-                bad += report(it, "data", b, off, per * 8)
+                if ck === nothing
+                    bad += 1
+                else
+                    keys_ = ck.forest.leaves
+                    b = findall(i -> keys_[i] != forest.leaves[i], 1:n)
+                    bad += report(it, "leaves", b, 0, 17)
+                    got = reshape(ck.fieldsets["U"].state, per, n)
+                    b = findall(j -> any(i -> got[i, j] != value(j, i), 1:per), 1:n)
+                    bad += report(it, "data", b, 0, per * 8)
+                end
+                global nbad += bad
             end
-        elseif mode == "hdf5"
+            MPI.Barrier(comm)
+        end
+    elseif rank in readers
+        local bad = 0
+        if mode == "hdf5"
             h5open(path, "r") do f
                 for (name, el) in (("root", 4), ("level", 1), ("coords", 12))
                     got = read(f[name])

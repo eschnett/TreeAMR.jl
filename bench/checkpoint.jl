@@ -1,4 +1,4 @@
-# Checkpoint throughput (M9a; in parallel, M7 step 6).
+# Checkpoint throughput (M9a; distributed, M7 steps 6 and 6b).
 #
 #     julia -t N --project=<env> bench/checkpoint.jl
 #     mpiexec -n P julia -t N --project=<env> bench/checkpoint.jl mpi
@@ -63,14 +63,19 @@
 #
 # **Under MPI** (the argument `mpi`, launched by `mpiexec`; the test
 # environment has MPI) the forest is distributed over `MPI.COMM_WORLD`,
-# every rank writes its own blocks into the one shared file through
-# parallel HDF5, and every rank loads its own blocks back
-# (`load_checkpoint(path; comm)`). Each call is timed between two
-# barriers, as the slowest rank's time, and the rates are the aggregate
-# over all ranks: the whole state over that time. Rank 0 prints, and adds
-# each rank's share of the state, the largest one. `TREEAMR_BENCH_DIR` is
-# then a directory every rank sees — on a cluster, the parallel file
-# system under test (`bench/symmetry_checkpoint_mpi.sh`).
+# and the save writes one part file per I/O process beside an index
+# (step 6b: no file is written or opened by more than one process; until
+# then, step 6, one shared file through parallel HDF5): `TREEAMR_BENCH_IO`
+# chooses the I/O processes, `node` (the default), `all` or a number. Every
+# rank loads its own blocks back (`load_checkpoint(path; comm)`), each
+# part read by one rank and sent to the blocks' owners. Each call is timed
+# between two barriers, as the slowest rank's time, and the rates are the
+# aggregate over all ranks: the whole state over that time. Rank 0
+# prints, and adds each rank's share of the state, the largest one, and
+# the number of parts. The file size is the index's and the parts'
+# together. `TREEAMR_BENCH_DIR` is then a directory every rank sees — on
+# a cluster, the parallel file system under test
+# (`bench/symmetry_checkpoint_mpi.sh`).
 #
 #     TREEAMR_BENCH_D       dimension (default 3)
 #     TREEAMR_BENCH_N       cells per block edge (default 16)
@@ -79,6 +84,8 @@
 #     TREEAMR_BENCH_REPS    timed repetitions (default 5)
 #     TREEAMR_BENCH_DIR     directory for the files (default a fresh temporary
 #                           one); on a cluster, the file system under test
+#     TREEAMR_BENCH_IO      the `io` of save_checkpoint: node (default), all, or
+#                           a number of I/O processes
 
 const USE_MPI = "mpi" in ARGS
 if USE_MPI
@@ -100,6 +107,9 @@ const ROOTS = parse(Int, get(ENV, "TREEAMR_BENCH_ROOTS", "6"))
 const LEVELS = parse(Int, get(ENV, "TREEAMR_BENCH_LEVELS", "2"))
 const REPS = parse(Int, get(ENV, "TREEAMR_BENCH_REPS", "5"))
 const DIR = get(ENV, "TREEAMR_BENCH_DIR", "")
+const IO_SETTING = let io = get(ENV, "TREEAMR_BENCH_IO", "node")
+    io in ("node", "all") ? Symbol(io) : parse(Int, io)
+end
 
 # The filter packages that can be loaded here. They register their filters
 # with HDF5 when loaded; the constructors are called only from `main`,
@@ -226,6 +236,12 @@ function verify(path, forest, u, what)
     return nothing
 end
 
+# The files of the checkpoint at `path`: the index and its parts, which
+# are named after it.
+checkpoint_files(path) =
+    [joinpath(dirname(path), n) for n in readdir(dirname(path))
+     if n == basename(path) || startswith(n, basename(path) * ".")]
+
 # A line printed by rank 0 alone.
 say(fmt, args...) = (RANK == 0 && print(Printf.format(Printf.Format(fmt), args...)); nothing)
 
@@ -247,11 +263,11 @@ function main()
     say("# blocks per rank: %s\n",
         join(TreeAMR.allgather(comm, length(blockrange(forest))), ", "))
     say("# filter packages: %s\n", isempty(OPTIONAL) ? "none" : join(OPTIONAL, ", "))
-    say("# files in %s\n", dir)
-    say("%-6s %-20s %9s %9s %9s %7s %8s %8s %8s\n", "data", "filter", "state MB",
-        "rank MB", "file MB", "ratio", "save", "sync", "load")
-    say("%-6s %-20s %9s %9s %9s %7s %8s %8s %8s\n", "", "", "", "max", "", "", "GB/s",
-        "GB/s", "GB/s")
+    say("# files in %s, io = %s\n", dir, repr(IO_SETTING))
+    say("%-6s %-20s %9s %9s %9s %7s %8s %8s %8s %6s\n", "data", "filter", "state MB",
+        "rank MB", "file MB", "ratio", "save", "sync", "load", "parts")
+    say("%-6s %-20s %9s %9s %9s %7s %8s %8s %8s %6s\n", "", "", "", "max", "", "", "GB/s",
+        "GB/s", "GB/s", "")
     for (dname, fs) in datasets
         u = statevector(fs)
         gather!(u, fs)
@@ -261,17 +277,19 @@ function main()
             path = joinpath(dir, "checkpoint-$dname.h5")
             save(sync) = save_checkpoint(path, forest; fieldsets=("U" => (fs, u),),
                                          application="bench" => 1, data=(; t=0.0),
-                                         filters=filters, sync=sync)
+                                         filters=filters, sync=sync, io=IO_SETTING)
             check() = verify(path, forest, u, "$dname with $fname")
             t_save = best(() -> save(false), comm; check=check)
             t_sync = best(() -> save(true), comm; check=check)
-            fsize = filesize(path)
+            TreeAMR.allgather(comm, true)        # rank 0 removes the old parts first
+            fsize = sum(filesize, checkpoint_files(path))
+            nparts = load_checkpoint(path; comm=COMM).provenance.nparts
             t_load = best(() -> load_checkpoint(path; comm=COMM), comm)
-            say("%-6s %-20s %9.1f %9.1f %9.1f %7.2f %8.2f %8.2f %8.2f\n", dname, fname,
-                bytes / 1e6, maximum(shares) / 1e6, fsize / 1e6, bytes / fsize,
-                bytes / t_save / 1e9, bytes / t_sync / 1e9, bytes / t_load / 1e9)
+            say("%-6s %-20s %9.1f %9.1f %9.1f %7.2f %8.2f %8.2f %8.2f %6d\n", dname,
+                fname, bytes / 1e6, maximum(shares) / 1e6, fsize / 1e6, bytes / fsize,
+                bytes / t_save / 1e9, bytes / t_sync / 1e9, bytes / t_load / 1e9, nparts)
             TreeAMR.allgather(comm, true)
-            RANK == 0 && rm(path)
+            RANK == 0 && foreach(rm, checkpoint_files(path))
         end
     end
     TreeAMR.allgather(comm, true)

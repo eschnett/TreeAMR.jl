@@ -1,12 +1,16 @@
 #!/bin/bash
-# The shared-file checkpoint throughput of M7 step 6 on Symmetry: the
-# measurement "Parallel I/O and M7" in CODE.md asked for, on the
-# parallel file system (BeeGFS, /mnt/beegfs).
+# The distributed checkpoint throughput of M7 on Symmetry, on the
+# parallel file system (BeeGFS, /mnt/beegfs): the shared file of step 6
+# (the measurement "Parallel I/O and M7" in CODE.md asked for) until step
+# 6b replaced it with a part file per I/O process and an index; since
+# then each setting runs once per `io` in TREEAMR_CKPT_IO (default "node
+# all"), which the benchmark's TREEAMR_BENCH_IO takes.
 #
 #     sbatch bench/symmetry_checkpoint_mpi.sh                 # 2 nodes, 8 ranks each
 #     sbatch --nodes=4 bench/symmetry_checkpoint_mpi.sh 8     # 4 nodes, 8 ranks each
 #     sbatch --partition=amddebugq --nodes=1 bench/symmetry_checkpoint_mpi.sh 8
 #                                                             # one node only
+#     TREEAMR_CKPT_ONENODE_RANKS=8 …                          # only 8 ranks on it
 #
 # The argument is the ranks per node (default 8, one per NUMA domain of
 # an AMD node, at 64 / ranks threads each). The job runs
@@ -29,13 +33,15 @@
 #   (2.07 GB of `blast` state) is less affected than the default one
 #   (540 MB); a cold-cache read needs the caches dropped on every
 #   node, which takes root.
-# - `sync` waits for every client's writes to reach the servers
-#   (`MPI_File_sync` on every rank, then rank 0's `fsync`), but what the
-#   servers do with them — their own caches, their disks — is BeeGFS's.
+# - `sync` waits for every writer's files to reach the servers (each I/O
+#   process's `fsync` of its part and of the directory, then rank 0's of
+#   the index), but what the servers do with them — their own caches,
+#   their disks — is BeeGFS's.
 #
 # The MPI is MPI.jl's default binary (MPICH_jll), launched by `srun`
 # over PMI-2, which needs nothing installed, and HDF5_jll's MPICH
-# artifact with it. On Symmetry that works (2026-10-02); MPICH_jll's
+# artifact with it (since step 6b HDF5 is used serially only, so any
+# HDF5 build would do). On Symmetry that works (2026-10-02); MPICH_jll's
 # libfabric talks TCP over IPoIB there, which matters to the collective
 # buffering of MPI-IO between nodes, not to the file system's own
 # traffic. `TREEAMR_MPI=system` with `TREEAMR_MPI_MODULE=<module>` uses a
@@ -97,22 +103,32 @@ df -h "$TREEAMR_BENCH_DIR"
 # every rank's threads to the same first cores. The step's task count is
 # given explicitly: SLURM 21.08 (Symmetry's) otherwise takes the job's
 # and ignores --ntasks-per-node.
-run() {  # run <nodes> <ranks per node> <roots>
+run() {  # run <nodes> <ranks per node> <roots>, once per io setting
     local nodes=$1 rpn=$2 roots=$3
     local threads=$((64 / rpn))
-    echo "--- nodes=$nodes ranks/node=$rpn threads/rank=$threads roots=$roots"
-    TREEAMR_BENCH_ROOTS=$roots srun --mpi=pmi2 --nodes="$nodes" --ntasks=$((nodes * rpn)) \
-        --ntasks-per-node="$rpn" \
-        --cpus-per-task="$threads" --cpu-bind=cores --distribution=block:block \
-        julia --project="$ENVDIR" -t "$threads" "$REPO/bench/checkpoint.jl" mpi
+    for io in ${TREEAMR_CKPT_IO:-node all}; do
+        echo "--- nodes=$nodes ranks/node=$rpn threads/rank=$threads roots=$roots io=$io"
+        TREEAMR_BENCH_IO=$io TREEAMR_BENCH_ROOTS=$roots srun --mpi=pmi2 \
+            --nodes="$nodes" --ntasks=$((nodes * rpn)) --ntasks-per-node="$rpn" \
+            --cpus-per-task="$threads" --cpu-bind=cores --distribution=block:block \
+            julia --project="$ENVDIR" -t "$threads" "$REPO/bench/checkpoint.jl" mpi
+    done
 }
 
+# The one-node rank counts: TREEAMR_CKPT_ONENODE_RANKS, or 1, 2, 4, … up
+# to the ranks per node.
+ONENODE_RANKS="${TREEAMR_CKPT_ONENODE_RANKS:-}"
+if [ -z "$ONENODE_RANKS" ]; then
+    r=1
+    while [ "$r" -le "$RPN" ]; do
+        ONENODE_RANKS="$ONENODE_RANKS $r"
+        r=$((r * 2))
+    done
+fi
 for roots in 6 12; do
     if [ "${TREEAMR_CKPT_ONENODE:-1}" = 1 ]; then
-        r=1
-        while [ "$r" -le "$RPN" ]; do
+        for r in $ONENODE_RANKS; do
             run 1 "$r" "$roots"
-            r=$((r * 2))
         done
     fi
     n=2

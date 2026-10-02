@@ -5,14 +5,23 @@
 #
 #     sbatch --nodes=4 bench/symmetry_checkpoint_stress.sh <iters> <case>...
 #
-# A case is `mode[:sync[:hints[:iters]]]`: a mode of checkpoint_stress.jl,
-# 0 or 1 for STRESS_SYNC, a set of ROMIO hints from the list below
-# (default none), and its own iteration count. For example the
+# A case is `mode[:sync[:hints[:iters[:io]]]]`: a mode of
+# checkpoint_stress.jl, 0 or 1 for STRESS_SYNC, a set of ROMIO hints from
+# the list below (default none), its own iteration count, and for the
+# `treeamr` modes STRESS_IO (default `node`). For example the
 # measurement of CODE.md ("Parallel checkpoints", M7 step 6):
 #
 #     sbatch --nodes=4 bench/symmetry_checkpoint_stress.sh 200 \
 #         treeamr-filt treeamr-filt:0:dsoff sieve-ind:0:default:2000 \
 #         sieve-ind:0:dsoff:2000 sieve-coll:0:cbon sieve-coll:0:cboff visible
+#
+# Since step 6b the `treeamr` modes save with part files and an index;
+# STRESS_IO (`node`, the default, `all` or a number) chooses the I/O
+# processes, as in the measurement of step 6b:
+#
+#     sbatch --nodes=4 bench/symmetry_checkpoint_stress.sh 500 \
+#         treeamr-filt:0:default:500:node treeamr-filt:1:default:500:all \
+#         treeamr:0:default:500:node
 #
 # The files go under STRESS_BASEDIR (default BeeGFS scratch; /home is the
 # NFS comparison) and are removed at the end; each case's output is kept
@@ -50,12 +59,12 @@ shift
 julia --project="$ENVDIR" -e "using Pkg; Pkg.develop(path = \"$REPO\"); Pkg.precompile()" \
     2>&1 | tail -1
 for c in "$@"; do
-    IFS=: read -r mode sync hints iters <<< "$c"
-    sync=${sync:-0} hints=${hints:-default} iters=${iters:-$ITERS}
+    IFS=: read -r mode sync hints iters io <<< "$c"
+    sync=${sync:-0} hints=${hints:-default} iters=${iters:-$ITERS} io=${io:-node}
     [ -f "$DIR/hints/$hints" ] || { echo "no hint set $hints"; exit 1; }
-    echo "=== $mode sync=$sync hints=$hints ($(tr '\n' ' ' < "$DIR/hints/$hints")) iterations=$iters"
-    out="$OUT/stress-$SLURM_JOB_ID-$mode-$sync-$hints.txt"
-    STRESS_SYNC=$sync ROMIO_HINTS="$DIR/hints/$hints" \
+    echo "=== $mode sync=$sync hints=$hints ($(tr '\n' ' ' < "$DIR/hints/$hints")) iterations=$iters io=$io"
+    out="$OUT/stress-$SLURM_JOB_ID-$mode-$sync-$hints-$io.txt"
+    STRESS_IO=$io STRESS_SYNC=$sync ROMIO_HINTS="$DIR/hints/$hints" \
         srun --mpi=pmi2 --nodes="$NODES" --ntasks=$((NODES * 8)) --ntasks-per-node=8 \
         --cpus-per-task=8 --cpu-bind=cores --distribution=block:block \
         julia --project="$ENVDIR" -t 8 "$REPO/bench/checkpoint_stress.jl" "$mode" "$iters" \
