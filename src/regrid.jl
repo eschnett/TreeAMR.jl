@@ -22,8 +22,9 @@ siblings ask for it *and* balance still permits — see
 """
     flag_blocks(f, forest) -> Vector
 
-Build a flag vector by calling `f(b, key)` for every leaf, with `b` the
-block index and `key` its [`MortonKey`](@ref).
+Build a flag vector by calling `f(b, key)` for every block this rank
+stores, with `b` the local block index and `key` its [`MortonKey`](@ref)
+— serially, for every leaf (see [`blockrange`](@ref)).
 
 `f` may return either a bare [`RegridFlag`](@ref) or a
 `(flag, box)` pair, where `box::NTuple{D,UnitRange{Int}}` is the
@@ -41,9 +42,11 @@ the vector any other way, which is what will let the flagging kernel run
 on the device in M6 while the completion logic stays on the host.
 """
 function flag_blocks(f, forest::Forest)
-    out = Vector{Any}(undef, nleaves(forest))
-    threaded_foreach(nleaves(forest)) do b
-        out[b] = f(b, forest.leaves[b])
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    out = Vector{Any}(undef, length(owned))
+    threaded_foreach(length(owned)) do b
+        out[b] = f(b, forest.leaves[offset + b])
     end
     # The element type has to come from the values, not from `f`: the
     # bare and `(flag, box)` forms may be mixed within one vector.
@@ -135,7 +138,10 @@ end
     firing_boxes(fires, fs::FieldSet) -> Vector{Tuple{Int,NTuple{D,UnitRange{Int}}}}
 
 Per block, how many interior cells satisfied `fires` and the bounding
-box of those cells, in that block's own interior indices `1:N`.
+box of those cells, in that block's own interior indices `1:N`. The
+blocks are the ones this rank stores (see [`blockrange`](@ref)), so over
+a distributed forest the result is this rank's part of the flags, which
+is what [`regrid!`](@ref) takes; nothing is communicated.
 
 `fires(work, idx, b, x) -> Bool` is evaluated at every **owned** point of
 every block from a kernel, so it runs on the field set's backend and
@@ -154,7 +160,7 @@ refinement level reads
 ```julia
 flags = map(enumerate(firing_boxes(fires, fs))) do (b, (n, box))
     n == 0 && return Coarsen
-    level(forest.leaves[b]) < lmax ? (Refine, box) : (Keep, box)
+    level(blockkey(fs, b)) < lmax ? (Refine, box) : (Keep, box)
 end
 ```
 
@@ -177,6 +183,7 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
     n = nblocks(fs)
+    n == 0 && return Tuple{Int,NTuple{D,UnitRange{Int}}}[]   # a rank without blocks
     W = REDUCE_LANES
     lcounts = allocate(backend, Int32, (W, n))
     llos = allocate(backend, NTuple{D,Int32}, (W, n))
@@ -226,6 +233,44 @@ markbox(m, N::Int, ::Val) = markflag(m)      # not a flag at all: complain about
 issource(m::RegridFlag) = m === Refine
 issource(m::Tuple{RegridFlag,Any}) = m[1] !== Coarsen
 
+# A flag in canonical form (M7): what `markflag`, `markbox` and
+# `issource` read from either form a caller may report, as one `isbits`
+# value. Over a distributed forest each rank reports flags for its own
+# blocks, and `regrid!` gathers them into the global vector in curve
+# order; a caller's vector may mix the bare and the `(flag, box)` forms,
+# so it cannot be gathered as it is ("Regridding" under "Distributed
+# meshes" in CODE.md). `explicit` records which form it was, since that
+# decides whether a `Keep` is a source. The box has been validated by
+# `markbox` when the mark is made.
+struct RegridMark{D}
+    flag::RegridFlag
+    explicit::Bool
+    lo::NTuple{D,Int32}
+    hi::NTuple{D,Int32}
+end
+
+function RegridMark{D}(m, N::Int) where {D}
+    box = markbox(m, N, Val(D))              # validates, and complains about a non-flag
+    return RegridMark{D}(markflag(m), m isa Tuple, ntuple(d -> Int32(first(box[d])), D),
+                         ntuple(d -> Int32(last(box[d])), D))
+end
+
+markflag(m::RegridMark) = m.flag
+markbox(m::RegridMark{D}, N::Int, ::Val{D}) where {D} =
+    ntuple(d -> Int(m.lo[d]):Int(m.hi[d]), D)
+issource(m::RegridMark) = m.explicit ? m.flag !== Coarsen : m.flag === Refine
+
+# The limits on `buffer`, shared by `buffered_flags` and the argument
+# checks of `regrid!`, which have to refuse it before the flags are
+# gathered.
+function check_buffer(buffer::Integer, N::Int)
+    buffer >= 0 || throw(ArgumentError("buffer must be non-negative, got $buffer"))
+    buffer <= N || throw(ArgumentError(
+        "buffer of $buffer cells exceeds the block width N = $N; recruitment is a " *
+        "single pass and cannot reach past the first ring of neighbours"))
+    return nothing
+end
+
 # The level a source is asking to hold around itself.
 requestedlevel(f::RegridFlag, l::Int) = f === Refine ? l + 1 : l
 
@@ -273,35 +318,65 @@ Recruitment is a single pass over the original marks: a block pulled
 into the buffer does not itself recruit further neighbours. `buffer` is
 therefore limited to `N` cells, one block width, so that the dilated
 box cannot reach past the first ring of neighbours.
+
+`flags` has one entry per leaf of the whole forest, in leaf order, and a
+vector of another length is refused. Serially that is one per block.
+Over a distributed forest (M7) a rank's [`flag_blocks`](@ref) are its
+own blocks' only; pass those to [`regrid!`](@ref) with its `buffer`
+keyword, which searches the buffer from each rank's own sources and
+gathers the result.
 """
 function buffered_flags(forest::Forest{D}, flags::AbstractVector,
                         buffer::Integer) where {D}
     N = forest.N
-    buffer >= 0 || throw(ArgumentError("buffer must be non-negative, got $buffer"))
-    buffer <= N || throw(ArgumentError(
-        "buffer of $buffer cells exceeds the block width N = $N; recruitment is a " *
-        "single pass and cannot reach past the first ring of neighbours"))
+    check_buffer(buffer, N)
+    # One flag per leaf of the whole forest, as `complete_marks` asks: the
+    # recruits it writes are global leaves. Over a distributed forest a
+    # rank's flags are its local blocks' only, which without this check
+    # would buffer around the wrong leaves (step 9 of M7 found a
+    # downstream calling it that way); `regrid!` buffers those itself.
+    length(flags) == nleaves(forest) || throw(DimensionMismatch(
+        "got $(length(flags)) flags for $(nleaves(forest)) leaves: buffered_flags " *
+        "takes one flag per leaf of the whole forest; over a distributed forest, " *
+        "pass the local flags to regrid! with its buffer keyword instead"))
 
     # Validate every box even when there is no buffering to do, so that a
     # malformed box is reported the same way either way.
-    boxes = [markbox(m, N, Val(D)) for m in flags]
+    foreach(m -> markbox(m, N, Val(D)), flags)
     marks = RegridFlag[markflag(m) for m in flags]
     buffer == 0 && return marks
+    return apply_recruits!(marks, forest, buffer_recruits(forest, flags, 0, buffer))
+end
 
+# One leaf drawn into the regrid buffer: global leaf `leaf` is asked by a
+# source to hold `level`. `isbits`, so that over a distributed forest the
+# recruits can be gathered (M7).
+struct Recruit
+    leaf::Int32
+    level::Int32
+end
+
+# The recruits of the buffer's sources among `flags`, which are the marks
+# of the leaves `offset + 1 : offset + length(flags)`: every leaf a
+# source's dilated box reaches, with the level the source asks for, in
+# source order. This is the neighbour search, the expensive half of
+# `buffered_flags`, and it touches only the tree, so each source's
+# recruits are found in parallel, and over a distributed forest each
+# rank searches from its own blocks only (`regrid_marks`). Writing the
+# marks from the tasks would race, since one leaf can be recruited by
+# several sources at once; `apply_recruits!` writes them afterwards.
+function buffer_recruits(forest::Forest{D}, flags::AbstractVector, offset::Int,
+                         buffer::Integer) where {D}
+    N = forest.N
     directions = alldirections(Val(D))
-
-    # Each source's recruits are found in parallel — the neighbor search
-    # is the expensive half and touches only the tree — and the marks
-    # are then rewritten in a serial pass in block order. Writing them
-    # from the tasks would race: one leaf can be recruited by several
-    # sources at once.
-    recruits = threaded_collect(Pair{Int,Int}, nleaves(forest)) do found, b
-        # The *reported* mark, not `marks[b]`: a block recruited into the
-        # buffer by an earlier source must not become a source itself.
-        issource(flags[b]) || return
-        k = forest.leaves[b]
-        L = requestedlevel(markflag(flags[b]), level(k))
-        box = boxes[b]
+    return threaded_collect(Recruit, length(flags)) do found, b
+        # The *reported* mark: a block recruited into the buffer by
+        # another source must not become a source itself.
+        m = flags[b]
+        issource(m) || return
+        k = forest.leaves[offset + b]
+        L = requestedlevel(markflag(m), level(k))
+        box = markbox(m, N, Val(D))
         # The dilated box leaves the block in direction δ[d] = ∓1 only if
         # it crosses that face; a tangential dimension never restricts.
         exits = ntuple(d -> (first(box[d]) - buffer < 1, last(box[d]) + buffer > N), D)
@@ -312,17 +387,70 @@ function buffered_flags(forest::Forest{D}, flags::AbstractVector,
             for nk in neighbor_keys(forest, k, δ)
                 j = find_leaf(forest, nk)
                 j === nothing && continue          # cannot happen: nk is a leaf
-                push!(found, j => L)
+                push!(found, Recruit(j, L))
             end
         end
     end
+end
 
-    for (j, L) in recruits
+# Rewrite the marks for the recruits: a recruit at level `L` raises a
+# leaf below `L` to `Refine` and lifts its `Coarsen` to `Keep` at or
+# below `L`. The result does not depend on the order of the recruits, nor
+# on how often one appears (M7; "What was done about it" under step 7 in
+# CODE.md): `Refine` is never undone, a `Keep` made from `Coarsen` is only
+# ever raised to `Refine`, and so a leaf of level `l` ends as `Refine` if
+# any recruit asks it for more than `l`, as `Keep` if it was `Coarsen`
+# and some recruit asks for `l` exactly, and as it was otherwise — a
+# function of its own mark and of the largest level asked of it. That is
+# what lets the ranks search separately and apply the union.
+function apply_recruits!(marks::Vector{RegridFlag}, forest::Forest,
+                         recruits::AbstractVector{Recruit})
+    for r in recruits
+        j, L = Int(r.leaf), Int(r.level)
         l = level(forest.leaves[j])
         marks[j] === Coarsen && l <= L && (marks[j] = Keep)
         l < L && (marks[j] = Refine)
     end
     return marks
+end
+
+# What a rank contributes to the gathered recruits: per leaf only the
+# largest level asked of it, and nothing for a leaf already finer than
+# that, where a recruit changes no mark. By the argument above the marks
+# come out the same, and the gather is at most one entry per leaf the
+# rank's sources reach.
+function strongest_recruits(forest::Forest, recruits::Vector{Recruit})
+    sort!(recruits; by=r -> (r.leaf, r.level))
+    out = Recruit[]
+    for r in recruits
+        level(forest.leaves[r.leaf]) <= r.level || continue
+        if !isempty(out) && out[end].leaf == r.leaf
+            out[end] = r                           # sorted, so a larger level
+        else
+            push!(out, r)
+        end
+    end
+    return out
+end
+
+# The buffered marks `regrid!` completes (M7): `allmarks` the gathered
+# global vector, `marks` this rank's own part of it. Each rank runs the
+# neighbour search for its own sources only, and the strongest recruits
+# of every rank are gathered and applied on every rank, which gives every
+# rank the marks the serial `buffered_flags` gives over `allmarks`, at
+# `O(local sources)` rather than `O(sources)` per rank and one more
+# `allgatherv`. Serially it is `buffered_flags` itself. Every rank knows
+# whether there is a buffer, since it is agreed, so they all gather or
+# none does.
+function regrid_marks(forest::Forest, allmarks::AbstractVector, marks::AbstractVector,
+                      buffer::Integer)
+    out = RegridFlag[markflag(m) for m in allmarks]
+    buffer == 0 && return out
+    recruits = buffer_recruits(forest, marks, first(blockrange(forest)) - 1, buffer)
+    if isdistributed(forest)
+        recruits = allgatherv(forest.comm, strongest_recruits(forest, recruits))
+    end
+    return apply_recruits!(out, forest, recruits)
 end
 
 """
@@ -332,7 +460,10 @@ The sorted leaf array that `flags` asks for, completed so that the
 result is still 2:1 balanced.
 
 `flags` holds one entry per leaf, each either a [`RegridFlag`](@ref) or
-a `(flag, box)` pair as [`flag_blocks`](@ref) produces. `buffer` is a
+a `(flag, box)` pair as [`flag_blocks`](@ref) produces — per leaf of the
+whole forest, which serially is per block; over a distributed forest
+[`regrid!`](@ref) assembles this global vector from every rank's flags
+for its own blocks. `buffer` is a
 margin in **cells**, applied first: every block that reports a box (or
 is marked with a bare `Refine`) pulls the neighbouring leaves its box
 comes within `buffer` cells of up to the level it asks for — `level + 1`
@@ -350,7 +481,15 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector;
                         buffer::Integer=0) where {D}
     length(flags) == nleaves(forest) || throw(DimensionMismatch(
         "got $(length(flags)) flags for $(nleaves(forest)) leaves"))
-    marks = buffered_flags(forest, flags, buffer)
+    return completed_leaves(forest, buffered_flags(forest, flags, buffer))
+end
+
+# `complete_marks` after the buffer: the leaves that the buffered marks,
+# one per leaf, ask for, balanced. `regrid!` comes in here with the marks
+# of `regrid_marks`.
+function completed_leaves(forest::Forest{D}, marks::Vector{RegridFlag}) where {D}
+    length(marks) == nleaves(forest) || throw(DimensionMismatch(
+        "got $(length(marks)) marks for $(nleaves(forest)) leaves"))
 
     # A sibling group coarsens only if it is complete and unanimous.
     wanted = Dict{MortonKey{D},Int}()
@@ -380,81 +519,303 @@ function complete_marks(forest::Forest{D}, flags::AbstractVector;
         end
     end
 
-    # Balance the candidate tree without disturbing the live one.
+    # Balance the candidate tree without disturbing the live one. It
+    # carries the live forest's communicator, so that it is the forest
+    # the ranks will hold; balancing sends nothing, since every rank
+    # holds the whole tree and arrives at the same leaves. Its state is
+    # its own, so it has no buffer pool, and would make its own if it
+    # exchanged anything.
     scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
-                             forest.extents, forest.N, candidate, Ref(0))
+                             forest.extents, forest.N, candidate, ForestState(),
+                             forest.comm)
     balance!(scratch)
     return scratch.leaves
 end
 
-# Classify every new leaf by where its data comes from, and batch the
+# Classify new leaves by where their data come from, and batch the
 # transfers by (kind, child offset) so each batch shares one set of
-# stencils — the same grouping the ghost schedule uses.
-function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
-                         c::NTuple{D,Int}, oldleaves, newleaves,
-                         operators::Operators, backend::Backend) where {T,D}
-    oldindex = Dict{MortonKey{D},Int32}(k => Int32(i) for (i, k) in enumerate(oldleaves))
-    N = forest.N
-    zerodir = ntuple(_ -> 0, D)
+# stencils — the same grouping the ghost schedule uses, under the same
+# `GroupKey`, with direction zero. Targets are new leaves and sources old
+# ones, both as global leaf indices.
+#
+# Not every new leaf (amended in M7 after step 7, which measured the
+# replicated classification at 38 % of a rank's regrid at 512 ranks): a
+# rank needs the transfers of the new leaves it will own, `newrange`,
+# and of those whose sources it owns now, which are the new leaves that
+# overlap its old leaves `oldrange` — one contiguous range of new
+# indices, since refinement and coarsening keep the curve order
+# (`overlapping_leaves`). The leaves are classified in ascending order,
+# so every list comes out as the whole classification's, restricted to
+# them; `split_regrid` keeps only this rank's ends of it, and the stage
+# layouts are sorted explicitly, so no message changes. An old leaf is
+# found in the sorted old leaves by a search that starts at the previous
+# target's sources (`findfrom`), rather than in a `Dict` of every old
+# leaf. The default ranges are every leaf, the serial classification.
+function regrid_sources(oldleaves::AbstractVector{MortonKey{D}},
+                        newleaves::AbstractVector{MortonKey{D}};
+                        oldrange::UnitRange{Int}=1:length(oldleaves),
+                        newrange::UnitRange{Int}=1:length(newleaves)) where {D}
+    targets = Int[]
+    for r in union_ranges(newrange, overlapping_leaves(oldleaves, newleaves, oldrange))
+        append!(targets, r)
+    end
 
-    # Classify every new block in parallel (dictionary *lookups* only —
-    # nothing is inserted), then merge in block order so the batches come
-    # out the same whatever the thread count.
-    perblock = [Pair{Tuple{Symbol,NTuple{D,Int}},Int32}[] for _ in 1:length(newleaves)]
-    threaded_foreach(length(newleaves)) do bn
-        kn = newleaves[bn]
-        out = perblock[bn]
-        same = get(oldindex, kn, nothing)
-        if same !== nothing
-            push!(out, (:copy, zerodir) => same)
-            return
-        end
-
-        parent = level(kn) > 0 ? get(oldindex, parentkey(kn), nothing) : nothing
-        if parent !== nothing
-            push!(out, (:prolong, childoffset(kn)) => parent)
-            return
-        end
-
-        # Otherwise this block was coarsened, so its children were leaves.
-        level(kn) < MAX_LEVEL || throw(ArgumentError(
-            "cannot rebuild $kn: it is neither an old leaf, a child of one, nor a parent"))
-        for kc in childkeys(kn)
-            child = get(oldindex, kc, nothing)
-            child === nothing && throw(ArgumentError(
-                "cannot rebuild $kn: neither it, its parent, nor its child $kc was a " *
-                "leaf before regridding. A single regrid may move a block by at most " *
-                "one level, which holds when the previous tree was 2:1 balanced."))
-            push!(out, (:restrict, childoffset(kc)) => child)
+    # Classify the new blocks in parallel (lookups only), then merge in
+    # block order so the batches come out the same whatever the thread
+    # count. The sources of ascending new leaves are non-decreasing old
+    # leaves, so within a chunk each target's lookups start where the
+    # previous target's sources were found.
+    perblock = [Pair{GroupKey{D},Int32}[] for _ in 1:length(targets)]
+    threaded_chunks(length(targets)) do _, chunk
+        from = 1
+        for t in chunk
+            from = classify_regrid!(perblock[t], oldleaves, newleaves[targets[t]], from)
         end
     end
 
-    pairs = Dict{Tuple{Symbol,NTuple{D,Int}},Tuple{Vector{Int32},Vector{Int32}}}()
-    for bn in 1:length(newleaves)
-        for (key, source) in perblock[bn]
+    pairs = TransferPairs{D}()
+    for (t, bn) in enumerate(targets)
+        for (key, source) in perblock[t]
             push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(bn), source))
         end
     end
+    return pairs
+end
 
-    # Every target here is the new block's *owned* range — the δ = 0 case
-    # of the same builders. A fresh block's shared plane and ghosts are
-    # left to the next `fill_ghosts!`, as ghosts always are; in a
-    # vertex-like dimension that makes coarsening halved injection from
-    # the children's even points, all of which they own.
-    stencils(kind, o) =
-        kind === :copy ? ntuple(d -> copy_stencil(T, N, G[d], c[d], 0), D) :
-        kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, G[d], c[d], 0, o[d], operators), D) :
-        ntuple(d -> prolongation_stencil(T, N, G[d], c[d], 0, o[d], operators), D)
+# Where new leaf `kn`'s data come from, pushed onto `out` as
+# `GroupKey => old leaf`: the old leaf itself (a copy), its parent (a
+# prolongation), or each of its children (a restriction). Every source
+# is at or after old leaf `from`; returns the last one found, where the
+# next target's search can start.
+function classify_regrid!(out::Vector{Pair{GroupKey{D},Int32}},
+                          oldleaves::AbstractVector{MortonKey{D}}, kn::MortonKey{D},
+                          from::Int) where {D}
+    zerodir = ntuple(_ -> 0, D)
+    same = findfrom(oldleaves, kn, from)
+    if same != 0
+        push!(out, GroupKey{D}(:copy, zerodir, zerodir, 0) => Int32(same))
+        return same
+    end
 
+    parent = level(kn) > 0 ? findfrom(oldleaves, parentkey(kn), from) : 0
+    if parent != 0
+        push!(out, GroupKey{D}(:prolong, zerodir, childoffset(kn), 0) => Int32(parent))
+        return parent
+    end
+
+    # Otherwise this block was coarsened, so its children were leaves.
+    level(kn) < MAX_LEVEL || throw(ArgumentError(
+        "cannot rebuild $kn: it is neither an old leaf, a child of one, nor a parent"))
+    last_ = from
+    for kc in childkeys(kn)
+        child = findfrom(oldleaves, kc, from)
+        child == 0 && throw(ArgumentError(
+            "cannot rebuild $kn: neither it, its parent, nor its child $kc was a " *
+            "leaf before regridding. A single regrid may move a block by at most " *
+            "one level, which holds when the previous tree was 2:1 balanced."))
+        push!(out, GroupKey{D}(:restrict, zerodir, childoffset(kc), 0) => Int32(child))
+        last_ = max(last_, child)
+    end
+    return last_
+end
+
+# The index of `k` in the sorted `v`, or 0, given that it is not before
+# `from`: a few steps along the curve first, since a regrid's next source
+# is almost always among them, and a binary search over the rest
+# otherwise — the first lookup of a chunk, or after a run of new leaves
+# without old ones.
+function findfrom(v::AbstractVector{MortonKey{D}}, k::MortonKey{D}, from::Int) where {D}
+    n = length(v)
+    for i in from:min(from + 3, n)
+        x = v[i]
+        x == k && return i
+        isless(k, x) && return 0
+    end
+    from + 4 > n && return 0
+    i = from + 3 + searchsortedfirst(view(v, (from + 4):n), k)
+    return i <= n && v[i] == k ? i : 0
+end
+
+# The new leaves that overlap the old leaves `oldrange`, as one range of
+# new indices. Both arrays tile the same brick in curve order, so they
+# are a contiguous run: from the new leaf that covers where the first
+# old leaf begins — that leaf itself or an ancestor, which precedes it,
+# else its first descendant, which follows it directly — to the last new
+# leaf at or before the last old leaf's deepest last descendant, the
+# last node of its subtree in the curve's pre-order. An ancestor of that
+# old leaf qualifies, since everything after the ancestor lies beyond
+# its subtree; anything later lies beyond the old leaf's own.
+function overlapping_leaves(oldleaves::AbstractVector{MortonKey{D}},
+                            newleaves::AbstractVector{MortonKey{D}},
+                            oldrange::UnitRange{Int}) where {D}
+    isempty(oldrange) && return 1:0
+    a, z = oldleaves[first(oldrange)], oldleaves[last(oldrange)]
+    i = searchsortedlast(newleaves, a)
+    lo = i >= 1 && (newleaves[i] == a || isancestor(newleaves[i], a)) ? i : i + 1
+    shift = MAX_LEVEL - level(z)
+    deepest = MortonKey{D}(z.root, MAX_LEVEL,
+                           map(c -> (UInt64(c) << shift) | ((UInt64(1) << shift) - 1),
+                               z.coords))
+    return lo:searchsortedlast(newleaves, deepest)
+end
+
+# Two ranges as ascending, disjoint ranges covering both.
+function union_ranges(a::UnitRange{Int}, b::UnitRange{Int})
+    isempty(a) && return (b,)
+    isempty(b) && return (a,)
+    first(a) > first(b) && ((a, b) = (b, a))
+    last(a) + 1 >= first(b) && return (first(a):max(last(a), last(b)),)
+    return (a, b)
+end
+
+# The regrid transfers split by where their ends live (M7): targets in
+# the new partition, `newrange` this rank's new leaves, and sources in
+# the old one, `oldrange` its old leaves. A transfer with both ends here
+# is *local*, shifted to local block indices (new ones for the target,
+# old ones for the source); one with only its target here is
+# *received*, one with only its source here is *sent*, both kept global
+# for the stage builder; the rest belong to other ranks. Each list stays
+# in the order of `pairs`, so the local targets are still
+# non-decreasing.
+function split_regrid(pairs::TransferPairs{D}, oldrange::UnitRange{Int},
+                      newrange::UnitRange{Int}) where {D}
+    local_, sent, received = TransferPairs{D}(), TransferPairs{D}(), TransferPairs{D}()
+    toffset, soffset = Int32(first(newrange) - 1), Int32(first(oldrange) - 1)
+    for (key, (targets, sources)) in pairs, i in eachindex(targets)
+        t, s = targets[i], sources[i]
+        heret, heres = t in newrange, s in oldrange
+        into, tt, ss = heret && heres ? (local_, t - toffset, s - soffset) :
+                       heret ? (received, t, s) : heres ? (sent, t, s) :
+                       (nothing, t, s)
+        into === nothing && continue
+        push!.(get!(into, key, (Int32[], Int32[])), (tt, ss))
+    end
+    return local_, sent, received
+end
+
+# The regrid transfer of one layout as one stage (M7, tag `REGRID_TAG`),
+# from the classified `pairs`. Its local groups are the serial transfer
+# groups restricted to this rank's ends; its messages are built by the
+# exchange's own `remote_stage`, with the targets in the new partition
+# and the sources in the old, so the old owner of each source evaluates
+# the transfer — a copy, a prolongation from the parent, or one child's
+# share of a restriction — into a slot shaped like that transfer's target
+# box, and the new owner copies it into place. Serially both ranges are
+# every leaf, nothing is split, and the stage is the serial groups with
+# no messages.
+#
+# Every target here is the new block's *owned* range — the δ = 0 case of
+# the ghost builders. A fresh block's shared plane and ghosts are left
+# to the next `fill_ghosts!`, as ghosts always are; in a vertex-like
+# dimension that makes coarsening halved injection from the children's
+# even points, all of which they own.
+function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
+                      operators::Operators, backend::Backend, pairs::TransferPairs{D};
+                      oldrange::UnitRange{Int}, newrange::UnitRange{Int},
+                      nold::Int, nnew::Int, oldowner, newowner) where {T,D}
     # These stencils are rebuilt on every regrid — the child offsets
     # involved depend on which blocks moved — so, like the schedule's,
     # they are uploaded here, once, rather than at the launch.
+    build1(key) =
+        key.kind === :copy ? ntuple(d -> copy_stencil(T, N, G[d], c[d], 0), D) :
+        key.kind === :restrict ?
+        ntuple(d -> restriction_stencil(T, N, G[d], c[d], 0, key.offset[d], operators),
+               D) :
+        ntuple(d -> prolongation_stencil(T, N, G[d], c[d], 0, key.offset[d], operators),
+               D)
+    built = Dict{GroupKey{D},Any}()
+    stencils(key) = get!(() -> build1(key), built, key)
+
+    serial = oldrange == 1:nold && newrange == 1:nnew
+    local_, sent, received = serial ? (pairs, nothing, nothing) :
+                             split_regrid(pairs, oldrange, newrange)
     GRP = grouptype(backend, T, Val(D))
-    return GRP[todevice(backend, TransferGroup{T,D}(kind, stencils(kind, o),
-                                                    targets, sources))
-               for ((kind, o), (targets, sources)) in pairs]
+    locals = GRP[todevice(backend, TransferGroup{T,D}(key.kind, stencils(key), targets,
+                                                      sources))
+                 for (key, (targets, sources)) in local_]
+    ST = stagetype(backend, T, Val(D))
+    remote = serial ? nothing :
+             remote_stage(remotetype(ST), T, backend, sent, received, stencils, key -> 0;
+                          targetowner=newowner, sourceowner=oldowner,
+                          targetrange=newrange, sourcerange=oldrange)
+    return ST(REGRID_TAG, locals, remote)
 end
+
+# The serial regrid transfer's groups, from the old and the new leaf
+# arrays: what `regrid!` runs over a forest on one rank, kept as a
+# function of its own for the tests and `bench/gpu.jl`.
+function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
+                         c::NTuple{D,Int}, oldleaves, newleaves,
+                         operators::Operators, backend::Backend) where {T,D}
+    nold, nnew = length(oldleaves), length(newleaves)
+    stage = regrid_stage(T, forest.N, G, c, operators, backend,
+                         regrid_sources(oldleaves, newleaves); oldrange=1:nold,
+                         newrange=1:nnew, nold=nold, nnew=nnew, oldowner=nothing,
+                         newowner=nothing)
+    return stage.locals
+end
+
+# The argument checks of `regrid!`, run on every rank before anything is
+# gathered so that a refusal on some ranks is raised on all of them
+# (`collective_checks`). Returns this rank's flags in canonical form and
+# a hash of what every rank must agree on beyond the forest: the field
+# sets' layouts and schedules' operators, in order, `buffer`, `transfer`
+# and whether there is a hook — a rank that moved other field sets, or
+# the same ones in another order, would match its regrid messages to the
+# wrong field set's.
+function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer::Bool,
+                      boundary) where {D}
+    layout = Any[transfer, Int(buffer), boundary === nothing]
+    for p in sets
+        p isa Pair && p.first isa FieldSet || throw(ArgumentError(
+            "regrid! takes `fs => schedule` pairs, got a $(typeof(p)). Each field " *
+            "set brings its own schedule, since a schedule belongs to a layout " *
+            "(G, element type, backend) and not to the forest; write " *
+            "`fs => nothing` for a set that should only be resized."))
+        fs, sched = p
+        fs.forest === forest || throw(ArgumentError(
+            "every field set must be over the forest being regridded"))
+        nblocks(fs) == length(blockrange(forest)) || throw(ArgumentError(
+            "field set has $(nblocks(fs)) blocks but the forest has " *
+            "$(length(blockrange(forest))) on this rank"))
+        backend = get_backend(fs.work)
+        push!(layout, (fs.nvars, fs.G, fs.centering, eltype(fs.work),
+                       nameof(typeof(backend)), sched === nothing))
+        sched === nothing && continue
+        sched.forest === forest || throw(ArgumentError(
+            "schedule was built for a different forest"))
+        isstale(sched) && throw(ArgumentError(
+            "schedule is stale; rebuild it before regridding"))
+        fs.G == sched.G || throw(ArgumentError(
+            "the field set has ghost width G=$(fs.G) but its schedule was built " *
+            "for G=$(sched.G); pair each field set with its own schedule"))
+        fs.centering == sched.centering || throw(ArgumentError(
+            "the field set has centering $(fs.centering) but its schedule was " *
+            "built for $(sched.centering); pair each field set with its own " *
+            "schedule"))
+        # What `fill_ghosts!` would refuse further down, refused here,
+        # where the refusal is agreed between the ranks.
+        eltype(fs.work) == scheduletype(sched) || throw(ArgumentError(
+            "the field set stores $(eltype(fs.work)) but its schedule carries " *
+            "$(scheduletype(sched)) weights; pair each field set with its own schedule"))
+        samebackend(backend, sched.backend) || throw(ArgumentError(
+            "the field set lives on $(nameof(typeof(backend))) but its schedule was " *
+            "built for $(nameof(typeof(sched.backend))); pair each field set with its " *
+            "own schedule"))
+        ops = sched.operators
+        push!(layout, (Int(ops.family), ops.prolongation, ops.restriction))
+    end
+    check_buffer(buffer, forest.N)
+    length(flags) == length(blockrange(forest)) || throw(DimensionMismatch(
+        "got $(length(flags)) flags for the $(length(blockrange(forest))) blocks " *
+        "this rank stores" *
+        (isdistributed(forest) ? " (one per local block, not per leaf of the forest)" :
+         "")))
+    marks = RegridMark{D}[RegridMark{D}(m, forest.N) for m in flags]
+    return marks, layouthash(layout...)
+end
+
+scheduletype(::GhostSchedule{T}) where {T} = T
 
 """
     regrid!(forest, pairs; flags, buffer=0, boundary=nothing, transfer=true)
@@ -480,8 +841,8 @@ over `forest` and each schedule the current one *for that field set*
 layout, so a bare field set no longer says which schedule moves it).
 Every set's storage is replaced in place, so references an application
 already holds stay valid, but **block indices do not survive**: slots
-are compacted, and `forest.leaves[b]` is the only way to say which block
-is which.
+are compacted, and [`blockkey`](@ref)`(fs, b)` is the only way to say
+which block is which.
 
 The target of every transfer is the new block's **owned** range, whatever
 the centering: a fresh block's shared boundary plane and its ghosts are
@@ -510,40 +871,54 @@ Set `transfer = false` to rebuild the mesh and storage without moving
 data at all — what the initial-data cycle wants, since it re-evaluates
 the initial data on the new mesh instead (see
 [`adapt_to_initial_data!`](@ref)).
+
+Over a forest distributed between ranks (M7) the call is collective:
+every rank makes it, with the same field sets, schedules, `buffer` and
+`transfer`, and `flags` holds one entry per **local** block, as
+[`flag_blocks`](@ref) and [`firing_boxes`](@ref) produce them. The ranks
+gather the flags into the global vector, complete it identically, and
+so arrive at the same leaves and return the same `Bool`. The new leaves
+are split over the ranks afresh, and the transfer moves each block to
+its new owner: its old owner — the owner of the parent for a refined
+block, of each child for a coarsened one — evaluates the transfer and
+sends the result. Every block comes out bit for bit as a serial regrid
+writes it, whatever the number of ranks. An argument that some ranks'
+checks refuse is refused on all of them, and so is a forest that
+differs between ranks; see "Distributed meshes" in `CODE.md`.
 """
 function regrid!(forest::Forest{D}, pairs;
                  flags::AbstractVector, buffer::Integer=0, boundary=nothing,
                  transfer::Bool=true) where {D}
     sets = pairs isa Pair ? (pairs,) : pairs
-    for p in sets
-        p isa Pair && p.first isa FieldSet || throw(ArgumentError(
-            "regrid! takes `fs => schedule` pairs, got a $(typeof(p)). Each field " *
-            "set brings its own schedule, since a schedule belongs to a layout " *
-            "(G, element type, backend) and not to the forest; write " *
-            "`fs => nothing` for a set that should only be resized."))
-        fs, sched = p
-        fs.forest === forest || throw(ArgumentError(
-            "every field set must be over the forest being regridded"))
-        nblocks(fs) == nleaves(forest) || throw(ArgumentError(
-            "field set has $(nblocks(fs)) blocks but the forest has " *
-            "$(nleaves(forest)) leaves"))
-        sched === nothing && continue
-        sched.forest === forest || throw(ArgumentError(
-            "schedule was built for a different forest"))
-        isstale(sched) && throw(ArgumentError(
-            "schedule is stale; rebuild it before regridding"))
-        fs.G == sched.G || throw(ArgumentError(
-            "the field set has ghost width G=$(fs.G) but its schedule was built " *
-            "for G=$(sched.G); pair each field set with its own schedule"))
-        fs.centering == sched.centering || throw(ArgumentError(
-            "the field set has centering $(fs.centering) but its schedule was " *
-            "built for $(sched.centering); pair each field set with its own " *
-            "schedule"))
+    # The checks run on every rank, and a refusal on any of them is
+    # raised on all of them, together with the forest digest: one
+    # `allgather` over a distributed forest, nothing serially (M7).
+    marks = collective_checks(forest, "regrid!") do
+        check_regrid(forest, sets, flags, buffer, transfer, boundary)
     end
+    comm = forest.comm
+    distributed = isdistributed(forest)
+    # Each rank flagged its own blocks; the decision is made over all of
+    # them, replicated, so every rank arrives at the same new leaves and
+    # returns the same answer. The buffer's neighbour search is the one
+    # part that is not replicated: each rank searches from its own
+    # sources, and the recruits are gathered (`regrid_marks`).
+    allmarks = distributed ? allgatherv(comm, marks) : marks
 
     oldleaves = copy(forest.leaves)
-    newleaves = complete_marks(forest, flags; buffer=buffer)
+    newleaves = completed_leaves(forest, regrid_marks(forest, allmarks, marks, buffer))
     newleaves == oldleaves && return false
+
+    # The partitions before and after: this rank's old leaves, which its
+    # field sets store now, and its new ones (`blockrange` of the forest
+    # once it holds `newleaves`).
+    nold, nnew = length(oldleaves), length(newleaves)
+    P, rank = commsize(comm), commrank(comm)
+    oldrange = blockrange(forest)
+    newrange = equalsplit(nnew, P, rank + 1)
+    oldowner(i) = equalsplit_part(nold, P, Int(i)) - 1
+    newowner(j) = equalsplit_part(nnew, P, Int(j)) - 1
+    sources = nothing                            # classified once, on first use
 
     for (fs, sched) in sets
         # Per field set, not once from the first one: nothing says two
@@ -554,21 +929,36 @@ function regrid!(forest::Forest{D}, pairs;
         if move
             # Prolongation from a parent reaches into that parent's ghost
             # layers, so they have to hold data before anything moves.
+            # Over a distributed forest this is the distributed fill, so a
+            # parent's ghosts are current on its owner.
             fill_ghosts!(fs, sched; boundary=boundary)
         end
         stored = storedsize(forest.N, fs.G, staggers(fs))
-        fresh = similar(fs.work, stored..., fs.nvars, length(newleaves))
+        fresh = similar(fs.work, stored..., fs.nvars, length(newrange))
         zerofill!(fresh, backend)
         if move
-            groups = transfer_groups(eltype(fs.work), forest, fs.G, staggers(fs),
-                                     oldleaves, newleaves, sched.operators, backend)
+            sources === nothing && (sources = regrid_sources(oldleaves, newleaves;
+                                                             oldrange=oldrange,
+                                                             newrange=newrange))
+            stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
+                                 sched.operators, backend, sources; oldrange=oldrange,
+                                 newrange=newrange, nold=nold, nnew=nnew,
+                                 oldowner=oldowner, newowner=newowner)
             # The transfer moves every cell in the domain, so it is
             # threaded the same way a ghost phase is — its groups are
             # just as uneven, a whole block against a single child — and
             # by owner of the *new* block, which is also the thread that
-            # zeroed it above and will compute on it next.
-            run_phase!(fresh, fs.work, groups, fs.nvars, backend)
-            synchronize(backend)
+            # zeroed it above and will compute on it next. Over a
+            # distributed forest it is one stage, which is also the
+            # repartitioning: a kept block whose owner changes is a copy
+            # between ranks.
+            sends = run_stage!(fresh, fs.work, fs.nvars, nothing, stage, forest, backend,
+                               nothing)
+            sends === nothing || waitall(comm, sends)
+            # The stage lives for this call, so its buffers go back to the
+            # forest's pool now that nothing is in flight, for the next
+            # field set's stage or the next regrid to take.
+            stage.remote === nothing || release_stage!(forest, stage.remote)
         end
         fs.work = fresh
     end
@@ -617,6 +1007,12 @@ The criterion is given exactly one of two ways:
 The schedule is rebuilt from `fs` itself, so it carries that field set's
 ghost width, element type and backend — a device-resident field set
 adapts without anything further.
+
+Over a distributed forest (M7) the cycle is collective, as every
+[`regrid!`](@ref) in it is: `flag` is called for this rank's blocks,
+`flags` returns the flags of this rank's blocks, and every rank leaves
+with the same mesh after the same number of passes. A rank may start
+without blocks, as all but one do from a single leaf.
 """
 function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
                                 initial, flag=nothing, flags=nothing,

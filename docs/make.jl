@@ -21,6 +21,7 @@ makedocs(;
             "Regridding" => "api/regrid.md",
             "Point interpolation" => "api/interpolate.md",
             "Checkpoint and restart" => "api/io.md",
+            "Distributed meshes" => "api/distributed.md",
             "Internals" => "api/internals.md",
             "Index" => "api/genindex.md",
         ],

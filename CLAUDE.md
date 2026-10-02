@@ -12,27 +12,45 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M6, M8, M10, M11 and M9a are done (tree core,
+Current state: milestones M0–M8, M10, M11 and M9a are done (tree core,
 ghost exchange, ODE coupling, regridding, multi-threading, GPU; then every
 centering, per-field-set ghost widths, and conservation at coarse-fine
 faces; then reflecting boundaries; then point interpolation; then
-checkpoint and restart, through an HDF5 package extension). Everything
-is `D`-generic and floating-point-type generic. Next is MPI (M7),
-deliberately after M8 and M10 so the distributed exchange is built once
-over a layout-generic schedule that already holds the mirrored
-transfers; then visualization export (M9b), the other half of the old
-M9. M9a went before M7 because the downstream runs need to restart
-before they need MPI.
+checkpoint and restart, through an HDF5 package extension; then MPI).
+M7 (done 2026-10-02): the forest replicated on every rank, the blocks
+distributed in contiguous curve ranges, and the ghost exchange,
+interface restriction, reductions, regrid, interpolation and
+checkpoints across ranks, bit-identical to serial but for floating-point
+sums, through an MPI package extension. Its cluster measurements ran on
+Symmetry on 2026-10-02 (CODE.md, steps 6–8). Its checkpoint was first a
+shared file written through MPI-IO, which lost data between nodes on
+BeeGFS; it was replaced the same day (step 6b, decided with Erik) by
+one without parallel I/O — part files per I/O process and an index,
+each file with one writer and one opener. What M7 leaves for later is
+listed under "Performance work left for later" in CODE.md. It came after
+M8 and M10 so the distributed exchange was built once over a
+layout-generic schedule that already held the mirrored transfers, and
+after M9a because the downstream runs needed to restart before they
+needed MPI. Everything is `D`-generic and floating-point-type generic.
+Next is visualization export (M9b), the other half of the old M9.
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
 ## Commands
 
-Full test suite (about 4–5 min at one thread and at eight — 93686 tests
-in 4m16 and 93738 in 4m47 after M9a — the thread-independence test
-spends ~45 s of that running `test/thread_workload.jl` in two
-subprocesses, M10's `reflect_tests.jl` about 45 s more, and M9a's
-`checkpoint_tests.jl` about 30 s).
+Full test suite (about 6½ min at one thread and at eight — 110606 tests
+in 6m32 and 110658 in 6m28 after M7's step 6b, against M9a's 93686 in
+4m16 — of
+which the thread-independence test spends ~50 s running
+`test/thread_workload.jl` in two subprocesses, `exchange_tests.jl` ~33 s,
+M10's `reflect_tests.jl` ~30 s, and M9a's `checkpoint_tests.jl` ~28 s).
+The MPI test's two `mpiexec` jobs, ~55 s each and nearly all
+compilation, run *beside* the suite where the machine has 8+ threads and
+24+ GB (`test/mpi_jobs.jl`), so `mpi_tests.jl` itself costs ~15 s here;
+on a smaller machine, CI's runners among them, they run one after the
+other and the suite takes about 8 min (7m52 here with
+`TREEAMR_TEST_MPI_CONCURRENT=0`, CI's path). The per-file times before
+and after M7's trim are in CODE.md's M7 step 9.
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
 shorten it by making the kernels faster. Measured: annotating the test
@@ -64,6 +82,41 @@ IMEXRungeKutta (GitHub `main`) through `[sources]`:
 julia --project=test -e 'using Test, Random, TreeAMR; include("test/oracles.jl"); include("test/ghost_oracles.jl"); include("test/wave.jl"); include("test/regrid_tests.jl")'
 ```
 
+The MPI tests (M7) are part of `Pkg.test`: `test/mpi_tests.jl` launches
+`test/mpi_workload.jl` under `MPI.mpiexec()` — the launcher of the MPI
+binary MPIPreferences selects for the load path: MPICH_jll by default
+(CI, Julia 1.11 here), MPIABI_jll on Julia 1.13 here, which a
+`LocalPreferences.toml` in the global v1.13 environment selects — with
+`setenv(cmd, mpiexec().env)`, since interpolating `mpiexec()` into a
+larger command drops its library paths. On its own (it needs no helper
+file; about 1m47 on the sequential path):
+
+```bash
+julia --project=test -e 'using Test, TreeAMR, HDF5; @testset "mpi" begin include("test/mpi_tests.jl") end'
+```
+
+The workload by hand, serially and at three ranks; every line but the
+`#` lines and the last digits of the `sum` lines must agree:
+
+```bash
+julia --project=test test/mpi_workload.jl > /tmp/serial.txt
+julia --project=test -e 'using MPI; m = MPI.mpiexec(); run(pipeline(setenv(`$m -n 3 $(Base.julia_cmd()) --threads=1 --project=test test/mpi_workload.jl mpi`, m.env); stdout = "/tmp/n3.txt"))'
+diff /tmp/serial.txt /tmp/n3.txt
+```
+
+The device counterpart, `test/mpi_device_tests.jl`, is not in
+`Pkg.test` (the test environment has no device package and must not
+gain one). It runs in a scratch environment that develops this checkout
+and adds the device package, MPI, KernelAbstractions, SHA and Test:
+
+```bash
+TREEAMR_TEST_BACKEND=metal julia --project=<env> test/mpi_device_tests.jl
+```
+
+(`TREEAMR_TEST_RANKS`, default `"2 3"`; `TREEAMR_TEST_T`;
+`TREEAMR_TEST_DEVICEAWARE=1` for the direct path). It passed on Metal
+in 1m45 (step 8).
+
 On a fresh clone the test environment has no Manifest; run this once
 first (`Pkg.test` needs nothing, it resolves an environment of its own).
 The same line with `docs` sets up the docs environment, which locates
@@ -87,7 +140,9 @@ though that is not the CI factor, because the action also defaults
 thread-independence test spawns, so those are instrumented too — three
 PIDs write `.cov` files and `julia-processcoverage` merges them per
 source file, which is why a single-threaded cell still sees the
-threaded code paths. The `.cov` files scattered through `src/` are
+threaded code paths. The MPI test's five ranks launch through
+`Base.julia_cmd()` too, so the MPI extension's coverage comes from them
+(not measured in step 9). The `.cov` files scattered through `src/` are
 gitignored; delete them before the next run, because counts from
 separate runs accumulate:
 
@@ -128,7 +183,7 @@ dependency: an application that never checkpoints should not load it.
 Documenter is strict: every docstring in the module must appear in a `@docs`
 block, and every `` [`name`](@ref) `` must resolve, or the build errors out.
 **Adding a documented function means adding it to the API page of its
-layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,io,internals}.md`.
+layer**, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,io,distributed,internals}.md`.
 `docs/src/index.md` is the guide (prose and doctests, plus the status) and
 holds no `@docs` blocks. The split is there because Documenter's HTML writer
 fails the build on any page over 200 KiB (`size_threshold`), and the single
@@ -200,6 +255,40 @@ finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
 cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
 on an H200. CODE.md's M11 entry has the numbers.
 
+`bench/mpi.jl` is M7's weak-scaling smoke test: a fixed number of blocks
+per rank (`TILES` stacked tiles, one a rank), timed in synchronized
+windows, minimum and median; `bench/mpiscan.sh P…` launches each rank
+count through `MPI.mpiexec()` at `TREEAMR_BENCH_THREADS` threads a rank
+and prints the table through `bench/mpitable.awk`
+(`TREEAMR_BENCH_BACKEND`, `TREEAMR_BENCH_DEVICEAWARE`,
+`TREEAMR_BENCH_TILES` for a serial control). `bench/replicated.jl` needs
+no MPI: it simulates rank `P÷2` of `P` in one process to price the
+replicated `O(nleaves)` passes at large leaf counts. CODE.md's M7 step 7
+has both tables (laptop only):
+
+```bash
+TREEAMR_BENCH_N=8 bench/mpiscan.sh 1 2 4
+julia -t 4 --project=test bench/replicated.jl 8 64 512
+```
+
+Three SLURM jobs hold the M7 measurements, all run on 2026-10-02:
+`bench/symmetry_mpi.sh` (weak scaling, one rank per NUMA domain at 8
+threads, 1–4 nodes, plus single-process controls),
+`bench/symmetry_checkpoint_mpi.sh` (checkpoint throughput on BeeGFS: the
+shared file of step 6, then the part files of step 6b, once per `io` in
+`TREEAMR_CKPT_IO`) and `bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
+staged and, with a CUDA-aware system MPI, direct). Each launches
+MPICH_jll through `srun --mpi=pmi2` by default or a system MPI through
+MPIPreferences (`TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`).
+`bench/symmetry_checkpoint_stress.sh` runs `bench/checkpoint_stress.jl`,
+the reproducers of the multi-node checkpoint loss, from
+`save_checkpoint` (now the part-file writer, verified by serial loads on
+two nodes; `STRESS_IO`) down to plain `pwrite`;
+`bench/checkpoint_inspect.jl` and `bench/checkpoint_layout.jl` read a
+damaged shared file of step 6. Nothing in the package writes one file
+from several processes any more; anything that would must be checked
+with them first.
+
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
 runs in the test environment, which has both:
@@ -231,29 +320,36 @@ There is no formatter or linter configured.
 
 ## Architecture
 
-Fourteen source files, included in dependency order from `src/TreeAMR.jl`, plus
-one package extension in `ext/`; each layer uses only the ones before it:
+Fifteen source files, included in dependency order from `src/TreeAMR.jl`, plus
+two package extensions in `ext/`; each layer uses only the ones before it:
 
 | layer | files | what |
 |---|---|---|
 | threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
+| communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
-| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number, where M7's Allreduce will go), `volume_weighted_norm` |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 | interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
-| checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension |
+| checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension — serial HDF5 only, over a distributed forest the I/O groups, part files and index of M7 step 6b, the data moved by the communicator verbs |
 
 The ideas that span several files and are easy to violate:
 
 - **Linear octree, leaf-only data.** `forest.leaves` *is* the tree: no node
   objects, no pointers, no coarse data under refined regions. Block `b` of
-  any `FieldSet` is `forest.leaves[b]`. Block indices are **not** stable
+  any `FieldSet` is `blockkey(fs, b)`, leaf `first(blockrange(forest)) + b
+  - 1`: since M7 step 1 every block index is **local to the rank**, while
+  tree queries (`nleaves`, `find_leaf`, `locate_point`, `neighbor_keys`)
+  stay global. Serially the two coincide, so a site that indexes
+  `forest.leaves` by a block index, or sizes a per-block array by
+  `nleaves`, passes every serial test and is wrong under MPI; walk
+  `blockrange` and size by `nblocks`. Block indices are **not** stable
   across a regrid (slots are compacted), and `FieldSet` is a `mutable struct`
   precisely so that `regrid!` can swap `fs.work` wholesale while callers keep
   their reference.
@@ -335,7 +431,8 @@ The ideas that span several files and are easy to violate:
   integer reduction are bit-identical whatever the thread count.
   Floating-point sums are promised to roundoff only (narrowed after M8,
   so that a device can reduce hierarchically — it does, in two launches
-  with 256 lanes per block and no barrier — and MPI can `Allreduce`);
+  with 256 lanes per block and no barrier — and ranks can fold their own
+  blocks, which M7 does);
   the CPU fold is still one `mapreduce` per block summed in block
   order, and so still exact, which is why `test/thread_tests.jl`'s
   acceptance test — `test/thread_workload.jl` in subprocesses at two
@@ -399,7 +496,95 @@ The ideas that span several files and are easy to violate:
   (`Float32x2` as two `Float32`), named as a Base-only module prints
   them and matched against the loader's `types`. No Julia type
   definition reaches the file, so a converter can read an old file
-  without the old package; do not add JLD2 or `Serialization`.
+  without the old package; do not add JLD2 or `Serialization`. Every
+  file carries CRC-32C checksums — the leaf list's (`leaves_crc32c`)
+  and one per block of each field set (`data_crc32c`), and the index
+  one per part and field set over those — verified on load; HDF5's own
+  Fletcher-32 is deliberately not used (it accepts an all-zero chunk).
+- **No file of a checkpoint has two writers or two openers** (M7 step
+  6b, CODE.md "Checkpoints without parallel I/O"). A shared file
+  written from several nodes through MPI-IO lost data on Symmetry's
+  BeeGFS (step 6), so HDF5 is used serially only and the data travel
+  as messages: the ranks form `k` contiguous I/O groups (`io = :node`,
+  the default, by `commnodes`; `:all`; or a number), each group's first
+  rank writes a part file `path.<saveid>.<j>.h5` from its members'
+  streamed blocks, and rank 0 writes the index (format version 2) last;
+  its rename is the commit point, after which rank 0 removes the
+  previous parts and orphans. Loading, only rank 0 opens the index and
+  broadcasts an in-memory image of it without the data (`bcast`), each
+  part is read by one rank, which sends the blocks to their owners, and
+  every step that runs on some ranks only ends in `agree_errors`, so a
+  failure anywhere throws everywhere and nobody waits on a message. The
+  index's external links to the parts are for tools; the loader must
+  never follow them (that opens the target). One part lives inside the
+  index, so a serial checkpoint is one file; version-1 files (the
+  fixtures in `test/fixtures/`) still load. Do not reintroduce parallel
+  HDF5 or MPI-IO.
+- **The forest is replicated, the blocks are distributed** (M7, CODE.md
+  "Distributed meshes"). Every rank holds `forest.leaves` whole; rank
+  `r` stores the contiguous curve range `blockrange(forest)`
+  (`equalsplit`, the arithmetic `threadchunks` uses one level down), and
+  every block index of a field set is local (the first bullet). Every
+  forest mutation is **collective**: the same call with the same
+  arguments on every rank, which is what keeps the copies equal without
+  a message, since every host pass is deterministic. `GhostSchedule`,
+  `InterfaceSchedule` and `regrid!` check it through
+  `collective_checks` in `forest.jl` (`interpolate` and the checkpoint
+  functions through the same `ForestDigest` and `digest_verdict`): one
+  `allgather` of a
+  `ForestDigest` (generation, `nleaves`, a fold of `hash(key, h)` over
+  every leaf — not `hash(leaves)`, which samples a long vector — the
+  brick, a layout hash and a refusal flag), so a diverged forest, a
+  layout that differs, or an `ArgumentError` on some ranks is refused on
+  all of them together. `fill_ghosts!`'s checks stay rank-local on
+  purpose (a collective per fill would sit on the per-evaluation path);
+  a one-rank refusal there is a hang, never wrong data. Serially nothing
+  is gathered. Any new check that can fire on some ranks only goes
+  through `collective_checks`.
+- **The sender computes; messages are stages of packed buffers.** A
+  transfer whose source and target live on different ranks is evaluated
+  on the source's rank by the one kernel into a packed buffer (a
+  `NamedTuple` `(buf, offsets, dims)` that `transfer_kernel!` reaches
+  through three accessor methods), sent, and unpacked on the target's
+  rank by a width-1, weight-1 transfer that carries the mirrored
+  group's **parity factor**: applied when packing, the factor would
+  turn the serial fill's `−0` into `+0`. Every ordering point of the
+  serial fill is a stage with its own tag — phase 1 (1), each phase-2
+  target level (`2 + ℓ`), each interface dimension (`40 + d`), the
+  regrid (50) — run by `run_stage!` in five steps (post receives, pack
+  and synchronize, send, run the local groups, wait and unpack). Both
+  ends derive a message's layout from the replicated forest, sorted by
+  `keyorder`, so no descriptor is ever sent and `Dict` order must never
+  reach a layout. Device buffers are staged through page-locked host
+  mirrors unless `communicator(comm; deviceaware = true)` (`hoststaging`).
+  Stage buffers and mirrors are **leased from the forest's buffer pool**
+  (`bufferpool(forest)`, in `forest.state` beside the generation): the
+  regrid stage releases its leases after its sends are waited on, and a
+  schedule's are reclaimed once the generation has moved on, so a
+  regrid reuses what earlier stages held instead of allocating and
+  page-locking it again. A lease is an `Array` (`Base.wrap` over pooled
+  `Memory`) or a contiguous device `view`, never a `SubArray` of host
+  memory. Do not add a field to `Forest`: put mutable state in
+  `ForestState` (a ninth field made the schedule build allocate more).
+  MPI is called from the calling task only, never in a threaded loop or
+  kernel, and needs `THREAD_SERIALIZED`.
+- **Reductions are an allgather of per-rank partials**, folded in rank
+  order on every rank (`combine_blocks` in `state.jl`, the only site),
+  not an `Allreduce`: the association is the package's, so every rank
+  gets the same bits, any `op` and `isbits` partial works (MPI.jl
+  refuses custom operators off Intel), and one rank is exactly serial. An
+  empty rank contributes nothing, not `init`. `block_mapreduce` and
+  `firing_boxes` stay per local block; a number combined from them is
+  rank-local, which is the downstream hazard the step-9 audit found
+  everywhere (CODE.md, M7 step 9).
+- **MPI is a weak dependency** (`[weakdeps]`, `[compat]` 0.20), like
+  HDF5: `src/` never names MPI and never branches on it — a serial run
+  takes the distributed code path with every message empty, and the
+  serial suite is its test. Do not make MPI a hard dependency, do not
+  call MPI from `src/`, and do not use `MPI.Comm_dup` (MPI.jl's attaches
+  a finalizer that frees collectively at different moments on each
+  rank; the extension calls `MPI.API.MPI_Comm_dup` and caches one
+  duplicate per communicator, checked with `MPI_Comm_compare`).
 
 Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 (`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
@@ -420,16 +605,57 @@ ghost slab.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`interpolate_tests.jl` (M11), `interface_tests.jl`,
+`interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
+M7 files `partition_tests.jl`, `exchange_tests.jl`,
+`regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
-`wave_cell_tests.jl`, `burgers_tests.jl`, `type_tests.jl`,
-`checkpoint_tests.jl` (M9a), `thread_tests.jl`, `gpu_tests.jl` (M2–M8).
+`wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`, `type_tests.jl`,
+`checkpoint_tests.jl` (M9a), `thread_tests.jl`, `mpi_tests.jl` (M7) and
+`gpu_tests.jl` (M2–M8).
+
+The M7 tests come in two kinds. **In process**, simulated ranks over
+test-only communicators, each answering only the verbs its test needs:
+`PartitionCommunicator(rank, size)` (`partition_tests.jl`: rank and size,
+and the digest gather by replication) for the partition and each rank's
+local schedule; `exchange_tests.jl`'s lockstep, which builds every
+simulated rank's stages and wires their buffers directly, for the
+classification, the layouts, write-once and the bitwise pack/unpack
+round trip (the `−0` parity case included), and its
+`MailboxCommunicator`, one task per rank with a channel per message,
+for the staged driver itself; `regrid_exchange_tests.jl`'s
+`GatherCommunicator` (collectives as rendezvous between the tasks, the
+mailbox for messages) for `regrid!`, `adapt_to_initial_data!`, the
+per-rank buffer search and the refusals, and its `StagingCommunicator`
+for the host-mirror path; `interpolate_exchange_tests.jl` over the same
+for routed interpolation. **Over MPI**, `mpi_tests.jl` runs the
+standalone `mpi_workload.jl` serially in process (the reference) and
+under `MPI.mpiexec()` at `-n 3` and `-n 2`, one thread a rank, and
+requires every line byte for byte except the `sum` lines (`rtol =
+1e-12`); `#` lines depend on the rank count and carry the refusals,
+the checkpoint cross loads, the migrations and the negative control,
+each asserted on its own. The launches are compilation-bound (about
+55 s each), so `test/mpi_jobs.jl` starts both at the start of the
+suite where the machine has room (`concurrent_launches`: 8+ threads and
+24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and runs them beside the
+serial reference otherwise; the workload's `TREEAMR_CHECKPOINT_FROM`
+and its marker files order the cross loads either way. Keep
+`mpi_workload.jl` self-contained like `thread_workload.jl`, its
+non-`#` output independent of the rank count, and a new case's lines
+deterministic. `mpi_device_workload.jl` and `mpi_device_tests.jl` are
+its device counterpart, run by hand (see Commands), never by
+`Pkg.test`.
 `checkpoint_tests.jl` checks a bitwise round trip over every centering,
 `Float64`/`Float32`/`Float32x2` and every face kind, restarts of the
 wave and Burgers studies that continue byte for byte through regrids,
-the refusals with their reasons, the atomic write, plain data and
-`checkpoint_environment`; the leaf-list `Forest` it loads through is
-tested inline in `runtests.jl`, against the oracles. The wave
+the refusals with their reasons, the checksums (a damaged block, a
+recomputed one, missing ones), the atomic write and a failing I/O
+process, plain data and `checkpoint_environment`, and that the
+version-1 files in `test/fixtures/` (written by the step-6 writer)
+still load; the leaf-list `Forest` it loads through is tested inline in
+`runtests.jl`, against the oracles. The part files themselves are
+`mpi_workload.jl`'s: saves with `io = :all`, `2` and `:node`, a part
+from another save, a missing part, orphans, a failed I/O process, and
+the `OPEN_LOG` hook showing that no file is opened by two processes. The wave
 study comes in two halves: `wave_tests.jl` is the **vertex-centered**
 one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
 verbatim so its numbers stay under test. `imex_tests.jl` runs the wave
@@ -439,7 +665,7 @@ from `threadchunks`; it also asserts that a stage limiter's correction
 never reaches the state (the drift of a conserved total is the step
 limiter's injection) and that OrdinaryDiffEq's Shu–Osher SSPRK33 is
 different there. Its names clash with OrdinaryDiffEq's (`RK4`,
-`SSPRK33`), so it uses `import IMEXRungeKutta as IRK`. Five helper
+`SSPRK33`), so it uses `import IMEXRungeKutta as IRK`. Seven helper
 files are not tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
@@ -472,6 +698,15 @@ files are not tests:
   for byte. It is deliberately self-contained (its own RK4 and SSPRK3, no
   ODE package) so a subprocess starts in a couple of seconds; keep it that
   way, and keep everything it prints deterministic.
+- `mpi_workload.jl` — the M7 counterpart, standalone too: the argument
+  `mpi` makes its forests distributed over `MPI.COMM_WORLD`, and rank 0
+  prints the digests gathered in block order. `mpi_tests.jl` also runs
+  it in process, in a module of its own, printing into the `IOBuffer`
+  it defines as `WORKLOAD_IO`.
+- `mpi_jobs.jl` — the launcher of those `mpiexec` jobs
+  (`launch_workload`, `finish_workload`, `concurrent_launches`), which
+  `runtests.jl` includes before the first test so that the jobs can
+  start early.
 
 Testset names are claims ("Coarsening conserves any field exactly", not
 "coarsening test"), and each opens with a comment naming the failure mode it
@@ -570,6 +805,18 @@ of the *public API only*. Facts that matter here:
   beside TreeAMR loads the extension, and nothing else is needed. It
   calls none of the checkpoint functions yet. Against the M9a checkout
   its suite is unchanged, 310 tests in 1m12 (2026-09-29).
+- **M7 reaches it with the next release and changes nothing serially**:
+  310 tests in 1m22 against the M7 checkout (2026-10-02). It does not
+  pass `comm` to any `Forest` yet, so under `mpiexec` each rank would
+  run a whole serial copy. Once it does, the step-9 audit (CODE.md, M7
+  step 9) found what would go wrong: `field_scales`
+  (`src/refinement.jl:112`) takes `maximum(block_mapreduce(…))`, a
+  per-rank scale, so the mesh would depend on the rank count and an
+  empty rank would throw; `blast_coverage` (`src/blast.jl:281–295`) and
+  `track_pulse`'s tracking measure (`src/supergaussian.jl:188–195`) are
+  rank-local; `bin/`'s viewers would draw one rank's blocks. The fix is
+  `mesh_mapreduce`. It indexes nothing by a global `b` and sizes
+  nothing by `nleaves`.
 - Its `CLAUDE.md` and `CODE.md` record API sharp edges found from the
   outside — a keyword named `maxlevel` shadows the exported
   `maxlevel(forest)` inside a function body; `coordinates` taking stored
@@ -644,12 +891,30 @@ nothing here. Its `bin/`, like TreeWave's, is run by its CI's `viewer`
 job rather than by `Pkg.test`.
 
 **Checkpointing (M9a) is what its long runs were waiting for**, and it
-reaches TreeHydro with 0.1.4, through `using HDF5`. The restart itself is TreeHydro's to write, and is not
-started. The plan (2026-09-29) saves at the start of a chunk, *after*
+reaches TreeHydro with 0.1.4, through `using HDF5`. The plan (2026-09-29) saves at the start of a chunk, *after*
 the regrid and the atmosphere reset — its observer fires before the
 regrid, so saving there would mean replaying both — with the chunk
 index, the case recipe as Rationals, the `evolve!` keywords and the run
-histories as plain data.
+histories as plain data; its `src/checkpoint.jl` (`run_state`,
+`rotate_checkpoints!`) has since implemented it.
+
+**M7 changes nothing for it serially**: 12447 tests in 5m00 against the
+M7 checkout, at one thread (2026-10-02). It does not pass `comm` to a
+`Forest` yet. Once it does, the step-9 audit found it the most exposed
+of the three, all through five host combinations of `block_mapreduce`
+— `max_signal_speed` (`src/evolution.jl:477`), `floor_hits` (`:505`),
+`ghost_floor_hits` (`:578–585`), `indicator_scales`
+(`src/refinement.jl:189–190`), `peak_compression` (`src/sedov.jl:512`).
+The first is the CFL speed, and `evolve!` takes each chunk's step count
+from it (`src/driver.jl:857–860`), so the ranks would take different
+numbers of steps and hang in the exchange. Its wall-clock checkpoint
+triggers (`src/driver.jl:910–917`) decide per rank whether to enter the
+collective `save_checkpoint`, and its run state carries the rank-local
+counts and speeds, which the plain-data agreement would refuse on every
+rank. The diagnostics (`tracked_share`, `reduce_to_grid`,
+`mode_amplitude`, `shock_radius`, …) are rank-local, and
+`src/kelvinhelmholtz.jl:544` records `nblocks` for the mesh's block
+count. The fixes are `mesh_mapreduce`, and an agreed trigger.
 
 Mesh machinery belongs here; physics belongs there — the same rule as
 for TreeWave.
@@ -661,14 +926,15 @@ is the third application: the vacuum Einstein equations in the
 generalized harmonic formulation, a black hole on the octree. It
 pinned TreeAMR to GitHub `main` through `[sources]` until 2026-09-26,
 when it retired its stopgap interpolator for M11's `interpolate`; since
-then it takes TreeAMR from **General**, `TreeAMR = "0.1.3"` under
-`[compat]`, like the other two, so a change here reaches it only with a
+then it takes TreeAMR from **General**, `TreeAMR = "0.1.4"` under
+`[compat]` since its checkpointing, like the other two, so a change here reaches it only with a
 release. That includes M9a: checkpointing reaches it with 0.1.4,
 through `using HDF5`, together with TreeAMR's new `__init__`
 and the five new exports (none of which clashes with a name of its
 own). Its production runs, estimated at 38–149 h, are one of the
-reasons M9a went before M7; beyond `(t, u)` its restart has to store
-its horizon tracking and interior fits, which is its own work. Every
+reasons M9a went before M7; beyond `(t, u)` its restart stores its
+horizon tracking and interior fits, which its `src/checkpoint.jl` does
+through 0.1.4. Every
 kernel it has goes through `map_blocks!`. Its
 `test/prerequisite_tests.jl` names the four unexported TreeAMR names it
 relies on — `threadchunks` (its integrator's partition) and M11's
@@ -682,3 +948,27 @@ per-`solve` buffers, a first-touch anomaly that looks like NUMA
 balancing, and why not Polyester). Erik decided the same day not to optimise the
 OrdinaryDiffEq path further, Polyester included; what is left open there
 is where limiters go (Shu–Osher against Butcher form).
+
+**M7 changes nothing for it serially**: its full suite takes about 19
+minutes, so step 9 ran a subset against the M7 checkout — `precision_`,
+`prerequisite_`, `stencils_`, `stepping_`, `interface_`, `refinement_`,
+`horizon_`, `checkpoint_` and `type_tests.jl`, 1760 tests in 7m04 at one
+thread, all passing (2026-10-02). Its production runs are the reason M7
+was wanted, and of the three it is the closest to ready: its reductions
+are already `mesh_mapreduce` and its integrator is fixed-step. It does
+not pass `comm` yet (`gh_forest`, `src/initialdata.jl`; `load_run`,
+`src/checkpoint.jl`). The step-9 audit found, for when it does:
+`indicator_flags` hands its local flags to the public `buffered_flags`
+(`src/refinement.jl:739`), which TreeAMR now refuses (step 9 added the
+length check, so this fails loudly instead of buffering the wrong
+leaves) — under MPI the dilation has to come from `regrid!`'s
+`buffer`, which it avoids on purpose so that its level ceiling applies
+after the dilation; `clamp_marks` (`:762`) and
+`refinement_centroid` (`:816`) index `forest.leaves[b]` by a local
+block, and the centroid's sums stay per rank; its wall-clock checkpoint
+triggers (`src/driver.jl:1287–1293`) decide per rank, and its run state
+holds wall-clock fit costs and the per-rank centroids (`:1312`), which
+the plain-data agreement refuses; its non-finite check (`:741`) reads
+the local state, so one rank would throw alone. Its horizon finder
+passing every point on every rank is correct under the collective
+`interpolate`, only redundant.

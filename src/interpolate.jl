@@ -356,9 +356,11 @@ end
 """
     locate_point(forest, x) -> Union{Int,Nothing}
 
-The index into `forest.leaves` — and so the block index of every
-[`FieldSet`](@ref) over `forest` — of the leaf containing the point `x`,
-or `nothing` when `x` is outside the domain.
+The index into `forest.leaves` of the leaf containing the point `x`, or
+`nothing` when `x` is outside the domain. It is a global leaf index, as
+every tree query's is: serially it is also the block index of every
+[`FieldSet`](@ref) over `forest`, and over a distributed forest the
+block is stored by the rank whose [`blockrange`](@ref) contains it.
 
 Leaves own half-open boxes, so a point on a face shared by two leaves
 belongs to the upper one; a point on the domain's upper face belongs to
@@ -398,11 +400,19 @@ end
 end
 
 # The whole of one query, written into slot `j` of the outputs.
+#
+# `leaves` is the whole leaf array, replicated on every rank, so the
+# search answers in global leaf indices, which is what `blocks[j]`
+# records. `origins`, `spacings` and `work` are per local block, and
+# `boffset` is the global index of the leaf before this rank's first
+# block: zero serially, where the two coincide, and under M7 the shift a
+# point routed to the owner of its block takes to reach it ("Point
+# interpolation" under "Distributed meshes" in CODE.md).
 @inline function interpolate_point!(values, excluded, blocks, xs, leaves, origins,
                                     spacings, work, factors, vars, region, basis,
                                     g::PointGeometry{D,T}, derivs::NTuple{K},
                                     ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
-                                    j) where {D,T,K,M,G,C,S}
+                                    boffset, j) where {D,T,K,M,G,C,S}
     x, fold, ok = fold_point(g, xs[j])
     if !ok
         blocks[j] = 0
@@ -410,6 +420,7 @@ end
     end
     b = locate_leaf(leaves, g, x)
     blocks[j] = b
+    b -= boffset
     origin = origins[b]
     h = spacings[b]
     n = stencilwidth(basis)
@@ -463,7 +474,8 @@ end
             for i1 in 1:n
                 # In bounds by construction: the start is clamped into
                 # `1 : S − n + 1` in every dimension (`query_stencil`), and
-                # `b` is a leaf index. As in `stencil_sum`, a CI run with
+                # `b` is a local block: a point is evaluated on the rank
+                # that owns the block it lies in. As in `stencil_sum`, a CI run with
                 # `check_bounds = yes` still checks it.
                 @inbounds u = work[vcorner + rowoff[jr] + (i1 - 1)]
                 r = row_update(r, W[1], i1, u)
@@ -528,11 +540,11 @@ end
                                      @Const(leaves), @Const(origins), @Const(spacings),
                                      @Const(work), factors, @Const(vars), region, basis,
                                      g, ::Val{DV}, ::Val{M}, ::Val{G}, ::Val{C},
-                                     ::Val{S}) where {DV,M,G,C,S}
+                                     ::Val{S}, boffset) where {DV,M,G,C,S}
     j = @index(Global, Linear)
     interpolate_point!(values, excluded, blocks, xs, leaves, origins, spacings, work,
                        factors, vars, region, basis, g, DV, Val(M), Val(G),
-                       Val(C), Val(S), j)
+                       Val(C), Val(S), boffset, j)
 end
 
 # --- the driver --------------------------------------------------------------
@@ -641,12 +653,39 @@ raised once the whole batch has run.
 Every query writes only its own slots, so the result does not depend on
 the thread count. The batch is one kernel launch; see "Point
 interpolation" in `CODE.md`.
+
+**Over a distributed forest** (M7) the call is collective: every rank
+calls it with the same field set, basis, `derivs`, `vars` and
+`exclude`, and with *its own* points — any number, none included — and
+gets the answers for its own points, in its own order. Each point is
+located on the calling rank, sent to the rank that stores its block,
+evaluated there by the same kernel as serially and sent back, so every
+value and flag is bit for bit the serial one, whatever the number of
+ranks. A point outside the domain on any rank is refused on every rank
+together, before anything is sent: the rank that passed it names it,
+and the others name the first rank that did. So is an argument that
+some ranks' checks refuse, or `derivs`, `vars`, `exclude` or the basis
+differing between ranks. A device backend's points and results go
+through the host for the messages (see "Distributed meshes" in
+`CODE.md`).
 """
 function interpolate(fs::FieldSet{T,D}, xs::AbstractArray, basis::InterpolationBasis;
                      derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
                      exclude=nothing) where {T,D}
     backend = get_backend(fs.work)
-    ms = check_derivs(basis, derivs, Val(D))
+    ms = if isdistributed(fs.forest)
+        # Over a distributed forest a refusal must reach `interpolate!`,
+        # where the ranks agree on it, rather than be raised here on some
+        # ranks only while the others wait in the gather.
+        try
+            check_derivs(basis, derivs, Val(D))
+        catch err
+            err isa ArgumentError || rethrow()
+            derivs isa Tuple ? derivs : ()
+        end
+    else
+        check_derivs(basis, derivs, Val(D))
+    end
     values = allocate(backend, T, (length(vars), length(ms), length(xs)))
     excluded = allocate(backend, Bool, length(xs))
     interpolate!(values, excluded, fs, xs, basis; derivs=ms, vars=vars, exclude=exclude)
@@ -658,12 +697,35 @@ end
 
 [`interpolate`](@ref) into caller-supplied outputs: `values` of size
 `(length(vars), length(derivs), length(xs))` and `excluded` of length
-`length(xs)`, both on the field set's backend.
+`length(xs)`, both on the field set's backend. Collective over a
+distributed forest, as `interpolate` is.
 """
 function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet{T,D},
                       xs::AbstractArray, basis::InterpolationBasis;
                       derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
                       exclude=nothing) where {T,D}
+    isdistributed(fs.forest) &&
+        return interpolate_distributed!(values, excluded, fs, xs, basis, derivs, vars,
+                                        exclude)
+    ms = check_interpolation(values, excluded, fs, xs, basis, derivs, vars)
+    npts = length(xs)
+    npts == 0 && return values, excluded
+    blocks = launch_interpolation!(values, excluded, fs, xs, PointGeometry(T, fs.forest),
+                                   basis, ms, vars, exclude, 0)
+
+    # Reduced where the indices are, so that a device batch copies back one
+    # flag rather than an index per point; only a batch that has an
+    # outside point pays for finding which.
+    if any(iszero, blocks)
+        j = findfirst(iszero, tohost(blocks))
+        throw(outside_error(fs, tohost(xs)[j], j))
+    end
+    return values, excluded
+end
+
+# Every argument check of `interpolate!`, returning the checked `derivs`.
+function check_interpolation(values, excluded, fs::FieldSet{T,D}, xs, basis, derivs,
+                             vars) where {T,D}
     ms = check_derivs(basis, derivs, Val(D))
     check_stencil_fits(fs, basis)
     all(v -> 1 <= v <= fs.nvars, vars) || throw(ArgumentError(
@@ -688,10 +750,17 @@ function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldS
             "a point in a $D-dimensional field set has $D coordinates, got " *
             "$(length(first(xs)))"))
     end
-    npts == 0 && return values, excluded
+    return ms
+end
 
+# The one launch over the points `xs`, on the field set's backend, with
+# the block offset of this rank (zero serially). Returns the global leaf
+# index each point was located in, `0` for a point outside the domain.
+function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, xs, g, basis, ms,
+                               vars, exclude, boffset::Int) where {T,D}
     forest = fs.forest
-    g = PointGeometry(T, forest)
+    backend = get_backend(fs.work)
+    npts = length(xs)
     # Uploaded per call: this is an analysis-cadence operation, and on the
     # CPU the leaves are not copied at all.
     leaves = todevice(backend, forest.leaves)
@@ -715,15 +784,164 @@ function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldS
               interpolate_kernel!(backend)
     kernel!(values, excluded, blocks, xs, leaves, origins, spacings, fs.work,
             fs.factors, vs, region, basis, g, Val(ms), Val(M), Val(fs.G),
-            Val(staggers(fs)), Val(S); ndrange=npts)
+            Val(staggers(fs)), Val(S), boffset; ndrange=npts)
     synchronize(backend)
+    return blocks
+end
 
-    # Reduced where the indices are, so that a device batch copies back one
-    # flag rather than an index per point; only a batch that has an
-    # outside point pays for finding which.
-    if any(iszero, blocks)
-        j = findfirst(iszero, tohost(blocks))
-        throw(outside_error(fs, tohost(xs)[j], j))
+# --- over a distributed forest (M7) ------------------------------------------
+#
+# Each rank passes its own points. They are located on the host, against
+# the replicated leaves, which gives each point's global leaf and so its
+# owner; an `alltoallv` sends every point to the owner of its block, the
+# owner runs the kernel above over what it received, with its block
+# offset, and a second `alltoallv` — a third with an `exclude` region —
+# returns the answers, which are put back in the caller's order. A point
+# reaches the kernel as the `NTuple{D,T}` the serial kernel converts it
+# to first, so the owner folds, locates and interpolates it exactly as a
+# serial call does, and the value is the serial one bit for bit.
+#
+# Before anything is sent, one `allgather` agrees on what a refusal on
+# some ranks would otherwise leave hanging: each rank's argument checks,
+# a cheap forest check (the generation and the leaf count), a hash of
+# the arguments that must agree, and the rank's first outside point.
+
+# Fold, convert and locate this rank's points on the host: the points as
+# the kernel will read them, and each one's global leaf, `0` outside.
+function locate_on_host(forest::Forest, g::PointGeometry{D,T}, xh) where {D,T}
+    n = length(xh)
+    for j in 1:n
+        length(xh[j]) == D || throw(ArgumentError(
+            "a point in a $D-dimensional field set has $D coordinates, got " *
+            "$(length(xh[j])) (point $j)"))
+    end
+    pts = Vector{NTuple{D,T}}(undef, n)
+    leafof = Vector{Int}(undef, n)
+    leaves = forest.leaves
+    locate!(j) = begin
+        p = ntuple(d -> T(xh[j][d]), Val(D))
+        pts[j] = p
+        xf, _, ok = fold_point(g, p)
+        leafof[j] = ok ? locate_leaf(leaves, g, xf) : 0
+        nothing
+    end
+    # A search is some tens of nanoseconds, so a batch the size of a
+    # horizon finder's is not worth a task per thread.
+    if n < HOST_LOCATE_THREADED
+        foreach(locate!, 1:n)
+    else
+        threaded_foreach(locate!, n)
+    end
+    return pts, leafof
+end
+
+const HOST_LOCATE_THREADED = 4096
+
+# The agreed verdict on outside points, from every rank's first one. A
+# rank that passed one raises the serial error for it; every other rank
+# names the first rank that did, so that all of them throw together.
+function outside_verdict(fs::FieldSet, gathered, rank::Integer, own)
+    bad = [r - 1 for r in eachindex(gathered) if gathered[r][2] > 0]
+    isempty(bad) && return nothing
+    which = "rank(s) $(join(bad, ", ")) of $(length(gathered))"
+    if own !== nothing
+        x, j = own
+        throw(ArgumentError(
+            outside_error(fs, x, j).msg * " The call is collective, and $which passed " *
+            "a point outside the domain, so it is refused on every rank."))
+    end
+    r = first(bad)
+    _, j, x = gathered[r + 1]
+    throw(ArgumentError(
+        "interpolate is refused on every rank, this one (rank $rank) included, since " *
+        "$which passed a point outside the domain. On rank $r, " *
+        outside_error(fs, x, j).msg))
+end
+
+function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, xs, basis,
+                                  derivs, vars, exclude) where {T,D}
+    forest = fs.forest
+    comm = forest.comm
+    rank, P = commrank(comm), commsize(comm)
+    npts = length(xs)
+    g = PointGeometry(T, forest)
+    ms, layout, refusal = nothing, UInt(0), nothing
+    pts, leafof = NTuple{D,T}[], Int[]
+    try
+        ms = check_interpolation(values, excluded, fs, xs, basis, derivs, vars)
+        # What every rank must pass alike, since an owner evaluates the
+        # points it receives with its own arguments.
+        layout = layouthash(string(basis), ms, collect(Int, vars),
+                            string(convertregion(T, exclude)), fs.nvars, fs.G,
+                            fs.centering, T, nameof(typeof(get_backend(fs.work))))
+        pts, leafof = locate_on_host(forest, g, tohost(xs))
+    catch err
+        err isa ArgumentError || rethrow()
+        refusal = err
+    end
+    outside = something(findfirst(iszero, leafof), 0)
+    x0 = outside > 0 ? pts[outside] : ntuple(_ -> zero(T), Val(D))
+    # Not the full forest digest: its fold over every leaf is `O(nleaves)`,
+    # which at analysis cadence would cost as much as the interpolation.
+    digest = ForestDigest(generation(forest), nleaves(forest), UInt(0), UInt(0), layout,
+                          refusal !== nothing)
+    gathered = allgather(comm, (digest, outside, x0))
+    digest_verdict(map(first, gathered), "interpolate", rank, refusal)
+    outside_verdict(fs, gathered, rank, outside > 0 ? (tohost(xs)[outside], outside) :
+                                        nothing)
+
+    # Route: a stable counting sort by owner, so that each owner receives
+    # a caller's points in the caller's order.
+    nl = nleaves(forest)
+    counts = zeros(Int, P)
+    owners = Vector{Int}(undef, npts)
+    for j in 1:npts
+        o = equalsplit_part(nl, P, leafof[j])
+        owners[j] = o
+        counts[o] += 1
+    end
+    next = cumsum([1; counts[1:(end - 1)]])
+    perm = Vector{Int}(undef, npts)
+    for j in 1:npts
+        o = owners[j]
+        perm[next[o]] = j
+        next[o] += 1
+    end
+    received, rcounts = alltoallv(comm, pts[perm], counts)
+
+    # Evaluate what this rank received, over its own blocks.
+    backend = get_backend(fs.work)
+    owned = blockrange(forest)
+    nv, K, nrecv = length(vars), length(ms), length(received)
+    rvalues = allocate(backend, T, (nv, K, nrecv))
+    rexcluded = allocate(backend, Bool, nrecv)
+    if nrecv > 0
+        blocks = launch_interpolation!(rvalues, rexcluded, fs, todevice(backend, received),
+                                       g, basis, ms, vars, exclude, first(owned) - 1)
+        all(b -> b in owned, tohost(blocks)) || error(
+            "rank $rank received a point that it locates outside its own blocks " *
+            "$owned: the ranks' forests differ, which every collective mutation is " *
+            "meant to prevent")
+    end
+
+    # Answer: each owner's segment goes back to the rank that asked, which
+    # receives them in owner order, the order of `perm`.
+    back, _ = alltoallv(comm, vec(tohost(rvalues)), rcounts .* (nv * K))
+    answers = reshape(back, nv, K, npts)
+    out = values isa Array ? values : Array{T}(undef, size(values))
+    for (i, j) in enumerate(perm), k in 1:K, iv in 1:nv
+        out[iv, k, j] = answers[iv, k, i]
+    end
+    out === values || copyto!(values, out)
+    if exclude === nothing
+        fill!(excluded, false)
+    else
+        flags, _ = alltoallv(comm, tohost(rexcluded), rcounts)
+        ex = Vector{Bool}(undef, npts)
+        for (i, j) in enumerate(perm)
+            ex[j] = flags[i]
+        end
+        copyto!(excluded, ex)
     end
     return values, excluded
 end

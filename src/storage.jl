@@ -112,7 +112,10 @@ including their ghosts,
 
 Cell indices vary fastest (so a GPU reads them coalesced), then the
 variable index, then the block index; blocks are ordered by the forest's
-Morton key order, so `forest.leaves[b]` is the key of block `b`.
+Morton key order, so [`blockkey`](@ref)`(fs, b)` is the key of block `b`.
+Over a distributed forest (M7) the array holds this rank's blocks only,
+the leaves of [`blockrange`](@ref), and `b` is a **local** block index;
+serially that is every leaf, and `forest.leaves[b]` is the same key.
 
 `G` is the **ghost width, per dimension**, and it lives here rather than
 on the forest (amended in M8): it says how far a stencil reaches into a
@@ -242,7 +245,7 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     parities = parities_of(parity, forest, Int(nvars))
     factors = hasreflecting(forest) ?
               todevice(backend, parityfactors(T, parities, Val(D))) : nothing
-    work = allocate(backend, T, (stored..., Int(nvars), nleaves(forest)))
+    work = allocate(backend, T, (stored..., Int(nvars), length(blockrange(forest))))
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
@@ -352,16 +355,21 @@ KernelAbstractions.get_backend(fs::FieldSet) = get_backend(fs.work)
 """
     nblocks(fs::FieldSet)
 
-The number of blocks stored — one per leaf of the underlying forest.
+The number of blocks stored — one per leaf of the underlying forest, or
+over a distributed forest one per leaf of this rank's
+[`blockrange`](@ref). Every per-block array is sized by this, and never
+by [`nleaves`](@ref), which counts the leaves of every rank.
 """
 nblocks(fs::FieldSet) = size(fs.work, ndims(fs.work))
 
 """
     blockkey(fs::FieldSet, b::Integer)
 
-The [`MortonKey`](@ref) of block `b`.
+The [`MortonKey`](@ref) of local block `b`: leaf
+`first(blockrange(fs.forest)) + b - 1`, which serially is
+`fs.forest.leaves[b]`.
 """
-blockkey(fs::FieldSet, b::Integer) = fs.forest.leaves[b]
+blockkey(fs::FieldSet, b::Integer) = fs.forest.leaves[blockrange(fs.forest)[b]]
 
 """
     blockview(fs::FieldSet, b::Integer)
@@ -635,6 +643,9 @@ end
 function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
+    # A rank without blocks has no point to check the callback at, and
+    # nothing to fill.
+    nblocks(fs) == 0 && return fs
     check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))

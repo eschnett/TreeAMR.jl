@@ -1,3 +1,20 @@
+# The mutable part of a forest. `pool` holds the message buffers of the
+# exchanges over the forest between the stages that use them: a regrid
+# builds new stages, and they take their buffers, and host mirrors, from
+# it instead of allocating them again (`BufferPool`). It is made on first
+# use, so a serial forest, whose stages have no messages, never has one.
+mutable struct ForestState
+    generation::Int
+    pool::Union{Nothing,BufferPool}
+end
+ForestState() = ForestState(0, nothing)
+
+function bufferpool(forest)
+    state = forest.state
+    state.pool === nothing && (state.pool = BufferPool())
+    return state.pool::BufferPool
+end
+
 """
     Forest{D,T}
 
@@ -37,7 +54,7 @@ Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
     Forest(roots; N, periodic=all false, reflecting=all false,
-           extents=one unit per root, leaves=nothing)
+           extents=one unit per root, leaves=nothing, comm=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
 
 Without `leaves` the forest starts as its unrefined roots. With it, it
@@ -49,6 +66,14 @@ built over a forest trusts its leaves, so the list is refused unless
 every key lies in the brick, the keys strictly increase, they tile the
 brick exactly — no gap, no overlap — and they are 2:1 balanced (see
 [`balance!`](@ref)).
+
+`comm` is the communicator the forest is distributed over (M7), as
+[`communicator`](@ref) converts it; `nothing`, the default, is a serial
+forest. Every rank holds the whole forest, and the field data of a
+[`FieldSet`](@ref) over it are split by [`blockrange`](@ref): each rank
+stores the blocks of one contiguous run of the leaves. Every forest
+mutation is then collective — the same call with the same arguments on
+every rank. See "Distributed meshes" in `CODE.md`.
 
 # Examples
 
@@ -68,12 +93,24 @@ struct Forest{D,T}
     extents::NTuple{D,Tuple{T,T}}
     N::Int
     leaves::Vector{MortonKey{D}}
-    # Bumped whenever the leaf array changes, so anything derived from
-    # the tree (a GhostSchedule, say) can detect in O(1) that it is
-    # stale — a same-size refine-then-coarsen would otherwise slip past
-    # a leaf-count check and silently transfer the wrong data.
-    generation::Base.RefValue{Int}
+    # What changes while the fields above stay: the generation, bumped
+    # whenever the leaf array changes, so anything derived from the tree
+    # (a GhostSchedule, say) can detect in O(1) that it is stale — a
+    # same-size refine-then-coarsen would otherwise slip past a
+    # leaf-count check and silently transfer the wrong data — and the
+    # message-buffer pool (M7). One mutable object for both, in place of
+    # the `Ref` the generation had, so that the struct stays as large as
+    # it was: a ninth field made the schedule build allocate more
+    # (CODE.md, "The buffer pool").
+    state::ForestState
+    # The processes the field data are split over (M7). Abstract-typed
+    # on purpose, so that `Forest{D,T}` keeps its two parameters and no
+    # `FieldSet` or schedule signature downstream changes; the price is
+    # a dynamic dispatch per verb, a few per ghost fill and none in a
+    # kernel ("Distributed meshes" in CODE.md).
+    comm::Communicator
 end
+
 
 # `G` is still accepted as a keyword so that the move can be reported
 # instead of surfacing as a bare `MethodError` on an unrecognised
@@ -98,7 +135,7 @@ function Forest{T}(roots::NTuple{D,Integer};
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
                    leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
-                   G=nothing) where {T,D}
+                   comm=nothing, G=nothing) where {T,D}
     G === nothing || throw(no_forest_ghosts)
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
     N > 0 || throw(ArgumentError("N must be positive, got $N"))
@@ -135,7 +172,8 @@ function Forest{T}(roots::NTuple{D,Integer};
         # array in place, which must never reach the caller's vector.
         list = collect(MortonKey{D}, leaves)
     end
-    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, Ref(0))
+    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, ForestState(),
+                         communicator(comm))
     leaves === nothing || check_leaves(forest)
     return forest
 end
@@ -149,16 +187,16 @@ function Forest(roots::NTuple{D,Integer};
                 reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
                 leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
-                G=nothing) where {D}
+                comm=nothing, G=nothing) where {D}
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
         return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                               leaves=leaves)
+                               leaves=leaves, comm=comm)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
     return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                     extents=extents, leaves=leaves)
+                     extents=extents, leaves=leaves, comm=comm)
 end
 
 # Validate a caller's leaf list (the `leaves` keyword), already copied
@@ -299,15 +337,191 @@ A counter bumped on every change to the leaf array. Structures derived
 from the tree record it so they can tell in O(1) whether they are still
 valid — see [`GhostSchedule`](@ref).
 """
-generation(forest::Forest) = forest.generation[]
+generation(forest::Forest) = forest.state.generation
 
 """
     nleaves(forest::Forest)
 
-The number of leaves currently tiling `forest`; equivalently the number
-of blocks a [`FieldSet`](@ref) over it stores.
+The number of leaves currently tiling `forest` — all of them, on every
+rank. Serially that is also the number of blocks a [`FieldSet`](@ref)
+over it stores; over a distributed forest a field set stores the
+`length(blockrange(forest))` blocks of this rank (see
+[`blockrange`](@ref)), so a per-block array is sized by
+[`nblocks`](@ref), never by `nleaves`.
 """
 nleaves(forest::Forest) = length(forest.leaves)
+
+"""
+    blockrange(forest::Forest) -> UnitRange{Int}
+
+The leaves whose blocks this rank stores: a contiguous range of
+`1:nleaves(forest)`, in curve order. Local block `b` of every
+[`FieldSet`](@ref) over `forest` is leaf `first(blockrange(forest)) + b - 1`,
+which is what [`blockkey`](@ref) returns.
+
+The ranges of the ranks tile `1:nleaves(forest)` in rank order, and their
+lengths differ by at most one, the longer ones first — the same
+equal-count arithmetic that splits a rank's blocks over its threads
+(`CODE.md`, "Distributed meshes"). Every block costs the same under one
+global time step, so equal counts are equal work. A rank beyond the
+number of leaves owns none, which is allowed. Serially this is
+`1:nleaves(forest)`, and local and global block indices coincide.
+"""
+blockrange(forest::Forest) =
+    equalsplit(nleaves(forest), commsize(forest.comm), commrank(forest.comm) + 1)
+
+# The rank whose blocks include global leaf `i` (M7): the inverse of
+# `blockrange`, from the same split arithmetic.
+leafowner(forest::Forest, i::Integer) =
+    equalsplit_part(nleaves(forest), commsize(forest.comm), Int(i)) - 1
+
+# The leaves outside `range` that touch a leaf inside it, as ascending
+# global leaf indices: the union of `neighbor_keys` over every direction
+# around the leaves of `range`. These are the *candidate remote targets*
+# of a distributed schedule (M7): adjacency is mutually discoverable, so
+# a leaf of another rank whose ghosts read one of this rank's blocks is
+# found from that block across some direction. Kept here because it is
+# brick knowledge, as `neighbor_keys` is. Empty when `range` is every
+# leaf, which is the serial case, without a search.
+function remote_neighbors(forest::Forest{D}, range::UnitRange{Int}) where {D}
+    length(range) == nleaves(forest) && return Int[]
+    dirs = alldirections(Val(D))
+    found = threaded_collect(Int, length(range)) do hits, i
+        k = forest.leaves[first(range) + i - 1]
+        for δ in dirs, nbr in neighbor_keys(forest, k, δ)
+            j = find_leaf(forest, nbr)::Int
+            j in range || push!(hits, j)
+        end
+    end
+    return unique!(sort!(found))
+end
+
+# Whether the forest's field data are split over more than one rank:
+# what takes the distributed path of an operation that has one.
+isdistributed(forest::Forest) = commsize(forest.comm) > 1
+
+# --- The forest digest (M7) ----------------------------------------------
+#
+# Every forest mutation is collective, and every host pass is a
+# deterministic function of its inputs, so the ranks' forests agree
+# without a message — as long as the application kept the contract.
+# What would go wrong *silently* on a forest that diverged is checked:
+# a schedule build gathers every rank's digest and refuses, on every
+# rank together, if any differs ("Every forest mutation is collective"
+# in CODE.md). The digest is the generation, the leaf count, a fold of
+# every leaf's hash — not `hash(forest.leaves)`, which for a long
+# vector samples only some of the elements — and the brick. Beside it
+# goes a hash of the layout the build is for, since a rank that built
+# its stencils from other operators would deliver wrong ghosts as
+# silently, and a flag saying whether this rank's own argument checks
+# refused. Every hash here is of integers and strings, never of a
+# `Symbol` or an object identity, which differ between processes.
+struct ForestDigest
+    generation::Int
+    nleaves::Int
+    leaves::UInt
+    brick::UInt
+    layout::UInt
+    refused::Bool
+end
+
+function ForestDigest(forest::Forest, layout::UInt, refused::Bool)
+    h = hash(nleaves(forest))
+    for k in forest.leaves
+        h = hash(k, h)
+    end
+    brick = hash(string((forest.roots, forest.N, forest.periodic, forest.reflecting,
+                         forest.extents)))
+    return ForestDigest(generation(forest), nleaves(forest), h, brick, layout, refused)
+end
+
+sameforest(a::ForestDigest, b::ForestDigest) =
+    (a.generation, a.nleaves, a.leaves, a.brick) == (b.generation, b.nleaves, b.leaves,
+                                                     b.brick)
+
+# A hash of the values a build's layout is made of, for the digest.
+layouthash(values...) = hash(string(values))
+
+# Agree, across the ranks, that `what` may go ahead: one `allgather` of
+# the digest, then the same verdict on every rank. `refusal` is this
+# rank's own argument error, if its checks refused; a rank that refused
+# throws its own, and every other rank says which ranks refused, so no
+# rank goes on to wait in an exchange the others never enter. Serially
+# nothing is gathered and the refusal, if any, is thrown as it is.
+function agree_on_forest(forest::Forest, what::AbstractString;
+                         layout::UInt=UInt(0), refusal=nothing)
+    comm = forest.comm
+    if commsize(comm) == 1
+        refusal === nothing || throw(refusal)
+        return nothing
+    end
+    digests = allgather(comm, ForestDigest(forest, layout, refusal !== nothing))
+    return digest_verdict(digests, what, commrank(comm), refusal)
+end
+
+# The verdict on the gathered digests, apart from the gathering so that
+# it can be tested in one process.
+function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
+                        rank::Integer, refusal=nothing)
+    nranks = length(digests)
+    refused = [r - 1 for r in 1:nranks if digests[r].refused]
+    if !isempty(refused)
+        refusal === nothing || throw(refusal)
+        throw(ArgumentError(
+            "$what was refused on rank(s) $(join(refused, ", ")) of $nranks, and so " *
+            "on this one (rank $rank) too: the call is collective, and a rank that " *
+            "went on would wait for the others in its first exchange. The reason is " *
+            "in the error on rank $(first(refused)); the arguments evidently differ " *
+            "between ranks, which they must not."))
+    end
+    first_ = digests[1]
+    diverged = [r - 1 for r in 2:nranks if !sameforest(digests[r], first_)]
+    if !isempty(diverged)
+        describe(r) = (d = digests[r + 1];
+                       "rank $r has generation $(d.generation) and $(d.nleaves) leaves")
+        throw(ArgumentError(
+            "the forest differs between ranks, so $what is refused on every rank: " *
+            "$(describe(0)), but rank(s) $(join(diverged, ", ")) hold a different " *
+            "one ($(join(describe.(diverged), "; "))). Every forest mutation — the " *
+            "constructors, refine!, coarsen!, balance! and regrid! — is collective: " *
+            "the same call with the same arguments on every rank. Over forests that " *
+            "differ, the ranks would exchange the wrong data without noticing."))
+    end
+    mismatched = [r - 1 for r in 2:nranks if digests[r].layout != first_.layout]
+    isempty(mismatched) || throw(ArgumentError(
+        "$what was called for a different layout on rank(s) " *
+        "$(join(mismatched, ", ")) than on rank 0, so it is refused on every rank: " *
+        "the ghost widths, the centering, the operators and the element type must " *
+        "be the same everywhere (for regrid!, so must the field sets passed, their " *
+        "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
+        "`derivs`, `vars` and `exclude`; for save_checkpoint and load_checkpoint, " *
+        "the path and every keyword but `data`, and for write_plain the item's " *
+        "name), since a rank computes the data it sends with its own stencils and " *
+        "lays out what it receives by its own, and the ranks of a checkpoint send " *
+        "and receive its blocks by the layout each derives from its arguments."))
+    return nothing
+end
+
+# A collective build's argument checks: run `check`, which returns the
+# checked values and their `layouthash`, and agree on the forest and
+# the layout across the ranks before going on. A refusal on some ranks
+# only is raised on all of them (see `agree_on_forest`). A refusal is an
+# `ArgumentError`, or the `DimensionMismatch` `regrid!` raises for a flag
+# vector of the wrong length (step 4 of M7); anything else is a bug and
+# is rethrown at once.
+function collective_checks(check, forest::Forest, what::AbstractString)
+    distributed = isdistributed(forest)
+    checked, refusal = try
+        check(), nothing
+    catch err
+        (distributed && err isa Union{ArgumentError,DimensionMismatch}) || rethrow()
+        nothing, err
+    end
+    distributed || return first(checked)
+    agree_on_forest(forest, what; layout=checked === nothing ? UInt(0) : last(checked),
+                    refusal=refusal)
+    return first(checked)
+end
 
 """
     maxlevel(forest::Forest)
@@ -520,7 +734,7 @@ end
 function rebuild_leaves!(forest::Forest{D}, newleaves::Vector{MortonKey{D}}) where {D}
     empty!(forest.leaves)
     append!(forest.leaves, newleaves)
-    forest.generation[] += 1
+    forest.state.generation += 1
     return forest
 end
 

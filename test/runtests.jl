@@ -7,6 +7,10 @@ include("oracles.jl")
 include("ghost_oracles.jl")
 include("wave.jl")
 include("burgers.jl")
+# The MPI test's `mpiexec` jobs start now where the machine has room for
+# them beside the suite, and are collected by `mpi_tests.jl` (M7).
+include("mpi_jobs.jl")
+start_mpi_jobs!()
 
 @info "Running the tests on $(Threads.nthreads()) thread(s)"
 
@@ -578,6 +582,10 @@ include("centering_tests.jl")
 include("reflect_tests.jl")
 include("interpolate_tests.jl")
 include("interface_tests.jl")
+include("partition_tests.jl")
+include("exchange_tests.jl")
+include("regrid_exchange_tests.jl")
+include("interpolate_exchange_tests.jl")
 include("allvariables_tests.jl")
 include("state_tests.jl")
 include("regrid_tests.jl")
@@ -588,6 +596,7 @@ include("imex_tests.jl")
 include("type_tests.jl")
 include("checkpoint_tests.jl")
 include("thread_tests.jl")
+include("mpi_tests.jl")
 include("gpu_tests.jl")
 
 end

@@ -385,6 +385,11 @@ end
     @test_throws ArgumentError buffered_flags(forest, bad((3:2, 1:2)), 1)   # empty
     @test_throws ArgumentError buffered_flags(forest, bad((1:2,)), 1)       # wrong rank
     @test_throws ArgumentError buffered_flags(forest, fill(1, nleaves(forest)), 1)
+    # A flag vector that is not one per leaf — a rank's local flags, over
+    # a distributed forest — is refused, saying where those go instead.
+    @test_throws "one flag per leaf of the whole forest" buffered_flags(forest,
+                                                                     keep[2:end], 1)
+    @test_throws DimensionMismatch buffered_flags(forest, [keep; Keep], 0)
 end
 
 @testset "regrid! mechanics: D=$D" for D in (1, 2)

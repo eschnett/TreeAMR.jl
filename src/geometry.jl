@@ -47,12 +47,18 @@ minimum_spacing(forest::Forest{D,T}) where {D,T} = minimum_spacing(T, forest)
 """
     block_spacings(forest, T=floattype(forest))
 
-The cell size of every leaf, indexed by block — what a kernel needs to
-scale a finite-difference stencil, since blocks at different levels have
-different spacings.
+The cell size of every block this rank stores, indexed by local block —
+what a kernel needs to scale a finite-difference stencil, since blocks
+at different levels have different spacings. Serially that is every
+leaf; over a distributed forest it is the leaves of
+[`blockrange`](@ref), so that entry `b` belongs to block `b` of every
+[`FieldSet`](@ref) over `forest`.
 """
 block_spacings(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
-    T[spacing(T, forest, k) for k in forest.leaves]
+    T[spacing(T, forest, k) for k in localleaves(forest)]
+
+# The leaves whose blocks this rank stores, in local block order.
+localleaves(forest::Forest) = view(forest.leaves, blockrange(forest))
 
 """
     block_origin([T], forest, k::MortonKey)
@@ -74,17 +80,17 @@ block_origin(forest::Forest{D,T}, k::MortonKey{D}) where {D,T} = block_origin(T,
 """
     block_origins(forest, T=floattype(forest))
 
-The lower corner of every leaf's interior, indexed by block — the
-companion of [`block_spacings`](@ref), and what a kernel needs to turn
-its cell index into a position without consulting the tree. Interior
-cell `i` of block `b` is centred at
+The lower corner of the interior of every block this rank stores,
+indexed by local block — the companion of [`block_spacings`](@ref), and
+what a kernel needs to turn its cell index into a position without
+consulting the tree. Interior cell `i` of block `b` is centred at
 `origins[b][d] + (i - 1/2) * spacings[b]`.
 
 Together the two arrays are the whole geometry a device-side kernel
 sees: plain `isbits` arrays indexed by block, no keys and no forest.
 """
 block_origins(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
-    NTuple{D,T}[block_origin(T, forest, k) for k in forest.leaves]
+    NTuple{D,T}[block_origin(T, forest, k) for k in localleaves(forest)]
 
 """
     block_extent([T], forest, k::MortonKey)

@@ -89,7 +89,7 @@ Unlike a [`GhostSchedule`](@ref) this takes no [`Operators`](@ref). The
 transfer is not interpolation: it is injection and the exact two-cell
 average, fixed by the geometry, so there is no order to choose.
 """
-struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D}}
+struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},ST<:ExchangeStage{GRP}}
     forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
     G::NTuple{D,Int}                             # ghost width it was built for
@@ -97,6 +97,7 @@ struct InterfaceSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D}}
     backend::BK
     dimensions::Vector{Int}                      # face dimension of each phase
     phases::Vector{Vector{GRP}}
+    stages::Vector{ST}                           # one per face dimension (M7)
 end
 
 isstale(s::InterfaceSchedule) = generation(s.forest) != s.generation
@@ -126,16 +127,23 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     N = forest.N
     ghosts = fs.G
     stags = staggers(fs)
-    faces = filter(d -> stags[d] == 1, collect(1:D))
-    isempty(faces) && throw(ArgumentError(
-        "a cell-centered field set has no coarse-fine interface to restrict: the " *
-        "fixup replaces the values lying *on* a block's boundary face, and a " *
-        "cell-centered field has none — its values sit half a cell in from every " *
-        "face. Build it over the field set that holds the face quantity, whose " *
-        "centering is vertex-like in the face dimension (`facecentered($D, d)`), " *
-        "not over the cell-centered state."))
     backend = get_backend(fs.work)
-    nb = nleaves(forest)
+    # Collective over a distributed forest (M7), as `GhostSchedule` is.
+    faces::Vector{Int} = collective_checks(forest, "InterfaceSchedule") do
+        fd = filter(d -> stags[d] == 1, collect(1:D))
+        isempty(fd) && throw(ArgumentError(
+            "a cell-centered field set has no coarse-fine interface to restrict: the " *
+            "fixup replaces the values lying *on* a block's boundary face, and a " *
+            "cell-centered field has none — its values sit half a cell in from every " *
+            "face. Build it over the field set that holds the face quantity, whose " *
+            "centering is vertex-like in the face dimension (`facecentered($D, d)`), " *
+            "not over the cell-centered state."))
+        return fd, layouthash(ghosts, fs.centering, T, nameof(typeof(backend)))
+    end
+    # This rank's blocks, in global leaf indices, as in `GhostSchedule`.
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    nb = length(owned)
 
     # Threaded over blocks and merged in chunk order, so the schedule is
     # a function of the tree alone — the same argument as in
@@ -144,35 +152,49 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     perpairs = [TransferPairs{D}() for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            interface_sources!(perpairs[c], forest, faces, b)
+            interface_sources!(perpairs[c], forest, faces, offset + b)
         end
     end
     pairs = TransferPairs{D}()
     for c in eachindex(chunks)
         merge_pairs!(pairs, perpairs[c])
     end
+    # The three classes of a distributed forest (M7), as in `GhostSchedule`.
+    received = split_received!(pairs, owned, nleaves(forest))
+    sent = sent_transfers(forest, owned) do into, j
+        interface_sources!(into, forest, faces, j)
+    end
 
+    build(key) = ntuple(d -> interface_stencil(T, N, ghosts[d], stags[d],
+                                               key.direction[d], key.offset[d]), D)
+    facedim(key) = findfirst(!=(0), key.direction)::Int
     GRP = grouptype(backend, T, Val(D))
     byface = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
-        stencils = ntuple(d -> interface_stencil(T, N, ghosts[d], stags[d],
-                                                 key.direction[d], key.offset[d]), D)
-        d = findfirst(!=(0), key.direction)::Int
-        push!(get!(byface, d, GRP[]),
-              todevice(backend, TransferGroup{T,D}(:restrict, stencils, targets,
+        push!(get!(byface, facedim(key), GRP[]),
+              todevice(backend, TransferGroup{T,D}(:restrict, build(key), targets,
                                                    sources)))
     end
 
     dims = sort!(collect(keys(byface)))
     phases = [byface[d] for d in dims]
-    return InterfaceSchedule{T,D,floattype(forest),typeof(backend),GRP}(
-        forest, generation(forest), ghosts, fs.centering, backend, dims, phases)
+
+    # One stage per face dimension, which serially is one of the phases.
+    stageof(key) = interface_tag(facedim(key))
+    localsof(tag) = get(byface, tag - interface_tag(0), GRP[])
+    ST = stagetype(backend, T, Val(D))
+    stages = build_stages(ST, T, backend, interface_tag.(dims), localsof,
+                          bystage(stageof, sent), bystage(stageof, received), build,
+                          key -> 0, forest)
+    return InterfaceSchedule{T,D,floattype(forest),typeof(backend),GRP,ST}(
+        forest, generation(forest), ghosts, fs.centering, backend, dims, phases, stages)
 end
 
 function Base.show(io::IO, s::InterfaceSchedule{T,D}) where {T,D}
     n = sum(gs -> sum(ntransfers, gs; init=0), s.phases; init=0)
     print(io, "InterfaceSchedule{", T, ",", D, "}(", n, " restrictions over ",
-          length(s.phases), " face dimension(s) ", Tuple(s.dimensions), ")")
+          length(s.phases), " face dimension(s) ", Tuple(s.dimensions),
+          messages_summary(s.stages), ")")
 end
 
 """
@@ -192,6 +214,12 @@ The phases (one per face dimension) run in ascending order with a barrier
 between them, exactly as [`fill_ghosts!`](@ref)'s do. It touches neither
 ghosts nor interior values away from a coarse-fine face, so the field set
 it runs over may have `G = 0`.
+
+Over a distributed forest it is collective, as `fill_ghosts!` is: a fine
+side on another rank computes its restricted plane there and sends it,
+and the result is bit for bit the serial one. Building the
+[`InterfaceSchedule`](@ref) is collective too, and refuses a forest or a
+layout that differs between ranks, on every rank.
 """
 function restrict_interfaces!(fs::FieldSet{T,D},
                               isched::InterfaceSchedule{T,D}) where {T,D}
@@ -200,9 +228,9 @@ function restrict_interfaces!(fs::FieldSet{T,D},
     isstale(isched) && throw(ArgumentError(
         "the forest changed since this interface schedule was built (generation " *
         "$(isched.generation) -> $(generation(isched.forest))); rebuild it"))
-    nblocks(fs) == nleaves(isched.forest) || throw(ArgumentError(
+    nblocks(fs) == length(blockrange(isched.forest)) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
-        "$(nleaves(isched.forest)) leaves; rebuild both"))
+        "$(length(blockrange(isched.forest))) on this rank; rebuild both"))
     fs.G == isched.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this interface schedule was " *
         "built for G=$(isched.G); every target plane in it is wrong for this " *
@@ -220,10 +248,19 @@ function restrict_interfaces!(fs::FieldSet{T,D},
         "are in the wrong memory. Build it with `InterfaceSchedule(fs)` from a " *
         "field set on the backend you mean to run on."))
 
-    for groups in isched.phases
-        run_phase!(fs, groups, backend)
-        synchronize(backend)
+    return exchange_interfaces!(fs, isched, backend)
+end
+
+# The staged interface restriction, once its checks have passed: one
+# stage per face dimension, ascending (M7). Serially each stage is one
+# of the phases and nothing is sent.
+function exchange_interfaces!(fs::FieldSet, isched::InterfaceSchedule, backend)
+    forest = isched.forest
+    sends = nothing
+    for stage in isched.stages
+        sends = run_stage!(fs, stage, forest, backend, sends)
     end
+    sends === nothing || waitall(forest.comm, sends)
     return fs
 end
 

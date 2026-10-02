@@ -1456,7 +1456,16 @@ first step on its own. Decided:
 Under M7 the leaves a rank holds are its own, so a query must first be
 routed to the rank that owns its block — the one place this design will
 change. The location already produces exactly the block index that
-routing needs.
+routing needs. *(Designed 2026-10-01 under
+[Distributed meshes](#distributed-meshes): the location stays on the
+host against the replicated leaves, two `alltoallv`s route the points
+to their owners and the values back, and the kernel is unchanged.
+Implemented in M7's step 5, with the kernel unchanged except for one
+argument, the block offset, which is 0 serially. Over a distributed
+forest an outside point is found on the host before anything is
+routed, and refused on every rank there, rather than after the launch.
+A device batch goes through the host for the messages. The serial path
+measured the same before and after.)*
 
 ### Checkpoint and restart
 
@@ -1502,7 +1511,9 @@ so there is no hidden mesh state to lose. (Parthenon, by contrast,
 warns that an AMR run restarted without its per-block derefinement
 counters may not be bitwise exact.)
 
-**File layout, format version 1** (decided). One HDF5 file. Everything
+**File layout, format version 1** (decided; written through M7's step
+6, and read by every later version — version 2, the files per I/O
+process of step 6b, follows the version-1 bullets). One HDF5 file. Everything
 TreeAMR writes lives under one top-level group, `/TreeAMR.jl`, and the
 application gets a top-level group of its own, named after it:
 
@@ -1512,13 +1523,14 @@ application gets a top-level group of its own, named after it:
                                 application = "<app name>"
       provenance/        scalar datasets: treeamr_version,
                          julia_version, created (UTC, ISO 8601),
-                         hostname, nthreads,
+                         hostname, nthreads, nranks (M7; 1 if absent),
                          project (Project.toml text, or ""),
                          manifest (Manifest.toml text, or "")
       forest/            attrs: D, N, connectivity = "brick",
                                 roots (D), periodic (D),
                                 reflecting (2, D), geometry_type
-                                [, geometry_limbtype, geometry_nlimbs]
+                                [, geometry_limbtype, geometry_nlimbs],
+                                leaves_crc32c (M7; absent before)
         extents          (limbs?, 2, D), in the geometry type, bitwise
         root             Int32[nleaves]
         level            Int8[nleaves]
@@ -1529,6 +1541,7 @@ application gets a top-level group of its own, named after it:
                                 "none"; absent when the set has none),
                                 range = "owned"
         data             (limbs?, N, …, N, nvars, nblocks)
+        data_crc32c      UInt32[nblocks] (M7; absent before)
     /<app name>/         attr: format_version (the application's own)
       data               the plain-data tree; beside it, whatever the
                          do-block writes
@@ -1568,6 +1581,57 @@ application gets a top-level group of its own, named after it:
 - `range = "owned"` says the data are the owned points only, and leaves
   room for a file that stores more, which a version-1 reader would
   refuse by value.
+- **Checksums** (added in M7, 2026-10-02, decided with Erik after a
+  parallel file came back damaged; the account is under "Parallel
+  checkpoints" in [Distributed meshes](#distributed-meshes)).
+  `leaves_crc32c` is the CRC-32C (Castagnoli) of the bytes of `root`,
+  then `level`, then `coords`, each column whole, as stored; entry `b`
+  of `data_crc32c` is the CRC-32C of block `b`'s bytes in `data`, the
+  slice `data[…, b]` with all its variables and limbs, in the file's
+  order. Both are over the little-endian bytes the file holds, so a C or
+  Python reader can check them. A load verifies both and refuses a
+  mismatch, with the reason that the file was damaged while or after it
+  was written; over several ranks each rank checks the blocks it reads,
+  and the verdict is agreed. A file without them, from before, loads
+  unchecked.
+  - *No format change* (decided). They are an additive change with an
+    obvious default, "not checked", so `format_version` stays 1 and
+    nothing joins `features`: a reader that ignores them reads the file
+    exactly as before. A feature would have made every file M7 writes
+    unreadable to 0.1.4 for nothing a reader must understand. The 0.1.4
+    reader was checked to load files with them, filtered and not.
+    *(Step 6b bumps the version to 2 after all, for the part files,
+    which a reader must understand; the checksums alone would not have.)*
+  - *CRC-32C*, because it is in Julia's standard library (`CRC32c`,
+    which TreeAMR now depends on), runs in hardware on x86-64 and
+    AArch64 (13.7 GB/s on one thread of the development laptop, against
+    the 1–2 GB/s of a save), and is defined outside Julia.
+  - *Per block*, not per rank or per file, because the file stores no
+    partition and loads on any rank count: each rank checks exactly the
+    blocks it reads, and the checksums are written beside the data by
+    the same slab. The leaf list, which every rank reads whole, has one.
+  - *Not covered*: the extents, the provenance and the plain data, which
+    are small and written by rank 0 alone, and HDF5's own metadata.
+  - *Not HDF5's own checksums* (decided 2026-10-02 with Erik, checked
+    the same day). HDF5's Fletcher-32 filter was considered and is not
+    used, for four reasons. It accepts an all-zero chunk, trailer
+    included: on libhdf5 2.2.0 a chunk overwritten with zeros through
+    `H5Dwrite_chunk` read back without an error, while one nonzero byte
+    with a zero trailer was refused — and whole zeroed slabs are exactly
+    the loss seen on BeeGFS, whereas the CRC-32C of zeros is not zero. Its
+    checksum lives inside the chunk, so an intact chunk in the wrong
+    place, or one left from an earlier write, verifies; ours are stored
+    apart from the data and indexed by block. It needs chunked storage,
+    which would leave the contiguous, unfiltered datasets uncovered. And
+    it is weaker: 16-bit words, with 0x0000 and 0xFFFF ambiguous. HDF5's
+    checksums of its own metadata, which the newer format structures
+    carry (through the library-version bounds), are not enabled either.
+  - *Over the parts* (step 6b). A part file stores each field set's
+    `data_crc32c` for its blocks, and the index's part table stores a
+    CRC-32C of each of those arrays, so the index vouches for the
+    per-block checksums and they for the data: a part from another save,
+    or one whose checksums were damaged, is refused before its data are
+    read.
 - **Spellings** (fixed by the implementation). Shapes above are in
   Julia's order, which C sees reversed. Every `Bool` in the file —
   `periodic`, `reflecting`, a plain-data `Bool` — is a `UInt8`, 0 or 1,
@@ -1577,6 +1641,50 @@ application gets a top-level group of its own, named after it:
   `Int64`, the leaf columns excepted. A `Float16`, which HDF5.jl does
   not predefine, is the IEEE half type built as h5py builds it, and a
   `Complex` is the compound `(r, i)`, as HDF5.jl and h5py spell it.
+
+**File layout, format version 2** (M7 step 6b, decided 2026-10-02 with
+Erik; the design is "Checkpoints without parallel I/O" under
+[Distributed meshes](#distributed-meshes)). A checkpoint is an *index
+file* `path` and one *part file* per I/O process, `path.<saveid>.<j>.h5`;
+with one I/O process the single part lives inside the index, so a
+serial checkpoint is one file. The index is the version-1 file with the
+field data moved out:
+
+    path:
+    /TreeAMR.jl/         attrs: format = "TreeAMR checkpoint",
+                                format_version = 2, features = ["brick"],
+                                application, save_id (32 hex digits)
+      provenance/        as in version 1, and nparts (1 if absent)
+      forest/            as in version 1, leaves_crc32c included
+      fieldsets/<name>/  the layout attributes of version 1; no datasets
+      parttable/         file        String[k]  (relative; "" for the
+                                                 part inside the index)
+                         first_block Int64[k]   (global leaf index, from 1)
+                         last_block  Int64[k]   (first_block − 1 if empty)
+                         bytes       Int64[k]   (the part file's size; 0
+                                                 for the inline part)
+                         fieldsets   String[s]  (the field sets, in order)
+                         data_crc32c UInt32[s, k] (CRC-32C of each part's
+                                                 data_crc32c, per set)
+      parts/<jjjj>       an external link to `<file>:/TreeAMR.jl` per part
+                         file, for tools; with one part, the part group
+                         itself, inline (`jjjj` zero-padded to 4 digits)
+    /<app name>/         as in version 1
+
+    path.<saveid>.<j>.h5:
+    /TreeAMR.jl/         attrs: format = "TreeAMR checkpoint part",
+                                format_version = 2, save_id, part = j,
+                                first_block, last_block
+      fieldsets/<name>/
+        data             (limbs?, N, …, N, nvars, last − first + 1)
+        data_crc32c      UInt32[last − first + 1]
+
+The inline part, `/TreeAMR.jl/parts/0000` of the index, has the part
+file's `/TreeAMR.jl` attributes and contents. The datasets keep version
+1's spellings, chunking and filters; a part's block axis is its own
+range, so block `b` of the forest is entry `b − first_block + 1` of the
+part that holds it. The parts tile `1:nleaves` in order, as the ranks'
+ranges do.
 
 **Element types** (decided).
 
@@ -1649,6 +1757,10 @@ with the reason, and defaults are supplied where they are obvious.
   over `path` when it is complete; on any error the partial file is
   removed and the error rethrown. A crash while writing then cannot
   destroy the previous checkpoint, which is the one a restart needs.
+  *(Step 6b: with part files, the parts are written and flushed first,
+  under a fresh save id that no index names, and the rename of the index
+  is the commit point; the previous index's parts are deleted only after
+  it. See "Checkpoints without parallel I/O".)*
 - **Durably, by default** (`sync = true`; added 2026-09-29, after the
   first implementation, which left it as an open question). Closing a
   file only hands its data to the operating system's page cache, which
@@ -1793,7 +1905,9 @@ is why `sync = true` is the default.
   chunk on the calling thread, so a filtered save gains nothing from
   threads, and a filtered load gains only the part of it that is not
   HDF5's. Under M7 each rank compresses its own chunks, which is where
-  a filter parallelizes.
+  a filter parallelizes. *(Step 6b: each I/O process compresses its
+  group's chunks, so a filter parallelizes over the I/O processes —
+  every rank under `io = :all`, one per node under the default.)*
 - **Where an unfiltered load goes.** For the 540 MB state at one
   thread, 470 ms: the field set's allocation and zero fill 157, the
   state vector's first touch 84, the HDF5 read 87, `scatter!` 134, the
@@ -1806,7 +1920,8 @@ is why `sync = true` is the default.
   Linux, both root-only) and was not measured. The numbers that matter
   for a production run are the cluster file system's, which
   `TREEAMR_BENCH_DIR` points the benchmark at, and belong to M7's
-  parallel-I/O measurement.
+  parallel-I/O measurement. *(They are in M7's steps 6, for the shared
+  file, and 6b, for the part files that replaced it.)*
 
 **Parallel I/O and M7** (the facts checked 2026-09-29 against the HDF
 Group's "Collective Calling Requirements in Parallel HDF5
@@ -1845,7 +1960,29 @@ decided).
 - **Decided:** M9a is serial. Which parallel design M7 uses is
   benchmarked first, on Symmetry and other HPC systems; this layout is
   the candidate, not a commitment. If the shared file does not hold up,
-  M7 bumps `format_version`, and that is accepted.
+  M7 bumps `format_version`, and that is accepted. *(Amended
+  2026-10-01, decided with Erik: parallel HDF5 into this layout is part
+  of M7, with `format_version` unchanged, and the benchmark became M7's
+  step 6 instead of a precondition — the shared file is built and then
+  measured, and the per-process files remain the fallback if it does
+  not hold up. The design, and the check that the stock HDF5_jll is
+  already a parallel build, are under
+  [Distributed meshes](#distributed-meshes).)* *(Step 6 of M7 built it:
+  the version-1 layout written and read by every rank of a distributed
+  forest at once, a file loading on any rank count; what it settled is
+  under "Parallel checkpoints" there.)* *(Measured on Symmetry's
+  BeeGFS in step 6, 2026-10-02: the shared file lost data between
+  nodes until ROMIO's read-modify-write was turned off, and its rate
+  did not grow with nodes; it is to be replaced by files per I/O
+  process, decided that day with Erik. The account is under "Parallel
+  checkpoints".)* *(Step 6b, decided 2026-10-02 with Erik: the shared
+  file is replaced by one file per I/O process and an index — the
+  alternative of the fourth bullet — with every file written by one
+  process and opened by one, and `format_version` becomes 2. The
+  awkwardness that bullet names is met by an index that lists every
+  part's block range, so a reader on any rank count knows which part
+  holds which blocks; the design is "Checkpoints without parallel I/O"
+  in [Distributed meshes](#distributed-meshes).)*
 
 **Multi-block** (checked). Keys are relative to their root,
 `connectivity = "brick"` is a tagged record rather than an assumption,
@@ -1892,12 +2029,14 @@ load HDF5 while the extension is not loaded. `fieldsets` and
                     fieldsets   = ("U" => (U, u), "aux" => aux),  # or ()
                     application = "TreeHydro" => 1,  # name => its version
                     data = (; t, chunk, recipe), filters = (),
-                    sync = true)                     # flush to stable storage
+                    sync = true,                     # flush to stable storage
+                    io = :node)                      # I/O processes (M7 step 6b)
     save_checkpoint(path, forest; …) do app::HDF5.Group
         # further datasets in the application's group, beside `data`
     end
     ck = load_checkpoint(path; backend = CPU(), types = (),
-                         fieldsets = nothing)        # or names, a subset
+                         fieldsets = nothing,        # or names, a subset
+                         comm = nothing)             # or an MPI.Comm (M7)
         # ck.forest, ck.fieldsets["U"].fieldset, ck.fieldsets["U"].state,
         # ck.application, ck.data, ck.provenance
     load_checkpoint(path; …) do app … end        # result in ck.result
@@ -2345,7 +2484,11 @@ entries per volume — documented here, implemented post-M3.
   not 3x, and it is not a per-process limit but the loss of
   data-to-core affinity between launches, which a block-ownership
   launch policy recovers entirely inside one process (next paragraph).
-  M7 therefore gains no bandwidth argument from this, and loses none:
+  M7 therefore gains no bandwidth argument from this, and loses none
+  *(confirmed in M7's step 7: on one Symmetry node one pinned 64-thread
+  process runs the RHS 1.5–1.6 times as fast as 8 ranks of 8 threads
+  over the same mesh, the ranks paying the packs and unpacks of their
+  halos)*:
   its partition of blocks over ranks and the ownership partition over
   threads are the same contiguous Morton ranges, one level apart. The
   M5 finding that pages must be interleaved stands as advice for Rome
@@ -2895,7 +3038,12 @@ entries per volume — documented here, implemented post-M3.
     communicator and an application must not be asked to. `+`, `max`
     and `min` map to the builtin operations, anything else to a custom
     one. The name sits beside `block_mapreduce`: one returns a value per
-    block, the other one value for the mesh.
+    block, the other one value for the mesh. *(Amended 2026-10-01: the
+    site stays, but what it does across ranks is an `allgather` of one
+    partial per rank, folded in rank order, with no MPI operation at
+    all — custom operations fail on ARM, and a builtin one exists only
+    for MPI's native types. See "Reductions" under
+    [Distributed meshes](#distributed-meshes).)*
 
     *The combination is `mapreduce(identity, op, values)` with no
     `init`, and `init` is returned only for an empty vector.* This is
@@ -3009,7 +3157,1412 @@ entries per volume — documented here, implemented post-M3.
   layout-generic before MPI exists (M8 precedes M7, decided), so ghost
   fill, interface restriction and regrid transfer for every centering
   are distributed by one design. CUDA-aware MPI
-  for GPU+MPI.
+  for GPU+MPI. *(Amended 2026-10-01, when M7 was specified under
+  [Distributed meshes](#distributed-meshes) below: a transfer is
+  evaluated on the owner of its **source**, not of the finer data —
+  the sender computes — so a restriction runs on the fine side, as
+  this said, but a prolongation runs on the coarse side.)*
+
+### Distributed meshes
+
+*(Designed 2026-10-01 as M7, before implementation. Four choices were
+decided with Erik that day and are marked so; the rest follows from
+them and from the sections cited, and is open to amendment as the
+implementation measures it. The steps are in the M7 entry under
+[Milestones](#milestones). Implemented in them by 2026-10-02, the
+amendments marked where they were made. Measured on Symmetry the same
+day: steps 7 and 8 in full, and step 6, whose multi-node run lost data
+and led to the decision to replace the shared-file checkpoint; the
+findings are in the steps, and amend the bullets below where marked.
+The replacement, checkpoints without parallel I/O, was specified,
+built and measured the same day as step 6b.)* M7 runs one forest over several
+processes. It came after M8 and M10 on purpose: every centering, the
+interface restriction and the mirrored transfers at reflecting faces
+are now entries of one schedule, so distributing the schedule
+distributes all of them at once. The claim extends the one
+[Parallelism](#parallelism) makes for threads. The leaf array, the
+schedule, the state vector gathered in curve order, and every max, min
+and integer reduction are bit-identical to a serial run at any rank
+count. A floating-point sum is reproducible to roundoff across rank
+counts, and at one rank it is exactly the serial value.
+
+**What is replicated and what is distributed** (decided 2026-10-01 with
+Erik). Every rank holds the whole forest, `forest.leaves` included, and
+only field data are distributed.
+
+- *Why it is affordable.* A leaf is a key of about 20 bytes in 3D (see
+  "Key encoding" under [Tree structure](#tree-structure)), so 10⁵
+  leaves are 2 MB per rank. Everything that reads the whole leaf
+  array — the neighbor search, the buffered flags, mark completion,
+  balance — runs at regrid frequency, `O(nleaves)` per rank. AMReX
+  replicates its `BoxArray` and `DistributionMapping` the same way, and
+  Parthenon, after Athena++, its block tree.
+- *What the alternative costs.* p4est distributes the forest, and then
+  balance and neighbor search are themselves parallel algorithms with
+  a ghost layer of the tree. That is the hard part of p4est, and it
+  buys memory a mesh of up to some 10⁶ leaves does not need.
+- *What it buys.* Every tree query stays a local call: the schedule
+  build, `locate_point` and the regrid's classification of new leaves
+  send no messages. The same arithmetic on the same leaves gives every
+  rank the same answer, and the message layouts below rely on that.
+
+What replication costs at thousands of ranks — the replicated regrid
+bookkeeping above all — is for the weak-scaling smoke test (step 7) to
+measure, not for this section to assume. *(Measured in step 7, in one
+process at up to 180224 leaves: the schedule build stays flat at a fixed
+number of blocks per rank, and of the replicated passes two grow to
+dominate a rank's regrid — the buffer's neighbour search when many
+blocks report boxes, and the classification of every new leaf — both of
+which can be made `O(local)` without changing a result; see step 7 under
+[Milestones](#milestones). Both were, the same day: each rank now
+searches the buffer from its own sources and classifies only the new
+leaves it needs, and a rank's regrid stayed at its 1408-leaf cost up to
+180224 leaves.)* *(On Symmetry, step 7: at up to 32 ranks on four nodes
+the schedule build and the refining regrid are flat from 2 ranks on, and
+`bench/replicated.jl` on a rank's domain reproduces the flat regrid to
+180224 leaves; the replicated completion after the buffer, 20 ms there
+when every block is a source, is what still grows.)*
+
+**The communicator layer** (MPI a weak dependency, decided 2026-10-01
+with Erik). A new file, `src/communicator.jl`, sits after `device.jl`
+in the layer order.
+
+- It defines an abstract `Communicator` and the default
+  `SerialCommunicator`, rank 0 of 1, which sends nothing.
+- The package talks to it through a few internal verbs: `commrank`,
+  `commsize`, `allgather` of one `isbits` value, `allgatherv` of a
+  vector, `alltoallv`, and nonblocking `isend` / `irecv` with
+  `waitall` over flat buffers. *(Amended in step 6b: two more,
+  `commnodes`, the number of shared-memory nodes, and `bcast` of one
+  rank's vector, for the checkpoints without parallel I/O.)*
+- Every verb has a serial method, so `src/` never branches on whether
+  MPI is there. A serial run takes the distributed code path with every
+  message empty, and the existing suite is its test.
+- The MPI methods live in a package extension, `TreeAMRMPIExt`,
+  triggered by MPI.jl, as HDF5 is for checkpoints: an application that
+  never runs distributed does not load MPI. It adds `MPICommunicator`,
+  which holds `MPI.Comm_dup(comm)` of the application's communicator,
+  so that TreeAMR's messages can never match the application's.
+- An application writes `Forest(…; comm = MPI.COMM_WORLD)`, and
+  `communicator(::MPI.Comm)` converts it.
+
+Three details follow from this:
+
+- *One duplicate per application communicator.* `Comm_dup` is
+  collective, and so is `Comm_free`, which therefore cannot run from a
+  finalizer, since a finalizer runs at a different moment on each rank.
+  `communicator` caches the duplicate per communicator it is given, so
+  a test that builds a thousand forests over `COMM_WORLD` holds one
+  duplicate and not a thousand. MPICH_jll 5.0.2 gives a process 2046
+  duplicates and then fails (measured 2026-10-01, on Julia 1.11 and
+  1.13). *(Step 3: MPI.jl's own `Comm_dup` attaches a finalizer that
+  frees the duplicate, so the extension calls `MPI_Comm_dup` through
+  `MPI.API` and attaches none. The cache is keyed by the handle; since
+  MPI may reuse a handle once the application frees its communicator, a
+  hit is used only while `MPI_Comm_compare` still finds the duplicate
+  `CONGRUENT` with the communicator passed — a local call whose answer
+  is the same on every rank of the group.)*
+- *MPI is called from the calling task only*, never inside a threaded
+  loop or a kernel. A Julia task may still migrate between OS threads
+  between two calls, so the extension requires
+  `MPI_THREAD_SERIALIZED` or better — `MPI.Init()`'s default — and
+  refuses a communicator initialized with less, saying why.
+- *Why the field is abstract.* `Forest` gains `comm::Communicator`,
+  abstract-typed, so `Forest{D,T}` keeps its two parameters and every
+  `FieldSet{…}` and `GhostSchedule{…}` signature downstream is
+  unchanged. The price is a dynamic dispatch per verb: a few per ghost
+  fill, and none in a kernel.
+
+**Every forest mutation is collective.** `refine!`, `coarsen!`,
+`balance!`, `regrid!` and the constructors are called on every rank
+with the same arguments. Every host pass in `src/` is a deterministic
+function of its inputs — the thread-count invariant under
+[Parallelism](#parallelism) — so the calls produce the same forest
+everywhere without a message. Checking that at every call would cost a
+collective each, so the operations that would go wrong silently on a
+diverged forest check it instead: `GhostSchedule`, `InterfaceSchedule`
+and `regrid!` `allgather` a digest of the forest — its generation,
+`nleaves` and `hash(forest.leaves)`, which for `MortonKey` is defined
+from the fields. A forest whose digest differs between ranks is
+refused, naming the ranks and saying that every forest mutation is
+collective. At regrid frequency that is one `O(nleaves)` pass and one
+collective.
+
+*(Amended in step 3, where the check was implemented.)*
+
+- *Not `hash(forest.leaves)`.* Base's hash of a long vector samples its
+  elements rather than reading them all: on Julia 1.11 and 1.13 alike,
+  zeroing element 50001 of `collect(1:100_000)` leaves the hash
+  unchanged (checked). So the digest folds `hash(key, h)` over every
+  leaf.
+- *It carries the brick and the layout too.* The brick (roots, `N`,
+  the periodic and reflecting faces, the extents) is hashed through its
+  printed form. Beside it goes a hash of the layout the schedule is
+  built for — the ghost widths, the centering, the operator family and
+  orders, the element type and the backend's name — since a rank that
+  built its stencils for other operators would deliver wrong ghosts as
+  silently as a diverged forest. Every hash is of integers and strings,
+  never of a `Symbol` or an object identity, which differ between
+  processes. A layout that differs is refused with a reason of its own.
+- *A refusal on some ranks is a refusal on all.* A schedule's argument
+  checks run before the gather; a rank whose checks refuse sets a flag
+  in its digest instead of throwing at once, and after the gather it
+  throws its own error while every other rank throws one naming the
+  ranks that refused. Without that, one rank's `ArgumentError` would
+  leave the others waiting in the gather, or in their first exchange.
+  Only `ArgumentError`s are agreed this way; anything else is a bug and
+  is rethrown at once. *(Amended in step 4: `regrid!`'s checks run
+  through the same gather, and the `DimensionMismatch` it raises
+  serially for a flag vector of the wrong length is agreed too, so that
+  error keeps its type on the rank that raised it.)*
+- *Serially nothing is gathered*: a forest over one rank skips the
+  digest and its `O(nleaves)` pass, so a serial build is unchanged.
+- *The verdict is the same on every rank* because it is computed from
+  the same gathered digests: the message names rank 0's forest and the
+  ranks that differ from it, whichever rank prints it.
+
+**The partition** (decided). Rank `r` owns the contiguous leaf range
+`blockrange(forest)`, an equal-count split of `1:nleaves(forest)` over
+`commsize`. The arithmetic is `threadchunks`'s — `divrem`, the
+remainder to the first ranks — and both are written over one shared
+helper. The rank split and the thread split under it are then the same
+contiguous Morton ranges one level apart, as "Where the 64-thread
+efficiency goes" anticipated. Equal counts balance the load because
+every block costs the same under a global `dt` (the MPI bullet above).
+The one imbalance is ghost work concentrating at level boundaries,
+noted under "What one process loses"; a cost-weighted split would
+change only the helper, at both levels.
+
+- **Block index `b` becomes local, everywhere.** `nblocks(fs)` is the
+  rank's count, the last axis of `fs.work`, and `blockkey(fs, b)` is
+  `forest.leaves[first(blockrange(forest)) + b - 1]`. The state
+  vector, `statelength`, `block_spacings`, `block_origins`, the flags
+  of `flag_blocks` and the values of `block_mapreduce` and
+  `firing_boxes` are all per local block.
+- **Tree queries stay global.** `nleaves(forest)` is the global count,
+  and `find_leaf`, `locate_point` and `neighbor_keys` answer in global
+  leaf indices, since they are about the forest and not about a field
+  set.
+- **No API break.** Serially local and global coincide, so nothing
+  downstream changes and no 0.2 is needed. What becomes wrong only
+  under MPI is code that sizes a per-block array by `nleaves`, or
+  indexes `forest.leaves` by a block index. The docstrings say "local
+  block", and step 9 audits the three downstreams for both.
+- **Ranks without blocks are allowed.** Such a rank takes part in every
+  collective, enters no exchange stage, and contributes nothing to a
+  reduction (below). Every launch guards an empty `ndrange`. Empty
+  ranks occur whenever ranks outnumber leaves, which a coarse initial
+  mesh on many ranks does for a while, and the workload tests one.
+- **What an application must make global itself.** `block_mapreduce`
+  stays local by design, so a value an application combines from it —
+  TreeHydro's CFL signal speed, TreeWave's per-variable refinement
+  scale — becomes a per-rank value under MPI. A `dt` that differs
+  between ranks desynchronizes the run, and a rank-dependent scale
+  makes the mesh depend on the rank count. Such a value goes through
+  `mesh_mapreduce`. So does an adaptive integrator's error norm: it has
+  to be a global one (`volume_weighted_norm`, the open `internalnorm`
+  question), or each rank chooses its own step.
+
+**The exchange: the sender computes** (decided 2026-10-01 with Erik). A
+transfer whose source and target blocks live on different ranks is
+evaluated on the source's rank, into a packed buffer, which is sent.
+The target's rank only copies it into place. Three reasons:
+
+- *The source rank has everything the transfer reads*, including the
+  source's own ghost layers, which a prolongation reads (in phase 2,
+  and in the regrid from a parent). Evaluated on the receiver, the
+  transfer would need those ghosts shipped too, as a second and wider
+  exchange.
+- *The message is the transfer's target box.* A restriction's source
+  footprint is `2^D` times its target and more, so sending the result
+  is much smaller. For a prolongation the two are about the same size:
+  in 3D at `N = 16`, `G = 2` and order 4, a fine face slab is 512
+  points and the coarse footprint it is computed from about 480.
+- *The receiver needs nothing but a layout*: no stencils, no second
+  schedule, no knowledge of the source's ghosts. Unpacking is a copy.
+
+**Building the distributed schedule.** Each rank runs the existing
+`block_sources!` for its own targets, as today, and also for the
+*candidate remote targets*: the remote leaves that touch one of its
+own, i.e. the union of `neighbor_keys` over all directions `δ` around
+its leaves.
+
+- *The candidates are complete.* Adjacency is mutually discoverable
+  (`neighbor_keys`' docstring): a target that takes data from a local
+  block is found from that block across some direction, if not
+  necessarily the opposite one.
+- *Mirrored transfers need nothing extra.* A mirrored transfer's source
+  is found across `δ′` from the target, so it is a neighbor or the
+  target itself. A self-transfer — a block's reflection into its own
+  ghosts, the derived wall plane — is always local.
+- *Three classes.* A *local* transfer has target and source on this
+  rank; it is today's group, run as today. A *recv* transfer has a
+  local target and a remote source, and becomes an unpack. A *send*
+  transfer has a remote target and a local source, and becomes a pack.
+- *What is checked.* The union over ranks of the local, recv and send
+  transfers is the serial schedule's transfer set exactly; that is
+  step 2's acceptance.
+- *Cost.* The build is `O(local + halo)` per rank, the halo being the
+  remote neighbors. The digest check above is the one `O(nleaves)`
+  pass.
+
+**Stages.** The serial fill is ordered by its phases because a later
+phase reads what an earlier one wrote: copies and restrictions, then
+the hook, then prolongations by target level, coarsest first. Each such
+ordering point becomes a *stage*, and a stage completes on a rank
+before the next one starts there:
+
+- phase 1 is one stage. The boundary hook then runs locally, on each
+  rank's own blocks, after that stage's unpacks — exactly where it runs
+  today;
+- phase 2 is one stage per target level, ascending;
+- `restrict_interfaces!` is one stage per face dimension, ascending.
+  Its serial phases exist because a point on the line where two
+  coarse-fine faces meet is written in two of them (`InterfaceSchedule`'s
+  docstring), and with three levels a later dimension can also read,
+  on a fine block's plane, a point an earlier one wrote there, where
+  that fine block is itself the coarse side of a face. Either makes
+  the phases ordering points like the ghost fill's;
+- the regrid transfer is one stage.
+
+A stage runs in five steps:
+
+1. post an `irecv` per peer into the stage's receive buffer;
+2. pack every send transfer, then synchronize the backend;
+3. `isend` per peer;
+4. run the local groups, which overlap the messages in flight;
+5. `waitall` on the receives, then unpack.
+
+The sends are waited on at the end of the call, before any buffer is
+reused. *(Step 2: `run_stage!` in `ghosts.jl` runs these five steps
+through the communicator verbs. A stage without messages is the serial
+phase, the same launch and the same barrier.)* Within a stage, nothing a pack or a local group reads is
+written by an unpack:
+
+- phase 1 reads interiors and writes ghosts;
+- a level-`ℓ` stage reads level-`ℓ − 1` sources and their ghosts, and
+  writes level-`ℓ` ghosts;
+- an interface stage reads fine-side planes and writes coarse-side
+  ones. A block that is both, at different faces, plays the two roles
+  on different planes.
+
+So the order inside a stage is free, as the order inside a serial
+phase is, and only the stage boundaries carry the serial ordering.
+
+**Deadlock freedom and message matching.** Messages are nonblocking
+and matched by peer and tag, and the tag names the stage: phase 1, the
+target level, the face dimension, or the regrid. A rank enters only the
+stages in which it has a message or a local group. A skipped stage
+cannot be confused with another, since its tag is its own.
+
+- *Progress, by induction on the stage.* Suppose every rank has
+  completed the stages before `k`. A pack reads only what those stages
+  completed locally, so every rank can pack and post its stage-`k`
+  sends without waiting for anyone. Then every stage-`k` receive has
+  its send posted, and the `waitall` returns.
+- *Across calls*, MPI's non-overtaking rule — two messages from one
+  sender with one tag arrive in the order they were sent — matches each
+  fill's message to the same fill's receive, provided every rank makes
+  the collective calls in the same order. That is the contract, and it
+  implies one more rule: two exchanges over one forest must not run
+  concurrently from two tasks.
+
+**Buffer layout.** Each stage has one send buffer and one receive
+buffer, each divided into one contiguous segment per peer.
+
+- Within a segment the transfers are ordered by `GroupKey` (under a
+  total order over its fields), then by global target leaf, then by
+  global source leaf. Each transfer occupies its target box times
+  `nvars`, in the kernel's index order.
+- Both ends derive this order from the replicated forest, the sender
+  from its send list and the receiver from its recv list, which hold
+  the same transfers. So no layout descriptor is ever exchanged; only
+  the stage's data move.
+- Phase 1's groups come out of a `Dict` today, in an order that does
+  not matter there. The remote groups are sorted explicitly, since for
+  them it does.
+- Step 2 checks that rank `r`'s send layout to `s` is `s`'s receive
+  layout from `r`.
+
+**Pack and unpack are transfers.** Both go through `transfer_kernel!`,
+which keeps "one kernel for every transfer" true.
+
+- *The packed buffer is a kernel argument.* It is passed in place of
+  the working array as a small `NamedTuple` — the flat buffer and each
+  transfer's offset into it — which KernelAbstractions adapts to a
+  device without a new dependency. *(Amended in step 2: the kernel's
+  tuple has a third field, `dims`, the target box times `nvars`, since
+  a slot's linear index needs the box's shape. The offsets are stored
+  in points, not elements, and multiplied by `nvars` when the buffer is
+  addressed, because a schedule belongs to a layout and serves field
+  sets of any variable count. A driver passes `(buf, offsets)`, and
+  `run_group!` adds the group's `dims`. The "block" index the kernel
+  hands the accessor is the slot.)*
+- *Three accessor methods, not two.* The kernel reaches `dest` and
+  `src` through a load, a store and the element type that
+  `stencil_sum` starts its accumulator from, `zero(eltype(src))` today.
+  `eltype` of a `NamedTuple` is not the buffer's, so it needs a method
+  of its own. Each accessor has a method for an array, today's indexing
+  unchanged, and one for a packed buffer.
+- *Groups.* A pack group is a send group whose target is a buffer
+  slot. An unpack group is a width-1, weight-1 transfer from a buffer
+  slot into the recv target.
+- *Ownership.* Pack groups are sorted by source block and run by the
+  owner of the source block. Unpack groups run by the owner of the
+  target, as every group does today. On the CPU, `run_phase!`'s
+  bisection is then over whichever block list says who owns the
+  transfer.
+- **The parity factor is applied when unpacking** (amended while
+  specifying; the first draft applied it when packing). An unpack goes
+  through the kernel's sum, `0 + 1·x`. That is the identity on every
+  value a stencil sum produces, because the sum starts at `+0` and so
+  never yields `−0`. It is not the identity on `−0` itself, which it
+  turns into `+0`. A mirrored transfer is the one transfer that can
+  produce `−0`: an odd variable that is zero at the wall, such as the
+  normal momentum of a fluid at rest, gives `+0 · (−1)`. A pack that
+  applied the factor would therefore deliver `+0` where the serial
+  fill writes `−0`, and the byte-for-byte digests would see it. So a
+  pack computes the unscaled sum, and the unpack group carries the
+  mirrored group's `factorcol`. The value written is then
+  `scaled(0 + 1·acc) == scaled(acc)`, bit for bit what the serial
+  kernel writes. Step 2's round trip checks this bitwise, `Float32x2`
+  included, for which it also needs `0 + 1·x` to be the identity on
+  normalized limbs. *(Measured in step 2. With the factor moved to the
+  pack, the `Float64` round trip fails in every 2D case tried, as
+  argued. `Float32x2` cannot tell the two apart: MultiFloats' product
+  returns `+0` for `0 · (−1)`, so its serial fill has no `−0` to lose.
+  Nor is `0 + 1·x` the identity on every limb pair — it maps `(−0, −0)`
+  to `(+0, +0)` — but it held on every value a pack produced in the
+  round trip, which is a check over the tested cases and not a proof.
+  In 1D every mirrored transfer is the block's own reflection,
+  so the remote `−0` case exists from 2D on.)*
+- **Why the ghosts are bit-identical.** Every ghost is written once, by
+  the same kernel, from the same source values and the same stencil,
+  summed in the same order as in the serial fill; the unpack adds an
+  identity. So the ghosts are bit-identical to serial for any
+  partition, and so is everything computed from them. It is the
+  argument the thread invariant rests on, with a rank boundary in place
+  of a thread boundary. It needs the transfer arithmetic not to depend
+  on the destination type: no `@fastmath` or `@simd` reassociation in
+  `transfer_kernel!`. That holds today, since "What the ghost fill
+  costs" fixed its summation order.
+
+**MPI+GPU.** The pack and receive buffers live on the field set's
+backend and are allocated once per schedule (amended in step 2: once
+per schedule *and variable count*, on first use, for the reason the
+offsets are in points). They go to MPI directly
+when MPI is device-aware (`MPI.has_cuda()` for CUDA). Otherwise they
+are staged through host buffers of the same layout, which is the path
+Metal always takes and the one the suite tests. The synchronization
+after the pack is what makes a device buffer safe to send.
+`MPI.has_cuda()` asks only Open MPI (and answers `true` for IBM
+Spectrum MPI); for any MPICH it is `false` unless the environment
+variable `JULIA_MPI_HAS_CUDA` says otherwise (MPI.jl 0.20.27's
+`environment.jl`). So on a CUDA-aware MPICH the direct path is opted
+into by that variable, and step 8 records whether the MPI on
+Symmetry's H200 nodes is CUDA-aware at all. *(It is: HPC-X 2.20's Open
+MPI 4.1.7, for which `MPI.has_cuda()` is `true`; both paths pass there,
+and the direct one saves the two copies, 0.16–0.2 ms of a 2.5 ms fill
+on four H200s. See step 8.)*
+
+*(Step 8, where this was implemented; what it settled, and where it
+amends the paragraph above:)*
+
+- *Who decides* (amended: the paragraph had `MPI.has_cuda()` decide). The
+  caller does, when it converts its communicator:
+  `communicator(comm; deviceaware = true)` hands MPI the device buffers,
+  and the default, `false`, stages every device message through host
+  mirrors. Four reasons. A wrong "yes" is a crash, or silent garbage,
+  inside the MPI library, and a wrong "no" costs two copies a message, so
+  the safe answer is the default. `MPI.has_cuda()` is not a safe answer:
+  it is `false` for every MPICH, CUDA-aware or not, unless an environment
+  variable says otherwise, and it is about CUDA only, while the package
+  cannot tell, without naming a device package, whether a buffer is a
+  `CuArray`, a `ROCArray` or an `MtlArray` — so a `true` from an Open MPI
+  built with CUDA would also send a ROCm buffer's device pointer to a
+  library that cannot read it. The application knows its backend and its
+  MPI, and `deviceaware = MPI.has_cuda()` is one line for it to write on
+  CUDA (the docstring shows it). And the setting belongs with the
+  communicator, since it is a property of the MPI library: not a keyword
+  of `Forest`, which would put it beside the mesh's parameters, and not a
+  TreeAMR environment variable or preference, which would be state the
+  call does not show and, for a preference, a new dependency.
+- *The ranks need not agree.* Staged or not, the bytes on the wire are
+  the stage buffer's, so one rank may stage while its peer sends from
+  the device. Nothing is gathered for it, and it is not part of the
+  layout hash.
+- *A verb, not a type test in the driver.* `hoststaging(comm, buffer)`
+  is a new verb of the communicator layer, and the only one whose
+  fallback on the abstract type answers rather than refuses: `true` for anything but a host `Array`.
+  The MPI extension answers `false` for a device buffer only when the
+  communicator was made device-aware. The CPU's buffers are `Array`s, so
+  its path is the direct one whatever the setting, and the serial path
+  never asks, since a stage without messages has no buffers. The setting
+  is a field of `MPICommunicator` beside the duplicate, and not part of
+  it: a device-aware forest and an ordinary one over the same
+  communicator share the one cached duplicate.
+- *The mirrors* are `Vector`s of the element type with the stage
+  buffers' layout, one send and one receive mirror per stage and
+  variable count, allocated on first use and kept in the `RemoteStage`
+  beside the buffers (a new field, `mirrors`, and a fifth type parameter,
+  `HB`), so a staged fill allocates no buffer after its first. They are
+  page-locked for the backend through `KernelAbstractions.pagelock!`
+  (since KernelAbstractions 0.9.40, inside the `[compat]` floor of
+  0.9.42): CUDA pins them, which lets the copies run at the bus's rate
+  rather than through the driver's bounce buffer; the CPU and Metal do
+  nothing, Metal's memory being unified. A regrid stage is built per
+  regrid, so its mirrors are too, and CUDA unpins them when they are
+  collected. No weak dependency on a device package was needed.
+  *(Amended after step 8: a regrid stage's buffers and mirrors, and those
+  of the schedules rebuilt after a regrid, now come from the forest's
+  buffer pool, the next bullet, so they are allocated and page-locked
+  once rather than at every regrid.)*
+- *The buffer pool* (added after step 8, 2026-10-02, for the staged
+  regrid Symmetry measured at 48 ms against 8.7 ms direct; see step 8).
+  Every regrid built its transfer stage afresh, and the schedules an
+  application rebuilds after it start without buffers, so every
+  distributed regrid allocated and zero-filled the device buffers of
+  its own stage and of the next schedule's first fill, and, staged,
+  allocated and page-locked their host mirrors. The pool keeps them.
+  - *Where it lives.* In the forest, whose leaves every schedule and
+    regrid is over and which `run_stage!` already has: a mutable
+    `ForestState` holds the generation, which was a `Ref` of its own
+    before, and the pool, made on first use. One object for both keeps
+    `Forest` the size it was. A ninth field made the schedule build
+    allocate 80 and 4816 bytes more in `bench/ghosts.jl` (presumably
+    closures that capture a `Forest` by value growing by a word; not
+    traced), and with the fold its 392832 and 4656880 are unchanged. A
+    serial forest never makes a pool.
+  - *What it hands out.* A *lease* of at least the length asked for, as
+    an object of exactly that length over pooled memory, keyed by role
+    (buffer or mirror), array type and backend type. A host vector — a
+    CPU stage buffer or any mirror — is an `Array` made by `Base.wrap`
+    over the pooled `Memory`, so `hoststaging`'s test for an `Array` and
+    the MPI extension's contiguous-host-vector check see what they saw
+    before; a device buffer is a contiguous `view`, which CUDA and Metal
+    (and every GPUArrays backend) return as an array of the parent's own
+    type, so the kernels and the device-aware path see a `CuArray` or an
+    `MtlArray` as before. A backend whose view is of another type gets
+    an ordinary allocation. A pooled mirror is page-locked once, when it
+    is allocated.
+  - *When a lease comes back.* The regrid stage gives its leases back
+    after its sends have been waited on, at the end of the field set's
+    transfer. A schedule's leases are reclaimed at the next lease after
+    the forest's generation has moved past the one they were taken at,
+    or after their holder has been collected: a stale schedule can never
+    run again, since every entry point refuses one, and every message of
+    the call it last ran in was waited on in that call. Reclaiming also
+    deletes the lease from the stale stage's dictionary, so that a stale
+    stage asked for its buffers through the internals takes new ones
+    rather than memory another stage holds. So no buffer is held by two
+    leases, and none is reused while a message is in flight; the
+    in-process test checks that the live schedule's buffers and mirrors
+    never overlap.
+  - *Sizes.* Best fit: the smallest free buffer that is long enough. If
+    none is, the smallest free one is dropped and a new one allocated
+    with a quarter's headroom, so the number of buffers per key is
+    bounded by the most leased at once and their sizes follow the
+    largest requests. Nothing shrinks otherwise: what a forest keeps is
+    about the buffers of one live schedule plus one regrid stage, free
+    between regrids. That is the memory a staged regrid on CUDA would
+    otherwise allocate and pin again each time.
+  - *Zeros.* A fresh buffer is zero-filled, as before; a reused one holds
+    an earlier stage's bytes, which nothing reads, since every element
+    of a send buffer is packed and every element of a receive buffer
+    received before it is unpacked. The suite's bitwise comparisons
+    run through reused buffers.
+- *The order of a staged stage*: post the receives into the receive
+  mirror; pack and synchronize; copy the send buffer down (`copyto!`
+  into an `Array`, which returns once the host holds the data — CUDA.jl
+  synchronizes before a download); send from the send mirror; run the
+  local groups; wait for the receives; copy the receive mirror up; unpack;
+  synchronize. The upload is asynchronous on CUDA from pinned memory, but
+  it is queued before the unpack on the backend's queue, and the final
+  synchronization completes it before the next call can receive into the
+  mirror again. The send mirror is rewritten only by the next call's
+  download, after this call's sends have been waited on.
+- *The direct path* is the CPU's code with the device buffers' views in
+  place of the mirrors'. The extension's buffer check, which accepted any
+  contiguous view before — a view of a device array included — now
+  accepts host memory only, `Array` or a contiguous view of one, and a
+  dense device vector or a contiguous view of one only over a
+  device-aware communicator; the refusal names the setting. MPI.jl hands
+  a `CuArray` to the library by its device pointer through its own CUDA
+  extension.
+- *Interpolation and checkpoints* stay as steps 5 and 6 left them: both
+  go through the host, at analysis and checkpoint cadence.
+
+**Reductions: an allgather of per-rank partials** (decided).
+`combine_blocks` in `state.jl` is already the single site where M7's
+communication was to go. It folds the local blocks as today,
+`mapreduce(identity, op, values)`, then `allgather`s one partial per
+rank, which every rank folds in rank order. This supersedes the
+`Allreduce` that the `mesh_mapreduce` bullet above planned, for four
+reasons:
+
+- *The association is the package's, not the library's.* MPI leaves
+  the order in which an `Allreduce` combines floating-point values to
+  the implementation and only recommends that it be reproducible, so
+  whether every rank receives the same bits, and whether a rerun does,
+  is a property of the MPI library. A rank-order fold of gathered
+  partials is defined here and is the same on every rank by
+  construction, which a `dt` or a norm-driven decision needs.
+- *Any `op` and any `isbits` partial work*, with no custom MPI
+  operation. Custom operations do not work on this development
+  machine: MPI.jl 0.20.27 refuses every user-defined reduction operator
+  on non-Intel architectures, a closure and a named function alike,
+  unless it is registered statically with `@RegisterOp` (measured
+  2026-10-01, Apple M3 Pro). A builtin operation exists only for MPI's
+  native types, which `Float32x2` and a tuple partial are not, while
+  `MPI.Allgather` of a tuple and of a struct with padding both worked.
+- *At one rank the result is exactly the serial one.*
+- *It costs what an `Allreduce` of one value costs*: `log P` latency
+  steps, plus `P` small values per rank, about 160 KB at 10⁴ ranks for
+  a `Float64` with its flag (below).
+
+Three consequences:
+
+- **An empty rank contributes no partial, not `init`.** `init` need
+  only satisfy `op(init, init) == init` (the `init` bullet under
+  "**Implemented**" above). So `max` over negative data from
+  `init = 0` is right serially, and would be wrong if an empty rank's
+  `0` entered the fold. Each rank therefore gathers `(hasvalue, value)`, and the fold
+  skips the empty ones; `init` is returned only if every rank is empty.
+  *(Amended in step 3: the example is wrong. `init` starts every
+  block's fold, so with an associative `op` and `op(init, init) ==
+  init`, one more `init` cannot change the result: `max` from 0 over
+  negative data is 0 on every rank count. What an empty rank's `init`
+  would change is a weighted reduction, since the weight scales a
+  block's value and not `init`: `max` from 1 over values below 1,
+  weight ½, is ½, and 1 with an empty rank's `init` in the fold. The
+  workload checks exactly that, at a rank count with an empty rank.)*
+- **What is exact.** Max, min and integer reductions are bit-identical
+  across rank counts. A floating-point sum is reproducible to roundoff,
+  since each rank's partial is associated differently when the
+  partition moves, which the narrowing above permits. Gathering every
+  block's partial instead would make sums independent of the rank
+  count too, at `nleaves` values per reduction on every rank — the
+  price the narrowing declined.
+- **What stays as it is.** `volume_weighted_norm` reduces twice (the
+  sum and the domain volume), so it costs two collectives; folding both
+  into one tuple partial is the obvious change if that ever shows.
+  `block_mapreduce` and `firing_boxes` stay local.
+
+**Regridding.** Flagging is local and the decision is replicated.
+
+1. `flag_blocks` and `firing_boxes` iterate the local blocks, and
+   `regrid!` takes the local flags.
+2. Each rank reduces its flags to the canonical mark, `markbox`'s flag
+   and box, which is an `isbits` value, and `allgatherv` assembles the
+   global vector in curve order. A caller's flag vector may be
+   heterogeneous, so it is not gathered as it is.
+3. `buffered_flags`, `complete_marks` and `balance!` run replicated,
+   `O(nleaves)` per rank, as AMReX and Parthenon do. Every rank arrives
+   at the same new leaves, so `regrid!` returns the same `Bool`
+   everywhere. `buffered_flags` and `complete_marks` remain public over
+   the *global* flag vector, which serially is the only one. *(Amended
+   after step 7: the buffer's neighbour search is not replicated. Each
+   rank searches from its own sources, and the recruits are gathered in
+   a second `allgatherv` and applied on every rank, which gives the
+   marks the replicated search gives; the rest of the completion is
+   replicated as described.)*
+4. The ghost fill before the transfer is the distributed fill, so a
+   parent's ghosts are current on its owner.
+5. The transfer is one stage over the new partition. `transfer_groups`
+   classifies every new leaf as today, from the replicated old and new
+   leaf arrays. The old owner of each source evaluates the transfer —
+   a copy, a prolongation from the parent, or one child's share of a
+   restriction — into a buffer shaped like that transfer's target box,
+   and the new owner unpacks it. *(Amended while specifying: the
+   first draft said a buffer shaped like the new block's owned box.
+   That is right for a copy and a prolongation; a restriction's target
+   is one child's part of it, and a coarsened block's children may have
+   had up to `2^D` different owners.)* Sender computes is what makes this
+   simple: the prolongation reads the parent's ghost layers, which only
+   the parent's old owner holds. *(Amended after step 7: a rank
+   classifies only the new leaves it will own and those whose sources
+   it owns, not every new leaf.)*
+6. That stage is also the repartitioning: a kept block whose owner
+   changes is a copy between ranks. When `k` blocks are added near the
+   start of the curve, an equal-count split shifts every later rank's
+   boundary, by `k(1 − r/P)` blocks for rank `r`: up to `k` blocks
+   moved per rank, `k/2` on average, the same order as the change
+   itself.
+7. `fs => nothing` reallocates to the new local count and moves
+   nothing.
+
+`adapt_to_initial_data!` and `total_mass` follow unchanged: the first
+is a loop of collective calls, the second a `mesh_mapreduce`.
+
+*(Step 4, where this was implemented; what it settled:)*
+
+- *The canonical mark* is `RegridMark{D}`: the flag, whether the caller
+  reported a box (`explicit`, which decides whether a `Keep` is a
+  dilation source), and the box as two `NTuple{D,Int32}` corners,
+  validated by `markbox` when the mark is made. `buffered_flags` reads
+  it through methods of `markflag`, `markbox` and `issource`, so the
+  public functions keep taking either caller form, and a gathered
+  vector is concretely typed. `regrid!` makes the marks serially too:
+  one code path, and a serial regrid measures the same (below).
+- *The checks ride the digest gather.* `regrid!`'s argument checks —
+  the pairs, each field set's forest and block count, each schedule's
+  forest, staleness, ghost width, centering, element type and backend,
+  `buffer`'s limits, the flag count and every flag's box — run inside
+  `collective_checks`, with a layout hash of what the ranks must also
+  agree on: each pair's variable count, ghost width, centering, element
+  type, backend and operators, in order, `buffer`, `transfer`, and
+  whether there is a hook. A rank that passed other field sets, or the
+  same ones in another order, would match its regrid messages — all
+  under tag 50 — to the wrong field set's. So one `allgather` of the
+  digest carries every refusal, and the flags follow in an
+  `allgatherv` only once all ranks have passed. Serially nothing is
+  gathered and every refusal keeps its serial type and message.
+- *The stage is `remote_stage`'s*, as step 2 left it to be.
+  `regrid_sources` classifies every new leaf once per regrid (amended
+  after step 7: only the new leaves this rank needs), not once
+  per field set as before, into a `TransferPairs` under `GroupKey`s
+  with direction zero and level 0 — targets new leaves, sources old,
+  both global — and `regrid_stage` splits it by the new partition for
+  the targets and the old for the sources, builds the local groups and
+  calls `remote_stage` with the two owners and ranges. A coarsened
+  block's `2^D` restrictions are `2^D` transfers with one target and
+  their own sources, so children with different owners are simply
+  received from different peers; nothing about them is special. Over
+  one rank both ranges are every leaf, nothing is split, and the stage
+  is the serial groups with no messages. `run_stage!` gained a form
+  over a separate `dest` and `src` — the new mesh's array and the old
+  one's — which the exchange's form now calls with `fs.work` twice.
+  `transfer_groups` keeps its signature, as the serial stage's groups,
+  for `thread_tests.jl` and `bench/gpu.jl`.
+- *The ghost fill's checks stay rank-local* (decided in step 4).
+  `fill_ghosts!` refuses a stale schedule, a field set over another
+  forest, a block count that does not match, another layout or
+  backend, each on the rank that sees it, and does not agree. Two
+  reasons. Each check is a function of objects the collective contract
+  keeps identical on every rank — the forest's generation and leaves,
+  a schedule whose build was digest-checked, a field set's layout — so
+  under the contract they agree without a message, and a check that
+  fires on one rank only means the contract was already broken, which
+  the digest catches at the next schedule build or regrid. And agreeing
+  would cost a collective per fill, which is per right-hand-side
+  evaluation: a global synchronization of every rank on the path "Two
+  time scales" keeps free of everything but the neighbour messages.
+  What a one-rank refusal does is make that rank throw before it posts
+  a message, so the others wait in their first stage: a hang, never
+  wrong data. An MPI application turns it into a job failure the usual
+  way — `MPI.Abort` from a handler, as `test/mpi_workload.jl` does.
+
+**Point interpolation.** `interpolate` becomes collective. Each rank
+passes its own points, possibly none.
+
+1. Each rank locates its points on the host against the replicated
+   leaves, which gives each point's global leaf index. The owner
+   follows from the split arithmetic in `O(1)`.
+2. An `alltoallv` routes the points to their owners.
+3. The existing kernel runs over the received points, with the block
+   offset subtracted to reach the local block.
+4. A second `alltoallv` returns the values and the `exclude` flags, in
+   the caller's order.
+
+Each value comes from the same kernel, block and stencil as serially,
+so it is bit-identical. Outside points are agreed by an `allgather` of
+each rank's first one, so every rank throws the same `ArgumentError`
+together, instead of one rank throwing while the others wait in the
+next collective. Ghosts must be current, as now.
+
+*(Step 5, where this was implemented; what it settled, and where it
+amends the four steps above:)*
+
+- *The contract.* Every rank passes the same field set, basis, `derivs`,
+  `vars` and `exclude`, and its own points, any number or none; it gets
+  the answers for its own points, in its own order, on the field set's
+  backend. An owner evaluates the points it receives with its *own*
+  arguments, so those that shape the evaluation must agree, and are
+  hashed for the check below; the points are the only per-rank input.
+- *One `allgather` before anything is sent* (amended: the four steps had
+  the outside points agreed after the values returned). The location runs
+  on the host, before the routing, so a rank knows its outside points
+  before it sends anything, and the same gather that agrees on them can
+  carry everything else a refusal on one rank would leave hanging. It is
+  a `ForestDigest` — this rank's refusal flag, the generation, `nleaves`
+  and a hash of the arguments above, with the leaf fold and the brick
+  zeroed — beside the rank's first outside point, if any, and that point
+  as `NTuple{D,T}`. `digest_verdict` gives the verdict on the first part,
+  whose layout message now names interpolation's arguments too. So a
+  refused batch, for any reason, routes nothing and writes nothing;
+  serially the in-domain values are written before the throw, which the
+  docstring never promised either way.
+- *Not the full forest digest.* Its fold over every leaf costs about
+  14 ns a leaf — 10 µs at 288 leaves, 38 µs at 2304, 260 µs at 18432
+  (measured, `D = 3`) — against 0.11 ms for the 496-point horizon batch
+  at four threads. Per call at analysis cadence it would cost as much as
+  the interpolation, while the generation and the leaf count catch every
+  mutation made on one rank only, and the schedule builds and regrids
+  check the leaves themselves.
+- *Not the same message on every rank* (amended: the design said every
+  rank throws the same `ArgumentError`). A rank that passed an outside
+  point raises the serial message for its own first one, with a sentence
+  naming the ranks that passed any; every other rank names the first such
+  rank, its point index and the point. A rank's own point is what its
+  caller can act on, and the others still all throw, together.
+- *The messages.* Points travel as `NTuple{D,T}` — converted on the host
+  by the same `T(x[d])` the serial kernel applies first, so the owner's
+  fold, location and stencil start from the same bits. MPI.jl sends an
+  `isbits` element type through a derived datatype it builds and caches
+  (`Datatype(T)` in its `datatypes.jl`), which covers `Float32x2` points
+  and values as it does in the regrid stage. Then the values come back as
+  a flat vector of `T`: the received points are concatenated in rank
+  order, so each asking rank's answers are one contiguous segment of the
+  owner's `(nvars, K, n)` output. The `exclude` flags take a third
+  `alltoallv`, of `Bool` (`MPI_C_BOOL`), only when there is a region;
+  every rank knows whether there is one, since it is agreed. Each
+  `alltoallv` is an `Alltoall` of the counts and the `Alltoallv`, so a
+  batch costs one `allgather` and four or six all-to-all calls; the
+  return could reuse the known counts, which was not worth a verb.
+- *The order.* A stable counting sort by owner gives each owner a rank's
+  points in that rank's order, and the inverse permutation puts the
+  answers back. Bit for bit, the value of a point is the serial one: the
+  same kernel, the same point, the same block's array (ghosts included,
+  which the distributed fill made bit-identical) and the same stencil.
+- *One kernel, one more argument.* `interpolate_kernel!` takes the block
+  offset, `first(blockrange) − 1`, which is 0 serially. The owner
+  re-folds and re-locates each point it receives — the kernel's own
+  search, against the replicated leaves — rather than receive the leaf:
+  that keeps the serial kernel unchanged, and it makes the kernel's
+  per-point leaf a check. Every received point must locate in the
+  owner's own blocks, and otherwise the owner raises an error saying the
+  forests differ. That error is raised on one rank only, but it can
+  only follow a broken collective contract that the generation check
+  missed.
+- *A device backend goes through the host.* The points are copied to the
+  host for the location and the routing, the received ones uploaded for
+  the kernel, its results downloaded for the return, and the answers
+  uploaded into the caller's arrays. At analysis cadence, hundreds of
+  points of `nvars × K` values, those copies are small, and the device
+  location stays the serial path's. Step 8's device buffers are for the
+  exchange; nothing here needs them. Checked once on Metal in process
+  (`Float32`, three simulated ranks, one with no points, value, gradient
+  and an excluded ball): bitwise equal to the serial Metal call. That
+  check is a scratch script, not part of the suite, which has no device
+  in its environment.
+- *The host location* is one search per point at tens of nanoseconds, so
+  it runs serially below 4096 points and through `threaded_foreach`
+  above, every point writing only its own slot.
+
+**Parallel checkpoints** (parallel HDF5 in M7, decided 2026-10-01 with
+Erik; *superseded 2026-10-02*, decided with Erik, by "Checkpoints
+without parallel I/O" below, after the four-node account at the end of
+this item. What follows is kept as the record of the design that was
+built in step 6 and measured, and as the reason for its replacement.)
+One shared file, with the version-1 layout unchanged:
+`format_version` stays 1, and a file restarts on any rank count, serial
+included, which is what "No coordinates, and no partition" was for.
+
+- *Where the code goes.* The MPI-specific calls —
+  `h5open(path, mode, comm, info)`, the `mpio` file access, the
+  collective transfer property — come from HDF5.jl's own MPI
+  extension, which loads only with MPI. So they go into a second
+  extension, `TreeAMRHDF5MPIExt`, triggered by HDF5 and MPI together.
+  `TreeAMRHDF5Ext` gains hooks, dispatched on the forest's communicator
+  type, for opening the file, for creating objects and for the slab
+  each rank reads and writes, with today's code as the serial methods.
+- *Collective metadata.* Every rank creates every group, dataset and
+  attribute with the same arguments, which the layout keeps to a fixed
+  dozen or so at any rank count (see "Parallel I/O and M7" under
+  [Checkpoint and restart](#checkpoint-and-restart)). Attribute values
+  must agree, so the provenance is formed on rank 0 and broadcast,
+  since `created`, `hostname` and `nthreads` differ between ranks. It
+  gains `nranks` (decided 2026-10-01 with Erik), an additive field
+  whose obvious default for an older file is 1, so the format does not
+  change.
+- *Raw data by hyperslab.* Each rank writes and reads the last-axis
+  hyperslab of its own blocks, `blockrange`, in every dataset: the leaf
+  columns `root`, `level` and `coords`, and each field set's `data`.
+  The transfers are collective, as a filtered dataset requires. With
+  filters a chunk is one block and variable, so every chunk has exactly
+  one writer. A rank with no blocks takes part with an empty slab.
+- *Durability.* The write still goes to `path * ".partial"`. Under
+  `sync = true` the flush has to reach every rank's writes, not only
+  rank 0's: on a parallel file system each client caches its own, and
+  an `fsync` on rank 0 flushes none of the others'. So the ranks make a
+  collective `H5Fflush`, which the MPI-IO driver turns into
+  `MPI_File_sync` on every rank (confirmed in step 6 against libhdf5
+  2.2.0's source, below), and then close the file collectively. Rank 0 then
+  flushes the file itself as today (`F_FULLFSYNC` on macOS, where a
+  plain `fsync` does not reach the drive), renames it and flushes the
+  directory. A barrier follows, so that no rank returns before the
+  rename.
+- *Errors.* Everything that can be refused — the field sets, the
+  forest, the path, the plain data — is checked before the first
+  collective HDF5 call, and the verdict is agreed by `allgather`, so a
+  refusal is raised on every rank with the same reason. An error inside
+  a collective HDF5 call on one rank cannot be recovered portably,
+  since the others are waiting in it. It is fatal to the job, as in any
+  MPI code, and documented as such.
+- *Plain data and the do-block are collective.* `write_plain` and the
+  `f(app)` callback run on every rank with the same data, because an
+  attribute written collectively has one value. `write_plain` checks
+  this by gathering a digest of the encoded bytes, and refuses data
+  that differ between ranks; that is step 6's refusal test.
+- *Loading.* Every rank reads all of the leaf columns, since the forest
+  is replicated, builds the forest with `comm` through the validated
+  `leaves` path, and reads its own slab of each field set into its
+  state vector.
+
+*(Step 6, where this was implemented; what it settled, and where it
+amends the bullets above:)*
+
+- *Where the code goes* (amended). `TreeAMRHDF5MPIExt` holds one call,
+  `open_parallel_file(::MPI.Comm, path, mode)`, which is HDF5.jl's
+  `h5open(path, mode, comm, info)`. The collective transfer property is
+  HDF5.jl's own `dxpl_mpio = :collective`, which needs no MPI, and
+  everything else is in `TreeAMRHDF5Ext` beside the serial code. The
+  hooks dispatch not on the communicator type, which the HDF5 extension
+  cannot name (it is `TreeAMRMPIExt`'s, and the load order of two
+  extensions is not defined), but on an `Access` chosen by `commsize`:
+  `Alone` for one rank, whose methods are M9a's calls unchanged, and
+  `Ranked` otherwise. The extension reaches MPI through two stubs in
+  `src/`: `librarycomm(comm)`, whose method in `TreeAMRMPIExt` returns
+  the duplicate, and `open_parallel_file`, whose fallback refuses with
+  the reason. A forest over a one-rank MPI communicator takes the
+  serial path, and its file is a serial file with `nranks = 1`.
+- *Who writes what.* Every rank creates every group, dataset and
+  attribute with the same arguments, and writes every attribute. A
+  dataset over the blocks — `root`, `level`, `coords` and each `data` —
+  is written by last-axis hyperslab in one collective transfer, an
+  empty rank with an empty selection (`H5Sselect_none`, which HDF5.jl
+  does not wrap). Every other dataset — the extents, the provenance,
+  the plain data — is written by rank 0 alone with an independent
+  transfer, and read by every rank. That is legal because parallel
+  HDF5 allocates an unfiltered dataset's storage when it creates it
+  (`H5D__create` in `H5Dint.c`), and it keeps a value from being written
+  `P` times over to the same bytes.
+- *No variable-length data in a parallel file* (found in step 6).
+  libhdf5 refuses to write variable-length data through the MPI-IO
+  driver (`H5D__write`: "Parallel IO does not support writing VL or
+  region reference datatypes yet"), from any number of ranks, and
+  HDF5.jl stores an array of strings as variable-length. Attributes are
+  not affected (the `features`, `centering` and `parity` arrays wrote
+  and read back), nor are scalar strings, which HDF5.jl stores at a
+  fixed length. So in a parallel file a plain-data array of strings is
+  fixed-length UTF-8, NUL-padded to its longest string; `read` returns
+  the same `Array{String}`, so the item reads back the same, with the
+  same `type` and `eltype`, and the format version is unchanged. A
+  string in such an array that holds a NUL is refused before anything
+  is written, since the padding would lose it. The M9a reader (0.1.4)
+  reads a parallel file, fixed-length strings and filtered data
+  included (checked).
+- *Provenance* is rank 0's, gathered to every rank by an `allgatherv` to
+  which the other ranks contribute nothing, so no broadcast verb was
+  added. `nranks` follows `nthreads`; a serial file carries `nranks = 1`
+  (decided here: the field is then in every file M7 writes, and a file
+  without it is from before M7, which `read_provenance` reads as 1).
+- *The agreement.* Before the file is created every rank runs the
+  serial checks — the field sets, `application`, the geometry type —
+  and walks `data` the way `write_plain` will write it, refusing what it
+  would refuse, with the same messages, and folding a hash of every
+  item's name, type and bits. One `allgather` carries a `ForestDigest`
+  (the full one: a forest that differs would write a corrupt leaf
+  list), the hash of the path and every keyword but `data` as its
+  layout, and the data hash, and `digest_verdict` gives the verdict, the
+  data a message of its own. A load agrees on its arguments the same
+  way, with rank 0 alone checking that the file exists and is HDF5;
+  what the file holds is the same for every rank, so a refusal of its
+  contents comes on every rank at the same point without a message.
+  Serially the walk runs too, so a value outside the plain-data types is
+  now refused before the file is created rather than while it is
+  written, with the same message.
+- *How much of the plain data is checked* (decided here): all of it, by
+  that hash, once per `save_checkpoint` and once per `write_plain` in
+  the do-block. Two reasons. Under the collective contract a value that
+  differs between ranks need not fail: an attribute written with
+  different values is undefined in parallel HDF5, which does not check
+  it, and a dataset that rank 0 writes alone would silently record rank
+  0's value, so a restart would read one rank's run state as
+  everyone's. And the
+  cost is a walk over values that are small next to the field data, plus
+  one collective per call. What the do-block writes through HDF5 itself
+  is not checked; the docstring says it must be the same on every rank.
+- *Durability, confirmed.* In libhdf5 2.2.0, `H5Fflush` reaches
+  `H5F__flush` (`H5VLnative_file.c`), which calls `H5F__flush_phase2`
+  with `closing = false` and so `H5FD_flush` and the driver's
+  `H5FD__mpio_flush`, which calls `MPI_File_sync` unless the file is
+  closing (`H5FDmpio.c`). So a flush as the file closes does not sync,
+  and the explicit collective flush before the close is needed. In
+  MPICH's ROMIO, `MPI_File_sync` is `ADIOI_GEN_Flush`, an `fsync` on
+  each rank that wrote through its own descriptor, which under
+  collective buffering are the aggregators that did the writing. Then
+  rank 0 does what a serial save does — `F_FULLFSYNC` on macOS, where
+  the ranks' `fsync` stops short of the drive, then the rename, then the
+  directory — and an `allgather` of whether it succeeded is the barrier,
+  so every rank returns once the checkpoint is in place, or throws.
+  Whether BeeGFS honours each client's `fsync` is the file system's,
+  and is not something a test here can see.
+- *Collective metadata reads are not enabled.* Each rank reads the
+  file's metadata independently, which is always correct, and keeps a
+  do-block that reads on rank 0 alone legal. At thousands of ranks the
+  independent reads of one small object header may become the cost
+  (`H5Pset_all_coll_metadata_ops` is the remedy); the Symmetry
+  measurement is where that would show. *(At up to 8 ranks on one node,
+  and at 32 on four nodes, step 6, it did not.)*
+- *Errors inside a collective call* remain fatal, as above. A
+  `write_plain` refused in the do-block is agreed, so every rank leaves
+  the block together and closes the file collectively, and the partial
+  file is removed (tested).
+
+*(Step 6 on four nodes of Symmetry, 2026-10-02: what amends the bullets
+above, and withdraws the step's earlier reading that its one-node
+measurement stood for the design. The account, with the jobs, is in the step's record under
+[Milestones](#milestones).)* **The shared file is to be replaced**
+(decided 2026-10-02 with Erik, after what follows): writing one file
+from several nodes is judged not reliable enough, and the parallel
+checkpoint becomes one without parallel I/O — a subset of the ranks are
+I/O processes, each writes a file of its own, an index file ties them
+together, and on reading each file is opened by one process. The
+checksums and the reproducers below carry over to it; the hints and the
+shared-file layout need not.
+
+- *No read-modify-write* (amends "Raw data by hyperslab", which took a
+  rank writing only its own bytes to be enough). A checkpoint saved by
+  32 ranks on four nodes came back with one rank's slab of the leaf
+  coordinates zeroed. ROMIO, the MPI-IO of MPICH and MPICH_jll, knows
+  no BeeGFS and drives it with its generic POSIX driver ("UFS"), which
+  turns some writes into a read-modify-write of a wider range: data
+  sieving, for an independent write with a noncontiguous file view,
+  under an `fcntl` write lock over the extent; and collective
+  buffering, which writes each aggregator's whole file domain after
+  reading it if anything in it is not being written, under no lock
+  outside atomic mode (read in MPICH 5.0's `ad_write_str.c` and
+  `ad_write_coll.c`). On a POSIX file system that is safe, since a
+  write that has returned is visible to every reader and a lock
+  excludes every other locker. Symmetry's BeeGFS clients break both:
+  they hold a node's writes until a flush (`tuneFileCacheType =
+  buffered`), and their `fcntl` locks are local to the node
+  (`tuneUseGlobalFileLocks = false`, in `/etc/beegfs/beegfs-client.conf`
+  and the client's `/proc` view). The first is shown directly: a rank's
+  completed `write`, read after a barrier by a rank on another node,
+  was not there in 5 of 300 trials, and never between ranks of one
+  node (28 of the 32 pairs tried). The second is read from the
+  configuration and was not tested. HDF5 had placed the first chunks of the filtered data before the leaf
+  columns, so rank 0's write of its chunks spanned the columns; data
+  sieving read them while another node still held a rank's
+  coordinates, and wrote the zeros back. The explanation is the one
+  consistent with all of the evidence in the step's record — under data
+  sieving the loss is always whole slabs of ranks on nodes other than
+  rank 0's, the rank whose write spans them, and under collective
+  buffering whole file domains of aggregators; it vanishes with both off,
+  it appears below HDF5 with nothing but MPI-IO calls, and the file
+  system's configuration and visibility are as described — but no
+  trace of an individual write's journey was taken. The destroyed write
+  itself took no lock, so global locks alone would not have saved it.
+- *The hints* (the remedy for ROMIO). Every parallel file is opened
+  with `romio_ds_write = disable` and `romio_cb_write = disable`, so
+  each rank writes exactly its own bytes. On the reproducer (four nodes,
+  32 ranks, filtered saves through `save_checkpoint`) damaged saves went
+  from 12 in 200 (6 %) to 0 in 1000, where the old rate predicts about
+  60; and at two nodes, in the throughput benchmark, saves without the
+  hints were refused by the checksums in both of two rounds and saves
+  with them never. The cost is in filtered saves of data that compress
+  well, where each chunk becomes a write of its own: blast with zstd(1)
+  at 16 ranks saved at 1.40 GB/s with the hints against 1.88 without,
+  while unfiltered saves and pulse did not change (the step's record).
+  **Not covered: Open MPI.** Its own MPI-IO, OMPIO, the default of the
+  HPC-X that step 7 measured between nodes, ignores the
+  `romio_` keys; whether OMPIO reads or writes back anything it was
+  not given was not established, since HDF5_jll's Open MPI build loads
+  its own Open MPI rather than HPC-X's and the run was stopped by the
+  change of plan above. Enabling `tuneUseGlobalFileLocks` on the BeeGFS
+  clients, which only the administrators can do, would restore ROMIO's
+  locking between data-sieving ranks, but not, by the reading above,
+  the visibility of unlocked writes that the observed loss needed.
+- *Checksums* (decided with Erik after it). The leaf list and every
+  block of every field set carry a CRC-32C, verified on load, with the
+  verdict agreed across ranks; the format and the reasons are under
+  "Checksums" in [Checkpoint and restart](#checkpoint-and-restart).
+  They are not the remedy — damage refused is still a lost checkpoint
+  — but they are the defence for file systems and MPI-IO
+  implementations this was not measured on: the next such loss is
+  refused with its reason instead of restored into a wrong state. A
+  damaged field set would have been restored: only the leaf list's own
+  validation caught this one, and only because zeros broke the curve
+  order.
+- *NFS, for comparison.* ROMIO on the NFS `/home` of the same nodes —
+  whose NFS driver locks around its writes, though which driver ran was
+  not checked — lost nothing with data sieving (0 damaged in 1000) or with collective
+  buffering forced on (0 in 200). Plain `pwrite`s of adjacent ranges
+  from several nodes, no MPI-IO involved, lost whole pages there in 98
+  of 200 trials — NFS's page cache, and the reason ROMIO locks — while
+  on BeeGFS the same `pwrite`s were exact in 200 of 200. Neither file
+  system is coherent between nodes; they fail differently, and a
+  shared file is safe only when the MPI-IO layer knows how each fails.
+
+**Checkpoints without parallel I/O** (decided 2026-10-02 with Erik; it
+replaces the shared file of "Parallel checkpoints" above, whose
+four-node account is the reason, and is M7's step 6b). Writing one file
+from several nodes was not reliable on Symmetry, and the remedy found
+there — two ROMIO hints — is specific to one MPI-IO implementation on
+one file system, while the same measurement showed NFS losing whole
+pages to plain `pwrite`s from several nodes. Smaller clusters may fail
+in ways of their own, and a checkpoint that can be lost is not one. So
+no file of a checkpoint is ever shared between processes:
+
+- **One writer and one opener per file** (decided). Every file a
+  checkpoint consists of is created and written by exactly one process,
+  and on reading opened by exactly one process. HDF5 is used serially
+  only, so nothing depends on MPI-IO, its hints, or a file system's
+  coherence between clients. `TreeAMRHDF5MPIExt`, `open_parallel_file`,
+  `librarycomm` and the hints are removed (decided), and HDF5_jll need
+  no longer be a parallel build or match the MPI: the stock one still
+  is, which is harmless, and any other serves.
+- **I/O groups.** The ranks are split into `k` contiguous groups in rank
+  order, by the equal-count split that partitions the blocks
+  (`equalsplit`); the first rank of each group is its *I/O process*, and
+  the others its members. The ranks own contiguous runs of the curve in
+  rank order, so a group's blocks are one contiguous run of the curve,
+  and its part of every field set is one range of blocks. The keyword
+  `io` of `save_checkpoint` chooses `k`:
+  - `io = :node`, the default (decided): one per shared-memory node.
+    `k` is the number of nodes, which a new verb, `commnodes`, counts
+    from `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)`; its serial method
+    answers 1. A node's client is the unit a cluster file system caches
+    and is fed by, and one file per node keeps the number of files, and
+    the metadata server's load, at the number of nodes.
+  - `io = :all`: every rank writes its own part, and nothing is sent.
+  - An integer `k ≥ 1`, used as it is up to the rank count and clamped
+    to it beyond (decided here: an I/O process with no member is a rank
+    writing its own part, so a larger `k` can mean nothing else).
+  - *Nodes whose ranks are not contiguous* (decided here). The groups
+    are always contiguous, equal-count rank ranges; `:node` sets `k`
+    only. Under the usual block placement of ranks (SLURM's `block`
+    distribution, `mpiexec`'s by-slot default) the groups are then
+    exactly the nodes and every message stays on its node. Under a
+    round-robin placement, or with unequal counts per node, a group
+    spans nodes and its messages cross the network, which costs time
+    and nothing else. Contiguity is worth more than locality: it is what
+    makes a part one range of blocks, which one reader can send back
+    out as contiguous ranges at any other rank count.
+- **Files** (decided). Beside the *index file* `path`, which rank 0
+  writes, each I/O process writes one *part file*,
+  `path.<saveid>.<j>.h5` for its group `j in 0:k-1`, in the index's
+  directory. The save id is 128 random bits drawn by rank 0
+  (`RandomDevice`) and written as 32 lowercase hex digits; it is
+  recorded in the index and in every part, with the part's number and
+  block range, so that a part from another save — the previous one, or
+  one that crashed — is refused rather than read. With one I/O process
+  (a serial run, `io = 1`, or one node under `:node`) the single part
+  lives inside the index file, so a serial checkpoint is still one
+  file. The layout is format version 2, under "File layout, format
+  version 2" in [Checkpoint and restart](#checkpoint-and-restart).
+- **Writing.**
+  1. Every refusal is decided before anything is created and agreed
+     across the ranks, as in step 6.
+  2. Rank 0 draws the save id and broadcasts it (a new verb, `bcast`,
+     with a serial method).
+  3. Each member sends its owned data — the state vector, on the host;
+     a device field set through `tohost` as before — to its I/O
+     process: the members in curve order, a member's per-block
+     CRC-32Cs first and then its blocks, in messages of whole blocks of
+     at most 1 GiB each (one block if a block is larger; 64 MiB as
+     implemented, see below). The I/O
+     process writes each message as it arrives, by hyperslab, with the
+     next receive already posted, so it holds at most two messages and
+     never its group's data whole. It checks every block it receives
+     against the member's CRC before writing it, so a block damaged in
+     transit is refused rather than written.
+  4. The I/O process writes its part's `data_crc32c`, closes the part
+     and, under `sync = true`, flushes it and then its directory to
+     stable storage (`flush_to_storage`). It reports success, the
+     part's size in bytes, and a checksum of each field set's
+     `data_crc32c` to every rank, in one `allgatherv`, which is also the
+     verdict: if any I/O process failed, every rank throws and each I/O
+     process removes its new part. Nothing is committed.
+  5. Rank 0 writes `path * ".partial"`: the format attributes, the
+     provenance, the forest, the field sets' layouts, the part table,
+     the external links, and the application's group, the do-block's
+     writes included. Under `sync = true` it flushes the file, renames
+     it over `path` (`Base.Filesystem.rename`), which is the commit
+     point, and flushes the directory; the verdict on that is agreed.
+  6. Only then does rank 0 delete the parts the previous index named,
+     read from it before the commit, and every *orphan*: a file in the
+     index's directory whose name is exactly `basename(path)`, a dot,
+     32 lowercase hex digits, a dot, decimal digits and `.h5`, with a
+     save id other than this one. A failure to delete is a warning, not
+     an error, since the checkpoint is in place.
+
+  A crash at any point before the rename leaves the previous index and
+  every part it names intact, plus at worst new parts that no index
+  names, which the next save removes; a crash after it leaves the new
+  checkpoint complete and at worst old parts, removed the same way. An
+  I/O process whose writing fails goes on receiving everything its
+  members send, without writing it, so that no member waits forever in
+  a send, and the failure arrives in the verdict. An error of the MPI
+  library itself remains fatal to the job. The cost of the cleanup rule
+  is that a copy of the index under another name in the same directory
+  does not keep its parts: an earlier checkpoint is kept by saving to
+  another path, or by moving the index and its parts to another
+  directory together, which keeps their relative names valid.
+- **Reading.**
+  1. The arguments are agreed, and only rank 0 opens the index. With
+     one rank it reads it directly. Otherwise it copies everything but
+     the part data — the `/TreeAMR.jl` group's attributes, the
+     provenance, the forest, the field sets' layouts, the part table
+     and the application's group — into an in-memory HDF5 file (the
+     core driver, without a backing store) and broadcasts its bytes,
+     and every rank opens that image (HDF5.jl's `h5open(bytes)`, which
+     sets the file image). HDF5 itself serializes the forest and the
+     plain data, so no serializer is needed. A refusal of the file
+     itself — it is missing, or is not a checkpoint — is rank 0's, and
+     is broadcast in place of the image, so it is raised on every rank;
+     what the image holds is the same everywhere, so a refusal of its
+     contents comes on every rank at the same point without a message.
+  2. Each part is read by exactly one rank: the owner, under the new
+     partition, of the part's first block, moved on to the next rank
+     while that one already reads `cld(k, P)` parts, so that no rank
+     reads more than its share when that is possible. The assignment is
+     a function of the replicated part table, the same on every rank.
+  3. Each reading rank opens its parts and checks each against the
+     index: that it is a part, its save id, its number and block range,
+     its size in bytes, and the checksum of each field set's
+     `data_crc32c`. The verdict is agreed before any data move, so a
+     missing part, a part from another save, or a truncated one is
+     refused on every rank.
+  4. Each owner posts its receives, straight into its state vector. The
+     reader reads, for each field set, the part's blocks in the range
+     each owner needs — contiguous, so a part goes to a contiguous run
+     of ranks — by hyperslab, in pieces of at most 1 GiB (64 MiB as
+     implemented), checks each
+     block's CRC-32C, and sends it, with at most two pieces in flight; a
+     piece for itself it reads in place. A reader whose read fails goes
+     on sending, so no owner waits forever, and the damage and failure
+     verdict is agreed afterwards: a block that fails its checksum is
+     refused on every rank, as in step 6.
+
+  A version-1 file is read as one inline part covering every block, by
+  rank 0, which already has it open; so a file written before step 6b,
+  serially or by the shared-file writer, loads on any rank count.
+  Loading on a different rank count, and serially, works for every
+  combination, as it did.
+- **The do-block runs on every rank**, as it did. Rank 0's application
+  group is the index's; every other rank gets the same group in an
+  in-memory scratch file, discarded afterwards, so that a block that
+  calls collective operations still runs on every rank. `write_plain`
+  in it still agrees its value across the ranks, so what rank 0 writes
+  is what every rank passed; a dataset the block writes through HDF5
+  itself is kept from rank 0 alone and must be the same on every rank.
+  On loading, each rank's block gets the application group of its
+  image.
+- **External links for tools** (recommended to Erik, included). For
+  each part file the index holds an HDF5 external link,
+  `/TreeAMR.jl/parts/0003` → `ckpt.h5.<saveid>.3.h5:/TreeAMR.jl`, so
+  that `h5dump`, h5py and HDFView navigate from the index into every
+  part. TreeAMR's loader never traverses them: traversing an external
+  link opens its target, which would have rank 0 open every part, and
+  the other ranks hold the index only as an image. It takes the part
+  names from the part table and resolves them against the index's
+  directory itself. *The shadowing caveat*, for external tools: HDF5
+  resolves a relative external link by trying a prefix
+  (`HDF5_EXT_PREFIX`, or the link access property), the current
+  working directory and the directory of the file holding the link, and
+  HDF5's documentation lists the working directory before the parent's
+  directory — so a tool started in another directory may open a
+  same-named file there instead of the part. (Checked 2026-10-02:
+  libhdf5 2.2.0, HDF5_jll's, and h5dump 2.1.1 resolved the parent's
+  directory first, and fell back to the working directory only when the
+  part was missing there; older libraries may not.) TreeAMR's own
+  reader cannot be misled either way.
+- **Format version 2; the reader reads 1 and 2.** The parts change what
+  a file is, so the version is bumped, as "If the shared file does not
+  hold up, M7 bumps `format_version`" accepted. 0.1.4 refuses a
+  version-2 file with its format-version refusal, saying it was written
+  by a newer TreeAMR and naming `checkpoint_environment` (accepted, by
+  the versioning rules).
+- **What carries over from step 6**: the CRC-32C checksums per block and
+  of the leaf list, now with a checksum per part and field set in the
+  index above them; the refusals agreed before anything is created; the
+  plain-data agreement; the self-checking benchmark, which loads every
+  save it times; and the BeeGFS reproducers, whose `save_checkpoint`
+  modes now exercise this writer and whose MPI-IO and POSIX modes
+  remain as regression jobs for the file system. The shared-file
+  layout, the collective transfers, the fixed-length string arrays
+  (parallel HDF5 wrote no variable-length data) and the hints do not.
+
+*(Step 6b, where this was implemented, 2026-10-02; what it settled, and
+where it amends the bullets above:)*
+
+- *The save id* is drawn from `Base.Libc.getrandom!`, which is what
+  `RandomDevice` reads, and not from `rand`: an application that seeds
+  the global generator the same way in every run would draw, in a
+  restarted run, the id of the checkpoint it restarted from, and its
+  parts would overwrite that checkpoint's before the commit. An I/O
+  process also refuses to create a part file that exists already.
+- *The gathering's messages.* Per field set and member, first a vector
+  of `UInt32`: a status word, then the member's per-block CRC-32Cs; then
+  its blocks in pieces of whole blocks. A member that cannot prepare
+  its data (gather it, copy it to the host) sends the status 1 and no
+  blocks, and its own error comes in the verdict, so its I/O process
+  never waits for blocks that are not coming. The I/O process holds two
+  receive buffers of at most one piece each and writes its own blocks
+  straight from its state vector. *(Amended after the first Symmetry
+  run, job 568077: there each member's blocks were one message,
+  received and then written with nothing in flight, and one I/O process
+  for eight ranks on a node saved at 0.80 GB/s, against 1.47 for step
+  6's shared file. Now the I/O process receives every member's
+  checksums first, queues all the members' pieces in curve order, and
+  keeps the next piece in flight while it writes the current one — the
+  first while it writes its own blocks — and a piece is at most 64 MiB,
+  so a member's blocks are several. Measured again, it made no
+  difference that the noise lets one see; it is kept for the memory it
+  bounds, and the likelier reason is under step 6b's record.)*
+- *An empty part is stored contiguously*, without filters: HDF5 refuses
+  a chunk larger than a fixed dataset whose extent is 0, which a group
+  whose ranks hold no blocks would otherwise need.
+- *Version 2 requires its checksums*: a part without `data_crc32c`, or
+  an index without `leaves_crc32c`, is refused as damaged; in a version-1
+  file they stay optional.
+- *The agreements.* Every step that runs on some ranks only — the parts,
+  the index and the do-block, the commit, opening the parts, reading
+  them — ends in one `allgather` of whether each rank failed and an
+  `allgatherv` of the messages (`agree_errors`). A rank that failed
+  throws its own error; every other rank throws one that quotes the
+  first failing rank's message, an `ArgumentError` when that was a
+  refusal, so the reason is on every rank's screen. The commit's verdict
+  also carries whether the rename happened: if only the directory flush
+  after it failed, the new checkpoint is the one at `path`, and its
+  parts are kept.
+- *The cleanup runs on rank 0 after the others have returned.* It
+  touches only files of earlier saves, and the next collective call
+  orders it before anything else the ranks do with the directory (the
+  MPI test waits at a barrier before it lists the directory). Of the
+  names the previous index lists, only those of the part form — a
+  `.`, 32 hex digits, a `.`, digits and `.h5`, no `/` — are removed, so
+  a damaged index cannot make a save remove any other file.
+- *Flushing.* Each I/O process flushes its part and then the directory,
+  so the part's directory entry is durable before an index names it;
+  rank 0 flushes the index, renames it, and flushes the directory.
+- *The index image.* The `/TreeAMR.jl` group's attributes and the field
+  sets' layout attributes are copied attribute by attribute, as HDF5.jl
+  reads and writes them, and the provenance, the forest, the part table
+  and the application's group by `H5Ocopy` (HDF5.jl's `copy_object`),
+  which keeps a group's creation order, so a NamedTuple's fields come
+  back in order (checked). The image is created with the core driver
+  and no backing store, so nothing touches the disk.
+- *Reading.* A reader reads a piece for itself straight into its state
+  vector, and for another rank into one of two send buffers, waiting on
+  that buffer's previous send first; the pieces are cut as the
+  gathering's are, so both ends agree on them without a message.
+- *Plain data.* Without parallel HDF5 an array of strings is
+  variable-length again, as in M9a. A string or `Symbol` holding a NUL is
+  now refused by the plain-data walk, serially too, before anything is
+  written: HDF5 stores a C string, and HDF5.jl refused it in the middle
+  of the write.
+
+**What the feasibility check found** (2026-10-01, in a scratch
+environment on the development machine: Apple M3 Pro, HDF5.jl 0.17.4,
+HDF5_jll 2.2.2+0, which is libhdf5 2.2.0, and MPI.jl 0.20.27).
+
+- *Parallel HDF5 needs nothing chosen.* Every one of HDF5_jll 2.2.2's
+  60 artifacts is an MPI build, tagged by MPI ABI: `mpich`, `mpiabi`,
+  `openmpi` and `mpitrampoline`, all four on `x86_64-linux-gnu` and on
+  `aarch64-apple-darwin`, and `microsoftmpi` on Windows. MPIPreferences
+  selects the one matching the MPI binary. So `HDF5.has_parallel()` is
+  `true` out of the box, and has been all along under M9a, which loads
+  the same MPI build and never opens a file in parallel.
+- *Both binaries work.* On Julia 1.11.9 with the default binary,
+  MPICH_jll 5.0.2, the `mpich` artifact loads. On Julia 1.13.1 it is
+  MPIABI_jll with the `mpiabi` artifact, because a `LocalPreferences.toml`
+  in the global v1.13 environment selects it on this machine. That
+  preference stacks into every project, and subprocesses must see the
+  same one as the `mpiexec` that launches them; launching them with
+  `MPI.mpiexec()` from a parent with the same load path ensures that.
+- *What was run.* Under `mpiexec -n 2` and `-n 3`,
+  `h5open(path, "w", comm, info)` created a file with an attribute and
+  a dataset written by column, on both Julia versions. On 1.13, a
+  contiguous dataset and a chunked one with `Deflate(1)` were written
+  collectively by last-axis hyperslab, one chunk per column, with one
+  rank's slab empty, and read back correctly, serially and in
+  parallel.
+- *What was not.* Linux CI was not run. Its artifact exists for the
+  default binary, and step 3, which adds MPI to the test environment,
+  will show it there. `MPI.has_cuda()` exists in MPI.jl 0.20.27 and
+  returns `false` for MPICH_jll here.
+
+**What an MPI test costs** (measured the same day). One `mpiexec -n 3`
+subprocess, two threads per rank, that loads MPI and TreeAMR, builds a
+forest and does one `Allreduce`, takes 1.7–1.8 s of wall clock in three
+runs, 1.04 s of it inside the script on rank 0. The M5 workload,
+`test/thread_workload.jl`, run under `-n 3` with each rank doing the
+whole of it, takes 29.8 s, against 24.0 s for one process at two
+threads. The ranks compile in parallel, so a rank count costs about one
+serial workload plus a quarter. Two such subprocesses (`-n 2`, `-n 3`)
+would add about a minute to the suite, and the serial reference can run
+in-process. CI runners have three or four cores, while `-n 3` at two
+threads wants six, and MPICH polls while it waits; on CI the ranks
+should therefore run one thread each.
+
+**Performance work left for later** (to do, recorded 2026-10-02 after
+the buffer pool; none of it blocks M7, and each item is to be measured
+before it is built):
+
+- *The H200 re-measurement of the staged regrid with the pool* is
+  pending: `bench/symmetry_mpi_gpu.sh`'s `bench/mpi.jl` over CUDA at 2
+  and 4 ranks, staged against direct, against step 8's 25.4 / 48.0 ms
+  staged and 7.1 / 8.7 ms direct. The pool's local effect (step 8) says
+  nothing about `cuMemHostRegister`, which neither the CPU nor Metal
+  calls, so whether the 40 ms were the page-locking is still the
+  untraced guess it was.
+- *The pool's own rules.* It never shrinks: a forest keeps about one
+  live schedule's and one regrid stage's buffers, free between regrids.
+  A rule that drops buffers unused for some regrids, or a pool shared
+  between forests over one communicator, waits for a run where the
+  memory matters.
+- *Fewer copies and launches.* Packing straight into page-locked host
+  memory (or, on Metal, into the shared buffer the mirror copies to)
+  would drop the staging copies; one launch per stage for all its packs,
+  and one for its unpacks, would drop most of the 0.95 ms of launches in
+  a 2.5 ms H200 fill (step 8); a copy between same-shaped boxes could be
+  an MPI subarray datatype with no pack at all, on the host path.
+- *One-sided and persistent communication.* A fill repeats the same
+  messages until the next regrid, so persistent requests
+  (`MPI_Send_init` / `MPI_Recv_init`) built with the schedule would
+  save the matching, and RMA (`MPI_Put` into a window over the peer's
+  receive buffer, exposed once per schedule) or GPU-initiated transfers
+  (NVSHMEM, NCCL) would let the sender write into the peer's memory
+  without a receive.
+- *`interpolate!` at 32 ranks* (step 7, item 4): 8–10 ms against
+  0.6–0.9 at 2–16 ranks under HPC-X's Open MPI, and a median of 9.9 ms
+  already at 16; the HCOLL on/off job (567858) was never collected, and
+  the cause is open.
+- *Compression where the data are* (added in step 6b). With `io =
+  :node` one process per node runs HDF5's filter pipeline for the
+  node's blocks, serially, so a filtered save is bounded by one core's
+  compression per node (blast with zstd(1) on four nodes: 1.45 GB/s,
+  against 4.50 with `io = :all`; step 6b's record). The members could
+  compress their own chunks and send them compressed, for the I/O
+  process to write with `H5Dwrite_chunk`, and a load could send
+  compressed chunks to their owners (`H5Dread_chunk`); either needs the
+  filter pipeline outside HDF5's own write, which HDF5.jl does not wrap.
+  Until then `io = :all`, or a larger integer, is the setting for a
+  filtered save; whether that should be the default is Erik's to decide.
+- *What only many more ranks will show.* Measured to 32 ranks on four
+  nodes and 4 GPUs on one: the replicated forest's memory and its
+  `O(nleaves)` completion (20 ms at 32 ranks when every block is a
+  source, step 7), the flags' `allgatherv`, the forest digest gathered
+  by every checked call, the number of peers and messages per rank on
+  a deeper hierarchy, and GPUs across nodes, which no run has used.
+
+**The multi-block check** (the standing instruction, checked
+2026-10-01). Nothing here obstructs a conforming multi-block forest.
+
+- Ownership is by curve index, whatever the roots' connectivity.
+- Candidate peers come from `neighbor_keys`, in `forest.jl`, which is
+  where a multi-block connectivity would live.
+- A remote transfer is still a stencil built in `schedule.jl` and
+  evaluated by the one kernel, so an oriented root face would change
+  only the stencils. The pack evaluates them, and the unpack is a copy
+  into a target box whatever the orientation.
+- Face-resident quantities cross ranks through the interface
+  restriction's path.
+- The checkpoint stores no partition.
 
 ## Ecosystem integration
 
@@ -3059,6 +4612,13 @@ Remaining, none blocking before their milestone:
   - The parallel I/O design for M7: one shared file, as the version-1
     layout allows, against one file per I/O process plus a wrapper
     file. It is benchmarked on Symmetry and other HPC systems first.
+    *(Decided 2026-10-01 with Erik: the shared file, specified under
+    [Distributed meshes](#distributed-meshes). What stays open is its
+    throughput on a cluster file system, measured in M7's step 6.)*
+    *(Measured there, 2026-10-02: on BeeGFS the shared file lost data
+    between nodes until ROMIO's read-modify-write was turned off, and
+    did not get faster with nodes; it is to be replaced by one file per
+    I/O process with an index file, decided that day with Erik.)*
   - An ADIOS2 backend, if parallel HDF5 does not scale at M7. The data
     model maps one-to-one onto ADIOS2 variables (the datasets) and
     attributes.
@@ -3190,7 +4750,9 @@ checkpoint and restart** (decided 2026-09-29), because the downstream
 applications need to restart long runs before they need MPI. M9 is
 split for it: its second half, M9b (visualization export), stays after
 M7. M9a's layout was chosen so that M7 need not change it, subject to
-M7's benchmarks. The list below is in execution order.
+M7's benchmarks (in the end it did change it: format version 2, M7 step
+6b). The list below is in execution order. M7 is done (2026-10-02), so
+M9b is next.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -3670,15 +5232,1943 @@ M7's benchmarks. The list below is in execution order.
     into scratch copies, at one thread: TreeWave 310 tests in 1m12, and
     TreeHydro 11893 in 4m16. Neither calls the new functions yet; each
     gains them with `using HDF5` once a release carries them.
-- **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
+- **M7 — MPI.** *(Done, 2026-10-02. Measured on Symmetry the same day:
+  the weak-scaling table of step 7 at up to four nodes and the H200 run
+  of step 8, both paths, pass. The checkpoint of step 6, measured on
+  four nodes the same day, lost data on BeeGFS until ROMIO's
+  read-modify-write was turned off, and was replaced the same day by
+  one without parallel I/O — part files per I/O process and an index
+  file, decided with Erik — which is step 6b, measured on one, two and
+  four nodes with every save verified and 1000 stress saves without
+  damage. Left open, as later work rather than as part of the
+  milestone: the items under "Performance work left for later" in
+  [Distributed meshes](#distributed-meshes) — the H200 re-measurement
+  of the staged regrid with the buffer pool, `interpolate!` at 32 ranks
+  under Open MPI, compression at the members under `io = :node`, the
+  pool's own rules, and what only many more ranks will show.)* Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
   and the `Allreduce` inside `mesh_mapreduce` (the planned global
   reduction under [Parallelism](#parallelism)), the one place a
-  communicator appears in a reduction. *Accept:* results match serial
-  to roundoff — bit-identical for everything but floating-point sums,
-  as [Parallelism](#parallelism) states; weak-scaling smoke test; then
-  MPI+GPU with CUDA-aware MPI.
+  communicator appears in a reduction. *(Amended 2026-10-01: the
+  reduction is an `allgather` of per-rank partials folded in rank
+  order, not an `Allreduce`, and parallel checkpoints are part of M7;
+  both are under [Distributed meshes](#distributed-meshes), which
+  specifies the milestone. Interpolation routing is added with them.)*
+  *Accept:* results match serial to roundoff — bit-identical for
+  everything but floating-point sums, as [Parallelism](#parallelism)
+  states; weak-scaling smoke test; then MPI+GPU with CUDA-aware MPI. In
+  steps, each ending green and committed, with what it measured recorded
+  here and in the commit body. Every step runs the full suite at one
+  thread and at eight, with the thread-independence digests byte for
+  byte, and from step 3 on the MPI tests with it:
+  - **Step 0 — specification.** *(Done, 2026-10-01.)*
+    [Distributed meshes](#distributed-meshes), after two feasibility
+    checks recorded there: the stock HDF5_jll is a parallel build and
+    works under `mpiexec` with MPICH_jll on Julia 1.11 and MPIABI_jll
+    on 1.13, and an `mpiexec -n 3` subprocess costs about a serial
+    workload and a quarter.
+  - **Step 1 — local blocks, no messages.** `communicator.jl`, the
+    forest's `comm` field and keyword, the split helper shared with
+    `threadchunks`, and `blockrange`. Every block-index site becomes
+    local: allocation, `blockkey` and the coordinate and fill origins in
+    `storage.jl`; `block_origins` and `block_spacings`; the schedule's
+    block count and `BoundaryPlan`; the block-count checks in
+    `ghosts.jl` and `interfaces.jl`; `combine_blocks` and the volume
+    loop in `state.jl`; `flag_blocks`, `regrid!`, the scratch forest and
+    `firing_boxes` in `regrid.jl`; and `interpolate.jl`. *Accept:* the
+    whole suite passes unchanged. New in-process tests, through a
+    test-only `PartitionCommunicator(rank, size)` that answers rank and
+    size and sends nothing, check the partition: the ranges tile
+    `1:nleaves` in order and differ in length by at most one, ranks
+    beyond `nleaves` are empty, and `blockkey` on every rank names the
+    leaf that rank owns. *(Done, 2026-10-01.)* What it settled, and
+    where it went beyond the plan:
+    - *The split.* `equalsplit(n, p, i)` in `threading.jl`, the closed
+      form of `threadchunks`' old loop, is the one helper:
+      `threadchunks` returns its parts, and `blockrange(forest)` is part
+      `commrank + 1` of `commsize`. The test compares it against the old
+      loop for every `n ≤ 40` and `p ≤ 9`, and `threadchunks` against it
+      at the suite's thread count.
+    - *The keyword.* `Forest(…; comm = nothing)`, and
+      `communicator(nothing)` is the `SerialCommunicator`, so the default
+      is spelled the same way the MPI case will be. A `Communicator`
+      subtype lacking a verb is refused at that verb by name, through a
+      fallback method on the abstract type, rather than with a
+      `MethodError` inside a reduction; that is what lets the test-only
+      communicator answer rank and size alone. The serial `isend` and
+      `irecv` refuse any peer, since a serial rank has none, and the
+      serial `waitall` accepts only an empty list.
+    - *The geometry per local block.* `block_origins(forest)` and
+      `block_spacings(forest)` take the forest, not a field set, and are
+      per local block through `blockrange`, so every kernel that reads
+      them is unchanged. Tree queries — `nleaves`, `find_leaf`,
+      `neighbor_keys`, `locate_point` — stay global, and `flag_blocks`
+      walks the local range and passes the local index.
+    - *The schedules build their local part* (amended: the plan had them
+      untouched until step 2). `GhostSchedule` and `InterfaceSchedule`
+      walk the rank's own targets in global leaf indices and then keep
+      the transfers with both ends on the rank, shifted to local
+      indices, together with the boundary regions of the rank's blocks.
+      That is step 2's *local* class already; the test checks it against
+      the serial schedule restricted to each rank's range, mirrored
+      transfers and three levels included, over 2 and 3 fake ranks.
+    - *What refuses a distributed forest until its step*: `fill_ghosts!`
+      and `restrict_interfaces!` (step 3), `regrid!` (step 4),
+      `interpolate` (step 5) and `save_checkpoint` (step 6), each with an
+      `ArgumentError` naming the step; a reduction is refused by the
+      missing `allgather` of a communicator that lacks one.
+    - *The reduction is already written* (amended: the plan put it in
+      step 3). `combine_blocks` gathers `(hasvalue, partial)` per rank
+      and folds the ranks that have a value, in rank order, as
+      "Reductions" above specifies — but at one rank it returns its own
+      fold without calling `allgather`, so the serial value is unchanged
+      by construction and a serial reduction keeps accepting a
+      non-`isbits` partial, which `allgather` refuses. The multi-rank
+      fold is first exercised by step 3's workload.
+    - *Empty ranks.* `launch_by_owner!` skips an empty `ndrange` on a
+      device too, `firing_boxes` returns an empty vector, and the
+      `AllVariables` fill returns before checking its callback at a
+      block that does not exist.
+    - *Docs.* The `docs/src/api/distributed.md` page that step 9 was to
+      add exists now, with `communicator`, `blockrange` and the internal
+      verbs, since Documenter refuses a docstring that is on no page.
+    - *Suite cost.* 98818 tests in 4m44 at one thread and 98870 in 4m51
+      at eight; the difference from M9a's 93686 and 93738 is exactly
+      `partition_tests.jl`'s 5132, so no existing test moved. The docs
+      build.
+  - **Step 2 — the distributed schedule.** The candidate remote targets,
+    the three classes, the sorted layouts, the stages, and the
+    packed-buffer accessors. *Accept,* in process, over 1–5 fake ranks,
+    in `D = 1, 2, 3`, with periodic, reflecting and outer faces, every
+    centering, three levels and the interface schedule:
+    - the union over ranks of the local, send and recv transfers
+      equals the serial schedule's transfer set exactly;
+    - rank `r`'s send layout to `s` equals `s`'s receive layout from
+      `r`;
+    - every target is written exactly once;
+    - a pack-then-unpack round trip, with every rank's buffers wired
+      directly in one process, reproduces the serial `fill_ghosts!`
+      bitwise, in `Float64`, `Float32` and `Float32x2`, including an
+      odd variable that is zero at a reflecting wall (the `−0` case).
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan:
+    - *The data structures.* `GhostSchedule` keeps `phase1`, `phase2`
+      and `levels`, which now hold the transfers *local* to the rank,
+      and gains `stages`, a vector of `ExchangeStage`s in tag order:
+      phase 1, then one per phase-2 target level. A stage holds its
+      `tag`, its local groups and a `remote` part, which is `nothing`
+      when the stage has no messages on this rank. Serially every stage
+      is `nothing`-remote and its local groups *are* the phase (the same
+      vector). `InterfaceSchedule` gains `stages` the same way, one per
+      face dimension. A `RemoteStage` holds, per direction, the peers
+      ascending with their segment lengths in points; one `LayoutEntry`
+      per buffer slot (peer, `GroupKey`, global target and source,
+      offset and size in points), kept on the host; the pack and unpack
+      groups; the slot offsets on the backend; and the buffers. A
+      `GroupKey` has an explicit total order (`keyorder`: kind ranked,
+      then direction, offset, level, mirror state), so a layout never
+      depends on `Dict` order.
+    - *The tags*: phase 1 is 1, the level-`ℓ` stage `2 + ℓ`, interface
+      dimension `d` is `40 + d`, and 50 is reserved for the regrid.
+      They ascend in the order the stages run.
+    - *The classification.* `split_received!` splits the transfers
+      found for the rank's own targets into local ones, which are
+      shifted to local indices, and received ones, kept global.
+      `sent_transfers` runs the builder's own search (`block_sources!`
+      or `interface_sources!`) for every candidate remote target,
+      `remote_neighbors` in `forest.jl`, and keeps those with a local
+      source. `leafowner` inverts the split in `O(1)`, through
+      `equalsplit_part` beside `equalsplit`. `remote_stage` builds one
+      stage's messages. It takes the target and source owners and
+      ranges separately, so that step 4's regrid stage — targets in the
+      new partition, sources in the old — is a call of it, and is not
+      built here.
+    - *Packs and unpacks.* A pack is the serial group's stencils with
+      every target range moved to start at 1, `targetblocks` the slots,
+      `sourceblocks` the local sources, sorted by (source, slot), and
+      no parity column. An unpack is a width-1, weight-1 group from the
+      slot into the serial target box, sorted by (target, slot), with
+      the parity column. On the CPU, `run_phase!` bisects
+      `sourceblocks` when the destination is a packed buffer, through
+      `ownerblocks` and `ownercount`; the device path is the per-group
+      one, unchanged.
+    - *The driver.* `run_stage!` runs the five steps through the
+      communicator verbs. `exchange_ghosts!` and `exchange_interfaces!`
+      are the bodies of `fill_ghosts!` and `restrict_interfaces!` after
+      their checks, and a serial fill now goes through them. The two
+      public functions still refuse a distributed forest, so step 3
+      removes the refusal and adds the MPI methods of the verbs.
+      `run_stage!` takes the forest rather than its communicator: the
+      `comm` field is abstractly typed, and passing it made every stage
+      of a serial fill a run-time dispatch of 48 bytes (measured, then
+      removed).
+    - *Tests*, in `test/exchange_tests.jl`. They cover 1–5 simulated
+      ranks (and `nleaves + 1` in 1D, which leaves a rank empty), `D =
+      1, 2, 3`, periodic, outer and reflecting faces, `faces_forest`'s
+      three levels, every centering, both operator families, and the
+      interface schedule over every centering with a face dimension.
+      They check the candidates against the serial schedule's readers.
+      They check the union of the local transfers and the matched
+      sent and received halves against the serial set, per stage, with
+      every slot consistent with its layout entry. They check both
+      ends' layouts entry by entry and the per-stage write counts
+      against the serial ones, at most one write per point. They run
+      the bitwise lockstep round trip, the boundary hook between the
+      stages included: `Float64` over every centering, `Float32` and
+      `Float32x2` over a subset, and the interface restriction in
+      `Float64` and `Float32x2`. Finally the staged driver itself runs
+      over an in-process mailbox communicator, one task per rank, in
+      `D = 2, 3` at 3 and 5 ranks, for the ghosts and the interfaces,
+      bitwise against serial. `gpu_tests.jl` runs the lockstep round
+      trip on every backend; on Metal (Float32) it passes, with the
+      rest of that file.
+    - *Serial cost* (`bench/ghosts.jl` at its defaults: `D = 3`,
+      `N = 8`, 4³ roots, 10 variables, order 4; best of 400 fills and 40
+      builds, HEAD before and after, alternated). The fill is unchanged
+      at one thread: 2.71–2.78 ms against 2.71–2.73 ms on the uniform
+      mesh, 11.8–14.5 ms against 12.0–15.0 ms on the two-level one, with
+      identical allocations (10912 and 97536 bytes). At four threads
+      the uniform fill measured 0.51–0.52 ms against 0.64–0.65 ms; the
+      cause was not traced. The schedule build is within noise,
+      0.40–0.43 ms against 0.41 ms and 3.0–3.3 ms against 3.0–3.2 ms.
+      It allocates 2.8 % more on the uniform mesh (389 KB against 379 KB)
+      and 3.1 % more on the two-level one (4.65 MB against 4.51 MB),
+      nearly all of it the per-key stencil memo below.
+    - *Distributed build cost* (one thread, `D = 3`, `N = 8`, `G = 2`,
+      order 4, the bench's two-level periodic mesh, slowest rank of `P`
+      fake ranks). At 120 leaves the serial build is 3.4 ms and a rank's
+      is 3.6, 3.1 and 2.6 ms at `P = 2`, 4 and 8. At 960 leaves (8³
+      roots) the serial build is 9.7 ms and a rank's 11.0, 9.2 and
+      7.3 ms. So at these sizes a rank's build costs about the serial
+      one, not `1/P` of it. A profile of one of the eight ranks at 960
+      leaves puts a third of the time in the search for the sent
+      transfers and another third in building the remote stages. At
+      120 blocks a rank, a 3D halo is about as many blocks as the
+      rank's own, so that is the `O(local + halo)` the spec predicts,
+      not a defect. It is a regrid-frequency cost, about 1,300–2,100
+      sent transfers a rank here. The host stencils are memoized per
+      group key, which the stage builder asks for again (10 % of the
+      rank build).
+    - *What was not done.* The regrid's stage, which is step 4, has
+      only its builder's interface, as above.
+    - *Suite cost.* 108338 tests at one thread, in 5m29 and 5m51 over
+      two runs, and 108390 at eight, in 5m35 and 5m54. The increase over
+      step 1's 98818 and 98870 is exactly the 9506 tests of
+      `exchange_tests.jl` and the 14 of the CPU entry of the new
+      `gpu_tests.jl` testset (7380 of the 9506 check the owner inverse),
+      so no existing test moved. The thread-independence digests are
+      unchanged. The new file takes about 50 s standalone, almost all of
+      it compilation of the `Float32` and `Float32x2` kernels and of the
+      3D centerings; that is most of the 45–65 s the suite grew by, and
+      what to trim first if the suite has to shrink. The docs build.
+  - **Step 3 — the MPI extension and the exchange.** `TreeAMRMPIExt`,
+    the staged `fill_ghosts!` and `restrict_interfaces!`, the
+    `combine_blocks` allgather, and the forest digest check; MPI in
+    `[weakdeps]` and `[extensions]`, and in `test/Project.toml`. A new
+    `test/mpi_workload.jl`, a standalone script like
+    `thread_workload.jl`, prints on rank 0 digests of the leaves and of
+    the state gathered in curve order, the integer and max reductions
+    exactly, and the sums to `%.17g`. A new `test/mpi_tests.jl` runs it
+    under `MPI.mpiexec()` at `-n 2` and `-n 3`. *Accept:* against a
+    serial run, every line byte-identical except the sum lines, which
+    agree to roundoff, over the vertex and cell waves, Burgers with the
+    fixup, a reflecting box, three levels, and a rank with no blocks;
+    the digest check refuses a forest mutated on one rank only, on
+    every rank; and what the subprocesses add to the suite is measured,
+    with the rank counts trimmed if it is large.
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan:
+    - *The extension.* `ext/TreeAMRMPIExt.jl` defines `MPICommunicator`
+      (the duplicate, with its rank and size read once) and one method
+      per verb, each a single MPI.jl call: `MPI.Allgather` of the
+      `isbits` value, `Allgatherv!` after a gather of the lengths,
+      `Alltoallv!` after an `Alltoall` of the counts, `Isend`, `Irecv!`
+      and `Waitall`. `communicator(::MPI.Comm)` refuses MPI not
+      initialized (or finalized), `COMM_NULL` and a thread level below
+      `THREAD_SERIALIZED`, each saying what to do; the duplicate and its
+      cache are as amended under "The communicator layer". A message
+      buffer must be an `Array` or a `UnitRange` view of one, which
+      MPI.jl passes as a pointer and a count: the exchange's per-peer
+      segments are exactly such views, and anything else is refused
+      rather than sent as a derived datatype. The fill and the
+      interface restriction lose their refusals and run through
+      `run_stage!` unchanged from step 2; the reduction needed nothing,
+      since step 1 had written it.
+    - *The digest*, in `forest.jl` (`ForestDigest`, `agree_on_forest`,
+      `digest_verdict`, `collective_checks`), as amended under "Every
+      forest mutation is collective": a fold over every leaf, the brick,
+      the layout, and a refusal flag, so that a refusal on some ranks is
+      raised on all. `GhostSchedule` and `InterfaceSchedule` run their
+      argument checks through `collective_checks`; `regrid!` will in
+      step 4. The in-process fakes of steps 1 and 2 answer the digest
+      gather alone, by replication — their ranks are copies of one
+      forest — so they still refuse every other verb they lack.
+    - *The workload.* `test/mpi_workload.jl` prints, on rank 0, lines
+      that do not depend on the rank count: per case the leaf count, the
+      maximum level and a digest of the leaves; the serial transfer
+      count, as the sum over ranks of local and received transfers, and
+      whether the totals sent and received agree; digests, gathered to
+      every rank in block order, of the working arrays *with their
+      ghosts* after a fill, of the state after the steps, and of the
+      working arrays after a last fill; and the reductions — a count,
+      `linf`, `min`, a `max` of negative data and a weighted `max` from a
+      non-neutral `init` exactly, the norm and the mass on `sum` lines.
+      The cases: the cell-centered wave in 1D on two periodic leaves,
+      which leaves a rank empty at `-n 3`, and on three levels against
+      outer faces; the vertex-centered wave in 2D on three levels with
+      the hook; the cell-centered wave in 3D, periodic, three levels; a
+      reflecting box in 2D, vertex-centered with walls at both ends
+      (the derived wall plane) and cell-centered with low walls, the
+      first variable odd across x₁; Burgers in 2D on three levels with
+      the fixup, the fluxes digested after it and mass conservation
+      asserted; and every centering through one fill and, where a
+      dimension is vertex-like, one interface restriction — cell,
+      vertex and both faces in 2D, vertex, a face and an edge in 3D —
+      over pseudo-random data that is a function of the global leaf and
+      the stored index, so that no stencil reproduces it by accident
+      and the injection at a vertex-like face is not a no-op. Lines
+      starting with `#` depend on the rank count and are checked on
+      their own: the refusals, the duplicate cache, `alltoallv` and
+      `allgatherv` with empty contributions, and the negative control.
+      Without the argument `mpi` the forests are serial.
+    - *The test.* `test/mpi_tests.jl` runs the serial reference in
+      process (the script in a module of its own, printing into a
+      buffer), then `MPI.mpiexec()` at `-n 2` and `-n 3`, one thread a
+      rank, with `Base.julia_cmd()` and the active project, under a
+      deadline, and compares: every line byte for byte except the `sum`
+      lines, within `rtol = 1e-12`. It checks the comparison itself on
+      the serial output (a flipped digest character is caught, a sum
+      moved by `10⁻⁹` is caught, one moved by three ulps is not). The
+      negative control rewrites one rank's received ghosts from its last
+      receive buffer with one value moved by an ulp, and asserts that
+      the gathered digest changes. The refusals are a `refine!` on rank
+      1 only (`GhostSchedule`) and on rank 0 only
+      (`InterfaceSchedule`), other operators on rank 1, and an argument
+      only rank 1's checks refuse; each is raised on every rank, and the
+      test asserts the reasons. In process, the verdict is tested on
+      digests of real forests, and a forest over `COMM_WORLD` in a
+      process without `MPI.Init` is refused.
+    - *The launcher's environment.* `MPI.mpiexec()` returns a `Cmd`
+      carrying an environment — the library paths of the MPI binary —
+      which interpolating it into a larger command drops. The test
+      launches `setenv(cmd, mpiexec().env)`.
+    - *What was measured.* At `-n 2`, `-n 3` and `-n 4` with one thread
+      a rank, and at `-n 3` with two, every line agrees with the serial
+      run byte for byte except the `sum` lines, which differ in the last
+      one or two digits of 17 where they differ at all (`l2`, `mass`;
+      Burgers' mass 16 against 15.999999999999998); at `-n 1` the output
+      is the serial output exactly. Each `mpiexec` run of the workload
+      takes 27–29 s of wall clock at any of these rank counts, and the
+      serial run 25 s, nearly all of it compilation. Inside the suite
+      `mpi_tests.jl` takes 58.4 s at one thread and 58.9 s at eight
+      (timed around its `include`): the serial reference in process,
+      which reuses the suite's compiled kernels, and the two `mpiexec`
+      runs. That is the minute "What an MPI test costs" predicted, so the
+      rank counts were not trimmed.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 resolves
+      MPI.jl 0.20.27 with MPICH_jll (its global environment's preference),
+      against MPIABI_jll on 1.13.1 here, where the global v1.13
+      `LocalPreferences.toml` selects it; `Pkg.test` copies the merged
+      preferences of the load path into its sandbox (Pkg's
+      `Operations.jl`, read, not measured), so the suite's ranks run the
+      same binary as its `MPI.mpiexec()` either way. `mpi_tests.jl` alone
+      passes there (32 tests, 1m04), and so does the whole suite, 108376
+      tests in 5m08.
+    - *Suite cost.* 108376 tests at one thread, in 6m10 and 6m00 over
+      two runs, and 108428 at eight, in 6m01. The increase over step 2's
+      108338 and 108390 is 38: the 32 of `mpi_tests.jl` and the 16 of the
+      in-process verdict test, less a net 10 in the refusal assertions
+      steps 1 and 2 made of `fill_ghosts!` and `restrict_interfaces!`
+      over a distributed forest (11 removed, and one added: a fill over
+      a communicator that answers rank and size alone now stops at
+      `irecv`, by name). The thread-independence digests are
+      unchanged. The docs build.
+  - **Step 4 — the distributed regrid.** The flag gather, the transfer
+    stage with the repartitioning, and `adapt_to_initial_data!`.
+    *Accept:* the tracked pulse and the Burgers shock through regrid
+    cycles in the workload, with leaves and state byte-identical to
+    serial and mass conserved to roundoff across ranks; a regrid that
+    migrates blocks between ranks, and one that coarsens a block whose
+    children had different owners.
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan (the design decisions are recorded under "Regridding" in
+    [Distributed meshes](#distributed-meshes)):
+    - *The driver.* `regrid!` runs its checks through
+      `collective_checks`, gathers the canonical marks with one
+      `allgatherv`, completes them replicated, and per field set fills
+      the old mesh's ghosts (the distributed fill), zero-fills the new
+      local array and runs the regrid stage through `run_stage!` from
+      the old array into the new one, waiting for its sends before the
+      next field set; then `rebuild_leaves!`. `fs => nothing`
+      reallocates to the new local count, `transfer = false` moves
+      nothing, and "nothing changed" returns `false` on every rank,
+      since every rank decides it from the same gathered marks. The
+      step-1 refusal is gone; `adapt_to_initial_data!`, `firing_boxes`
+      and `total_mass` needed no change.
+    - *The workload.* `test/mpi_workload.jl` gains the tracked pulse (a
+      right-moving Gaussian, vertex-centered, outer faces with the hook,
+      flagged through `firing_boxes` with a buffer, three regrids with
+      RK4 steps between), Burgers' shock through three regrids with the
+      fixup (conservative operators, the fluxes `=> nothing`; mass
+      conserved across each regrid and the run, and on `sum` lines),
+      `adapt_to_initial_data!` from a single leaf with the host callback
+      and with a `firing_boxes` flag vector (two of three ranks start
+      empty at `-n 3`), and a case that refines the first blocks of a
+      uniform mesh and coarsens them back, and refines three of four
+      roots and coarsens them back, over three field sets at once (cell,
+      `nvars = 2`, `G = 2`, order 4; vertex, `nvars = 1`, `G = 1`,
+      order 2; a face, `nvars = 3`, `G = 2`, order 4), then a regrid
+      that changes nothing. The second half runs again in `Float32` and
+      `Float32x2` over the cell-centered set, so both types cross MPI in
+      the regrid stage and the exchange. After each regrid the leaves
+      and every moved field set's array, ghosts zero, are digested
+      before any fill, so the transfer itself is compared bit for bit.
+      `#` lines count the blocks that moved up and down the ranks and
+      the coarsened blocks whose children had more than one owner, and
+      the test asserts at each rank count that both directions and the
+      straddling case occur. Four more refusals: a bad flag box on rank
+      1, a flag vector of the wrong length on rank 0, another `buffer`
+      on rank 1, and a forest refined on rank 1, each refused on every
+      rank, the forest untouched by the first three.
+    - *In process*, `test/regrid_exchange_tests.jl`. The lockstep test
+      builds the regrid stage of every simulated rank, packs from its
+      slice of the old array, delivers every segment, runs the local
+      groups and unpacks, and requires the result bit for bit equal to
+      the serial `regrid!` on every rank's new blocks; the union of the
+      local and received transfers equal to the serial transfer set;
+      both ends' layouts entry for entry; and every sent transfer naming
+      its source's old owner and its target's new one. It covers `D =
+      1, 2, 3`, every centering, the periodic, outer and reflecting
+      faces of `exchange_tests.jl`, PointValue and Conservative, 1–5
+      ranks and one more than the leaves in 1D (empty ranks), and, in
+      3D, 7 ranks, which is the first count at which a coarsened group
+      of that mesh straddles a rank boundary; `Float32` and `Float32x2`
+      over a 2D subset. Then `regrid!` and `adapt_to_initial_data!`
+      themselves run with one task per rank over a communicator whose
+      collectives are rendezvous between the tasks and whose messages
+      go through step 2's mailbox: two field sets and a flux `=> nothing`
+      with mixed bare and boxed flags and a buffer, in 2D and 3D at 3
+      and 5 ranks, bitwise against serial, and `transfer = false`; both
+      criterion forms from a single leaf at 3 ranks, with the serial
+      passes and data; and the refusals.
+    - *Measured.* The workload at `-n 2`, `3` and `4` with one thread a
+      rank, and at `-n 3` with two, prints the serial lines byte for
+      byte except the `sum` lines, which differ in the last one or two
+      of 17 digits where they differ (`l2`; Burgers' mass 16 against
+      15.999999999999998 and 16.000000000000004); 39–42 s of wall clock
+      per run, against 27–29 s in step 3. Blocks moved up and down at
+      every rank count (the uniform mesh: 3, 6 and 5 up on the refine,
+      as many down on the coarsen, at 2, 3 and 4 ranks), and 1, 2 and
+      2 coarsened blocks had children of more than one owner.
+    - *Serial cost* (a scratch script, best of 15: `D = 3`, `N = 16`,
+      the 4³-root mesh of `bench/threads.jl` with its middle refined, a
+      field set of 2 variables, `G = 2`, order 4, and a face-centered
+      flux `=> nothing`, refining a slab of 128 blocks and coarsening it
+      back; HEAD before and after, alternated). At one thread the
+      refine took 37.1–38.4 ms before and 37.2–38.3 ms after, the
+      coarsening 23.2–23.7 against 23.4–23.7; at four threads the
+      refine 12.6–13.2 ms against 12.7–14.3 and the coarsening 7.4–7.9
+      against 7.5–7.9. On a host-heavier mesh (`N = 6`, 8³ roots, 1856
+      leaves after the refine) 26.3–27.0 ms against 26.4–27.2 and
+      28.2–28.3 against 28.0–30.7. A regrid allocates 0.1–0.8 % more
+      (38.55 MB against 38.50, 34.86 against 34.57): the marks and the
+      layout hash. `bench/ghosts.jl`'s fill is unchanged, 2.57–2.59 ms
+      against 2.57–2.58 and 11.45–11.46 against 11.48, with 16 and 32
+      bytes less allocated per fill.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
+      `partition_tests.jl`, `exchange_tests.jl`,
+      `regrid_exchange_tests.jl`, `regrid_tests.jl` and `mpi_tests.jl`
+      (2m38 together); the whole suite was not run there.
+    - *Suite cost.* 108827 tests at one thread in 6m57 (7m02 in a
+      second run, timed by file) and 108879 at eight in 6m57: 451 more
+      than step 3 at each — the 430 of `regrid_exchange_tests.jl`, 22
+      more in `mpi_tests.jl`, and one fewer in `partition_tests.jl`,
+      whose two regrid refusals became one. `mpi_tests.jl` now takes
+      96.6 s inside the suite, against step 3's 58.4 s, and
+      `regrid_exchange_tests.jl` 12.4 s: about 50 s more in all. The
+      `Float32x2` and `Float32` workload cases cost about 2 s each per
+      run and the three-field-set case the most compilation; those are
+      what to trim first. The thread-independence digests are
+      unchanged. The docs build.
+  - **Step 5 — interpolation routing.** *Accept:* an interpolation line
+    in the workload, bit-identical to serial; a rank that passes no
+    points; and an outside point refused on every rank with the same
+    reason. *(Amended in step 5: every rank refuses together, but a rank
+    that passed an outside point names its own, and the others name the
+    first rank's; see "Point interpolation" in
+    [Distributed meshes](#distributed-meshes).)*
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan (the design decisions are recorded under "Point interpolation"
+    in [Distributed meshes](#distributed-meshes)):
+    - *The driver.* `interpolate!` over a distributed forest goes to
+      `interpolate_distributed!` in `interpolate.jl`: the serial
+      argument checks, factored into `check_interpolation`, run inside
+      one agreed gather together with the cheap forest check, a hash of
+      the arguments that must agree and the rank's first outside point;
+      then the host location, the route by a stable counting sort and
+      `alltoallv`, the kernel over the received points through
+      `launch_interpolation!` — the serial launch, factored out, with
+      the block offset — and the return of the values, and of the flags
+      when there is a region, into the caller's order. `interpolate`
+      itself defers a refusal of `derivs` to `interpolate!` over a
+      distributed forest, so that it too is agreed. The step-1 refusal
+      is gone; `refuse_distributed` now serves only the checkpoint.
+    - *In process*, `test/interpolate_exchange_tests.jl`, over
+      `regrid_exchange_tests.jl`'s rendezvous communicator, which gains
+      an `alltoallv`. Every simulated rank queries an uneven slice of
+      one point list — rank 1 none — and must reproduce its part of the
+      serial `interpolate` bit for bit: value and gradient of two
+      variables in reverse order with an excluded ball, the value alone
+      of every variable without a region, and `interpolate!` into
+      caller-supplied outputs from points given as vectors. The points
+      run beyond periodic dimensions and reflecting walls, sit on every
+      leaf's lower corner (so on every rank boundary) and on the
+      domain's corners, over random data in every stored point. The
+      cases are `D = 1` with a reflecting wall at 2 and 3 ranks and
+      periodic at `nleaves + 2` ranks (two of them without blocks);
+      `D = 2` reflecting at both ends and periodic, vertex-centered, at
+      3 ranks, outer and cell-centered at 5, and a face-centered
+      `Float32` set at 3; `D = 3` with a reflecting, an outer and a
+      periodic dimension at 4. The refusals at 3 ranks: an outside
+      point on rank 1 (its message and the others'), outside points on
+      ranks 0 and 2 with rank 1 passing none, `derivs` only rank 0's
+      checks refuse, `vars` and `exclude` that differ on one rank, and
+      a forest refined on one rank.
+    - *The workload.* `test/mpi_workload.jl` gains a 2D case, periodic
+      in x₁, reflecting below in x₂ and outer above, three levels and an
+      odd variable, over pseudo-random data with the ghosts filled:
+      every rank asks for its own uneven slice (rank 1 none) of 301
+      points running half a period and half a domain beyond the faces,
+      and rank 0 digests the gathered answers, which are then in
+      global order — value and gradient of two variables with an
+      excluded ellipse and its flags in `Float64`, the value alone in
+      `Float64` and `Float32x2`. A `#` line refuses an outside point on
+      rank 1, and `mpi_tests.jl` asserts it is refused on every rank
+      with rank 0 naming rank 1's point.
+    - *Measured.* The workload at `-n 2`, `3` and `4`, one thread a
+      rank, prints the serial lines byte for byte except the `sum`
+      lines, which differ in the last one or two of 17 digits where they
+      differ, as in step 4; the five interpolation lines are
+      byte-identical at every rank count. 44–47 s of wall clock per
+      run, against 39–42 s in step 4, the serial run 38 s. On Metal, a
+      scratch script found the device path bitwise equal to the serial
+      Metal call (the device bullet under "Point interpolation" in
+      [Distributed meshes](#distributed-meshes)); it is not in the suite.
+    - *Serial cost* (`bench/interpolate.jl` with `N = 8`, 4³ roots and
+      176 leaves, 20 variables, value and gradient with an excluded
+      ball, best of 200 calls; HEAD before and after, alternated, four
+      runs each). At one thread the 496-point batch took 0.353–0.368 ms
+      before and 0.363–0.370 ms after, 4960 points 3.61–3.66 ms against
+      3.64–3.71 ms; at four threads 0.109–0.114 ms against
+      0.110–0.114 ms and 0.981–0.998 ms against 0.979–0.992 ms. That is
+      within the run-to-run spread. A call allocates 32 bytes more at
+      one thread (10320 against 10288) and 96 more at four (13232
+      against 13136), the block offset in the kernel's arguments.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes `interpolate_tests.jl`, `partition_tests.jl`,
+      `exchange_tests.jl`, `regrid_exchange_tests.jl`,
+      `interpolate_exchange_tests.jl` and `mpi_tests.jl` (3m06
+      together); the whole suite was not run there.
+    - *Suite cost.* 109038 tests at one thread in 7m49 and 109090 at
+      eight in 8m09: 211 more than step 4 at each — the 204 of
+      `interpolate_exchange_tests.jl` and 7 more in `mpi_tests.jl`;
+      `partition_tests.jl`'s interpolation refusal became a refusal by
+      verb, one test for one. The thread-independence digests are
+      unchanged. The docs build. The step-4 tree, run the same day on
+      the same machine, took 7m02 at one thread, so the suite grew by
+      about 47 s; of that the new tests account for about 24 s when run
+      standalone — `interpolate_exchange_tests.jl` 13.5 s, nearly all of
+      it compilation, and `mpi_tests.jl` 125 s against the step-4 tree's
+      114 s — and the rest was not separated from the run-to-run spread.
+      The `Float32` and 3D cases of the new file are what to trim first.
+  - **Step 6 — parallel checkpoints.** `TreeAMRHDF5MPIExt` and the hooks
+    in `TreeAMRHDF5Ext`. *Accept:* save at `-n 3`, then load at `-n 2`,
+    at `-n 1` and serially, each continuation byte-identical to the
+    uninterrupted run; a serial file loaded at `-n 3`; a rank with no
+    blocks; plain data that differ between ranks refused on every rank;
+    `MPI_File_sync` confirmed under the collective flush; and
+    `bench/checkpoint.jl` run under MPI on Symmetry, with the shared
+    file's throughput recorded on its parallel file system — the
+    benchmark "Parallel I/O and M7" asked for. The per-process files
+    are revisited only if the shared file does not hold up.
+
+    *(Done, 2026-10-01; measured on Symmetry on 2026-10-02, on one node
+    and then on two and four, where the shared file lost data until
+    ROMIO's read-modify-write was turned off, which with its rate led to
+    the decision to replace it; see the last items.)*
+    What it settled, and where it went beyond the
+    plan (the design decisions are recorded under "Parallel checkpoints"
+    in [Distributed meshes](#distributed-meshes)):
+    - *The code.* `ext/TreeAMRHDF5MPIExt.jl` (`[extensions]`
+      `TreeAMRHDF5MPIExt = ["HDF5", "MPI"]`) opens the shared file;
+      `TreeAMRHDF5Ext` gains the `Access` hooks (`open_file`,
+      `write_whole`, `write_slab` / `read_slab`, `put_value`,
+      `agree_values`, `flush_ranks`, `publish`), the agreement
+      (`agreed`), the plain-data walk (`plain_hash`) and the
+      fixed-length string arrays; `src/` gains the stubs `librarycomm`
+      and `open_parallel_file`, `load_checkpoint`'s `comm` keyword, and
+      the docstrings' collective contract. `refuse_distributed` is gone,
+      its last caller with it.
+    - *The serial file is unchanged but for `nranks`.* A scratch script
+      wrote the same checkpoint — two field sets, `Float64` with parity
+      and a `Float32x2` vertex set, a reflecting face, every kind of
+      plain data and a do-block `write_plain` — with HEAD before the step
+      and after it, unfiltered and with `Shuffle` + `Deflate(1)`; `h5dump`
+      of the two files differs in `created` and the new `nranks = 1`
+      only, and `h5dump -p` also in the storage offsets, which the 8-byte
+      dataset shifts.
+    - *The workload.* `test/mpi_workload.jl` gains `checkpoint_case`:
+      the tracked pulse as a chunked driver (RK4 steps, the flags and a
+      regrid per chunk), run uninterrupted for three chunks, then saved
+      after the first — the bare `name => fs` form, plain data with a
+      Rational and an array of strings including an empty one —
+      unfiltered and with `Shuffle` + `Deflate(1)`, dropped, loaded at
+      the same rank count and continued; the mesh refines again after
+      the save (39 leaves, then 87). Its lines must be the serial
+      run's, and the continued digests the uninterrupted run's. A 1D
+      forest of two leaves is saved and loaded too, which at three ranks
+      leaves one rank without blocks both times. `checkpoint_cross` then
+      loads every file the earlier runs wrote at another rank count, at
+      this one and, under MPI, a second time over `MPI.COMM_SELF`, on
+      `#` lines. `mpi_tests.jl` runs the serial reference, `-n 3` and
+      `-n 2` (in that order now) over one `TREEAMR_CHECKPOINT_DIR`, then
+      the serial loads in process: so the serial file loads at 3 ranks
+      and at one; the 3-rank files at 2, at one inside the 2-rank job
+      (a one-rank MPI communicator — what a separate `mpiexec -n 1`
+      would test, without a third launch) and serially; the 2-rank files
+      serially. Every load reproduces the saved digests and every
+      continuation the uninterrupted ones. The refusals, at every rank
+      count: plain data that differ between ranks; an `application` only
+      rank 1 refuses; filters that differ on rank 1; a `write_plain` in
+      the do-block of a value that differs, after which the earlier file
+      is intact and no partial file is left; a load whose `fieldsets`
+      differ on rank 1; a load of a missing file, which rank 0 alone
+      looks for. Each is raised on every rank.
+    - *In process*: `checkpoint_tests.jl` passes unchanged but for two
+      deliberate assertions, `nranks == 1` and a file without `nranks`
+      reading as 1; `partition_tests.jl`'s save over the test-only
+      communicator now stops at its missing `allgather`, by name, like
+      the interpolation.
+    - *Measured by hand.* The workload at `-n 2`, `3` and `4`, one thread
+      a rank, prints the serial lines byte for byte except the `sum`
+      lines, which agree to roundoff, as in step 5; every cross load at
+      every count reproduces the digests. 53–57 s of wall clock per run,
+      against 44–47 s in step 5, and the serial run 44 s, against 38;
+      most of the difference is compiling HDF5.jl's paths in each rank.
+      `mpi_tests.jl` alone takes 2m34, against step 5's 125 s.
+    - *Throughput, locally only* (`bench/checkpoint.jl`, now runnable
+      under `mpiexec` with the argument `mpi`; the development laptop of
+      "Throughput and filters", its internal SSD, one thread a rank,
+      MPICH_jll 5.0.2, the same day and the same in-use conditions).
+      GB/s of state, aggregate over the ranks, the slowest rank's time;
+      `-n 1` is the serial path over a one-rank communicator:
+
+      | data | filter | serial | `-n 1` | `-n 2` | `-n 4` |
+      |---|---|---|---|---|---|
+      | blast, save | none | 7.49 | 7.50 | 6.66 | 6.90 |
+      | blast, sync | none | 4.58 | 4.66 | 4.52 | 4.47 |
+      | blast, load | none | 1.24 | 1.28 | 2.28 | 3.89 |
+      | blast, save | `Shuffle` + `Deflate(1)` | 0.34 | 0.34 | 0.67 | 0.92 |
+      | blast, load | `Shuffle` + `Deflate(1)` | 0.51 | 0.51 | 0.96 | 1.57 |
+      | pulse, save | none | 5.66 | 7.46 | 6.51 | 4.55 |
+      | pulse, load | none | 1.20 | 1.21 | 2.03 | 3.09 |
+      | pulse, save | `Shuffle` + `Deflate(1)` | 0.11 | 0.11 | 0.21 | 0.38 |
+      | pulse, save | bitshuffle + LZ4 | 0.62 | 0.62 | 1.12 | 1.80 |
+
+      So on one SSD the unfiltered save stays at the page cache's rate
+      and the flush at the drive's whatever the rank count, while what
+      is per rank — compression, the load's allocation, first touch and
+      `scatter!` — divides among the ranks: the filtered save 2.7 times
+      faster at 4 ranks, the unfiltered load 3.1 times. This is the
+      point "Compression is serial" made, that under M7 a filter
+      parallelizes. File sizes are the serial ones (90.0 MB for blast
+      with Deflate). H5Zzstd and H5Zlz4 were not in the environment, so
+      their rows are missing; H5Zbitshuffle was, from the default
+      environment. One run each; the M9a table varied by 15–60 % run to
+      run on this machine. These are not the parallel file system's
+      numbers, which are the point of the measurement.
+    - *`MPI_File_sync`* is confirmed by reading libhdf5 2.2.0's and
+      MPICH 5.0's sources (the chain is under "Parallel checkpoints"),
+      not by tracing a run: the call is made, but no test here can see
+      a write reach stable storage, and macOS's `fsync` does not.
+    - *Symmetry, one node only* (measured 2026-10-02, job 567854 on
+      cn106, AMD EPYC 7543, 64 cores, 8 NUMA domains; Julia 1.13.1,
+      MPICH_jll 5.0.2 through `srun --mpi=pmi2`, HDF5_jll's MPICH build
+      of libhdf5 2.2.0 with `HDF5.has_parallel()`; the files on BeeGFS
+      under `/mnt/beegfs/eschnetter/claude`; `bench/symmetry_checkpoint_mpi.sh`
+      as amended in the step's script commit, `TREEAMR_BENCH_REPS = 3`,
+      `64 / P` threads a rank, ranks in blocks so that 8 are one per
+      domain). GB/s of state, aggregate, the slowest rank's time, save
+      (`sync = false`) / sync / load; the default mesh, 3296 blocks,
+      216 MB of `pulse` and 540 MB of `blast`; `-n 1` is the serial
+      path over a one-rank communicator:
+
+      | data | filter | `-n 1` | `-n 2` | `-n 4` | `-n 8` |
+      |---|---|---|---|---|---|
+      | blast | none | 1.53 / 1.60 / 1.52 | 1.56 / 1.26 / 2.82 | 1.44 / 0.96 / 4.03 | 1.37 / 0.84 / 4.56 |
+      | blast | `Shuffle` + `Deflate(1)` | 0.22 / 0.22 / 0.42 | 0.40 / 0.38 / 0.70 | 0.52 / 0.52 / 1.40 | 0.81 / 0.77 / 2.51 |
+      | blast | shuffle + zstd(1) | 0.64 / 0.64 / 0.70 | 0.89 / 0.85 / 1.02 | 1.18 / 1.01 / 2.50 | 1.46 / 1.28 / 3.83 |
+      | blast | bitshuffle + zstd(1) | 0.51 / 0.51 / 0.68 | 0.77 / 0.74 / 1.28 | 1.01 / 0.96 / 2.41 | 1.15 / 1.06 / 3.65 |
+      | pulse | none | 1.26 / 1.34 / 1.20 | 1.35 / 1.11 / 2.31 | 1.34 / 0.90 / 2.36 | 1.15 / 0.77 / 3.27 |
+      | pulse | `Shuffle` + `Deflate(1)` | 0.07 / 0.07 / 0.19 | 0.12 / 0.12 / 0.45 | 0.19 / 0.18 / 0.74 | 0.25 / 0.23 / 1.33 |
+      | pulse | shuffle + zstd(1) | 0.30 / 0.30 / 0.42 | 0.35 / 0.34 / 1.05 | 0.42 / 0.36 / 1.79 | 0.42 / 0.34 / 2.43 |
+
+      File sizes are the serial ones (blast 89.9 MB with Deflate, 87.9
+      with zstd(1); pulse 161–164 MB). The mesh with 6³ → 12³ roots has
+      12648 blocks (the refinement follows a surface, so 3.8 times the
+      blocks, not 8; 829 MB of pulse and 2.07 GB of blast): at `-n 1`
+      pulse unfiltered 1.25 / 1.48 / 1.35, blast zstd(1) 0.62 / 0.63 /
+      0.69; at `-n 2` pulse unfiltered 1.48 / 1.32 / 2.55, blast
+      unfiltered 1.48 / 1.13 / 2.96 — the default mesh's rates, so the
+      table is not a small-file effect. What it shows:
+      1. **An unfiltered save from one node is 1.2–1.6 GB/s at every
+         rank count**, and the flush costs more with more ranks (blast
+         sync 1.60 → 0.84 GB/s from 1 to 8), every rank's
+         `MPI_File_sync` being a BeeGFS client round trip. One node's
+         client, or the servers, set that rate; which, only the
+         multi-node run can say.
+      2. **A filter parallelizes**, as "Compression is serial"
+         predicted: blast with zstd(1) saves at 1.46 GB/s at 8 ranks,
+         2.3 times its one-rank rate and about the unfiltered rate,
+         for a file 6.1 times smaller; Deflate 3.7 times faster. Pulse,
+         whose data compress to 1.3 only, gains less (zstd(1) 1.4
+         times).
+      3. **The load scales** (blast unfiltered 1.52 → 4.56 GB/s), but it
+         reads a file the node just wrote, so this is the client's
+         cache and the per-rank allocation and `scatter!`, not BeeGFS's
+         read rate.
+      4. Collective metadata reads were not needed at these counts.
+
+      The log of 567854 was copied later and is complete; the larger
+      mesh at `-n 4` and `-n 8`, which the table above lacked, is pulse
+      unfiltered 1.28 / 0.94 / 3.41 and 1.43 / 0.89 / 4.24, blast
+      unfiltered 1.57 / 1.08 / 4.82 and 1.63 / 0.90 / 5.64.
+    - **The multi-node run lost data** (job 567855, 2026-10-02: cn092–095,
+      8 ranks a node, `TREEAMR_CKPT_ONENODE = 0`). Every setting at 2
+      nodes on both meshes and at 4 nodes on the default one, and at 4
+      nodes on the larger mesh through shuffle + zstd(3), loaded back; then a load of blast with
+      shuffle + LZ4 on the larger mesh was refused on every rank by the
+      forest: leaves 5538 and 5539 "out of curve order", the second a
+      key with coordinates `(0, 0, 0)`. The last file was still on
+      BeeGFS and was read serially on another node (job 567907,
+      `bench/checkpoint_inspect.jl`): `root`, `level` and all 63240
+      chunks of `data` were intact, and in `coords` exactly the 395
+      rows of rank 14 (on cn093) were zero, bytes [160993, 165733) of
+      the file. Every reader agreeing, the damage was in the file, not
+      in a read. `bench/checkpoint_layout.jl` showed the trigger: HDF5
+      had put the first 9 chunks of `data` (rank 0's first two blocks)
+      at [6672, 8110), in free space before the leaf columns at
+      [31309, 246325), and the rest from 250501 on, so rank 0's file
+      view for its chunks spanned the columns. ROMIO reported its
+      generic driver (`romio_filesystem_type` "UFS"), `romio_cb_write`
+      and `romio_ds_write` "automatic", and the BeeGFS client
+      `tuneFileCacheType = buffered` (512 KiB a file),
+      `tuneUseGlobalFileLocks = false`, `tuneRemoteFSync = true`; the
+      file was striped over 4 targets on 2 servers in 512 KiB chunks.
+      The mechanism this points to is under "Parallel checkpoints" in
+      [Distributed meshes](#distributed-meshes); here is what tested it.
+    - *The reproducers* (`bench/checkpoint_stress.jl`, run by
+      `bench/symmetry_checkpoint_stress.sh`; four nodes, 32 ranks,
+      MPICH_jll 5.0.2, files on BeeGFS unless marked; a save is damaged
+      when either of two serial readers on different nodes finds a row
+      that is not what was written). The 12648-leaf partition of the
+      failing run, at 4³ cells a block:
+
+      | layer | case | damaged | jobs |
+      |---|---|---|---|
+      | `save_checkpoint`, Shuffle + Deflate(1) | as in 0e71c75 | 12 / 200; 13 / 200 with `sync` | 567917 (and 567915) |
+      | | `romio_ds_write` off (hint file) | 0 / 200 | 567917 |
+      | | `romio_ds_write` and `romio_cb_write` off | 0 / 200 | 567917 |
+      | | with the fix (the hints in the code) | 0 / 1000 | 567930 |
+      | `save_checkpoint`, unfiltered | as in 0e71c75 | 0 / 200; 0 / 200 with `sync` | 567915 |
+      | | with the fix | 0 / 300 | 567930 |
+      | HDF5 alone, contiguous hyperslabs | defaults | 0 / 200 | 567915 |
+      | MPI-IO, the checkpoint's pattern, independent | defaults | 1 / 200; 3 / 2000 | 567917, 567930 |
+      | | data sieving off | 0 / 200; 0 / 2000 | 567917, 567930 |
+      | MPI-IO, the same, collective | defaults (falls back to independent) | 0 / 200; 0 / 200 with sync-barrier-sync | 567917 |
+      | | collective buffering forced on | 151 / 200; 176 / 200 | 567917, 567930 |
+      | | the same, data sieving off | 147 / 200 | 567917 |
+      | | both off | 0 / 200 | 567930 |
+      | MPI-IO, adjacent unaligned ranges | `write_at_all`; `write_at` | 0 / 200; 0 / 200 | 567915, 567917 |
+      | POSIX `pwrite`, adjacent unaligned ranges | — | 0 / 200 | 567915 |
+      | POSIX, a rank's write read by the next rank after a barrier | — | unseen 5 / 300, always across nodes; file after close intact | 567958 |
+      | NFS `/home`: MPI-IO pattern, independent; collective buffering on | defaults | 0 / 1000; 0 / 200 | 567959 |
+      | NFS: MPI-IO adjacent ranges; POSIX `pwrite`s | — | 0 / 200; 98 / 200, whole pages | 567959 |
+
+      Under data sieving the loss was always one or more whole slabs
+      of ranks on cn093–cn095 (31 damaged saves, ranks 9 to 30), never
+      of ranks 1–7, which share rank 0's node; under collective buffering,
+      whole aggregator file domains. Under the old rate, 0 damaged in
+      1000 has a probability of about e⁻⁶⁰. The collective MPI-IO case
+      with defaults saw no damage either way, so it says nothing about
+      sync-barrier-sync. What was not done: a trace of individual
+      writes, a cross-node `fcntl` lock test, a run with
+      `tuneUseGlobalFileLocks = true` (root only), and any Open MPI run
+      — HDF5_jll's Open MPI build failed to load HPC-X's library (job
+      567937), and the pure MPI-IO runs under OMPIO were cancelled when
+      the shared file was dropped.
+    - *Measured with the fix* (job 567938, cn092–095, the same day,
+      `TREEAMR_BENCH_REPS = 3`; every save now checked by a load, 8 a
+      setting, all of which passed): GB/s save / sync / load, as above.
+
+      | data | filter | 2 nodes, 16 ranks | 4 nodes, 32 ranks |
+      |---|---|---|---|
+      | blast | none | 1.69 / 0.92 / 5.45 | 1.72 / 0.93 / 6.10 |
+      | blast | `Shuffle` + `Deflate(1)` | 0.76 / 0.74 / 2.94 | 1.18 / 1.05 / 3.94 |
+      | blast | shuffle + zstd(1) | 1.29 / 1.16 / 4.27 | 1.79 / 1.57 / 4.76 |
+      | blast | bitshuffle + zstd(1) | 1.22 / 1.03 / 4.28 | 1.68 / 1.34 / 4.68 |
+      | pulse | none | 1.33 / 0.81 / 2.84 | 1.38 / 0.81 / 3.00 |
+      | pulse | `Shuffle` + `Deflate(1)` | 0.38 / 0.35 / 1.62 | 0.56 / 0.48 / 1.85 |
+      | pulse | shuffle + zstd(1) | 0.64 / 0.49 / 2.56 | 0.89 / 0.62 / 2.43 |
+
+      The larger mesh: at 2 nodes pulse unfiltered 2.00 / 0.88 / 5.13,
+      blast unfiltered 1.85 / 1.13 / 7.90, blast zstd(1) 1.26 / 1.06 /
+      5.21; at 4 nodes 1.72 / 1.05 / 5.49, 1.98 / 0.95 / 9.18 and 1.95 /
+      1.58 / 8.23. One node with the fix (job 567939, which overlapped
+      the cost measurement below on the same file system, on cn112): at `-n 8` blast unfiltered
+      1.47 / 0.94 / 3.82 and zstd(1) 0.80 / 0.72 / 2.96, against 1.37 /
+      0.84 / 4.56 and 1.46 / 1.28 / 3.83 without (567854); `-n 1`, the
+      serial path, which the hints do not touch, unchanged (blast
+      zstd(1) 0.64).
+    - *The hints' cost* (job 567964, 2 nodes, 16 ranks, alternating with
+      and without them in a scratch copy, two rounds, at the same time
+      as 567939): blast zstd(1) 1.40 and 1.40 GB/s with, 1.88 without;
+      shuffle + LZ4 1.37 and 1.40 against 2.08; Deflate(1) 0.95 and 0.91
+      against 1.16 and 1.15; blast unfiltered 1.73 and 1.79 against 1.68
+      and 1.84; pulse unchanged, unfiltered and filtered. With the
+      hints data sieving is replaced by one write a chunk (ROMIO's
+      "naive" strided path, `ad_write_str_naive.c`), and blast's chunks
+      compress to about 5 KB. Without the hints both rounds were
+      refused by the checksums, on every rank — round 1 at
+      bitshuffle + LZ4, round 2 at shuffle + zstd(1) — which is the
+      checksums catching the original loss in the benchmark itself.
+    - *What it says about the shared file.* An unfiltered save is 1.3–2.0
+      GB/s at one, two and four nodes alike, so its rate is that of one
+      file, presumably its four storage targets, and not of the
+      clients; a filter parallelizes up to that rate (blast zstd(1)
+      1.95 GB/s at 32 ranks on the larger mesh); a load of a file just
+      written reaches 9 GB/s at 32 ranks. Whether the shared file's
+      rate grows with nodes past one node's was the question; it does
+      not, and with the losses that settles it: **the shared file is to be replaced** by files per I/O
+      process (decided 2026-10-02 with Erik; see "Parallel
+      checkpoints"). The checksums, the self-checking benchmark and the
+      reproducers carry over to the replacement.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
+      `partition_tests.jl`, `checkpoint_tests.jl` and `mpi_tests.jl`
+      (2m53 together), the parallel checkpoints and every cross load
+      included; the whole suite was not run there.
+    - *Suite cost.* 109107 tests at one thread in 8m10 and 109159 at
+      eight in 8m02, against step 5's 109038 in 7m49 and 109090 in 8m09:
+      69 more at each — 67 in `mpi_tests.jl` (the checkpoint lines, the
+      cross loads at each rank count and in process, the refusals, and
+      the extension's presence) and the two `nranks` assertions of
+      `checkpoint_tests.jl`. `mpi_tests.jl` takes about 28 s more than in
+      step 5 standalone (2m34 against 125 s), which is the HDF5 code
+      compiled in each `mpiexec` run and the in-process loads; at one
+      thread the suite grew by about 20 s. The thread-independence
+      digests are unchanged. The docs build.
+  - **Step 6b — checkpoints without parallel I/O.** The design under
+    "Checkpoints without parallel I/O" in
+    [Distributed meshes](#distributed-meshes), decided 2026-10-02 with
+    Erik, replacing step 6's shared file: I/O groups and the `io`
+    keyword, part files and an index (format version 2, the reader
+    reading 1 and 2), the verbs `commnodes` and `bcast`, and the removal
+    of `TreeAMRHDF5MPIExt`. *Accept:* serially, the single file with its
+    inline part round-trips as before, and version-1 files written by
+    the old writer (fixtures committed under `test/fixtures/`) still
+    load; under MPI, saves at `-n 3` with `io = :all`, `io = 1` (or
+    `:node` on one node) and an `io` between, loaded at `-n 2`, at one
+    rank and serially, each continuation byte-identical, and the
+    version-1 fixtures loaded at every rank count; refused on every
+    rank: a part from another save, a block damaged in a part, a missing
+    part; orphans removed and nothing else; an I/O process failing
+    mid-save, after which the previous checkpoint loads and no new part
+    is left; and no file opened by more than one process, by a test hook
+    that records every open. Then `bench/checkpoint.jl` under MPI with
+    `io = :node` and `io = :all` on one, two and four nodes of Symmetry,
+    on BeeGFS, every save verified, compared with step 6's shared file;
+    and the stress reproducer's `save_checkpoint` modes on four nodes,
+    hundreds of verified saves, with no damage.
+
+    *(Done, 2026-10-02.)* What it settled (the design decisions made
+    while implementing are under "Checkpoints without parallel I/O" in
+    [Distributed meshes](#distributed-meshes)):
+    - *The code.* `ext/TreeAMRHDF5MPIExt.jl` and its `[extensions]` entry
+      are gone, with `open_parallel_file`, `librarycomm` and the hints;
+      `src/communicator.jl` gains `bcast` and `commnodes`, each with a
+      serial method and an MPI one; `TreeAMRHDF5Ext` replaces the
+      `Access` hooks with the I/O plan (`io_plan`, `groupblocks`), the
+      gathering (`send_blocks`, `write_blocks!`), the index
+      (`write_index!`), the cleanup (`previous_parts`, `remove_stale`),
+      the image (`share_index`, `index_image`) and the scattering
+      (`part_readers`, `open_part`, `read_blocks!`), with `agree_errors`
+      after every step that runs on some ranks only.
+    - *The tests.* `checkpoint_tests.jl` checks the single version-2
+      file (its part inside the index, the part table, the save id), a
+      damaged block, a block whose checksum was recomputed with it
+      (refused by the index's checksum of the part's checksums), the
+      required checksums, an I/O process failing after its first write
+      (a test hook, `FAIL_PART`), the NUL refusal, and two version-1
+      fixtures written by the step-6 writer (`test/fixtures/`, 42 KB
+      together; generated without an active project, so that they hold
+      no environment texts). `mpi_workload.jl` saves the chunked pulse
+      run with `io = :all`, `io = 2` and `:node` (one part on one node),
+      with messages cut at 4 KiB by the hook `MAX_MESSAGE`, so that a
+      rank's blocks travel in several; continues from each at the same
+      rank count; loads the version-1 fixtures, on lines that must be
+      the serial run's; and refuses on every rank a block damaged in
+      the last part, a part from another save copied over one of this
+      save's, and a missing part. It checks that a save removes an
+      orphan and the previous save's parts and nothing else, that an
+      I/O process failing mid-save fails the save on every rank and
+      leaves the previous checkpoint loadable with no new part and no
+      partial index, and that no file is opened by two processes in a
+      save with two I/O groups or in a load (a hook, `OPEN_LOG`,
+      records every open on every rank). `mpi_tests.jl` loads every
+      file at the other rank counts, at one rank and serially, as
+      before, now for the three files, and follows the external links
+      of the three-rank `io = :all` index into its parts with HDF5.jl,
+      as a tool would.
+    - *Checked by hand.* TreeAMR 0.1.4, from the registry, refuses a
+      version-2 file with its format-version refusal, saying it was
+      written by a newer TreeAMR. Julia 1.11.9, in the manifest-free
+      copy, passes `partition_tests.jl`, `checkpoint_tests.jl` and
+      `mpi_tests.jl`, 5899 tests in 2m48.
+    - *Suite cost.* 110606 tests at one thread in 6m32 and 110658 at
+      eight in 6m28, against 110525 in 7m16 at one thread at 67c9153 the
+      same day: 81 more, in `checkpoint_tests.jl` (593 tests, 1m08 on
+      its own), `mpi_tests.jl` (173, 1m07 on its own) and
+      `partition_tests.jl`. The thread-independence digests are
+      unchanged. The docs build.
+    - *Measured on Symmetry* (2026-10-02: AMD EPYC 7543 nodes, 8 ranks a
+      node at 8 threads, one per NUMA domain; Julia 1.13.1, MPICH_jll
+      5.0.2 through `srun --mpi=pmi2`, libhdf5 2.2.0 used serially; files
+      on BeeGFS, then 91 % full; `bench/symmetry_checkpoint_mpi.sh`,
+      `TREEAMR_BENCH_REPS = 3`, every save verified by a load). GB/s of
+      state, save (`sync = false`) / sync / load, aggregate, the slowest
+      rank's time; the default mesh, 3296 blocks, 216 MB of `pulse` and
+      540 MB of `blast`; the parts in parentheses. `:all` is from jobs
+      568075 (two and four nodes, cn095 and cn102–104) and 568077 (one
+      node, cn084), `:node` from their repetition after the amendment
+      to the gathering, 568119 (cn107) and 568120 (cn093–096); the last
+      column is step 6's shared file on four nodes, with the hints
+      (567938):
+
+      | data | filter | 1 node, `:node` (1) | 1 node, `:all` (8) | 2 nodes, `:node` (2) | 2 nodes, `:all` (16) | 4 nodes, `:node` (4) | 4 nodes, `:all` (32) | shared, 4 nodes |
+      |---|---|---|---|---|---|---|---|---|
+      | blast | none | 0.77 / 0.71 / 0.99 | 2.45 / 4.16 / 4.64 | 1.28 / 1.34 / 1.58 | 2.55 / 2.59 / 6.78 | 2.22 / 2.17 / 3.18 | 2.70 / 2.37 / 8.24 | 1.72 / 0.93 / 6.10 |
+      | blast | `Shuffle` + `Deflate(1)` | 0.20 / 0.20 / 0.39 | 0.94 / 0.94 / 1.94 | 0.32 / 0.32 / 0.73 | 1.45 / 1.46 / 3.66 | 0.57 / 0.57 / 1.26 | 1.94 / 1.92 / 4.99 | 1.18 / 1.05 / 3.94 |
+      | blast | shuffle + zstd(1) | 0.49 / 0.48 / 0.59 | 2.96 / 2.88 / 2.77 | 0.72 / 0.73 / 1.07 | 3.49 / 3.60 / 5.36 | 1.45 / 1.46 / 2.00 | 4.50 / 4.32 / 7.46 | 1.79 / 1.57 / 4.76 |
+      | blast | bitshuffle + zstd(1) | 0.39 / 0.39 / 0.53 | 2.40 / 2.42 / 2.65 | 0.60 / 0.60 / 1.00 | 2.92 / 2.92 / 5.15 | 1.23 / 1.21 / 1.81 | 3.93 / 3.80 / 6.95 | 1.68 / 1.34 / 4.68 |
+      | pulse | none | 0.71 / 0.67 / 0.78 | 1.72 / 2.13 / 3.11 | 1.18 / 1.16 / 1.08 | 2.07 / 1.63 / 4.33 | 1.76 / 1.76 / 2.29 | 1.62 / 2.08 / 4.33 | 1.38 / 0.81 / 3.00 |
+      | pulse | `Shuffle` + `Deflate(1)` | 0.06 / 0.06 / 0.19 | 0.38 / 0.38 / 0.99 | 0.12 / 0.12 / 0.36 | 0.46 / 0.45 / 1.98 | 0.24 / 0.24 / 0.63 | 0.55 / 0.55 / 2.94 | 0.56 / 0.48 / 1.85 |
+      | pulse | shuffle + zstd(1) | 0.25 / 0.25 / 0.35 | 1.53 / 1.57 / 1.80 | 0.45 / 0.46 / 0.66 | 1.40 / 1.45 / 3.14 | 0.83 / 0.85 / 1.07 | 1.51 / 1.44 / 3.95 | 0.89 / 0.62 / 2.43 |
+
+      The larger mesh (12648 blocks, 829 MB of pulse and 2.07 GB of
+      blast), blast unfiltered: 1.37 / 1.35 / 1.69 and 3.47 / 3.06 /
+      9.07 at two nodes with `:node` and `:all`, 2.01 / 2.02 / 3.66 and
+      2.92 / 2.99 / 12.46 at four, against the shared file's 1.85 / 1.13
+      / 7.90 and 1.98 / 0.95 / 9.18; blast with zstd(1) 0.76 / 0.75 /
+      0.99 and 4.20 / 4.14 / 5.88 at two, 1.19 / 1.19 / 1.82 and 5.60 /
+      5.25 / 10.60 at four, against 1.26 / 1.06 / 5.21 and 1.95 / 1.58 /
+      8.23; pulse unfiltered 1.13 / 1.15 / 1.63 and 3.17 / 3.02 / 6.35 at
+      two, 2.24 / 2.38 / 3.11 and 2.70 / 2.57 / 8.02 at four. On one
+      node the shared file had saved blast at 1.47 / 0.94 / 3.82 and
+      with zstd(1) at 0.80 / 0.72 / 2.96 (567939, 8 ranks). What it
+      shows:
+      1. **A part per rank (`io = :all`) is the fastest setting
+         measured, everywhere.** Unfiltered it saves at 1.2–1.9 times
+         the shared file's rate, and its flush to stable storage costs
+         nothing measurable (sync ≈ save, where the shared file's
+         per-rank `MPI_File_sync` cost 40–55 % of the rate); a filter
+         parallelizes over the ranks (blast with zstd(1) at 4.50 GB/s on
+         four nodes, 5.60 on the larger mesh, 2.5 and 2.9 times the
+         shared file); and the load reaches 4–12 GB/s. The unfiltered
+         save does not grow from two nodes to four (2.55 → 2.70 GB/s,
+         3.47 → 2.92 on the larger mesh), so at about 3 GB/s it is the
+         file system's rate for these writes, not the clients'.
+      2. **A part per node (`io = :node`, the default) grows with the
+         nodes** — blast unfiltered 0.77, 1.28 and 2.22 GB/s on one, two
+         and four nodes — at 0.5–0.8 GB/s per I/O process. On one node
+         that is half the shared file's rate; on four, it is above it
+         unfiltered (2.22 against 1.72, and 2.17 against 0.93 synced)
+         and below it filtered (1.45 against 1.79 with zstd(1)), since
+         one process per node runs the node's compression, serially (see
+         "Compression where the data are" under "Performance work left
+         for later"). A load with one part per node is read by one rank
+         per node, 0.8–3.7 GB/s.
+      3. **The amendment to the gathering made no measurable
+         difference** (568119/568120 against 568075/568077, the `:node`
+         runs of the same jobs: blast unfiltered 0.77 against 0.80 on
+         one node, 1.28 against 1.36 on two, 2.22 against 2.76 on four,
+         inside this file system's run-to-run spread). It is kept for the
+         memory it bounds — two 64 MiB buffers on an I/O process instead
+         of two the size of a member's share — but the guess that
+         motivated it was wrong. What is consistent with the numbers,
+         and not traced: MPICH makes no progress on a posted receive
+         while the process is inside HDF5 (it has no asynchronous
+         progress by default), so the transfer from the members —
+         2.7–2.8 GB/s for 1–64 MiB between two ranks of one node,
+         `pingpong` job 568132 — and the write add up rather than
+         overlap. A write task on another thread while the calling task
+         waits in MPI, or MPICH's asynchronous progress, would test it.
+      4. **Every save was verified**, by a load that compared the leaves
+         and the state bit for bit on every rank and verified every
+         checksum: none failed, against both rounds of step 6's
+         measurement without the hints.
+    - *The stress reproducer on four nodes* (job 568076, cn093–096, 32
+      ranks, the 12648-leaf partition of step 6's failure at `4³` cells
+      a block, every save loaded serially and compared by a reader on
+      cn093 and then one on cn096): shuffle + `Deflate(1)` with `io =
+      :node`, 400 saves; the same with `io = :all` and `sync = true`, 300
+      saves; unfiltered with `:node`, 300 saves: **0 damaged in 1000**,
+      in 10m30. Step 6's shared file lost 12 of 200 filtered saves of
+      this mesh (567917); at that rate 0 in the 700 filtered saves here
+      has a probability of about e⁻⁴³.
+    - *What was not done.* An Open MPI run (nothing in the package needs
+      MPI-IO any more, so its OMPIO question is moot for checkpoints);
+      a cold-cache load; more than four nodes, where the metadata cost
+      of `:all`'s file per rank is the open question; and a trace of
+      where an I/O process's time goes.
+  - **Step 7 — weak-scaling smoke test.** `bench/mpi.jl` holds the
+    blocks per rank fixed and times the RHS, the ghost fill, a regrid
+    and the norm; `bench/symmetry_mpi.sh` runs one rank per NUMA domain
+    at eight threads, on one, two and four nodes, with the system MPI
+    through MPIPreferences. *Accept:* the table recorded here, with
+    what limits it named, the replicated regrid bookkeeping and the
+    overlap of the exchange with the local groups among them.
+
+    *(Done, 2026-10-02: built and run locally, then on Symmetry at up to
+    four nodes, 32 ranks; the table and what limits it are the
+    "Symmetry" items below.)* What it settled:
+    - *The benchmark.* `bench/mpi.jl` (under `mpiexec` with the
+      argument `mpi`, in the test environment) builds a mesh of `TILES`
+      identical tiles of `ROOTS^D` roots stacked along `x_D`, periodic,
+      `TILES` the rank count unless set. The roots are numbered with
+      `x_D` slowest and every tile has the same leaves, so the
+      equal-count split gives rank `r` exactly tile `r`: the blocks per
+      rank are fixed by construction, and the halo per rank is constant
+      from three ranks on. Two tiles: *two-level*, the leaves with `x₁`
+      in the lower half and `x_D` in the upper half of the tile refined
+      once (176 blocks at `ROOTS = 4` in 3D), so a coarse-fine face
+      crosses every rank boundary and phase 1, the prolongation stage
+      and the interface restriction all carry messages; and *uniform*
+      (64 blocks), copies only. Timed in synchronized windows — an
+      `MPI.Barrier`, the call, the slowest rank's time by `allgather` —
+      as the minimum and the median over the repetitions: the wave RHS
+      (`scatter!` → `fill_ghosts!` → `map_blocks!`), the fill alone and
+      its three parts run separately through the internals (the stages'
+      local groups, the packs, the unpacks), `scatter!`, the norm, a
+      `mesh_mapreduce` max, `restrict_interfaces!` on a set
+      face-centered along `x_D`, `interpolate!` of 1000 points a rank
+      spread over the whole domain, the two schedule builds, a regrid
+      that refines the lowest layer of roots of tile 0 — the start of
+      the curve, so every later rank's range shifts and blocks migrate
+      — and one that coarsens it back, and the triad. `#` lines give per
+      rank, as min/mean/max, the messages, bytes, transfers and peers of
+      a fill and of an interface restriction (read from the stages),
+      the blocks a regrid made a rank take from another, and ns per cell
+      of the whole job. `TREEAMR_BENCH_BACKEND` and
+      `TREEAMR_BENCH_DEVICEAWARE` choose a device and its message path,
+      `TREEAMR_BENCH_TILES` the mesh of a `P`-rank run for a serial
+      control, `TREEAMR_BENCH_LABEL` the column name. The tab-separated
+      lines carry the minimum *and* the median, so `bench/scan.sh`'s
+      awk does not read them; `bench/mpitable.awk` is the matching
+      parser (efficiency against the first run, then both times) and
+      `bench/mpiscan.sh P…` launches each count through
+      `MPI.mpiexec()` and prints the table.
+    - *Laptop smoke run, not a scaling result* (Apple M3 Pro, 6
+      performance and 6 efficiency cores, one memory system; MPIABI_jll
+      through the global preference; `D = 3`, `N = 16`, `ROOTS = 4`, 2
+      variables, `G = 2`, order 4, Float64, 10 windows; `bench/mpiscan.sh
+      1 2 4`, one thread a rank). Minimum ms, two-level mesh, with the
+      weak-scaling efficiency `t(1)/t(P)`:
+
+      | phase | 1 rank | 2 ranks | 4 ranks | eff. 2 | eff. 4 |
+      |---|---|---|---|---|---|
+      | rhs | 16.65 | 20.12 | 22.56 | 0.83 | 0.74 |
+      | fill_ghosts | 10.22 | 14.00 | 16.38 | 0.73 | 0.62 |
+      | — its local groups | 9.91 | 11.43 | 14.16 | | |
+      | — its packs | – | 1.63 | 1.68 | | |
+      | — its unpacks | – | 0.29 | 0.30 | | |
+      | scatter | 2.56 | 2.61 | 2.69 | 0.98 | 0.95 |
+      | norm | 6.15 | 6.25 | 6.46 | 0.98 | 0.95 |
+      | interfaces | 0.025 | 0.046 | 0.073 | | |
+      | interpolate (1000 pts/rank) | 0.148 | 0.272 | 0.396 | 0.54 | 0.37 |
+      | ghost_schedule | 3.82 | 6.30 | 6.57 | 0.61 | 0.58 |
+      | interface_schedule | 0.13 | 1.23 | 1.35 | | |
+      | regrid, refine | 46.0 | 57.4 | 65.5 | 0.80 | 0.70 |
+      | regrid, coarsen | 30.4 | 45.5 | 44.7 | 0.67 | 0.68 |
+      | triad reference | 0.61 | 1.22 | 2.20 | 0.50 | 0.28 |
+
+      A fill sends, per rank, 2 messages at 2 ranks and 3 at 4 (phase 1
+      to both neighbours, the prolongation stage to one), 717 KB each way
+      in both cases, 560 transfers sent and 560 received against 4224
+      local (4784 serially); the interface restriction one message of
+      32 KB, 32 transfers. The uniform mesh: one stage, 410 KB, 288
+      transfers; its rhs 3.26 / 4.25 / 4.56 ms, fill 1.19 / 1.70 / 2.51,
+      build 0.40 / 1.20 / 1.26, refine 32.2 / 39.1 / 46.1. The refine
+      makes ranks take 0/28/56 blocks from another (min/mean/max) at 2
+      ranks and 0/42/84 at 4, the coarsening as many. At two threads a
+      rank the two-level rhs is 8.72 / 11.53 / 22.47 ms (efficiency 0.76
+      and 0.39) — eight threads on this machine reach its efficiency
+      cores, and the window is the slowest rank's.
+    - *What limits it here, named.* (1) **Memory bandwidth is shared**:
+      the triad's aggregate is about 120 GB/s at any rank count, one
+      core nearly saturates it, and so the per-rank triad halves with
+      each doubling. Whatever streams memory cannot weak-scale on this
+      machine, and the local groups of the fill do not (9.9 → 14.2 ms
+      for *fewer* transfers); only the phases bound by one core's
+      arithmetic do (`scatter`, the norm, 0.95). That is the reason the
+      numbers are not a scaling result. (2) **The sender computes**: the
+      packs are 1.6–1.7 ms, about a tenth of the fill. They are the
+      halo's copies, restrictions and prolongations, evaluated into the
+      send buffer rather than into ghosts, and the unpacks (0.3 ms) are
+      the extra pass that copies them into place. (3) **The overlap**: the fill less its local groups, packs
+      and unpacks is 0.7 ms at 2 ranks and 0.2 ms at 4, so over shared
+      memory almost nothing of the messages is left unhidden behind the
+      local groups; between nodes is what Symmetry will show. (4)
+      **Per-call collectives on small work**: an interpolation of 1000
+      points a rank costs an `allgather` and four `alltoallv`, 0.40 ms
+      at 4 ranks against 0.06 ms in one 4-thread process over the same
+      4-tile mesh (`TREEAMR_BENCH_TILES=4`); there the rhs and fill were
+      within 5 % of the 4-rank run (22.1 against 22.7 ms, 15.9 against
+      16.8), the schedule build 3.9 against 6.7 ms, the interface
+      schedule 0.14 against 1.35 ms and the refine 48.8 against 65.4 ms.
+      The interface schedule's growth is `remote_neighbors`, which
+      searches all `3^D − 1` directions of every local leaf (about 1 ms
+      here) for a builder that needs only faces, and which each
+      schedule build repeats.
+    - *Does the schedule build stay flat with `P`?* Yes. Step 2's
+      finding — a rank's build costs about the serial one at 120 blocks
+      a rank — was strong scaling: the halo is as large as the local
+      part, so the build does not shrink with `P`. At a *fixed* number
+      of blocks per rank it does not grow either. `bench/replicated.jl`
+      simulates rank `P÷2` of `P` in one process, over a communicator
+      that answers the digest gather by replication, hands `regrid!` the
+      global marks and makes every message a no-op, over this tile mesh
+      (176 blocks a rank, `N = 16`); best of 3–5, ms, at one thread and
+      at four:
+
+      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
+      |---|---|---|---|---|
+      | digest, fold over every leaf | 0.024 | 0.15 | 1.14 | 2.27 |
+      | `GhostSchedule` on the rank, 1 thread | 6.3 | 6.7 | 8.1 | 9.1 |
+      | the same, 4 threads | 4.3 | 4.4 | 5.6 | 6.8 |
+      | `remote_neighbors`, 1 thread | 1.04 | 1.19 | 1.29 | 1.34 |
+      | `complete_marks`, the slab, no buffer | 0.025 | 0.13 | 1.01 | 1.90 |
+      | `balance!` alone | 0.005 | 0.033 | 0.26 | 0.52 |
+      | `regrid_sources`, 1 thread | 0.17 | 1.27 | 12.1 | 29.0 |
+      | the same, 4 threads | 0.17 | 1.01 | 8.7 | 19.4 |
+      | `split_regrid` | 0.015 | 0.026 | 0.11 | 0.21 |
+      | `complete_marks`, every block a `(Keep, box)` source, buffer 4, 1 thread | 8.2 | 74 | 672 | 1407 |
+      | the same, 4 threads | 2.3 | 21 | 204 | 436 |
+      | `regrid!` on the rank, refine, 1 thread | 21.7 | 21.9 | 51.7 | 67.2 |
+      | `regrid!` on the rank, refine, 4 threads | 11.4 | 12.7 | 17.7 | 44.0 |
+      | marks gathered per rank and regrid | 0.05 MB | 0.36 MB | 2.9 MB | 5.8 MB |
+
+      Over 128 times the leaves the rank's build grows by 2.8 ms at one
+      thread, 2.2 ms of it the digest, the rest the `log n` of the
+      searches; so it is weak-scaling-flat, and the digest is the only
+      `O(nleaves)` part of it (13 ns a leaf, single-threaded, folded up
+      to three times per generation: `regrid!`, each `GhostSchedule`,
+      each `InterfaceSchedule`). The `regrid!` times are noisy, the
+      garbage collector's share included; a profile of one rank at 90112
+      leaves (one thread, 20 regrids, 29 ms each) put 38 % in
+      `regrid_sources`, 25 % in the fill before the transfer, 22 % in
+      allocating and zeroing the new array (local, first touch), 7 % in
+      `complete_marks` and
+      7 % in the transfer stage.
+    - *The replicated regrid bookkeeping, and what to do about it*
+      (proposed here, and the first two implemented the same day; what
+      was done, and measured, is the next item). Two passes become the
+      regrid's cost long before the forest's memory does:
+      1. **The buffer's recruit search** in `buffered_flags`, about
+         5.8–7.8 µs per source leaf at one thread and 1.6–2.4 at four,
+         over every source of the whole forest on every rank. With
+         every block a source it overtakes the whole local regrid
+         between 1408 and 11264 leaves (8.2 and 74 ms against 22) and
+         is 13 times it at 90112 (672 against 52); at 32 ranks
+         of 176 blocks (four Symmetry nodes) it would be some 35–40 ms
+         at one thread, by the 1408- and 11264-leaf points, against a
+         local regrid of 11–22 ms — an extrapolation, not measured
+         there. The share of sources is the share of blocks whose
+         criterion fired (`firing_boxes`), so a run with a wide feature
+         pays it. *Remedy:* the recruits of a source are found from the
+         tree alone, so each rank can search for its own sources only
+         and gather the `(leaf, level)` pairs beside the marks; applying
+         them only raises a mark to `Refine` below a level or lifts a
+         `Coarsen` at or below one, which does not depend on their
+         order, so the result is bit for bit the replicated one, at
+         `O(local sources)` per rank and one `allgatherv` of the pairs.
+      2. **`regrid_sources`** classifies every new leaf on every rank,
+         with a `Dict` of every old leaf and a vector per new one: 12 ms
+         at 90112 leaves, 29 ms at 180224, 38 % of a rank's regrid at
+         512 ranks. *Remedy:* a rank needs only the new leaves it will
+         own and those whose sources it owns now. Refinement and
+         coarsening keep the curve order, so the second set is one
+         contiguous range of new indices, found by two binary searches
+         over the new leaves at the keys of the rank's first and last
+         old leaf, and an old leaf is found by `searchsortedfirst`
+         instead of the `Dict`: `O(local · log n)`. The layouts are
+         sorted explicitly (`stage_layout`), so restricting the list
+         changes no message.
+      3. Smaller and left as they are: the digest (cache its leaf fold
+         per generation if it ever shows; 1.1 ms at 90112 leaves is
+         14 % of a build), `complete_marks`' own passes and `balance!`
+         (1–2 ms at 10⁵ leaves, replicated in AMReX and Parthenon too),
+         and the marks' `allgatherv`, 32 bytes a leaf to every rank,
+         which a gather of the marks that are not a bare `Keep` would
+         shrink when it matters.
+    - *What was done about it* (2026-10-02, after the measurement; the
+      results are unchanged, bit for bit):
+      1. **The recruits.** `buffered_flags` is now two passes, both
+         internal: `buffer_recruits`, the neighbour search over a run of
+         sources, which returns `Recruit(leaf, level)` pairs in source
+         order, and `apply_recruits!`, the serial rewrite of the marks.
+         The public function runs both over every leaf, as before.
+         `regrid!` runs `regrid_marks` instead: each rank searches from
+         its own sources, reduces its recruits with
+         `strongest_recruits`, gathers them in a second `allgatherv`,
+         and applies the union to the gathered marks; then the
+         completion, which is `complete_marks` after the buffer
+         (`completed_leaves`). Serially nothing is gathered and the
+         recruits are applied as found, which is `buffered_flags`.
+         *Why the order does not matter*, checked against the code
+         rather than assumed: the rewrite is two statements per recruit
+         `(j, L)` at a leaf of level `l` — a `Coarsen` with `l ≤ L`
+         becomes `Keep`, then anything with `l < L` becomes `Refine`.
+         `Refine` is never undone, and a `Keep` made from `Coarsen` is
+         only ever raised to `Refine`. So a leaf ends as `Refine` if any
+         recruit asks it for more than its level, as `Keep` if it was
+         `Coarsen` and some recruit asks for its level exactly, and as
+         it was otherwise: a function of its own reported mark and of
+         the largest level asked of it, whatever the order of the
+         recruits and however often one repeats. Recruitment reads the
+         *reported* marks, never the rewritten ones, so the search
+         itself does not depend on the order either. That is also what
+         lets a rank keep, per leaf, only its largest request, and drop
+         a request at a leaf already finer, which changes no mark; so
+         gathering in global source order, the fallback had the rewrite
+         been order-dependent, was not needed. *Why a second gather and
+         not the marks' own*: merging the two would need a
+         byte-level encoding of a vector of padded structs with its
+         per-rank counts, to save one collective whose cost is below
+         the marks' gather. Measured over MPI on this laptop (one tile
+         a rank, one thread, every block a `(Keep, box)` source, buffer
+         4), at 2, 4 and 8 ranks: the recruits' `allgatherv` 0.015,
+         0.034 and 0.078 ms with 1600 bytes from a rank, the marks'
+         0.021, 0.074 and 0.188 ms with 5632; the whole `regrid_marks`
+         0.97, 1.12 and 1.93 ms against the replicated `buffered_flags`
+         1.88, 4.11 and 11.8 ms, with the same leaves at every count.
+      2. **`regrid_sources`** takes `oldrange` and `newrange` and
+         classifies `newrange` and `overlapping_leaves(oldrange)`: the
+         new leaves from the one that covers the start of the rank's
+         first old leaf (that leaf or an ancestor, at or before it in the
+         curve's pre-order, else its first descendant, directly after
+         it) through the last one at or before the deepest last
+         descendant of its last old leaf. Without the ranges it
+         classifies every leaf, as before, which is what the serial
+         `regrid!`, `transfer_groups` and the tests use. A plain
+         `searchsortedfirst` in place of the `Dict` was *slower* for the
+         full classification — 14.1 against 11.6 ms at 90112 leaves,
+         30.9 against 29.6 at 180224 — so the serial regrid would have
+         paid for the distributed one. The search therefore starts at the
+         previous target's sources (`findfrom`: four steps along the
+         curve, then a binary search over the rest), since the sources
+         of ascending new leaves are non-decreasing old leaves; that
+         made the full classification faster than the `Dict`. The
+         in-process lockstep test now builds every rank's stage from its
+         own classification and checks that `split_regrid` keeps the
+         same transfers from it as from the full one.
+      3. **The digest's fold is not cached.** A cache per forest and
+         generation goes stale whenever the leaves change without
+         `rebuild_leaves!`, and nothing prevents that: `forest.leaves`
+         is a public `Vector`, and `test/regrid_tests.jl` itself
+         empties and refills one at generation 0. The digest exists to
+         catch a forest that changed outside the collective contract,
+         so it should not trust the generation to say the leaves are
+         unchanged. Where to keep the cache is a second problem:
+         `Forest` is immutable, and its positional constructor is called
+         from `complete_marks`. The saving would be at most 1.1 ms a
+         build at 90112 leaves.
+
+      `bench/replicated.jl` (rank `P÷2`, 176 blocks a rank, ms, best of
+      3–5) now also times the rank's own buffer and classification.
+      Before and after on the same machine, run back to back, a stale
+      copy of the tree for the "before":
+
+      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
+      |---|---|---|---|---|
+      | every block a source, buffer 4: replicated `complete_marks`, 1 thread | 7.6 | 71 | 650 | 1365 |
+      | on the rank: `regrid_marks` / with the completion, 1 thread | 1.0 / 1.1 | 1.1 / 1.6 | 1.4 / 5.4 | 1.6 / 9.6 |
+      | replicated, 4 threads | 2.3 | 21.7 | 212 | 422 |
+      | on the rank, 4 threads | 0.45 / 0.52 | 0.53 / 0.93 | 0.64 / 3.8 | 0.78 / 7.5 |
+      | `regrid_sources`, every leaf, `Dict` (before), 1 thread | 0.165 | 1.26 | 11.6 | 29.6 |
+      | the same by `findfrom` | 0.134 | 0.99 | 8.1 | 18.1 |
+      | the rank's own (what `regrid!` runs) | 0.021 | 0.019 | 0.017 | 0.016 |
+      | `regrid!` on the rank, refine / coarsen, 1 thread, before | 21.6 / 22.7 | 22.4 / 23.0 | 33.6 / 42.6 | 73.1 / 68.1 |
+      | after | 21.9 / 22.9 | 22.7 / 22.8 | 20.7 / 21.0 | 23.2 / 23.6 |
+      | the same, 4 threads, before | 11.1 / 11.0 | 11.4 / 11.7 | 22.5 / 17.4 | 35.7 / 41.4 |
+      | after | 11.3 / 9.9 | 9.8 / 11.4 | 17.0 / 9.4 | 15.4 / 11.4 |
+
+      So a rank's regrid no longer grows with the forest here: at
+      180224 leaves it costs what it costs at 1408, within the noise
+      the four-thread column shows. What remains replicated is the
+      completion. It is the 4–8 ms above at 90112–180224 leaves when
+      every block is a source, since these marks then refine every
+      coarse leaf beside a fine one and `balance!` has a level 2 to
+      check; with the slab's marks it is the 0.9–2.0 ms of item 3. A
+      recruit gathers as 8 bytes, 0.82 MB a rank at 90112 leaves in
+      that case, against 2.9 MB of marks.
+
+      *Tests.* A new in-process testset in
+      `test/regrid_exchange_tests.jl` runs `regrid_marks`, the
+      completion and `regrid!` itself (one task per simulated rank, over
+      the rendezvous communicator) on random forests with random bare and
+      boxed flags, `D = 1, 2, 3`, buffer 0–4 and 1–7 ranks, a roots-only
+      forest among them so that most ranks are empty, and requires every
+      rank's marks and leaves to be the serial `buffered_flags` and
+      `complete_marks` ones. Each of four deliberate breakages fails it
+      or the lockstep test: skipping the gather, dropping a recruit at a
+      leaf of the requested level, and moving either end of
+      `overlapping_leaves`. The suite passes at one thread (110511
+      tests, 8m08) and at eight (110563, 7m57), and the MPI workload at
+      2, 3 and 4 ranks prints the serial lines byte for byte, apart from
+      the 20 `sum` lines, which agree to roundoff (11, 11 and 9 of them
+      byte for byte).
+    - *A device.* `TREEAMR_BENCH_BACKEND=metal TREEAMR_BENCH_N=8
+      TREEAMR_BENCH_REPS=3 TREEAMR_BENCH_PROJECT=<env> bench/mpiscan.sh
+      1 2` (a scratch environment that develops this checkout and adds
+      Metal, MPI and KernelAbstractions) runs in Float32 through the
+      staging path at 2 ranks, every phase included; its numbers, two
+      ranks sharing one GPU, say only that the path works.
+    - *Symmetry* (measured 2026-10-02, job 567847 on cn092–cn095: AMD
+      EPYC 7532, the Rome nodes of `amdq`, 64 cores and 8 NUMA domains
+      each, ConnectX-6 HDR100 InfiniBand; Julia 1.13.1; HPC-X 2.20's Open
+      MPI 4.1.7 over UCX 1.17, `nvhpc-hpcx-cuda12/24.9`, through
+      MPIPreferences' system binary). `bench/symmetry_mpi.sh` as amended
+      in the same step's script commit: one rank per NUMA domain bound by
+      `numactl`, 8 threads, `D = 3`, `ROOTS = 4`, 2 variables, Float64,
+      10 windows, the minimum over them. Launching took four fixes to
+      the script and none to the package: `amddebugq` takes one node a
+      job, so the job ran on `amdq`; SLURM 21.08 ignores
+      `--ntasks-per-node` in a step unless `--ntasks` is given;
+      MPICH_jll starts under `srun --mpi=pmi2` but runs TCP over IPoIB,
+      2.1 GB/s and 40 µs ping-pong between nodes (job 567845), while
+      HPC-X runs 12.0 GB/s and 2.2 µs (job 567846) and is not built with
+      SLURM's PMI, so it is launched by its own `mpiexec`; and Open MPI
+      hands each rank a pseudo-terminal, into which the juliaup launcher
+      writes a terminal title, so the ranks run the julia binary itself.
+      Minimum ms, two-level mesh (176 blocks a rank), one node at 1–8
+      ranks, then 2 and 4 nodes at 8 a node; efficiency `t(1)/t(P)`:
+
+      | `N = 16` | 1 | 2 | 4 | 8 | 16 | 32 | eff. 32 |
+      |---|---|---|---|---|---|---|---|
+      | rhs | 7.75 | 11.98 | 12.99 | 12.78 | 13.59 | 14.41 | 0.54 |
+      | fill_ghosts | 4.37 | 8.40 | 8.86 | 8.87 | 8.93 | 9.64 | 0.45 |
+      | — its local groups | 4.33 | 5.18 | 3.90 | 5.29 | 5.31 | 5.55 | |
+      | — its packs | – | 2.73 | 2.97 | 2.98 | 2.95 | 2.93 | |
+      | — its unpacks | – | 0.51 | 0.78 | 0.80 | 0.79 | 0.80 | |
+      | scatter | 1.84 | 1.84 | 1.84 | 1.95 | 1.91 | 1.91 | 0.97 |
+      | norm | 2.96 | 2.09 | 2.09 | 2.08 | 3.34 | 3.00 | 0.99 |
+      | interfaces | 0.13 | 0.70 | 0.62 | 0.74 | 0.72 | 0.52 | |
+      | interpolate (1000 pts/rank) | 0.24 | 0.77 | 0.83 | 0.61 | 0.69 | 10.24 | 0.02 |
+      | ghost_schedule | 8.38 | 11.79 | 11.65 | 12.10 | 11.70 | 11.73 | 0.71 |
+      | interface_schedule | 0.33 | 1.54 | 1.23 | 1.63 | 1.36 | 1.36 | |
+      | regrid, refine | 25.6 | 28.9 | 26.4 | 27.0 | 24.9 | 32.5 | 0.79 |
+      | regrid, coarsen | 21.9 | 28.9 | 33.9 | 30.5 | 33.7 | 38.8 | 0.56 |
+      | triad reference | 1.70 | 1.74 | 2.13 | 2.18 | 2.26 | 2.15 | 0.79 |
+
+      | `N = 32` | 1 | 2 | 4 | 8 | 16 | 32 | eff. 32 |
+      |---|---|---|---|---|---|---|---|
+      | rhs | 37.9 | 47.7 | 49.4 | 58.2 | 55.0 | 55.9 | 0.68 |
+      | fill_ghosts | 18.7 | 29.2 | 28.6 | 27.7 | 29.8 | 30.1 | 0.62 |
+      | — its local groups | 18.7 | 17.0 | 17.0 | 17.0 | 16.9 | 17.1 | |
+      | — its packs | – | 8.58 | 8.58 | 8.55 | 8.96 | 9.07 | |
+      | — its unpacks | – | 2.04 | 1.73 | 1.77 | 1.99 | 2.09 | |
+      | scatter | 8.02 | 8.69 | 8.71 | 9.38 | 9.96 | 11.98 | 0.67 |
+      | norm | 15.5 | 15.2 | 15.9 | 16.2 | 16.0 | 16.9 | 0.92 |
+      | interpolate | 0.19 | 0.78 | 0.94 | 0.63 | 0.86 | 8.28 | 0.02 |
+      | ghost_schedule | 13.2 | 16.0 | 16.4 | 16.2 | 16.2 | 16.3 | 0.81 |
+      | regrid, refine | 162 | 174 | 192 | 163 | 154 | 162 | 1.00 |
+      | regrid, coarsen | 134 | 172 | 224 | 225 | 217 | 217 | 0.62 |
+      | triad reference | 13.3 | 13.6 | 13.8 | 14.5 | 14.4 | 13.8 | 0.96 |
+
+      A fill sends, per rank, 2 messages at 2 ranks and 3 from 4 on
+      (716800 bytes each way at `N = 16`, 2.3 MB at 32; 560 transfers
+      sent and 560 received against 4224 local); the regrid makes ranks
+      take 0/50/108 blocks from another (min/mean/max) at 32 ranks. The
+      uniform mesh (64 blocks a rank, one stage): rhs 2.05 / 3.75 / 2.62 /
+      3.92 / 3.85 / 3.83 ms at `N = 16` (efficiency 0.53 at 32) and 9.84
+      / 13.4 / 15.3 / 16.3 / 16.2 / 16.9 at 32 (0.58). What it shows:
+      1. **The step from one rank to two is the whole loss, and the
+         network is not in it.** From 2 to 32 ranks, across one, two and
+         four nodes, the two-level rhs grows by 20 % at `N = 16` (12.0 →
+         14.4 ms) and 17 % at 32 (47.7 → 55.9): efficiency 0.83 and 0.85
+         against 2 ranks. The fill less its local groups, packs and
+         unpacks — what the messages left unhidden — is −0.2 to 0.4 ms
+         at `N = 16` and 0.4 to 2.0 ms at 32 at every count, inside the
+         error of subtracting separately measured minima; 2.3 MB over
+         UCX at 12 GB/s is 0.2 ms. The overlap does its job, and
+         between nodes too.
+      2. **The packs are the cost**: 2.7–3.0 ms of an 8.9 ms fill at
+         `N = 16`, 8.6–9.1 of 30 at 32, against local groups of 5.3 and
+         17.0 ms for 7.5 times as many transfers. So a packed transfer
+         costs about 4 times a local one. The likely reason, not
+         measured: pack groups run by the owner of the *source* block
+         ("Ownership" under "Pack and unpack are transfers"), and the
+         sources of a rank's halo are the bottom and top layers of its
+         tile, which sit at the two ends of its curve range and so in
+         the first and last thread chunks: at 8 threads the packs for
+         the rank below run on one thread, those for the rank above on
+         about four. The sender-computes rule moves the halo's
+         arithmetic to the sender, as designed; what costs is that the
+         block-ownership partition then gives it to a few threads. A
+         pack split over all threads by transfer, not by owner, would
+         trade affinity for balance, which is a design question.
+      3. **The schedule build and the regrid are flat from 2 ranks on**,
+         as `bench/replicated.jl` predicted: the build 11.7–12.1 ms at
+         `N = 16` and 16.0–16.4 at 32 at every count from 2 to 32; the
+         refining regrid 25–33 ms and 154–192 ms. The coarsening regrid
+         rises from 1 to 4 ranks, by 55 % at `N = 16` and 67 % at 32,
+         and is flat after at `N = 32`; at 16 it rises again at 32 ranks
+         (not traced).
+      4. **`interpolate!` at 32 ranks jumps to 8–10 ms**, from 0.6–0.9
+         ms at 2–16 ranks; at 16 ranks (two nodes) its *median* is
+         already 9.9 ms. Nothing else in the table does this, and
+         MPICH_jll over TCP at 16 ranks takes 2.0 ms (below), so it is
+         the collectives — an `allgather` and four `alltoallv` — inside
+         this Open MPI at that scale, not the work. A job that repeats
+         the 16- and 32-rank runs with HPC-X's HCOLL collectives on and
+         off (567858) was queued and its result not collected; the cause
+         is open.
+      5. **Phases without messages slow by the slowest of 32 ranks**:
+         `scatter` 8.0 → 12.0 ms at `N = 32` and the uniform mesh's
+         local groups 2.5 → 4.3, while the triad stays at 0.96. The
+         window is the slowest rank's.
+    - *One node, the same mesh: 8 ranks against one process* (the same
+      job; the control is 64 threads over the 8-tile mesh in one
+      process). The one process wins the per-evaluation phases. Minimum
+      ms, two-level, 8 ranks / one process pinned with first touch
+      (`JULIA_EXCLUSIVE=1`) / one process interleaved:
+
+      | | `N = 16` | `N = 32` |
+      |---|---|---|
+      | rhs | 12.78 / 7.98 / 11.97 | 58.2 / 39.4 / 50.5 |
+      | fill_ghosts | 8.87 / 4.78 / 7.82 | 27.7 / 19.8 / 28.2 |
+      | ghost_schedule | 12.1 / 16.7 / 17.1 | 16.2 / 23.0 / 19.9 |
+      | regrid, refine | 27.0 / 48.1 / 44.3 | 163 / 233 / 245 |
+      | regrid, coarsen | 30.5 / 48.9 / 41.4 | 225 / 221 / 218 |
+
+      One pinned process runs the rhs 1.6 times as fast at `N = 16` and
+      1.5 times at 32 (the uniform mesh 1.3 and 1.6), because the 8-rank
+      run pays the packs and unpacks of item 2 and the one process pays
+      nothing for the same halo: its local groups are the 8 ranks' local
+      groups plus the halo, at about the same time (4.95 against 5.29
+      ms at `N = 16`). That settles what "What one process loses" left
+      for this step: the ownership policy recovers inside one process
+      everything one rank per domain was expected to, and on one node
+      ranks are a loss for the rhs. The replicated host passes go the
+      other way — the schedule build and the refining regrid are
+      1.4–1.8 times faster over 8 ranks, being per rank `O(local)` work
+      on fewer threads — but they run at regrid frequency. So the
+      layout to recommend is one process per node, its threads pinned,
+      and ranks between nodes.
+    - *The default binary between nodes* (job 567857, cn109–cn110, the
+      Milan EPYC 7543 nodes, MPICH_jll 5.0.2 through `srun --mpi=pmi2`,
+      `N = 16`; compare within the job only). On one node it matches
+      HPC-X's shape (two-level rhs 6.32 / 11.83 / 12.31 / 13.66 ms at
+      1–8 ranks); on two nodes the rhs is 18.52 ms and the fill 13.42,
+      against 13.66 and 9.48 at 8 ranks, so TCP over IPoIB adds 4 ms a
+      fill that UCX does not (efficiency 0.34 at 16 ranks, against 0.57
+      for HPC-X at 16 in job 567847). Between nodes the system MPI is
+      not optional.
+    - *The replicated costs on a rank's domain* (`bench/replicated.jl`
+      in job 567847, one domain of cn092, 8 threads, 176 blocks a rank;
+      ms):
+
+      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
+      |---|---|---|---|---|
+      | digest | 0.036 | 0.19 | 1.40 | 2.79 |
+      | `GhostSchedule` on the rank | 11.9 | 11.7 | 13.0 | 14.3 |
+      | `regrid_sources`, every leaf / the rank's own | 0.40 / 0.17 | 1.94 / 0.18 | 15.8 / 0.16 | 32.3 / 0.17 |
+      | every block a source: replicated `complete_marks` | 3.6 | 33 | 290 | 596 |
+      | on the rank: `regrid_marks` / the completion | 0.78 / 1.04 | 0.84 / 2.15 | 0.89 / 12.2 | 1.26 / 20.4 |
+      | `regrid!` on the rank, refine / coarsen | 23.1 / 18.5 | 19.2 / 22.8 | 19.5 / 19.4 | 22.4 / 23.9 |
+
+      So the laptop's finding holds on the cluster: a rank's regrid
+      costs at 180224 leaves what it costs at 1408. What remains
+      replicated and grows is the completion after the buffer, 20 ms at
+      180224 leaves when every block is a source, about a regrid's
+      worth; the build grows by 2.4 ms over 128 times the leaves, the
+      digest most of it.
+    - *What was not done.* The benchmark itself changed nothing in
+      `src/`, so the suite was not rerun for it; the follow-up above
+      did, and it was.
+      The fill's overlap is read from the difference of its parts, not
+      traced inside `run_stage!`. The benchmark's mesh is periodic, so
+      the boundary hook is not timed.
+  - **Step 8 — MPI+GPU.** Device-resident buffers, the device-aware
+    check and host staging. *Accept:* the workload on Metal through the
+    staging path, and on an H200 on Symmetry, agreeing with the serial
+    device run as [Parallelism](#parallelism) states for a device.
+
+    *(Done locally, 2026-10-01, and on Symmetry's H200s, both paths, on
+    2026-10-02.)*
+    What it settled, and where it went beyond the plan (the design
+    decisions are recorded under "MPI+GPU" in
+    [Distributed meshes](#distributed-meshes)):
+    - *The code.* `run_stage!` in `ghosts.jl` is the one place every
+      stage runs — the ghost fill, the interface restriction and the
+      regrid transfer — so it is the one place that stages: it asks the
+      new verb `hoststaging(comm, buffer)`, and when the answer is yes it
+      posts the receives into host mirrors, downloads the packed buffer
+      after the pack's synchronization, sends from the mirror, and
+      uploads the receive mirror before the unpack. `stagemirrors`
+      allocates the mirrors once per stage and variable count, kept in
+      `RemoteStage`'s new `mirrors` field, and page-locks them with
+      `KernelAbstractions.pagelock!`. The MPI extension gains the
+      `deviceaware` keyword of `communicator` and a field of
+      `MPICommunicator` for it, answers `hoststaging`, and checks a
+      message buffer against the setting. No new dependency, weak or
+      otherwise.
+    - *An inference fix found by the new test.* The in-process staging
+      test defines a fourth test `Communicator` with an `allgather`
+      method, and with it `type_tests.jl`'s `@inferred total_mass` and
+      `@inferred volume_weighted_norm` failed: `combine_blocks` calls
+      `allgather` on the abstractly typed `comm` field, and with that
+      many methods inference returns `Any` for the call, and the fold
+      over its result with it. Nothing about a reduction's type should
+      depend on how many communicator types a process has loaded — an
+      application with its own would have hit it too — so the gather is
+      now asserted, `allgather(comm, partial)::Vector{typeof(partial)}`,
+      which every `allgather` returns.
+    - *The device workload.* `test/mpi_device_workload.jl`, standalone and
+      not in `Pkg.test`, since the test environment has no device package
+      and must not gain one: the vertex-centered wave on three levels with
+      the hook, a reflecting box with an odd variable, a periodic 3D
+      mesh, each filled and stepped with RK4; Burgers with the interface
+      fixup and its conservation; the tracked pulse through two regrids
+      flagged by `firing_boxes` on the device; and refinements of the
+      first blocks and their coarsening, which move blocks up and down
+      the ranks and coarsen siblings with different owners, over a
+      conservative cell-centered set and a vertex-centered one. Rank 0
+      prints digests of the arrays downloaded and gathered in block
+      order, ghosts included, the exact reductions, the sums, and `#`
+      lines with how many of each schedule's stages had messages and how
+      many were staged, and how blocks migrated. Every callback computes
+      in the coordinates' type (the forests' extents are in `T`), since
+      Metal has no Float64. `TREEAMR_TEST_BACKEND` chooses `cpu`, `metal`
+      or `cuda`, `TREEAMR_TEST_T` the type, and
+      `TREEAMR_TEST_DEVICEAWARE=1` the direct path; on a node with several
+      devices each rank takes device `local rank mod devices`.
+      `test/mpi_device_tests.jl` runs it serially and under `mpiexec` at
+      `TREEAMR_TEST_RANKS` (default `2 3`), one thread a rank, and
+      requires every line to be the serial device run's, the `sum` lines
+      to `rtol = 10⁻⁵` in Float32 and `10⁻¹²` in Float64; every stage with
+      messages to have been staged on a device that is not device-aware,
+      and none otherwise; and the migrations to have happened.
+    - *Measured on Metal* (Apple M3 Pro, Metal.jl in a scratch environment
+      that develops this checkout and adds Metal, MPI, KernelAbstractions,
+      SHA and Test; MPICH_jll 5.0.2; two and three ranks sharing the one
+      GPU). `TREEAMR_TEST_BACKEND=metal julia --project=<env>
+      test/mpi_device_tests.jl` passes, 36 tests in 1m45: the serial run
+      31 s, `-n 2` 36 s and `-n 3` 38 s of wall clock, nearly all of it
+      compilation. In Float32 every line but the sums is the serial Metal
+      run's byte for byte, at both counts; at `-n 3` the sums move in the
+      seventh or eighth of 9 digits (Burgers' mass 15.999999 against 16,
+      `l2` by 1–2 × 10⁻⁷ relative). At `-n 3` 9, 8, 6, 9 and 5 stages of
+      the five schedules had messages, and all of them were staged;
+      6 blocks moved up the ranks on the refinement, 6 back down on the
+      coarsening, and 2 coarsened blocks had children of two owners. As a
+      negative control, with the upload of the receive mirror removed the
+      `-n 2` run differs from the serial one in 53 lines. The same driver
+      on the CPU (the direct path, nothing staged) passes in 59 s.
+    - *In process*, the staging path on the CPU: a communicator in
+      `regrid_exchange_tests.jl` that answers `hoststaging` with `true`
+      for every buffer, over the rendezvous communicator, and records the
+      arrays every message is handed out of. At 3 ranks in 2D, vertex-
+      centered, outer and reflecting faces with the hook, the staged ghost
+      fill, the interface restriction and `regrid!` reproduce the serial
+      results bit for bit; every buffer handed to the communicator is one
+      of the stages' mirrors and none is a stage buffer; a second fill
+      reuses the mirrors and gives the same bits. With the upload removed
+      it fails, 7 of its 31 tests. `mpi_workload.jl` gains a `#` line that
+      checks, under MPI, that a device-aware communicator shares the
+      duplicate, and that a buffer which is not contiguous host memory is
+      refused before anything is sent, naming the setting.
+    - *The CPU path is unchanged.* `bench/ghosts.jl` at its defaults, one
+      thread, best of 200, HEAD before and after, alternated twice: the
+      serial fill allocates exactly what it did, 10896 bytes on the
+      uniform mesh and 97504 on the two-level one, and the schedule build
+      392832 and 4656880; the fill took 2.660–2.719 ms against
+      2.667–2.670 ms and 12.09–12.22 ms against 11.87–11.92 ms, the second
+      1.5–3 % slower in both rounds, though the serial path runs no
+      changed line (the stage without messages returns before the new
+      code); not traced further. A distributed CPU fill (the same
+      two-level mesh, 10 variables, `mpiexec` with one thread a rank,
+      best of 50) allocates exactly what it did, 130320 bytes on each rank
+      at `-n 2` and 151856 / 189168 / 151856 at `-n 3`, in 7.0 ms and
+      6.1–6.9 ms both before and after.
+    - *The CPU workload by hand*, `test/mpi_workload.jl` at `-n 3` against
+      the serial run (before the inference fix above, which changes no
+      value): every line but the `sum` lines and the `#` lines identical,
+      the sums agreeing to the last one or two of 17 digits, as in step 6.
+    - *Symmetry* (measured 2026-10-02 on cn111, one node of 8 H200s
+      with 4 of them allocated, NVLink between every pair; Julia 1.13.1,
+      CUDA.jl's CUDACore 6.4.1; `bench/symmetry_mpi_gpu.sh` as amended
+      in the step's script commit, on `h200q`, since `h200debugq`'s QOS
+      allows a group 2 GPUs and 24 CPUs). One rank per GPU, one thread a
+      rank, `TREEAMR_TEST_RANKS = "2 3 4"`:
+      - **Host staging, MPICH_jll 5.0.2** (job 567852):
+        `test/mpi_device_tests.jl` passes in Float64 and in Float32, 52
+        tests each, every line of every distributed run the serial CUDA
+        run's but the sums, every stage with messages staged. The first
+        job (567850) had failed at `-n 2`: CUDA refuses to page-lock an
+        empty range, and a stage this rank only sends in, or only
+        receives in, has an empty mirror, which Metal and the CPU never
+        refused. `pagelock_mirror!` now skips an empty mirror (the
+        step's fix commit), and nothing else changed between the jobs.
+      - **Symmetry has a CUDA-aware MPI**: HPC-X 2.20's Open MPI 4.1.7
+        (`nvhpc-hpcx-cuda12/24.9`, through MPIPreferences' system
+        binary), whose `ompi_info` says `opal_built_with_cuda_support`
+        and for which `MPI.has_cuda()` is `true`. Over it (job 567856)
+        the test passes through host staging and through the direct
+        path, `communicator(COMM_WORLD; deviceaware = true)`, in
+        Float64 and in Float32: four times 52 tests, the direct runs
+        with no stage staged. So the direct path, which no device here
+        could run, is checked — MPI.jl hands the `CuArray` views to the
+        library by device pointer, and UCX moves them. The probe of
+        `MPI.has_cuda()` has to run under `mpiexec -n 1`: a singleton
+        `MPI.Init()` of this Open MPI inside a SLURM job waits forever
+        for the daemon it spawns (job 567853, cancelled).
+      - **What the two paths cost** (`bench/mpi.jl` on CUDA through
+        `bench/mpiscan.sh 1 2 4`, `N = 32`, `ROOTS = 4`, Float64, 5.8 M
+        cells a rank, the four GPUs of one node, HPC-X; minimum ms,
+        staged / direct):
+
+        | phase | 1 rank | 2 ranks | 4 ranks |
+        |---|---|---|---|
+        | two-level rhs | 2.07 / 2.06 | 2.89 / 2.72 | 2.92 / 2.76 |
+        | two-level fill_ghosts | 1.71 / 1.70 | 2.49 / 2.29 | 2.52 / 2.35 |
+        | — its local groups | 1.69 / 1.67 | 1.44 / 1.41 | 1.44 / 1.43 |
+        | — its packs | – | 0.52 / 0.51 | 0.51 / 0.50 |
+        | — its unpacks | – | 0.44 / 0.44 | 0.44 / 0.44 |
+        | uniform rhs | 0.31 / 0.31 | 0.63 / 0.61 | 0.71 / 0.63 |
+        | two-level regrid, refine | 5.2 / 5.2 | 25.4 / 7.1 | 48.0 / 8.7 |
+        | two-level regrid, coarsen | 3.6 / 3.6 | 26.1 / 7.3 | 52.6 / 8.2 |
+        | interpolate (1000 pts/rank) | 0.11 / 0.11 | 0.55 / 0.55 | 0.47 / 0.50 |
+
+        The rhs weak-scales at 0.71 staged and 0.74 direct to 4 GPUs.
+        As on the CPU, the messages are not the cost: the fill less its
+        parts is under 0.2 ms either way. The packs and unpacks are,
+        0.95 ms of a 2.5 ms fill, and on a device that is launches —
+        one per group, for groups of a few thousand points (the
+        uniform mesh's single stage has 0.12 + 0.12 ms of them for a
+        fill of 0.16 ms serially). The direct path saves 0.16–0.2 ms a
+        fill, the two copies. **The staged regrid is the surprise**: 48
+        ms at 4 ranks against 8.7 direct and 5.2 serially. A regrid
+        stage is built per regrid, so its host mirrors are allocated,
+        zero-filled and page-locked afresh each time, for up to 84
+        blocks of `32³ × 2` values; that is the likely cost (not
+        traced), and MPICH_jll's staging (job 567852) shows the same
+        48.4 ms. A regrid that staged through pageable memory, or kept
+        its mirrors, would not pay it; left open, since a regrid runs at
+        regrid frequency and the direct path exists. *(Followed up the
+        same day with the buffer pool, the next bullet; the H200
+        re-measurement is pending.)*
+    - *The buffer pool* (the follow-up, 2026-10-02; the design is "The
+      buffer pool" under "MPI+GPU" in
+      [Distributed meshes](#distributed-meshes)). Stage buffers and host
+      mirrors are leased from the forest's pool, the regrid stage's
+      returned at the end of its transfer and a stale schedule's
+      reclaimed at the next lease, so that a regrid reuses what the
+      earlier ones allocated and, on CUDA, page-locked. Measured locally
+      only (Apple M3 Pro, MPICH_jll 5.0.2, one thread a rank, Symmetry
+      being in use by another job):
+      - *Reuse.* In process, `regrid_exchange_tests.jl`'s new test runs
+        a refine-and-coarsen cycle three times at 3 ranks with every
+        message staged on the CPU, schedules rebuilt after each regrid
+        and filled, with the serial bits throughout and no buffer
+        allocated in the third cycle. A script running five cycles of
+        the same setup shows the three ranks' pools allocating 8, 10
+        and 8 buffers in the first cycle (half of them mirrors) and none
+        in the four after it. `mpi_device_workload.jl` runs its
+        moving-blocks cycle twice and prints the ranks' pool counts after
+        each: on Metal at `-n 3`, 42 buffers (21 mirrors) and 48 (24)
+        after the first cycles of its two meshes, the same after the
+        second, and `mpi_device_tests.jl` now asserts that, 52 tests
+        passing on Metal (staged) and on the CPU (direct, no mirrors).
+        `bench/mpi.jl` over its six regrid cycles at `N = 16`: rank 0's
+        pool allocates 20 buffers at 2 ranks and 18 at 4 in the first
+        cycle, staged on Metal or forced-staged on the CPU, 10 and 9
+        direct on the CPU, and nothing after.
+      - *Negative controls.* With reclaiming disabled, the pool's unit
+        test fails 4 of its 9 tests; with a leased buffer left on the
+        free list, the unit test fails 2 and the cycle test's overlap
+        check fails on all 3 ranks — while its bits stayed serial,
+        since the in-process mailbox copies a message when it is sent,
+        which is why the overlap is checked directly.
+      - *Host allocation per regrid*, rank 0, `bench/mpi.jl`'s last
+        refine / coarsen (`@allocated`, `N = 16`, `ROOTS = 4`, 2 / 4
+        ranks), before and after: forced staging on the CPU 57.0 / 48.4
+        and 55.2 / 52.2 MB to 46.8 / 35.5 and 41.4 / 35.6; direct on the
+        CPU 51.9 / 42.0 and 48.3 / 43.9 to 46.8 / 35.5 and 41.3 / 35.6;
+        staged on Metal (Float32) 5.3 / 6.5 and 6.3 / 7.4 to 2.7 / 3.2
+        and 2.8 / 3.2. What remains on the CPU is mostly the new
+        working arrays, which a regrid allocates by design.
+      - *Time: no change that the noise lets one see* — the cost the
+        pool removes is not one this machine has. Two runs each,
+        alternated, minimum ms, refine / coarsen at 2 and 4 ranks:
+        forced staging on the CPU 61.2–62.8 / 50.2–50.9 and
+        69.1–72.6 / 48.4–48.7 before, 61.5–63.8 / 49.6–54.5 and
+        71.3–71.6 / 44.0–44.5 after; Metal 40.2–51.1 / 40.0–42.4 and
+        51.4–56.0 / 50.5–50.8 before, 47.9–50.3 / 40.7 and 51.2–52.8 /
+        48.2–49.9 after (the ranks share one GPU, so the Metal
+        distributed numbers are not weak scaling). Neither backend
+        page-locks, and the allocation and zero-filling the pool does
+        save here are evidently lost in a 40–70 ms regrid.
+        So the local runs show that the pool works and is safe, not
+        what it buys on CUDA: whether step 8's 40 ms were the pinning
+        is still to be measured on Symmetry (pending; see "Performance
+        work left for later" under
+        [Distributed meshes](#distributed-meshes)).
+      - *Unchanged elsewhere.* `bench/ghosts.jl` at one thread: the
+        serial fill allocates 10896 and 97504 bytes and the schedule
+        build 392832 and 4656880, as in step 8; the distributed CPU
+        fill of step 8 allocates 130320 bytes a rank at `-n 2` and
+        151856 / 189168 / 151856 at `-n 3`, as before.
+    - *What was not checked* (before the Symmetry run, which checked the
+      direct path on CUDA). The direct path on any device: Metal has no
+      device-aware MPI, and the CPU's direct path is not the device's
+      code path for MPI.jl, which hands a `CuArray` over through its
+      own CUDA extension. A checkpoint or an interpolation from a device
+      field set under MPI was not run (both go through the host, as steps
+      5 and 6 recorded).
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
+      `partition_tests.jl`, `exchange_tests.jl`,
+      `regrid_exchange_tests.jl` (the staging test included),
+      `type_tests.jl` after them (the inference fix) and `mpi_tests.jl`
+      (3m21 together); the whole suite was not run there.
+    - *Suite cost.* 109140 tests at one thread in 7m55 and 109192 at eight
+      in 7m51, against step 6's 109107 in 8m10 and 109159 in 8m02: 33
+      more at each, the 31 of the staging test and the device-aware line
+      at two rank counts. The thread-independence digests are unchanged.
+      The docs build.
+  - **Step 9 — wrap-up.** A `docs/src/api/distributed.md` page
+    (`communicator`, `blockrange`), a guide section in `index.md`, the
+    status there and in `README.md`, and CLAUDE.md's architecture row,
+    MPI test commands and suite cost. *Accept:* the docs build; TreeWave
+    and TreeHydro green in scratch copies against the checkout, with
+    the audit for `nleaves`-sized per-block arrays done in all three
+    downstreams; M7 marked *(Done.)*. Tagging the release is left to
+    Erik. *(Amended in step 9: M7 is marked implemented rather than
+    done, since the acceptance's weak-scaling table and the H200 run
+    are scripted and not run; see the milestone's heading.)*
+
+    *(Done, 2026-10-02.)* What it settled:
+    - *Suite cost, and what was trimmed.* After step 8 the suite took
+      about 8 minutes at one thread, against M9a's 4m16, and
+      `mpi_tests.jl` was the largest file: 123–128 s, the serial
+      reference in process and then `mpiexec -n 3` and `-n 2` one after
+      the other, each launch about 55 s of wall clock and, by a timed
+      copy of the workload, almost all of it compilation (a fresh serial
+      process spends about 20 s compiling `main`'s call tree before its
+      first case runs, and the cases' own time is about 19 s). Nothing
+      orders the launches but the checkpoint cross loads, so they now
+      overlap. Each run leaves an empty marker beside its checkpoints
+      once they are written, and `TREEAMR_CHECKPOINT_FROM` names the
+      rank counts whose files a run waits for and loads; every rank
+      waits on its own, sleeping, so none spins in MPI meanwhile, and a
+      run by hand without the variable loads whatever it finds, as
+      before. A new helper, `test/mpi_jobs.jl`, starts both jobs at the
+      start of the suite where the machine has room for five ranks
+      beside it — eight threads and 24 GB, since a rank measured about
+      2 GB resident — and `mpi_tests.jl` collects them; elsewhere, a CI
+      runner among them, the three-rank job runs beside the serial
+      reference and the two-rank job after it.
+      `TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice. Two
+      type repeats went, each of a path covered elsewhere: the
+      workload's `Float32` regrid case (`Float32` crosses MPI as a
+      native type, its regrid stage is checked bitwise in process by
+      `regrid_exchange_tests.jl`, and `Float32x2`, which MPI sends
+      through a derived datatype, stays), and `exchange_tests.jl`'s
+      pack/unpack round trip in `Float32` in 1D and 3D and in `Float32x2`
+      in 1D, 29 tests (`Float32` stays in 2D, `Float32x2` in 2D and 3D,
+      where remote mirrored transfers exist). No claim of an acceptance
+      list went with them: every case the step-3 to step-6 acceptances
+      name is still in the workload, at both rank counts, and every type
+      the step-2 round trip names is still in it. The thread-independence
+      test was not touched.
+
+      Per file, one thread, timed around each `include` in a scratch
+      copy of `runtests.jl` (s; before and after on the same machine,
+      the same day):
+
+      | file | before | after |
+      |---|---|---|
+      | inline M1 tests | 10.7 | 14.7 |
+      | `ghost_tests.jl` | 14.2 | 18.0 |
+      | `centering_tests.jl` | 25.7 | 30.5 |
+      | `reflect_tests.jl` | 28.7 | 29.5 |
+      | `interpolate_tests.jl` | 18.0 | 23.4 |
+      | `interface_tests.jl` | 5.2 | 5.1 |
+      | `partition_tests.jl` | 8.8 | 8.2 |
+      | `exchange_tests.jl` | 40.1 | 32.8 |
+      | `regrid_exchange_tests.jl` | 20.3 | 19.0 |
+      | `interpolate_exchange_tests.jl` | 13.2 | 12.9 |
+      | `allvariables_tests.jl` | 8.3 | 8.1 |
+      | `state_tests.jl` | 7.6 | 7.5 |
+      | `regrid_tests.jl` | 10.4 | 10.8 |
+      | `wave_tests.jl` | 4.2 | 4.2 |
+      | `wave_cell_tests.jl` | 2.3 | 2.3 |
+      | `burgers_tests.jl` | 16.6 | 17.2 |
+      | `imex_tests.jl` | 5.6 | 5.3 |
+      | `type_tests.jl` | 12.8 | 13.4 |
+      | `checkpoint_tests.jl` | 26.6 | 28.6 |
+      | `thread_tests.jl` | 50.2 | 50.3 |
+      | `mpi_tests.jl` | 127.8 | 15.0 |
+      | `gpu_tests.jl` | 27.5 | 27.0 |
+      | whole run | 489.6 | 386.5 |
+
+      The files that run while the jobs compile lose 4–6 s each, about
+      20 s in all, to the five ranks on the other cores (an M3 Pro, six
+      performance and six efficiency cores); the net is 103 s. On the
+      sequential path, which is CI's, `mpi_tests.jl` alone takes 1m47
+      (130 tests), against step 6's 2m34 for three launches in a row,
+      and the whole suite, forced onto that path here with
+      `TREEAMR_TEST_MPI_CONCURRENT=0`, 7m52 (110484 tests), within the
+      run-to-run spread of the 7m55 before (steps 5–8 measured 7m49 to
+      8m10). So the trim is a local saving: a CI cell, whose runner has
+      no room for the jobs beside the suite, is not expected to get
+      faster, and launching them there anyway was not tried, since a
+      `macos-latest` runner has 7 GB for the main process and five ranks
+      of about 2 GB.
+    - *CI.* `.github/workflows/CI.yml` needed no change for MPI: MPI.jl's
+      default binary is MPICH_jll, an artifact on both runners'
+      platforms, and the parallel HDF5_jll build matching it is chosen
+      by MPIPreferences with nothing configured ("What the feasibility
+      check found"); the ranks run at one thread whatever
+      `JULIA_NUM_THREADS` says, and inherit `--check-bounds=yes` and,
+      on the single-threaded cells, `--code-coverage` through
+      `Base.julia_cmd()`, so their `.cov` files are merged with the
+      rest. The job gained a `timeout-minutes` of 120, since a process
+      stuck outside the test's own deadlines would hold a runner for
+      GitHub's default six hours. **None of it has run on GitHub**: the
+      branch is not pushed. What is unverified there: that MPICH's
+      launcher starts on the hosted macOS runner; the memory of a
+      `macos-latest` runner (7 GB) against the main process and three
+      ranks of about 2 GB each, which may swap; and the time of the
+      coverage cells, whose ranks are instrumented too (the deadline is
+      900 s a launch, against about 55 s uninstrumented here).
+      *(Linux, 2026-10-02: in a fresh clone of the branch at 12a6cd6 on
+      one Symmetry node each — jobs 567843 on cn106 and 567844 on cn109,
+      AMD EPYC 7543 — `Pkg.test()` at one thread passes on Julia 1.11.9,
+      110484 tests in 13m34 (`--check-bounds=yes`, which 1.11's
+      `Pkg.test` sets), and on 1.13.1, 110484 in 11m18, the MPI jobs
+      started early on both, with MPICH_jll 5.0.2 resolved by default.
+      `HYDRA_LAUNCHER=fork` was set, so that MPICH's launcher forked its
+      ranks as on a runner without SLURM, rather than starting them
+      through `srun`. So the MPI tests work on Linux; GitHub's runners
+      are what CI is for.)*
+    - *Docs.* A guide section, "Running distributed", in
+      `docs/src/index.md`; the status there and in `README.md`; the
+      distributed API page pointing at the guide. Two examples that
+      were right only serially were fixed: `firing_boxes`' verdict used
+      `level(forest.leaves[b])`, and the regridding section named
+      `forest.leaves[b]` as the way to tell blocks apart; both are
+      `blockkey(fs, b)`. The docs build.
+    - *Fixed upstream from the audit.* `buffered_flags` now refuses a
+      flag vector that is not one per leaf, as `complete_marks` already
+      did: TreeGeneralizedHarmonic calls it with `flag_blocks`' flags,
+      which over a distributed forest are a rank's local blocks, and
+      without the check it buffered around leaves `1:nblocks` and wrote
+      global recruit indices into the local vector — silently. The
+      `DimensionMismatch` says to pass the local flags to `regrid!` with
+      `buffer` instead. And `block_mapreduce`'s docstring had shown
+      `maximum(block_mapreduce(…))` as a refinement scale, the
+      rank-local pattern two downstreams copied; it shows
+      `mesh_mapreduce` now and says why.
+    - *The downstreams*, each copied to scratch with this checkout
+      developed into the copy, at one thread: TreeWave 310 tests in 1m22
+      (`Pkg.test`'s summary; 310 in 1m12 against the M9a checkout);
+      TreeHydro 12447 in 5m00 (11893 in 4m16 then; it has grown since);
+      TreeGeneralizedHarmonic, whose whole suite takes about 19 minutes,
+      a subset of 1760 tests in 7m04 — `precision_`, `prerequisite_`,
+      `stencils_`, `stepping_`, `interface_`, `refinement_`, `horizon_`,
+      `checkpoint_` and `type_tests.jl`, the files that reach TreeAMR
+      most directly (its names, the partition, the exchange, the
+      buffer, `interpolate`, checkpoints, the element types). All pass,
+      so the local block indices, the new check in `buffered_flags` and
+      the rest of M7 change nothing serially for them.
+    - *The audit* (read-only, of each downstream's `src/` and `bin/`
+      against the list under "What an application must make global
+      itself"). None of the three passes `comm` to a `Forest` yet, so
+      today an `mpiexec` launch runs a full serial copy per rank, and
+      nothing below is wrong until one does. None indexes
+      `forest.leaves` by a block index or sizes a per-block array by
+      `nleaves`, with the exceptions named. What would go wrong once it
+      is distributed:
+      - *TreeWave.* `field_scales` (`src/refinement.jl:112`) is
+        `maximum(block_mapreduce(…))`, so the Löhner reference amplitude
+        becomes per rank: the mesh would depend on the rank count, and an
+        empty rank would throw on `maximum` of nothing and leave the
+        others in the next collective. `blast_coverage`
+        (`src/blast.jl:281–295`) and `track_pulse`'s tracking measure
+        (`src/supergaussian.jl:188–195`) are rank-local diagnostics.
+        Its integrators are fixed-step, so no adaptive norm. The viewers
+        in `bin/` would plot one rank's blocks.
+      - *TreeHydro.* Five functions combine `block_mapreduce` on the host
+        — `max_signal_speed` (`src/evolution.jl:477`), `floor_hits`
+        (`:505`), `ghost_floor_hits` (`:578–585`), `indicator_scales`
+        (`src/refinement.jl:189–190`), `peak_compression`
+        (`src/sedov.jl:512`) — and the first is the CFL speed: `evolve!`
+        derives each chunk's step count from it (`src/driver.jl:857–860`),
+        so the ranks would take different numbers of steps and hang in
+        the exchange; `entropywave_errors`, `sedov_static` and the
+        `check_cfl` calls do the same. Its time-based checkpoint triggers
+        read each rank's own clock (`src/driver.jl:910–917`), so some
+        ranks would enter the collective `save_checkpoint` and others
+        not. The run state it checkpoints holds the rank-local counts and
+        speeds, which `write_plain`'s agreement would refuse on every
+        rank. `tracked_share`, `reduce_to_grid`, `mode_amplitude`,
+        `max_y_kinetic_energy`, `shock_radius` are rank-local
+        diagnostics, and `src/kelvinhelmholtz.jl:544` records
+        `nblocks` where the mesh's block count is meant.
+      - *TreeGeneralizedHarmonic.* Its reductions are already
+        `mesh_mapreduce` (the speed, the bounds, the constraint norms),
+        and its integrator is fixed-step. But `indicator_flags` passes
+        local flags to the public `buffered_flags`
+        (`src/refinement.jl:739`) — now refused, above — and
+        `clamp_marks` (`:762`) and `refinement_centroid` (`:816`) index
+        `forest.leaves[b]` by a local block, the centroid's sums staying
+        per rank too; `nfiring` (`:743`) is a local count. Its
+        time-based checkpoint triggers read each rank's clock
+        (`src/driver.jl:1287–1293`), its run state holds wall-clock fit
+        costs and the rank-local centroids (`:1312`), which the agreement
+        would refuse, and its non-finite check (`:741`) reads the local
+        state only, so one rank would throw alone. Its horizon finder
+        passes every point on every rank, which is correct under M7's
+        collective `interpolate` and only redundant.
+      None of these is fixed here: they are the downstreams' to fix
+      when they distribute.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes the
+      whole suite, 110484 tests in 6m46 at one thread, with the MPI jobs
+      started early as on 1.13. It resolves MPICH_jll there, the binary
+      CI's runners get, against MPIABI_jll on 1.13.1 here (the global
+      preference), and IMEXRungeKutta 1.3.0 from `main`, against the 1.1.0
+      the 1.13 test manifest holds.
+    - *Suite cost.* 110484 tests at one thread in 6m25 and 110536 at
+      eight in 6m21 (`Pkg.test`), against 7m55 and 7m51 after step 8.
+      The differences from the step-7 follow-up's 110511 and 110563 are the
+      29 tests of the round trip and two new `buffered_flags`
+      assertions. The thread-independence digests are unchanged. The
+      docs build.
 - **M9b — Visualization export.** *(Split from M9, "I/O and
   visualization", on 2026-09-29, when its checkpoint half became M9a;
   not designed.)* After M7. The candidates:

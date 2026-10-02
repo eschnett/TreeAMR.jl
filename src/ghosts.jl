@@ -47,7 +47,7 @@
     wprod = foldl((a, d) -> :($a * $(Symbol(:wt_, d))), 2:D;
                   init=Symbol(:wt_, 1))
     body = quote
-        acc += $wprod * src[$(idx...), v, sblock]
+        acc += $wprod * transfer_load(src, ($(idx...),), v, sblock)
     end
     for d in 1:D
         body = quote
@@ -59,11 +59,64 @@
     end
     return quote
         Base.@_inline_meta
-        acc = zero(eltype(src))
+        acc = zero(transfer_eltype(src))
         @inbounds $body
         acc
     end
 end
+
+# The packed buffer of a distributed exchange (M7), as a kernel sees it.
+#
+# Pack and unpack are transfers like any other, so they go through the
+# same kernel, with a message buffer in place of the working array: the
+# pack's `dest`, the unpack's `src` ("Pack and unpack are transfers" in
+# CODE.md). The kernel reaches both arrays through the three accessors
+# below — a load, a store, and the element type `stencil_sum` starts
+# its accumulator from — each with a method for an array, which is
+# exactly the indexing it always did, and one for a packed buffer.
+#
+# A packed buffer is a `NamedTuple` rather than a struct of our own so
+# that KernelAbstractions adapts it to a device as it is, with no new
+# dependency: the flat buffer `buf`, the `offsets` of the transfers'
+# slots in points, and the `dims` of one transfer's target box times the
+# variables. The "block" index the kernel passes is the slot: a pack's
+# target slot, an unpack's source slot. A slot's box is laid out in the
+# kernel's own index order, `(box…, v)` column-major, starting at
+# element `offsets[slot] * nvars`.
+const PackedBuffer = NamedTuple{(:buf, :offsets, :dims)}
+# The form a driver passes to `run_phase!`: the buffer and the slot
+# offsets of a stage, completed with each group's box in `run_group!`.
+const PackedSlots = NamedTuple{(:buf, :offsets)}
+
+@inline transfer_eltype(a) = eltype(a)
+@inline transfer_eltype(p::PackedBuffer) = eltype(p.buf)
+
+Base.@propagate_inbounds transfer_load(a, idx, v, b) = a[idx..., v, b]
+Base.@propagate_inbounds transfer_load(p::PackedBuffer, idx, v, b) =
+    p.buf[packed_index(p, idx, v, b)]
+
+Base.@propagate_inbounds function transfer_store!(a, x, idx, v, b)
+    a[idx..., v, b] = x
+    return nothing
+end
+Base.@propagate_inbounds function transfer_store!(p::PackedBuffer, x, idx, v, b)
+    p.buf[packed_index(p, idx, v, b)] = x
+    return nothing
+end
+
+# The element of slot `slot` at box position `idx` and variable `v`.
+# Recursion over the tuple rather than a loop, so that it unrolls in a
+# device kernel too.
+@inline packed_index(p, idx, v, slot) =
+    Int(p.offsets[slot]) * last(p.dims) + boxlinear((idx..., v), p.dims) + 1
+@inline boxlinear(::Tuple{}, ::Tuple{}) = 0
+@inline boxlinear(i::Tuple, n::Tuple) =
+    (first(i) - 1) + first(n) * boxlinear(Base.tail(i), Base.tail(n))
+
+# The argument the kernel gets: an array as it is, and a stage's packed
+# slots with this group's box.
+@inline kernelarg(a, dims) = a
+@inline kernelarg(p::PackedSlots, dims) = (buf=p.buf, offsets=p.offsets, dims=dims)
 
 # `dest` and `src` are the same array for ghost filling (targets are
 # ghosts, sources interiors, so they never overlap) and different arrays
@@ -104,7 +157,7 @@ end
     @inbounds base = ntuple(d -> Int(srcstarts[d][I[d]]), Val(D))
 
     acc = stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
-    @inbounds dest[tidx..., v, tblock] = scaled(acc, factors, v, fcol)
+    @inbounds transfer_store!(dest, scaled(acc, factors, v, fcol), tidx, v, tblock)
 end
 
 # Launch one group's transfers `range` — the whole group by default.
@@ -133,6 +186,8 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
     weights = ntuple(d -> group.stencils[d].weights, Val(D))
     ndrange = (blen..., Int(nvars), n)
+    kdest = kernelarg(dest, (blen..., Int(nvars)))
+    ksrc = kernelarg(src, (blen..., Int(nvars)))
 
     # A slice of a group is passed as an offset into the group's own
     # block lists rather than as two `view`s: every kernel argument
@@ -141,7 +196,7 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # "What the ghost fill costs" in CODE.md for what that buys and what
     # it does not.
     kernel! = transfer_kernel!(backend)
-    kernel!(dest, src, group.targetblocks, group.sourceblocks,
+    kernel!(kdest, ksrc, group.targetblocks, group.sourceblocks,
             srcstarts, weights, tfirst, first(range) - 1, gfactors, group.factorcol,
             Val(orders), Val(D);
             ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
@@ -177,6 +232,16 @@ run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D} =
 # a group is one contiguous run found by bisection. A device backend has
 # neither problem — there a launch *is* the parallel unit — and takes
 # the plain per-group path below.
+#
+# A pack (M7) writes a message buffer rather than a block, so it is the
+# *source* block's owner that runs it: the thread that last wrote the
+# data it reads. Its groups are sorted by source block instead, and the
+# bisection runs over whichever block list says who owns the transfer.
+ownerblocks(group, dest) = group.targetblocks
+ownerblocks(group, ::PackedSlots) = group.sourceblocks
+ownercount(dest, src) = size(dest, ndims(dest))
+ownercount(::PackedSlots, src) = size(src, ndims(src))
+
 function run_phase!(dest, src, groups, nvars::Integer, backend; factors=nothing)
     for group in groups
         run_group!(dest, src, group, nvars, backend; factors=factors)
@@ -186,7 +251,7 @@ end
 
 function run_phase!(dest, src, groups, nvars::Integer, backend::CPU;
                     factors=nothing)
-    nb = size(dest, ndims(dest))
+    nb = ownercount(dest, src)
     if length(threadchunks(nb)) <= 1
         for group in groups
             run_group!(dest, src, group, nvars, backend; factors=factors)
@@ -195,9 +260,9 @@ function run_phase!(dest, src, groups, nvars::Integer, backend::CPU;
     end
     threaded_chunks(nb) do _, owned
         for group in groups
-            targets = group.targetblocks
-            lo = searchsortedfirst(targets, first(owned))
-            hi = searchsortedlast(targets, last(owned))
+            owners = ownerblocks(group, dest)
+            lo = searchsortedfirst(owners, first(owned))
+            hi = searchsortedlast(owners, last(owned))
             lo <= hi && run_group!(dest, src, group, nvars, backend;
                                    range=lo:hi, single=true, factors=factors)
         end
@@ -207,6 +272,245 @@ end
 
 run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
     run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors)
+
+# --- Stages (M7) -----------------------------------------------------------
+#
+# The driver of a staged exchange. Every ordering point of the serial
+# fill is a stage (see `ExchangeStage`), and a stage runs in five steps
+# ("Stages" in CODE.md): post the receives, pack and synchronize, post
+# the sends, run the local groups while the messages are in flight, and
+# wait for the receives and unpack. The sends are waited on once, at the
+# end of the call. The pieces are separate functions so that the tests
+# can run every simulated rank's stage in lockstep in one process,
+# wiring the buffers between ranks directly; `run_stage!` composes them
+# through the communicator verbs, which is the path a real run takes.
+#
+# A stage without messages is a phase exactly as before M7, so a serial
+# fill runs the same launches and the same barriers it always did.
+
+# The stage's send and receive buffers for `nvars` variables, on the
+# backend, taken on first use and kept with the schedule, since a
+# schedule serves every field set of its layout. Over a forest they are
+# leased from its buffer pool (`BufferPool`), so that a stage built
+# after a regrid reuses what earlier stages held; without one (the
+# in-process tests, which wire the buffers between simulated ranks
+# themselves) they are allocated and zeroed, as before the pool.
+function stagebuffers(remote::RemoteStage{D,GRP,VB,BUF}, nvars::Integer, backend,
+                      forest=nothing) where {D,GRP,VB,BUF}
+    bufs = get(remote.buffers, Int(nvars), nothing)
+    bufs === nothing || return bufs
+    make = cap -> new_stagebuffer(BUF, backend, cap)
+    lengths = (Int(nvars) * sum(remote.sendcounts; init=0),
+               Int(nvars) * sum(remote.recvcounts; init=0))
+    bufs = map(lengths) do n
+        forest === nothing ? make(n).full::BUF :
+        lease!(make, BUF, bufferpool(forest), (:buffer, BUF, typeof(backend)), n,
+               generation(forest), remote.buffers, Int(nvars))
+    end
+    remote.buffers[Int(nvars)] = bufs
+    return bufs
+end
+
+# A fresh, zeroed stage buffer of `cap` elements. A host one (the CPU's)
+# is an `Array` over a `Memory` of its own, which a lease can wrap at a
+# shorter length; a device one is the backend's array, which a lease
+# views.
+function new_stagebuffer(::Type{BUF}, backend, cap::Int) where {BUF}
+    T = eltype(BUF)
+    if BUF <: Array
+        mem = Memory{T}(undef, cap)
+        full = fill!(Base.wrap(Array, mem, (cap,)), zero(T))
+        return PooledBuffer(full, mem)
+    end
+    full = allocate(backend, T, cap)
+    fill!(full, zero(T))
+    return PooledBuffer(full, nothing)
+end
+
+# Host mirrors of the stage's buffers for `nvars` variables, for a
+# communicator that cannot send from or receive into the backend's own
+# memory (`hoststaging`): the same layout in host vectors, taken on
+# first use and kept with the stage like the buffers themselves, so a
+# staged fill allocates nothing new either. They are page-locked for the
+# backend where it implements that (`KernelAbstractions.pagelock!`; CUDA
+# pins them, the CPU and Metal do nothing), which is what lets a device
+# copy them at the bus's rate rather than through a bounce buffer, and
+# leased from the forest's pool like the buffers: page-locking is the
+# slow part of allocating one, so a pooled mirror is page-locked once.
+function stagemirrors(remote::RemoteStage{D,GRP,VB,BUF,HB}, nvars::Integer,
+                      backend, forest=nothing) where {D,GRP,VB,BUF,HB}
+    mirrors = get(remote.mirrors, Int(nvars), nothing)
+    mirrors === nothing || return mirrors
+    pool = forest === nothing ? nothing : bufferpool(forest)
+    make = cap -> new_mirror(eltype(HB), backend, cap, pool)
+    lengths = (Int(nvars) * sum(remote.sendcounts; init=0),
+               Int(nvars) * sum(remote.recvcounts; init=0))
+    mirrors = map(lengths) do n
+        forest === nothing ? make(n).full::HB :
+        lease!(make, HB, pool, (:mirror, HB, typeof(backend)), n,
+               generation(forest), remote.mirrors, Int(nvars))
+    end
+    remote.mirrors[Int(nvars)] = mirrors
+    return mirrors
+end
+
+function new_mirror(::Type{T}, backend, cap::Int, pool) where {T}
+    mem = Memory{T}(undef, cap)
+    full = fill!(Base.wrap(Array, mem, (cap,)), zero(T))
+    pagelock_mirror!(backend, full)
+    pool === nothing || cap == 0 || (pool.pagelocked += 1)
+    return PooledBuffer(full, mem)
+end
+
+# Give a stage's buffers and mirrors back to the forest's pool, and
+# forget them: the regrid stage's, once its sends have been waited on,
+# since it lives for one call.
+function release_stage!(forest::Forest, remote::RemoteStage)
+    for bufs in values(remote.buffers)
+        release!(bufferpool(forest), bufs)
+    end
+    for mirrors in values(remote.mirrors)
+        release!(bufferpool(forest), mirrors)
+    end
+    empty!(remote.buffers)
+    empty!(remote.mirrors)
+    return nothing
+end
+
+# `pagelock!` is in KernelAbstractions from 0.9.40 on; where a backend
+# does not implement it, it returns `missing` and the mirror is ordinary
+# pageable memory, which is still correct. An empty mirror — a stage
+# this rank only sends in, or only receives in — is not page-locked:
+# CUDA refuses to register an empty range (found on Symmetry's H200s,
+# M7 step 8), and there is nothing to copy.
+pagelock_mirror!(backend, a::Vector) =
+    isdefined(KernelAbstractions, :pagelock!) && !isempty(a) ?
+    KernelAbstractions.pagelock!(backend, a) : nothing
+
+# Each peer's segment of a buffer, in elements: `counts` are in points,
+# and the segments follow each other in peer order.
+function segment_ranges(counts::Vector{Int}, nvars::Integer)
+    ranges = Vector{UnitRange{Int}}(undef, length(counts))
+    lo = 1
+    for (i, c) in enumerate(counts)
+        ranges[i] = lo:(lo + c * Int(nvars) - 1)
+        lo += c * Int(nvars)
+    end
+    return ranges
+end
+
+# Evaluate every send transfer of the stage into its slot of the send
+# buffer, then synchronize: a device buffer is safe to hand to MPI only
+# once the kernels writing it have finished. `src` is the array the
+# transfers read: a field set's working array in an exchange, the old
+# mesh's in the regrid transfer.
+function pack_stage!(src::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
+                     backend)
+    run_phase!((buf=bufs[1], offsets=remote.sendoffsets), src, remote.packs, nvars,
+               backend)
+    synchronize(backend)
+    return nothing
+end
+pack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
+    pack_stage!(fs.work, remote, bufs, fs.nvars, backend)
+
+# Copy every received slot into its target box in `dest`, applying the
+# parity factor of a mirrored transfer here, where the serial kernel
+# applies it.
+function unpack_stage!(dest::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
+                       factors, backend)
+    run_phase!(dest, (buf=bufs[2], offsets=remote.recvoffsets), remote.unpacks, nvars,
+               backend; factors=factors)
+    return nothing
+end
+unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
+    unpack_stage!(fs.work, remote, bufs, fs.nvars, fs.factors, backend)
+
+# Run one stage on this rank through the forest's communicator, from
+# `src` into `dest`: the same working array in an exchange, since its
+# targets are ghosts and its sources interiors, and the old and the new
+# mesh's arrays in the regrid transfer (step 4 of M7), whose packs read
+# the old blocks and whose local groups and unpacks write the new ones.
+# `sends` collects the send requests of the call so far — `nothing`
+# until the first one — and is returned, to be waited on at the end of
+# the call. The communicator is fetched only where a stage has
+# messages: the field is abstractly typed, and a call that took it as an
+# argument would be dispatched at run time on every stage of a serial
+# fill too.
+#
+# On a device whose buffers the communicator cannot take (`hoststaging`,
+# step 8 of M7) the messages go through host mirrors: the receives are
+# posted into the receive mirror, the packed buffer is copied down after
+# the pack's synchronization and sent from the send mirror, and the
+# received mirror is copied up before the unpack. The data, the layout
+# and the kernels are the device buffers' own, so the bytes on the wire
+# and the ghosts written are the same either way; only where MPI reads
+# and writes them differs. Each copy is ordered where it has to be: the
+# download (`copyto!` into an `Array`) returns once the host holds the
+# data, and the upload is queued before the unpack on the backend's
+# queue, and complete by the final `synchronize`, before the next call
+# can receive into the mirror again (each stage has mirrors of its own,
+# and the send mirror is rewritten only after the call's sends have been
+# waited on). A CPU buffer is an `Array` and goes to the communicator
+# directly, as before.
+function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
+                    stage::ExchangeStage, forest::Forest, backend, sends)
+    remote = stage.remote
+    if remote === nothing
+        run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
+        synchronize(backend)
+        return sends
+    end
+    comm = forest.comm
+    bufs = stagebuffers(remote, nvars, backend, forest)
+    staged = hoststaging(comm, bufs[1])
+    wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
+    recvs = Any[irecv(comm, view(wire[2], r), peer, stage.tag)
+                for (peer, r) in zip(remote.recvpeers,
+                                     segment_ranges(remote.recvcounts, nvars))]
+    pack_stage!(src, remote, bufs, nvars, backend)
+    staged && copyto!(wire[1], bufs[1])
+    sends === nothing && (sends = Any[])
+    for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
+        push!(sends, isend(comm, view(wire[1], r), peer, stage.tag))
+    end
+    run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
+    waitall(comm, recvs)
+    staged && copyto!(bufs[2], wire[2])
+    unpack_stage!(dest, remote, bufs, nvars, factors, backend)
+    synchronize(backend)
+    return sends
+end
+run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
+    run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends)
+
+# A whole staged ghost fill: phase 1, the boundary hook on this rank's
+# own blocks, then phase 2 by target level. This is `fill_ghosts!` once
+# its checks have passed; over a serial forest every stage is a plain
+# phase and no message is sent.
+function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backend)
+    forest = schedule.forest
+    stages = schedule.stages
+    # Phase 1: same-level copies and restrictions. Both read interiors
+    # only, so they cannot race with each other.
+    sends = run_stage!(fs, stages[1], forest, backend, nothing)
+
+    # Physical boundaries, before prolongation rather than after
+    # everything: a block against the domain edge has prolongation
+    # stencils that reach tangentially past that edge into its coarse
+    # source's outer ghosts, so those must already hold data.
+    if boundary !== nothing
+        apply_boundary!(fs, boundary, schedule, backend)
+    end
+
+    # Phase 2: prolongations, coarsest targets first. A prolongation may
+    # read its coarse source's ghosts, which the earlier sweeps filled.
+    for i in 2:length(stages)
+        sends = run_stage!(fs, stages[i], forest, backend, sends)
+    end
+    sends === nothing || waitall(forest.comm, sends)
+    return fs
+end
 
 # The cell-wise boundary form (M6).
 #
@@ -394,7 +698,7 @@ function apply_boundary!(fs::FieldSet{T,D}, hook,
                          schedule::GhostSchedule{T,D}, backend::CPU) where {T,D}
     threaded_foreach(length(schedule.boundaries)) do i
         region = schedule.boundaries[i]
-        hook(fs, Int(region.block), fs.forest.leaves[region.block],
+        hook(fs, Int(region.block), blockkey(fs, region.block),
              region.direction, region.region)
     end
     return nothing
@@ -449,6 +753,15 @@ the price of a uniform `N^D` state layout for every centering; see
     interpolation. The hook may therefore read the block's interior
     (as an extrapolating condition does) but not other blocks' ghosts.
 
+!!! note "Over a distributed forest"
+    The fill is collective (M7): every rank calls it, with its own field
+    set over its own blocks, in the same order relative to the other
+    collective calls. A ghost whose source block lives on another rank is
+    computed there and sent; the hook runs on each rank for its own
+    blocks, in the same place as serially. The ghosts come out bit for
+    bit as a serial fill writes them, whatever the number of ranks. Two
+    fills over one forest must not run concurrently from two tasks.
+
 !!! note "The hook is called concurrently"
     The boundary regions are a parallel loop like every other phase
     (M5): the hook runs on several threads at once, once per region.
@@ -463,9 +776,9 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     isstale(schedule) && throw(ArgumentError(
         "the forest changed since this schedule was built (generation " *
         "$(schedule.generation) -> $(generation(schedule.forest))); rebuild it"))
-    nblocks(fs) == nleaves(schedule.forest) || throw(ArgumentError(
+    nblocks(fs) == length(blockrange(schedule.forest)) || throw(ArgumentError(
         "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
-        "$(nleaves(schedule.forest)) leaves; rebuild both"))
+        "$(length(blockrange(schedule.forest))) on this rank; rebuild both"))
     fs.G == schedule.G || throw(ArgumentError(
         "the field set has ghost width G=$(fs.G) but this schedule was built for " *
         "G=$(schedule.G); every target range and stencil in it is wrong for this " *
@@ -485,26 +798,7 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
         "`GhostSchedule(forest, operators; backend = $(nameof(typeof(backend)))())`, " *
         "or let both default to the CPU."))
 
-    # Phase 1: same-level copies and restrictions. Both read interiors
-    # only, so they cannot race with each other.
-    run_phase!(fs, schedule.phase1, backend)
-    synchronize(backend)
-
-    # Physical boundaries, before prolongation rather than after
-    # everything: a block against the domain edge has prolongation
-    # stencils that reach tangentially past that edge into its coarse
-    # source's outer ghosts, so those must already hold data.
-    if boundary !== nothing
-        apply_boundary!(fs, boundary, schedule, backend)
-    end
-
-    # Phase 2: prolongations, coarsest targets first. A prolongation may
-    # read its coarse source's ghosts, which the earlier sweeps filled.
-    for groups in schedule.phase2
-        run_phase!(fs, groups, backend)
-        synchronize(backend)
-    end
-    return fs
+    return exchange_ghosts!(fs, schedule, boundary, backend)
 end
 
 # The element types have to agree exactly — the transfer accumulates in

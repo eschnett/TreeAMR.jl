@@ -202,6 +202,188 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
         batches, origins, spacings)
 end
 
+# What one ghost region of one block needs, as found by the neighbor
+# search. Transfers sharing a `GroupKey` share their 1D stencils and are
+# batched into one `TransferGroup`, hence one kernel launch.
+#
+# For prolongations the key also carries the target's *level*. The
+# stencils do not depend on it — but the phase-2 sweep does: a group is
+# scheduled at the level of its targets, so merging two levels into one
+# group would file them both under one of the two and silently defeat
+# the coarsest-target-first ordering that a prolongation reading its
+# source's own prolongated ghosts relies on. (Found in M5, while
+# threading this loop; see `CODE.md`.) Phase 1 is order independent by
+# construction, so copies and restrictions carry `level = 0` and stay
+# batched across levels — one launch instead of one per level.
+#
+# `mirror` is the mirror state per dimension of a transfer across a
+# reflecting face (M10): 0 for an ordinary dimension, 1 for rows
+# mirrored across the wall, 2 for the derived upper wall row of a
+# vertex-like dimension. It changes the stencils, and — through the
+# parity factor — what the kernel does with their result, so it is part
+# of the key. Everything that is not a mirror transfer has all zeros.
+struct GroupKey{D}
+    kind::Symbol
+    direction::NTuple{D,Int}
+    offset::NTuple{D,Int}
+    level::Int
+    mirror::NTuple{D,Int8}
+end
+
+GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
+            level::Int) where {D} =
+    GroupKey{D}(kind, direction, offset, level, ntuple(_ -> Int8(0), D))
+
+# A total order over group keys (M7). Within a single rank the order in
+# which groups run does not matter, and phase 1's come out of a `Dict`.
+# Across ranks it does: both ends of a message lay their buffers out in
+# the same order without exchanging a descriptor, so that order has to
+# be a function of the keys alone. The kinds are ranked explicitly
+# rather than compared as strings, which keeps a comparison free of
+# allocation when a layout sorts one entry per remote transfer.
+kindrank(kind::Symbol) =
+    kind === :copy ? 1 : kind === :restrict ? 2 : kind === :prolong ? 3 :
+    throw(ArgumentError("no transfer kind $kind"))
+keyorder(k::GroupKey) = (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror)
+Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
+
+# --- Distributed stages (M7) ----------------------------------------------
+#
+# Over a forest distributed between ranks a transfer whose target and
+# source blocks live on different ranks becomes a message, and the
+# *sender computes* it: the source's rank evaluates the transfer into a
+# flat buffer, and the target's rank copies it into place ("Distributed
+# meshes" in CODE.md). Every ordering point of the serial exchange — the
+# end of phase 1, each phase-2 target level, each interface face
+# dimension — becomes a *stage*, and the types below are one stage as
+# one rank holds it.
+
+"""
+    LayoutEntry{D}
+
+One transfer of a stage's message buffer, as both of its ends describe
+it: the peer rank at the other end, the transfer's group key (the
+kind, direction, child offset, target level and mirror state that fix
+its stencils), its target and source as *global* leaf indices, and where
+it sits in the buffer.
+
+`offset` is the transfer's first point, counted from the start of the
+stage buffer, and `npoints` the size of its target box; both are in
+points, so the element offset is `offset * nvars` and the transfer
+occupies `npoints * nvars` elements, its target box times the
+variables, in the transfer kernel's index order. A schedule is built
+for a layout and not for a variable count (one schedule serves every
+field set of the layout), which is why the factor is applied when the
+buffer is addressed rather than stored here.
+
+Both ends derive the entries from the replicated forest — the sender
+from its send transfers, the receiver from its receive transfers, which
+are the same transfers — in one order: by peer, then by `GroupKey`,
+then by global target, then by global source. That is why no layout
+descriptor ever travels with the data.
+"""
+struct LayoutEntry{D}
+    peer::Int
+    key::GroupKey{D}
+    target::Int
+    source::Int
+    offset::Int
+    npoints::Int
+end
+
+"""
+    RemoteStage{D,GRP,VB,BUF,HB}
+
+The messages of one stage on one rank: what it packs and sends, and what
+it receives and unpacks, with the layouts of both buffers.
+
+- `sendpeers` / `recvpeers` are the ranks this one sends to and receives
+  from in this stage, ascending, and `sendcounts` / `recvcounts` the
+  points of each peer's segment; segments follow each other in peer
+  order.
+- `sendlayout` / `recvlayout` hold one [`LayoutEntry`](@ref
+  TreeAMR.LayoutEntry) per buffer *slot*, in buffer order; `sendoffsets`
+  / `recvoffsets` are the same offsets, on the backend, which is what a
+  kernel reads.
+- `packs` are the send transfers as groups whose target is a slot of the
+  send buffer: the stencils of the serial group with every target range
+  starting at 1, `targetblocks` the slots and `sourceblocks` the local
+  sources, sorted by source block so that the owner of the source runs
+  them. They compute the **unscaled** sum, even for a mirrored transfer.
+- `unpacks` are width-1, weight-1 transfers from a slot of the receive
+  buffer into the local target's box, `sourceblocks` the slots, sorted
+  by target block; a mirrored transfer's unpack carries its parity
+  column, so the factor is applied here, where the serial kernel
+  applies it. (Applied when packing, `0 + 1·x` in the unpack would turn
+  the `−0` of a mirrored zero into `+0`; see "Pack and unpack are
+  transfers" in CODE.md.)
+- `buffers` holds the send and receive buffers per variable count, on
+  the backend, taken on first use and kept with the schedule.
+- `mirrors` holds their host mirrors, of type `HB` (a `Vector` of the
+  element type), per variable count: taken, page-locked for the
+  backend, the first time the stage runs over a communicator that cannot
+  take the buffers themselves ([`hoststaging`](@ref TreeAMR.hoststaging)).
+  That is a device without a device-aware MPI; a CPU buffer is host
+  memory already, and MPI is handed it directly.
+
+Both are leased from the forest's buffer pool, which keeps them once the
+stage is done with them — the regrid's stage at the end of its call, a
+schedule's once the forest has moved on — so that the stages a regrid
+builds reuse earlier stages' memory rather than allocating, and
+page-locking, their own; see "MPI+GPU" under "Distributed meshes" in
+`CODE.md`.
+"""
+struct RemoteStage{D,GRP<:TransferGroup,VB<:AbstractVector{Int32},BUF<:AbstractVector,
+                   HB<:Vector}
+    sendpeers::Vector{Int}
+    sendcounts::Vector{Int}
+    recvpeers::Vector{Int}
+    recvcounts::Vector{Int}
+    sendlayout::Vector{LayoutEntry{D}}
+    recvlayout::Vector{LayoutEntry{D}}
+    packs::Vector{GRP}
+    unpacks::Vector{GRP}
+    sendoffsets::VB
+    recvoffsets::VB
+    buffers::Dict{Int,Tuple{BUF,BUF}}
+    mirrors::Dict{Int,Tuple{HB,HB}}
+end
+
+"""
+    ExchangeStage{GRP,RS}
+
+One stage of an exchange as this rank runs it: the `tag` that names it
+(and matches its messages), the `locals` — the groups with target and
+source on this rank, exactly the serial groups of that phase when there
+is one rank — and the `remote` part, a [`RemoteStage`](@ref
+TreeAMR.RemoteStage), or `nothing` when the stage sends and receives
+nothing here, which is every stage of a serial schedule.
+"""
+struct ExchangeStage{GRP<:TransferGroup,RS<:RemoteStage}
+    tag::Int
+    locals::Vector{GRP}
+    remote::Union{Nothing,RS}
+end
+
+hasmessages(s::ExchangeStage) = s.remote !== nothing
+
+# The concrete stage type on a backend, as `grouptype` is for groups.
+function stagetype(backend::Backend, ::Type{T}, ::Val{D}) where {T,D}
+    GRP = grouptype(backend, T, Val(D))
+    VB = typeof(todevice(backend, Int32[0]))
+    BUF = typeof(allocate(backend, T, 0))
+    return ExchangeStage{GRP,RemoteStage{D,GRP,VB,BUF,Vector{T}}}
+end
+
+# The message tags, one per stage, so that a stage's messages can only
+# match the same stage on the peer (CODE.md, "Deadlock freedom and
+# message matching"). Ascending in the order the stages run, which the
+# in-process tests rely on to run every rank's stages in lockstep.
+const PHASE1_TAG = 1
+prolongation_tag(level::Integer) = 2 + Int(level)       # 2 … 2 + MAX_LEVEL
+interface_tag(d::Integer) = 40 + Int(d)                  # one per face dimension
+const REGRID_TAG = 50                                     # the regrid transfer
+
 """
     GhostSchedule{T,D,R}
 
@@ -224,7 +406,17 @@ The phasing follows `CODE.md`:
   hook between the two phases;
   `boundaryplan` is the same information batched by region shape and
   resident on the backend, which is what the cell-wise hook form
-  ([`CellBoundary`](@ref)) is launched over.
+  ([`CellBoundary`](@ref)) is launched over;
+- `stages` is the order [`fill_ghosts!`](@ref) runs them in: phase 1,
+  then one stage per phase-2 target level, each an
+  [`ExchangeStage`](@ref TreeAMR.ExchangeStage). Serially a stage's
+  local groups are exactly `phase1` or one entry of `phase2`, and it has
+  no messages. Over a forest distributed between ranks (M7), `phase1`,
+  `phase2` and `levels` hold the transfers *local* to this rank, in
+  local block indices, and a stage also carries the transfers this rank
+  computes for another one's ghosts and those it receives — together
+  exactly the serial schedule's transfers, split by where their two
+  blocks live; see "Distributed meshes" in `CODE.md`.
 
 Periodic boundaries appear nowhere special here: the tree wraps around,
 so they are ordinary copies, restrictions, and prolongations. Reflecting
@@ -258,8 +450,19 @@ are built on the host in exact rational arithmetic and uploaded once,
 here, rather than at every ghost fill. That is the same argument that
 put the exchange in a cached schedule in the first place, applied one
 level down.
+
+Over a distributed forest (M7) the build is collective. The ranks
+gather a digest of their forests — generation, leaf count, every leaf
+and the brick — and of the layout and operators asked for, and a forest
+that differs between ranks, or a layout, is refused on every rank
+together, saying which ranks differ: every forest mutation must be the
+same call on every rank, and over forests that differ the exchange would
+deliver the wrong data without noticing. An argument that one rank's
+checks refuse is refused on every rank too, so that no rank goes on to
+wait in an exchange the others never enter.
 """
-struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{D}}
+struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{D},
+                     ST<:ExchangeStage{GRP}}
     forest::Forest{D,R}
     generation::Int                              # forest generation it was built for
     G::NTuple{D,Int}                             # ghost width it was built for
@@ -271,6 +474,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     levels::Vector{Int}                          # target level of each phase2 entry
     boundaries::Vector{BoundaryRegion{D}}
     boundaryplan::BP
+    stages::Vector{ST}                           # phase 1, then phase 2 by level
 end
 
 """
@@ -587,38 +791,6 @@ end
 # A block's offset within its parent, per dimension.
 childoffset(k::MortonKey{D}) where {D} = ntuple(d -> Int(k.coords[d]) & 1, D)
 
-# What one ghost region of one block needs, as found by the neighbor
-# search. Transfers sharing a `GroupKey` share their 1D stencils and are
-# batched into one `TransferGroup`, hence one kernel launch.
-#
-# For prolongations the key also carries the target's *level*. The
-# stencils do not depend on it — but the phase-2 sweep does: a group is
-# scheduled at the level of its targets, so merging two levels into one
-# group would file them both under one of the two and silently defeat
-# the coarsest-target-first ordering that a prolongation reading its
-# source's own prolongated ghosts relies on. (Found in M5, while
-# threading this loop; see `CODE.md`.) Phase 1 is order independent by
-# construction, so copies and restrictions carry `level = 0` and stay
-# batched across levels — one launch instead of one per level.
-#
-# `mirror` is the mirror state per dimension of a transfer across a
-# reflecting face (M10): 0 for an ordinary dimension, 1 for rows
-# mirrored across the wall, 2 for the derived upper wall row of a
-# vertex-like dimension. It changes the stencils, and — through the
-# parity factor — what the kernel does with their result, so it is part
-# of the key. Everything that is not a mirror transfer has all zeros.
-struct GroupKey{D}
-    kind::Symbol
-    direction::NTuple{D,Int}
-    offset::NTuple{D,Int}
-    level::Int
-    mirror::NTuple{D,Int8}
-end
-
-GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
-            level::Int) where {D} =
-    GroupKey{D}(kind, direction, offset, level, ntuple(_ -> Int8(0), D))
-
 # The per-key transfer lists a schedule is assembled from: for each
 # group key, the target blocks and the source blocks of its transfers,
 # in the order the blocks were walked.
@@ -750,6 +922,219 @@ function merge_pairs!(into::TransferPairs{D}, from::TransferPairs{D}) where {D}
     return into
 end
 
+# Split the transfers `pairs`, collected for this rank's own targets in
+# global leaf indices, by where their source lives (M7). Those whose
+# source is on this rank as well stay in `pairs`, shifted to local block
+# indices: the *local* class, today's groups. Those whose source is on
+# another rank are the *recv* class, and are returned, still in global
+# indices, for the stage builder. Serially `range` is every leaf, so
+# nothing is returned and `pairs` is untouched.
+function split_received!(pairs::TransferPairs{D}, range::UnitRange{Int},
+                         n::Int) where {D}
+    received = TransferPairs{D}()
+    range == 1:n && return received
+    offset = Int32(first(range) - 1)
+    for key in collect(keys(pairs))
+        targets, sources = pairs[key]
+        here = [i for i in eachindex(targets) if sources[i] in range]
+        there = [i for i in eachindex(targets) if !(sources[i] in range)]
+        isempty(there) || (received[key] = (targets[there], sources[there]))
+        if isempty(here)
+            delete!(pairs, key)
+        else
+            pairs[key] = (targets[here] .- offset, sources[here] .- offset)
+        end
+    end
+    return received
+end
+
+# The *send* class (M7): the transfers this rank computes for another
+# rank's targets. `sources!(pairs, j)` is the neighbor search a builder
+# runs for its own targets — `block_sources!`, `interface_sources!` —
+# and it is run here for every *candidate remote target* `j`, a leaf of
+# another rank that touches one of this rank's (`remote_neighbors`),
+# keeping the transfers whose source is on this rank. Adjacency is
+# mutually discoverable, so the candidates miss no target, and the
+# search is the target owner's own, so the sender finds exactly the
+# transfers the receiver does. Threaded and merged in candidate order
+# like the local search, hence a function of the tree alone. Serially
+# there are no candidates and nothing is searched.
+function sent_transfers(sources!, forest::Forest{D}, range::UnitRange{Int}) where {D}
+    sent = TransferPairs{D}()
+    candidates = remote_neighbors(forest, range)
+    isempty(candidates) && return sent
+    chunks = threadchunks(length(candidates))
+    perpairs = [TransferPairs{D}() for _ in chunks]
+    threaded_chunks(length(candidates)) do c, part
+        for i in part
+            sources!(perpairs[c], candidates[i])
+        end
+    end
+    for c in eachindex(chunks)
+        merge_pairs!(sent, perpairs[c])
+    end
+    for key in collect(keys(sent))
+        targets, sources = sent[key]
+        keep = [i for i in eachindex(targets) if sources[i] in range]
+        if isempty(keep)
+            delete!(sent, key)
+        else
+            sent[key] = (targets[keep], sources[keep])
+        end
+    end
+    return sent
+end
+
+# The transfers of `pairs` filed by the stage they belong to, `stageof(key)`.
+function bystage(stageof, pairs::TransferPairs{D}) where {D}
+    out = Dict{Int,TransferPairs{D}}()
+    for (key, lists) in pairs
+        get!(TransferPairs{D}, out, stageof(key))[key] = lists
+    end
+    return out
+end
+
+# One buffer's layout: every transfer of `pairs` as a `LayoutEntry`, in
+# the order both ends derive — peer, `GroupKey`, global target, global
+# source — with the offsets accumulated in that order. `peerof(t, s)` is
+# the rank at the other end of the transfer from target `t` to source
+# `s`, and `npoints(key)` the size of the group's target box.
+function stage_layout(pairs::TransferPairs{D}, peerof, npoints) where {D}
+    entries = Tuple{Int,GroupKey{D},Int,Int}[]
+    for (key, (targets, sources)) in pairs, i in eachindex(targets)
+        t, s = Int(targets[i]), Int(sources[i])
+        push!(entries, (peerof(t, s), key, t, s))
+    end
+    sort!(entries)
+    layout = Vector{LayoutEntry{D}}(undef, length(entries))
+    offset = 0
+    for (i, (peer, key, t, s)) in enumerate(entries)
+        n = npoints(key)
+        layout[i] = LayoutEntry{D}(peer, key, t, s, offset, n)
+        offset += n
+    end
+    offset <= typemax(Int32) || throw(ArgumentError(
+        "a stage buffer of $offset points does not fit the Int32 offsets the " *
+        "transfer kernel reads; this rank exchanges far more ghost data than a " *
+        "block decomposition should"))
+    return layout
+end
+
+# The peers of a layout, ascending, and the points of each one's segment.
+function layout_segments(layout::Vector{<:LayoutEntry})
+    peers, counts = Int[], Int[]
+    for e in layout
+        if isempty(peers) || last(peers) != e.peer
+            push!(peers, e.peer)
+            push!(counts, 0)
+        end
+        counts[end] += e.npoints
+    end
+    return peers, counts
+end
+
+# The slots of a layout, by group key.
+function slots_by_key(layout::Vector{LayoutEntry{D}}) where {D}
+    out = Dict{GroupKey{D},Vector{Int}}()
+    for (slot, e) in enumerate(layout)
+        push!(get!(Vector{Int}, out, e.key), slot)
+    end
+    return out
+end
+
+# A stage's messages on this rank (M7), from the transfers it sends and
+# those it receives, both in global leaf indices.
+#
+# `stencils(key)` builds a group's host stencils and `factorcol(key)`
+# its parity column, exactly as the builder does for its local groups,
+# so a pack evaluates the serial transfer. `targetowner(t)` and
+# `sourceowner(s)` are the ranks of a global target and source, and
+# `targetrange` / `sourcerange` this rank's own leaves in the partitions
+# the targets and the sources are local to. For the ghost and interface
+# exchanges both are `blockrange(forest)`; the regrid transfer (`regrid_stage`)
+# has its targets in the new partition and its sources in the old.
+# Returns `nothing` when the stage has no messages here.
+function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
+                      sent::TransferPairs{D}, received::TransferPairs{D}, stencils,
+                      factorcol; targetowner, sourceowner, targetrange::UnitRange{Int},
+                      sourcerange::UnitRange{Int}) where {RS<:RemoteStage,T,D}
+    isempty(sent) && isempty(received) && return nothing
+    built = Dict{GroupKey{D},Any}()
+    host(key) = get!(() -> stencils(key), built, key)
+    npoints(key) = prod(ntarget, host(key))
+    sendlayout = stage_layout(sent, (t, s) -> targetowner(t), npoints)
+    recvlayout = stage_layout(received, (t, s) -> sourceowner(s), npoints)
+    sendpeers, sendcounts = layout_segments(sendlayout)
+    recvpeers, recvcounts = layout_segments(recvlayout)
+
+    GRP = eltype(fieldtype(RS, :packs))
+    # A pack is the serial transfer with its target box moved to the
+    # start of a buffer slot: the same source windows, the same weights,
+    # summed in the same order, and no parity factor. Sorted by source
+    # block, so that on the CPU the owner of the source runs it.
+    packs = GRP[]
+    sendslots = slots_by_key(sendlayout)
+    for key in sort!(collect(keys(sendslots)))
+        order = sort!([(sendlayout[slot].source - first(sourcerange) + 1, slot)
+                       for slot in sendslots[key]])
+        st = map(s -> Stencil1D{T}(1, s.srcstart, s.weights), host(key))
+        push!(packs, todevice(backend, TransferGroup{T,D}(
+            key.kind, st, Int32[o[2] for o in order], Int32[o[1] for o in order], 0)))
+    end
+    # An unpack is a width-1, weight-1 transfer from a slot into the
+    # target box the serial group writes, carrying its parity column.
+    # Sorted by target block, so that the owner of the target runs it.
+    unpacks = GRP[]
+    recvslots = slots_by_key(recvlayout)
+    for key in sort!(collect(keys(recvslots)))
+        order = sort!([(recvlayout[slot].target - first(targetrange) + 1, slot)
+                       for slot in recvslots[key]])
+        st = map(host(key)) do s
+            n = ntarget(s)
+            Stencil1D{T}(s.targetfirst, Int32.(1:n), ones(T, 1, n))
+        end
+        push!(unpacks, todevice(backend, TransferGroup{T,D}(
+            :copy, st, Int32[o[1] for o in order], Int32[o[2] for o in order],
+            factorcol(key))))
+    end
+    sendoffsets = todevice(backend, Int32[e.offset for e in sendlayout])
+    recvoffsets = todevice(backend, Int32[e.offset for e in recvlayout])
+    return RS(sendpeers, sendcounts, recvpeers, recvcounts, sendlayout, recvlayout,
+              packs, unpacks, sendoffsets, recvoffsets,
+              fieldtype(RS, :buffers)(), fieldtype(RS, :mirrors)())
+end
+
+remotetype(::Type{ExchangeStage{GRP,RS}}) where {GRP,RS} = RS
+
+# The stages of an exchange, in tag order: one per tag that this rank
+# has local groups or messages in, `localsof(tag)` giving the local
+# groups (possibly none) and `sentby` / `receivedby` the remote transfers
+# filed by stage. `required` tags are present even when empty here, as
+# phase 1 is, after which the boundary hook runs.
+function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, localsof,
+                      sentby::Dict{Int,TransferPairs{D}},
+                      receivedby::Dict{Int,TransferPairs{D}}, stencils, factorcol,
+                      forest::Forest{D}; required=Int[]) where {ST,T,D}
+    owned = blockrange(forest)
+    owner(i) = leafowner(forest, i)
+    tags = sort!(unique!([required; localtags; collect(keys(sentby));
+                          collect(keys(receivedby))]))
+    nopairs = TransferPairs{D}()
+    return ST[ST(tag, localsof(tag),
+                 remote_stage(remotetype(ST), T, backend, get(sentby, tag, nopairs),
+                              get(receivedby, tag, nopairs), stencils, factorcol;
+                              targetowner=owner, sourceowner=owner, targetrange=owned,
+                              sourcerange=owned))
+              for tag in tags]
+end
+
+function localize_boundaries(boundaries::Vector{BoundaryRegion{D}},
+                             range::UnitRange{Int}) where {D}
+    offset = Int32(first(range) - 1)
+    iszero(offset) && return boundaries
+    return [BoundaryRegion{D}(r.block - offset, r.direction, r.region) for r in boundaries]
+end
+
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, T=T,
                   backend=get_backend(fs.work))
@@ -759,14 +1144,28 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        centering=cellcentered(D),
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
-    ghosts = ghostwidths(G, Val(D))
-    centers = centerings(centering, Val(D))
-    stags = staggers(centers)
-    storedsize(N, ghosts, stags)                 # the N >= 2G[d] + 2c[d] invariant
-    check_operators(N, ghosts, stags, operators)
-    check_floattype(T, backend)
+    # The build is collective over a distributed forest (M7): the ranks
+    # agree that their forests and layouts are the same, and a refusal
+    # on any of them is raised on all of them.
+    checked = collective_checks(forest, "GhostSchedule") do
+        gs = ghostwidths(G, Val(D))
+        cs = centerings(centering, Val(D))
+        ss = staggers(cs)
+        storedsize(N, gs, ss)                    # the N >= 2G[d] + 2c[d] invariant
+        check_operators(N, gs, ss, operators)
+        check_floattype(T, backend)
+        layout = layouthash(gs, cs, Int(operators.family), operators.prolongation,
+                            operators.restriction, T, nameof(typeof(backend)))
+        return (gs, cs, ss), layout
+    end
+    ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int} = checked
     dirs = alldirections(Val(D))
-    nb = nleaves(forest)
+    # The targets are this rank's blocks (M7), walked in global leaf
+    # indices, since that is what the tree answers in; `split_received!`
+    # turns the local transfers into local block indices below.
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    nb = length(owned)
 
     # Neighbor finding, threaded over blocks: it reads nothing but the
     # tree, and each task collects into buffers of its own. Those are
@@ -777,8 +1176,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags, b,
-                           dirs)
+            block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
+                           offset + b, dirs)
         end
     end
 
@@ -791,6 +1190,15 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     for c in eachindex(chunks)
         merge_pairs!(pairs, perpairs[c])
         append!(boundaries, perboundaries[c])
+    end
+    # Over a distributed forest (M7) the transfers split three ways: the
+    # local ones stay in `pairs`, in local block indices; those with a
+    # remote source are received; and those this rank computes for a
+    # remote target are sent, found by the target owner's own search.
+    received = split_received!(pairs, owned, nleaves(forest))
+    boundaries = localize_boundaries(boundaries, owned)
+    sent = sent_transfers(forest, owned) do into, j
+        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs)
     end
 
     # One dimension of a group's stencils. Along a masked dimension of a
@@ -807,7 +1215,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         state == 0 && return s
         return mirror_rows(s, N, ghosts[d], stags[d], δd)
     end
-    build(key) = ntuple(d -> build1(key, d), D)
+    # Memoized per key: over a distributed forest the stage builder asks
+    # again for the keys the local groups were built from.
+    built = Dict{GroupKey{D},Any}()
+    build(key) = get!(() -> ntuple(d -> build1(key, d), D), built, key)
     factorcol(key) = any(!iszero, key.mirror) ? mirrorcolumn(key.mirror) : 0
 
     GRP = grouptype(backend, T, Val(D))
@@ -826,9 +1237,20 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
     bplan = BoundaryPlan(backend, T, forest, boundaries)
-    return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan)}(
+
+    # Phase 1 is one stage and phase 2 one per target level. Serially
+    # each stage is one of the phases above and sends nothing.
+    stageof(key) = key.kind === :prolong ? prolongation_tag(key.level) : PHASE1_TAG
+    leveltags = prolongation_tag.(levels)
+    localsof(tag) = tag == PHASE1_TAG ? phase1 :
+                    (i = findfirst(==(tag), leveltags); i === nothing ? GRP[] : phase2[i])
+    ST = stagetype(backend, T, Val(D))
+    stages = build_stages(ST, T, backend, leveltags, localsof, bystage(stageof, sent),
+                          bystage(stageof, received), build, factorcol, forest;
+                          required=[PHASE1_TAG])
+    return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, operators, backend, phase1,
-        phase2, levels, boundaries, bplan)
+        phase2, levels, boundaries, bplan, stages)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
@@ -843,5 +1265,16 @@ function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
     print(io, "GhostSchedule{", T, ",", D, "}(", ncopy, " copies, ", nrest,
           " restrictions, ", nprol, " prolongations over ", length(s.phase2),
           " level(s), ", nmirror == 0 ? "" : "$nmirror mirrored transfers, ",
-          length(s.boundaries), " boundary regions)")
+          length(s.boundaries), " boundary regions", messages_summary(s.stages), ")")
+end
+
+# What a distributed schedule (M7) sends and receives, said only when it
+# does, so that a serial schedule prints as it always has.
+function messages_summary(stages)
+    nsent = sum(st -> st.remote === nothing ? 0 : length(st.remote.sendlayout), stages;
+                init=0)
+    nrecv = sum(st -> st.remote === nothing ? 0 : length(st.remote.recvlayout), stages;
+                init=0)
+    nsent + nrecv == 0 && return ""
+    return "; $nsent transfers sent and $nrecv received"
 end

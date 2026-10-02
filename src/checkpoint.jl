@@ -14,7 +14,7 @@
 
 """
     save_checkpoint(path, forest; fieldsets, application, data = (;), filters = (),
-                    sync = true)
+                    sync = true, io = :node)
     save_checkpoint(f, path, forest; ...)        # do-block: f(app::HDF5.Group)
 
 Write a checkpoint of `forest`, of the field sets over it that the
@@ -66,6 +66,14 @@ run began it with. Put `t`, the chunk index and any other run state in
   that a power loss can take with it is not one; `sync = false` is for
   files that need not survive the machine, such as a test's or a
   scratch file system's.
+- `io` — over a distributed forest, how many processes write files (see
+  "Over a distributed forest" below): `:node`, the default, for one per
+  shared-memory node; `:all` for every rank; or an integer, at most the
+  number of ranks (a larger one counts as that). Serially there is one
+  whatever it says. `:node` keeps the number of files at the number of
+  nodes; `:all` was the faster setting on a cluster's BeeGFS, most of
+  all with a filter, since each I/O process compresses its group's
+  blocks on its own (`CODE.md`, M7 step 6b).
 
 The do-block form calls `f` with the application's group open for
 writing, after everything else is written, for datasets of the
@@ -81,7 +89,10 @@ field set its element type, `nvars`, `G`, centering and parity, and its
 shared boundary planes of a vertex-like dimension and the derived wall
 planes, all of which [`fill_ghosts!`](@ref) rebuilds from the owned
 points with the application's own operators and hook; the forest's
-[`generation`](@ref); schedules, operators and hooks.
+[`generation`](@ref); schedules, operators and hooks. Beside the leaf
+list and each field set go CRC-32C checksums, one over the leaf list and
+one per block, which `load_checkpoint` verifies (added in M7, after a
+parallel file came back damaged; a file without them loads unchecked).
 
 An element type is stored as itself when it is an HDF5 native — `Bool`,
 the signed and unsigned integers, `Float16`, `Float32`, `Float64`, and
@@ -93,9 +104,11 @@ Anything else is refused, before the file is created.
 # Atomicity
 
 The file is written to `path * ".partial"` and renamed over `path` only
-once it is complete. On any error, one thrown by the do-block included,
-the partial file is removed and the error rethrown, so a failed or
-interrupted write never destroys the previous checkpoint at `path`.
+once it is complete, and everything else a checkpoint consists of is
+written before that rename. On any error, one thrown by the do-block
+included, what was written is removed and the error rethrown, so a
+failed or interrupted write never destroys the previous checkpoint at
+`path`.
 
 Closing a file only hands its data to the operating system, which
 survives the process but not a power loss or a kernel crash — and after
@@ -107,8 +120,44 @@ rename (`fsync`; on macOS `fcntl(F_FULLFSYNC)`, since `fsync` there does
 not wait for the drive's own cache), and the directory after it, so
 that the rename is durable too. On Windows `sync` does nothing.
 
-Returns `path`. See `CODE.md`, "Checkpoint and restart", for the file
-layout and the reasons behind it.
+# Over a distributed forest (M7)
+
+Over a forest distributed over MPI ranks, `save_checkpoint` is
+collective: every rank calls it with the same `path`, the same field
+sets — each rank's own blocks of them — and the same keywords, `data`
+included. No file is written by more than one process, so nothing
+depends on parallel I/O or on the file system's coherence between nodes
+(a shared file written from several nodes lost data on a cluster's
+BeeGFS; see "Checkpoints without parallel I/O" in `CODE.md`). The ranks
+form `k` groups of consecutive ranks, `k` as `io` says, and the first
+rank of each group, its I/O process, receives the group's blocks from
+the others and writes them into a *part file* of its own beside the
+index, `path.<saveid>.<j>.h5`; rank 0 then writes the *index* at `path`,
+which names every part, and its rename over the previous index is the
+moment the new checkpoint replaces the old one. After it the previous
+checkpoint's parts, and any part that no checkpoint at `path` names, are
+removed. With one I/O process — serially, `io = 1`, or one node — the
+part lives inside the index, which is then the whole checkpoint. To
+keep an earlier checkpoint, save to another path, or move the index and
+its parts to another directory together: a copy of the index under
+another name keeps the names of its parts, which the next save to the
+original path removes.
+
+The files load on any rank count, and serially. Everything that can be
+refused is checked on every rank before anything is created, and the
+verdict is agreed, so a refusal — an argument or a value of `data` that
+differs between ranks included — is raised on every rank together; so
+is a failure of any I/O process, after which nothing is committed. The
+do-block runs on every rank: on rank 0 with the index's application
+group, elsewhere with a copy in memory that is discarded. A
+[`write_plain`](@ref) in it agrees its value across the ranks, and a
+dataset the block writes through HDF5 itself is kept from rank 0 alone,
+so it must be the same on every rank. With `sync = true` every part is
+flushed to stable storage by its writer before the index is written,
+and the index before its rename.
+
+Returns `path`. See `CODE.md`, "Checkpoint and restart" and "Parallel
+checkpoints", for the file layout and the reasons behind it.
 
 ```julia
 using HDF5
@@ -119,7 +168,8 @@ save_checkpoint("run.h5", forest; fieldsets = ("U" => (U, u),),
 function save_checkpoint end
 
 """
-    load_checkpoint(path; backend = CPU(), types = (), fieldsets = nothing)
+    load_checkpoint(path; backend = CPU(), types = (), fieldsets = nothing,
+                    comm = nothing)
     load_checkpoint(f, path; ...)                # do-block: f(app::HDF5.Group)
 
 Read a checkpoint written by [`save_checkpoint`](@ref) into fresh
@@ -142,9 +192,11 @@ with `using HDF5`. Returns a NamedTuple with
 - `data` — the application's plain data, as [`read_plain`](@ref)
   returns it;
 - `provenance` — `(; treeamr_version, julia_version, created, hostname,
-  nthreads, project, manifest)`: who wrote the file, when (UTC), on how
-  many threads, and the texts of the writer's `Project.toml` and
-  `Manifest.toml` (see [`checkpoint_environment`](@ref));
+  nthreads, nranks, nparts, project, manifest)`: who wrote the file,
+  when (UTC), on how many threads (of rank 0), ranks and part files, and
+  the texts of the writer's `Project.toml` and `Manifest.toml` (see
+  [`checkpoint_environment`](@ref)). A file from before M7 has no
+  `nranks` and no `nparts`, which read as 1;
 - `result` — what the do-block returned, or `nothing`. The do-block is
   called with the application's group open, for whatever it wrote there
   beside `data`.
@@ -161,15 +213,30 @@ with `using HDF5`. Returns a NamedTuple with
   entry.
 - `fieldsets` — `nothing` for every field set in the file, or a
   collection of names for a subset.
+- `comm` — the communicator to distribute the loaded forest over, as for
+  [`Forest`](@ref): `nothing` for a serial forest, or an `MPI.Comm` such
+  as `MPI.COMM_WORLD`. The call is then collective, with the same
+  arguments on every rank. Only rank 0 opens the index; every rank gets
+  a copy of it in memory, without the field data, and builds the
+  replicated forest over `comm`. Each part file is opened by one rank,
+  which sends its blocks to the ranks that own them now. A checkpoint
+  written on any number of ranks loads on any other, or serially, since
+  the partition it was written with matters only to which part holds
+  which blocks, which the index records.
 
 # Refusals
 
 A file this version cannot interpret is refused with an `ArgumentError`
 that says why: one that is not a TreeAMR checkpoint at all, a
-`format_version` other than the one this version reads (1), a feature
-this version does not know (every listed feature must be understood), an
-element type missing from `types` or one that does not match the file's
-layout, and a field set name the file does not hold. Compatibility is
+`format_version` other than the ones this version reads (1 and 2), a
+feature this version does not know (every listed feature must be
+understood), an element type missing from `types` or one that does not
+match the file's layout, and a field set name the file does not hold. A
+leaf list or a block whose bytes do not match the checksum stored with
+them is refused too: the file was damaged while or after it was written.
+So is a part file that is missing, truncated, or from another save than
+the index's. Over several ranks each part's reader checks it, and the
+verdict is agreed, so the refusal comes on every rank. Compatibility is
 decided by the format version and the features, never by package
 versions. Each refusal of what a checkpoint holds names the TreeAMR
 version that wrote it and points to [`checkpoint_environment`](@ref),
@@ -227,6 +294,17 @@ layout can only read the old *file*. The same holds for JLD2 and
 `Serialization`, which is why neither is used. An item name must be
 nonempty, cannot be `"."`, and cannot contain `/`.
 
+A string, or a `Symbol`, that holds a NUL character is refused too:
+HDF5 keeps a string as a C string, which ends at its first NUL.
+Everything is checked before anything is written.
+
+In the application's group of a checkpoint being saved over a
+distributed forest (the do-block of [`save_checkpoint`](@ref)),
+`write_plain` is collective: every rank passes the same `name` and the
+same `value`, which is checked by a digest of what would be written,
+gathered from every rank before anything is, and refused on every rank
+if it differs. Rank 0's is the value the index keeps.
+
 See `CODE.md`, "Checkpoint and restart".
 """
 function write_plain end
@@ -264,7 +342,9 @@ project file at all, stored an empty text; the file that is missing is
 then not written, and a warning says so. A path in them — a `[sources]`
 entry, a developed package — still names the writer's disk.
 
-Existing files in `dir` are not overwritten unless `force = true`.
+Existing files in `dir` are not overwritten unless `force = true`. It
+is not collective: it reads the file serially, on whichever process
+calls it.
 """
 function checkpoint_environment end
 

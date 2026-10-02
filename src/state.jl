@@ -356,11 +356,15 @@ the thread count, since it is computed from that block's cells alone; a
 floating-point combination of them is promised to roundoff only,
 whichever way it is written.
 
-The largest value of each variable, which a refinement criterion needs
-for its scale:
+The values are per **local** block (M7): over a distributed forest they
+are this rank's blocks only, so a number combined from them — the
+largest value of a variable, which a refinement criterion needs for its
+scale, or a signal speed for a time step — is this rank's number, not
+the mesh's, and would differ between ranks. Such a number is a
+[`mesh_mapreduce`](@ref), the same on every rank:
 
 ```julia
-scales = [maximum(block_mapreduce(abs, max, zero(eltype(fs.work)), fs; vars=v))
+scales = [mesh_mapreduce(abs, max, zero(eltype(fs.work)), fs; vars=v)
           for v in 1:fs.nvars]
 ```
 
@@ -455,16 +459,41 @@ end
 # `mapreduce(identity, op, values)` *without* `init`: `sum(v)` and
 # `mapreduce(identity, +, v)` are the same pairwise reduction bit for
 # bit, whereas `reduce(+, v; init)` is a sequential left fold — an
-# explicit `init` changes Base's association (measured, 2026-09-22). The
-# M7 `Allreduce` goes here and nowhere else.
+# explicit `init` changes Base's association (measured, 2026-09-22).
+#
+# The values are this rank's blocks, and the one cross-rank step of any
+# reduction is here and nowhere else (M7): every rank gathers each
+# rank's partial and folds them in rank order, so that the association
+# is the package's and the result the same on every rank. A rank with
+# no blocks contributes no partial rather than `init`, which need only
+# satisfy `op(init, init) == init` (`max` from 0 over negative data);
+# `init` comes back only when every rank is empty. At one rank the
+# partial is the result, exactly the serial value, and nothing is
+# gathered. See "Reductions" under "Distributed meshes" in CODE.md.
 function combine_blocks(op, init::R, fs::FieldSet, values::Vector{R}, weight) where {R}
     if weight !== nothing
         for b in eachindex(values)
             values[b] *= oftype(init, weight(blockkey(fs, b)))
         end
     end
-    isempty(values) && return init
-    return mapreduce(identity, op, values)
+    comm = fs.forest.comm
+    if commsize(comm) == 1
+        isempty(values) && return init
+        return mapreduce(identity, op, values)
+    end
+    partial = isempty(values) ? (false, init) : (true, mapreduce(identity, op, values))
+    # Asserted, since `comm` is abstractly typed: with more than a few
+    # `Communicator` subtypes loaded, inference gives up on the call and
+    # the reduction's result would be inferred as `Any` (found in step 8,
+    # when the suite's fourth test communicator made it so).
+    partials = allgather(comm, partial)::Vector{typeof(partial)}
+    acc, found = init, false
+    for (hasvalue, value) in partials
+        hasvalue || continue
+        acc = found ? op(acc, value) : value
+        found = true
+    end
+    return acc
 end
 
 """
