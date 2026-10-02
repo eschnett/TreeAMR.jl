@@ -21,10 +21,13 @@ is implemented (2026-10-02): the forest replicated on every rank, the
 blocks distributed in contiguous curve ranges, and the ghost exchange,
 interface restriction, reductions, regrid, interpolation and parallel
 checkpoints across ranks, bit-identical to serial but for floating-point
-sums, through an MPI package extension (and an HDF5+MPI one). What M7
-leaves open are its cluster measurements, all scripted under `bench/`
-and none run: the shared-file checkpoint throughput on BeeGFS (step 6),
-the weak-scaling table (step 7) and the H200 run (step 8). It came after
+sums, through an MPI package extension (and an HDF5+MPI one). Its
+cluster measurements ran on Symmetry on 2026-10-02 (CODE.md, steps 6–8).
+What M7 leaves open is its checkpoint: the shared file, written by every
+rank through MPI-IO, lost data between nodes on BeeGFS until ROMIO's
+read-modify-write was turned off, and is to be replaced by one without
+parallel I/O — files per I/O process and an index file — decided with
+Erik that day. It came after
 M8 and M10 so the distributed exchange was built once over a
 layout-generic schedule that already held the mirrored transfers, and
 after M9a because the downstream runs needed to restart before they
@@ -267,7 +270,7 @@ TREEAMR_BENCH_N=8 bench/mpiscan.sh 1 2 4
 julia -t 4 --project=test bench/replicated.jl 8 64 512
 ```
 
-Three SLURM jobs hold the open M7 measurements and **have not run**:
+Three SLURM jobs hold the M7 measurements, all run on 2026-10-02:
 `bench/symmetry_mpi.sh` (weak scaling, one rank per NUMA domain at 8
 threads, 1–4 nodes, plus single-process controls),
 `bench/symmetry_checkpoint_mpi.sh` (shared-file checkpoint throughput on
@@ -275,6 +278,11 @@ BeeGFS) and `bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
 staged and, with a CUDA-aware system MPI, direct). Each launches
 MPICH_jll through `srun --mpi=pmi2` by default or a system MPI through
 MPIPreferences (`TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`).
+`bench/symmetry_checkpoint_stress.sh` runs `bench/checkpoint_stress.jl`,
+the reproducers of the multi-node checkpoint loss, from
+`save_checkpoint` down to plain `pwrite`; `bench/checkpoint_inspect.jl`
+and `bench/checkpoint_layout.jl` read a damaged file. Anything that
+writes one file from several nodes is to be checked with them first.
 
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
@@ -483,7 +491,14 @@ The ideas that span several files and are easy to violate:
   (`Float32x2` as two `Float32`), named as a Base-only module prints
   them and matched against the loader's `types`. No Julia type
   definition reaches the file, so a converter can read an old file
-  without the old package; do not add JLD2 or `Serialization`.
+  without the old package; do not add JLD2 or `Serialization`. Every
+  file carries CRC-32C checksums — the leaf list's (`leaves_crc32c`)
+  and one per block of each field set (`data_crc32c`) — verified on
+  load, an additive change with `format_version` still 1. A parallel
+  file is opened with ROMIO's data sieving and collective buffering for
+  writes disabled, since either rewrote other nodes' bytes on BeeGFS
+  (CODE.md, "Parallel checkpoints"); Open MPI's OMPIO ignores those
+  hints and was not tested.
 - **The forest is replicated, the blocks are distributed** (M7, CODE.md
   "Distributed meshes"). Every rank holds `forest.leaves` whole; rank
   `r` stores the contiguous curve range `blockrange(forest)`

@@ -18,28 +18,33 @@ using MPI: MPI
 import TreeAMR: open_parallel_file
 
 # The MPI-IO hints every parallel checkpoint is opened with: no
-# read-modify-write, ever. ROMIO (MPICH's MPI-IO, and the one MPICH_jll
-# ships) knows no BeeGFS and treats it as a generic POSIX file system,
-# whose writes it takes to be visible to every node at once. Under that
-# assumption it turns a write into a read-modify-write of a wider range
-# in two places: data sieving, for an independent write whose file view
-# is noncontiguous — the chunks of a filtered dataset, of which HDF5 may
-# place the first few in free space before the leaf columns — reads the
-# whole extent, fills in its pieces and writes it all back; and
-# collective buffering writes each aggregator's file domain whole, after
-# reading it first if anything in it is not being written. Both write
-# back bytes that other ranks wrote earlier, as they were when read. On
-# BeeGFS, whose client buffers a node's writes until a flush, a write
-# another node has made but not yet flushed reads as the zeros it
-# replaced, and the write-back destroys it: on Symmetry's BeeGFS a rank's
-# whole slab of the leaf coordinates came back zero (M7 step 6, in
-# "Parallel checkpoints" in CODE.md, with the reproducers). Disabling
-# both makes every rank write exactly its own bytes and nothing else,
-# which no write-back caching can turn into a loss. The cost is nothing
-# measurable here: a rank's blocks are one contiguous run of the file,
-# or a few runs of whole chunks, so there is nothing for either to
-# aggregate. Other MPI-IO implementations ignore the `romio_` keys, as
-# the standard has them ignore any key they do not know.
+# read-modify-write in ROMIO, the MPI-IO of MPICH and of MPICH_jll. ROMIO
+# knows no BeeGFS and drives it as a generic POSIX file system (its "UFS"
+# driver), and turns a write into a read-modify-write of a wider range in
+# two places: data sieving, for an independent write whose file view is
+# noncontiguous — the chunks of a filtered dataset, of which HDF5 may
+# place the first few in free space before the leaf columns — and
+# collective buffering, which writes each aggregator's file domain whole,
+# after reading it if anything in it is not being written. Data sieving
+# holds an `fcntl` write lock over the extent while it does so; the
+# collective path's read of holes takes none outside atomic mode (MPICH
+# 5.0's `ad_write_str.c` and `ad_write_coll.c`). On generic POSIX that is
+# safe, because a write that has returned is visible to every reader and
+# a lock excludes every other locker. On Symmetry's BeeGFS neither holds:
+# the client buffers a node's writes until a flush ("buffered" cache), so
+# another node's read misses them, and `tuneUseGlobalFileLocks = false`
+# makes `fcntl` locks local to a node. A read-modify-write then reads
+# another node's completed but unflushed write as the zeros it replaced
+# and writes them back, and a whole slab of a rank's leaf coordinates was
+# lost that way (M7 step 6, "Parallel checkpoints" in CODE.md, with the
+# reproducers; the write that was destroyed took no lock, so global
+# locks alone would not have saved it). With both disabled every rank
+# writes exactly its own bytes. The cost is in filtered saves of data
+# that compress well: each chunk becomes its own write, and a blast-wave
+# save with zstd(1) on two nodes ran at three quarters of its rate
+# without them; unfiltered saves did not change. Open MPI's own MPI-IO, OMPIO, ignores the `romio_` keys, as
+# the standard has it ignore any key it does not know, so this does not
+# cover it, and it was not tested.
 const NO_READ_MODIFY_WRITE = (:romio_ds_write => "disable", :romio_cb_write => "disable")
 
 # Collective. `comm` is the forest's duplicate of the application's

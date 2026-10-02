@@ -15,8 +15,11 @@ faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, and
 M7's distribution over MPI). M7 is implemented, and measured on a
 cluster: weak scaling to four nodes and the distributed run on CUDA
-GPUs, with and without a CUDA-aware MPI. The parallel checkpoint's
-throughput on more than one node is still open.
+GPUs, with and without a CUDA-aware MPI. The parallel checkpoint, one
+shared file written through MPI-IO, lost data on more than one node of
+the cluster's BeeGFS until ROMIO's read-modify-write was turned off; it
+is to be replaced by one file per I/O process, and every checkpoint now
+carries checksums that a load verifies.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.

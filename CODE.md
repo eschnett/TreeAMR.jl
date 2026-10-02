@@ -1527,7 +1527,8 @@ application gets a top-level group of its own, named after it:
       forest/            attrs: D, N, connectivity = "brick",
                                 roots (D), periodic (D),
                                 reflecting (2, D), geometry_type
-                                [, geometry_limbtype, geometry_nlimbs]
+                                [, geometry_limbtype, geometry_nlimbs],
+                                leaves_crc32c (M7; absent before)
         extents          (limbs?, 2, D), in the geometry type, bitwise
         root             Int32[nleaves]
         level            Int8[nleaves]
@@ -1538,6 +1539,7 @@ application gets a top-level group of its own, named after it:
                                 "none"; absent when the set has none),
                                 range = "owned"
         data             (limbs?, N, …, N, nvars, nblocks)
+        data_crc32c      UInt32[nblocks] (M7; absent before)
     /<app name>/         attr: format_version (the application's own)
       data               the plain-data tree; beside it, whatever the
                          do-block writes
@@ -1577,6 +1579,35 @@ application gets a top-level group of its own, named after it:
 - `range = "owned"` says the data are the owned points only, and leaves
   room for a file that stores more, which a version-1 reader would
   refuse by value.
+- **Checksums** (added in M7, 2026-10-02, decided with Erik after a
+  parallel file came back damaged; the account is under "Parallel
+  checkpoints" in [Distributed meshes](#distributed-meshes)).
+  `leaves_crc32c` is the CRC-32C (Castagnoli) of the bytes of `root`,
+  then `level`, then `coords`, each column whole, as stored; entry `b`
+  of `data_crc32c` is the CRC-32C of block `b`'s bytes in `data`, the
+  slice `data[…, b]` with all its variables and limbs, in the file's
+  order. Both are over the little-endian bytes the file holds, so a C or
+  Python reader can check them. A load verifies both and refuses a
+  mismatch, with the reason that the file was damaged while or after it
+  was written; over several ranks each rank checks the blocks it reads,
+  and the verdict is agreed. A file without them, from before, loads
+  unchecked.
+  - *No format change* (decided). They are an additive change with an
+    obvious default, "not checked", so `format_version` stays 1 and
+    nothing joins `features`: a reader that ignores them reads the file
+    exactly as before. A feature would have made every file M7 writes
+    unreadable to 0.1.4 for nothing a reader must understand. The 0.1.4
+    reader was checked to load files with them, filtered and not.
+  - *CRC-32C*, because it is in Julia's standard library (`CRC32c`,
+    which TreeAMR now depends on), runs in hardware on x86-64 and
+    AArch64 (13.7 GB/s on one thread of the development laptop, against
+    the 1–2 GB/s of a save), and is defined outside Julia.
+  - *Per block*, not per rank or per file, because the file stores no
+    partition and loads on any rank count: each rank checks exactly the
+    blocks it reads, and the checksums are written beside the data by
+    the same slab. The leaf list, which every rank reads whole, has one.
+  - *Not covered*: the extents, the provenance and the plain data, which
+    are small and written by rank 0 alone, and HDF5's own metadata.
 - **Spellings** (fixed by the implementation). Shapes above are in
   Julia's order, which C sees reversed. Every `Bool` in the file —
   `periodic`, `reflecting`, a plain-data `Bool` — is a `UInt8`, 0 or 1,
@@ -1864,8 +1895,12 @@ decided).
   [Distributed meshes](#distributed-meshes).)* *(Step 6 of M7 built it:
   the version-1 layout written and read by every rank of a distributed
   forest at once, a file loading on any rank count; what it settled is
-  under "Parallel checkpoints" there. The throughput on Symmetry's
-  parallel file system is still to be measured.)*
+  under "Parallel checkpoints" there.)* *(Measured on Symmetry's
+  BeeGFS in step 6, 2026-10-02: the shared file lost data between
+  nodes until ROMIO's read-modify-write was turned off, and its rate
+  did not grow with nodes; it is to be replaced by files per I/O
+  process, decided that day with Erik. The account is under "Parallel
+  checkpoints".)*
 
 **Multi-block** (checked). Keys are relative to their root,
 `connectivity = "brick"` is a tagged record rather than an assumption,
@@ -3053,8 +3088,9 @@ them and from the sections cited, and is open to amendment as the
 implementation measures it. The steps are in the M7 entry under
 [Milestones](#milestones). Implemented in them by 2026-10-02, the
 amendments marked where they were made. Measured on Symmetry the same
-day: steps 7 and 8 in full, step 6 on one node; the findings are in
-the steps, and amend the bullets below where marked.)* M7 runs one forest over several
+day: steps 7 and 8 in full, and step 6, whose multi-node run lost data
+and led to the decision to replace the shared-file checkpoint; the
+findings are in the steps, and amend the bullets below where marked.)* M7 runs one forest over several
 processes. It came after M8 and M10 on purpose: every centering, the
 interface restriction and the mirrored transfers at reflecting faces
 are now entries of one schedule, so distributing the schedule
@@ -3919,11 +3955,97 @@ amends the bullets above:)*
   independent reads of one small object header may become the cost
   (`H5Pset_all_coll_metadata_ops` is the remedy); the Symmetry
   measurement is where that would show. *(At up to 8 ranks on one node,
-  step 6, it did not; the multi-node run is open.)*
+  and at 32 on four nodes, step 6, it did not.)*
 - *Errors inside a collective call* remain fatal, as above. A
   `write_plain` refused in the do-block is agreed, so every rank leaves
   the block together and closes the file collectively, and the partial
   file is removed (tested).
+
+*(Step 6 on four nodes of Symmetry, 2026-10-02: what amends the bullets
+above, and withdraws the step's earlier reading that its one-node
+measurement stood for the design. The account, with the jobs, is in the step's record under
+[Milestones](#milestones).)* **The shared file is to be replaced**
+(decided 2026-10-02 with Erik, after what follows): writing one file
+from several nodes is judged not reliable enough, and the parallel
+checkpoint becomes one without parallel I/O — a subset of the ranks are
+I/O processes, each writes a file of its own, an index file ties them
+together, and on reading each file is opened by one process. The
+checksums and the reproducers below carry over to it; the hints and the
+shared-file layout need not.
+
+- *No read-modify-write* (amends "Raw data by hyperslab", which took a
+  rank writing only its own bytes to be enough). A checkpoint saved by
+  32 ranks on four nodes came back with one rank's slab of the leaf
+  coordinates zeroed. ROMIO, the MPI-IO of MPICH and MPICH_jll, knows
+  no BeeGFS and drives it with its generic POSIX driver ("UFS"), which
+  turns some writes into a read-modify-write of a wider range: data
+  sieving, for an independent write with a noncontiguous file view,
+  under an `fcntl` write lock over the extent; and collective
+  buffering, which writes each aggregator's whole file domain after
+  reading it if anything in it is not being written, under no lock
+  outside atomic mode (read in MPICH 5.0's `ad_write_str.c` and
+  `ad_write_coll.c`). On a POSIX file system that is safe, since a
+  write that has returned is visible to every reader and a lock
+  excludes every other locker. Symmetry's BeeGFS clients break both:
+  they hold a node's writes until a flush (`tuneFileCacheType =
+  buffered`), and their `fcntl` locks are local to the node
+  (`tuneUseGlobalFileLocks = false`, in `/etc/beegfs/beegfs-client.conf`
+  and the client's `/proc` view). The first is shown directly: a rank's
+  completed `write`, read after a barrier by a rank on another node,
+  was not there in 5 of 300 trials, and never between ranks of one
+  node (28 of the 32 pairs tried). The second is read from the
+  configuration and was not tested. HDF5 had placed the first chunks of the filtered data before the leaf
+  columns, so rank 0's write of its chunks spanned the columns; data
+  sieving read them while another node still held a rank's
+  coordinates, and wrote the zeros back. The explanation is the one
+  consistent with all of the evidence in the step's record — under data
+  sieving the loss is always whole slabs of ranks on nodes other than
+  rank 0's, the rank whose write spans them, and under collective
+  buffering whole file domains of aggregators; it vanishes with both off,
+  it appears below HDF5 with nothing but MPI-IO calls, and the file
+  system's configuration and visibility are as described — but no
+  trace of an individual write's journey was taken. The destroyed write
+  itself took no lock, so global locks alone would not have saved it.
+- *The hints* (the remedy for ROMIO). Every parallel file is opened
+  with `romio_ds_write = disable` and `romio_cb_write = disable`, so
+  each rank writes exactly its own bytes. On the reproducer (four nodes,
+  32 ranks, filtered saves through `save_checkpoint`) damaged saves went
+  from 12 in 200 (6 %) to 0 in 1000, where the old rate predicts about
+  60; and at two nodes, in the throughput benchmark, saves without the
+  hints were refused by the checksums in both of two rounds and saves
+  with them never. The cost is in filtered saves of data that compress
+  well, where each chunk becomes a write of its own: blast with zstd(1)
+  at 16 ranks saved at 1.40 GB/s with the hints against 1.88 without,
+  while unfiltered saves and pulse did not change (the step's record).
+  **Not covered: Open MPI.** Its own MPI-IO, OMPIO, the default of the
+  HPC-X that step 7 measured between nodes, ignores the
+  `romio_` keys; whether OMPIO reads or writes back anything it was
+  not given was not established, since HDF5_jll's Open MPI build loads
+  its own Open MPI rather than HPC-X's and the run was stopped by the
+  change of plan above. Enabling `tuneUseGlobalFileLocks` on the BeeGFS
+  clients, which only the administrators can do, would restore ROMIO's
+  locking between data-sieving ranks, but not, by the reading above,
+  the visibility of unlocked writes that the observed loss needed.
+- *Checksums* (decided with Erik after it). The leaf list and every
+  block of every field set carry a CRC-32C, verified on load, with the
+  verdict agreed across ranks; the format and the reasons are under
+  "Checksums" in [Checkpoint and restart](#checkpoint-and-restart).
+  They are not the remedy — damage refused is still a lost checkpoint
+  — but they are the defence for file systems and MPI-IO
+  implementations this was not measured on: the next such loss is
+  refused with its reason instead of restored into a wrong state. A
+  damaged field set would have been restored: only the leaf list's own
+  validation caught this one, and only because zeros broke the curve
+  order.
+- *NFS, for comparison.* ROMIO on the NFS `/home` of the same nodes —
+  whose NFS driver locks around its writes, though which driver ran was
+  not checked — lost nothing with data sieving (0 damaged in 1000) or with collective
+  buffering forced on (0 in 200). Plain `pwrite`s of adjacent ranges
+  from several nodes, no MPI-IO involved, lost whole pages there in 98
+  of 200 trials — NFS's page cache, and the reason ROMIO locks — while
+  on BeeGFS the same `pwrite`s were exact in 200 of 200. Neither file
+  system is coherent between nodes; they fail differently, and a
+  shared file is safe only when the MPI-IO layer knows how each fails.
 
 **What the feasibility check found** (2026-10-01, in a scratch
 environment on the development machine: Apple M3 Pro, HDF5.jl 0.17.4,
@@ -4033,6 +4155,10 @@ Remaining, none blocking before their milestone:
     *(Decided 2026-10-01 with Erik: the shared file, specified under
     [Distributed meshes](#distributed-meshes). What stays open is its
     throughput on a cluster file system, measured in M7's step 6.)*
+    *(Measured there, 2026-10-02: on BeeGFS the shared file lost data
+    between nodes until ROMIO's read-modify-write was turned off, and
+    did not get faster with nodes; it is to be replaced by one file per
+    I/O process with an index file, decided that day with Erik.)*
   - An ADIOS2 backend, if parallel HDF5 does not scale at M7. The data
     model maps one-to-one onto ADIOS2 variables (the datasets) and
     attributes.
@@ -4647,9 +4773,12 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
     gains them with `using HDF5` once a release carries them.
 - **M7 — MPI.** *(Implemented 2026-10-02. Measured on Symmetry the same
   day: the weak-scaling table of step 7 at up to four nodes and the H200
-  run of step 8, both paths, pass; the checkpoint throughput of step 6
-  ran on one node, and its multi-node part is open, so M7 is not yet
-  marked done.)* Curve partitioning, distributed ghost exchange (for
+  run of step 8, both paths, pass. The checkpoint of step 6, measured
+  on four nodes the same day, lost data on BeeGFS until ROMIO's
+  read-modify-write was turned off, and is to be replaced by one
+  without parallel I/O — files per I/O process and an index file —
+  decided with Erik that day, so M7 is not yet marked done: its
+  checkpoint is open again.)* Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
   and the `Allreduce` inside `mesh_mapreduce` (the planned global
@@ -5200,8 +5329,10 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
     benchmark "Parallel I/O and M7" asked for. The per-process files
     are revisited only if the shared file does not hold up.
 
-    *(Done, 2026-10-01, except the Symmetry measurement, which ran on
-    one node on 2026-10-02 and not yet on several; see the last items.)*
+    *(Done, 2026-10-01; measured on Symmetry on 2026-10-02, on one node
+    and then on two and four, where the shared file lost data until
+    ROMIO's read-modify-write was turned off, which with its rate led to
+    the decision to replace it; see the last items.)*
     What it settled, and where it went beyond the
     plan (the design decisions are recorded under "Parallel checkpoints"
     in [Distributed meshes](#distributed-meshes)):
@@ -5345,16 +5476,120 @@ M7's benchmarks. The list below is in execution order. M7 is implemented
          read rate.
       4. Collective metadata reads were not needed at these counts.
 
-      **Not run: the multi-node part.** Job 567855 (4 nodes, 8 ranks a
-      node, `TREEAMR_CKPT_ONENODE=0`, so 2 and 4 nodes) was queued
-      behind 567854, and the tunnel to the cluster went down before
-      either finished, so their logs were not copied; the table above is
-      read from 567854's log while it ran, its 4- and 8-rank rows on the
-      larger mesh and the shuffle + LZ4 and bitshuffle + LZ4 rows above
-      one rank not included. Whether the shared file's aggregate rate
-      grows with nodes past the one-node 1.5 GB/s — the question
-      "Parallel I/O and M7" asked — therefore stays open, and with it
-      whether the per-process files need revisiting.
+      The log of 567854 was copied later and is complete; the larger
+      mesh at `-n 4` and `-n 8`, which the table above lacked, is pulse
+      unfiltered 1.28 / 0.94 / 3.41 and 1.43 / 0.89 / 4.24, blast
+      unfiltered 1.57 / 1.08 / 4.82 and 1.63 / 0.90 / 5.64.
+    - **The multi-node run lost data** (job 567855, 2026-10-02: cn092–095,
+      8 ranks a node, `TREEAMR_CKPT_ONENODE = 0`). Every setting at 2
+      nodes on both meshes and at 4 nodes on the default one, and at 4
+      nodes on the larger mesh through shuffle + zstd(3), loaded back; then a load of blast with
+      shuffle + LZ4 on the larger mesh was refused on every rank by the
+      forest: leaves 5538 and 5539 "out of curve order", the second a
+      key with coordinates `(0, 0, 0)`. The last file was still on
+      BeeGFS and was read serially on another node (job 567907,
+      `bench/checkpoint_inspect.jl`): `root`, `level` and all 63240
+      chunks of `data` were intact, and in `coords` exactly the 395
+      rows of rank 14 (on cn093) were zero, bytes [160993, 165733) of
+      the file. Every reader agreeing, the damage was in the file, not
+      in a read. `bench/checkpoint_layout.jl` showed the trigger: HDF5
+      had put the first 9 chunks of `data` (rank 0's first two blocks)
+      at [6672, 8110), in free space before the leaf columns at
+      [31309, 246325), and the rest from 250501 on, so rank 0's file
+      view for its chunks spanned the columns. ROMIO reported its
+      generic driver (`romio_filesystem_type` "UFS"), `romio_cb_write`
+      and `romio_ds_write` "automatic", and the BeeGFS client
+      `tuneFileCacheType = buffered` (512 KiB a file),
+      `tuneUseGlobalFileLocks = false`, `tuneRemoteFSync = true`; the
+      file was striped over 4 targets on 2 servers in 512 KiB chunks.
+      The mechanism this points to is under "Parallel checkpoints" in
+      [Distributed meshes](#distributed-meshes); here is what tested it.
+    - *The reproducers* (`bench/checkpoint_stress.jl`, run by
+      `bench/symmetry_checkpoint_stress.sh`; four nodes, 32 ranks,
+      MPICH_jll 5.0.2, files on BeeGFS unless marked; a save is damaged
+      when either of two serial readers on different nodes finds a row
+      that is not what was written). The 12648-leaf partition of the
+      failing run, at 4³ cells a block:
+
+      | layer | case | damaged | jobs |
+      |---|---|---|---|
+      | `save_checkpoint`, Shuffle + Deflate(1) | as in 0e71c75 | 12 / 200; 13 / 200 with `sync` | 567917 (and 567915) |
+      | | `romio_ds_write` off (hint file) | 0 / 200 | 567917 |
+      | | `romio_ds_write` and `romio_cb_write` off | 0 / 200 | 567917 |
+      | | with the fix (the hints in the code) | 0 / 1000 | 567930 |
+      | `save_checkpoint`, unfiltered | as in 0e71c75 | 0 / 200; 0 / 200 with `sync` | 567915 |
+      | | with the fix | 0 / 300 | 567930 |
+      | HDF5 alone, contiguous hyperslabs | defaults | 0 / 200 | 567915 |
+      | MPI-IO, the checkpoint's pattern, independent | defaults | 1 / 200; 3 / 2000 | 567917, 567930 |
+      | | data sieving off | 0 / 200; 0 / 2000 | 567917, 567930 |
+      | MPI-IO, the same, collective | defaults (falls back to independent) | 0 / 200; 0 / 200 with sync-barrier-sync | 567917 |
+      | | collective buffering forced on | 151 / 200; 176 / 200 | 567917, 567930 |
+      | | the same, data sieving off | 147 / 200 | 567917 |
+      | | both off | 0 / 200 | 567930 |
+      | MPI-IO, adjacent unaligned ranges | `write_at_all`; `write_at` | 0 / 200; 0 / 200 | 567915, 567917 |
+      | POSIX `pwrite`, adjacent unaligned ranges | — | 0 / 200 | 567915 |
+      | POSIX, a rank's write read by the next rank after a barrier | — | unseen 5 / 300, always across nodes; file after close intact | 567958 |
+      | NFS `/home`: MPI-IO pattern, independent; collective buffering on | defaults | 0 / 1000; 0 / 200 | 567959 |
+      | NFS: MPI-IO adjacent ranges; POSIX `pwrite`s | — | 0 / 200; 98 / 200, whole pages | 567959 |
+
+      Under data sieving the loss was always one or more whole slabs
+      of ranks on cn093–cn095 (31 damaged saves, ranks 9 to 30), never
+      of ranks 1–7, which share rank 0's node; under collective buffering,
+      whole aggregator file domains. Under the old rate, 0 damaged in
+      1000 has a probability of about e⁻⁶⁰. The collective MPI-IO case
+      with defaults saw no damage either way, so it says nothing about
+      sync-barrier-sync. What was not done: a trace of individual
+      writes, a cross-node `fcntl` lock test, a run with
+      `tuneUseGlobalFileLocks = true` (root only), and any Open MPI run
+      — HDF5_jll's Open MPI build failed to load HPC-X's library (job
+      567937), and the pure MPI-IO runs under OMPIO were cancelled when
+      the shared file was dropped.
+    - *Measured with the fix* (job 567938, cn092–095, the same day,
+      `TREEAMR_BENCH_REPS = 3`; every save now checked by a load, 8 a
+      setting, all of which passed): GB/s save / sync / load, as above.
+
+      | data | filter | 2 nodes, 16 ranks | 4 nodes, 32 ranks |
+      |---|---|---|---|
+      | blast | none | 1.69 / 0.92 / 5.45 | 1.72 / 0.93 / 6.10 |
+      | blast | `Shuffle` + `Deflate(1)` | 0.76 / 0.74 / 2.94 | 1.18 / 1.05 / 3.94 |
+      | blast | shuffle + zstd(1) | 1.29 / 1.16 / 4.27 | 1.79 / 1.57 / 4.76 |
+      | blast | bitshuffle + zstd(1) | 1.22 / 1.03 / 4.28 | 1.68 / 1.34 / 4.68 |
+      | pulse | none | 1.33 / 0.81 / 2.84 | 1.38 / 0.81 / 3.00 |
+      | pulse | `Shuffle` + `Deflate(1)` | 0.38 / 0.35 / 1.62 | 0.56 / 0.48 / 1.85 |
+      | pulse | shuffle + zstd(1) | 0.64 / 0.49 / 2.56 | 0.89 / 0.62 / 2.43 |
+
+      The larger mesh: at 2 nodes pulse unfiltered 2.00 / 0.88 / 5.13,
+      blast unfiltered 1.85 / 1.13 / 7.90, blast zstd(1) 1.26 / 1.06 /
+      5.21; at 4 nodes 1.72 / 1.05 / 5.49, 1.98 / 0.95 / 9.18 and 1.95 /
+      1.58 / 8.23. One node with the fix (job 567939, which overlapped
+      the cost measurement below on the same file system, on cn112): at `-n 8` blast unfiltered
+      1.47 / 0.94 / 3.82 and zstd(1) 0.80 / 0.72 / 2.96, against 1.37 /
+      0.84 / 4.56 and 1.46 / 1.28 / 3.83 without (567854); `-n 1`, the
+      serial path, which the hints do not touch, unchanged (blast
+      zstd(1) 0.64).
+    - *The hints' cost* (job 567964, 2 nodes, 16 ranks, alternating with
+      and without them in a scratch copy, two rounds, at the same time
+      as 567939): blast zstd(1) 1.40 and 1.40 GB/s with, 1.88 without;
+      shuffle + LZ4 1.37 and 1.40 against 2.08; Deflate(1) 0.95 and 0.91
+      against 1.16 and 1.15; blast unfiltered 1.73 and 1.79 against 1.68
+      and 1.84; pulse unchanged, unfiltered and filtered. With the
+      hints data sieving is replaced by one write a chunk (ROMIO's
+      "naive" strided path, `ad_write_str_naive.c`), and blast's chunks
+      compress to about 5 KB. Without the hints both rounds were
+      refused by the checksums, on every rank — round 1 at
+      bitshuffle + LZ4, round 2 at shuffle + zstd(1) — which is the
+      checksums catching the original loss in the benchmark itself.
+    - *What it says about the shared file.* An unfiltered save is 1.3–2.0
+      GB/s at one, two and four nodes alike, so its rate is that of one
+      file, presumably its four storage targets, and not of the
+      clients; a filter parallelizes up to that rate (blast zstd(1)
+      1.95 GB/s at 32 ranks on the larger mesh); a load of a file just
+      written reaches 9 GB/s at 32 ranks. Whether the shared file's
+      rate grows with nodes past one node's was the question; it does
+      not, and with the losses that settles it: **the shared file is to be replaced** by files per I/O
+      process (decided 2026-10-02 with Erik; see "Parallel
+      checkpoints"). The checksums, the self-checking benchmark and the
+      reproducers carry over to the replacement.
     - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
       `partition_tests.jl`, `checkpoint_tests.jl` and `mpi_tests.jl`
       (2m53 together), the parallel checkpoints and every cross load

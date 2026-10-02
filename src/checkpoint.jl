@@ -137,7 +137,8 @@ The file is opened with MPI-IO hints that turn off ROMIO's two
 read-modify-write paths for writes, data sieving and collective
 buffering: on a parallel file system whose clients buffer writes, such
 as BeeGFS, either can write back another rank's bytes as they were
-before that rank's write arrived, destroying it.
+before that rank's write arrived, destroying it. Open MPI's own MPI-IO
+(OMPIO) ignores these hints and has not been tested.
 
 Returns `path`. See `CODE.md`, "Checkpoint and restart" and "Parallel
 checkpoints", for the file layout and the reasons behind it.

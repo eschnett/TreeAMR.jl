@@ -53,8 +53,12 @@ count, except floating-point sums, which agree to roundoff. MPI is a
 weak dependency, loaded with `using MPI` (see
 [Running distributed](@ref)). It is measured on a cluster: weak
 scaling to four nodes, and the distributed run on CUDA GPUs with and
-without a CUDA-aware MPI; the parallel checkpoint's throughput on more
-than one node is still open. Next is visualization export (M9b).
+without a CUDA-aware MPI. The parallel checkpoint, one shared file
+written through MPI-IO, lost data on more than one node of the
+cluster's BeeGFS until ROMIO's read-modify-write was turned off; it is
+to be replaced by one file per I/O process, and every checkpoint now
+carries checksums that a load verifies. Next is visualization export
+(M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
