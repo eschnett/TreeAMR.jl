@@ -7,11 +7,14 @@
 # CODE.md's "What one process loses" expected one rank per domain to
 # recover.
 #
-#     sbatch bench/symmetry_mpi.sh                         # 4 nodes, N = 16 and 32
+#     TREEAMR_MPI=system TREEAMR_MPI_MODULE=nvhpc-hpcx-cuda12/24.9 \
+#         sbatch bench/symmetry_mpi.sh                     # 4 nodes, N = 16 and 32
 #     sbatch --nodes=2 bench/symmetry_mpi.sh               # up to 2 nodes
 #     TREEAMR_BENCH_NS=32 sbatch bench/symmetry_mpi.sh     # one block size
-#     TREEAMR_MPI=system TREEAMR_MPI_MODULE=<module> TREEAMR_SRUN_MPI=pmix \
-#         sbatch bench/symmetry_mpi.sh
+#     sbatch --partition=amddebugq --nodes=1 bench/symmetry_mpi.sh   # one node
+#
+# amddebugq takes one node a job (MaxNodes=1), so the default partition
+# is amdq.
 #
 # Every rank holds one tile of the mesh (see the header of bench/mpi.jl):
 # at the default `ROOTS = 4` in 3D, 176 blocks on the two-level mesh and
@@ -39,18 +42,23 @@
 #
 # The MPI is MPI.jl's default binary (MPICH_jll), launched by `srun`
 # over PMI-2 (TREEAMR_SRUN_MPI, default pmi2; `srun --mpi=list` shows
-# what the SLURM there supports). `TREEAMR_MPI=system` with
-# `TREEAMR_MPI_MODULE=<module>` uses a system MPI instead, through
-# MPIPreferences in the scratch environment. Like
-# bench/symmetry_checkpoint_mpi.sh, this was written without access to
-# the cluster and has not run; read the first job with that in mind.
+# what the SLURM there supports). That works on Symmetry, but MPICH_jll's
+# libfabric has no InfiniBand provider and talks TCP over IPoIB (about 2
+# GB/s and 40 µs between nodes, measured 2026-10-02). `TREEAMR_MPI=system`
+# with `TREEAMR_MPI_MODULE=<module>` uses a system MPI instead, through
+# MPIPreferences in the scratch environment, launched by that MPI's own
+# `mpiexec`; on Symmetry that is HPC-X's Open MPI 4.1.7 over UCX
+# (`nvhpc-hpcx-cuda12/24.9`: 12 GB/s and 2 µs), which is not built with
+# SLURM's PMI and so cannot be started by `srun`. The ranks run the
+# julia binary itself, not the juliaup launcher, which writes a terminal
+# title into Open MPI's pseudo-terminal and so into the tables.
 #
 # Compare times only within one job: each window is the slowest rank's
 # time from a common barrier, so ranks are measured together, but runs
 # are not. The job ends with bench/replicated.jl on one domain, the
 # replicated regrid and digest passes at up to 180224 leaves.
 
-#SBATCH --partition=amddebugq
+#SBATCH --partition=amdq
 #SBATCH --nodes=4
 #SBATCH --exclusive
 #SBATCH --ntasks-per-node=8
@@ -89,25 +97,45 @@ julia --project="$ENVDIR" -e "
     end
     Pkg.instantiate()
     Pkg.precompile()"
+export JULIA=$(julia --startup-file=no -e 'print(joinpath(Sys.BINDIR, "julia"))')
 
-echo "# $(hostname) $(date -Iseconds) nodes=$NODES srun --mpi=$SRUN_MPI"
+echo "# $(hostname) $(date -Iseconds) nodes=$NODES mpi=${TREEAMR_MPI:-jll} $("$JULIA" --version)"
 lscpu | grep -E 'Model name|^Socket|^NUMA|L3'
 numactl -H
-julia --project="$ENVDIR" -e 'using MPI; MPI.versioninfo()'
+"$JULIA" --project="$ENVDIR" -e 'using MPI; MPI.versioninfo()'
+
+# What each rank runs: bound to its NUMA domain, by its rank on the node.
+# Under Open MPI's mpiexec SLURM_LOCALID is the daemon's, so the local
+# rank is Open MPI's own if it is set.
+cat > "$OUTDIR/rank.sh" <<'EOF'
+l=${OMPI_COMM_WORLD_LOCAL_RANK:-$SLURM_LOCALID}
+r=${OMPI_COMM_WORLD_RANK:-$SLURM_PROCID}
+d=$(( l * 8 / TREEAMR_RPN ))
+[ "$r" -lt 2 ] && echo "# rank $r on $(hostname): domain $d" >&2
+exec numactl --cpunodebind=$d --membind=$d \
+    "$JULIA" --project="$ENVDIR" -t 8 "$REPO/bench/mpi.jl" mpi
+EOF
 
 # run <label> <nodes> <ranks per node>: one rank per domain, 8 threads.
+# The step's task count is given explicitly: SLURM 21.08 (Symmetry's)
+# otherwise takes the job's and ignores --ntasks-per-node.
 run() {
     local label=$1 nodes=$2 rpn=$3
     echo "--- $label: nodes=$nodes ranks/node=$rpn threads/rank=8 N=$TREEAMR_BENCH_N"
-    TREEAMR_BENCH_LABEL=$label TREEAMR_RPN=$rpn \
-        srun --mpi="$SRUN_MPI" --nodes="$nodes" --ntasks-per-node="$rpn" \
-        --cpus-per-task=$((64 / rpn)) --cpu-bind=none \
-        bash -c 'd=$(( SLURM_LOCALID * 8 / TREEAMR_RPN ))
-                 [ "$SLURM_PROCID" -lt 2 ] &&
-                     echo "# rank $SLURM_PROCID on $(hostname): domain $d" >&2
-                 exec numactl --cpunodebind=$d --membind=$d \
-                     julia --project="$ENVDIR" -t 8 "$REPO/bench/mpi.jl" mpi' \
-        > "$OUTDIR/N$TREEAMR_BENCH_N-$label.tsv"
+    export TREEAMR_BENCH_LABEL=$label TREEAMR_RPN=$rpn
+    if [ "${TREEAMR_MPI:-jll}" = system ]; then
+        local pass=()
+        for v in $(compgen -e | grep -E '^(TREEAMR_|ENVDIR$|REPO$|JULIA$)'); do
+            pass+=(-x "$v")
+        done
+        mpiexec -n $((nodes * rpn)) --map-by ppr:"$rpn":node --bind-to none \
+            "${pass[@]}" bash "$OUTDIR/rank.sh" > "$OUTDIR/N$TREEAMR_BENCH_N-$label.tsv"
+    else
+        srun --mpi="$SRUN_MPI" --nodes="$nodes" --ntasks=$((nodes * rpn)) \
+            --ntasks-per-node="$rpn" --cpus-per-task=$((64 / rpn)) --cpu-bind=none \
+            bash "$OUTDIR/rank.sh" > "$OUTDIR/N$TREEAMR_BENCH_N-$label.tsv"
+    fi
+    unset TREEAMR_BENCH_LABEL TREEAMR_RPN
 }
 
 # control <label> <prefix command...>: one 64-thread process over the
@@ -117,7 +145,7 @@ control() {
     echo "--- $label: one process, 64 threads, 8 tiles, N=$TREEAMR_BENCH_N, $*"
     TREEAMR_BENCH_LABEL=$label TREEAMR_BENCH_TILES=8 \
         srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none \
-        "$@" julia --project="$ENVDIR" -t 64 "$REPO/bench/mpi.jl" \
+        "$@" "$JULIA" --project="$ENVDIR" -t 64 "$REPO/bench/mpi.jl" \
         > "$OUTDIR/N$TREEAMR_BENCH_N-$label.tsv"
 }
 
@@ -139,7 +167,7 @@ done
 echo "=== replicated costs, one domain, 8 threads ==="
 srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none \
     numactl --cpunodebind=0 --membind=0 \
-    julia --project="$ENVDIR" -t 8 "$REPO/bench/replicated.jl" 8 64 512 1024 \
+    "$JULIA" --project="$ENVDIR" -t 8 "$REPO/bench/replicated.jl" 8 64 512 1024 \
     | tee "$OUTDIR/replicated.txt"
 
 echo "=== results ==="

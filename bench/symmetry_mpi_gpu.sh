@@ -30,14 +30,16 @@
 #   the default binary, MPICH_jll, which is not built with CUDA, only the
 #   staging path runs, and the direct one needs a CUDA-aware system MPI
 #   selected with `TREEAMR_MPI=system TREEAMR_MPI_MODULE=<module>`, as in
-#   `symmetry_checkpoint_mpi.sh`. Whether Symmetry has such a module is
-#   not known here: this script was written without access to the
-#   cluster, and the first job should be read with that in mind
-#   (`module avail` for an Open MPI built with CUDA or UCX's cuda
-#   transport; `ompi_info --parsable --all | grep cuda_support`).
+#   `symmetry_checkpoint_mpi.sh`. On Symmetry that is HPC-X's Open MPI
+#   4.1.7 (`nvhpc-hpcx-cuda12/24.9`; `ompi_info --parsable --all | grep
+#   cuda_support` says it is built with CUDA), launched by its own
+#   `mpiexec`, which `MPI.mpiexec()` names under the system binary.
 #
-# Timings are not taken here: the weak-scaling benchmark of step 7
-# (`bench/mpi.jl`) is where the cost of the two paths belongs.
+# After the tests, the weak-scaling benchmark of step 7 (`bench/mpi.jl`
+# through `bench/mpiscan.sh`) on CUDA at 1, 2 and `GPUs` ranks, one GPU a
+# rank, through host staging and, where the MPI is CUDA-aware, directly:
+# that is where the cost of the two paths is measured. Its block size is
+# TREEAMR_BENCH_N (default 32 here, 5.8 M cells a rank).
 
 #SBATCH --partition=h200debugq
 #SBATCH --nodes=1
@@ -59,6 +61,10 @@ mkdir -p "$ENVDIR"
 
 if [ "${TREEAMR_MPI:-jll}" = system ]; then
     module load "${TREEAMR_MPI_MODULE:?set TREEAMR_MPI_MODULE to the MPI module}"
+else
+    # MPICH_jll's hydra would launch its proxies through `srun`, a step
+    # inside this one; on one node it can fork them.
+    export HYDRA_LAUNCHER=fork
 fi
 julia --project="$ENVDIR" -e "
     using Pkg
@@ -77,16 +83,24 @@ julia --project="$ENVDIR" -e "
     Pkg.precompile()"
 
 NGPU=$(nvidia-smi -L | wc -l)
-echo "# $(hostname) $(date -Iseconds) gpus=$NGPU"
+echo "# $(hostname) $(date -Iseconds) gpus=$NGPU mpi=${TREEAMR_MPI:-jll} $(julia --version)"
 nvidia-smi -L
 nvidia-smi topo -m || true
-AWARE=$(julia --project="$ENVDIR" -e '
+# Under the system MPI the query runs as one rank of its `mpiexec`: a
+# singleton `MPI.Init()` of Open MPI 4.1 inside a SLURM job waits forever
+# for the daemon it spawns (seen on Symmetry). The julia binary itself,
+# not the juliaup launcher, which writes a terminal title into Open MPI's
+# pseudo-terminal; and only the digit is kept.
+JULIA=$(julia --startup-file=no -e 'print(joinpath(Sys.BINDIR, "julia"))')
+LAUNCH=()
+[ "${TREEAMR_MPI:-jll}" = system ] && LAUNCH=(mpiexec -n 1)
+AWARE=$("${LAUNCH[@]}" "$JULIA" --project="$ENVDIR" -e '
     using CUDA, MPI
     MPI.Init()          # Open MPI answers MPIX_Query_cuda_support only after it
     MPI.versioninfo(stderr)
     CUDA.versioninfo(stderr)
     println(stderr, "MPI.has_cuda() = ", MPI.has_cuda())
-    print(MPI.has_cuda() ? 1 : 0)')
+    print(MPI.has_cuda() ? 1 : 0)' | tr -dc 01)
 echo "# has_cuda=$AWARE"
 
 RANKS="${TREEAMR_TEST_RANKS:-2 3 $NGPU}"
@@ -104,3 +118,13 @@ for T in Float64 Float32; do
         echo "=== the direct path is skipped: MPI.has_cuda() is false ==="
     fi
 done
+
+N="${TREEAMR_BENCH_N:-32}"
+echo "=== bench/mpi.jl on CUDA, host staging, N=$N ==="
+TREEAMR_BENCH_BACKEND=cuda TREEAMR_BENCH_N=$N TREEAMR_BENCH_PROJECT="$ENVDIR" \
+    TREEAMR_BENCH_DEVICEAWARE=0 "$REPO/bench/mpiscan.sh" 1 2 "$NGPU"
+if [ "$AWARE" = 1 ] || [ "${TREEAMR_DEVICEAWARE:-0}" = 1 ]; then
+    echo "=== bench/mpi.jl on CUDA, device buffers to MPI directly, N=$N ==="
+    TREEAMR_BENCH_BACKEND=cuda TREEAMR_BENCH_N=$N TREEAMR_BENCH_PROJECT="$ENVDIR" \
+        TREEAMR_BENCH_DEVICEAWARE=1 "$REPO/bench/mpiscan.sh" 1 2 "$NGPU"
+fi
