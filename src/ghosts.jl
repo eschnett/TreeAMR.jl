@@ -324,9 +324,12 @@ end
 
 # `pagelock!` is in KernelAbstractions from 0.9.40 on; where a backend
 # does not implement it, it returns `missing` and the mirror is ordinary
-# pageable memory, which is still correct.
+# pageable memory, which is still correct. An empty mirror — a stage
+# this rank only sends in, or only receives in — is not page-locked:
+# CUDA refuses to register an empty range (found on Symmetry's H200s,
+# M7 step 8), and there is nothing to copy.
 pagelock_mirror!(backend, a::Vector) =
-    isdefined(KernelAbstractions, :pagelock!) ?
+    isdefined(KernelAbstractions, :pagelock!) && !isempty(a) ?
     KernelAbstractions.pagelock!(backend, a) : nothing
 
 # Each peer's segment of a buffer, in elements: `counts` are in points,
