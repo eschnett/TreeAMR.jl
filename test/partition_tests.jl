@@ -207,13 +207,13 @@ end
 end
 
 @testset "What needs a message refuses a distributed forest, and says why" begin
-    # Until the routing and the parallel file exist, an operation that
-    # needs one must refuse rather than act on this rank's blocks as if
-    # they were the whole mesh. The exchange exists from step 3 on and the
-    # regrid from step 4, so a ghost fill gets as far as its first
-    # message, and a regrid as far as the gather of the flags, which a
-    # communicator answering only rank and size (and the digest) refuses
-    # by verb.
+    # Until the parallel file exists, an operation that needs one must
+    # refuse rather than act on this rank's blocks as if they were the
+    # whole mesh. The exchange exists from step 3 on, the regrid from step
+    # 4 and the interpolation from step 5, so a ghost fill gets as far as
+    # its first message, a regrid as far as the gather of the flags and an
+    # interpolation as far as its agreed checks, which a communicator
+    # answering only rank and size (and the digest) refuses by verb.
     serial = nested_forest(Val(2); N=8)
     forest = rank_forest(serial, 1, 3)
     fs = FieldSet(forest, 1; G=2)
@@ -223,7 +223,11 @@ end
     flags = fill(Keep, nblocks(fs))
     @test_throws "does not implement `allgatherv`" regrid!(forest, fs => sched;
                                                            flags=flags)
-    @test_throws "step 5" interpolate(fs, [(0.5, 0.5)], Lagrange(4))
+    # Interpolation routes its points from step 5 on, after one gather of
+    # each rank's checks, which this communicator answers only for the
+    # forest digest.
+    @test_throws "does not implement `allgather`" interpolate(fs, [(0.5, 0.5)],
+                                                              Lagrange(4))
     @test_throws "step 6" save_checkpoint(tempname(), forest; fieldsets=("u" => fs,))
     # A reduction needs `allgather`, which this communicator lacks; the
     # refusal names the verb rather than failing inside the fold.

@@ -386,7 +386,7 @@ function refuse_distributed(forest::Forest, what::AbstractString, why::AbstractS
         "implemented yet: $why. It arrives with M7 (see \"Distributed meshes\" in " *
         "CODE.md); until then a distributed forest supports the partition, the " *
         "field set storage, the geometry, the ghost exchange, the interface " *
-        "restriction, the reductions and the regrid."))
+        "restriction, the reductions, the regrid and point interpolation."))
 end
 
 # --- The forest digest (M7) ----------------------------------------------
@@ -482,8 +482,9 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "$(join(mismatched, ", ")) than on rank 0, so it is refused on every rank: " *
         "the ghost widths, the centering, the operators and the element type must " *
         "be the same everywhere (for regrid!, so must the field sets passed, their " *
-        "variable counts, `buffer` and `transfer`), since a rank computes the data " *
-        "it sends with its own stencils and lays out what it receives by its own."))
+        "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
+        "`derivs`, `vars` and `exclude`), since a rank computes the data it sends " *
+        "with its own stencils and lays out what it receives by its own."))
     return nothing
 end
 

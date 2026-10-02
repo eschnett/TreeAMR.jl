@@ -6,8 +6,8 @@ of one contiguous run of the leaves, and every block index is local to
 the rank. The design is "Distributed meshes" in `CODE.md`; M7 is being
 implemented in steps, and so far the partition, the local block
 indexing, the distributed schedule, the ghost exchange and the interface
-restriction over MPI, and the reductions across ranks are in place. The
-regrid, point interpolation and checkpoints still refuse a distributed
+restriction over MPI, the reductions across ranks, the regrid and point
+interpolation are in place. Checkpoints still refuse a distributed
 forest.
 
 A distributed run loads MPI.jl beside TreeAMR, which loads the package's
@@ -23,7 +23,9 @@ Every forest mutation and every schedule build is then collective. A
 [`GhostSchedule`](@ref) or [`InterfaceSchedule`](@ref) built over forests
 that differ between ranks — a `refine!` made on one rank only, say — is
 refused on every rank together, with the reason, as is one built for a
-different layout on some rank.
+different layout on some rank. [`interpolate`](@ref) is collective too:
+every rank passes the same field set and arguments and its own points,
+any number of them, and gets their values back in its own order.
 
 ```@docs
 communicator

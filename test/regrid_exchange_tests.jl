@@ -230,6 +230,21 @@ function TreeAMR.allgatherv(c::GatherCommunicator, v::AbstractVector)
     foreach(part -> append!(out, part), rendezvous(c, collect(v)))
     return out
 end
+# `interpolate` routes points (step 5): every rank deposits its buffer
+# and counts, and takes its own segment of each.
+function TreeAMR.alltoallv(c::GatherCommunicator, sendbuf::AbstractVector,
+                           sendcounts::AbstractVector{<:Integer})
+    length(sendcounts) == c.size && sum(sendcounts; init=0) == length(sendbuf) ||
+        error("rank $(c.rank) passed $(length(sendcounts)) counts summing to " *
+              "$(sum(sendcounts; init=0)) for $(length(sendbuf)) elements")
+    recv, counts = eltype(sendbuf)[], Int[]
+    for (buf, cnt) in rendezvous(c, (collect(sendbuf), collect(Int, sendcounts)))
+        lo = sum(cnt[1:c.rank]; init=0)
+        append!(recv, buf[(lo + 1):(lo + cnt[c.rank + 1])])
+        push!(counts, cnt[c.rank + 1])
+    end
+    return recv, counts
+end
 TreeAMR.isend(c::GatherCommunicator, buf::AbstractVector, peer::Integer, tag::Integer) =
     TreeAMR.isend(c.mail, buf, peer, tag)
 TreeAMR.irecv(c::GatherCommunicator, buf::AbstractVector, peer::Integer, tag::Integer) =

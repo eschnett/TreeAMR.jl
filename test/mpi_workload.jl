@@ -27,6 +27,9 @@
 # rank starts in seconds. From step 4 of M7 on it regrids too: the
 # leaves and the transferred arrays after every regrid are digested
 # before any ghost fill, so the transfer itself is checked bit for bit.
+# From step 5 on it interpolates: every rank queries its own slice of one
+# global point list, and the answers gathered in rank order are the
+# serial answers in global order.
 
 using TreeAMR
 using MPI: MPI
@@ -574,6 +577,49 @@ function moving_blocks_case(tag, ::Type{T}; full=true) where {T}
     return nothing
 end
 
+# --- point interpolation (step 5 of M7) ------------------------------------
+
+# A global list of points, the same at any rank count, of which rank `r`
+# queries a contiguous slice — unevenly, rank 1 none — so that gathering
+# the answers in rank order gives them in global order. The points cover
+# the domain and run half a period beyond the periodic dimension and
+# beyond the reflecting wall, so they are wrapped and mirrored, and
+# nearly every one lives on another rank than the one that asks.
+function interpolation_points(n)
+    φ = (sqrt(5.0) - 1) / 2
+    xs = [(-1.5 + 6.0 * mod(j * φ, 1.0), -1.5 + 4.5 * mod(j * φ^2, 1.0)) for j in 1:n]
+    weights = [(2, 0, 5, 1, 3)[r % 5 + 1] for r in 0:(NRANKS - 1)]
+    cuts = [0; round.(Int, n .* cumsum(weights) ./ sum(weights))]
+    return xs[(cuts[RANK + 1] + 1):cuts[RANK + 2]]
+end
+
+function interpolate_case(tag)
+    D = 2
+    forest = forest_of((3, 3), 8; periodic=(true, false),
+                       reflecting=((false, false), (true, false)), centre=(1.4, 0.5))
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    parity = [(EvenParity, OddParity), (EvenParity, EvenParity)]
+    xs = interpolation_points(301)
+    for T in (Float64, Float32x2)
+        fs = FieldSet{T}(forest, 2; G=2, parity=parity)
+        pseudorandom!(fs)
+        f = (x, v) -> v + x[1] / 7 + x[2]^2 / 5
+        fill_ghosts!(fs, GhostSchedule(fs, OPS4); boundary=boundary_by_coordinates(f))
+        name = "$tag." * (T === Float64 ? "F64" : "F32x2")
+        if T === Float64
+            r = interpolate(fs, xs, Lagrange(4); derivs=((0, 0), (1, 0), (0, 1)),
+                            vars=[2, 1], exclude=Ellipsoid((1.4, 0.5), (0.4, 0.3)))
+            flags = gathered(forest, r.excluded)
+            emit(name, "excluded", count(flags), digest(reinterpret(UInt8, flags)))
+            emit(name, "gradient", digest(gathered(forest, r.values)))
+        end
+        r = interpolate(fs, xs, Lagrange(4))
+        emit(name, "values", length(gathered(forest, r.excluded)),
+             digest(gathered(forest, r.values)))
+    end
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -648,12 +694,21 @@ function refusals()
     n, msg = attempt(() -> regrid!(forest, fs => nothing;
                                    flags=fill(Keep, length(blockrange(forest)))))
     emit("# regrid diverged refused on", n, "of", NRANKS, "ranks:", msg)
+
+    # A point outside the domain on rank 1 only (step 5): refused on every
+    # rank before anything is routed, rank 0 naming rank 1's point.
+    forest = Forest((4, 4); N=8, comm=COMM)
+    fs = FieldSet(forest, 1; G=2)
+    n, msg = attempt(() -> interpolate(fs, RANK == 1 ? [(0.5, 0.5), (0.5, 9.0)] :
+                                           [(0.5, 0.5)], Lagrange(4)))
+    emit("# interpolate outside refused on", n, "of", NRANKS, "ranks:", msg)
     return nothing
 end
 
-# The verbs the exchange does not use yet (step 5 routes points with
-# `alltoallv`), and the one duplicate per communicator: every forest
-# over `COMM` holds the same `MPICommunicator`.
+# The verbs the exchange does not use (`alltoallv` routes interpolation
+# points from step 5 on), with empty contributions, and the one
+# duplicate per communicator: every forest over `COMM` holds the same
+# `MPICommunicator`.
 function verbs()
     NRANKS > 1 || return nothing
     world = TreeAMR.communicator(COMM)
@@ -732,6 +787,8 @@ function main()
     moving_blocks_case("M", Float64)
     moving_blocks_case("M32-", Float32; full=false)
     moving_blocks_case("M32x2-", Float32x2; full=false)
+    # Point interpolation, routed to the owners and back.
+    interpolate_case("I2")
     refusals()
     verbs()
     return nothing

@@ -8,7 +8,9 @@
 # rank with no blocks; then (step 4) the tracked pulse and Burgers' shock
 # through regrid cycles, the initial-data cycle from a single leaf, and
 # regrids that move blocks between ranks both ways and coarsen siblings
-# that had different owners, in three element types — and prints
+# that had different owners, in three element types; then (step 5) point
+# interpolation, each rank asking for its own slice of a global point
+# list, and an outside point on one rank refused on all — and prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
 # reductions and the floating-point sums. Run serially in this
@@ -98,6 +100,11 @@ end
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
     @test count(l -> occursin(" unchanged false", l), lines) == 4
+    # Point interpolation (step 5): every point answered, some flagged.
+    @test count(startswith("I2"), lines) == 5
+    @test all(l -> split(l)[3] == "301", filter(l -> occursin(" values ", l) &&
+                                                     startswith(l, "I2"), lines))
+    @test 0 < parse(Int, split(only(filter(startswith("I2.F64 excluded"), lines)))[3]) < 301
     # Three levels wherever they were asked for.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p"), lines))
@@ -158,6 +165,14 @@ end
                          "# regrid diverged refused on $n of $n ranks: the forest differs " *
                          "between ranks, so regrid! is refused")
         @test "# regrid refusals left the forest alone true" in hashes
+        # A point outside the domain on rank 1 only (step 5), refused on
+        # every rank, rank 0 naming rank 1's point.
+        @test startswith(refused("interpolate outside"),
+                         "# interpolate outside refused on $n of $n ranks: interpolate is " *
+                         "refused on every rank, this one (rank 0) included, since " *
+                         "rank(s) 1 of $n passed a point outside the domain")
+        @test occursin("On rank 1, point 2, (0.5, 9.0), is outside the domain",
+                       refused("interpolate outside"))
         # What the regrid acceptance asks for actually happened at this
         # rank count: blocks moved up the ranks when the first ones were
         # refined and down again when they were coarsened, and a coarsened

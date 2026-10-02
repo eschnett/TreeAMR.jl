@@ -1459,7 +1459,13 @@ change. The location already produces exactly the block index that
 routing needs. *(Designed 2026-10-01 under
 [Distributed meshes](#distributed-meshes): the location stays on the
 host against the replicated leaves, two `alltoallv`s route the points
-to their owners and the values back, and the kernel is unchanged.)*
+to their owners and the values back, and the kernel is unchanged.
+Implemented in M7's step 5, with the kernel unchanged except for one
+argument, the block offset, which is 0 serially. Over a distributed
+forest an outside point is found on the host before anything is
+routed, and refused on every rank there, rather than after the launch.
+A device batch goes through the host for the messages. The serial path
+measured the same before and after.)*
 
 ### Checkpoint and restart
 
@@ -3578,6 +3584,85 @@ each rank's first one, so every rank throws the same `ArgumentError`
 together, instead of one rank throwing while the others wait in the
 next collective. Ghosts must be current, as now.
 
+*(Step 5, where this was implemented; what it settled, and where it
+amends the four steps above:)*
+
+- *The contract.* Every rank passes the same field set, basis, `derivs`,
+  `vars` and `exclude`, and its own points, any number or none; it gets
+  the answers for its own points, in its own order, on the field set's
+  backend. An owner evaluates the points it receives with its *own*
+  arguments, so those that shape the evaluation must agree, and are
+  hashed for the check below; the points are the only per-rank input.
+- *One `allgather` before anything is sent* (amended: the four steps had
+  the outside points agreed after the values returned). The location runs
+  on the host, before the routing, so a rank knows its outside points
+  before it sends anything, and the same gather that agrees on them can
+  carry everything else a refusal on one rank would leave hanging. It is
+  a `ForestDigest` — this rank's refusal flag, the generation, `nleaves`
+  and a hash of the arguments above, with the leaf fold and the brick
+  zeroed — beside the rank's first outside point, if any, and that point
+  as `NTuple{D,T}`. `digest_verdict` gives the verdict on the first part,
+  whose layout message now names interpolation's arguments too. So a
+  refused batch, for any reason, routes nothing and writes nothing;
+  serially the in-domain values are written before the throw, which the
+  docstring never promised either way.
+- *Not the full forest digest.* Its fold over every leaf costs about
+  14 ns a leaf — 10 µs at 288 leaves, 38 µs at 2304, 260 µs at 18432
+  (measured, `D = 3`) — against 0.11 ms for the 496-point horizon batch
+  at four threads. Per call at analysis cadence it would cost as much as
+  the interpolation, while the generation and the leaf count catch every
+  mutation made on one rank only, and the schedule builds and regrids
+  check the leaves themselves.
+- *Not the same message on every rank* (amended: the design said every
+  rank throws the same `ArgumentError`). A rank that passed an outside
+  point raises the serial message for its own first one, with a sentence
+  naming the ranks that passed any; every other rank names the first such
+  rank, its point index and the point. A rank's own point is what its
+  caller can act on, and the others still all throw, together.
+- *The messages.* Points travel as `NTuple{D,T}` — converted on the host
+  by the same `T(x[d])` the serial kernel applies first, so the owner's
+  fold, location and stencil start from the same bits. MPI.jl sends an
+  `isbits` element type through a derived datatype it builds and caches
+  (`Datatype(T)` in its `datatypes.jl`), which covers `Float32x2` points
+  and values as it does in the regrid stage. Then the values come back as
+  a flat vector of `T`: the received points are concatenated in rank
+  order, so each asking rank's answers are one contiguous segment of the
+  owner's `(nvars, K, n)` output. The `exclude` flags take a third
+  `alltoallv`, of `Bool` (`MPI_C_BOOL`), only when there is a region;
+  every rank knows whether there is one, since it is agreed. Each
+  `alltoallv` is an `Alltoall` of the counts and the `Alltoallv`, so a
+  batch costs one `allgather` and four or six all-to-all calls; the
+  return could reuse the known counts, which was not worth a verb.
+- *The order.* A stable counting sort by owner gives each owner a rank's
+  points in that rank's order, and the inverse permutation puts the
+  answers back. Bit for bit, the value of a point is the serial one: the
+  same kernel, the same point, the same block's array (ghosts included,
+  which the distributed fill made bit-identical) and the same stencil.
+- *One kernel, one more argument.* `interpolate_kernel!` takes the block
+  offset, `first(blockrange) − 1`, which is 0 serially. The owner
+  re-folds and re-locates each point it receives — the kernel's own
+  search, against the replicated leaves — rather than receive the leaf:
+  that keeps the serial kernel unchanged, and it makes the kernel's
+  per-point leaf a check. Every received point must locate in the
+  owner's own blocks, and otherwise the owner raises an error saying the
+  forests differ. That error is raised on one rank only, but it can
+  only follow a broken collective contract that the generation check
+  missed.
+- *A device backend goes through the host.* The points are copied to the
+  host for the location and the routing, the received ones uploaded for
+  the kernel, its results downloaded for the return, and the answers
+  uploaded into the caller's arrays. At analysis cadence, hundreds of
+  points of `nvars × K` values, those copies are small, and the device
+  location stays the serial path's. Step 8's device buffers are for the
+  exchange; nothing here needs them. Checked once on Metal in process
+  (`Float32`, three simulated ranks, one with no points, value, gradient
+  and an excluded ball): bitwise equal to the serial Metal call. That
+  check is a scratch script, not part of the suite, which has no device
+  in its environment.
+- *The host location* is one search per point at tens of nanoseconds, so
+  it runs serially below 4096 points and through `threaded_foreach`
+  above, every point writing only its own slot.
+
 **Parallel checkpoints** (parallel HDF5 in M7, decided 2026-10-01 with
 Erik). One shared file, with the version-1 layout unchanged:
 `format_version` stays 1, and a file restarts on any rank count, serial
@@ -4805,7 +4890,94 @@ M7's benchmarks. The list below is in execution order.
   - **Step 5 — interpolation routing.** *Accept:* an interpolation line
     in the workload, bit-identical to serial; a rank that passes no
     points; and an outside point refused on every rank with the same
-    reason.
+    reason. *(Amended in step 5: every rank refuses together, but a rank
+    that passed an outside point names its own, and the others name the
+    first rank's; see "Point interpolation" in
+    [Distributed meshes](#distributed-meshes).)*
+
+    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
+    plan (the design decisions are recorded under "Point interpolation"
+    in [Distributed meshes](#distributed-meshes)):
+    - *The driver.* `interpolate!` over a distributed forest goes to
+      `interpolate_distributed!` in `interpolate.jl`: the serial
+      argument checks, factored into `check_interpolation`, run inside
+      one agreed gather together with the cheap forest check, a hash of
+      the arguments that must agree and the rank's first outside point;
+      then the host location, the route by a stable counting sort and
+      `alltoallv`, the kernel over the received points through
+      `launch_interpolation!` — the serial launch, factored out, with
+      the block offset — and the return of the values, and of the flags
+      when there is a region, into the caller's order. `interpolate`
+      itself defers a refusal of `derivs` to `interpolate!` over a
+      distributed forest, so that it too is agreed. The step-1 refusal
+      is gone; `refuse_distributed` now serves only the checkpoint.
+    - *In process*, `test/interpolate_exchange_tests.jl`, over
+      `regrid_exchange_tests.jl`'s rendezvous communicator, which gains
+      an `alltoallv`. Every simulated rank queries an uneven slice of
+      one point list — rank 1 none — and must reproduce its part of the
+      serial `interpolate` bit for bit: value and gradient of two
+      variables in reverse order with an excluded ball, the value alone
+      of every variable without a region, and `interpolate!` into
+      caller-supplied outputs from points given as vectors. The points
+      run beyond periodic dimensions and reflecting walls, sit on every
+      leaf's lower corner (so on every rank boundary) and on the
+      domain's corners, over random data in every stored point. The
+      cases are `D = 1` with a reflecting wall at 2 and 3 ranks and
+      periodic at `nleaves + 2` ranks (two of them without blocks);
+      `D = 2` reflecting at both ends and periodic, vertex-centered, at
+      3 ranks, outer and cell-centered at 5, and a face-centered
+      `Float32` set at 3; `D = 3` with a reflecting, an outer and a
+      periodic dimension at 4. The refusals at 3 ranks: an outside
+      point on rank 1 (its message and the others'), outside points on
+      ranks 0 and 2 with rank 1 passing none, `derivs` only rank 0's
+      checks refuse, `vars` and `exclude` that differ on one rank, and
+      a forest refined on one rank.
+    - *The workload.* `test/mpi_workload.jl` gains a 2D case, periodic
+      in x₁, reflecting below in x₂ and outer above, three levels and an
+      odd variable, over pseudo-random data with the ghosts filled:
+      every rank asks for its own uneven slice (rank 1 none) of 301
+      points running half a period and half a domain beyond the faces,
+      and rank 0 digests the gathered answers, which are then in
+      global order — value and gradient of two variables with an
+      excluded ellipse and its flags in `Float64`, the value alone in
+      `Float64` and `Float32x2`. A `#` line refuses an outside point on
+      rank 1, and `mpi_tests.jl` asserts it is refused on every rank
+      with rank 0 naming rank 1's point.
+    - *Measured.* The workload at `-n 2`, `3` and `4`, one thread a
+      rank, prints the serial lines byte for byte except the `sum`
+      lines, which differ in the last one or two of 17 digits where they
+      differ, as in step 4; the five interpolation lines are
+      byte-identical at every rank count. 44–47 s of wall clock per
+      run, against 39–42 s in step 4, the serial run 38 s. On Metal, a
+      scratch script found the device path bitwise equal to the serial
+      Metal call (the device bullet under "Point interpolation" in
+      [Distributed meshes](#distributed-meshes)); it is not in the suite.
+    - *Serial cost* (`bench/interpolate.jl` with `N = 8`, 4³ roots and
+      176 leaves, 20 variables, value and gradient with an excluded
+      ball, best of 200 calls; HEAD before and after, alternated, four
+      runs each). At one thread the 496-point batch took 0.353–0.368 ms
+      before and 0.363–0.370 ms after, 4960 points 3.61–3.66 ms against
+      3.64–3.71 ms; at four threads 0.109–0.114 ms against
+      0.110–0.114 ms and 0.981–0.998 ms against 0.979–0.992 ms. That is
+      within the run-to-run spread. A call allocates 32 bytes more at
+      one thread (10320 against 10288) and 96 more at four (13232
+      against 13136), the block offset in the kernel's arguments.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes `interpolate_tests.jl`, `partition_tests.jl`,
+      `exchange_tests.jl`, `regrid_exchange_tests.jl`,
+      `interpolate_exchange_tests.jl` and `mpi_tests.jl` (3m06
+      together); the whole suite was not run there.
+    - *Suite cost.* 109038 tests at one thread in 7m49 and 109090 at
+      eight in 8m09: 211 more than step 4 at each — the 204 of
+      `interpolate_exchange_tests.jl` and 7 more in `mpi_tests.jl`;
+      `partition_tests.jl`'s interpolation refusal became a refusal by
+      verb, one test for one. The thread-independence digests are
+      unchanged. The docs build. The step-4 tree, run the same day on
+      the same machine, took 7m02 at one thread, so the suite grew by
+      about 47 s; of that the new tests account for about 24 s when run
+      standalone — `interpolate_exchange_tests.jl` 13.5 s, nearly all of
+      it compilation, and `mpi_tests.jl` 125 s against the step-4 tree's
+      114 s — and the rest was not separated from the run-to-run spread.
+      The `Float32` and 3D cases of the new file are what to trim first.
   - **Step 6 — parallel checkpoints.** `TreeAMRHDF5MPIExt` and the hooks
     in `TreeAMRHDF5Ext`. *Accept:* save at `-n 3`, then load at `-n 2`,
     at `-n 1` and serially, each continuation byte-identical to the
