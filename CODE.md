@@ -3047,7 +3047,9 @@ entries per volume — documented here, implemented post-M3.
 decided with Erik that day and are marked so; the rest follows from
 them and from the sections cited, and is open to amendment as the
 implementation measures it. The steps are in the M7 entry under
-[Milestones](#milestones).)* M7 runs one forest over several
+[Milestones](#milestones). Implemented in them by 2026-10-02, the
+amendments marked where they were made; the cluster measurements of
+steps 6–8 are open.)* M7 runs one forest over several
 processes. It came after M8 and M10 on purpose: every centering, the
 interface restriction and the mirrored transfers at reflecting faces
 are now entries of one schedule, so distributing the schedule
@@ -4149,7 +4151,8 @@ checkpoint and restart** (decided 2026-09-29), because the downstream
 applications need to restart long runs before they need MPI. M9 is
 split for it: its second half, M9b (visualization export), stays after
 M7. M9a's layout was chosen so that M7 need not change it, subject to
-M7's benchmarks. The list below is in execution order.
+M7's benchmarks. The list below is in execution order. M7 is implemented
+(2026-10-02), with its cluster measurements open, so M9b is next.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -4629,7 +4632,8 @@ M7's benchmarks. The list below is in execution order.
     into scratch copies, at one thread: TreeWave 310 tests in 1m12, and
     TreeHydro 11893 in 4m16. Neither calls the new functions yet; each
     gains them with `using HDF5` once a release carries them.
-- **M7 — MPI.** Curve partitioning, distributed ghost exchange (for
+- **M7 — MPI.** *(Implemented 2026-10-02; the Symmetry measurements of
+  steps 6–8 are open.)* Curve partitioning, distributed ghost exchange (for
   every centering, and the interface restriction with it, since both are
   transfers over the same schedule machinery), distributed regridding,
   and the `Allreduce` inside `mesh_mapreduce` (the planned global
@@ -5772,7 +5776,198 @@ M7's benchmarks. The list below is in execution order.
     and TreeHydro green in scratch copies against the checkout, with
     the audit for `nleaves`-sized per-block arrays done in all three
     downstreams; M7 marked *(Done.)*. Tagging the release is left to
-    Erik.
+    Erik. *(Amended in step 9: M7 is marked implemented rather than
+    done, since the acceptance's weak-scaling table and the H200 run
+    are scripted and not run; see the milestone's heading.)*
+
+    *(Done, 2026-10-02.)* What it settled:
+    - *Suite cost, and what was trimmed.* After step 8 the suite took
+      about 8 minutes at one thread, against M9a's 4m16, and
+      `mpi_tests.jl` was the largest file: 123–128 s, the serial
+      reference in process and then `mpiexec -n 3` and `-n 2` one after
+      the other, each launch about 55 s of wall clock and, by a timed
+      copy of the workload, almost all of it compilation (a fresh serial
+      process spends about 20 s compiling `main`'s call tree before its
+      first case runs, and the cases' own time is about 19 s). Nothing
+      orders the launches but the checkpoint cross loads, so they now
+      overlap. Each run leaves an empty marker beside its checkpoints
+      once they are written, and `TREEAMR_CHECKPOINT_FROM` names the
+      rank counts whose files a run waits for and loads; every rank
+      waits on its own, sleeping, so none spins in MPI meanwhile, and a
+      run by hand without the variable loads whatever it finds, as
+      before. A new helper, `test/mpi_jobs.jl`, starts both jobs at the
+      start of the suite where the machine has room for five ranks
+      beside it — eight threads and 24 GB, since a rank measured about
+      2 GB resident — and `mpi_tests.jl` collects them; elsewhere, a CI
+      runner among them, the three-rank job runs beside the serial
+      reference and the two-rank job after it.
+      `TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice. Two
+      type repeats went, each of a path covered elsewhere: the
+      workload's `Float32` regrid case (`Float32` crosses MPI as a
+      native type, its regrid stage is checked bitwise in process by
+      `regrid_exchange_tests.jl`, and `Float32x2`, which MPI sends
+      through a derived datatype, stays), and `exchange_tests.jl`'s
+      pack/unpack round trip in `Float32` in 1D and 3D and in `Float32x2`
+      in 1D, 29 tests (`Float32` stays in 2D, `Float32x2` in 2D and 3D,
+      where remote mirrored transfers exist). No claim of an acceptance
+      list went with them: every case the step-3 to step-6 acceptances
+      name is still in the workload, at both rank counts, and every type
+      the step-2 round trip names is still in it. The thread-independence
+      test was not touched.
+
+      Per file, one thread, timed around each `include` in a scratch
+      copy of `runtests.jl` (s; before and after on the same machine,
+      the same day):
+
+      | file | before | after |
+      |---|---|---|
+      | inline M1 tests | 10.7 | 14.7 |
+      | `ghost_tests.jl` | 14.2 | 18.0 |
+      | `centering_tests.jl` | 25.7 | 30.5 |
+      | `reflect_tests.jl` | 28.7 | 29.5 |
+      | `interpolate_tests.jl` | 18.0 | 23.4 |
+      | `interface_tests.jl` | 5.2 | 5.1 |
+      | `partition_tests.jl` | 8.8 | 8.2 |
+      | `exchange_tests.jl` | 40.1 | 32.8 |
+      | `regrid_exchange_tests.jl` | 20.3 | 19.0 |
+      | `interpolate_exchange_tests.jl` | 13.2 | 12.9 |
+      | `allvariables_tests.jl` | 8.3 | 8.1 |
+      | `state_tests.jl` | 7.6 | 7.5 |
+      | `regrid_tests.jl` | 10.4 | 10.8 |
+      | `wave_tests.jl` | 4.2 | 4.2 |
+      | `wave_cell_tests.jl` | 2.3 | 2.3 |
+      | `burgers_tests.jl` | 16.6 | 17.2 |
+      | `imex_tests.jl` | 5.6 | 5.3 |
+      | `type_tests.jl` | 12.8 | 13.4 |
+      | `checkpoint_tests.jl` | 26.6 | 28.6 |
+      | `thread_tests.jl` | 50.2 | 50.3 |
+      | `mpi_tests.jl` | 127.8 | 15.0 |
+      | `gpu_tests.jl` | 27.5 | 27.0 |
+      | whole run | 489.6 | 386.5 |
+
+      The files that run while the jobs compile lose 4–6 s each, about
+      20 s in all, to the five ranks on the other cores (an M3 Pro, six
+      performance and six efficiency cores); the net is 103 s. On the
+      sequential path, which is CI's, `mpi_tests.jl` alone takes 1m47
+      (130 tests), against step 6's 2m34 for three launches in a row,
+      and the whole suite, forced onto that path here with
+      `TREEAMR_TEST_MPI_CONCURRENT=0`, 7m52 (110484 tests), within the
+      run-to-run spread of the 7m55 before (steps 5–8 measured 7m49 to
+      8m10). So the trim is a local saving: a CI cell, whose runner has
+      no room for the jobs beside the suite, is not expected to get
+      faster, and launching them there anyway was not tried, since a
+      `macos-latest` runner has 7 GB for the main process and five ranks
+      of about 2 GB.
+    - *CI.* `.github/workflows/CI.yml` needed no change for MPI: MPI.jl's
+      default binary is MPICH_jll, an artifact on both runners'
+      platforms, and the parallel HDF5_jll build matching it is chosen
+      by MPIPreferences with nothing configured ("What the feasibility
+      check found"); the ranks run at one thread whatever
+      `JULIA_NUM_THREADS` says, and inherit `--check-bounds=yes` and,
+      on the single-threaded cells, `--code-coverage` through
+      `Base.julia_cmd()`, so their `.cov` files are merged with the
+      rest. The job gained a `timeout-minutes` of 120, since a process
+      stuck outside the test's own deadlines would hold a runner for
+      GitHub's default six hours. **None of it has run on GitHub**: the
+      branch is not pushed. What is unverified there: that MPICH's
+      launcher starts on the hosted macOS runner; the memory of a
+      `macos-latest` runner (7 GB) against the main process and three
+      ranks of about 2 GB each, which may swap; and the time of the
+      coverage cells, whose ranks are instrumented too (the deadline is
+      900 s a launch, against about 55 s uninstrumented here).
+    - *Docs.* A guide section, "Running distributed", in
+      `docs/src/index.md`; the status there and in `README.md`; the
+      distributed API page pointing at the guide. Two examples that
+      were right only serially were fixed: `firing_boxes`' verdict used
+      `level(forest.leaves[b])`, and the regridding section named
+      `forest.leaves[b]` as the way to tell blocks apart; both are
+      `blockkey(fs, b)`. The docs build.
+    - *Fixed upstream from the audit.* `buffered_flags` now refuses a
+      flag vector that is not one per leaf, as `complete_marks` already
+      did: TreeGeneralizedHarmonic calls it with `flag_blocks`' flags,
+      which over a distributed forest are a rank's local blocks, and
+      without the check it buffered around leaves `1:nblocks` and wrote
+      global recruit indices into the local vector — silently. The
+      `DimensionMismatch` says to pass the local flags to `regrid!` with
+      `buffer` instead. And `block_mapreduce`'s docstring had shown
+      `maximum(block_mapreduce(…))` as a refinement scale, the
+      rank-local pattern two downstreams copied; it shows
+      `mesh_mapreduce` now and says why.
+    - *The downstreams*, each copied to scratch with this checkout
+      developed into the copy, at one thread: TreeWave 310 tests in 1m22
+      (`Pkg.test`'s summary; 310 in 1m12 against the M9a checkout);
+      TreeHydro 12447 in 5m00 (11893 in 4m16 then; it has grown since);
+      TreeGeneralizedHarmonic, whose whole suite takes about 19 minutes,
+      a subset of 1760 tests in 7m04 — `precision_`, `prerequisite_`,
+      `stencils_`, `stepping_`, `interface_`, `refinement_`, `horizon_`,
+      `checkpoint_` and `type_tests.jl`, the files that reach TreeAMR
+      most directly (its names, the partition, the exchange, the
+      buffer, `interpolate`, checkpoints, the element types). All pass,
+      so the local block indices, the new check in `buffered_flags` and
+      the rest of M7 change nothing serially for them.
+    - *The audit* (read-only, of each downstream's `src/` and `bin/`
+      against the list under "What an application must make global
+      itself"). None of the three passes `comm` to a `Forest` yet, so
+      today an `mpiexec` launch runs a full serial copy per rank, and
+      nothing below is wrong until one does. None indexes
+      `forest.leaves` by a block index or sizes a per-block array by
+      `nleaves`, with the exceptions named. What would go wrong once it
+      is distributed:
+      - *TreeWave.* `field_scales` (`src/refinement.jl:112`) is
+        `maximum(block_mapreduce(…))`, so the Löhner reference amplitude
+        becomes per rank: the mesh would depend on the rank count, and an
+        empty rank would throw on `maximum` of nothing and leave the
+        others in the next collective. `blast_coverage`
+        (`src/blast.jl:281–295`) and `track_pulse`'s tracking measure
+        (`src/supergaussian.jl:188–195`) are rank-local diagnostics.
+        Its integrators are fixed-step, so no adaptive norm. The viewers
+        in `bin/` would plot one rank's blocks.
+      - *TreeHydro.* Five functions combine `block_mapreduce` on the host
+        — `max_signal_speed` (`src/evolution.jl:477`), `floor_hits`
+        (`:505`), `ghost_floor_hits` (`:578–585`), `indicator_scales`
+        (`src/refinement.jl:189–190`), `peak_compression`
+        (`src/sedov.jl:512`) — and the first is the CFL speed: `evolve!`
+        derives each chunk's step count from it (`src/driver.jl:857–860`),
+        so the ranks would take different numbers of steps and hang in
+        the exchange; `entropywave_errors`, `sedov_static` and the
+        `check_cfl` calls do the same. Its time-based checkpoint triggers
+        read each rank's own clock (`src/driver.jl:910–917`), so some
+        ranks would enter the collective `save_checkpoint` and others
+        not. The run state it checkpoints holds the rank-local counts and
+        speeds, which `write_plain`'s agreement would refuse on every
+        rank. `tracked_share`, `reduce_to_grid`, `mode_amplitude`,
+        `max_y_kinetic_energy`, `shock_radius` are rank-local
+        diagnostics, and `src/kelvinhelmholtz.jl:544` records
+        `nblocks` where the mesh's block count is meant.
+      - *TreeGeneralizedHarmonic.* Its reductions are already
+        `mesh_mapreduce` (the speed, the bounds, the constraint norms),
+        and its integrator is fixed-step. But `indicator_flags` passes
+        local flags to the public `buffered_flags`
+        (`src/refinement.jl:739`) — now refused, above — and
+        `clamp_marks` (`:762`) and `refinement_centroid` (`:816`) index
+        `forest.leaves[b]` by a local block, the centroid's sums staying
+        per rank too; `nfiring` (`:743`) is a local count. Its
+        time-based checkpoint triggers read each rank's clock
+        (`src/driver.jl:1287–1293`), its run state holds wall-clock fit
+        costs and the rank-local centroids (`:1312`), which the agreement
+        would refuse, and its non-finite check (`:741`) reads the local
+        state only, so one rank would throw alone. Its horizon finder
+        passes every point on every rank, which is correct under M7's
+        collective `interpolate` and only redundant.
+      None of these is fixed here: they are the downstreams' to fix
+      when they distribute.
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes the
+      whole suite, 110484 tests in 6m46 at one thread, with the MPI jobs
+      started early as on 1.13. It resolves MPICH_jll there, the binary
+      CI's runners get, against MPIABI_jll on 1.13.1 here (the global
+      preference), and IMEXRungeKutta 1.3.0 from `main`, against the 1.1.0
+      the 1.13 test manifest holds.
+    - *Suite cost.* 110484 tests at one thread in 6m25 and 110536 at
+      eight in 6m21 (`Pkg.test`), against 7m55 and 7m51 after step 8.
+      The differences from the step-7 follow-up's 110511 and 110563 are the
+      29 tests of the round trip and two new `buffered_flags`
+      assertions. The thread-independence digests are unchanged. The
+      docs build.
 - **M9b — Visualization export.** *(Split from M9, "I/O and
   visualization", on 2026-09-29, when its checkpoint half became M9a;
   not designed.)* After M7. The candidates:
