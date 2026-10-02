@@ -4,6 +4,7 @@ version = "0.1.4"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
+CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 
 [weakdeps]
@@ -16,6 +17,7 @@ TreeAMRHDF5MPIExt = ["HDF5", "MPI"]
 TreeAMRMPIExt = "MPI"
 
 [compat]
+CRC32c = "1"
 HDF5 = "0.17"
 KernelAbstractions = "0.9.42, 1"
 MPI = "0.20"

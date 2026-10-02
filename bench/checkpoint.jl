@@ -54,7 +54,12 @@
 #   the read and the `scatter!`. The ghosts are not filled, as in the
 #   function itself.
 #
-# Every load is checked to return the saved state bit for bit.
+# Every save is checked, untimed, by a load that must return the saved
+# leaves and state bit for bit on every rank, so a file damaged while it
+# was written cannot pass (on a cluster file system one did: "Parallel
+# checkpoints" under "Distributed meshes" in CODE.md, M7 step 6). The
+# load verifies the file's checksums too, and refuses damage with its
+# reason.
 #
 # **Under MPI** (the argument `mpi`, launched by `mpiexec`; the test
 # environment has MPI) the forest is distributed over `MPI.COMM_WORLD`,
@@ -193,15 +198,32 @@ function timed(f, comm)
     return maximum(TreeAMR.allgather(comm, t))
 end
 
-function best(f, comm, reps=REPS)
+# The best of `reps` timed calls after an untimed first one; `check`, if
+# given, runs untimed after every call, the first included.
+function best(f, comm, reps=REPS; check=nothing)
     GC.gc()
     f()
+    check === nothing || check()
     t = Inf
     for _ in 1:reps
         GC.gc()
         t = min(t, timed(f, comm))
+        check === nothing || check()
     end
     return t
+end
+
+# Whether the checkpoint at `path`, as loaded, holds `forest`'s leaves and
+# the state `u` bit for bit, on every rank; an error saying which rank's
+# part differs, on every rank, if not.
+function verify(path, forest, u, what)
+    ck = load_checkpoint(path; comm=COMM)
+    exact = ck.forest.leaves == forest.leaves &&
+            reinterpret(UInt8, ck.fieldsets["U"].state) == reinterpret(UInt8, u)
+    ok = TreeAMR.allgather(forest.comm, exact)
+    all(ok) || error("$what did not round-trip bit for bit on rank(s) ",
+                     join(findall(!, ok) .- 1, ", "))
+    return nothing
 end
 
 # A line printed by rank 0 alone.
@@ -240,15 +262,11 @@ function main()
             save(sync) = save_checkpoint(path, forest; fieldsets=("U" => (fs, u),),
                                          application="bench" => 1, data=(; t=0.0),
                                          filters=filters, sync=sync)
-            t_save = best(() -> save(false), comm)
-            t_sync = best(() -> save(true), comm)
+            check() = verify(path, forest, u, "$dname with $fname")
+            t_save = best(() -> save(false), comm; check=check)
+            t_sync = best(() -> save(true), comm; check=check)
             fsize = filesize(path)
             t_load = best(() -> load_checkpoint(path; comm=COMM), comm)
-            ck = load_checkpoint(path; comm=COMM)
-            exact = ck.forest.leaves == forest.leaves &&
-                    reinterpret(UInt8, ck.fieldsets["U"].state) == reinterpret(UInt8, u)
-            all(TreeAMR.allgather(comm, exact)) ||
-                error("$dname with $fname did not round-trip bit for bit")
             say("%-6s %-20s %9.1f %9.1f %9.1f %7.2f %8.2f %8.2f %8.2f\n", dname, fname,
                 bytes / 1e6, maximum(shares) / 1e6, fsize / 1e6, bytes / fsize,
                 bytes / t_save / 1e9, bytes / t_sync / 1e9, bytes / t_load / 1e9)

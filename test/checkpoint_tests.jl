@@ -378,13 +378,57 @@ end
     @test_throws "collection of types" load_checkpoint(narrowpath; types=(1,))
 
     # A leaf list out of order is refused by the forest, as it would be
-    # from any other caller.
+    # from any other caller: here without the checksum, which would refuse
+    # it first, as in a file written before there were checksums.
     swapped = edited_copy(path, "swapped.h5") do file
         roots = file["TreeAMR.jl/forest/root"]
         r = read(roots)
         roots[1:2] = r[[2, 1]]
+        delete_attribute(file["TreeAMR.jl/forest"], "leaves_crc32c")
     end
     @test_throws "out of curve order" load_checkpoint(swapped)
+
+    # Damage that leaves a valid file: a leaf column's rows zeroed, as one
+    # rank's were in the four-node run that showed the need (M7 step 6),
+    # and one value of a field set changed, in the contiguous layout and
+    # in the chunked one. The checksums are what refuse them; without
+    # them, a file from before they existed, an intact one still loads.
+    big = Forest((4, 4); N=4, periodic=(true, true))
+    refine!(big, big.leaves[[1, 6]])
+    bigfs = FieldSet(big, 2; G=1)
+    fill_by_coordinates!((x, v) -> x[1] + 2x[2] + v, bigfs)
+    for filters in ((), (HDF5.Filters.Shuffle(), HDF5.Filters.Deflate(1)))
+        intact = joinpath(dir, "intact.h5")
+        save_checkpoint(intact, big; fieldsets=("u" => bigfs,), application="Refusals" => 1,
+                        filters=filters)
+        zeroed = edited_copy(intact, "zeroed.h5") do file
+            coords = file["TreeAMR.jl/forest/coords"]
+            c = read(coords)
+            c[:, 9:14] .= 0
+            coords[:, :] = c
+        end
+        @test_throws "the leaf list does not match the checksum" load_checkpoint(zeroed)
+        @test_throws "refused rather than read into a wrong mesh" load_checkpoint(zeroed)
+        @test_throws "checkpoint_environment(path, dir)" load_checkpoint(zeroed)
+        changed = edited_copy(intact, "changed.h5") do file
+            data = file["TreeAMR.jl/fieldsets/u/data"]
+            d = read(data)
+            d[3, 2, 1, 7] += 1
+            data[:, :, :, :] = d
+        end
+        @test_throws("the data of field set \"u\" do not match the checksums stored " *
+                     "with them in 1 of its $(nleaves(big)) blocks, the first being block 7",
+                     load_checkpoint(changed))
+        unsummed = edited_copy(intact, "unsummed.h5") do file
+            delete_attribute(file["TreeAMR.jl/forest"], "leaves_crc32c")
+            delete_object(file["TreeAMR.jl/fieldsets/u"], "data_crc32c")
+        end
+        ck = load_checkpoint(unsummed)
+        @test ck.forest.leaves == big.leaves
+        u = statevector(bigfs)
+        gather!(u, bigfs)
+        @test bytes(ck.fieldsets["u"].state) == bytes(u)
+    end
 
     @test_throws "no field set named \"nope\"; it holds \"u\"" load_checkpoint(
         path; fieldsets=("nope",))

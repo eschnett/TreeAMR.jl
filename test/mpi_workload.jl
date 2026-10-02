@@ -980,7 +980,67 @@ function checkpoint_refusals()
     emit("# load layout refused on", n, "of", NRANKS, "ranks:", msg)
     n, msg = attempt(() -> load_checkpoint(joinpath(dir, "missing.h5"); comm=COMM))
     emit("# load missing refused on", n, "of", NRANKS, "ranks:", msg)
+    # Damage only the last rank's blocks can see — one value of its last
+    # block, changed by rank 0 alone between the save and the load — is
+    # refused by the checksums on every rank, which is the agreement: the
+    # other ranks' own blocks are intact. This is the multi-node
+    # corruption of step 6 made by hand, since the suite runs on one node,
+    # where the file system is coherent and none happens on its own.
+    damaged = joinpath(dir, "damaged-n$NRANKS.h5")
+    save_checkpoint(damaged, forest; fieldsets=("u" => fs,), application="Refused" => 1)
+    if RANK == 0
+        HDF5.h5open(damaged, "r+") do file
+            data = file["TreeAMR.jl/fieldsets/u/data"]
+            d = read(data)
+            d[2, 3, 1, end] += 1
+            data[:, :, :, :] = d
+        end
+    end
+    TreeAMR.allgather(world, true)
+    n, msg = attempt(() -> load_checkpoint(damaged; comm=COMM))
+    emit("# checkpoint damage refused on", n, "of", NRANKS, "ranks:", msg)
+    # The file is opened with the hints that keep MPI-IO from rewriting
+    # bytes other ranks wrote (`TreeAMRHDF5MPIExt`), and ROMIO, MPICH_jll's
+    # MPI-IO, reports them as in effect.
+    probe = joinpath(dir, "hints-n$NRANKS.h5")
+    file = TreeAMR.open_parallel_file(TreeAMR.librarycomm(world), probe, "w")
+    hints = try
+        romio_hints(file)
+    finally
+        close(file)
+    end
+    emit("# checkpoint hints", hints)
     return nothing
+end
+
+# The MPI-IO hints in effect on an open parallel HDF5 file, as the MPI
+# library reports them for its file handle.
+function romio_hints(file)
+    API = HDF5.API
+    fapl = API.h5f_get_access_plist(file)
+    handle = Ref{Ptr{Cvoid}}()
+    try
+        API.h5f_get_vfd_handle(file, fapl, handle)
+    finally
+        API.h5p_close(fapl)
+    end
+    fh = unsafe_load(Ptr{MPI.API.MPI_File}(handle[]))
+    ref = Ref{MPI.API.MPI_Info}()
+    MPI.API.MPI_File_get_info(fh, ref)
+    info = MPI.Info(ref[])
+    try
+        # MPI.jl's `Info` is an `AbstractDict` without `get`.
+        value(key) = try
+            info[key]
+        catch err
+            err isa KeyError || rethrow()
+            "absent"
+        end
+        return join(["$key=$(value(key))" for key in (:romio_ds_write, :romio_cb_write)],
+                    " ")
+    finally
+        MPI.free(info)
+    end
 end
 
 # --- the cases --------------------------------------------------------------

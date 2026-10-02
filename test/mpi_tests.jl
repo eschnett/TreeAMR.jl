@@ -206,6 +206,18 @@ end
                          "called for a different layout on rank(s) 1")
         @test startswith(refused("load missing"), "# load missing refused on $n of $n " *
                                                   "ranks: there is no checkpoint at")
+        # Damage in the last rank's blocks alone, refused by the checksums
+        # on every rank; and the hints that keep MPI-IO from writing back
+        # bytes it read, in effect. The corruption those hints prevent
+        # happens only between nodes, whose BeeGFS clients buffer writes
+        # (M7 step 6): on one node, as here, the file system is coherent
+        # and it cannot happen, which is why the hints are asserted rather
+        # than the corruption provoked.
+        @test startswith(refused("checkpoint damage"),
+                         "# checkpoint damage refused on $n of $n ranks: the data of " *
+                         "field set \"u\" do not match the checksums stored with them " *
+                         "in 1 of its 16 blocks, the first being block 16")
+        @test "# checkpoint hints romio_ds_write=disable romio_cb_write=disable" in hashes
         # The negative control: one received ghost rewritten from a
         # corrupted message buffer changes the gathered digest.
         @test "# W2v perturbed-ghost-changes-digest true" in hashes

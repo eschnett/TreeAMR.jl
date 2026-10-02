@@ -81,7 +81,10 @@ field set its element type, `nvars`, `G`, centering and parity, and its
 shared boundary planes of a vertex-like dimension and the derived wall
 planes, all of which [`fill_ghosts!`](@ref) rebuilds from the owned
 points with the application's own operators and hook; the forest's
-[`generation`](@ref); schedules, operators and hooks.
+[`generation`](@ref); schedules, operators and hooks. Beside the leaf
+list and each field set go CRC-32C checksums, one over the leaf list and
+one per block, which `load_checkpoint` verifies (added in M7, after a
+parallel file came back damaged; a file without them loads unchecked).
 
 An element type is stored as itself when it is an HDF5 native — `Bool`,
 the signed and unsigned integers, `Float16`, `Float32`, `Float64`, and
@@ -130,6 +133,11 @@ its writes to stable storage (a collective `H5Fflush`, which is an
 `MPI_File_sync`) before the file is closed, and rank 0 then flushes the
 file as in a serial save, renames it and flushes the directory, while
 the others wait, so no rank returns before the checkpoint is in place.
+The file is opened with MPI-IO hints that turn off ROMIO's two
+read-modify-write paths for writes, data sieving and collective
+buffering: on a parallel file system whose clients buffer writes, such
+as BeeGFS, either can write back another rank's bytes as they were
+before that rank's write arrived, destroying it.
 
 Returns `path`. See `CODE.md`, "Checkpoint and restart" and "Parallel
 checkpoints", for the file layout and the reasons behind it.
@@ -203,7 +211,11 @@ that says why: one that is not a TreeAMR checkpoint at all, a
 `format_version` other than the one this version reads (1), a feature
 this version does not know (every listed feature must be understood), an
 element type missing from `types` or one that does not match the file's
-layout, and a field set name the file does not hold. Compatibility is
+layout, and a field set name the file does not hold. A leaf list or a
+block whose bytes do not match the checksum stored with them is refused
+too: the file was damaged while or after it was written. Over several
+ranks each rank checks its own blocks, and the verdict is agreed, so
+the refusal comes on every rank. Compatibility is
 decided by the format version and the features, never by package
 versions. Each refusal of what a checkpoint holds names the TreeAMR
 version that wrote it and points to [`checkpoint_environment`](@ref),

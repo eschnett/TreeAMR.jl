@@ -34,6 +34,7 @@ module TreeAMRHDF5Ext
 using HDF5: HDF5, API, h5open, create_group, create_dataset, dataspace, attributes,
             read_attribute, write_attribute, write_dataset
 using KernelAbstractions: CPU, Backend, get_backend
+using CRC32c: crc32c
 using TreeAMR
 using TreeAMR: threaded_foreach, tohost, samebackend, Communicator, commrank, commsize,
                allgather, allgatherv, librarycomm, open_parallel_file, ForestDigest,
@@ -394,6 +395,62 @@ function agree_values(a::Ranked, values)
     end
 end
 
+# --- checksums (M7) ----------------------------------------------------------
+#
+# Every array the forest and the field sets are restored from carries a
+# CRC-32C, verified on load: the leaf list one over its three columns,
+# each field set one per block ("Checksums" in the file layout under
+# "Checkpoint and restart" in CODE.md). They were added after a checkpoint written by 32 ranks on
+# four nodes of a cluster came back with one rank's leaf coordinates
+# zeroed, a corruption the leaf list's own validation caught only because
+# it broke the curve order; the same loss in a field set's data would
+# have been restored silently. A checksum is over the bytes as the file
+# stores them — little-endian, the limbs of a limb type in order — so a
+# reader in another language can verify it. A file without them, written
+# before they existed, is read without the check.
+
+# The CRC-32C of `count` elements of the array `buf` from index `first`
+# on, continuing `crc`.
+function crc_of(buf::Array, first::Integer, count::Integer, crc::UInt32=UInt32(0))
+    count == 0 && return crc
+    GC.@preserve buf begin
+        bytes = unsafe_wrap(Array, Ptr{UInt8}(pointer(buf, first)),
+                            count * sizeof(eltype(buf)))
+        return crc32c(bytes, crc)
+    end
+end
+
+# One CRC-32C per block of `buf`, which holds `m` blocks of equal size in
+# state-vector layout: the order of `data`, block `b` being the slice
+# `data[…, b]`.
+function block_checksums(buf::Array, m::Integer)
+    per = m == 0 ? 0 : length(buf) ÷ m
+    sums = Vector{UInt32}(undef, m)
+    threaded_foreach(m) do j
+        sums[j] = crc_of(buf, (j - 1) * per + 1, per)
+    end
+    return sums
+end
+
+# The leaf list's CRC-32C: over `root`, then `level`, then `coords`, each
+# column whole.
+leaves_checksum(roots, levels, coords) =
+    crc_of(coords, 1, length(coords),
+           crc_of(levels, 1, length(levels), crc_of(roots, 1, length(roots))))
+
+# A checksum that fails is refused on every rank together: each rank has
+# checked its own blocks, so the verdicts are gathered. `bad` are the
+# failing blocks, in the whole forest's numbering; the result is how many
+# there are over all ranks and the first.
+damage(::Alone, bad) = (length(bad), isempty(bad) ? 0 : first(bad))
+
+function damage(a::Ranked, bad)
+    gathered = allgather(a.comm, (length(bad), isempty(bad) ? 0 : first(bad)))
+    total = sum(first, gathered)
+    firsts = [last(g) for g in gathered if first(g) > 0]
+    return (total, isempty(firsts) ? 0 : minimum(firsts))
+end
+
 # --- datasets --------------------------------------------------------------
 
 hasattr(obj, name) = haskey(attributes(obj), name)
@@ -640,23 +697,28 @@ function write_forest(root, forest::Forest{D,R}) where {D,R}
         # The leaves as columns, in curve order: block `b` of every field
         # set is row `b`, and any run of blocks is one hyperslab. Each rank
         # writes the rows of its own blocks; serially that is every row.
+        # Every rank forms the whole columns, which the forest replicates,
+        # for the checksum, an attribute and so the same on every rank.
         n = nleaves(forest)
         slab = slab_of(forest)
         offset, m = slab
-        roots = Vector{Int32}(undef, m)
-        levels = Vector{Int8}(undef, m)
-        coords = Matrix{UInt32}(undef, D, m)
-        threaded_foreach(m) do i
-            k = forest.leaves[offset + i]
+        roots = Vector{Int32}(undef, n)
+        levels = Vector{Int8}(undef, n)
+        coords = Matrix{UInt32}(undef, D, n)
+        threaded_foreach(n) do i
+            k = forest.leaves[i]
             roots[i] = k.root
             levels[i] = k.level
             for d in 1:D
                 coords[d, i] = k.coords[d]
             end
         end
-        write_array(g, "root", Int32, (n,), roots; slab=slab)
-        write_array(g, "level", Int8, (n,), levels; slab=slab)
-        write_array(g, "coords", UInt32, (D, n), coords; slab=slab)
+        write_attribute(g, "leaves_crc32c", leaves_checksum(roots, levels, coords))
+        rows = offset+1:offset+m
+        own(col) = m == n ? col : col[ntuple(_ -> Colon(), ndims(col) - 1)..., rows]
+        write_array(g, "root", Int32, (n,), own(roots); slab=slab)
+        write_array(g, "level", Int8, (n,), own(levels); slab=slab)
+        write_array(g, "coords", UInt32, (D, n), own(coords); slab=slab)
     finally
         close(g)
     end
@@ -696,6 +758,15 @@ function read_forest(g, ::Val{D}, types, context, comm) where {D}
     rootcol = read_array(rootset, Int32, (n,), "the leaves' roots", note)
     levels = read_array(g["level"], Int8, (n,), "the leaves' levels", note)
     coords = read_array(g["coords"], UInt32, (D, n), "the leaves' coordinates", note)
+    if hasattr(g, "leaves_crc32c")
+        stored = read_attribute(g, "leaves_crc32c")
+        intact = stored isa Integer && stored == leaves_checksum(rootcol, levels, coords)
+        first(damage(access_of(g), intact ? Int[] : [1])) == 0 || throw(ArgumentError(
+            "the leaf list does not match the checksum stored with it (a CRC-32C over " *
+            "its columns `root`, `level` and `coords`) on one rank or more: the file was " *
+            "damaged while or after it was written, and is refused rather than read into " *
+            "a wrong mesh. " * note))
+    end
     # Each key is checked by its own constructor, the list as a whole by
     # the forest's.
     leaves = Vector{MortonKey{D}}(undef, n)
@@ -747,8 +818,13 @@ function write_fieldset(parent, name, fs::FieldSet{T,D}, u, filters) where {T,D}
         # filter: reading a block then decompresses that block alone, and
         # over several ranks every chunk has one writer.
         block = (limbs..., ntuple(_ -> N, D)...)
-        write_array(g, "data", F, (block..., fs.nvars, nleaves(fs.forest)), tohost(u);
-                    chunk=(block..., 1, 1), filters=filters, slab=slab_of(fs.forest))
+        slab = slab_of(fs.forest)
+        buf = tohost(u)
+        write_array(g, "data", F, (block..., fs.nvars, nleaves(fs.forest)), buf;
+                    chunk=(block..., 1, 1), filters=filters, slab=slab)
+        # One CRC-32C per block, over all its variables, beside the data.
+        write_array(g, "data_crc32c", UInt32, (nleaves(fs.forest),),
+                    block_checksums(buf, last(slab)); slab=slab)
     finally
         close(g)
     end
@@ -783,13 +859,21 @@ function read_fieldset(g, name, forest::Forest{D}, types, backend, context) wher
     # The whole dataset's dimensions, of which this rank reads its blocks.
     dims = (limbs..., ntuple(_ -> forest.N, D)..., nvars, nleaves(forest))
     slab = slab_of(forest)
-    if u isa Array
-        read_array!(u, g["data"], F, dims, "the data of $what", note; slab=slab)
-    else
-        host = Vector{T}(undef, length(u))
-        read_array!(host, g["data"], F, dims, "the data of $what", note; slab=slab)
-        copyto!(u, host)
+    host = u isa Array ? u : Vector{T}(undef, length(u))
+    read_array!(host, g["data"], F, dims, "the data of $what", note; slab=slab)
+    if haskey(g, "data_crc32c")
+        n = nleaves(forest)
+        stored = read_array!(Vector{UInt32}(undef, last(slab)), g["data_crc32c"], UInt32,
+                             (n,), "the checksums of $what", note; slab=slab)
+        bad = findall(block_checksums(host, last(slab)) .!= stored) .+ first(slab)
+        count, b = damage(access_of(g), bad)
+        count == 0 || throw(ArgumentError(
+            "the data of $what do not match the checksums stored with them in $count of " *
+            "its $n blocks, the first being block $b (a CRC-32C per block): the file was " *
+            "damaged while or after it was written, and is refused rather than restored " *
+            "into a wrong state. " * note))
     end
+    host === u || copyto!(u, host)
     scatter!(fs, u)
     return (; fieldset=fs, state=u)
 end
