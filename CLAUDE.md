@@ -749,7 +749,7 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. **Registered in General** since 2026-09-21; 0.1.4 is the current
+  only. **Registered in General** since 2026-09-21; 0.1.5 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
   key behind `DOCUMENTER_KEY` to push them — the file says why. All
@@ -805,7 +805,7 @@ of the *public API only*. Facts that matter here:
   beside TreeAMR loads the extension, and nothing else is needed. It
   calls none of the checkpoint functions yet. Against the M9a checkout
   its suite is unchanged, 310 tests in 1m12 (2026-09-29).
-- **M7 reaches it with the next release and changes nothing serially**:
+- **M7 reaches it with 0.1.5 and changes nothing serially**:
   310 tests in 1m22 against the M7 checkout (2026-10-02). It does not
   pass `comm` to any `Forest` yet, so under `mpiexec` each rank would
   run a whole serial copy. Once it does, the step-9 audit (CODE.md, M7
