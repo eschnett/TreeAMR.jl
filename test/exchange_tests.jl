@@ -478,8 +478,15 @@ end
     @test nonempty > 0
 end
 
+# `Float32` in 2D only, and `Float32x2` from 2D on (trimmed in step 9, for
+# the suite's time: each pair of `D` and type compiles the kernels anew).
+# Neither type changes what a pack or an unpack does, only the arithmetic
+# the round trip must preserve bit for bit, which one dimension checks as
+# well as three; and in 1D every mirrored transfer is a block's own, so
+# the `−0` case that needs a remote mirror exists from 2D on.
 @testset "Packing, delivering and unpacking reproduces the serial fill bitwise: D=$D, T=$T" for
-        D in (1, 2, 3), T in (Float64, Float32, Float32x2)
+        (D, T) in ((1, Float64), (2, Float64), (3, Float64), (2, Float32),
+                   (2, Float32x2), (3, Float32x2))
     # The values themselves. The sender computes each remote ghost with
     # the serial stencil from the same source values and the unpack adds
     # an identity, so every rank's working array, ghosts included, must

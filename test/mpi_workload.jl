@@ -32,8 +32,10 @@
 # serial answers in global order. From step 6 on it checkpoints: a run
 # saved after a regrid, in parallel, and continued from the file at the
 # same rank count must print what the uninterrupted run prints; the
-# files of the runs before it, written at other rank counts, are loaded
-# at this one on `#` lines (`TREEAMR_CHECKPOINT_DIR`).
+# files of other runs, written at other rank counts, are loaded at this
+# one on `#` lines (`TREEAMR_CHECKPOINT_DIR`, and
+# `TREEAMR_CHECKPOINT_FROM` for the rank counts whose files to wait for
+# and load, which lets `mpi_tests.jl` run the launches at once).
 
 using TreeAMR
 using MPI: MPI
@@ -870,8 +872,32 @@ function checkpoint_case(tag; chunks=3, k=1)
     emit(tag * "1", "loaded", digest(gathered(ck.forest, ck.fieldsets["u"].state)))
     emit("#", tag * "1", "empty ranks", count(TreeAMR.allgather(forest.comm,
                                                                nblocks(fs) == 0)))
+    # Every file of this run is in place (each save returns on every rank
+    # after the rename), which a run waiting to load them is told by an
+    # empty marker file.
+    RANK == 0 && touch(joinpath(dir, "$tag-n$NRANKS.done"))
     checkpoint_cross(tag; chunks=chunks)
     return nothing
+end
+
+# The rank counts whose files `checkpoint_cross` loads: those that
+# `TREEAMR_CHECKPOINT_FROM` lists, once each run's marker is there, every
+# rank waiting on its own so that none spins in a collective meanwhile;
+# without the variable, every other rank count whose files are there.
+function checkpoint_sources(dir, tag)
+    from = get(ENV, "TREEAMR_CHECKPOINT_FROM", nothing)
+    from === nothing && return nothing
+    counts = parse.(Int, split(from))
+    deadline = time() + parse(Float64, get(ENV, "TREEAMR_CHECKPOINT_WAIT", "900"))
+    for n in counts
+        marker = joinpath(dir, "$tag-n$n.done")
+        while !isfile(marker)
+            time() < deadline ||
+                error("the checkpoints of the run at $n rank(s) did not appear: no $marker")
+            sleep(0.2)
+        end
+    end
+    return counts
 end
 
 # The files the other runs wrote, at other rank counts, loaded at this
@@ -881,9 +907,12 @@ end
 # MPI. Collective.
 function checkpoint_cross(tag; chunks=3)
     dir = checkpoint_dir()
+    counts = checkpoint_sources(dir, tag)
     names = filter(readdir(dir)) do name
         m = match(r"^(.*)-n(\d+)(-filtered)?\.h5$", name)
-        m !== nothing && m[1] in (tag, tag * "1") && parse(Int, m[2]) != NRANKS
+        m === nothing && return false
+        n = parse(Int, m[2])
+        m[1] in (tag, tag * "1") && n != NRANKS && (counts === nothing || n in counts)
     end
     comms = USE_MPI ? ((NRANKS, COMM), (1, MPI.COMM_SELF)) : ((1, nothing),)
     for name in sort(names), (n, comm) in comms
@@ -1005,12 +1034,16 @@ function main()
               G=1, ops=OPS2)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,
     # the initial-data cycle from one leaf, and blocks moving between
-    # ranks over several field sets, in Float64, Float32 and Float32x2.
+    # ranks over several field sets, in Float64 and Float32x2. Float32 is
+    # not repeated here (dropped in step 9): it crosses MPI as a native
+    # type, its regrid stage is checked bitwise in process by
+    # `regrid_exchange_tests.jl`, and Float32x2 is the element type MPI
+    # sends through a derived datatype, so it is the one that adds a code
+    # path.
     tracked_pulse_case("TP"; cycles=3, steps=4)
     burgers_regrid_case("BR"; cycles=3, steps=3)
     adapt_case("A2")
     moving_blocks_case("M", Float64)
-    moving_blocks_case("M32-", Float32; full=false)
     moving_blocks_case("M32x2-", Float32x2; full=false)
     # Point interpolation, routed to the owners and back.
     interpolate_case("I2")

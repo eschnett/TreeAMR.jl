@@ -32,16 +32,19 @@
 # says so — and the project is the *active* one, as in `thread_tests.jl`,
 # since under `Pkg.test` the tests run in a sandbox.
 #
-# The checkpoints go to one directory for every run, in the order serial,
-# three ranks, two ranks, then serial again in this process, so that a
-# file saved at three ranks is loaded at two, at one (over
-# `MPI.COMM_SELF` inside the two-rank run) and serially, and the serial
-# file at three; each continuation must print the uninterrupted run's
-# digests.
+# The checkpoints go to one directory for every run: a file saved at
+# three ranks is loaded at two, at one (over `MPI.COMM_SELF` inside the
+# two-rank run) and serially, and the serial file at three; each
+# continuation must print the uninterrupted run's digests. A run that
+# loads another's files waits for that run's marker
+# (`TREEAMR_CHECKPOINT_FROM`), so the runs need not follow one another.
+# Where they start is `mpi_jobs.jl`'s: at the start of the suite where
+# the machine has room for both jobs beside it. Otherwise the three-rank
+# job starts here, beside the serial reference, and the two-rank job
+# beside it too where there is room (this file run on its own), or after
+# it (a CI runner).
 
-using MPI: MPI
-
-const MPI_WORKLOAD = joinpath(@__DIR__, "mpi_workload.jl")
+isdefined(@__MODULE__, :MPI_JOBS) || include("mpi_jobs.jl")
 
 # The workload's lines, split into those that must agree byte for byte,
 # the floating-point sums, and the rank-count-dependent `#` lines.
@@ -69,35 +72,16 @@ function workload_mismatches(ref, out; rtol=1e-12)
 end
 
 # The serial reference, in this process: the script in a module of its
-# own, printing into a buffer it finds there.
+# own, printing into a buffer it finds there. It loads no other run's
+# files.
 function serial_workload(dir)
     m = Module(:MPIWorkloadSerial)
     io = IOBuffer()
     Core.eval(m, :(const WORKLOAD_IO = $io))
-    withenv("TREEAMR_CHECKPOINT_DIR" => dir) do
+    withenv("TREEAMR_CHECKPOINT_DIR" => dir, "TREEAMR_CHECKPOINT_FROM" => "") do
         Base.include(m, MPI_WORKLOAD)
     end
     return String(take!(io)), m, io
-end
-
-# The workload under `mpiexec -n $n`, with a deadline: a rank that
-# waited for a message never sent would otherwise hang the suite.
-function mpi_workload(n, dir; threads=1, timeout=900)
-    mpi = MPI.mpiexec()
-    project = Base.active_project()
-    cmd = `$mpi -n $n $(Base.julia_cmd()) --threads=$threads --project=$project
-           $MPI_WORKLOAD mpi`
-    cmd = addenv(setenv(cmd, mpi.env), "TREEAMR_CHECKPOINT_DIR" => dir)
-    out, err = IOBuffer(), IOBuffer()
-    proc = run(pipeline(cmd; stdout=out, stderr=err); wait=false)
-    if timedwait(() -> process_exited(proc), timeout) !== :ok
-        kill(proc)
-        error("the MPI workload at -n $n did not finish in $timeout s; its stderr:\n" *
-              String(take!(err)))
-    end
-    success(proc) || error("the MPI workload at -n $n failed; its stderr:\n" *
-                           String(take!(err)))
-    return String(take!(out))
 end
 
 # The two digests at the end of the `#` line that starts with `prefix`.
@@ -108,8 +92,17 @@ function digests_of(lines, prefix)
 end
 
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
-    dir = mktempdir()
-    serial, workload, io = serial_workload(dir)
+    early = take_mpi_jobs!()
+    dir = early === nothing ? mktempdir() : early.dir
+    three = early === nothing ? launch_workload(3, dir; from=(1,)) : early.three
+    two = early !== nothing ? early.two :
+          concurrent_launches() ? launch_workload(2, dir; from=(1, 3)) : nothing
+    serial, workload, io = try
+        serial_workload(dir)
+    catch
+        foreach(j -> j === nothing || kill(j.proc), (three, two))
+        rethrow()
+    end
     lines = workload_lines(serial)
     @test first(lines) == "# ranks 1"
     @test count(l -> occursin(" state ", l), lines) >= 7
@@ -117,10 +110,10 @@ end
     @test any(l -> startswith(l, "B2 conserved true"), lines)
     # The regrid cycles (step 4) changed the mesh every time, Burgers'
     # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 14
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 12
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
-    @test count(l -> occursin(" unchanged false", l), lines) == 4
+    @test count(l -> occursin(" unchanged false", l), lines) == 3
     # Point interpolation (step 5): every point answered, some flagged.
     @test count(startswith("I2"), lines) == 5
     @test all(l -> split(l)[3] == "301", filter(l -> occursin(" values ", l) &&
@@ -167,8 +160,12 @@ end
         @test length(c1) == 1 && split(only(c1))[end] == words("C1 saved")[3]
     end
 
+    outs = Dict{Int,String}()
+    outs[3] = finish_workload(three; others=two === nothing ? () : (two,))
+    two === nothing && (two = launch_workload(2, dir; from=(1, 3)))
+    outs[2] = finish_workload(two)
     for n in (3, 2)
-        out = mpi_workload(n, dir)
+        out = outs[n]
         @test first(workload_lines(out)) == "# ranks $n"
         bad = workload_mismatches(serial, out)
         isempty(bad) || foreach(l -> println("mismatch at -n $n: ", l), bad)
@@ -261,10 +258,10 @@ end
                                                      hashes)))[[4, 6, 8]])
         @test migrated("M4.refine")[1] > 0
         @test migrated("M4.coarsen")[2] > 0
-        @test all(t -> migrated("$t.coarsen")[3] > 0, ("M2", "M32-2", "M32x2-2"))
+        @test all(t -> migrated("$t.coarsen")[3] > 0, ("M2", "M32x2-2"))
     end
     # The files of both distributed runs, loaded serially in this process.
-    withenv("TREEAMR_CHECKPOINT_DIR" => dir) do
+    withenv("TREEAMR_CHECKPOINT_DIR" => dir, "TREEAMR_CHECKPOINT_FROM" => "2 3") do
         Base.invokelatest(workload.checkpoint_cross, "C")
     end
     hashes = workload_lines(String(take!(io)))

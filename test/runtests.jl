@@ -7,6 +7,10 @@ include("oracles.jl")
 include("ghost_oracles.jl")
 include("wave.jl")
 include("burgers.jl")
+# The MPI test's `mpiexec` jobs start now where the machine has room for
+# them beside the suite, and are collected by `mpi_tests.jl` (M7).
+include("mpi_jobs.jl")
+start_mpi_jobs!()
 
 @info "Running the tests on $(Threads.nthreads()) thread(s)"
 
