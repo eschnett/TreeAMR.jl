@@ -3,7 +3,7 @@
 # One forest can run over several processes. Every rank holds the whole
 # forest and only field data are distributed (`CODE.md`, "Distributed
 # meshes"), so the package needs very little of a message-passing
-# library: who it is, how many there are, three collectives and
+# library: who it is, how many there are, a few collectives and
 # nonblocking point-to-point messages over flat buffers. Those are the
 # verbs below. Every verb has a method for `SerialCommunicator`, the
 # default, which is rank 0 of 1 and sends nothing; so `src/` never
@@ -22,7 +22,8 @@ sees them: an abstract type whose subtypes answer the internal verbs
 [`commrank`](@ref TreeAMR.commrank), [`commsize`](@ref TreeAMR.commsize),
 [`allgather`](@ref TreeAMR.allgather),
 [`allgatherv`](@ref TreeAMR.allgatherv),
-[`alltoallv`](@ref TreeAMR.alltoallv) and the nonblocking
+[`alltoallv`](@ref TreeAMR.alltoallv), [`bcast`](@ref TreeAMR.bcast),
+[`commnodes`](@ref TreeAMR.commnodes) and the nonblocking
 [`isend`](@ref TreeAMR.isend) / [`irecv`](@ref TreeAMR.irecv) /
 [`waitall`](@ref TreeAMR.waitall).
 
@@ -106,7 +107,8 @@ missing_verb(comm::Communicator, verb::Symbol) = throw(ArgumentError(
     "$(typeof(comm)) does not implement `$verb`, which this operation needs: " *
     "a forest distributed over a communicator exchanges ghosts, reduces and " *
     "regrids through the verbs `commrank`, `commsize`, `allgather`, " *
-    "`allgatherv`, `alltoallv`, `isend`, `irecv` and `waitall`, and a " *
+    "`allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`, `irecv` and " *
+    "`waitall`, and a " *
     "communicator answering only some of them supports only what needs no more."))
 
 """
@@ -166,6 +168,32 @@ function alltoallv(::SerialCommunicator, sendbuf::AbstractVector,
 end
 alltoallv(comm::Communicator, sendbuf::AbstractVector, sendcounts) =
     missing_verb(comm, :alltoallv)
+
+"""
+    bcast(comm, v::AbstractVector, root::Integer) -> Vector
+
+Rank `root`'s vector `v`, on every rank: collective. The other ranks pass
+a vector of the same element type, whose contents are ignored (an empty
+one will do); the length is sent first. A checkpoint load broadcasts the
+index file's image this way, so that only one process opens the file
+(M7 step 6b, "Checkpoints without parallel I/O" in `CODE.md`).
+"""
+function bcast(::SerialCommunicator, v::AbstractVector, root::Integer)
+    root == 0 || no_peer(root)
+    return collect(v)
+end
+bcast(comm::Communicator, v::AbstractVector, root::Integer) = missing_verb(comm, :bcast)
+
+"""
+    commnodes(comm) -> Int
+
+The number of shared-memory nodes the ranks of `comm` run on:
+collective. A checkpoint saved with `io = :node` has one I/O process per
+node (M7 step 6b). Over MPI it is the number of groups that
+`MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)` forms; serially 1.
+"""
+commnodes(::SerialCommunicator) = 1
+commnodes(comm::Communicator) = missing_verb(comm, :commnodes)
 
 # A serial rank has no peer: the exchange never sends to its own rank,
 # since a transfer with both ends on one rank is a local group. So the
@@ -234,16 +262,6 @@ with `communicator(comm; deviceaware = true)`. See "MPI+GPU" under
 "Distributed meshes" in `CODE.md`.
 """
 hoststaging(::Communicator, buffer::AbstractVector) = !(buffer isa Array)
-
-# The library communicator underneath, for a library that has to be
-# handed one itself: parallel HDF5 opens a checkpoint over it (step 6 of
-# M7). The MPI extension returns its duplicate; no other communicator has
-# one, and the refusal says what the caller needs instead.
-librarycomm(comm::Communicator) = throw(ArgumentError(
-    "$(typeof(comm)) has no MPI communicator underneath it, and a checkpoint of a " *
-    "forest distributed over it would need one: every rank opens the one file " *
-    "through parallel HDF5, over MPI. Build the forest with `comm = " *
-    "MPI.COMM_WORLD` (or another MPI.Comm), with MPI.jl and HDF5.jl loaded."))
 
 # --- The message-buffer pool (M7) ------------------------------------------
 #

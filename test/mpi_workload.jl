@@ -30,12 +30,14 @@
 # From step 5 on it interpolates: every rank queries its own slice of one
 # global point list, and the answers gathered in rank order are the
 # serial answers in global order. From step 6 on it checkpoints: a run
-# saved after a regrid, in parallel, and continued from the file at the
-# same rank count must print what the uninterrupted run prints; the
-# files of other runs, written at other rank counts, are loaded at this
-# one on `#` lines (`TREEAMR_CHECKPOINT_DIR`, and
-# `TREEAMR_CHECKPOINT_FROM` for the rank counts whose files to wait for
-# and load, which lets `mpi_tests.jl` run the launches at once).
+# saved after a regrid, with one part file per rank, per two groups and
+# per node (step 6b), and continued from each file at the same rank count
+# must print what the uninterrupted run prints; the files of other runs,
+# written at other rank counts, are loaded at this one on `#` lines
+# (`TREEAMR_CHECKPOINT_DIR`, and `TREEAMR_CHECKPOINT_FROM` for the rank
+# counts whose files to wait for and load, which lets `mpi_tests.jl` run
+# the launches at once); and the version-1 fixtures, written by the
+# shared-file writer's version, load at every rank count.
 
 using TreeAMR
 using MPI: MPI
@@ -52,6 +54,11 @@ const COMM = USE_MPI ? MPI.COMM_WORLD : nothing
 const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 const OUT = isdefined(@__MODULE__, :WORKLOAD_IO) ? WORKLOAD_IO : stdout
+# Under MPI the checkpoints' messages are cut at 4 KiB (a test hook of
+# the HDF5 extension; 1 GiB otherwise), so that a rank's blocks travel to
+# its I/O process, and a part's from its reader, in several messages.
+const CKPT = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
+USE_MPI && (CKPT.MAX_MESSAGE[] = 4096)
 
 emit(words...) = (RANK == 0 && println(OUT, join(words, " ")); nothing)
 
@@ -804,10 +811,10 @@ end
 
 # The bare form, `name => fs`: `regrid!` has just filled the working
 # array's owned points. The plain data carry the run state and an array
-# of strings, which a parallel file stores at a fixed length.
-function ck_save(path, run; filters=())
+# of strings.
+function ck_save(path, run; filters=(), io=:node)
     return save_checkpoint(path, run.forest; fieldsets=("pulse" => run.fs,),
-                           application="PulseRestart" => 1, filters=filters,
+                           application="PulseRestart" => 1, filters=filters, io=io,
                            data=(; t=run.t, chunk=run.chunk, σ=7 // 20,
                                  tags=["pulse", "", "vertex-centered"]))
 end
@@ -817,7 +824,7 @@ function ck_restore(path, comm)
     ck.data.tags == ["pulse", "", "vertex-centered"] && ck.data.σ === 7 // 20 ||
         error("the plain data did not come back exactly: $(ck.data)")
     return (; forest=ck.forest, fs=ck.fieldsets["pulse"].fieldset, t=ck.data.t,
-            chunk=ck.data.chunk), ck.provenance.nranks
+            chunk=ck.data.chunk), ck.provenance
 end
 
 function ck_finish(run; chunks)
@@ -846,21 +853,37 @@ function checkpoint_case(tag; chunks=3, k=1)
     run = ck_finish(ck_start(COMM); chunks=chunks)
     emit(tag, "uninterrupted", ck_digests(run)...)
     final = nleaves(run.forest)
-    # Saved after chunk `k`, unfiltered and filtered, everything dropped,
-    # and continued from each file at this rank count.
+    # Saved after chunk `k`, everything dropped, and continued from each
+    # file at this rank count: unfiltered with a part per rank, filtered
+    # with two I/O groups (at three ranks, one of two ranks and one of
+    # one), and with the default, a part per node, which on one node is
+    # the one part inside the index.
     run = ck_finish(ck_start(COMM); chunks=k)
     emit(tag, "mesh", nleaves(run.forest), "then", final)
     emit(tag, "saved", ck_digests(run)...)
     plain = joinpath(dir, "$tag-n$NRANKS.h5")
     filtered = joinpath(dir, "$tag-n$NRANKS-filtered.h5")
-    ck_save(plain, run)
-    ck_save(filtered, run; filters=(Shuffle(), Deflate(1)))
+    node = joinpath(dir, "$tag-n$NRANKS-node.h5")
+    ck_save(plain, run; io=:all)
+    ck_save(filtered, run; filters=(Shuffle(), Deflate(1)), io=2)
+    ck_save(node, run)
     run = nothing
-    for (name, path) in (("restarted", plain), ("restarted-filtered", filtered))
-        resumed, nranks = ck_restore(path, COMM)
+    for (name, path) in (("restarted", plain), ("restarted-filtered", filtered),
+                         ("restarted-node", node))
+        resumed, provenance = ck_restore(path, COMM)
         emit(tag, name, "loaded", ck_digests(resumed)...)
         emit(tag, name, "continued", ck_digests(ck_finish(resumed; chunks=chunks))...)
-        emit("#", tag, name, "nranks", nranks)
+        emit("#", tag, name, "nranks", provenance.nranks, "nparts", provenance.nparts)
+    end
+    # The version-1 fixtures (`checkpoint_tests.jl`), loaded at this rank
+    # count: their digests must be the serial run's.
+    for name in ("plain", "filtered")
+        ck = load_checkpoint(joinpath(@__DIR__, "fixtures", "checkpoint-v1-$name.h5");
+                             comm=COMM, types=(Float32x2,))
+        emit("V1", name, "loaded", digest(string(ck.forest.leaves)),
+             digest(gathered(ck.forest, ck.fieldsets["u"].state)),
+             digest(reinterpret(UInt8, gathered(ck.forest, ck.fieldsets["w"].state))),
+             digest(string(ck.data)))
     end
     forest, fs = ck_small(COMM)
     u = statevector(fs)
@@ -909,7 +932,7 @@ function checkpoint_cross(tag; chunks=3)
     dir = checkpoint_dir()
     counts = checkpoint_sources(dir, tag)
     names = filter(readdir(dir)) do name
-        m = match(r"^(.*)-n(\d+)(-filtered)?\.h5$", name)
+        m = match(r"^(.*)-n(\d+)(-filtered|-node)?\.h5$", name)
         m === nothing && return false
         n = parse(Int, m[2])
         m[1] in (tag, tag * "1") && n != NRANKS && (counts === nothing || n in counts)
@@ -930,6 +953,29 @@ function checkpoint_cross(tag; chunks=3)
         end
     end
     return nothing
+end
+
+# The files of the directory that belong to the checkpoint `path`: the
+# index and every file named after it.
+ck_files(path) = sort(filter(n -> n == basename(path) || startswith(n, basename(path) * "."),
+                             readdir(dirname(path))))
+
+# Whether no file was opened by more than one process during `f()`: every
+# rank records the files it opens (a test hook of the HDF5 extension),
+# and the records are gathered.
+function opened_once(f)
+    CKPT.OPEN_LOG[] = String[]
+    try
+        f()
+    finally
+        mine = unique(CKPT.OPEN_LOG[])
+        CKPT.OPEN_LOG[] = nothing
+        world = TreeAMR.communicator(COMM)
+        all_ = split(String(TreeAMR.allgatherv(world, collect(codeunits(join(mine, "\n") *
+                                                                       "\n")))), '\n';
+                     keepempty=false)
+        return allunique(all_) && !isempty(all_)
+    end
 end
 
 # A refusal on some ranks, or arguments that differ between them, must be
@@ -954,7 +1000,7 @@ function checkpoint_refusals()
     fs = FieldSet(forest, 1; G=1)
     fill_by_coordinates!((x, v) -> x[1] - x[2], fs)
     save(; kwargs...) = save_checkpoint(path, forest; fieldsets=("u" => fs,),
-                                        application="Refused" => 1, kwargs...)
+                                        application="Refused" => 1, io=1, kwargs...)
     save(; data=(; t=1.0))
     n, msg = attempt(() -> save(; data=(; t=1.0, rank=RANK)))
     emit("# checkpoint data refused on", n, "of", NRANKS, "ranks:", msg)
@@ -980,67 +1026,103 @@ function checkpoint_refusals()
     emit("# load layout refused on", n, "of", NRANKS, "ranks:", msg)
     n, msg = attempt(() -> load_checkpoint(joinpath(dir, "missing.h5"); comm=COMM))
     emit("# load missing refused on", n, "of", NRANKS, "ranks:", msg)
-    # Damage only the last rank's blocks can see — one value of its last
-    # block, changed by rank 0 alone between the save and the load — is
-    # refused by the checksums on every rank, which is the agreement: the
-    # other ranks' own blocks are intact. This is the multi-node
-    # corruption of step 6 made by hand, since the suite runs on one node,
-    # where the file system is coherent and none happens on its own.
+    # Damage only the last part's reader can see — one value of the last
+    # block, changed by rank 0 alone in the last part file between the save
+    # and the load — is refused by the checksums on every rank, which is
+    # the agreement: the other parts are intact. This is the multi-node
+    # corruption of step 6 made by hand; no file is shared any more, so
+    # none can happen on its own.
     damaged = joinpath(dir, "damaged-n$NRANKS.h5")
-    save_checkpoint(damaged, forest; fieldsets=("u" => fs,), application="Refused" => 1)
+    save_checkpoint(damaged, forest; fieldsets=("u" => fs,), application="Refused" => 1,
+                    io=:all)
+    world_barrier() = TreeAMR.allgather(world, true)
+    parts = filter(n -> n != basename(damaged), ck_files(damaged))
     if RANK == 0
-        HDF5.h5open(damaged, "r+") do file
+        lastpart = last(sort(parts; by=n -> parse(Int, split(n, '.')[end - 1])))
+        HDF5.h5open(joinpath(dir, lastpart), "r+") do file
             data = file["TreeAMR.jl/fieldsets/u/data"]
             d = read(data)
             d[2, 3, 1, end] += 1
             data[:, :, :, :] = d
         end
     end
-    TreeAMR.allgather(world, true)
+    world_barrier()
     n, msg = attempt(() -> load_checkpoint(damaged; comm=COMM))
     emit("# checkpoint damage refused on", n, "of", NRANKS, "ranks:", msg)
-    # The file is opened with the hints that keep MPI-IO from rewriting
-    # bytes other ranks wrote (`TreeAMRHDF5MPIExt`), and ROMIO, MPICH_jll's
-    # MPI-IO, reports them as in effect.
-    probe = joinpath(dir, "hints-n$NRANKS.h5")
-    file = TreeAMR.open_parallel_file(TreeAMR.librarycomm(world), probe, "w")
-    hints = try
-        romio_hints(file)
-    finally
-        close(file)
+    # A part of another save in place of one of this save's, and a part
+    # missing: both refused on every rank, before any data move.
+    other = joinpath(dir, "other-n$NRANKS.h5")
+    save_checkpoint(other, forest; fieldsets=("u" => fs,), application="Refused" => 1,
+                    io=:all)
+    save_checkpoint(damaged, forest; fieldsets=("u" => fs,), application="Refused" => 1,
+                    io=:all)
+    partof(path, j) = only(filter(n -> endswith(n, ".$j.h5"), ck_files(path)))
+    if RANK == 0
+        cp(joinpath(dir, partof(other, 1)), joinpath(dir, partof(damaged, 1)); force=true)
     end
-    emit("# checkpoint hints", hints)
+    world_barrier()
+    n, msg = attempt(() -> load_checkpoint(damaged; comm=COMM))
+    emit("# checkpoint foreign part refused on", n, "of", NRANKS, "ranks:", msg)
+    RANK == 0 && rm(joinpath(dir, partof(other, NRANKS - 1)))
+    world_barrier()
+    n, msg = attempt(() -> load_checkpoint(other; comm=COMM))
+    emit("# checkpoint missing part refused on", n, "of", NRANKS, "ranks:", msg)
+    # Orphans: a file of the part form for the index, from a save no index
+    # names, is removed by the next save, and so are the previous save's
+    # parts; files of other forms are left alone.
+    orphans = joinpath(dir, "orphans-n$NRANKS.h5")
+    keep = [basename(orphans) * ".notapart.h5", basename(orphans) * "." * "a"^31 * ".0.h5",
+            basename(orphans) * "x." * "a"^32 * ".0.h5"]
+    if RANK == 0
+        touch(joinpath(dir, basename(orphans) * "." * "b"^32 * ".7.h5"))
+        foreach(name -> touch(joinpath(dir, name)), keep)
+    end
+    world_barrier()
+    save_checkpoint(orphans, forest; fieldsets=("u" => fs,), application="Refused" => 1,
+                    io=:all)
+    # Rank 0 removes the stale files after the commit, when the other ranks
+    # have returned: they wait for it here before they look.
+    world_barrier()
+    first_parts = ck_files(orphans)
+    save_checkpoint(orphans, forest; fieldsets=("u" => fs,), application="Refused" => 1,
+                    io=:all)
+    world_barrier()
+    after = ck_files(orphans)
+    # The index, its parts, and the two of `keep` named after the index.
+    cleaned = length(after) == NRANKS + 3 &&
+              !(basename(orphans) * "." * "b"^32 * ".7.h5" in after) &&
+              isempty(intersect(setdiff(first_parts, [basename(orphans)], keep), after)) &&
+              all(name -> isfile(joinpath(dir, name)), keep)
+    emit("# checkpoint orphans removed", all(TreeAMR.allgather(world, cleaned)))
+    # An I/O process that fails after its first write (a test hook): the
+    # save is refused on every rank, the previous checkpoint still loads,
+    # and none of the new parts, nor the partial index, is left.
+    world_barrier()
+    before = ck_files(orphans)
+    CKPT.FAIL_PART[] = NRANKS - 1
+    n, msg = try
+        attempt(() -> save_checkpoint(orphans, forest; fieldsets=("u" => fs,),
+                                      application="Refused" => 1, io=:all,
+                                      data=(; t=2.0)))
+    catch err
+        # Not an ArgumentError: an I/O error, which `attempt` rethrows.
+        count(TreeAMR.allgather(world, true)), sprint(showerror, err)
+    finally
+        CKPT.FAIL_PART[] = -1
+    end
+    emit("# checkpoint failed part on", n, "of", NRANKS, "ranks:", first(split(msg, '\n')))
+    intact = ck_files(orphans) == before &&
+             load_checkpoint(orphans; comm=COMM).data == (;)
+    emit("# checkpoint failed part left the previous one", all(TreeAMR.allgather(world,
+                                                                                  intact)))
+    # No file opened by more than one process, saving with two I/O groups
+    # and loading.
+    once = joinpath(dir, "once-n$NRANKS.h5")
+    saved = opened_once(() -> save_checkpoint(once, forest; fieldsets=("u" => fs,),
+                                              application="Refused" => 1, io=2))
+    loaded = opened_once(() -> load_checkpoint(once; comm=COMM))
+    emit("# checkpoint each file opened by one process", saved, loaded)
     return nothing
-end
-
-# The MPI-IO hints in effect on an open parallel HDF5 file, as the MPI
-# library reports them for its file handle.
-function romio_hints(file)
-    API = HDF5.API
-    fapl = API.h5f_get_access_plist(file)
-    handle = Ref{Ptr{Cvoid}}()
-    try
-        API.h5f_get_vfd_handle(file, fapl, handle)
-    finally
-        API.h5p_close(fapl)
-    end
-    fh = unsafe_load(Ptr{MPI.API.MPI_File}(handle[]))
-    ref = Ref{MPI.API.MPI_Info}()
-    MPI.API.MPI_File_get_info(fh, ref)
-    info = MPI.Info(ref[])
-    try
-        # MPI.jl's `Info` is an `AbstractDict` without `get`.
-        value(key) = try
-            info[key]
-        catch err
-            err isa KeyError || rethrow()
-            "absent"
-        end
-        return join(["$key=$(value(key))" for key in (:romio_ds_write, :romio_cb_write)],
-                    " ")
-    finally
-        MPI.free(info)
-    end
 end
 
 # --- the cases --------------------------------------------------------------

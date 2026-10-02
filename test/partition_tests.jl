@@ -10,7 +10,7 @@
 # serial forest stores or computes for leaf `first(blockrange) + b - 1`.
 
 using TreeAMR: equalsplit, threadchunks, commrank, commsize, allgather, allgatherv,
-               alltoallv, isend, irecv, waitall, SerialCommunicator
+               alltoallv, isend, irecv, waitall, bcast, commnodes, SerialCommunicator
 
 # A rank of a communicator that does not exist: it answers the two verbs
 # the partition needs, and every other verb is refused by the package's
@@ -255,9 +255,14 @@ end
     @test_throws "no peer 1" isend(comm, [1.0], 1, 0)
     @test_throws "no peer 0" irecv(comm, [1.0], 0, 0)
     @test waitall(comm, []) === nothing
+    # The two verbs of the checkpoints without parallel I/O (M7 step 6b).
+    @test bcast(comm, UInt8[1, 2], 0) == UInt8[1, 2]
+    @test_throws "no peer 1" bcast(comm, UInt8[], 1)
+    @test commnodes(comm) == 1
     # A communicator that answers only rank and size is refused at the
     # first verb it lacks, by name.
     fake = PartitionCommunicator(0, 2)
     @test_throws "does not implement `allgatherv`" allgatherv(fake, [1])
     @test_throws "does not implement `isend`" isend(fake, [1.0], 1, 0)
+    @test_throws "does not implement `commnodes`" commnodes(fake)
 end

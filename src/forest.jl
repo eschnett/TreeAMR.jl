@@ -497,8 +497,8 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "`derivs`, `vars` and `exclude`; for save_checkpoint and load_checkpoint, " *
         "the path and every keyword but `data`, and for write_plain the item's " *
         "name), since a rank computes the data it sends with its own stencils and " *
-        "lays out what it receives by its own, and every rank makes the same " *
-        "collective calls into a checkpoint file."))
+        "lays out what it receives by its own, and the ranks of a checkpoint send " *
+        "and receive its blocks by the layout each derives from its arguments."))
     return nothing
 end
 

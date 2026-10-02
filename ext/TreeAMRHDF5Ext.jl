@@ -1,15 +1,24 @@
-# Checkpoint and restart through HDF5 (M9a): the implementation of the
-# functions declared, and documented, in `src/checkpoint.jl`.
+# Checkpoint and restart through HDF5 (M9a; without parallel I/O, M7
+# step 6b): the implementation of the functions declared, and documented,
+# in `src/checkpoint.jl`.
 #
-# The file layout is format version 1 of `CODE.md`, "Checkpoint and
-# restart", which is the specification this follows object for object:
+# The file layout is format version 2 of `CODE.md`, "Checkpoint and
+# restart", which is the specification this follows object for object,
+# and the reader reads version 1 too:
 #
-#     /TreeAMR.jl/              format, format_version, features, application
-#       provenance/             who wrote the file, and in which environment
-#       forest/                 the brick, the extents, the leaves as columns
-#       fieldsets/<name>/       the layout, and `data`, the owned points
-#     /<application>/           format_version (the application's own)
-#       data                    the plain-data tree
+#     path                         the index, written by rank 0
+#       /TreeAMR.jl/               format, format_version, features,
+#                                  application, save_id
+#         provenance/              who wrote the file, and in which environment
+#         forest/                  the brick, the extents, the leaves as columns
+#         fieldsets/<name>/        the layout of each field set
+#         parttable/               every part's file, block range, size, checksums
+#         parts/<jjjj>             an external link to each part file, for tools;
+#                                  with one part, the part itself
+#       /<application>/            format_version (the application's own)
+#         data                     the plain-data tree
+#     path.<saveid>.<j>.h5         part j, written by its I/O process
+#       /TreeAMR.jl/fieldsets/<name>/data, data_crc32c
 #
 # Two rules shape everything below. The file holds bits and a small
 # documented vocabulary of names, never a Julia type's definition, so
@@ -18,33 +27,43 @@
 # own validating constructors, so that nothing read from a file is
 # trusted before the forest and the field set have checked it.
 #
+# And over a distributed forest a third ("Checkpoints without parallel
+# I/O" under "Distributed meshes" in CODE.md): every file has exactly one
+# writer, and on reading exactly one opener, so HDF5 is only ever used
+# serially and nothing depends on MPI-IO or on a file system's coherence
+# between nodes. The data travel between the ranks as messages instead:
+# to their group's I/O process when saving, and from a part's one reader
+# to the blocks' owners when loading. A serial checkpoint is the
+# degenerate case, one group of one rank, whose part lives inside the
+# index, so it is still one file.
+#
 # Nothing here loops over cells on the host. The field data go to and
-# from HDF5 as one whole-array transfer each, straight from and into the
+# from HDF5 a range of whole blocks at a time, straight from and into the
 # state vector on the CPU — whose pages `statevector` has already placed
 # by owner — and through one host buffer on a device. The per-leaf work,
 # splitting keys into columns and building them back, runs through
 # `threaded_foreach`, by owner.
-#
-# Over a distributed forest (M7) the same code writes and reads the same
-# file from every rank at once, through parallel HDF5: see "Serial and
-# parallel access" below, which is the only place the two differ.
 
 module TreeAMRHDF5Ext
 
 using HDF5: HDF5, API, h5open, create_group, create_dataset, dataspace, attributes,
-            read_attribute, write_attribute, write_dataset
+            read_attribute, write_attribute, write_dataset, copy_object, create_external
 using KernelAbstractions: CPU, Backend, get_backend
 using CRC32c: crc32c
 using TreeAMR
 using TreeAMR: threaded_foreach, tohost, samebackend, Communicator, commrank, commsize,
-               allgather, allgatherv, librarycomm, open_parallel_file, ForestDigest,
-               digest_verdict, layouthash
+               allgather, allgatherv, bcast, commnodes, isend, irecv, waitall,
+               equalsplit, equalsplit_part, ForestDigest, digest_verdict, layouthash
 import TreeAMR: save_checkpoint, load_checkpoint, write_plain, read_plain,
                 checkpoint_environment
 
 const GROUP = "TreeAMR.jl"
 const FORMAT = "TreeAMR checkpoint"
-const FORMAT_VERSION = 1
+const PART_FORMAT = "TreeAMR checkpoint part"
+const FORMAT_VERSION = 2
+# The versions this reader reads: version 1 is the single file of M9a and
+# of step 6's shared-file writer, read as one part inline.
+const READ_VERSIONS = (1, 2)
 # Every feature listed in a file must be understood by its reader; one
 # that may be ignored is simply not listed (Zarr v3's `must_understand`).
 const FEATURES = ("brick",)
@@ -222,133 +241,77 @@ function check_types(types)
     return Tuple(types)
 end
 
-# --- serial and parallel access (M7) ---------------------------------------
+# --- the ranks, and the test hooks (M7) ----------------------------------------
 #
-# A checkpoint of a serial forest is the whole file in one process, and
-# every HDF5 call below is the one M9a made: that is `Alone`. A
-# checkpoint of a forest distributed over several ranks is the same file,
-# written or read by all of them at once through parallel HDF5
-# ("Parallel checkpoints" in CODE.md), and differs in three places:
-#
-# - the file is opened over the forest's communicator, by
-#   `open_parallel_file`, whose method is `TreeAMRHDF5MPIExt`;
-# - a dataset over the blocks — the leaf columns and each field set's
-#   data — is written and read by last-axis hyperslab, each rank its own
-#   `blockrange`, in one collective transfer, which a filtered dataset
-#   requires; a rank without blocks takes part with an empty selection;
-# - any other dataset, which every rank holds whole, is written once, by
-#   rank 0, with an independent transfer, which is legal because parallel
-#   HDF5 allocates an unfiltered dataset's storage when it is created
-#   (`H5D__create` in libhdf5 2.2.0's `H5Dint.c`), and read by every rank.
-#
-# Everything else — creating a group, a dataset or an attribute, writing
-# an attribute, closing the file — is made by every rank with the same
-# arguments, the collective contract of parallel HDF5. The agreement
-# before the file is opened is what makes the arguments the same.
-abstract type Access end
-
-struct Alone <: Access end
-
-struct Ranked <: Access
+# The processes a save or a load runs on: the forest's communicator, or
+# the one `load_checkpoint` is given, with this rank and the count read
+# once. Serially it is rank 0 of 1, and every collective below returns at
+# once.
+struct Ranks
     comm::Communicator
     rank::Int
     size::Int
-    collective::HDF5.DatasetTransferProperties
 end
 
-access_for(comm::Communicator) =
-    commsize(comm) == 1 ? Alone() :
-    Ranked(comm, commrank(comm), commsize(comm),
-           HDF5.DatasetTransferProperties(; dxpl_mpio=:collective))
+Ranks(comm::Communicator) = Ranks(comm, commrank(comm), commsize(comm))
 
-release(::Alone) = nothing
-release(a::Ranked) = (close(a.collective); nothing)
+# The message tags of a checkpoint's own messages, beside the exchange's
+# (`schedule.jl`): a member's per-block checksums and its blocks, sent to
+# its I/O process, and a part's blocks, sent by their reader to their
+# owner. Within one tag, messages between two ranks match in the order
+# they were posted, which both ends follow.
+const TAG_HEAD = 60
+const TAG_SAVE = 61
+const TAG_LOAD = 62
 
-# The parallel files open in this process, so that `write_plain`, which is
-# handed a group, knows whether its write is collective.
-const OPEN_RANKED = IdDict{HDF5.File,Ranked}()
-const OPEN_LOCK = ReentrantLock()
-
-access_of(obj) = lock(() -> get(OPEN_RANKED, HDF5.file(obj), Alone()), OPEN_LOCK)
-
-open_file(f, ::Alone, path, mode) = h5open(f, path, mode)
-
-function open_file(f, a::Ranked, path, mode)
-    file = open_parallel_file(librarycomm(a.comm), path, mode)
-    lock(() -> (OPEN_RANKED[file] = a), OPEN_LOCK)
-    try
-        return f(file)
-    finally
-        lock(() -> delete!(OPEN_RANKED, file), OPEN_LOCK)
-        close(file)                      # collective
-    end
-end
-
-# A dataset that every rank holds whole: written by `write`, once.
-write_whole(write, ::Alone) = write()
-write_whole(write, a::Ranked) = (a.rank == 0 && write(); nothing)
-
-# A dataset over the blocks, of dimensions `dims` in Julia's order with
-# the blocks last: this rank's `count` blocks from `offset` on, from or
-# into `buf`. Serially `buf` is the whole dataset, as in M9a.
-write_slab(dset, dt, buf, dims, slab, ::Alone) = HDF5.write_dataset(dset, dt, buf)
-read_slab(dset, dt, buf, dims, slab, ::Alone) = HDF5.read_dataset(dset, dt, buf)
-
-write_slab(dset, dt, buf, dims, slab, a::Ranked) =
-    transfer_slab(API.h5d_write, dset, dt, buf, dims, slab, a)
-read_slab(dset, dt, buf, dims, slab, a::Ranked) =
-    transfer_slab(API.h5d_read, dset, dt, buf, dims, slab, a)
-
-function transfer_slab(transfer, dset, dt, buf, dims, (offset, count), a::Ranked)
-    filespace = HDF5.dataspace(dset)
-    memspace = HDF5.dataspace(count == 0 ? (1,) : (dims[1:(end - 1)]..., count))
-    try
-        if count == 0
-            select_none(filespace)
-            select_none(memspace)
-        else
-            # C's order is Julia's reversed: the block axis comes first.
-            start = API.hsize_t[offset; zeros(Int, length(dims) - 1)]
-            counts = API.hsize_t[count; reverse(collect(dims[1:(end - 1)]))]
-            API.h5s_select_hyperslab(filespace, API.H5S_SELECT_SET, start, C_NULL, counts,
-                                     C_NULL)
-        end
-        transfer(dset, dt, memspace, filespace, a.collective, buf)
-    finally
-        close(memspace)
-        close(filespace)
-    end
-    return nothing
-end
-
-# HDF5.jl has no wrapper for `H5Sselect_none`.
-function select_none(space)
-    API.lock(API.liblock)
-    status = try
-        ccall((:H5Sselect_none, API.libhdf5), API.herr_t, (API.hid_t,), space)
-    finally
-        API.unlock(API.liblock)
-    end
-    status < 0 && error("H5Sselect_none failed")
-    return nothing
-end
-
-# This rank's part of a dataset over the forest's leaves: `(offset,
-# count)`, every leaf serially.
-slab_of(forest::Forest) = (first(blockrange(forest)) - 1, length(blockrange(forest)))
-
-# --- agreement before the file is opened (M7) ------------------------------
+# Three hooks for the tests, never set otherwise (M7 step 6b):
 #
-# Over a distributed forest every refusal is decided before the first
-# collective HDF5 call, and agreed: one `allgather` of each rank's verdict
-# and of a hash of what the ranks must pass alike, so that a refusal on
-# some ranks is raised on all of them together, with the reason, rather
-# than leaving the others waiting inside HDF5. `ForestDigest` and
+# - `OPEN_LOG`: when it holds a vector, every file this process opens —
+#   an HDF5 file, or a file opened to flush it — is recorded in it by its
+#   absolute path, so that the MPI test can check that no file of a save
+#   or a load is opened by more than one process.
+# - `FAIL_PART`: the number of the part whose I/O process fails on
+#   purpose after its first write, so that the test can check what a
+#   failed save leaves behind.
+# - `MAX_MESSAGE`: the largest message, in bytes, that the gathering of a
+#   save and the scattering of a load send, short of one block; 1 GiB, and
+#   small in the tests, so that a rank's blocks travel in several
+#   messages.
+const OPEN_LOG = Ref{Union{Nothing,Vector{String}}}(nothing)
+const FAIL_PART = Ref(-1)
+const MAX_MESSAGE = Ref(2^30)
+
+function note_open(path)
+    log = OPEN_LOG[]
+    log === nothing || push!(log, abspath(path))
+    return nothing
+end
+
+# Open the HDF5 file `path`, recording it.
+function open_h5(path, mode)
+    note_open(path)
+    return h5open(path, mode)
+end
+
+# An HDF5 file in memory only (the core driver without a backing store):
+# the image of an index that rank 0 broadcasts, and the scratch file in
+# which the other ranks run a save's do-block. No file is created.
+memory_file() = h5open("TreeAMR in-memory $(objectid(Ref(0)))", "w";
+                       driver=HDF5.Drivers.Core(; backing_store=false))
+
+# --- agreement (M7) ------------------------------------------------------------
+#
+# Over a distributed forest every refusal is decided before anything is
+# created, and agreed: one `allgather` of each rank's verdict and of a
+# hash of what the ranks must pass alike, so that a refusal on some ranks
+# is raised on all of them together, with the reason, rather than leaving
+# the others waiting in a message that never comes. `ForestDigest` and
 # `digest_verdict` are the schedule builds' (`forest.jl`); a load, which
 # has no forest yet, gathers a digest with the forest's fields zeroed, as
 # `interpolate` does. Beside it goes the hash of the plain data, which
 # gets a refusal of its own.
-function agreed(check, a::Ranked, what; forest=nothing)
+function agreed(check, r::Ranks, what; forest=nothing)
+    r.size == 1 && return first(check())
     checked, refusal = try
         check(), nothing
     catch err
@@ -359,55 +322,62 @@ function agreed(check, a::Ranked, what; forest=nothing)
     digest = forest === nothing ?
              ForestDigest(0, 0, UInt(0), UInt(0), layout, refusal !== nothing) :
              ForestDigest(forest, layout, refusal !== nothing)
-    gathered = allgather(a.comm, (digest, datahash))
-    digest_verdict(map(first, gathered), what, a.rank, refusal)
-    differ = [r - 1 for r in 2:a.size if last(gathered[r]) != last(gathered[1])]
+    gathered = allgather(r.comm, (digest, datahash))
+    digest_verdict(map(first, gathered), what, r.rank, refusal)
+    differ = [q - 1 for q in 2:r.size if last(gathered[q]) != last(gathered[1])]
     isempty(differ) || throw(ArgumentError(
         "the plain data of $what differ between ranks: rank(s) $(join(differ, ", ")) " *
-        "of $(a.size) pass other values than rank 0, so it is refused on every rank, " *
-        "this one (rank $(a.rank)) included. A checkpoint is one file, and each item " *
-        "in it is written once, with one value, for every rank; a value that is per " *
-        "rank belongs in a field set, or is gathered to every rank first."))
+        "of $(r.size) pass other values than rank 0, so it is refused on every rank, " *
+        "this one (rank $(r.rank)) included. A checkpoint is written by rank 0, with one " *
+        "value of each item for every rank; a value that is per rank belongs in a field " *
+        "set, or is gathered to every rank first."))
     return first(checked)
 end
 
-agreed(check, ::Alone, what; forest=nothing) = first(check())
-
-# The texts and numbers of the provenance, every rank the same: rank 0's,
-# broadcast through `allgatherv`, to which the others contribute nothing.
-function agree_values(::Alone, values)
-    return values
-end
-
-function agree_values(a::Ranked, values)
-    io = IOBuffer()
-    if a.rank == 0
-        for v in values
-            bytes = v isa AbstractString ? codeunits(String(v)) :
-                    reinterpret(UInt8, [Int64(v)])
-            write(io, Int64(length(bytes)), bytes)
-        end
+# The errors of a step that runs on some ranks only — an I/O process
+# writing its part, a reader checking or reading its parts, rank 0
+# writing and committing the index — agreed after it, so that every rank
+# throws together. `err` is this rank's error, or `nothing`. A rank that
+# failed throws its own; every other rank throws one quoting the first
+# failing rank's, an `ArgumentError` if that was one (a refusal, such as
+# a part from another save) and an `ErrorException` otherwise.
+function agree_errors(r::Ranks, err, what)
+    if r.size == 1
+        err === nothing || throw(err)
+        return nothing
     end
-    io = IOBuffer(allgatherv(a.comm, take!(io)))
-    return map(values) do v
-        bytes = read(io, read(io, Int64))
-        v isa AbstractString ? String(bytes) : only(reinterpret(Int64, bytes))
-    end
+    text = err === nothing ? "" : err isa ArgumentError ? err.msg : sprint(showerror, err)
+    bytes = collect(codeunits(text))
+    flags = allgather(r.comm, (err !== nothing, err isa ArgumentError, length(bytes)))
+    failed = [q - 1 for q in 1:r.size if flags[q][1]]
+    isempty(failed) && return nothing
+    texts = allgatherv(r.comm, bytes)
+    err === nothing || throw(err)
+    q = first(failed)
+    offset = sum(last, flags[1:q]; init=0)
+    quoted = String(texts[offset+1:offset+last(flags[q+1])])
+    message = "$what failed on rank(s) $(join(failed, ", ")) of $(r.size), and so on " *
+              "this one (rank $(r.rank)) too. On rank $q: " * quoted
+    flags[q+1][2] ? throw(ArgumentError(message)) : error(message)
 end
 
 # --- checksums (M7) ----------------------------------------------------------
 #
 # Every array the forest and the field sets are restored from carries a
 # CRC-32C, verified on load: the leaf list one over its three columns,
-# each field set one per block ("Checksums" in the file layout under
-# "Checkpoint and restart" in CODE.md). They were added after a checkpoint written by 32 ranks on
-# four nodes of a cluster came back with one rank's leaf coordinates
-# zeroed, a corruption the leaf list's own validation caught only because
-# it broke the curve order; the same loss in a field set's data would
-# have been restored silently. A checksum is over the bytes as the file
-# stores them — little-endian, the limbs of a limb type in order — so a
-# reader in another language can verify it. A file without them, written
-# before they existed, is read without the check.
+# each field set one per block, and the index one per part and field set
+# over that part's per-block checksums ("Checksums" in the file layout
+# under "Checkpoint and restart" in CODE.md). They were added after a
+# checkpoint written by 32 ranks on four nodes of a cluster came back with
+# one rank's leaf coordinates zeroed, a corruption the leaf list's own
+# validation caught only because it broke the curve order; the same loss
+# in a field set's data would have been restored silently. A checksum is
+# over the bytes as the file stores them — little-endian, the limbs of a
+# limb type in order — so a reader in another language can verify it. A
+# version-1 file without them, written before they existed, is read
+# without the check. HDF5's own Fletcher-32 is not used: among other
+# reasons it accepts an all-zero chunk, trailer included, which is exactly
+# the damage that was seen.
 
 # The CRC-32C of `count` elements of the array `buf` from index `first`
 # on, continuing `crc`.
@@ -420,14 +390,15 @@ function crc_of(buf::Array, first::Integer, count::Integer, crc::UInt32=UInt32(0
     end
 end
 
-# One CRC-32C per block of `buf`, which holds `m` blocks of equal size in
-# state-vector layout: the order of `data`, block `b` being the slice
-# `data[…, b]`.
-function block_checksums(buf::Array, m::Integer)
-    per = m == 0 ? 0 : length(buf) ÷ m
+crc_of(buf::Array) = crc_of(buf, 1, length(buf))
+
+# One CRC-32C per block of `buf` from element `start` on, which holds `m`
+# blocks of `per` elements each in state-vector layout: the order of
+# `data`, block `b` being the slice `data[…, b]`.
+function block_checksums(buf::Array, m::Integer, per::Integer, start::Integer=1)
     sums = Vector{UInt32}(undef, m)
     threaded_foreach(m) do j
-        sums[j] = crc_of(buf, (j - 1) * per + 1, per)
+        sums[j] = crc_of(buf, start + (j - 1) * per, per)
     end
     return sums
 end
@@ -438,14 +409,13 @@ leaves_checksum(roots, levels, coords) =
     crc_of(coords, 1, length(coords),
            crc_of(levels, 1, length(levels), crc_of(roots, 1, length(roots))))
 
-# A checksum that fails is refused on every rank together: each rank has
-# checked its own blocks, so the verdicts are gathered. `bad` are the
-# failing blocks, in the whole forest's numbering; the result is how many
-# there are over all ranks and the first.
-damage(::Alone, bad) = (length(bad), isempty(bad) ? 0 : first(bad))
-
-function damage(a::Ranked, bad)
-    gathered = allgather(a.comm, (length(bad), isempty(bad) ? 0 : first(bad)))
+# A checksum that fails is refused on every rank together: each reader
+# has checked the blocks it read, so the verdicts are gathered. `bad` are
+# the failing blocks, in the whole forest's numbering; the result is how
+# many there are over all ranks and the first.
+function damage(r::Ranks, bad)
+    r.size == 1 && return (length(bad), isempty(bad) ? 0 : first(bad))
+    gathered = allgather(r.comm, (length(bad), isempty(bad) ? 0 : first(bad)))
     total = sum(first, gathered)
     firsts = [last(g) for g in gathered if first(g) > 0]
     return (total, isempty(firsts) ? 0 : minimum(firsts))
@@ -465,17 +435,17 @@ function tag!(obj, tag; attrs...)
 end
 
 # Create the dataset `name` of HDF5 element type `F` and dimensions
-# `dims`, in Julia's order, and write `buf` into it whole. `buf` may be
-# an array of any isbits type whose bytes are `F`s, since HDF5 checks
-# only the byte count: an array of a limb type is written from its own
-# memory, with no copy (a `reinterpret` would cost one, because HDF5.jl
-# copies a `ReinterpretArray` to take a pointer to it). A plain-data item
-# passes its `tag`; the TreeAMR group's own datasets carry none, since
-# the specification describes them. A dataset over the blocks passes its
-# `slab`, this rank's part, and `buf` holds only that part.
+# `dims`, in Julia's order, and write `buf` into it whole unless `buf` is
+# `nothing` (a dataset over blocks that is filled by `write_blocks`).
+# `buf` may be an array of any isbits type whose bytes are `F`s, since
+# HDF5 checks only the byte count: an array of a limb type is written from
+# its own memory, with no copy (a `reinterpret` would cost one, because
+# HDF5.jl copies a `ReinterpretArray` to take a pointer to it). A
+# plain-data item passes its `tag`; the TreeAMR group's own datasets carry
+# none, since the specification describes them. Returns the dataset open
+# when `keep`, for the caller to fill and close.
 function write_array(parent, name, ::Type{F}, dims::Dims, buf; chunk=nothing,
-                     filters=(), tag=nothing, slab=nothing, attrs...) where {F}
-    access = access_of(parent)
+                     filters=(), tag=nothing, keep=false, attrs...) where {F}
     withtype(F) do dt
         space = dataspace(dims)
         props = isempty(filters) ? (;) : (; chunk=chunk, filters=filters)
@@ -485,14 +455,37 @@ function write_array(parent, name, ::Type{F}, dims::Dims, buf; chunk=nothing,
             close(space)
         end
         try
-            if slab === nothing
-                write_whole(() -> HDF5.write_dataset(dset, dt, buf), access)
-            else
-                write_slab(dset, dt, buf, dims, slab, access)
-            end
+            buf === nothing || prod(dims) == 0 || HDF5.write_dataset(dset, dt, buf)
             tag === nothing || tag!(dset, tag; attrs...)
-        finally
+        catch
             close(dset)
+            rethrow()
+        end
+        keep || close(dset)
+        return keep ? dset : nothing
+    end
+end
+
+# Write or read the blocks `rows` (of the dataset's last axis, counted
+# from 1) of `dset`, whose dimensions are `dims` in Julia's order, from or
+# into the memory at `ptr`, which holds exactly those blocks, in the HDF5
+# element type `F`. HDF5's order is Julia's reversed, so the block axis
+# comes first in the selection. Serial: one process holds the file.
+function block_slab(transfer, dset, ::Type{F}, dims::Dims, rows::UnitRange{Int},
+                    ptr::Ptr) where {F}
+    isempty(rows) && return nothing
+    withtype(F) do dt
+        filespace = HDF5.dataspace(dset)
+        memspace = HDF5.dataspace((dims[1:(end - 1)]..., length(rows)))
+        try
+            start = API.hsize_t[first(rows) - 1; zeros(Int, length(dims) - 1)]
+            counts = API.hsize_t[length(rows); reverse(collect(dims[1:(end - 1)]))]
+            API.h5s_select_hyperslab(filespace, API.H5S_SELECT_SET, start, C_NULL, counts,
+                                     C_NULL)
+            transfer(dset, dt, memspace, filespace, API.H5P_DEFAULT, ptr)
+        finally
+            close(memspace)
+            close(filespace)
         end
     end
     return nothing
@@ -519,14 +512,11 @@ function check_dataset(dset, ::Type{F}, dims, what, note) where {F}
     return nothing
 end
 
-function read_array!(buf, dset, ::Type{F}, dims, what, note; slab=nothing) where {F}
+function read_array!(buf, dset, ::Type{F}, dims, what, note) where {F}
     check_dataset(dset, F, dims, what, note)
+    prod(dims) == 0 && return buf
     withtype(F) do dt
-        if slab === nothing
-            HDF5.read_dataset(dset, dt, buf)
-        else
-            read_slab(dset, dt, buf, dims, slab, access_of(dset))
-        end
+        HDF5.read_dataset(dset, dt, buf)
     end
     return buf
 end
@@ -573,47 +563,41 @@ function read_flags(obj, name, dims, note)
     return raw
 end
 
-# --- provenance ----------------------------------------------------------
-
-# Who wrote the file. Over several ranks these are rank 0's values,
-# which every rank writes, since an object is created collectively with
-# one value: `created`, `hostname` and `nthreads` can differ between
-# ranks. `nranks` is the one field M7 added (decided 2026-10-01 with
-# Erik); a file without it was written serially.
-const PROVENANCE = ("treeamr_version", "julia_version", "created", "hostname", "nthreads",
-                    "nranks", "project", "manifest")
-
-function provenance_values(nranks)
-    project, manifest = environment_texts()
-    version = pkgversion(TreeAMR)
-    return (version === nothing ? "" : string(version), string(VERSION), utc_now(),
-            gethostname(), Int64(Threads.nthreads()), Int64(nranks), project, manifest)
-end
-
-function write_provenance(root, values)
-    access = access_of(root)
-    g = create_group(root, "provenance"; track_order=true)
-    try
-        for (name, value) in zip(PROVENANCE, values)
-            put_value(access, g, name, value)
-        end
-    finally
-        close(g)
+# Every attribute of `src`, written to `dst` as HDF5.jl reads it — which
+# is how the reader reads it back.
+function copy_attributes(src, dst)
+    for name in keys(attributes(src))
+        write_attribute(dst, name, read_attribute(src, name))
     end
     return nothing
 end
 
-# A scalar dataset of a string or an Int64, created by every rank and
-# written by one.
-put_value(::Alone, g, name, value) = write_dataset(g, name, value)
+# --- provenance ----------------------------------------------------------
 
-function put_value(a::Ranked, g, name, value)
-    dset, dt = create_dataset(g, name, value)
+# Who wrote the file: rank 0, whose values these are (`created`,
+# `hostname` and `nthreads` can differ between ranks). M7 added two
+# fields, `nranks` (decided 2026-10-01 with Erik) and `nparts`, the number
+# of part files (step 6b); a file without them was written serially, and
+# as one file.
+const PROVENANCE = ("treeamr_version", "julia_version", "created", "hostname", "nthreads",
+                    "nranks", "nparts", "project", "manifest")
+
+function provenance_values(nranks, nparts)
+    project, manifest = environment_texts()
+    version = pkgversion(TreeAMR)
+    return (version === nothing ? "" : string(version), string(VERSION), utc_now(),
+            gethostname(), Int64(Threads.nthreads()), Int64(nranks), Int64(nparts),
+            project, manifest)
+end
+
+function write_provenance(root, values)
+    g = create_group(root, "provenance"; track_order=true)
     try
-        write_whole(() -> HDF5.write_dataset(dset, dt, value), a)
+        for (name, value) in zip(PROVENANCE, values)
+            write_dataset(g, name, value)
+        end
     finally
-        close(dset)
-        close(dt)
+        close(g)
     end
     return nothing
 end
@@ -664,6 +648,7 @@ function read_provenance(root)
             created=text("created"), hostname=text("hostname"),
             nthreads=(n = item("nthreads", 0); n isa Integer ? Int(n) : 0),
             nranks=(n = item("nranks", 1); n isa Integer ? Int(n) : 1),
+            nparts=(n = item("nparts", 1); n isa Integer ? Int(n) : 1),
             project=text("project"), manifest=text("manifest"))
 end
 
@@ -694,14 +679,9 @@ function write_forest(root, forest::Forest{D,R}) where {D,R}
         F, limbs = storage_of(R, "the forest's geometry")
         extents = R[forest.extents[d][s] for s in 1:2, d in 1:D]
         write_array(g, "extents", F, (limbs..., 2, D), extents)
-        # The leaves as columns, in curve order: block `b` of every field
-        # set is row `b`, and any run of blocks is one hyperslab. Each rank
-        # writes the rows of its own blocks; serially that is every row.
-        # Every rank forms the whole columns, which the forest replicates,
-        # for the checksum, an attribute and so the same on every rank.
+        # The leaves as columns, in curve order: block `b` of the forest is
+        # row `b`, and the blocks of a part are one run of rows.
         n = nleaves(forest)
-        slab = slab_of(forest)
-        offset, m = slab
         roots = Vector{Int32}(undef, n)
         levels = Vector{Int8}(undef, n)
         coords = Matrix{UInt32}(undef, D, n)
@@ -714,18 +694,16 @@ function write_forest(root, forest::Forest{D,R}) where {D,R}
             end
         end
         write_attribute(g, "leaves_crc32c", leaves_checksum(roots, levels, coords))
-        rows = offset+1:offset+m
-        own(col) = m == n ? col : col[ntuple(_ -> Colon(), ndims(col) - 1)..., rows]
-        write_array(g, "root", Int32, (n,), own(roots); slab=slab)
-        write_array(g, "level", Int8, (n,), own(levels); slab=slab)
-        write_array(g, "coords", UInt32, (D, n), own(coords); slab=slab)
+        write_array(g, "root", Int32, (n,), roots)
+        write_array(g, "level", Int8, (n,), levels)
+        write_array(g, "coords", UInt32, (D, n), coords)
     finally
         close(g)
     end
     return nothing
 end
 
-function read_forest(g, types, context, comm)
+function read_forest(g, types, context, comm, version)
     note = writer_note(context)
     connectivity = read_attribute(g, "connectivity")
     connectivity == "brick" || throw(ArgumentError(
@@ -735,12 +713,14 @@ function read_forest(g, types, context, comm)
     (D isa Integer && D >= 1) || throw(ArgumentError(
         "the forest's dimension, D = $(repr(D)), is not a positive integer: the file is " *
         "damaged. " * note))
-    return read_forest(g, Val(Int(D)), types, context, comm)
+    return read_forest(g, Val(Int(D)), types, context, comm, version)
 end
 
-# Every rank reads every leaf, since the forest is replicated, and builds
-# it over `comm`.
-function read_forest(g, ::Val{D}, types, context, comm) where {D}
+# Every rank reads every leaf, since the forest is replicated — over
+# several ranks from its own copy of the index's image, so every rank
+# reaches the same verdict on it without a message — and builds it over
+# `comm`.
+function read_forest(g, ::Val{D}, types, context, comm, version) where {D}
     note = writer_note(context)
     N = read_attribute(g, "N")
     roots = read_attribute(g, "roots")
@@ -758,14 +738,18 @@ function read_forest(g, ::Val{D}, types, context, comm) where {D}
     rootcol = read_array(rootset, Int32, (n,), "the leaves' roots", note)
     levels = read_array(g["level"], Int8, (n,), "the leaves' levels", note)
     coords = read_array(g["coords"], UInt32, (D, n), "the leaves' coordinates", note)
+    # Required from version 2 on; a version-1 file from before M7 has none.
+    version == 1 || hasattr(g, "leaves_crc32c") || throw(ArgumentError(
+        "the leaf list has no checksum, which every file of format version 2 stores " *
+        "with it: the file is damaged. " * note))
     if hasattr(g, "leaves_crc32c")
         stored = read_attribute(g, "leaves_crc32c")
-        intact = stored isa Integer && stored == leaves_checksum(rootcol, levels, coords)
-        first(damage(access_of(g), intact ? Int[] : [1])) == 0 || throw(ArgumentError(
-            "the leaf list does not match the checksum stored with it (a CRC-32C over " *
-            "its columns `root`, `level` and `coords`) on one rank or more: the file was " *
-            "damaged while or after it was written, and is refused rather than read into " *
-            "a wrong mesh. " * note))
+        stored isa Integer && stored == leaves_checksum(rootcol, levels, coords) ||
+            throw(ArgumentError(
+                "the leaf list does not match the checksum stored with it (a CRC-32C over " *
+                "its columns `root`, `level` and `coords`): the file was damaged while or " *
+                "after it was written, and is refused rather than read into a wrong mesh. " *
+                note))
     end
     # Each key is checked by its own constructor, the list as a whole by
     # the forest's.
@@ -797,13 +781,9 @@ function parity_of(name, note)
     return first(PARITY_NAMES[i])
 end
 
-function write_fieldset(parent, name, fs::FieldSet{T,D}, u, filters) where {T,D}
-    if u === nothing
-        u = statevector(fs)
-        gather!(u, fs)
-    end
-    F, limbs = storage_of(T, "field set $(repr(name))")
-    N = fs.forest.N
+# A field set's layout, as the attributes of its group in the index; the
+# data are in the parts.
+function write_layout(parent, name, fs::FieldSet{T,D}) where {T,D}
     g = create_group(parent, name)
     try
         write_typeattrs(g, T, ELTYPE_ATTRS)
@@ -814,24 +794,16 @@ function write_fieldset(parent, name, fs::FieldSet{T,D}, u, filters) where {T,D}
         fs.parity === nothing ||
             write_attribute(g, "parity", [parity_name(p[d]) for d in 1:D, p in fs.parity])
         write_attribute(g, "range", "owned")
-        # One chunk per block and variable, when there is anything to
-        # filter: reading a block then decompresses that block alone, and
-        # over several ranks every chunk has one writer.
-        block = (limbs..., ntuple(_ -> N, D)...)
-        slab = slab_of(fs.forest)
-        buf = tohost(u)
-        write_array(g, "data", F, (block..., fs.nvars, nleaves(fs.forest)), buf;
-                    chunk=(block..., 1, 1), filters=filters, slab=slab)
-        # One CRC-32C per block, over all its variables, beside the data.
-        write_array(g, "data_crc32c", UInt32, (nleaves(fs.forest),),
-                    block_checksums(buf, last(slab)); slab=slab)
     finally
         close(g)
     end
     return nothing
 end
 
-function read_fieldset(g, name, forest::Forest{D}, types, backend, context) where {D}
+# The layout of field set `name` from its group `g` in the index: the
+# element type `T` and how it is stored (`F`, `limbs`), and the arguments
+# of its constructor.
+function read_layout(g, name, ::Val{D}, types, context) where {D}
     note = writer_note(context)
     what = "field set $(repr(name))"
     range = read_attribute(g, "range")
@@ -850,33 +822,14 @@ function read_fieldset(g, name, forest::Forest{D}, types, backend, context) wher
             "is damaged. " * note))
         parity = [ntuple(d -> parity_of(names[d, v], note), D) for v in 1:nvars]
     end
-    # The constructor validates the layout against the forest, as it
-    # would a caller's, and `statevector` places the pages by owner, which
-    # is what decides their NUMA domain; the read below only fills them.
-    fs = FieldSet{T}(forest, nvars; G=G, centering=centering, parity=parity,
-                     backend=backend)
-    u = statevector(fs)
-    # The whole dataset's dimensions, of which this rank reads its blocks.
-    dims = (limbs..., ntuple(_ -> forest.N, D)..., nvars, nleaves(forest))
-    slab = slab_of(forest)
-    host = u isa Array ? u : Vector{T}(undef, length(u))
-    read_array!(host, g["data"], F, dims, "the data of $what", note; slab=slab)
-    if haskey(g, "data_crc32c")
-        n = nleaves(forest)
-        stored = read_array!(Vector{UInt32}(undef, last(slab)), g["data_crc32c"], UInt32,
-                             (n,), "the checksums of $what", note; slab=slab)
-        bad = findall(block_checksums(host, last(slab)) .!= stored) .+ first(slab)
-        count, b = damage(access_of(g), bad)
-        count == 0 || throw(ArgumentError(
-            "the data of $what do not match the checksums stored with them in $count of " *
-            "its $n blocks, the first being block $b (a CRC-32C per block): the file was " *
-            "damaged while or after it was written, and is refused rather than restored " *
-            "into a wrong state. " * note))
-    end
-    host === u || copyto!(u, host)
-    scatter!(fs, u)
-    return (; fieldset=fs, state=u)
+    return (; name=String(name), T, F, limbs, nvars, G, centering, parity)
 end
+
+# How a field set's blocks are stored: the dimensions of one block in the
+# file, limbs first, and the number of elements of `T` a block holds in
+# the state vector, which is a block's run of the data's last axis.
+block_dims(N, ::Val{D}, limbs) where {D} = (limbs..., ntuple(_ -> N, D)...)
+block_length(N, D, nvars) = N^D * nvars
 
 # Validate the `fieldsets` keyword of `save_checkpoint` into a list of
 # `(name, fs, u)`, `u` being `nothing` for the bare form, before a file
@@ -944,33 +897,293 @@ function check_application(application)
     return (String(name), Int64(version))
 end
 
-# --- saving and loading ----------------------------------------------------
+function check_io(io)
+    (io === :node || io === :all || (io isa Integer && !(io isa Bool) && io >= 1)) ||
+        throw(ArgumentError(
+            "`io` is `:node` (one I/O process per shared-memory node, the default), " *
+            "`:all` (every rank writes its own part) or a positive integer, the number " *
+            "of I/O processes; got $(repr(io))"))
+    return io
+end
+
+# --- I/O groups and parts (M7 step 6b) ---------------------------------------
+#
+# The ranks are split into `k` contiguous groups in rank order, by the
+# equal-count split that partitions the blocks; the first rank of each
+# group is its I/O process. The ranks own contiguous runs of the curve in
+# rank order, so a group's blocks are one contiguous run of the curve,
+# and its part one range of blocks. `:node` sets `k` to the number of
+# shared-memory nodes and nothing else: the groups stay equal-count rank
+# ranges even when a node's ranks are not contiguous, which costs
+# messages across the network then and nothing else ("Checkpoints without
+# parallel I/O" in CODE.md).
+struct IOPlan
+    k::Int                      # the number of groups, and of parts
+    group::Int                  # this rank's group, from 0
+    ranks::UnitRange{Int}       # the group's ranks, from 0; the first is its I/O process
+end
+
+function io_plan(r::Ranks, io)
+    k = io === :node ? commnodes(r.comm) : io === :all ? r.size : min(Int(io), r.size)
+    g = equalsplit_part(r.size, k, r.rank + 1)
+    return IOPlan(k, g - 1, equalsplit(r.size, k, g) .- 1)
+end
+
+isio(plan::IOPlan, r::Ranks) = r.rank == first(plan.ranks)
+
+# The blocks of rank `q` among `P`, and of group `g` among `k`, as global
+# leaf indices from 1: `blockrange`'s arithmetic, for any rank.
+rankblocks(n, P, q) = equalsplit(n, P, q + 1)
+
+function groupblocks(n, P, k, g)
+    ranks = equalsplit(P, k, g + 1)
+    return first(rankblocks(n, P, first(ranks) - 1)):last(rankblocks(n, P, last(ranks) - 1))
+end
+
+# A range of blocks cut into pieces of whole blocks of at most
+# `MAX_MESSAGE` bytes each, or of one block where a block is larger: how a
+# member's blocks travel to its I/O process, and a part's blocks from
+# their reader to their owner. Both ends cut a range the same way.
+function pieces(blocks::UnitRange{Int}, blockbytes::Integer)
+    per = max(1, MAX_MESSAGE[] ÷ max(1, Int(blockbytes)))
+    return [b:min(b + per - 1, last(blocks)) for b in first(blocks):per:last(blocks)]
+end
+
+# The elements of blocks `rows` (from 1) of a state vector whose blocks
+# hold `per` elements each.
+elements(rows::UnitRange{Int}, per) = ((first(rows) - 1) * per + 1):(last(rows) * per)
+
+# The part file of group `j`: beside the index, named after it and the
+# save, so that a part from another save cannot be taken for one of this
+# save's. The link to it in the index is named with four digits at least,
+# so that the links list in order.
+partname(path, saveid, j) = basename(path) * "." * saveid * "." * string(j) * ".h5"
+linkname(j) = lpad(string(j), 4, '0')
+
+# The save id and part number in `name` if it is exactly the name of a
+# part of the index `base`, that is `base`, a dot, 32 lowercase hex
+# digits, a dot, decimal digits and `.h5`; otherwise `nothing`. Only such
+# a file is ever removed as an orphan.
+function part_of(base::AbstractString, name::AbstractString)
+    startswith(name, base * ".") || return nothing
+    m = match(r"^([0-9a-f]{32})\.([0-9]+)\.h5$", name[(ncodeunits(base) + 2):end])
+    return m === nothing ? nothing : (m[1], parse(Int, m[2]))
+end
+
+# Whether `name` has the form of some index's part, whatever the index
+# is called: the only names a previous index may make a save remove.
+is_partname(name::AbstractString) =
+    !occursin('/', name) && occursin(r"\.[0-9a-f]{32}\.[0-9]+\.h5$", name)
+
+# 128 random bits from the operating system, as 32 hex digits. Not
+# `rand`: an application that seeds the global generator the same way in
+# every run would draw the same id in a restarted run as in the run that
+# wrote the checkpoint it restarts from, and its parts would overwrite
+# that checkpoint's. `Libc.getrandom!` is what `RandomDevice` draws
+# from.
+function new_saveid()
+    bytes = zeros(UInt8, 16)
+    Base.Libc.getrandom!(bytes)
+    return bytes2hex(bytes)
+end
+
+# Run `f` unless an error has happened already, and return the first
+# error: how the I/O process and the readers keep going through their
+# messages after a failure, so that no rank waits forever for one.
+function attempt(f, err)
+    err === nothing || return err
+    try
+        f()
+        return nothing
+    catch e
+        return e
+    end
+end
+
+# A field set's data for the save on this rank: its state vector on the
+# host, `u` or the owned points gathered from `fs.work`, and one checksum
+# per block.
+function prepared((name, fs, u))
+    if u === nothing
+        u = statevector(fs)
+        gather!(u, fs)
+    end
+    host = tohost(u)
+    per = block_length(fs.forest.N, dimension(fs.forest), fs.nvars)
+    return host, per, block_checksums(host, nblocks(fs), per)
+end
+
+dimension(::Forest{D}) where {D} = D
+
+# A member's part of a save: for each field set its per-block checksums,
+# after a status word (0, or 1 if it could not prepare its data, which its
+# own error then says), and its blocks, to its I/O process. Returns this
+# rank's error, or `nothing`.
+function send_blocks(r::Ranks, plan::IOPlan, sets)
+    io = first(plan.ranks)
+    err = nothing
+    for set in sets
+        prep = nothing
+        err = attempt(() -> (prep = prepared(set)), err)
+        if prep === nothing
+            status = UInt32[1]
+            waitall(r.comm, [isend(r.comm, status, io, TAG_HEAD)])
+            continue
+        end
+        host, per, sums = prep
+        head = [UInt32(0); sums]
+        requests = Any[isend(r.comm, head, io, TAG_HEAD)]
+        for piece in pieces(1:length(sums), per * sizeof(eltype(host)))
+            push!(requests, isend(r.comm, view(host, elements(piece, per)), io, TAG_SAVE))
+        end
+        waitall(r.comm, requests)
+    end
+    return err
+end
+
+# The I/O process's part of a save: its part group `pg` (`nothing` if it
+# could not be created, `err` saying why), filled with each field set's
+# data for the group's blocks — its own first, then each member's as it
+# arrives, the next message posted before the current one is written —
+# and their checksums. Every block received is checked against the
+# checksum its member computed before sending it. After a failure it
+# goes on receiving, without writing, so that no member waits forever.
+# Returns the first error and, per field set, the CRC-32C of the part's
+# `data_crc32c`.
+function write_blocks!(pg, err, r::Ranks, plan::IOPlan, forest, sets, filters)
+    n, P = nleaves(forest), r.size
+    D = dimension(forest)
+    nb = length(groupblocks(n, P, plan.k, plan.group))
+    fg = nothing
+    err = attempt(() -> (fg = create_group(pg, "fieldsets"; track_order=true)), err)
+    summaries = UInt32[]
+    for (s, set) in enumerate(sets)
+        name, fs, _ = set
+        T = eltype(fs.work)
+        F, limbs = storage_of(T, "field set $(repr(name))")
+        block = block_dims(forest.N, Val(D), limbs)
+        dims = (block..., fs.nvars, nb)
+        per = block_length(forest.N, D, fs.nvars)
+        sums = zeros(UInt32, nb)
+        g = dset = nothing
+        err = attempt(err) do
+            g = create_group(fg, name)
+            # An empty part is stored contiguously: HDF5 refuses a chunk
+            # larger than a fixed dataset of extent 0.
+            dset = write_array(g, "data", F, dims, nothing; chunk=(block..., 1, 1),
+                               filters=nb == 0 ? () : filters, keep=true)
+        end
+        # Its own blocks, from its own state vector.
+        own = length(rankblocks(n, P, r.rank))
+        prep = nothing
+        err = attempt(() -> (prep = prepared(set)), err)
+        if prep !== nothing
+            host, _, mine = prep
+            sums[1:own] = mine
+            err = attempt(err) do
+                GC.@preserve host block_slab(API.h5d_write, dset, F, dims, 1:own,
+                                             pointer(host))
+            end
+            if err === nothing && FAIL_PART[] == plan.group
+                err = ErrorException(
+                    "the I/O process of part $(plan.group) failed on purpose after its " *
+                    "first write (TreeAMRHDF5Ext.FAIL_PART, a test hook)")
+            end
+        end
+        # Each member's, in curve order.
+        offset = own
+        buffers = (Vector{T}(undef, 0), Vector{T}(undef, 0))
+        for q in plan.ranks[2:end]
+            m = length(rankblocks(n, P, q))
+            head = Vector{UInt32}(undef, 1 + m)
+            waitall(r.comm, [irecv(r.comm, head, q, TAG_HEAD)])
+            if head[1] != 0
+                err === nothing && (err = ErrorException(
+                    "rank $q could not prepare its blocks of field set $(repr(name)) for " *
+                    "its I/O process, rank $(r.rank); rank $q's own error says why"))
+                offset += m
+                continue
+            end
+            sums[offset .+ (1:m)] = view(head, 2:(m + 1))
+            ps = pieces(1:m, per * sizeof(T))
+            longest = isempty(ps) ? 0 : maximum(length, ps) * per
+            for buf in buffers
+                length(buf) < longest && resize!(buf, longest)
+            end
+            post(i) = irecv(r.comm, view(buffers[mod1(i, 2)], 1:(length(ps[i]) * per)), q,
+                            TAG_SAVE)
+            request = isempty(ps) ? nothing : post(1)
+            for (i, piece) in enumerate(ps)
+                waitall(r.comm, [request])
+                i < length(ps) && (request = post(i + 1))
+                err === nothing || continue
+                buf = buffers[mod1(i, 2)]
+                got = block_checksums(buf, length(piece), per)
+                bad = findfirst(j -> got[j] != head[1 + piece[j]], eachindex(got))
+                if bad !== nothing
+                    b = first(groupblocks(n, P, plan.k, plan.group)) + offset +
+                        piece[bad] - 1
+                    err = ErrorException(
+                        "block $b of field set $(repr(name)) arrived at its I/O process, " *
+                        "rank $(r.rank), from rank $q damaged: its CRC-32C does not match " *
+                        "the one rank $q computed before sending it, so it was not " *
+                        "written, and the checkpoint is not saved")
+                    continue
+                end
+                err = attempt(err) do
+                    GC.@preserve buf block_slab(API.h5d_write, dset, F, dims,
+                                                offset .+ piece, pointer(buf))
+                end
+            end
+            offset += m
+        end
+        err = attempt(() -> write_array(g, "data_crc32c", UInt32, (nb,), sums), err)
+        push!(summaries, crc_of(sums))
+        dset === nothing || close(dset)
+        g === nothing || close(g)
+    end
+    fg === nothing || close(fg)
+    return err, summaries
+end
+
+# The attributes that make a group a part (M7 step 6b): which save it
+# belongs to, its number and its blocks.
+function part_attributes!(pg, saveid, j, range)
+    write_attribute(pg, "format", PART_FORMAT)
+    write_attribute(pg, "format_version", Int64(FORMAT_VERSION))
+    write_attribute(pg, "save_id", saveid)
+    write_attribute(pg, "part", Int64(j))
+    write_attribute(pg, "first_block", Int64(first(range)))
+    write_attribute(pg, "last_block", Int64(last(range)))
+    return nothing
+end
+
+# --- saving ------------------------------------------------------------------
 
 save_checkpoint(path::AbstractString, forest::Forest; kwargs...) =
     save_checkpoint(nothing, path, forest; kwargs...)
 
 function save_checkpoint(f, path::AbstractString, forest::Forest; fieldsets=nothing,
-                         application=nothing, data=(;), filters=(), sync::Bool=true)
-    access = access_for(forest.comm)
-    try
-        # Every refusal before the file is created, and over several ranks
-        # agreed, so that a refusal is raised on all of them together.
-        checked = agreed(access, "save_checkpoint"; forest=forest) do
-            c = check_save(forest, fieldsets, application, filters)
-            appname, appversion, sets, filters′ = c
-            datahash = plain_hash("/$appname/data", data, UInt(0), access isa Ranked)
-            layout = layouthash(String(path), appname, appversion, string(filters′), sync,
-                                f === nothing, map(set_layout, sets))
-            return (c, layout, datahash)
-        end
-        write_checkpoint(f, access, path, forest, checked..., data, sync)
-    finally
-        release(access)
+                         application=nothing, data=(;), filters=(), sync::Bool=true,
+                         io=:node)
+    r = Ranks(forest.comm)
+    # Every refusal before anything is created, and over several ranks
+    # agreed, so that a refusal is raised on all of them together.
+    appname, appversion, sets, filters′, io′ = agreed(r, "save_checkpoint";
+                                                      forest=forest) do
+        c = check_save(forest, fieldsets, application, filters, io)
+        appname, appversion, sets, filters′, io′ = c
+        datahash = plain_hash("/$appname/data", data, UInt(0))
+        layout = layouthash(String(path), appname, appversion, string(filters′), sync,
+                            f === nothing, string(io′), map(set_layout, sets))
+        return (c, layout, datahash)
     end
+    write_checkpoint(f, r, String(path), forest, appname, appversion, sets, filters′,
+                     data, sync, io′)
     return path
 end
 
-function check_save(forest, fieldsets, application, filters)
+function check_save(forest, fieldsets, application, filters, io)
     fieldsets === nothing && throw(ArgumentError(
         "save_checkpoint has no default `fieldsets`: pass the field sets the " *
         "application evolves, as `name => (fs, u)` pairs, or `()` for none. Which sets " *
@@ -980,7 +1193,7 @@ function check_save(forest, fieldsets, application, filters)
     sets = collect_fieldsets(fieldsets, forest)
     storage_of(floattype(forest), "the forest's geometry")
     filters isa HDF5.Filters.Filter && (filters = (filters,))
-    return (appname, appversion, sets, filters)
+    return (appname, appversion, sets, filters, check_io(io))
 end
 
 # What the ranks must agree on about one field set: everything that
@@ -990,88 +1203,252 @@ set_layout((name, fs, u)) =
      fs.parity === nothing ? "" : string(map(p -> map(parity_name, p), fs.parity)),
      u === nothing)
 
-nranks(::Alone) = 1
-nranks(a::Ranked) = a.size
-
-function write_checkpoint(f, access, path, forest, appname, appversion, sets, filters, data,
-                          sync)
-    provenance = agree_values(access, provenance_values(nranks(access)))
-    # Written beside `path` and renamed over it once complete. `rename`,
-    # not `mv(…; force = true)`, which on Julia 1.11 removes `path` first
-    # and leaves a moment with no checkpoint there at all; a rename on one
-    # file system replaces the old file atomically.
+# The steps of "Checkpoints without parallel I/O" in CODE.md: the parts,
+# the index, the commit, the cleanup. Every rank runs this; each step
+# that runs on some ranks only ends in an agreement, so that a failure
+# anywhere is raised everywhere, and until the rename nothing the
+# previous checkpoint needs has been touched.
+function write_checkpoint(f, r::Ranks, path, forest, appname, appversion, sets, filters,
+                          data, sync, io)
+    plan = io_plan(r, io)
+    # The save id, rank 0's, on every rank.
+    saveid = String(bcast(r.comm, r.rank == 0 ? collect(codeunits(new_saveid())) : UInt8[],
+                          0))
+    dir = dirname(abspath(path))
     partial = path * ".partial"
+    inline = plan.k == 1
+    # Read before anything changes: the parts the checkpoint at `path`
+    # names, which are removed once this one has replaced it.
+    previous = r.rank == 0 ? previous_parts(path) : String[]
+    index = nothing                       # rank 0's partial index, once created
+    mypart = nothing                      # this I/O process's part file
+    renamed = false
     try
-        open_file(access, partial, "w") do file
-            root = create_group(file, GROUP)
-            write_attribute(root, "format", FORMAT)
-            write_attribute(root, "format_version", Int64(FORMAT_VERSION))
-            write_attribute(root, "features", collect(String, FEATURES))
-            write_attribute(root, "application", appname)
-            write_provenance(root, provenance)
-            write_forest(root, forest)
-            group = create_group(root, "fieldsets"; track_order=true)
-            for (name, fs, u) in sets
-                write_fieldset(group, name, fs, u, filters)
+        # 1. The parts. With one part it is a group of the index, which
+        # rank 0, its I/O process, creates now.
+        err = nothing
+        report = UInt64[]
+        if isio(plan, r)
+            range = groupblocks(nleaves(forest), r.size, plan.k, plan.group)
+            file = pg = nothing
+            err = attempt(err) do
+                if inline
+                    note_open(partial)
+                    index = h5open(partial, "w")
+                    root = create_group(index, GROUP)
+                    parts = create_group(root, "parts")
+                    pg = create_group(parts, linkname(0))
+                    close(parts)
+                    close(root)
+                else
+                    mypart = joinpath(dir, partname(path, saveid, plan.group))
+                    ispath(mypart) && error(
+                        "the part file $(repr(mypart)) exists already, and a save never " *
+                        "overwrites one: its name holds a save id drawn afresh for this " *
+                        "save, so another process is writing to the same checkpoint")
+                    file = open_h5(mypart, "w")
+                    pg = create_group(file, GROUP)
+                end
+                part_attributes!(pg, saveid, plan.group, range)
             end
-            app = create_group(file, appname; track_order=true)
-            write_attribute(app, "format_version", appversion)
-            put_plain(app, "data", data)            # checked and agreed above
-            f === nothing || f(app)
-            flush_ranks(access, file, sync)
-            return nothing
+            err, sums = write_blocks!(pg, err, r, plan, forest, sets, filters)
+            pg === nothing || close(pg)
+            bytes = 0
+            if !inline
+                # Closed whatever happened, so that a failed part can be
+                # removed; flushed and measured only if nothing failed.
+                closing = attempt(() -> (file === nothing || close(file)), nothing)
+                err = err === nothing ? closing : err
+                err = attempt(err) do
+                    if sync
+                        flush_to_storage(mypart)
+                        flush_to_storage(dir; directory=true)
+                    end
+                    bytes = filesize(mypart)
+                end
+            end
+            report = UInt64[plan.group; bytes; sums]
+        else
+            err = send_blocks(r, plan, sets)
         end
-        publish(access, partial, path, sync)
+        agree_errors(r, err, "save_checkpoint, writing the parts,")
+        reports = reshape(allgatherv(r.comm, report), 2 + length(sets), plan.k)
+
+        # 2. The index, on rank 0; the do-block on every rank.
+        err = nothing
+        scratch = nothing
+        try
+            err = attempt(err) do
+                if r.rank == 0
+                    if index === nothing
+                        note_open(partial)
+                        index = h5open(partial, "w")
+                    end
+                    write_index!(index, path, saveid, forest, sets, appname, reports, plan.k,
+                                 r.size)
+                    target = index
+                else
+                    scratch = memory_file()
+                    target = scratch
+                end
+                app = create_group(target, appname; track_order=true)
+                try
+                    write_attribute(app, "format_version", appversion)
+                    put_plain(app, "data", data)            # checked and agreed above
+                    f === nothing || saving(() -> f(app), target, r)
+                finally
+                    close(app)
+                end
+            end
+        finally
+            scratch === nothing || close(scratch)
+        end
+        agree_errors(r, err, "save_checkpoint, writing the index,")
+
+        # 3. The commit: the index in place of the previous one.
+        err = nothing
+        if r.rank == 0
+            err = attempt(err) do
+                close(index)
+                index = nothing
+                sync && flush_to_storage(partial)
+                Base.Filesystem.rename(partial, path)
+                renamed = true
+                sync && flush_to_storage(dir; directory=true)
+            end
+        end
+        renamed = r.size == 1 ? renamed : first(allgather(r.comm, renamed))
+        agree_errors(r, err, "save_checkpoint, putting the index in place,")
     catch
-        rm(partial; force=true)
+        # Nothing is committed, unless the rename was: then the new
+        # checkpoint is the one at `path`, and its parts stay.
+        if !renamed
+            mypart === nothing || rm(mypart; force=true)
+            if r.rank == 0
+                index === nothing || close(index)
+                rm(partial; force=true)
+            end
+        end
         rethrow()
     end
+    # 4. The cleanup, once the new checkpoint is in place.
+    r.rank == 0 && remove_stale(path, saveid, previous)
     return nothing
 end
 
-# Over several ranks each rank's writes have to reach stable storage, not
-# only rank 0's: on a parallel file system every client caches its own,
-# and an `fsync` on one flushes none of the others'. A collective
-# `H5Fflush` does it, since the MPI-IO driver's flush is `MPI_File_sync`
-# on every rank (`H5FD__mpio_flush` in libhdf5 2.2.0's `H5FDmpio.c`,
-# reached through `H5F__flush` with `closing = false`; a flush as the
-# file closes skips the sync, which is why it is asked for here, before
-# the close). ROMIO's `MPI_File_sync` is an `fsync` on each rank that
-# wrote (`ADIOI_GEN_Flush`). Serially the file is flushed by
-# `flush_to_storage` alone, after it is closed, as in M9a.
-flush_ranks(::Alone, file, sync) = nothing
-flush_ranks(::Ranked, file, sync) = (sync && API.h5f_flush(file, API.H5F_SCOPE_LOCAL);
-                                     nothing)
+# The files a save's do-block writes into: the index on rank 0, the
+# scratch file on the others, so that `write_plain` in the block knows to
+# agree its value across the ranks.
+const SAVING = IdDict{HDF5.File,Ranks}()
+const SAVING_LOCK = ReentrantLock()
 
-# Put the closed partial file in place: the data first, then the rename,
-# then the directory entry the rename wrote. A rename that reaches the
-# disk before the data it points to would replace the previous checkpoint
-# with a truncated file.
-function publish(::Alone, partial, path, sync)
-    sync && flush_to_storage(partial)
-    Base.Filesystem.rename(partial, path)
-    sync && flush_to_storage(dirname(abspath(path)); directory=true)
-    return nothing
+function saving(f, file, r::Ranks)
+    lock(() -> (SAVING[file] = r), SAVING_LOCK)
+    try
+        return f()
+    finally
+        lock(() -> delete!(SAVING, file), SAVING_LOCK)
+    end
 end
 
-# Over several ranks rank 0 does it — its `flush_to_storage` is the full
-# flush on macOS, where the ranks' `fsync` does not reach the drive — and
-# the others wait for it, so that no rank returns before the checkpoint
-# is in place, and every rank fails if rank 0 did.
-function publish(a::Ranked, partial, path, sync)
-    failure = nothing
-    if a.rank == 0
+saving_ranks(obj) = lock(() -> get(SAVING, HDF5.file(obj), nothing), SAVING_LOCK)
+
+# Everything of the index but the application's group: the format
+# attributes, the provenance, the forest, the field sets' layouts, the
+# part table and the links to the parts. `reports` holds a column per
+# part, `(part, bytes, checksum per field set...)`, in part order.
+function write_index!(file, path, saveid, forest, sets, appname, reports, k, nranks)
+    root = haskey(file, GROUP) ? file[GROUP] : create_group(file, GROUP)
+    try
+        write_attribute(root, "format", FORMAT)
+        write_attribute(root, "format_version", Int64(FORMAT_VERSION))
+        write_attribute(root, "features", collect(String, FEATURES))
+        write_attribute(root, "application", appname)
+        write_attribute(root, "save_id", saveid)
+        write_provenance(root, provenance_values(nranks, k))
+        write_forest(root, forest)
+        group = create_group(root, "fieldsets"; track_order=true)
         try
-            publish(Alone(), partial, path, sync)
+            for (name, fs, _) in sets
+                write_layout(group, name, fs)
+            end
+        finally
+            close(group)
+        end
+        n = nleaves(forest)
+        ranges = [groupblocks(n, nranks, k, j) for j in 0:(k - 1)]
+        files = k == 1 ? [""] : [partname(path, saveid, j) for j in 0:(k - 1)]
+        table = create_group(root, "parttable")
+        try
+            write_dataset(table, "file", files)
+            write_array(table, "first_block", Int64, (k,), Int64[first(x) for x in ranges])
+            write_array(table, "last_block", Int64, (k,), Int64[last(x) for x in ranges])
+            write_array(table, "bytes", Int64, (k,), Int64.(reports[2, :]))
+            write_dataset(table, "fieldsets", String[name for (name, _, _) in sets])
+            write_array(table, "data_crc32c", UInt32, (length(sets), k),
+                        UInt32.(reports[3:end, :]))
+        finally
+            close(table)
+        end
+        if k > 1
+            # For tools only: TreeAMR's reader never follows them.
+            parts = create_group(root, "parts")
+            try
+                for j in 0:(k - 1)
+                    create_external(parts, linkname(j), files[j + 1], "/" * GROUP)
+                end
+            finally
+                close(parts)
+            end
+        end
+    finally
+        close(root)
+    end
+    return nothing
+end
+
+# The part files the checkpoint at `path` names, if it is a version-2
+# index: read leniently, since a missing or damaged earlier checkpoint
+# only means there is nothing of it to remove. Only names of the part
+# form are returned, so that a damaged index cannot make a save remove
+# any other file.
+function previous_parts(path)
+    isfile(path) && HDF5.ishdf5(path) || return String[]
+    names = String[]
+    try
+        file = open_h5(path, "r")
+        try
+            key = GROUP * "/parttable/file"
+            haskey(file, key) && append!(names, filter(is_partname, read(file[key])))
+        finally
+            close(file)
+        end
+    catch
+    end
+    return names
+end
+
+# Remove the parts the previous index named and every orphan: a file of
+# the part form for this index (`part_of`) from a save other than this
+# one. A failure to remove one is a warning, since the checkpoint is in
+# place.
+function remove_stale(path, saveid, previous)
+    dir = dirname(abspath(path))
+    stale = Set{String}(previous)
+    for name in readdir(dir)
+        part = part_of(basename(path), name)
+        part === nothing || first(part) == saveid || push!(stale, name)
+    end
+    for name in stale
+        part = part_of(basename(path), name)
+        part !== nothing && first(part) == saveid && continue
+        try
+            rm(joinpath(dir, name); force=true)
         catch err
-            failure = err
+            @warn "the checkpoint $(repr(path)) is in place, but a part of an earlier " *
+                  "one could not be removed" name exception = err
         end
     end
-    done = first(allgather(a.comm, failure === nothing))
-    failure === nothing || throw(failure)
-    done || error("the checkpoint $(repr(path)) was written by every rank but not put in " *
-                  "place: rank 0, which flushes it and renames it over the old one, " *
-                  "failed, and its error says why. The previous checkpoint is untouched.")
     return nothing
 end
 
@@ -1089,6 +1466,7 @@ const F_FULLFSYNC = Cint(51)        # macOS
 
 function flush_to_storage(path::AbstractString; directory::Bool=false)
     Sys.iswindows() && return nothing
+    directory || note_open(path)
     fd = ccall(:open, Cint, (Cstring, Cint), path, O_RDONLY)
     fd < 0 && systemerror("opening $(repr(path)) to flush it to stable storage")
     try
@@ -1102,6 +1480,8 @@ function flush_to_storage(path::AbstractString; directory::Bool=false)
     return nothing
 end
 
+# --- loading ---------------------------------------------------------------
+
 function check_file(path::AbstractString)
     isfile(path) || throw(ArgumentError(
         "there is no checkpoint at $(repr(path)): no such file"))
@@ -1110,37 +1490,112 @@ function check_file(path::AbstractString)
     return nothing
 end
 
-# Open `path` as a TreeAMR checkpoint and call `f(file, root, context)`,
-# refusing a file that is not one. Nothing about the format version is
-# checked here, so that `checkpoint_environment` can read a file whose
-# version `load_checkpoint` refuses. A load over several ranks has checked
-# the file already, on rank 0, before agreeing to open it.
-function open_checkpoint(f, path::AbstractString, access::Access=Alone();
-                         checked::Bool=false)
-    checked || check_file(path)
-    return open_file(access, path, "r") do file
-        haskey(file, GROUP) || throw(ArgumentError(
-            "$(repr(path)) is not a TreeAMR checkpoint: it is an HDF5 file with no " *
-            "/$GROUP group, which is where TreeAMR keeps everything it writes"))
-        root = file[GROUP]
-        format = hasattr(root, "format") ? read_attribute(root, "format") : nothing
-        format == FORMAT || throw(ArgumentError(
-            "$(repr(path)) is not a TreeAMR checkpoint: its /$GROUP group has format = " *
-            "$(repr(format)), not $(repr(FORMAT))"))
-        context = (; path=String(path), provenance=read_provenance(root))
-        return f(file, root, context)
+# The index at `path`, open, once it has been checked to be a TreeAMR
+# checkpoint. Nothing about the format version is checked here, so that
+# `checkpoint_environment` can read a file whose version `load_checkpoint`
+# refuses.
+function open_index(path::AbstractString)
+    check_file(path)
+    file = open_h5(path, "r")
+    try
+        check_checkpoint(file, path)
+    catch
+        close(file)
+        rethrow()
+    end
+    return file
+end
+
+function check_checkpoint(file, path)
+    haskey(file, GROUP) || throw(ArgumentError(
+        "$(repr(path)) is not a TreeAMR checkpoint: it is an HDF5 file with no " *
+        "/$GROUP group, which is where TreeAMR keeps everything it writes"))
+    root = file[GROUP]
+    format = hasattr(root, "format") ? read_attribute(root, "format") : nothing
+    format == FORMAT || throw(ArgumentError(
+        "$(repr(path)) is not a TreeAMR checkpoint: its /$GROUP group has format = " *
+        "$(repr(format)), not $(repr(FORMAT))"))
+    return nothing
+end
+
+context_of(root, path) = (; path=String(path), provenance=read_provenance(root))
+
+# Over several ranks only rank 0 opens the index. It copies everything of
+# it but the part data — the `/TreeAMR.jl` group's attributes, the
+# provenance, the forest, the field sets' layout attributes, the part
+# table, and the application's group — into an HDF5 file in memory and
+# broadcasts its bytes, which every rank opens as a file image. So HDF5
+# itself serializes the forest and the plain data, and every rank reads
+# the same objects as a serial load would. Rank 0 keeps the index open
+# for the part data inside it (one part, or a version-1 file). A refusal
+# of the file itself is rank 0's, and is broadcast in place of the image.
+function share_index(r::Ranks, path)
+    real = nothing
+    err = nothing
+    payload = UInt8[]
+    if r.rank == 0
+        try
+            real = open_index(path)
+            payload = [0x00; index_image(real)]
+        catch e
+            real === nothing || close(real)
+            real = nothing
+            err = e
+            payload = [e isa ArgumentError ? 0x01 : 0x02;
+                       codeunits(e isa ArgumentError ? e.msg : sprint(showerror, e))]
+        end
+    end
+    payload = bcast(r.comm, payload, 0)
+    if payload[1] != 0x00
+        err === nothing || throw(err)
+        text = String(payload[2:end])
+        payload[1] == 0x01 && throw(ArgumentError(text))
+        error("rank 0 could not open the checkpoint index $(repr(path)): " * text)
+    end
+    meta = h5open(payload[2:end], "r")
+    return real, meta
+end
+
+function index_image(file)
+    root = file[GROUP]
+    image = memory_file()
+    try
+        dst = create_group(image, GROUP)
+        copy_attributes(root, dst)
+        for name in keys(root)
+            name == "parts" && continue              # the part data, or links to them
+            if name == "fieldsets"
+                sets = create_group(dst, name; track_order=true)
+                for set in keys(root[name])
+                    g = create_group(sets, set)
+                    copy_attributes(root[name][set], g)
+                    close(g)
+                end
+                close(sets)
+            else
+                copy_object(root, name, dst, name)
+            end
+        end
+        close(dst)
+        app = hasattr(root, "application") ? read_attribute(root, "application") : nothing
+        app isa AbstractString && app != GROUP && haskey(file, app) &&
+            copy_object(file, app, image, app)
+        flush(image)
+        return Vector{UInt8}(image)
+    finally
+        close(image)
     end
 end
 
 function check_format(root, context)
     note = writer_note(context)
     version = read_attribute(root, "format_version")
-    version == FORMAT_VERSION || throw(ArgumentError(
+    version in READ_VERSIONS || throw(ArgumentError(
         "$(repr(context.path)) is in checkpoint format version $version, and this " *
-        "version of TreeAMR reads format version $FORMAT_VERSION" *
+        "version of TreeAMR reads format versions $(join(READ_VERSIONS, " and "))" *
         (version isa Integer && version > FORMAT_VERSION ?
          ", so it was written by a newer TreeAMR than this one. " :
-         ", which is the only one there has been. ") *
+         ", the only ones there have been. ") *
         "Compatibility is decided by the format version, not by the package version. " *
         note))
     features = read_attribute(root, "features")
@@ -1151,7 +1606,7 @@ function check_format(root, context)
         "$(join(repr.(unknown), ", ")), which this version of TreeAMR does not know. A " *
         "feature is listed only when a reader must understand it to read the file " *
         "correctly, so a file with an unknown one is refused rather than misread. " * note))
-    return nothing
+    return Int(version)
 end
 
 function select_fieldsets(group, fieldsets, context)
@@ -1172,47 +1627,337 @@ load_checkpoint(path::AbstractString; kwargs...) = load_checkpoint(nothing, path
 function load_checkpoint(f, path::AbstractString; backend::Backend=CPU(), types=(),
                          fieldsets=nothing, comm=nothing)
     c = communicator(comm)
-    access = access_for(c)
+    r = Ranks(c)
+    # The arguments are agreed before the file is opened, and whether
+    # it is a file at all is rank 0's to say.
+    typelist = agreed(r, "load_checkpoint") do
+        t = check_types(types)
+        r.rank == 0 && check_file(path)
+        layout = layouthash(String(path), map(typename, t), repr(fieldsets),
+                            string(nameof(typeof(backend))), f === nothing)
+        return (t, layout, UInt(0))
+    end
+    real = meta = nothing
     try
-        # The arguments are agreed before the file is opened, and whether
-        # it is a file at all is rank 0's to say. What the file holds is
-        # the same for every rank, so a refusal of its contents is raised
-        # on every rank at the same point without a message.
-        typelist = agreed(access, "load_checkpoint") do
-            t = check_types(types)
-            access isa Ranked && access.rank != 0 || check_file(path)
-            layout = layouthash(String(path), map(typename, t), repr(fieldsets),
-                                string(nameof(typeof(backend))), f === nothing)
-            return (t, layout, UInt(0))
+        if r.size == 1
+            real = meta = open_index(path)
+        else
+            real, meta = share_index(r, path)
         end
-        return open_checkpoint(path, access; checked=true) do file, root, context
-            check_format(root, context)
-            forest = read_forest(root["forest"], typelist, context, c)
-            group = root["fieldsets"]
-            sets = Dict{String,Any}()
-            for name in select_fieldsets(group, fieldsets, context)
-                sets[name] = read_fieldset(group[name], name, forest, typelist, backend,
-                                           context)
+        return load_from(f, meta, real, r, String(path), typelist, backend, fieldsets)
+    finally
+        meta === nothing || meta === real || close(meta)
+        real === nothing || close(real)
+    end
+end
+
+# A part, as the index describes it: its file (`""` for the part inside
+# the index, and for a version-1 file, which is read as one part), its
+# blocks, its size, and the checksum of each loaded field set's
+# `data_crc32c` (`nothing` in a version-1 file).
+struct PartEntry
+    file::String
+    blocks::UnitRange{Int}
+    bytes::Int
+    sums::Union{Nothing,Vector{UInt32}}
+end
+
+# The part table of the index `root`, for the field sets `names`, checked:
+# the parts tile the blocks in order, and every file name is a plain one.
+# A version-1 file is one inline part.
+function read_parttable(root, version, n, names, context)
+    version == 1 && return [PartEntry("", 1:n, 0, nothing)]
+    note = writer_note(context)
+    bad(what) = throw(ArgumentError(
+        "the part table of $(repr(context.path)) is damaged: $what. " * note))
+    haskey(root, "parttable") || bad("there is none")
+    t = root["parttable"]
+    for key in ("file", "first_block", "last_block", "bytes", "fieldsets", "data_crc32c")
+        haskey(t, key) || bad("it has no `$key`")
+    end
+    files = read(t["file"])
+    k = length(files)
+    (files isa AbstractVector{<:AbstractString} && k >= 1) || bad("`file` lists no parts")
+    firsts = read_array(t["first_block"], Int64, (k,), "the parts' first blocks", note)
+    lasts = read_array(t["last_block"], Int64, (k,), "the parts' last blocks", note)
+    bytes = read_array(t["bytes"], Int64, (k,), "the parts' sizes", note)
+    setnames = read(t["fieldsets"])
+    s = length(setnames)
+    sums = read_array(t["data_crc32c"], UInt32, (s, k), "the parts' checksums", note)
+    next = 1
+    for p in 1:k
+        (firsts[p] == next && lasts[p] >= firsts[p] - 1) ||
+            bad("part $(p - 1) holds blocks $(firsts[p]) to $(lasts[p]), where the parts " *
+                "must tile the blocks 1 to $n in order")
+        next = lasts[p] + 1
+    end
+    next == n + 1 || bad("the parts hold $(next - 1) blocks, and the forest has $n")
+    if k == 1
+        files[1] == "" || bad("its one part is named $(repr(files[1])), not inline")
+    else
+        for (p, name) in enumerate(files)
+            is_partname(name) && name == basename(name) ||
+                bad("part $(p - 1) is named $(repr(name)), not a part file beside the " *
+                    "index")
+        end
+    end
+    columns = map(names) do name
+        i = findfirst(==(name), setnames)
+        i === nothing && bad("it has no checksums for field set $(repr(name))")
+        return i
+    end
+    return [PartEntry(files[p], firsts[p]:lasts[p], bytes[p],
+                      UInt32[sums[i, p] for i in columns]) for p in 1:k]
+end
+
+# The rank that reads each part: the owner of its first block under the
+# new partition, moved on to the next rank while that one already reads
+# `cld(k, P)` parts, so that no rank reads more than its share when that
+# is possible. A function of the replicated part table alone, so the
+# same on every rank.
+function part_readers(table, n, P)
+    k = length(table)
+    share = cld(k, P)
+    count = zeros(Int, P)
+    readers = Vector{Int}(undef, k)
+    previous = 0
+    for p in 1:k
+        q = max(previous, equalsplit_part(n, P, clamp(first(table[p].blocks), 1, n)) - 1)
+        while count[q + 1] >= share && q < P - 1
+            q += 1
+        end
+        readers[p] = q
+        count[q + 1] += 1
+        previous = q
+    end
+    return readers
+end
+
+# A part opened by its reader and checked against the index: its file
+# (`nothing` when it is inside the index), and per field set its `data`
+# dataset and its stored per-block checksums (`nothing` in a version-1
+# file written before there were any).
+struct OpenPart
+    file::Union{Nothing,HDF5.File}
+    datasets::Vector{HDF5.Dataset}
+    sums::Vector{Union{Nothing,Vector{UInt32}}}
+end
+
+function open_part(entry::PartEntry, j, version, real, dir, saveid, layouts, forest,
+                   context)
+    note = writer_note(context)
+    what = entry.file == "" ? "the part inside $(repr(context.path))" :
+           "part $j of $(repr(context.path)), $(repr(entry.file)),"
+    refuse(why) = throw(ArgumentError(
+        "$what $why, so the checkpoint is refused rather than read. " * note))
+    file = nothing
+    if entry.file == ""
+        real === nothing && error("the part inside the index is read by rank 0, which " *
+                                  "opened the index; this rank did not")
+        inside = version == 1 ? GROUP : GROUP * "/parts/" * linkname(0)
+        haskey(real, inside) || refuse("is missing")
+        g = real[inside]
+    else
+        full = joinpath(dir, entry.file)
+        isfile(full) || refuse("is missing")
+        filesize(full) == entry.bytes ||
+            refuse("has $(filesize(full)) bytes where the index records $(entry.bytes): " *
+                   "it was truncated, or replaced")
+        HDF5.ishdf5(full) || refuse("is not an HDF5 file")
+        file = open_h5(full, "r")
+        haskey(file, GROUP) || (close(file); refuse("has no /$GROUP group"))
+        g = file[GROUP]
+    end
+    try
+        if version == 2
+            attr(name) = hasattr(g, name) ? read_attribute(g, name) : nothing
+            attr("format") == PART_FORMAT || refuse("is not a TreeAMR checkpoint part")
+            attr("save_id") == saveid ||
+                refuse("belongs to another save (its save id is $(repr(attr("save_id"))), " *
+                       "the index's $(repr(saveid))): it is left from an earlier " *
+                       "checkpoint, or from one that was not completed")
+            (attr("part") == j && attr("first_block") == first(entry.blocks) &&
+             attr("last_block") == last(entry.blocks)) ||
+                refuse("is part $(attr("part")), of blocks $(attr("first_block")) to " *
+                       "$(attr("last_block")), where the index names part $j, of blocks " *
+                       "$(first(entry.blocks)) to $(last(entry.blocks))")
+        end
+        D = dimension(forest)
+        nb = length(entry.blocks)
+        datasets = HDF5.Dataset[]
+        sums = Union{Nothing,Vector{UInt32}}[]
+        for (s, layout) in enumerate(layouts)
+            key = "fieldsets/$(layout.name)"
+            haskey(g, key * "/data") || refuse("holds no data of field set " *
+                                               repr(layout.name))
+            dset = g[key * "/data"]
+            push!(datasets, dset)
+            dims = (block_dims(forest.N, Val(D), layout.limbs)..., layout.nvars, nb)
+            check_dataset(dset, layout.F, dims, "the data of field set " *
+                          "$(repr(layout.name)) in $what", note)
+            if haskey(g, key * "/data_crc32c")
+                stored = read_array(g[key * "/data_crc32c"], UInt32, (nb,),
+                                    "the checksums of field set $(repr(layout.name))", note)
+                entry.sums === nothing || crc_of(stored) == entry.sums[s] ||
+                    refuse("holds checksums of field set $(repr(layout.name)) that do not " *
+                           "match the index's checksum of them: it was damaged, or is " *
+                           "from another save")
+                push!(sums, stored)
+            else
+                version == 1 || refuse("has no checksums of field set " *
+                                       repr(layout.name))
+                push!(sums, nothing)
             end
-            appname = read_attribute(root, "application")
-            haskey(file, appname) || throw(ArgumentError(
-                "$(repr(context.path)) names the application $(repr(appname)), but has no " *
-                "/$appname group: the file is damaged. " * writer_note(context)))
-            app = file[appname]
-            version = read_attribute(app, "format_version")
-            data = read_plain(app, "data")
-            result = f === nothing ? nothing : f(app)
-            return (; forest=forest, fieldsets=sets, application=appname => version,
-                    data=data, provenance=context.provenance, result=result)
+        end
+        return OpenPart(file, datasets, sums)
+    catch
+        file === nothing || close(file)
+        rethrow()
+    end
+end
+
+function load_from(f, meta, real, r::Ranks, path, types, backend, fieldsets)
+    root = meta[GROUP]
+    context = context_of(root, path)
+    version = check_format(root, context)
+    forest = read_forest(root["forest"], types, context, r.comm, version)
+    D = dimension(forest)
+    n = nleaves(forest)
+    group = root["fieldsets"]
+    names = select_fieldsets(group, fieldsets, context)
+    layouts = [read_layout(group[name], name, Val(D), types, context) for name in names]
+    # The constructor validates each layout against the forest, as it
+    # would a caller's, and `statevector` places the pages by owner, which
+    # is what decides their NUMA domain; the reads below only fill them.
+    sets = map(layouts) do l
+        fs = FieldSet{l.T}(forest, l.nvars; G=l.G, centering=l.centering, parity=l.parity,
+                           backend=backend)
+        return (; fieldset=fs, state=statevector(fs))
+    end
+    table = read_parttable(root, version, n, names, context)
+    saveid = version == 2 ? read_attribute(root, "save_id") : ""
+    readers = part_readers(table, n, r.size)
+    mine = [p for p in eachindex(table) if readers[p] == r.rank]
+    opened = Dict{Int,OpenPart}()
+    try
+        err = nothing
+        for p in mine
+            err = attempt(err) do
+                opened[p] = open_part(table[p], p - 1, version, real,
+                                      dirname(abspath(path)), saveid, layouts, forest,
+                                      context)
+            end
+        end
+        agree_errors(r, err, "load_checkpoint, opening the parts,")
+        for (s, layout) in enumerate(layouts)
+            read_blocks!(sets[s].state, r, s, layout, table, readers, opened, forest,
+                         context)
         end
     finally
-        release(access)
+        for part in values(opened)
+            part.file === nothing || close(part.file)
+        end
     end
+    for set in sets
+        scatter!(set.fieldset, set.state)
+    end
+    appname = read_attribute(root, "application")
+    haskey(meta, appname) || throw(ArgumentError(
+        "$(repr(context.path)) names the application $(repr(appname)), but has no " *
+        "/$appname group: the file is damaged. " * writer_note(context)))
+    app = meta[appname]
+    version′ = read_attribute(app, "format_version")
+    data = read_plain(app, "data")
+    result = f === nothing ? nothing : f(app)
+    return (; forest=forest, fieldsets=Dict{String,Any}(zip(names, sets)),
+            application=appname => version′, data=data, provenance=context.provenance,
+            result=result)
+end
+
+# One field set's blocks into `u`: each owner posts its receives straight
+# into its state vector, and each reader reads its parts' blocks for each
+# owner by hyperslab, a piece at a time, checks each block's CRC-32C, and
+# sends it, with at most two pieces in flight; a piece for itself it reads
+# in place. A reader whose read fails goes on sending, so that no owner
+# waits forever, and the failure and the damage are agreed afterwards.
+function read_blocks!(u, r::Ranks, s, layout, table, readers, opened, forest, context)
+    n, P = nleaves(forest), r.size
+    T, F = layout.T, layout.F
+    D = dimension(forest)
+    per = block_length(forest.N, D, layout.nvars)
+    bytes = per * sizeof(T)
+    host = u isa Array ? u : Vector{T}(undef, length(u))
+    mine = blockrange(forest)
+    offset = first(mine) - 1
+    requests = Any[]
+    for p in eachindex(table)
+        readers[p] == r.rank && continue
+        for piece in pieces(intersect(table[p].blocks, mine), bytes)
+            push!(requests, irecv(r.comm, view(host, elements(piece .- offset, per)),
+                                  readers[p], TAG_LOAD))
+        end
+    end
+    err = nothing
+    bad = Int[]
+    buffers = (Vector{T}(undef, 0), Vector{T}(undef, 0))
+    pending = Any[nothing, nothing]
+    turn = 1
+    for p in eachindex(table)
+        readers[p] == r.rank || continue
+        entry, part = table[p], opened[p]
+        dset, stored = part.datasets[s], part.sums[s]
+        dims = (block_dims(forest.N, Val(D), layout.limbs)..., layout.nvars,
+                length(entry.blocks))
+        isempty(entry.blocks) && continue
+        owner(b) = equalsplit_part(n, P, b) - 1
+        owners = owner(first(entry.blocks)):owner(last(entry.blocks))
+        for q in owners,
+            piece in pieces(intersect(entry.blocks, rankblocks(n, P, q)), bytes)
+            rows = piece .- (first(entry.blocks) - 1)
+            if q == r.rank
+                buf, start = host, (first(piece) - offset - 1) * per + 1
+            else
+                turn = 3 - turn
+                pending[turn] === nothing || waitall(r.comm, [pending[turn]])
+                pending[turn] = nothing
+                buf, start = buffers[turn], 1
+                length(buf) < length(piece) * per && resize!(buf, length(piece) * per)
+            end
+            err = attempt(err) do
+                GC.@preserve buf block_slab(API.h5d_read, dset, F, dims, rows,
+                                            pointer(buf, start))
+                if stored !== nothing
+                    got = block_checksums(buf, length(piece), per, start)
+                    for (i, b) in enumerate(piece)
+                        got[i] == stored[rows[i]] || push!(bad, b)
+                    end
+                end
+            end
+            q == r.rank ||
+                (pending[turn] = isend(r.comm, view(buf, 1:(length(piece) * per)), q,
+                                       TAG_LOAD))
+        end
+    end
+    waitall(r.comm, [requests; filter(!isnothing, pending)])
+    agree_errors(r, err, "load_checkpoint, reading the parts,")
+    count, b = damage(r, sort!(bad))
+    count == 0 || throw(ArgumentError(
+        "the data of field set $(repr(layout.name)) do not match the checksums stored " *
+        "with them in $count of its $n blocks, the first being block $b (a CRC-32C per " *
+        "block): the file was damaged while or after it was written, and is refused " *
+        "rather than restored into a wrong state. " * writer_note(context)))
+    host === u || copyto!(u, host)
+    return u
 end
 
 function checkpoint_environment(path::AbstractString, dir::AbstractString;
                                 force::Bool=false)
-    p = open_checkpoint((file, root, context) -> context.provenance, path)
+    file = open_index(path)
+    p = try
+        read_provenance(file[GROUP])
+    finally
+        close(file)
+    end
     files = Pair{String,String}[]
     isempty(p.project) || push!(files, joinpath(dir, "Project.toml") => p.project)
     isempty(p.manifest) || push!(files, joinpath(dir, "Manifest.toml") => p.manifest)
@@ -1248,22 +1993,22 @@ end
 # --- plain data ------------------------------------------------------------
 
 function write_plain(parent::Union{HDF5.File,HDF5.Group}, name::AbstractString, value)
-    access = access_of(parent)
+    # The value is walked before anything is written, so that what cannot
+    # be stored is refused with nothing created. In the do-block of a save
+    # over several ranks the value has to be the same on every rank, since
+    # rank 0's is the one the index keeps, and the walk's hash is agreed
+    # before anything is written.
     check() = begin
         check_name(name, "a plain-data item's name")
         haskey(parent, name) && throw(ArgumentError(
             "$(HDF5.name(parent)) already holds an item named $(repr(name)); each item " *
             "is written once"))
-        datahash = access isa Ranked ?
-                   plain_hash(itempath(parent, String(name)), value, UInt(0), true) :
-                   UInt(0)
+        datahash = plain_hash(itempath(parent, String(name)), value, UInt(0))
         (nothing, layouthash(HDF5.name(parent), String(name)), datahash)
     end
-    # In a parallel checkpoint the write is collective, and the value has
-    # to be the same on every rank, which is agreed before anything is
-    # written; serially the value is checked as it is written, as in M9a.
-    access isa Ranked ?
-    agreed(check, access, "write_plain of $(itempath(parent, String(name)))") : check()
+    r = saving_ranks(parent)
+    r === nothing ? check() :
+    agreed(check, r, "write_plain of $(itempath(parent, String(name)))")
     put_plain(parent, String(name), value)
     return nothing
 end
@@ -1280,9 +2025,7 @@ function put_plain(parent, name, x::NativeNumber)
             close(space)
         end
         try
-            write_whole(access_of(parent)) do
-                API.h5d_write(dset, dt, API.H5S_ALL, API.H5S_ALL, API.H5P_DEFAULT, Ref(x))
-            end
+            API.h5d_write(dset, dt, API.H5S_ALL, API.H5S_ALL, API.H5P_DEFAULT, Ref(x))
             tag!(dset, "number"; eltype=typename(T))
         finally
             close(dset)
@@ -1300,53 +2043,12 @@ put_plain(parent, name, x::Symbol) = put_string(parent, name, String(x), "symbol
 put_plain(parent, name, x::VersionNumber) = put_string(parent, name, string(x), "version")
 
 function put_string(parent, name, value, tag)
-    access = access_of(parent)
-    value isa AbstractArray && access isa Ranked &&
-        return put_fixed_strings(parent, name, value)
     dset, dt = create_dataset(parent, name, value)
     try
-        write_whole(() -> HDF5.write_dataset(dset, dt, value), access)
+        HDF5.write_dataset(dset, dt, value)
         tag!(dset, tag; (tag == "array" ? (; eltype="String") : (;))...)
     finally
         close(dset)
-        close(dt)
-    end
-    return nothing
-end
-
-# Parallel HDF5 writes no variable-length data ("Parallel IO does not
-# support writing VL or region reference datatypes yet", `H5D__write` in
-# libhdf5 2.2.0), which is how HDF5.jl stores an array of strings. In a
-# parallel file the array is fixed-length UTF-8 instead, every string
-# NUL-padded to the longest, which `read` gives back as the same
-# `Array{String}`: the same item to a reader, in another HDF5 string
-# type. A string holding a NUL would lose it, so the plain-data walk
-# refuses one beforehand.
-function put_fixed_strings(parent, name, value)
-    width = max(1, maximum(sizeof, value; init=0))
-    buf = zeros(UInt8, width, length(value))
-    for (j, x) in enumerate(value)
-        copyto!(view(buf, 1:sizeof(x), j), codeunits(x))
-    end
-    id = API.h5t_copy(API.H5T_C_S1)
-    API.h5t_set_size(id, width)
-    API.h5t_set_strpad(id, API.H5T_STR_NULLPAD)
-    API.h5t_set_cset(id, API.H5T_CSET_UTF8)
-    dt = HDF5.Datatype(id)
-    try
-        space = dataspace(size(value))
-        dset = try
-            create_dataset(parent, name, dt, space)
-        finally
-            close(space)
-        end
-        try
-            write_whole(() -> HDF5.write_dataset(dset, dt, buf), access_of(parent))
-            tag!(dset, "array"; eltype="String")
-        finally
-            close(dset)
-        end
-    finally
         close(dt)
     end
     return nothing
@@ -1406,8 +2108,8 @@ end
 # The plain-data walk: what `put_plain` would write, as a hash, refusing
 # what it would refuse, with the same messages, but before anything is
 # written. A save checks its `data` this way before it creates the file,
-# and over several ranks the hash is what the ranks agree on, since every
-# item is created collectively, with one value. The hash follows the
+# and over several ranks the hash is what the ranks agree on, since rank
+# 0 writes every item, with its own value, for all of them. The hash follows the
 # order of the writes — a Dict's items in its iteration order, which is
 # their order in the file — and the bits of every number, so that `0.0`
 # and `-0.0` differ, as they do in the file. Every hash is of integers
@@ -1420,16 +2122,16 @@ bitsof(x::Float32) = reinterpret(UInt32, x)
 bitsof(x::Float64) = reinterpret(UInt64, x)
 bitsof(x::Complex) = (bitsof(real(x)), bitsof(imag(x)))
 
-plain_hash(path, x::NativeNumber, h, parallel) =
+plain_hash(path, x::NativeNumber, h) =
     hash(("number", typename(typeof(x)), bitsof(x)), h)
-plain_hash(path, x::Rational{I}, h, parallel) where {I<:NativeInteger} =
+plain_hash(path, x::Rational{I}, h) where {I<:NativeInteger} =
     hash(("rational", typename(I), bitsof(numerator(x)), bitsof(denominator(x))), h)
-plain_hash(path, x::AbstractString, h, parallel) = hash(("string", String(x)), h)
-plain_hash(path, x::Symbol, h, parallel) = hash(("symbol", String(x)), h)
-plain_hash(path, x::VersionNumber, h, parallel) = hash(("version", string(x)), h)
-plain_hash(path, ::Nothing, h, parallel) = hash("nothing", h)
+plain_hash(path, x::AbstractString, h) = hash(("string", no_nul(path, String(x))), h)
+plain_hash(path, x::Symbol, h) = hash(("symbol", no_nul(path, String(x))), h)
+plain_hash(path, x::VersionNumber, h) = hash(("version", string(x)), h)
+plain_hash(path, ::Nothing, h) = hash("nothing", h)
 
-function plain_hash(path, x::AbstractArray{T}, h, parallel) where {T<:NativeNumber}
+function plain_hash(path, x::AbstractArray{T}, h) where {T<:NativeNumber}
     isconcretetype(T) || throw(not_plain_at(path, x))
     h = hash(("array", typename(T), size(x)), h)
     for y in x
@@ -1438,21 +2140,15 @@ function plain_hash(path, x::AbstractArray{T}, h, parallel) where {T<:NativeNumb
     return h
 end
 
-function plain_hash(path, x::AbstractArray{<:AbstractString}, h, parallel)
+function plain_hash(path, x::AbstractArray{<:AbstractString}, h)
     h = hash(("array", "String", size(x)), h)
     for y in x
-        parallel && occursin('\0', y) && throw(ArgumentError(
-            "$path holds a string with a NUL character, which a checkpoint written over " *
-            "several ranks cannot store in an array: parallel HDF5 writes no " *
-            "variable-length data, so there an array of strings is stored NUL-padded to " *
-            "a fixed length, and the NUL would be lost. Store such a string as an array " *
-            "of UInt8, or as a single string."))
-        h = hash(String(y), h)
+        h = hash(no_nul(path, String(y)), h)
     end
     return h
 end
 
-function plain_hash(path, x::Tuple, h, parallel)
+function plain_hash(path, x::Tuple, h)
     T = isempty(x) ? Nothing : typeof(first(x))
     if T <: NativeNumber && all(y -> typeof(y) === T, x)
         h = hash(("tuple", typename(T), length(x)), h)
@@ -1461,27 +2157,37 @@ function plain_hash(path, x::Tuple, h, parallel)
         end
         return h
     end
-    return group_hash(path, "tuple", (string(i) => y for (i, y) in enumerate(x)), h,
-                      parallel)
+    return group_hash(path, "tuple", (string(i) => y for (i, y) in enumerate(x)), h)
 end
 
-plain_hash(path, x::NamedTuple, h, parallel) =
-    group_hash(path, "namedtuple", pairs(x), h, parallel)
+plain_hash(path, x::NamedTuple, h) =
+    group_hash(path, "namedtuple", pairs(x), h)
 
-function plain_hash(path, x::AbstractDict{K}, h, parallel) where {K}
+function plain_hash(path, x::AbstractDict{K}, h) where {K}
     keytype = K <: AbstractString ? "String" : K === Symbol ? "Symbol" :
               throw(not_plain_at(path, x))
-    return group_hash(path, "dict", pairs(x), hash(keytype, h), parallel)
+    return group_hash(path, "dict", pairs(x), hash(keytype, h))
 end
 
-plain_hash(path, x, h, parallel) = throw(not_plain_at(path, x))
+plain_hash(path, x, h) = throw(not_plain_at(path, x))
 
-function group_hash(path, tag, items, h, parallel)
+# HDF5 stores a string as a C string, which ends at its first NUL, and
+# HDF5.jl refuses one that holds a NUL; the walk refuses it first, with
+# the item's path, before anything is written.
+function no_nul(path, s::String)
+    occursin('\0', s) && throw(ArgumentError(
+        "$path holds a string with a NUL character, which HDF5 cannot store: it keeps a " *
+        "string as a C string, which ends at its first NUL. Store such a string as an " *
+        "array of UInt8."))
+    return s
+end
+
+function group_hash(path, tag, items, h)
     h = hash(tag, h)
     for (key, value) in items
         key = string(key)
         check_name(key, "the plain-data item name in $path")
-        h = plain_hash(path * "/" * key, value, hash(key, h), parallel)
+        h = plain_hash(path * "/" * key, value, hash(key, h))
     end
     return h
 end

@@ -9,8 +9,11 @@
 # with regrids continues from a checkpoint exactly as it would have run
 # on; a newer format, an unknown feature, a type the reader cannot name
 # and a value outside the plain-data vocabulary are each refused with a
-# message saying why; and a write that fails leaves the previous
-# checkpoint as it was.
+# message saying why; a write that fails leaves the previous checkpoint
+# as it was; and a version-1 file, written before the part files of M7
+# step 6b, still loads (`test/fixtures/`). Serially a checkpoint is one
+# file, its one part inside the index; the part files themselves are the
+# MPI workload's (`mpi_workload.jl`).
 #
 # The drivers reuse the wave and Burgers applications of `wave.jl` and
 # `burgers.jl`, and the round trip the face-kind oracles of
@@ -42,6 +45,10 @@ function replace_attribute!(obj, name, value)
 end
 
 bytes(a) = reinterpret(UInt8, vec(Array(a)))
+
+# Where a serial checkpoint keeps a field set's data: in the one part,
+# which lives inside the index (format version 2, M7 step 6b).
+const PART = "TreeAMR.jl/parts/0000"
 
 # --- the round trip --------------------------------------------------------
 
@@ -340,9 +347,10 @@ end
     @test load_checkpoint(path).forest.leaves == forest.leaves
 
     newer = edited_copy(path, "newer.h5") do file
-        replace_attribute!(file["TreeAMR.jl"], "format_version", 2)
+        replace_attribute!(file["TreeAMR.jl"], "format_version", 3)
     end
-    @test_throws "format version 2" load_checkpoint(newer)
+    @test_throws "format version 3" load_checkpoint(newer)
+    @test_throws "reads format versions 1 and 2" load_checkpoint(newer)
     @test_throws "written by a newer TreeAMR" load_checkpoint(newer)
     @test_throws "The file was written by TreeAMR $(pkgversion(TreeAMR))" load_checkpoint(
         newer)
@@ -378,21 +386,27 @@ end
     @test_throws "collection of types" load_checkpoint(narrowpath; types=(1,))
 
     # A leaf list out of order is refused by the forest, as it would be
-    # from any other caller: here without the checksum, which would refuse
-    # it first, as in a file written before there were checksums.
+    # from any other caller: here with the checksum recomputed, which would
+    # refuse it first.
     swapped = edited_copy(path, "swapped.h5") do file
-        roots = file["TreeAMR.jl/forest/root"]
-        r = read(roots)
-        roots[1:2] = r[[2, 1]]
-        delete_attribute(file["TreeAMR.jl/forest"], "leaves_crc32c")
+        g = file["TreeAMR.jl/forest"]
+        r = read(g["root"])
+        g["root"][1:2] = r[[2, 1]]
+        ext = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
+        replace_attribute!(g, "leaves_crc32c",
+                           ext.leaves_checksum(read(g["root"]), read(g["level"]),
+                                               read(g["coords"])))
     end
     @test_throws "out of curve order" load_checkpoint(swapped)
 
     # Damage that leaves a valid file: a leaf column's rows zeroed, as one
     # rank's were in the four-node run that showed the need (M7 step 6),
     # and one value of a field set changed, in the contiguous layout and
-    # in the chunked one. The checksums are what refuse them; without
-    # them, a file from before they existed, an intact one still loads.
+    # in the chunked one; and the value changed with its block's checksum
+    # recomputed, which the index's checksum of the part's checksums
+    # refuses. In format version 2 the checksums are required: a file
+    # without them is damaged (a version-1 file without them loads
+    # unchecked, below).
     big = Forest((4, 4); N=4, periodic=(true, true))
     refine!(big, big.leaves[[1, 6]])
     bigfs = FieldSet(big, 2; G=1)
@@ -411,7 +425,7 @@ end
         @test_throws "refused rather than read into a wrong mesh" load_checkpoint(zeroed)
         @test_throws "checkpoint_environment(path, dir)" load_checkpoint(zeroed)
         changed = edited_copy(intact, "changed.h5") do file
-            data = file["TreeAMR.jl/fieldsets/u/data"]
+            data = file["$PART/fieldsets/u/data"]
             d = read(data)
             d[3, 2, 1, 7] += 1
             data[:, :, :, :] = d
@@ -419,15 +433,24 @@ end
         @test_throws("the data of field set \"u\" do not match the checksums stored " *
                      "with them in 1 of its $(nleaves(big)) blocks, the first being block 7",
                      load_checkpoint(changed))
-        unsummed = edited_copy(intact, "unsummed.h5") do file
-            delete_attribute(file["TreeAMR.jl/forest"], "leaves_crc32c")
-            delete_object(file["TreeAMR.jl/fieldsets/u"], "data_crc32c")
+        resummed = edited_copy(changed, "resummed.h5") do file
+            ext = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
+            sums = file["$PART/fieldsets/u/data_crc32c"]
+            d = read(file["$PART/fieldsets/u/data"])
+            s = read(sums)
+            s[7] = ext.crc_of(collect(vec(d[:, :, :, 7])))
+            sums[:] = s
         end
-        ck = load_checkpoint(unsummed)
-        @test ck.forest.leaves == big.leaves
-        u = statevector(bigfs)
-        gather!(u, bigfs)
-        @test bytes(ck.fieldsets["u"].state) == bytes(u)
+        @test_throws("holds checksums of field set \"u\" that do not match the index's",
+                     load_checkpoint(resummed))
+        unsummed = edited_copy(intact, "unsummed.h5") do file
+            delete_object(file["$PART/fieldsets/u"], "data_crc32c")
+        end
+        @test_throws "has no checksums of field set \"u\"" load_checkpoint(unsummed)
+        unleaved = edited_copy(intact, "unleaved.h5") do file
+            delete_attribute(file["TreeAMR.jl/forest"], "leaves_crc32c")
+        end
+        @test_throws "the leaf list has no checksum" load_checkpoint(unleaved)
     end
 
     @test_throws "no field set named \"nope\"; it holds \"u\"" load_checkpoint(
@@ -482,7 +505,8 @@ end
 @testset "A write that fails leaves the previous checkpoint intact" begin
     # The failure: a crash or an error in the middle of a write that
     # destroys the checkpoint a restart would need, or a `.partial` file
-    # left for the next write to trip over.
+    # left for the next write to trip over; here an error of the do-block,
+    # and the I/O process failing after its first write (a test hook).
     dir = mktempdir()
     path = joinpath(dir, "run.h5")
     forest = Forest((2,); N=4, periodic=(true,))
@@ -493,6 +517,15 @@ end
     @test_throws "interrupted while writing" save(2) do app
         write_plain(app, "extra", [1, 2, 3])
         error("interrupted while writing")
+    end
+    @test load_checkpoint(path).data.which == 1
+    @test readdir(dir) == ["run.h5"]
+    ext = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
+    ext.FAIL_PART[] = 0
+    try
+        @test_throws "failed on purpose after its first write" save(_ -> nothing, 4)
+    finally
+        ext.FAIL_PART[] = -1
     end
     @test load_checkpoint(path).data.which == 1
     @test readdir(dir) == ["run.h5"]
@@ -529,6 +562,18 @@ end
     @test bytes(synced.fieldsets["u"].state) == bytes(unsynced.fieldsets["u"].state)
     @test (synced.data.sync, unsynced.data.sync) == (true, false)
     @test sort(readdir(dir)) == ["sync-false.h5", "sync-true.h5"]
+    # One file, of format version 2, its one part inside it, and a save id.
+    h5open(paths[1]) do file
+        root = file["TreeAMR.jl"]
+        @test read_attribute(root, "format_version") == 2
+        @test occursin(r"^[0-9a-f]{32}$", read_attribute(root, "save_id"))
+        @test read(root["parttable/file"]) == [""]
+        @test (read(root["parttable/first_block"]), read(root["parttable/last_block"])) ==
+              ([1], [nleaves(forest)])
+        @test read_attribute(file[PART], "save_id") == read_attribute(root, "save_id")
+        @test haskey(file, "$PART/fieldsets/u/data")
+        @test !haskey(root, "fieldsets/u/data")
+    end
     # The flush itself, on a file, on a directory, and refusing a path
     # that is not there rather than skipping it.
     ext = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
@@ -599,6 +644,13 @@ end
         @test_throws "cannot name an HDF5 object" write_plain(
             file, "t", NamedTuple{(Symbol("a/b"),)}((1,)))
         @test_throws "already holds an item named \"recipe\"" write_plain(file, "recipe", 1)
+        # A NUL, which an HDF5 string cannot hold, refused before anything
+        # is written.
+        @test_throws "/nul holds a string with a NUL character" write_plain(file, "nul",
+                                                                         "a\0b")
+        @test_throws "/nuls/n holds a string with a NUL" write_plain(file, "nuls",
+                                                                  (; ok="x", n=["\0"]))
+        @test !haskey(file, "nul") && !haskey(file, "nuls")
         write(file, "foreign", [1, 2])
     end
     h5open(bare, "r") do file
@@ -629,10 +681,13 @@ end
     # The rank count, added by M7 (an additive field): a serial file says
     # 1, and a file written before there was one reads as 1 too.
     @test p.nranks == 1
+    @test p.nparts == 1
     older = edited_copy(path, "older.h5") do file
         delete_object(file, "TreeAMR.jl/provenance/nranks")
+        delete_object(file, "TreeAMR.jl/provenance/nparts")
     end
     @test load_checkpoint(older).provenance.nranks == 1
+    @test load_checkpoint(older).provenance.nparts == 1
     @test p.hostname == gethostname()
     @test occursin(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", p.created)
 
@@ -663,6 +718,74 @@ end
     @test !ispath(joinpath(env3, "Manifest.toml"))
     @test_throws "not a TreeAMR checkpoint" checkpoint_environment(
         joinpath(dir, "env", "Project.toml"), joinpath(dir, "env4"))
+end
+
+# --- version 1 ------------------------------------------------------------------
+
+# The two version-1 files in `test/fixtures/`, written by the M7 step-6
+# writer (HEAD 67c9153) before the part files replaced it, unfiltered and
+# with Shuffle + Deflate(1), from an environment without a project file
+# so that they stay small:
+#
+#     save_checkpoint(path, fixture_forest(); fieldsets=("u" => u, "w" => w),
+#                     application="Fixture" => 1, filters, sync=false,
+#                     data=(; t=1//3, chunk=7, tags=["a", "", "c"], name="fixture")) do app
+#         write_plain(app, "extra", [1, 2, 3])
+#     end
+#
+# with `u, w = fixture_sets(forest)`. The data are exact in binary, so
+# rebuilding them gives the saved bits on any Julia version.
+function fixture_forest(; comm=nothing)
+    forest = Forest((2, 2); N=4, periodic=(true, false),
+                    reflecting=((false, false), (false, true)), comm=comm)
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    return forest
+end
+
+function fixture_sets(forest)
+    u = FieldSet(forest, 2; G=1, parity=[(EvenParity, EvenParity), (OddParity, OddParity)])
+    w = FieldSet{Float32x2}(forest, 1; G=1, centering=vertexcentered(2),
+                            parity=[(EvenParity, OddParity)])
+    fill_by_coordinates!((x, v) -> x[1] + 2x[2] + 3v, u)
+    fill_by_coordinates!((x, v) -> Float32x2(x[1] - x[2] / 4), w)
+    return u, w
+end
+
+const FIXTURES = joinpath(@__DIR__, "fixtures")
+
+@testset "A version-1 file, written before the part files, still loads" begin
+    # The failure: a reader of format version 2 that no longer reads the
+    # single files every earlier version wrote — those of M9a, and the
+    # shared files of M7 step 6 — or reads them differently; and one that
+    # refuses a version-1 file without checksums, which are optional there.
+    forest = fixture_forest()
+    u, w = fixture_sets(forest)
+    want(fs) = (v = statevector(fs); gather!(v, fs); bytes(v))
+    for name in ("plain", "filtered")
+        path = joinpath(FIXTURES, "checkpoint-v1-$name.h5")
+        ck = load_checkpoint(app -> read_plain(app, "extra"), path; types=(Float32x2,))
+        @test ck.forest.leaves == forest.leaves
+        @test ck.forest.reflecting == forest.reflecting
+        @test bytes(ck.fieldsets["u"].state) == want(u)
+        @test bytes(ck.fieldsets["w"].state) == want(w)
+        @test ck.fieldsets["w"].fieldset.parity == w.parity
+        @test ck.data == (; t=1 // 3, chunk=7, tags=["a", "", "c"], name="fixture")
+        @test ck.result == [1, 2, 3]
+        @test (ck.provenance.nranks, ck.provenance.nparts) == (1, 1)
+        @test h5open(file -> read_attribute(file["TreeAMR.jl"], "format_version"),
+                     path) == 1
+    end
+    # Edited in a copy outside the fixtures' directory.
+    original = joinpath(mktempdir(), "v1.h5")
+    cp(joinpath(FIXTURES, "checkpoint-v1-filtered.h5"), original)
+    unsummed = edited_copy(original, "unsummed.h5") do file
+        delete_attribute(file["TreeAMR.jl/forest"], "leaves_crc32c")
+        delete_object(file["TreeAMR.jl/fieldsets/u"], "data_crc32c")
+    end
+    ck = load_checkpoint(unsummed; fieldsets=("u",))
+    @test ck.forest.leaves == forest.leaves
+    @test bytes(ck.fieldsets["u"].state) == want(u)
 end
 
 @testset "A subset of the field sets loads on its own" begin

@@ -5,9 +5,11 @@
 # `CODE.md`): its rank and size, three collectives — an allgather of one
 # `isbits` value, which every reduction and the forest digest are built
 # from, an allgatherv and an alltoallv — and nonblocking point-to-point
-# messages over flat buffers. Each verb below is one MPI.jl call over a
-# *duplicate* of the application's communicator, so that the package's
-# messages, whose tags are its own, can never match the application's.
+# messages over flat buffers, and (M7 step 6b) a broadcast and a count of
+# the shared-memory nodes for checkpoints. Each verb below is one MPI.jl
+# call, or two, over a *duplicate* of the application's communicator, so
+# that the package's messages, whose tags are its own, can never match
+# the application's.
 #
 # Three rules shape this file:
 #
@@ -36,7 +38,7 @@ using MPI: MPI
 using TreeAMR
 using TreeAMR: Communicator
 import TreeAMR: communicator, commrank, commsize, allgather, allgatherv, alltoallv,
-                isend, irecv, waitall, librarycomm, hoststaging
+                isend, irecv, waitall, bcast, commnodes, hoststaging
 
 # A forest's communicator over MPI: the duplicate, with its rank and size
 # read once, since neither can change, and whether the caller said the
@@ -101,10 +103,6 @@ end
 commrank(c::MPICommunicator) = c.rank
 commsize(c::MPICommunicator) = c.size
 
-# The duplicate, for parallel HDF5, which opens a checkpoint over it and
-# duplicates it once more itself (`TreeAMRHDF5MPIExt`).
-librarycomm(c::MPICommunicator) = c.comm
-
 function allgather(c::MPICommunicator, x)
     isbits(x) || throw(ArgumentError(
         "allgather sends one isbits value per rank, got a $(typeof(x))"))
@@ -117,6 +115,27 @@ function allgatherv(c::MPICommunicator, v::AbstractVector)
     recv = similar(send, sum(counts))
     MPI.Allgatherv!(send, MPI.VBuffer(recv, counts), c.comm)
     return recv
+end
+
+# Rank `root`'s vector on every rank: its length, then its elements. A
+# checkpoint load broadcasts the index's image this way (M7 step 6b).
+function bcast(c::MPICommunicator, v::AbstractVector, root::Integer)
+    0 <= root < c.size || throw(ArgumentError(
+        "there is no rank $root among the $(c.size) to broadcast from"))
+    n = MPI.Bcast!(Ref(c.rank == root ? length(v) : 0), Int(root), c.comm)[]
+    buf = c.rank == root ? collect(v) : similar(collect(v), n)
+    n > 0 && MPI.Bcast!(buf, Int(root), c.comm)
+    return buf
+end
+
+# The number of shared-memory nodes: the groups `MPI_Comm_split_type`
+# forms with `MPI_COMM_TYPE_SHARED`, counted by their first ranks. The
+# node communicator is freed at once, which is collective, as this is.
+function commnodes(c::MPICommunicator)
+    node = MPI.Comm_split_type(c.comm, MPI.COMM_TYPE_SHARED, c.rank)
+    first = MPI.Comm_rank(node) == 0
+    MPI.free(node)
+    return MPI.Allreduce(Int(first), +, c.comm)
 end
 
 function alltoallv(c::MPICommunicator, sendbuf::AbstractVector,
