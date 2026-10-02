@@ -318,13 +318,20 @@ it receives and unpacks, with the layouts of both buffers.
   the `−0` of a mirrored zero into `+0`; see "Pack and unpack are
   transfers" in CODE.md.)
 - `buffers` holds the send and receive buffers per variable count, on
-  the backend, allocated on first use and kept with the schedule.
+  the backend, taken on first use and kept with the schedule.
 - `mirrors` holds their host mirrors, of type `HB` (a `Vector` of the
-  element type), per variable count: allocated, and page-locked for the
+  element type), per variable count: taken, page-locked for the
   backend, the first time the stage runs over a communicator that cannot
   take the buffers themselves ([`hoststaging`](@ref TreeAMR.hoststaging)).
   That is a device without a device-aware MPI; a CPU buffer is host
   memory already, and MPI is handed it directly.
+
+Both are leased from the forest's buffer pool, which keeps them once the
+stage is done with them — the regrid's stage at the end of its call, a
+schedule's once the forest has moved on — so that the stages a regrid
+builds reuse earlier stages' memory rather than allocating, and
+page-locking, their own; see "MPI+GPU" under "Distributed meshes" in
+`CODE.md`.
 """
 struct RemoteStage{D,GRP<:TransferGroup,VB<:AbstractVector{Int32},BUF<:AbstractVector,
                    HB<:Vector}

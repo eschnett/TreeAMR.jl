@@ -536,6 +536,15 @@ The ideas that span several files and are easy to violate:
   `keyorder`, so no descriptor is ever sent and `Dict` order must never
   reach a layout. Device buffers are staged through page-locked host
   mirrors unless `communicator(comm; deviceaware = true)` (`hoststaging`).
+  Stage buffers and mirrors are **leased from the forest's buffer pool**
+  (`bufferpool(forest)`, in `forest.state` beside the generation): the
+  regrid stage releases its leases after its sends are waited on, and a
+  schedule's are reclaimed once the generation has moved on, so a
+  regrid reuses what earlier stages held instead of allocating and
+  page-locking it again. A lease is an `Array` (`Base.wrap` over pooled
+  `Memory`) or a contiguous device `view`, never a `SubArray` of host
+  memory. Do not add a field to `Forest`: put mutable state in
+  `ForestState` (a ninth field made the schedule build allocate more).
   MPI is called from the calling task only, never in a threaded loop or
   kernel, and needs `THREAD_SERIALIZED`.
 - **Reductions are an allgather of per-rank partials**, folded in rank

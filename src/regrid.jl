@@ -522,9 +522,12 @@ function completed_leaves(forest::Forest{D}, marks::Vector{RegridFlag}) where {D
     # Balance the candidate tree without disturbing the live one. It
     # carries the live forest's communicator, so that it is the forest
     # the ranks will hold; balancing sends nothing, since every rank
-    # holds the whole tree and arrives at the same leaves.
+    # holds the whole tree and arrives at the same leaves. Its state is
+    # its own, so it has no buffer pool, and would make its own if it
+    # exchanged anything.
     scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
-                             forest.extents, forest.N, candidate, Ref(0), forest.comm)
+                             forest.extents, forest.N, candidate, ForestState(),
+                             forest.comm)
     balance!(scratch)
     return scratch.leaves
 end
@@ -952,6 +955,10 @@ function regrid!(forest::Forest{D}, pairs;
             sends = run_stage!(fresh, fs.work, fs.nvars, nothing, stage, forest, backend,
                                nothing)
             sends === nothing || waitall(comm, sends)
+            # The stage lives for this call, so its buffers go back to the
+            # forest's pool now that nothing is in flight, for the next
+            # field set's stage or the next regrid to take.
+            stage.remote === nothing || release_stage!(forest, stage.remote)
         end
         fs.work = fresh
     end

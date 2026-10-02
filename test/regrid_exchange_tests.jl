@@ -543,6 +543,107 @@ TreeAMR.waitall(c::StagingCommunicator, requests::AbstractVector) =
     end
 end
 
+@testset "The buffer pool hands a buffer to one holder at a time" begin
+    # A pool that handed out memory still leased, or reclaimed a lease
+    # its holder can still use, would let two stages write one buffer. So
+    # leases must not overlap; a released one, and one whose holder is
+    # stale or gone, must be reused rather than reallocated, the stale
+    # holder losing its entry; and a request no free buffer fits must
+    # drop one rather than let the pool grow.
+    pool = TreeAMR.BufferPool()
+    B = Vector{Float64}
+    make = cap -> TreeAMR.new_stagebuffer(B, CPU(), cap)
+    lease(n, gen, holder) = TreeAMR.lease!(make, B, pool, :k, n, gen, holder, 1)
+    span(x) = UInt(pointer(x)):(UInt(pointer(x)) + sizeof(x) - 1)
+    h1, h2 = Dict{Int,Any}(), Dict{Int,Any}()
+    a = lease(100, 0, h1)
+    b = lease(50, 0, h2)
+    @test a isa B && length(a) == 100 && length(b) == 50 && all(iszero, a)
+    @test isempty(intersect(span(a), span(b)))
+    @test pool.allocated == 2
+    TreeAMR.release!(pool, (a,))
+    c = lease(80, 0, h1)                 # fits a's buffer, so reuses it
+    @test pointer(c) == pointer(a) && length(c) == 80 && pool.allocated == 2
+    h2[1] = b
+    h3, h4 = Dict{Int,Any}(), Dict{Int,Any}()
+    d = lease(40, 1, h3)                 # a new generation: b and c are stale
+    @test pool.allocated == 2 && !haskey(h2, 1) && length(pool.free[:k]) == 1
+    @test pointer(d) == pointer(b)       # the smallest that fits
+    e = lease(1000, 1, h4)               # fits nothing free: drops one
+    @test pool.allocated == 3 && pool.dropped == 1 && length(e) == 1000
+    @test isempty(pool.free[:k])
+    @test lease(0, 1, h1) isa B && pool.allocated == 3
+end
+
+@testset "Regrids reuse the message buffers and mirrors in the forest's pool" begin
+    # Before the pool, every regrid of a distributed forest allocated the
+    # buffers of its transfer stage and of the next schedule's first fill
+    # afresh, and when staging allocated and page-locked their mirrors:
+    # on Symmetry's H200s a staged regrid cost 48 ms against 8.7 direct
+    # (M7 step 8). A pool that handed one buffer to two live stages, or
+    # reclaimed a lease too early, would corrupt a message instead. So a
+    # cycle of a refining and a coarsening regrid, with the schedule
+    # rebuilt after each and filled as an application does, runs three
+    # times at 3 ranks with every message staged: every fill and regrid
+    # must give the serial bits, the live schedule's buffers and mirrors
+    # must never overlap, a stale schedule must have lost its leases, and
+    # the third cycle must allocate no buffer.
+    D = 2
+    ops = Operators(prolongation=4, restriction=4)
+    initial = (x, v) -> sin(2.1 * x[1] + v) * cos(1.3 * x[2]) + 0.1 * x[1] * x[2]
+    refine(forest) = flag_blocks((b, k) -> level(k) == 0 && k.root < 6 ? Refine : Keep,
+                                 forest)
+    coarsen(forest) = flag_blocks((b, k) -> level(k) == 1 && k.root < 6 ? Coarsen : Keep,
+                                  forest)
+    span(x) = UInt(pointer(x)):(UInt(pointer(x)) + sizeof(x) - 1)
+    # The non-empty buffers and mirrors the schedule's stages hold now.
+    held(sched) = [x for st in sched.stages if st.remote !== nothing
+                   for d in (st.remote.buffers, st.remote.mirrors)
+                   for pair in values(d) for x in pair if !isempty(x)]
+    disjoint(xs) = all(isempty(intersect(span(xs[i]), span(xs[j])))
+                       for i in eachindex(xs) for j in (i + 1):lastindex(xs))
+    function cycles(comm)
+        forest = Forest((4, 4); N=8, periodic=(true, true), comm=comm)
+        fs = FieldSet(forest, 2; G=2)
+        fill_by_coordinates!(initial, fs)
+        sched = GhostSchedule(fs, ops)
+        fill_ghosts!(fs, sched)
+        snapshots, allocated, ok = Any[], Int[], true
+        for _ in 1:3
+            for flags in (refine, coarsen)
+                regrid!(forest, fs => sched; flags=flags(forest))
+                push!(snapshots, (blockrange(forest), copy(fs.work)))
+                stale = sched
+                sched = GhostSchedule(fs, ops)
+                fill_ghosts!(fs, sched)
+                push!(snapshots, (blockrange(forest), copy(fs.work)))
+                ok &= disjoint(held(sched)) &&
+                      all(st -> st.remote === nothing ||
+                                (isempty(st.remote.buffers) && isempty(st.remote.mirrors)),
+                          stale.stages)
+            end
+            pool = forest.state.pool
+            push!(allocated, pool === nothing ? -1 : pool.allocated)
+        end
+        pool = forest.state.pool
+        return snapshots, allocated, pool === nothing ? -1 : pool.pagelocked, ok, comm
+    end
+    # A serial forest has no stage with messages, and so no pool at all.
+    reference, serialallocated, _, _, _ = cycles(nothing)
+    @test serialallocated == [-1, -1, -1]
+    P = 3
+    comms = map(StagingCommunicator, gather_ranks(P))
+    results = on_ranks(r -> cycles(comms[r]), P)
+    for (snapshots, allocated, pagelocked, ok, comm) in results
+        @test length(snapshots) == length(reference)
+        @test all(bitwise_equal(work, reference[i][2][:, :, :, range])
+                  for (i, (range, work)) in enumerate(snapshots))
+        @test ok
+        @test allocated[1] > 0 && pagelocked > 0 && !isempty(comm.handed)
+        @test allocated[3] == allocated[2]
+    end
+end
+
 @testset "adapt_to_initial_data! over a distributed forest starts from ranks without blocks" begin
     # From a single leaf, every rank but one starts empty, and each pass
     # gathers flags from ranks with and without blocks. Both criterion

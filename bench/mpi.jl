@@ -95,6 +95,10 @@
 #     TREEAMR_BENCH_DEVICEAWARE 1 to hand MPI the device buffers
 #                               (`communicator(…; deviceaware = true)`);
 #                               default 0, staging through host mirrors
+#     TREEAMR_BENCH_FORCESTAGING 1 to stage every message through host
+#                               mirrors even on the CPU, whose buffers are
+#                               host memory already: the staging path's
+#                               host-side cost, without a device (default 0)
 #
 # The test environment has MPI and KernelAbstractions; `--project=.`
 # does not (MPI is a weak dependency).
@@ -123,7 +127,31 @@ end
 const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 const DEVICEAWARE = get(ENV, "TREEAMR_BENCH_DEVICEAWARE", "0") == "1"
-const COMM = USE_MPI ? communicator(MPI.COMM_WORLD; deviceaware=DEVICEAWARE) : nothing
+const FORCESTAGING = get(ENV, "TREEAMR_BENCH_FORCESTAGING", "0") == "1"
+
+# The MPI communicator with every buffer staged (`TREEAMR_BENCH_FORCESTAGING`),
+# as `test/regrid_exchange_tests.jl`'s `StagingCommunicator` does in process.
+struct ForcedStaging{C<:TreeAMR.Communicator} <: TreeAMR.Communicator
+    inner::C
+end
+TreeAMR.hoststaging(::ForcedStaging, ::AbstractVector) = true
+for verb in (:commrank, :commsize, :librarycomm)
+    @eval TreeAMR.$verb(c::ForcedStaging) = TreeAMR.$verb(c.inner)
+end
+TreeAMR.allgather(c::ForcedStaging, x) = TreeAMR.allgather(c.inner, x)
+TreeAMR.allgatherv(c::ForcedStaging, v::AbstractVector) = TreeAMR.allgatherv(c.inner, v)
+TreeAMR.waitall(c::ForcedStaging, requests::AbstractVector) =
+    TreeAMR.waitall(c.inner, requests)
+TreeAMR.alltoallv(c::ForcedStaging, buf::AbstractVector, counts::AbstractVector{<:Integer}) =
+    TreeAMR.alltoallv(c.inner, buf, counts)
+TreeAMR.isend(c::ForcedStaging, buf::AbstractVector, peer::Integer, tag::Integer) =
+    TreeAMR.isend(c.inner, buf, peer, tag)
+TreeAMR.irecv(c::ForcedStaging, buf::AbstractVector, peer::Integer, tag::Integer) =
+    TreeAMR.irecv(c.inner, buf, peer, tag)
+
+const COMM = !USE_MPI ? nothing :
+             FORCESTAGING ? ForcedStaging(communicator(MPI.COMM_WORLD)) :
+             communicator(MPI.COMM_WORLD; deviceaware=DEVICEAWARE)
 const LOCALRANK = USE_MPI ?
                   MPI.Comm_rank(MPI.Comm_split_type(MPI.COMM_WORLD, MPI.COMM_TYPE_SHARED,
                                                     RANK)) : 0
@@ -383,12 +411,17 @@ function run_mesh(mesh)
                                          Keep, forest)
     t_refine, t_coarsen = Float64[], Float64[]
     moved = (0, 0)
+    bytes_refine = bytes_coarsen = 0               # host bytes allocated, last repetition
+    # The forest's buffer pool, where it has one (`forest.state.pool`).
+    pooled(forest) = hasfield(typeof(forest), :state) ? forest.state.pool : nothing
+    firstcycle = nothing
     current = schedule
     for rep in 0:slow
         oldlocal = Set(blockkey(fs, b) for b in 1:nblocks(fs))
         oldall = Set(forest.leaves)
         t = window(comm) do
-            regrid!(forest, (fs => current, fluxes => nothing); flags=refine_flags)
+            bytes_refine = @allocated regrid!(forest, (fs => current, fluxes => nothing);
+                                              flags=refine_flags)
         end
         rep > 0 && push!(t_refine, t)
         m1 = moved_in(oldlocal, oldall, fs)
@@ -398,12 +431,17 @@ function run_mesh(mesh)
         oldlocal = Set(blockkey(fs, b) for b in 1:nblocks(fs))
         oldall = Set(forest.leaves)
         t = window(comm) do
-            regrid!(forest, (fs => current, fluxes => nothing); flags=coarsen_flags)
+            bytes_coarsen = @allocated regrid!(forest, (fs => current, fluxes => nothing);
+                                               flags=coarsen_flags)
         end
         rep > 0 && push!(t_coarsen, t)
         moved = (m1, moved_in(oldlocal, oldall, fs))
         current = GhostSchedule(fs, OPS)
         forest.leaves == original || error("the regrid cycle did not return to the mesh")
+        if rep == 0 && pooled(forest) !== nothing
+            p = pooled(forest)
+            firstcycle = (p.allocated, p.pagelocked, p.dropped)
+        end
         GC.gc()
     end
     res["regrid_refine"] = (minimum(t_refine), median(t_refine))
@@ -415,6 +453,18 @@ function run_mesh(mesh)
     say("# $mesh: the regrid refines $nslab blocks into $(nslab * 2^D) and back; " *
         "blocks taking data from another rank (min/mean/max over ranks): refine " *
         "$(fmt(mv[1])), coarsen $(fmt(mv[2]))")
+    # What the last repetition allocated on the host, and, where the forest
+    # has a buffer pool, how many message buffers it ever allocated.
+    say(@sprintf("# %s: the last regrids allocate %.1f / %.1f MB (refine / coarsen) on rank 0",
+                 mesh, bytes_refine / 1e6, bytes_coarsen / 1e6))
+    pool = pooled(forest)
+    if pool !== nothing
+        say("# $mesh: rank 0's buffer pool after $(slow + 1) regrid cycles: " *
+            "$(pool.allocated) buffers allocated, $(pool.pagelocked) mirrors " *
+            "page-locked, $(pool.dropped) dropped" *
+            (firstcycle === nothing ? "" :
+             "; after the first cycle $(join(firstcycle, ", "))"))
+    end
 
     # The bandwidth reference, on every rank at once.
     n = length(fs.work)
@@ -435,7 +485,8 @@ end
 
 function main()
     say("ranks=$NRANKS threads=$(Threads.nthreads()) D=$D N=$N roots=$ROOTS tiles=$TILES " *
-        "nvars=$NVARS backend=$BNAME T=$T deviceaware=$DEVICEAWARE reps=$REPS " *
+        "nvars=$NVARS backend=$BNAME T=$T deviceaware=$DEVICEAWARE " *
+        "forcestaging=$FORCESTAGING reps=$REPS " *
         "npts=$NPTS Julia $VERSION")
     for mesh in MESHES
         run_mesh(mesh)

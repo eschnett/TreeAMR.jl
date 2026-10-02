@@ -405,7 +405,11 @@ end
 # where at 2 and 3 ranks a group of siblings straddles a rank boundary
 # when it is coarsened again (as in `mpi_workload.jl`). A cell-centered
 # set with conservative operators, whose mass the transfer conserves,
-# beside a vertex-centered one.
+# beside a vertex-centered one. The cycle runs twice, with the schedules
+# rebuilt for every regrid as an application rebuilds them, and a `#`
+# line after each says how many message buffers and host mirrors the
+# ranks' pools have allocated so far: the second cycle must allocate
+# none, since the first one's are kept (`BufferPool`).
 function moving_blocks_case(tag)
     D = 2
     cons = Operators(family=Conservative, prolongation=3, restriction=2)
@@ -419,14 +423,22 @@ function moving_blocks_case(tag)
         fill_by_coordinates!(pulse((1.2, 0.7), 0.5), b)
         pairs() = (a => GhostSchedule(a, cons), b => GhostSchedule(b, lagr))
         name = "$tag$(shape[1])"
-        offset = first(blockrange(forest)) - 1
-        flags = RegridFlag[offset + i <= refined ? Refine : Keep for i in 1:nblocks(a)]
         mass = total_mass(a, 1)
-        regridded("$name.refine", forest, pairs(); flags=flags)
-        offset = first(blockrange(forest)) - 1
-        flags = RegridFlag[level(forest.leaves[offset + i]) > 0 ? Coarsen : Keep
-                           for i in 1:nblocks(a)]
-        regridded("$name.coarsen", forest, pairs(); flags=flags)
+        for round in 1:2
+            suffix = round == 1 ? "" : string(round)
+            offset = first(blockrange(forest)) - 1
+            flags = RegridFlag[offset + i <= refined ? Refine : Keep for i in 1:nblocks(a)]
+            regridded("$name.refine$suffix", forest, pairs(); flags=flags)
+            offset = first(blockrange(forest)) - 1
+            flags = RegridFlag[level(forest.leaves[offset + i]) > 0 ? Coarsen : Keep
+                               for i in 1:nblocks(a)]
+            regridded("$name.coarsen$suffix", forest, pairs(); flags=flags)
+            pool = forest.state.pool
+            counts = TreeAMR.allgather(forest.comm, pool === nothing ? (0, 0) :
+                                                    (pool.allocated, pool.pagelocked))
+            emit("#", name, "pool", round, "allocated", sum(first, counts), "mirrors",
+                 sum(last, counts))
+        end
         conserved &= abs(total_mass(a, 1) - mass) <= 256 * eps(T) * abs(mass)
     end
     emit(tag, "conserved", conserved)

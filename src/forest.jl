@@ -1,3 +1,20 @@
+# The mutable part of a forest. `pool` holds the message buffers of the
+# exchanges over the forest between the stages that use them: a regrid
+# builds new stages, and they take their buffers, and host mirrors, from
+# it instead of allocating them again (`BufferPool`). It is made on first
+# use, so a serial forest, whose stages have no messages, never has one.
+mutable struct ForestState
+    generation::Int
+    pool::Union{Nothing,BufferPool}
+end
+ForestState() = ForestState(0, nothing)
+
+function bufferpool(forest)
+    state = forest.state
+    state.pool === nothing && (state.pool = BufferPool())
+    return state.pool::BufferPool
+end
+
 """
     Forest{D,T}
 
@@ -76,11 +93,16 @@ struct Forest{D,T}
     extents::NTuple{D,Tuple{T,T}}
     N::Int
     leaves::Vector{MortonKey{D}}
-    # Bumped whenever the leaf array changes, so anything derived from
-    # the tree (a GhostSchedule, say) can detect in O(1) that it is
-    # stale — a same-size refine-then-coarsen would otherwise slip past
-    # a leaf-count check and silently transfer the wrong data.
-    generation::Base.RefValue{Int}
+    # What changes while the fields above stay: the generation, bumped
+    # whenever the leaf array changes, so anything derived from the tree
+    # (a GhostSchedule, say) can detect in O(1) that it is stale — a
+    # same-size refine-then-coarsen would otherwise slip past a
+    # leaf-count check and silently transfer the wrong data — and the
+    # message-buffer pool (M7). One mutable object for both, in place of
+    # the `Ref` the generation had, so that the struct stays as large as
+    # it was: a ninth field made the schedule build allocate more
+    # (CODE.md, "The buffer pool").
+    state::ForestState
     # The processes the field data are split over (M7). Abstract-typed
     # on purpose, so that `Forest{D,T}` keeps its two parameters and no
     # `FieldSet` or schedule signature downstream changes; the price is
@@ -88,6 +110,7 @@ struct Forest{D,T}
     # kernel ("Distributed meshes" in CODE.md).
     comm::Communicator
 end
+
 
 # `G` is still accepted as a keyword so that the move can be reported
 # instead of surfacing as a bare `MethodError` on an unrecognised
@@ -149,7 +172,7 @@ function Forest{T}(roots::NTuple{D,Integer};
         # array in place, which must never reach the caller's vector.
         list = collect(MortonKey{D}, leaves)
     end
-    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, Ref(0),
+    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, ForestState(),
                          communicator(comm))
     leaves === nothing || check_leaves(forest)
     return forest
@@ -314,7 +337,7 @@ A counter bumped on every change to the leaf array. Structures derived
 from the tree record it so they can tell in O(1) whether they are still
 valid — see [`GhostSchedule`](@ref).
 """
-generation(forest::Forest) = forest.generation[]
+generation(forest::Forest) = forest.state.generation
 
 """
     nleaves(forest::Forest)
@@ -711,7 +734,7 @@ end
 function rebuild_leaves!(forest::Forest{D}, newleaves::Vector{MortonKey{D}}) where {D}
     empty!(forest.leaves)
     append!(forest.leaves, newleaves)
-    forest.generation[] += 1
+    forest.state.generation += 1
     return forest
 end
 

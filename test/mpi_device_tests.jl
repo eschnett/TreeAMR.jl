@@ -108,5 +108,16 @@ numbers(lines, words...) =
         @test moved("M4.refine")[1] > 0              # blocks moved up the ranks
         @test moved("M4.coarsen")[2] > 0             # and back down
         @test moved("M2.coarsen")[3] > 0             # siblings with different owners
+
+        # The second regrid cycle took every buffer and mirror from the
+        # pool, which kept the first cycle's; mirrors exactly where staged.
+        for name in ("M4", "M2")
+            pool = numbers(filter(startswith("# $name pool"), out), name, "pool")
+            @test length(pool) == 2
+            (r1, a1, m1), (r2, a2, m2) = pool
+            @test (r1, r2) == (1, 2)
+            @test a1 > 0 && a2 == a1 && m2 == m1
+            @test (m1 > 0) == (backend != "cpu" && !deviceaware)
+        end
     end
 end

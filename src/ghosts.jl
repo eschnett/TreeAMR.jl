@@ -289,37 +289,92 @@ run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
 # fill runs the same launches and the same barriers it always did.
 
 # The stage's send and receive buffers for `nvars` variables, on the
-# backend, allocated (and zeroed) on first use and kept with the
-# schedule, since a schedule serves every field set of its layout.
-function stagebuffers(remote::RemoteStage{D,GRP,VB,BUF}, nvars::Integer,
-                      backend) where {D,GRP,VB,BUF}
-    return get!(remote.buffers, Int(nvars)) do
-        T = eltype(BUF)
-        send = allocate(backend, T, Int(nvars) * sum(remote.sendcounts; init=0))
-        recv = allocate(backend, T, Int(nvars) * sum(remote.recvcounts; init=0))
-        fill!(send, zero(T))
-        fill!(recv, zero(T))
-        (send, recv)
+# backend, taken on first use and kept with the schedule, since a
+# schedule serves every field set of its layout. Over a forest they are
+# leased from its buffer pool (`BufferPool`), so that a stage built
+# after a regrid reuses what earlier stages held; without one (the
+# in-process tests, which wire the buffers between simulated ranks
+# themselves) they are allocated and zeroed, as before the pool.
+function stagebuffers(remote::RemoteStage{D,GRP,VB,BUF}, nvars::Integer, backend,
+                      forest=nothing) where {D,GRP,VB,BUF}
+    bufs = get(remote.buffers, Int(nvars), nothing)
+    bufs === nothing || return bufs
+    make = cap -> new_stagebuffer(BUF, backend, cap)
+    lengths = (Int(nvars) * sum(remote.sendcounts; init=0),
+               Int(nvars) * sum(remote.recvcounts; init=0))
+    bufs = map(lengths) do n
+        forest === nothing ? make(n).full::BUF :
+        lease!(make, BUF, bufferpool(forest), (:buffer, BUF, typeof(backend)), n,
+               generation(forest), remote.buffers, Int(nvars))
     end
+    remote.buffers[Int(nvars)] = bufs
+    return bufs
+end
+
+# A fresh, zeroed stage buffer of `cap` elements. A host one (the CPU's)
+# is an `Array` over a `Memory` of its own, which a lease can wrap at a
+# shorter length; a device one is the backend's array, which a lease
+# views.
+function new_stagebuffer(::Type{BUF}, backend, cap::Int) where {BUF}
+    T = eltype(BUF)
+    if BUF <: Array
+        mem = Memory{T}(undef, cap)
+        full = fill!(Base.wrap(Array, mem, (cap,)), zero(T))
+        return PooledBuffer(full, mem)
+    end
+    full = allocate(backend, T, cap)
+    fill!(full, zero(T))
+    return PooledBuffer(full, nothing)
 end
 
 # Host mirrors of the stage's buffers for `nvars` variables, for a
 # communicator that cannot send from or receive into the backend's own
-# memory (`hoststaging`): the same layout in host vectors, allocated on
+# memory (`hoststaging`): the same layout in host vectors, taken on
 # first use and kept with the stage like the buffers themselves, so a
 # staged fill allocates nothing new either. They are page-locked for the
 # backend where it implements that (`KernelAbstractions.pagelock!`; CUDA
 # pins them, the CPU and Metal do nothing), which is what lets a device
-# copy them at the bus's rate rather than through a bounce buffer.
+# copy them at the bus's rate rather than through a bounce buffer, and
+# leased from the forest's pool like the buffers: page-locking is the
+# slow part of allocating one, so a pooled mirror is page-locked once.
 function stagemirrors(remote::RemoteStage{D,GRP,VB,BUF,HB}, nvars::Integer,
-                      backend) where {D,GRP,VB,BUF,HB}
-    return get!(remote.mirrors, Int(nvars)) do
-        send = zeros(eltype(HB), Int(nvars) * sum(remote.sendcounts; init=0))
-        recv = zeros(eltype(HB), Int(nvars) * sum(remote.recvcounts; init=0))
-        pagelock_mirror!(backend, send)
-        pagelock_mirror!(backend, recv)
-        (send, recv)
+                      backend, forest=nothing) where {D,GRP,VB,BUF,HB}
+    mirrors = get(remote.mirrors, Int(nvars), nothing)
+    mirrors === nothing || return mirrors
+    pool = forest === nothing ? nothing : bufferpool(forest)
+    make = cap -> new_mirror(eltype(HB), backend, cap, pool)
+    lengths = (Int(nvars) * sum(remote.sendcounts; init=0),
+               Int(nvars) * sum(remote.recvcounts; init=0))
+    mirrors = map(lengths) do n
+        forest === nothing ? make(n).full::HB :
+        lease!(make, HB, pool, (:mirror, HB, typeof(backend)), n,
+               generation(forest), remote.mirrors, Int(nvars))
     end
+    remote.mirrors[Int(nvars)] = mirrors
+    return mirrors
+end
+
+function new_mirror(::Type{T}, backend, cap::Int, pool) where {T}
+    mem = Memory{T}(undef, cap)
+    full = fill!(Base.wrap(Array, mem, (cap,)), zero(T))
+    pagelock_mirror!(backend, full)
+    pool === nothing || cap == 0 || (pool.pagelocked += 1)
+    return PooledBuffer(full, mem)
+end
+
+# Give a stage's buffers and mirrors back to the forest's pool, and
+# forget them: the regrid stage's, once its sends have been waited on,
+# since it lives for one call.
+function release_stage!(forest::Forest, remote::RemoteStage)
+    for bufs in values(remote.buffers)
+        release!(bufferpool(forest), bufs)
+    end
+    for mirrors in values(remote.mirrors)
+        release!(bufferpool(forest), mirrors)
+    end
+    empty!(remote.buffers)
+    empty!(remote.mirrors)
+    return nothing
 end
 
 # `pagelock!` is in KernelAbstractions from 0.9.40 on; where a backend
@@ -407,9 +462,9 @@ function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fac
         return sends
     end
     comm = forest.comm
-    bufs = stagebuffers(remote, nvars, backend)
+    bufs = stagebuffers(remote, nvars, backend, forest)
     staged = hoststaging(comm, bufs[1])
-    wire = staged ? stagemirrors(remote, nvars, backend) : bufs
+    wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
     recvs = Any[irecv(comm, view(wire[2], r), peer, stage.tag)
                 for (peer, r) in zip(remote.recvpeers,
                                      segment_ranges(remote.recvcounts, nvars))]
