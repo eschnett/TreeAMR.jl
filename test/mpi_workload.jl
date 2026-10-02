@@ -720,6 +720,24 @@ function verbs()
     world = TreeAMR.communicator(COMM)
     shared = all(_ -> Forest((2, 2); N=4, comm=COMM).comm === world, 1:20)
     emit("# one duplicate per communicator", shared && TreeAMR.communicator(COMM) === world)
+    # The device-aware setting (step 8) shares the duplicate, and a buffer
+    # that is not a contiguous host vector is refused before anything is
+    # sent, naming the setting; over a device-aware communicator a range
+    # is no dense device vector either.
+    aware = TreeAMR.communicator(COMM; deviceaware=true)
+    refused(c) = try
+        TreeAMR.isend(c, 1:3, (RANK + 1) % NRANKS, 99)
+        false
+    catch err
+        err isa ArgumentError && occursin("deviceaware = true", sprint(showerror, err))
+    end
+    emit("# device-aware shares the duplicate",
+         aware.comm === world.comm && aware.deviceaware && !world.deviceaware &&
+         Forest((2, 2); N=4, comm=aware).comm === aware &&
+         !TreeAMR.hoststaging(aware, zeros(1)) && !TreeAMR.hoststaging(world, zeros(1)) &&
+         refused(world) && !refused(aware) &&
+         (try TreeAMR.isend(aware, 1:3, (RANK + 1) % NRANKS, 99); false
+          catch err; err isa ArgumentError end))
     # Rank r sends s + 1 copies of 100r + s to rank s, and nothing to
     # itself when r is even.
     counts = [s == RANK && iseven(RANK) ? 0 : s + 1 for s in 0:(NRANKS - 1)]

@@ -303,6 +303,32 @@ function stagebuffers(remote::RemoteStage{D,GRP,VB,BUF}, nvars::Integer,
     end
 end
 
+# Host mirrors of the stage's buffers for `nvars` variables, for a
+# communicator that cannot send from or receive into the backend's own
+# memory (`hoststaging`): the same layout in host vectors, allocated on
+# first use and kept with the stage like the buffers themselves, so a
+# staged fill allocates nothing new either. They are page-locked for the
+# backend where it implements that (`KernelAbstractions.pagelock!`; CUDA
+# pins them, the CPU and Metal do nothing), which is what lets a device
+# copy them at the bus's rate rather than through a bounce buffer.
+function stagemirrors(remote::RemoteStage{D,GRP,VB,BUF,HB}, nvars::Integer,
+                      backend) where {D,GRP,VB,BUF,HB}
+    return get!(remote.mirrors, Int(nvars)) do
+        send = zeros(eltype(HB), Int(nvars) * sum(remote.sendcounts; init=0))
+        recv = zeros(eltype(HB), Int(nvars) * sum(remote.recvcounts; init=0))
+        pagelock_mirror!(backend, send)
+        pagelock_mirror!(backend, recv)
+        (send, recv)
+    end
+end
+
+# `pagelock!` is in KernelAbstractions from 0.9.40 on; where a backend
+# does not implement it, it returns `missing` and the mirror is ordinary
+# pageable memory, which is still correct.
+pagelock_mirror!(backend, a::Vector) =
+    isdefined(KernelAbstractions, :pagelock!) ?
+    KernelAbstractions.pagelock!(backend, a) : nothing
+
 # Each peer's segment of a buffer, in elements: `counts` are in points,
 # and the segments follow each other in peer order.
 function segment_ranges(counts::Vector{Int}, nvars::Integer)
@@ -353,6 +379,22 @@ unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
 # messages: the field is abstractly typed, and a call that took it as an
 # argument would be dispatched at run time on every stage of a serial
 # fill too.
+#
+# On a device whose buffers the communicator cannot take (`hoststaging`,
+# step 8 of M7) the messages go through host mirrors: the receives are
+# posted into the receive mirror, the packed buffer is copied down after
+# the pack's synchronization and sent from the send mirror, and the
+# received mirror is copied up before the unpack. The data, the layout
+# and the kernels are the device buffers' own, so the bytes on the wire
+# and the ghosts written are the same either way; only where MPI reads
+# and writes them differs. Each copy is ordered where it has to be: the
+# download (`copyto!` into an `Array`) returns once the host holds the
+# data, and the upload is queued before the unpack on the backend's
+# queue, and complete by the final `synchronize`, before the next call
+# can receive into the mirror again (each stage has mirrors of its own,
+# and the send mirror is rewritten only after the call's sends have been
+# waited on). A CPU buffer is an `Array` and goes to the communicator
+# directly, as before.
 function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
                     stage::ExchangeStage, forest::Forest, backend, sends)
     remote = stage.remote
@@ -363,16 +405,20 @@ function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fac
     end
     comm = forest.comm
     bufs = stagebuffers(remote, nvars, backend)
-    recvs = Any[irecv(comm, view(bufs[2], r), peer, stage.tag)
+    staged = hoststaging(comm, bufs[1])
+    wire = staged ? stagemirrors(remote, nvars, backend) : bufs
+    recvs = Any[irecv(comm, view(wire[2], r), peer, stage.tag)
                 for (peer, r) in zip(remote.recvpeers,
                                      segment_ranges(remote.recvcounts, nvars))]
     pack_stage!(src, remote, bufs, nvars, backend)
+    staged && copyto!(wire[1], bufs[1])
     sends === nothing && (sends = Any[])
     for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
-        push!(sends, isend(comm, view(bufs[1], r), peer, stage.tag))
+        push!(sends, isend(comm, view(wire[1], r), peer, stage.tag))
     end
     run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
     waitall(comm, recvs)
+    staged && copyto!(bufs[2], wire[2])
     unpack_stage!(dest, remote, bufs, nvars, factors, backend)
     synchronize(backend)
     return sends

@@ -30,6 +30,18 @@ writes and reads its own blocks of one shared file through parallel
 HDF5, which loads with HDF5 and MPI together, and a file written on any
 number of ranks loads on any other, or serially.
 
+Field sets on a device backend work the same way. Their message buffers
+live on the device, and by default every message is staged through
+page-locked host mirrors, which any MPI can send. An MPI that reads
+device memory — a CUDA-aware one, for CUDA — can be handed the device
+buffers instead, which the application says when it converts its
+communicator; see [`communicator`](@ref):
+
+```julia
+forest = Forest((4, 4); N = 8,
+                comm = communicator(MPI.COMM_WORLD; deviceaware = true))
+```
+
 ```@docs
 communicator
 blockrange
@@ -52,6 +64,7 @@ TreeAMR.alltoallv
 TreeAMR.isend
 TreeAMR.irecv
 TreeAMR.waitall
+TreeAMR.hoststaging
 ```
 
 ## The distributed schedule

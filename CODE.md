@@ -3419,6 +3419,75 @@ variable `JULIA_MPI_HAS_CUDA` says otherwise (MPI.jl 0.20.27's
 into by that variable, and step 8 records whether the MPI on
 Symmetry's H200 nodes is CUDA-aware at all.
 
+*(Step 8, where this was implemented; what it settled, and where it
+amends the paragraph above:)*
+
+- *Who decides* (amended: the paragraph had `MPI.has_cuda()` decide). The
+  caller does, when it converts its communicator:
+  `communicator(comm; deviceaware = true)` hands MPI the device buffers,
+  and the default, `false`, stages every device message through host
+  mirrors. Four reasons. A wrong "yes" is a crash, or silent garbage,
+  inside the MPI library, and a wrong "no" costs two copies a message, so
+  the safe answer is the default. `MPI.has_cuda()` is not a safe answer:
+  it is `false` for every MPICH, CUDA-aware or not, unless an environment
+  variable says otherwise, and it is about CUDA only, while the package
+  cannot tell, without naming a device package, whether a buffer is a
+  `CuArray`, a `ROCArray` or an `MtlArray` — so a `true` from an Open MPI
+  built with CUDA would also send a ROCm buffer's device pointer to a
+  library that cannot read it. The application knows its backend and its
+  MPI, and `deviceaware = MPI.has_cuda()` is one line for it to write on
+  CUDA (the docstring shows it). And the setting belongs with the
+  communicator, since it is a property of the MPI library: not a keyword
+  of `Forest`, which would put it beside the mesh's parameters, and not a
+  TreeAMR environment variable or preference, which would be state the
+  call does not show and, for a preference, a new dependency.
+- *The ranks need not agree.* Staged or not, the bytes on the wire are
+  the stage buffer's, so one rank may stage while its peer sends from
+  the device. Nothing is gathered for it, and it is not part of the
+  layout hash.
+- *A verb, not a type test in the driver.* `hoststaging(comm, buffer)`
+  is a new verb of the communicator layer, and the only one whose
+  fallback on the abstract type answers rather than refuses: `true` for anything but a host `Array`.
+  The MPI extension answers `false` for a device buffer only when the
+  communicator was made device-aware. The CPU's buffers are `Array`s, so
+  its path is the direct one whatever the setting, and the serial path
+  never asks, since a stage without messages has no buffers. The setting
+  is a field of `MPICommunicator` beside the duplicate, and not part of
+  it: a device-aware forest and an ordinary one over the same
+  communicator share the one cached duplicate.
+- *The mirrors* are `Vector`s of the element type with the stage
+  buffers' layout, one send and one receive mirror per stage and
+  variable count, allocated on first use and kept in the `RemoteStage`
+  beside the buffers (a new field, `mirrors`, and a fifth type parameter,
+  `HB`), so a staged fill allocates no buffer after its first. They are
+  page-locked for the backend through `KernelAbstractions.pagelock!`
+  (since KernelAbstractions 0.9.40, inside the `[compat]` floor of
+  0.9.42): CUDA pins them, which lets the copies run at the bus's rate
+  rather than through the driver's bounce buffer; the CPU and Metal do
+  nothing, Metal's memory being unified. A regrid stage is built per
+  regrid, so its mirrors are too, and CUDA unpins them when they are
+  collected. No weak dependency on a device package was needed.
+- *The order of a staged stage*: post the receives into the receive
+  mirror; pack and synchronize; copy the send buffer down (`copyto!`
+  into an `Array`, which returns once the host holds the data — CUDA.jl
+  synchronizes before a download); send from the send mirror; run the
+  local groups; wait for the receives; copy the receive mirror up; unpack;
+  synchronize. The upload is asynchronous on CUDA from pinned memory, but
+  it is queued before the unpack on the backend's queue, and the final
+  synchronization completes it before the next call can receive into the
+  mirror again. The send mirror is rewritten only by the next call's
+  download, after this call's sends have been waited on.
+- *The direct path* is the CPU's code with the device buffers' views in
+  place of the mirrors'. The extension's buffer check, which accepted any
+  contiguous view before — a view of a device array included — now
+  accepts host memory only, `Array` or a contiguous view of one, and a
+  dense device vector or a contiguous view of one only over a
+  device-aware communicator; the refusal names the setting. MPI.jl hands
+  a `CuArray` to the library by its device pointer through its own CUDA
+  extension.
+- *Interpolation and checkpoints* stay as steps 5 and 6 left them: both
+  go through the host, at analysis and checkpoint cadence.
+
 **Reductions: an allgather of per-rank partials** (decided).
 `combine_blocks` in `state.jl` is already the single site where M7's
 communication was to go. It folds the local blocks as today,
@@ -5224,6 +5293,135 @@ M7's benchmarks. The list below is in execution order.
     check and host staging. *Accept:* the workload on Metal through the
     staging path, and on an H200 on Symmetry, agreeing with the serial
     device run as [Parallelism](#parallelism) states for a device.
+
+    *(Done locally, 2026-10-01; the H200 run is scripted and not run.)*
+    What it settled, and where it went beyond the plan (the design
+    decisions are recorded under "MPI+GPU" in
+    [Distributed meshes](#distributed-meshes)):
+    - *The code.* `run_stage!` in `ghosts.jl` is the one place every
+      stage runs — the ghost fill, the interface restriction and the
+      regrid transfer — so it is the one place that stages: it asks the
+      new verb `hoststaging(comm, buffer)`, and when the answer is yes it
+      posts the receives into host mirrors, downloads the packed buffer
+      after the pack's synchronization, sends from the mirror, and
+      uploads the receive mirror before the unpack. `stagemirrors`
+      allocates the mirrors once per stage and variable count, kept in
+      `RemoteStage`'s new `mirrors` field, and page-locks them with
+      `KernelAbstractions.pagelock!`. The MPI extension gains the
+      `deviceaware` keyword of `communicator` and a field of
+      `MPICommunicator` for it, answers `hoststaging`, and checks a
+      message buffer against the setting. No new dependency, weak or
+      otherwise.
+    - *An inference fix found by the new test.* The in-process staging
+      test defines a fourth test `Communicator` with an `allgather`
+      method, and with it `type_tests.jl`'s `@inferred total_mass` and
+      `@inferred volume_weighted_norm` failed: `combine_blocks` calls
+      `allgather` on the abstractly typed `comm` field, and with that
+      many methods inference returns `Any` for the call, and the fold
+      over its result with it. Nothing about a reduction's type should
+      depend on how many communicator types a process has loaded — an
+      application with its own would have hit it too — so the gather is
+      now asserted, `allgather(comm, partial)::Vector{typeof(partial)}`,
+      which every `allgather` returns.
+    - *The device workload.* `test/mpi_device_workload.jl`, standalone and
+      not in `Pkg.test`, since the test environment has no device package
+      and must not gain one: the vertex-centered wave on three levels with
+      the hook, a reflecting box with an odd variable, a periodic 3D
+      mesh, each filled and stepped with RK4; Burgers with the interface
+      fixup and its conservation; the tracked pulse through two regrids
+      flagged by `firing_boxes` on the device; and refinements of the
+      first blocks and their coarsening, which move blocks up and down
+      the ranks and coarsen siblings with different owners, over a
+      conservative cell-centered set and a vertex-centered one. Rank 0
+      prints digests of the arrays downloaded and gathered in block
+      order, ghosts included, the exact reductions, the sums, and `#`
+      lines with how many of each schedule's stages had messages and how
+      many were staged, and how blocks migrated. Every callback computes
+      in the coordinates' type (the forests' extents are in `T`), since
+      Metal has no Float64. `TREEAMR_TEST_BACKEND` chooses `cpu`, `metal`
+      or `cuda`, `TREEAMR_TEST_T` the type, and
+      `TREEAMR_TEST_DEVICEAWARE=1` the direct path; on a node with several
+      devices each rank takes device `local rank mod devices`.
+      `test/mpi_device_tests.jl` runs it serially and under `mpiexec` at
+      `TREEAMR_TEST_RANKS` (default `2 3`), one thread a rank, and
+      requires every line to be the serial device run's, the `sum` lines
+      to `rtol = 10⁻⁵` in Float32 and `10⁻¹²` in Float64; every stage with
+      messages to have been staged on a device that is not device-aware,
+      and none otherwise; and the migrations to have happened.
+    - *Measured on Metal* (Apple M3 Pro, Metal.jl in a scratch environment
+      that develops this checkout and adds Metal, MPI, KernelAbstractions,
+      SHA and Test; MPICH_jll 5.0.2; two and three ranks sharing the one
+      GPU). `TREEAMR_TEST_BACKEND=metal julia --project=<env>
+      test/mpi_device_tests.jl` passes, 36 tests in 1m45: the serial run
+      31 s, `-n 2` 36 s and `-n 3` 38 s of wall clock, nearly all of it
+      compilation. In Float32 every line but the sums is the serial Metal
+      run's byte for byte, at both counts; at `-n 3` the sums move in the
+      seventh or eighth of 9 digits (Burgers' mass 15.999999 against 16,
+      `l2` by 1–2 × 10⁻⁷ relative). At `-n 3` 9, 8, 6, 9 and 5 stages of
+      the five schedules had messages, and all of them were staged;
+      6 blocks moved up the ranks on the refinement, 6 back down on the
+      coarsening, and 2 coarsened blocks had children of two owners. As a
+      negative control, with the upload of the receive mirror removed the
+      `-n 2` run differs from the serial one in 53 lines. The same driver
+      on the CPU (the direct path, nothing staged) passes in 59 s.
+    - *In process*, the staging path on the CPU: a communicator in
+      `regrid_exchange_tests.jl` that answers `hoststaging` with `true`
+      for every buffer, over the rendezvous communicator, and records the
+      arrays every message is handed out of. At 3 ranks in 2D, vertex-
+      centered, outer and reflecting faces with the hook, the staged ghost
+      fill, the interface restriction and `regrid!` reproduce the serial
+      results bit for bit; every buffer handed to the communicator is one
+      of the stages' mirrors and none is a stage buffer; a second fill
+      reuses the mirrors and gives the same bits. With the upload removed
+      it fails, 7 of its 31 tests. `mpi_workload.jl` gains a `#` line that
+      checks, under MPI, that a device-aware communicator shares the
+      duplicate, and that a buffer which is not contiguous host memory is
+      refused before anything is sent, naming the setting.
+    - *The CPU path is unchanged.* `bench/ghosts.jl` at its defaults, one
+      thread, best of 200, HEAD before and after, alternated twice: the
+      serial fill allocates exactly what it did, 10896 bytes on the
+      uniform mesh and 97504 on the two-level one, and the schedule build
+      392832 and 4656880; the fill took 2.660–2.719 ms against
+      2.667–2.670 ms and 12.09–12.22 ms against 11.87–11.92 ms, the second
+      1.5–3 % slower in both rounds, though the serial path runs no
+      changed line (the stage without messages returns before the new
+      code); not traced further. A distributed CPU fill (the same
+      two-level mesh, 10 variables, `mpiexec` with one thread a rank,
+      best of 50) allocates exactly what it did, 130320 bytes on each rank
+      at `-n 2` and 151856 / 189168 / 151856 at `-n 3`, in 7.0 ms and
+      6.1–6.9 ms both before and after.
+    - *The CPU workload by hand*, `test/mpi_workload.jl` at `-n 3` against
+      the serial run (before the inference fix above, which changes no
+      value): every line but the `sum` lines and the `#` lines identical,
+      the sums agreeing to the last one or two of 17 digits, as in step 6.
+    - *Symmetry, not run.* `bench/symmetry_mpi_gpu.sh` (SLURM,
+      `h200debugq`, one node, 4 GPUs by default) runs
+      `test/mpi_device_tests.jl` on CUDA at 2, 3 and as many ranks as
+      GPUs, in Float64 and Float32, through the staging path, and through
+      the direct path too when `MPI.has_cuda()` says the MPI is
+      CUDA-aware (or `TREEAMR_DEVICEAWARE=1` says so). With the default
+      binary, MPICH_jll, it is not, so the direct path needs a CUDA-aware
+      system MPI through `TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`;
+      whether Symmetry has one is the open question the paragraph above
+      left for this step, and it stays open until the job runs. No timing
+      is taken there: the cost of the two paths belongs with step 7's
+      benchmark, which does not exist yet.
+    - *What was not checked.* The direct path on any device: Metal has no
+      device-aware MPI, and the CPU's direct path is not the device's
+      code path for MPI.jl, which hands a `CuArray` over through its
+      own CUDA extension. A checkpoint or an interpolation from a device
+      field set under MPI was not run (both go through the host, as steps
+      5 and 6 recorded).
+    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
+      `partition_tests.jl`, `exchange_tests.jl`,
+      `regrid_exchange_tests.jl` (the staging test included),
+      `type_tests.jl` after them (the inference fix) and `mpi_tests.jl`
+      (3m21 together); the whole suite was not run there.
+    - *Suite cost.* 109140 tests at one thread in 7m55 and 109192 at eight
+      in 7m51, against step 6's 109107 in 8m10 and 109159 in 8m02: 33
+      more at each, the 31 of the staging test and the device-aware line
+      at two rank counts. The thread-independence digests are unchanged.
+      The docs build.
   - **Step 9 — wrap-up.** A `docs/src/api/distributed.md` page
     (`communicator`, `blockrange`), a guide section in `index.md`, the
     status there and in `README.md`, and CLAUDE.md's architecture row,

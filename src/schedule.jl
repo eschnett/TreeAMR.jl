@@ -292,7 +292,7 @@ struct LayoutEntry{D}
 end
 
 """
-    RemoteStage{D,GRP,VB,BUF}
+    RemoteStage{D,GRP,VB,BUF,HB}
 
 The messages of one stage on one rank: what it packs and sends, and what
 it receives and unpacks, with the layouts of both buffers.
@@ -319,8 +319,15 @@ it receives and unpacks, with the layouts of both buffers.
   transfers" in CODE.md.)
 - `buffers` holds the send and receive buffers per variable count, on
   the backend, allocated on first use and kept with the schedule.
+- `mirrors` holds their host mirrors, of type `HB` (a `Vector` of the
+  element type), per variable count: allocated, and page-locked for the
+  backend, the first time the stage runs over a communicator that cannot
+  take the buffers themselves ([`hoststaging`](@ref TreeAMR.hoststaging)).
+  That is a device without a device-aware MPI; a CPU buffer is host
+  memory already, and MPI is handed it directly.
 """
-struct RemoteStage{D,GRP<:TransferGroup,VB<:AbstractVector{Int32},BUF<:AbstractVector}
+struct RemoteStage{D,GRP<:TransferGroup,VB<:AbstractVector{Int32},BUF<:AbstractVector,
+                   HB<:Vector}
     sendpeers::Vector{Int}
     sendcounts::Vector{Int}
     recvpeers::Vector{Int}
@@ -332,6 +339,7 @@ struct RemoteStage{D,GRP<:TransferGroup,VB<:AbstractVector{Int32},BUF<:AbstractV
     sendoffsets::VB
     recvoffsets::VB
     buffers::Dict{Int,Tuple{BUF,BUF}}
+    mirrors::Dict{Int,Tuple{HB,HB}}
 end
 
 """
@@ -357,7 +365,7 @@ function stagetype(backend::Backend, ::Type{T}, ::Val{D}) where {T,D}
     GRP = grouptype(backend, T, Val(D))
     VB = typeof(todevice(backend, Int32[0]))
     BUF = typeof(allocate(backend, T, 0))
-    return ExchangeStage{GRP,RemoteStage{D,GRP,VB,BUF}}
+    return ExchangeStage{GRP,RemoteStage{D,GRP,VB,BUF,Vector{T}}}
 end
 
 # The message tags, one per stage, so that a stage's messages can only
@@ -1086,7 +1094,7 @@ function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
     recvoffsets = todevice(backend, Int32[e.offset for e in recvlayout])
     return RS(sendpeers, sendcounts, recvpeers, recvcounts, sendlayout, recvlayout,
               packs, unpacks, sendoffsets, recvoffsets,
-              fieldtype(RS, :buffers)())
+              fieldtype(RS, :buffers)(), fieldtype(RS, :mirrors)())
 end
 
 remotetype(::Type{ExchangeStage{GRP,RS}}) where {GRP,RS} = RS

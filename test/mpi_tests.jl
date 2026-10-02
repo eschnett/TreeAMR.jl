@@ -225,6 +225,7 @@ end
         @test startswith(refused("partial"), "# partial refused on $n of $n ranks: " *
                                              "GhostSchedule was refused on rank(s) 1")
         @test "# one duplicate per communicator true" in hashes
+        @test "# device-aware shares the duplicate true" in hashes
         @test "# verbs agree on every rank true" in hashes
         @test startswith(refused("interface diverged"),
                          "# interface diverged refused on $n of $n ranks: the forest " *

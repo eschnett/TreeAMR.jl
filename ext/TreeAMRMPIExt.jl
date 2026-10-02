@@ -25,7 +25,10 @@
 #   `MPI.Init()`'s default.
 # - Buffers are flat and contiguous: an `Array` or a `UnitRange` view of
 #   one, which MPI.jl hands to the library as a pointer and a count, not
-#   as a derived datatype.
+#   as a derived datatype. A device buffer is handed over only by a
+#   communicator made with `deviceaware = true` (step 8 of M7); every
+#   other one has the exchange stage its messages through host mirrors
+#   (`hoststaging`), so the library sees host memory only.
 
 module TreeAMRMPIExt
 
@@ -33,18 +36,22 @@ using MPI: MPI
 using TreeAMR
 using TreeAMR: Communicator
 import TreeAMR: communicator, commrank, commsize, allgather, allgatherv, alltoallv,
-                isend, irecv, waitall, librarycomm
+                isend, irecv, waitall, librarycomm, hoststaging
 
 # A forest's communicator over MPI: the duplicate, with its rank and size
-# read once, since neither can change.
+# read once, since neither can change, and whether the caller said the
+# library reads device memory (`deviceaware`), which is the caller's to
+# know: see `communicator`'s docstring and "MPI+GPU" in `CODE.md`.
 struct MPICommunicator <: Communicator
     comm::MPI.Comm
     rank::Int
     size::Int
+    deviceaware::Bool
 end
 
 Base.show(io::IO, c::MPICommunicator) =
-    print(io, "MPICommunicator(rank ", c.rank, " of ", c.size, ")")
+    print(io, "MPICommunicator(rank ", c.rank, " of ", c.size,
+          c.deviceaware ? ", device-aware)" : ")")
 
 # The duplicates made so far, by the handle of the communicator they
 # duplicate. Guarded by a lock, since forests may be built from several
@@ -53,7 +60,7 @@ Base.show(io::IO, c::MPICommunicator) =
 const DUPLICATES = Dict{Any,MPICommunicator}()
 const DUPLICATES_LOCK = ReentrantLock()
 
-function communicator(comm::MPI.Comm)
+function communicator(comm::MPI.Comm; deviceaware::Bool=false)
     MPI.Initialized() && !MPI.Finalized() || throw(ArgumentError(
         "MPI is " * (MPI.Finalized() ? "already finalized" : "not initialized") *
         ": a forest over an MPI communicator duplicates it, which is an MPI call. " *
@@ -77,15 +84,17 @@ function communicator(comm::MPI.Comm)
         # is the same ranks in the same order (a duplicate compares
         # CONGRUENT with its original); the comparison is local, and its
         # answer is the same on every rank of the group.
-        if cached !== nothing &&
-           MPI.Comm_compare(cached.comm, comm) in (MPI.CONGRUENT, MPI.IDENT)
-            return cached
+        if cached === nothing ||
+           !(MPI.Comm_compare(cached.comm, comm) in (MPI.CONGRUENT, MPI.IDENT))
+            dup = MPI.Comm()
+            MPI.API.MPI_Comm_dup(comm, dup)
+            cached = MPICommunicator(dup, MPI.Comm_rank(dup), MPI.Comm_size(dup), false)
+            DUPLICATES[comm.val] = cached
         end
-        dup = MPI.Comm()
-        MPI.API.MPI_Comm_dup(comm, dup)
-        made = MPICommunicator(dup, MPI.Comm_rank(dup), MPI.Comm_size(dup))
-        DUPLICATES[comm.val] = made
-        return made
+        # The setting is not part of the duplicate: a forest made with it
+        # and one made without share the one duplicate, as every forest
+        # over the communicator does.
+        return MPICommunicator(cached.comm, cached.rank, cached.size, deviceaware)
     end
 end
 
@@ -127,13 +136,28 @@ end
 # A message buffer has to be one contiguous run of memory, which is what
 # the exchange hands over: a stage buffer or a `UnitRange` view of one
 # peer's segment of it. Anything else would reach MPI as a derived
-# datatype, or not at all, so it is refused rather than sent.
-const FlatBuffer = Union{Array,Base.FastContiguousSubArray}
+# datatype, or not at all, so it is refused rather than sent. Host memory
+# is what every communicator takes; a device-aware one also takes a
+# dense device vector or a contiguous view of one, which MPI.jl hands to
+# the library by its device pointer (through its CUDA or ROCm extension).
+const HostBuffer = Union{Array,Base.FastContiguousSubArray{<:Any,1,<:Array}}
+const DenseBuffer = Union{DenseVector,Base.FastContiguousSubArray{<:Any,1,<:DenseArray}}
 
-flatbuffer(buf::FlatBuffer) = buf
-flatbuffer(buf::AbstractVector) = throw(ArgumentError(
-    "a message buffer must be a contiguous host vector (an Array, or a UnitRange " *
-    "view of one), got a $(typeof(buf))"))
+# Whether a stage buffer goes through host mirrors: a host `Array` never
+# does, a device buffer unless the caller said the library reads device
+# memory.
+hoststaging(c::MPICommunicator, buffer::AbstractVector) =
+    !(buffer isa Array) && !c.deviceaware
+
+flatbuffer(c::MPICommunicator, buf::HostBuffer) = buf
+flatbuffer(c::MPICommunicator, buf::AbstractVector) =
+    c.deviceaware && buf isa DenseBuffer ? buf : throw(ArgumentError(
+        "a message buffer must be a contiguous host vector (an Array, or a UnitRange " *
+        "view of one)" *
+        (c.deviceaware ? ", or a dense device vector or a contiguous view of one" :
+         "; a device buffer is sent directly only over a communicator made with " *
+         "`communicator(comm; deviceaware = true)`, and otherwise staged through " *
+         "host memory by the exchange") * ", got a $(typeof(buf))"))
 
 checkpeer(c::MPICommunicator, peer) =
     0 <= peer < c.size && peer != c.rank || throw(ArgumentError(
@@ -142,12 +166,12 @@ checkpeer(c::MPICommunicator, peer) =
 
 function isend(c::MPICommunicator, buf::AbstractVector, peer::Integer, tag::Integer)
     checkpeer(c, peer)
-    return MPI.Isend(flatbuffer(buf), c.comm; dest=Int(peer), tag=Int(tag))
+    return MPI.Isend(flatbuffer(c, buf), c.comm; dest=Int(peer), tag=Int(tag))
 end
 
 function irecv(c::MPICommunicator, buf::AbstractVector, peer::Integer, tag::Integer)
     checkpeer(c, peer)
-    return MPI.Irecv!(flatbuffer(buf), c.comm; source=Int(peer), tag=Int(tag))
+    return MPI.Irecv!(flatbuffer(c, buf), c.comm; source=Int(peer), tag=Int(tag))
 end
 
 function waitall(c::MPICommunicator, requests::AbstractVector)

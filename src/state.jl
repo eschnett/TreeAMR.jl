@@ -478,7 +478,11 @@ function combine_blocks(op, init::R, fs::FieldSet, values::Vector{R}, weight) wh
         return mapreduce(identity, op, values)
     end
     partial = isempty(values) ? (false, init) : (true, mapreduce(identity, op, values))
-    partials = allgather(comm, partial)
+    # Asserted, since `comm` is abstractly typed: with more than a few
+    # `Communicator` subtypes loaded, inference gives up on the call and
+    # the reduction's result would be inferred as `Any` (found in step 8,
+    # when the suite's fourth test communicator made it so).
+    partials = allgather(comm, partial)::Vector{typeof(partial)}
     acc, found = init, false
     for (hasvalue, value) in partials
         hasvalue || continue

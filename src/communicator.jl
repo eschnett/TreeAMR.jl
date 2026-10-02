@@ -48,6 +48,7 @@ Base.show(io::IO, ::SerialCommunicator) = print(io, "SerialCommunicator()")
 
 """
     communicator(comm) -> TreeAMR.Communicator
+    communicator(comm::MPI.Comm; deviceaware = false)
 
 The package's view of an application's communicator: what a
 [`Forest`](@ref) stores for its `comm` keyword. A
@@ -72,6 +73,22 @@ MPI. Three things hold for it (see "Distributed meshes" in `CODE.md`):
   rank makes the same calls, in the same order, from one task at a time.
   That covers the forest mutations, the schedule builds, the ghost fill,
   the interface restriction and the reductions.
+- A field set on a device exchanges through host mirrors of its message
+  buffers unless the communicator is made with
+  `communicator(comm; deviceaware = true)`, which hands MPI the device
+  buffers themselves. Say so only for an MPI that reads the device's
+  memory (a CUDA-aware MPI for CUDA): a wrong `true` is a crash inside
+  the library, a wrong `false` two copies per message. `MPI.has_cuda()`
+  answers for Open MPI only, and for MPICH only through the environment
+  variable `JULIA_MPI_HAS_CUDA`, so it is a hint for the caller to pass,
+  not a default. The ranks need not agree on it, since the bytes sent
+  are the same either way.
+
+```julia
+# Field sets on CUDABackend(), and an MPI that may be CUDA-aware:
+forest = Forest((4, 4); N = 8,
+                comm = communicator(MPI.COMM_WORLD; deviceaware = MPI.has_cuda()))
+```
 """
 communicator(comm::Communicator) = comm
 communicator(::Nothing) = SerialCommunicator()
@@ -195,6 +212,28 @@ function waitall(::SerialCommunicator, requests::AbstractVector)
     return nothing
 end
 waitall(comm::Communicator, requests::AbstractVector) = missing_verb(comm, :waitall)
+
+"""
+    hoststaging(comm, buffer::AbstractVector) -> Bool
+
+Whether a stage buffer allocated on a device has to pass through a host
+mirror before `comm` can send it or receive into it (M7, step 8). The
+exchange packs on the field set's backend; when this answers `true` it
+copies the packed buffer to a host vector of the same layout before
+[`isend`](@ref TreeAMR.isend), and the received host vector to the
+device before unpacking, so that the communicator only ever sees host
+memory. When it answers `false` the device buffer itself is handed over,
+which needs a device-aware MPI.
+
+A host `Array` never needs staging, so the CPU path is the direct one.
+Any other buffer is staged unless the communicator says it can take it:
+that is the safe default, since a library handed device memory it cannot
+read fails, at best, while staging costs two copies. The MPI extension
+answers `false` for a device buffer only when its communicator was made
+with `communicator(comm; deviceaware = true)`. See "MPI+GPU" under
+"Distributed meshes" in `CODE.md`.
+"""
+hoststaging(::Communicator, buffer::AbstractVector) = !(buffer isa Array)
 
 # The library communicator underneath, for a library that has to be
 # handed one itself: parallel HDF5 opens a checkpoint over it (step 6 of

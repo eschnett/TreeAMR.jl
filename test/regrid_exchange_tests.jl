@@ -352,6 +352,128 @@ end
     end
 end
 
+# --- Host staging (step 8 of M7) ---------------------------------------------
+#
+# On a device whose memory the MPI cannot read, every stage's messages go
+# through host mirrors of its buffers: download after the pack, send and
+# receive from the mirrors, upload before the unpack. On the CPU the
+# buffers are host memory and go to MPI directly, so that path would
+# only ever run on a device, which the suite does not have. This
+# communicator forces it on the CPU — it answers `hoststaging` with
+# `true` for every buffer — and records the arrays the messages were
+# handed out of, so the test can tell that the path it means to test is
+# the one that ran.
+
+struct StagingCommunicator <: TreeAMR.Communicator
+    inner::GatherCommunicator
+    handed::Vector{Any}
+end
+StagingCommunicator(inner) = StagingCommunicator(inner, Any[])
+TreeAMR.hoststaging(::StagingCommunicator, ::AbstractVector) = true
+TreeAMR.commrank(c::StagingCommunicator) = TreeAMR.commrank(c.inner)
+TreeAMR.commsize(c::StagingCommunicator) = TreeAMR.commsize(c.inner)
+TreeAMR.allgather(c::StagingCommunicator, x) = TreeAMR.allgather(c.inner, x)
+TreeAMR.allgatherv(c::StagingCommunicator, v::AbstractVector) =
+    TreeAMR.allgatherv(c.inner, v)
+TreeAMR.alltoallv(c::StagingCommunicator, buf::AbstractVector,
+                  counts::AbstractVector{<:Integer}) = TreeAMR.alltoallv(c.inner, buf, counts)
+function TreeAMR.isend(c::StagingCommunicator, buf::AbstractVector, peer::Integer,
+                       tag::Integer)
+    push!(c.handed, parent(buf))
+    return TreeAMR.isend(c.inner, buf, peer, tag)
+end
+function TreeAMR.irecv(c::StagingCommunicator, buf::AbstractVector, peer::Integer,
+                       tag::Integer)
+    push!(c.handed, parent(buf))
+    return TreeAMR.irecv(c.inner, buf, peer, tag)
+end
+TreeAMR.waitall(c::StagingCommunicator, requests::AbstractVector) =
+    TreeAMR.waitall(c.inner, requests)
+
+@testset "Staging the messages through host mirrors delivers the same bits" begin
+    # A staged message that lost its download, its upload, or a segment
+    # boundary would deliver stale or shifted ghosts. So the ghost fill
+    # with the hook, the interface restriction and `regrid!` itself run
+    # with every message staged, at 3 ranks, and must reproduce the
+    # serial results bit for bit; every buffer handed to the
+    # communicator must be one of the stages' mirrors, never a stage
+    # buffer; and a second fill must reuse the mirrors, the ones it
+    # allocated on first use, and give the same bits.
+    D = 2
+    serial = faces_forest((:outer, :reflect_both); N=8)
+    hook = exchange_hook()
+    nvars = length(EXCHANGE_PARITY)
+    C = vertexcentered(D)
+    G = exchange_ghosts(C, PointValue)
+    rebuilt(comm) = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                           reflecting=serial.reflecting, extents=serial.extents,
+                           leaves=serial.leaves, comm=comm)
+    reference = rebuilt(nothing)
+    sfs = FieldSet(reference, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
+    data = exchange_data(MersenneTwister(21), Float64, size(sfs.work))
+    copyto!(sfs.work, data)
+    ssched = GhostSchedule(sfs, XOPS4)
+    fill_ghosts!(sfs, ssched; boundary=hook)
+    filled = copy(sfs.work)
+    sflux = FieldSet(reference, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
+    fdata = exchange_data(MersenneTwister(22), Float64, size(sflux.work))
+    copyto!(sflux.work, fdata)
+    restrict_interfaces!(sflux, InterfaceSchedule(sflux))
+    sflags = Any[f === Refine ? (Refine, ntuple(_ -> 1:2, D)) : f
+                 for f in regrid_test_flags(reference)]
+    @test regrid!(reference, sfs => ssched; flags=sflags, buffer=2, boundary=hook)
+
+    P = 3
+    comms = map(StagingCommunicator, gather_ranks(P))
+    results = on_ranks(P) do r
+        comm = comms[r]
+        forest = rebuilt(comm)
+        owned = blockrange(forest)
+        fs = FieldSet(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
+        copyto!(fs.work, data[:, :, :, owned])
+        sched = GhostSchedule(fs, XOPS4)
+        fill_ghosts!(fs, sched; boundary=hook)
+        work = copy(fs.work)
+        mirrors = [m for st in sched.stages if st.remote !== nothing
+                   for m in st.remote.mirrors[nvars]]
+        buffers = [x for st in sched.stages if st.remote !== nothing
+                   for x in st.remote.buffers[nvars]]
+        ghosts_handed = copy(comm.handed)
+        # The same fill again, now that the mirrors exist.
+        fill_ghosts!(fs, sched; boundary=hook)
+        again = bitwise_equal(fs.work, work) &&
+                all(splat(===), zip(mirrors, [m for st in sched.stages
+                                              if st.remote !== nothing
+                                              for m in st.remote.mirrors[nvars]]))
+        flux = FieldSet(forest, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
+        copyto!(flux.work, fdata[:, :, :, owned])
+        isched = InterfaceSchedule(flux)
+        restrict_interfaces!(flux, isched)
+        imirrors = [m for st in isched.stages if st.remote !== nothing
+                    for m in st.remote.mirrors[nvars]]
+        empty!(comm.handed)
+        flags = Any[sflags[i] for i in owned]
+        regrid!(forest, fs => sched; flags=flags, buffer=2, boundary=hook)
+        (owned, work, again, mirrors, buffers, ghosts_handed, copy(flux.work), imirrors,
+         copy(comm.handed), copy(forest.leaves), blockrange(forest), copy(fs.work))
+    end
+    for (owned, work, again, mirrors, buffers, handed, fluxwork, imirrors, regridhanded,
+         leaves, newowned, regridded) in results
+        @test bitwise_equal(work, filled[:, :, :, owned])
+        @test again
+        @test !isempty(mirrors) && !isempty(handed)
+        @test all(h -> any(m -> h === m, mirrors), handed)
+        @test !any(h -> any(x -> h === x, buffers), handed)
+        @test bitwise_equal(fluxwork, sflux.work[:, :, :, owned])
+        @test !isempty(imirrors)
+        @test leaves == reference.leaves
+        @test bitwise_equal(regridded, sfs.work[:, :, :, newowned])
+        # The regrid stage's messages were staged too: handed out of host
+        # vectors that are none of the field set's arrays.
+        @test !isempty(regridhanded) && all(h -> h isa Vector{Float64}, regridhanded)
+    end
+end
+
 @testset "adapt_to_initial_data! over a distributed forest starts from ranks without blocks" begin
     # From a single leaf, every rank but one starts empty, and each pass
     # gathers flags from ranks with and without blocks. Both criterion
