@@ -45,14 +45,11 @@ using TreeAMR: oriented_neighbors, virtual_offset, real_direction, rotating_dims
     @test Forest((2, 2); N=4, rotating=(1, 2),
                  extents=((0.0f0, 1.0f0), (0.0f0, 1.0f0))).rotating == (1, 2)
 
-    # Until interpolation and the checkpoint learn the orientation, each
-    # refuses the seam rather than read across it as though it were an
-    # ordinary face. (The ghost schedule learned it in step 3, the
-    # interface schedule in step 4.)
+    # Until the checkpoint learns the orientation, it refuses the seam
+    # rather than write a file that would load without it. (The ghost
+    # schedule learned it in step 3, the interface schedule in step 4 and
+    # the interpolation in step 5.)
     forest = Forest((2, 2); N=8, rotating=(1, 2))
-    fs = FieldSet(forest, 1; G=1, rotation=(1,))
-    @test_throws "interpolate over a rotating forest" interpolate(fs, [(0.5, 0.5)],
-                                                                  Lagrange(2))
     mktempdir() do dir
         @test_throws "save_checkpoint over a rotating forest" save_checkpoint(
             joinpath(dir, "c.h5"), forest; fieldsets=())
@@ -909,4 +906,215 @@ end
         println("rigid rotation through the seam $rot: $nsteps steps, crossed " *
                 "$(crossed / m0) of the mass, drift $drift with the fixup, $leak without")
     end
+end
+
+# --- M12 step 5: interpolation beyond the seam -------------------------------
+
+# The orthogonal signed permutation that carries the quadrant to where a
+# point lies: `r` quarter turns `R` (`R e_{d1} = e_{d2}`, `R e_{d2} =
+# −e_{d1}`), then, if `mirror`, the reflection of dimension `z` at its
+# low face. Written from the definition, as integer matrices.
+function turn_matrix(D, (d1, d2), r::Int; mirror::Bool=false, z::Int=0)
+    R = Matrix{Int}(I_(D))
+    R[d1, d1], R[d2, d2], R[d2, d1], R[d1, d2] = 0, 0, 1, -1
+    O = R^r
+    if mirror
+        M = Matrix{Int}(I_(D))
+        M[z, z] = -1
+        O = M * O
+    end
+    return O
+end
+I_(D) = [Int(i == j) for i in 1:D, j in 1:D]
+
+# The value and gradient at `R^r q` (mirrored or not) of the scalar and
+# the vector of `rotating_data`, from those at `q`: `s(Op) = s(p)`,
+# `V(Op) = O V(p)`, and each gradient turned by `O` too. Each sum has a
+# single nonzero term of weight ±1, so this is exact.
+function turned_values(vq::AbstractMatrix, O::Matrix{Int})
+    D = size(O, 1)
+    out = similar(vq)
+    comp(i, k) = i == 1 ? vq[1, k] : sum(O[i - 1, j] * vq[1 + j, k] for j in 1:D)
+    for i in 1:(D + 1)
+        out[i, 1] = comp(i, 1)
+        for k in 1:D
+            out[i, 1 + k] = sum(O[k, l] * comp(i, 1 + l) for l in 1:D)
+        end
+    end
+    return out
+end
+
+# A complex-step first derivative of the formula `f(x, v)` along `d`:
+# exact to roundoff for the polynomial data, and needing no package.
+function complex_step(f, x::NTuple{D}, v, d) where {D}
+    ε = 1e-20
+    return imag(f(ntuple(e -> e == d ? complex(x[e], ε) : complex(x[e]), D), v)) / ε
+end
+
+@testset "Interpolation beyond the seam is the turned field: D=$D" for D in (2, 3)
+    # A point beyond the seam is answered from its preimage in the
+    # quadrant: a wrong fold, variable, sign or derivative remap gives a
+    # wrong value there, which the polynomial data would show at once, and
+    # the turned value must be the preimage's bit for bit, since the
+    # stencil, its block and its arithmetic are the same. The smooth data
+    # are compared against the full plane, which holds them written out:
+    # at the preimage, turned, which is where the quadrant's stored points
+    # are the full plane's; and at the point itself, which agrees to
+    # roundoff for cell centering only. A vertex-like full plane is not
+    # itself covariant under the turn at coarse-fine faces — half-open
+    # ownership puts the shared plane, and a different ghost stencil, on
+    # a block's high side — so there the two agree to interpolation
+    # accuracy, and the quadrant is the covariant one.
+    cases = D == 2 ? [((1, 2), :none), ((2, 1), :none)] :
+            [((1, 2), :reflect_lo), ((3, 1), :periodic)]
+    derivs = (ntuple(_ -> 0, D), ntuple(k -> ntuple(d -> Int(d == k), D), D)...)
+    worst_poly, worst_full = 0.0, 0.0
+    worst_direct = Dict(:cell => 0.0, :vertex => 0.0)
+    for (rot, other) in cases, C in (cellcentered(D), vertexcentered(D))
+        d1, d2 = rot
+        z = outofplane(D, rot)
+        mirrors = other === :reflect_lo
+        rng = Xoshiro(hash((D, rot, C)))
+        # Points inside the quadrant, away from the high faces, and their
+        # images R^r q (and mirrored below z = 0, where z reflects).
+        qs = [ntuple(d -> 0.05 + 1.9 * rand(rng), D) for _ in 1:60]
+        image(q, r, m) = Tuple(turn_matrix(D, rot, r; mirror=m, z=z) * collect(q))
+        turns = [(r, m) for r in 0:3 for m in (mirrors ? (false, true) : (false,))]
+
+        # Polynomial data, which every operator and the interpolant
+        # reproduce: every point anywhere in the plane is exact.
+        p = 4
+        f = rotating_data(D, rot, other; poly=p)
+        fs = FieldSet(rotating_forest(Val(D); rotating=rot, other=other), D + 1;
+                      G=ghosts_for(C, p), centering=C,
+                      rotation=vector_rotation(D, rot),
+                      parity=vector_parity(D, rot, other))
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, ROT_OPS4); boundary=boundary_by_coordinates(f))
+        xs = [image(q, r, m) for q in qs for (r, m) in turns]
+        res = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+        for (j, x) in enumerate(xs), v in 1:(D + 1)
+            worst_poly = max(worst_poly, abs(res.values[v, 1, j] - f(x, v)))
+            for d in 1:D
+                worst_poly = max(worst_poly,
+                                 abs(res.values[v, 1 + d, j] - complex_step(f, x, v, d)))
+            end
+        end
+
+        # The turned value is the preimage's, turned, bit for bit.
+        vq = interpolate(fs, qs, Lagrange(4); derivs=derivs).values
+        exact = true
+        for (iq, q) in enumerate(qs), (r, m) in turns
+            vp = interpolate(fs, [image(q, r, m)], Lagrange(4); derivs=derivs).values
+            exact &= vp[:, :, 1] == turned_values(vq[:, :, iq],
+                                                  turn_matrix(D, rot, r; mirror=m, z=z))
+        end
+        @test exact
+        # `locate_point` folds the same way.
+        @test all(locate_point(fs.forest, image(q, r, m)) == locate_point(fs.forest, q)
+                  for q in qs[1:10] for (r, m) in turns)
+
+        # Smooth data against the full plane, at random points anywhere.
+        quad, full = quadrant_and_full(Val(D); rotating=rot, other=other, N=8)
+        g = rotating_data(D, rot, other)
+        par = vector_parity(D, rot, other)
+        fsq = FieldSet(quad, D + 1; G=ghosts_for(C, 4), centering=C, parity=par,
+                       rotation=vector_rotation(D, rot))
+        fsf = FieldSet(full, D + 1; G=ghosts_for(C, 4), centering=C, parity=par)
+        for s in (fsq, fsf)
+            fill_by_coordinates!(g, s)
+            fill_ghosts!(s, GhostSchedule(s, ROT_OPS4); boundary=boundary_by_coordinates(g))
+        end
+        ys = [ntuple(d -> d == z && !mirrors ? 0.05 + 1.9 * rand(rng) :
+                          3.9 * rand(rng) - 1.95, D) for _ in 1:400]
+        a = interpolate(fsq, ys, Lagrange(4); derivs=derivs)
+        b = interpolate(fsf, ys, Lagrange(4); derivs=derivs)
+        # The preimage of each point, by the test's own turns: `O' = O⁻¹`.
+        Os = map(ys) do y
+            r = y[d1] < 0 ? (y[d2] < 0 ? 2 : 1) : (y[d2] < 0 ? 3 : 0)
+            turn_matrix(D, rot, r; mirror=mirrors && y[z] < 0, z=z)
+        end
+        pre = [Tuple(O' * collect(y)) for (O, y) in zip(Os, ys)]
+        bq = interpolate(fsf, pre, Lagrange(4); derivs=derivs).values
+        for j in eachindex(ys)
+            worst_full = max(worst_full, maximum(abs.(a.values[:, :, j] .-
+                                                      turned_values(bq[:, :, j], Os[j]))))
+        end
+        kind = first(C)
+        worst_direct[kind] = max(worst_direct[kind], maximum(abs.(a.values .- b.values)))
+        # Every orientation is met.
+        seen = Set(Int(y[d1] < 0) + 2 * Int(y[d2] < 0) for y in ys)
+        @test length(seen) == 4
+
+        # A subset of the variables, reordered, is the same numbers.
+        sub = interpolate(fsq, ys, Lagrange(4); derivs=derivs, vars=[3, 2])
+        @test sub.values == a.values[[3, 2], :, :]
+    end
+    @test worst_poly < 1e-9
+    @test worst_full < 1e-12
+    @test worst_direct[:cell] < 1e-12
+    @test worst_direct[:vertex] < 2e-2               # values and gradients
+    println("interpolation beyond the seam D=$D: polynomial data within $worst_poly, " *
+            "smooth data within $worst_full of the full plane at the turned preimage; " *
+            "at the point itself $(worst_direct[:cell]) (cell) and " *
+            "$(worst_direct[:vertex]) (vertex)")
+end
+
+@testset "Interpolation beyond the seam in Float32, with a region" begin
+    # The fold and the turned tables in another element type, and a
+    # region's flags, which are tested where the stencil is read: a
+    # turned point and its preimage share both.
+    rot = (1, 2)
+    quad, _ = quadrant_and_full(Val(2); rotating=rot, other=:none, N=8)
+    quad32 = Forest{Float32}(quad.roots; N=quad.N, rotating=rot,
+                             extents=((0.0f0, 2.0f0), (0.0f0, 2.0f0)),
+                             leaves=copy(quad.leaves))
+    g = rotating_data(2, rot, :none)
+    derivs = ((0, 0), (1, 0), (0, 1))
+    res = map((quad, quad32)) do forest
+        T = floattype(forest)
+        fs = FieldSet{T}(forest, 3; G=2, rotation=vector_rotation(2, rot))
+        fill_by_coordinates!(g, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, ROT_OPS4); boundary=boundary_by_coordinates(g))
+        rng = Xoshiro(5)
+        qs = [(T(0.05 + 1.9 * rand(rng)), T(0.05 + 1.9 * rand(rng))) for _ in 1:40]
+        ps = [(-q[2], q[1]) for q in qs]                 # R q, r = 1
+        region = Ellipsoid((T(0.6), T(0.4)), (T(0.3), T(0.5)))
+        vq = interpolate(fs, qs, Lagrange(4); derivs=derivs, exclude=region)
+        vp = interpolate(fs, ps, Lagrange(4); derivs=derivs, exclude=region)
+        O = turn_matrix(2, rot, 1)
+        @test all(j -> vp.values[:, :, j] == turned_values(vq.values[:, :, j], O), 1:40)
+        @test vp.excluded == vq.excluded
+        @test 0 < count(vp.excluded) < 40
+        vp.values
+    end
+    @test eltype(res[2]) === Float32
+    @test maximum(abs.(res[2] .- res[1])) < 1e-4
+    println("Float32 beyond the seam: within $(maximum(abs.(res[2] .- res[1]))) of Float64")
+end
+
+@testset "A set that turns into its partner refuses points beyond the seam" begin
+    # A face-centered set's value beyond the seam is its partner's, turned;
+    # read from itself it would be the wrong component in the wrong
+    # layout, so the point is refused with the reason, after the launch,
+    # as an outside point is — and inside the quadrant it interpolates.
+    forest = rotating_forest(Val(2); rotating=(1, 2))
+    Bx = FieldSet(forest, 1; G=(1, 2), centering=facecentered(2, 1), rotation=(-1,))
+    By = FieldSet(forest, 1; G=(2, 1), centering=facecentered(2, 2), rotation=(1,))
+    fill_by_coordinates!((x, v) -> x[1] + 2x[2], Bx)
+    fill_ghosts!(RotationPair(Bx, By), (GhostSchedule(Bx, ROT_OPS4),
+                                        GhostSchedule(By, ROT_OPS4));
+                 boundary=CellBoundary((x, v, δ) -> zero(eltype(x))))
+    @test interpolate(Bx, [(0.3, 0.7)], Lagrange(2)).values[1] ≈ 0.3 + 1.4
+    @test_throws "lies 1 quarter turn(s) away across the rotating seam" interpolate(
+        Bx, [(0.3, 0.7), (-0.2, 0.5)], Lagrange(2))
+    @test_throws "Interpolate the partner at the turned point" interpolate(
+        By, [(-0.2, -0.5)], Lagrange(2))
+    # Beyond a high face, turned or not, is outside, and the faces say
+    # which are the seam.
+    @test_throws "rotating seam below" interpolate(Bx, [(2.5, 0.5)], Lagrange(2))
+    @test_throws "is outside the domain" interpolate(Bx, [(-0.5, 2.5)], Lagrange(2))
+    fs = FieldSet(forest, 1; G=2, rotation=(1,))
+    @test_throws "is outside the domain" interpolate(fs, [(-2.5, 0.5)], Lagrange(2))
+    @test locate_point(forest, (-2.5, 0.5)) === nothing
 end

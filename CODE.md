@@ -1799,6 +1799,28 @@ first step on its own. Decided:
   beyond the seam with the reason: its value there is its partner's,
   which the kernel does not read (an open question, see
   [Open questions](#open-questions)).
+  *(Step 5, 2026-10-03: as specified, with these details.
+  `fold_point` returns the orientation with the folded point, and the
+  turn is taken about the low corner of the plane, `(a, b) ↦ (b, −a)`,
+  `(−a, −b)` and `(−b, a)` for `r = 1, 2, 3`. An odd `r` contracts with
+  the requested multi-indices with `d1` and `d2` exchanged, a second
+  compile-time tuple beside `derivs`, so that the selections stay
+  static (run-time ones cost M11 21 %); each derivative takes the turn's
+  sign `(−1)^{m_{d1}}`, `(−1)^{m_{d1}+m_{d2}}` or `(−1)^{m_{d2}}`, which
+  holds at any order, so second derivatives need nothing more here. A set that cannot turn a point — an asymmetric layout — gets no
+  variable table in the kernel, which marks such a point `−1` beside an
+  outside point's `0`; the host decides which refusal it is with the
+  same fold (`outside_error`, whose face labels now name the seam). M7's
+  host routing marks it the same way. `exclude` is tested where the
+  stencil is read, as for a mirrored point. One finding about the
+  comparison, not the fold: the full plane agrees with the quadrant at a
+  turned point to roundoff for cell centering, but only to
+  interpolation accuracy for vertex centering, since a vertex-like full
+  plane is not itself covariant under the turn where levels meet — its
+  ghost stencils depend on the side, half-open ownership putting the
+  shared plane on a block's high one — while the quadrant is covariant
+  by construction. The test therefore compares with the full plane at
+  the preimage, turned; the numbers are under step 5 of M12.)*
 - **The basis is the extension point.** `Lagrange(n)` is the one
   implemented. The kernel knows a basis only through `stencilwidth`,
   `stencilstart` (which `n` points, from the query's continuous stored
@@ -7957,7 +7979,62 @@ being done now, so it comes before M9b, which follows it.
       rigid-rotation advection, both orders of the pair. The file holds
       1334 tests (1092 after step 3) and runs in 50 s at one thread and
       42 s at four.
-  - **Step 5 — interpolation.**
+  - **Step 5 — interpolation.** *(Done, 2026-10-03.)*
+    - *What was built.* The step-1 refusal is gone. `PointGeometry`
+      carries the seam's pair; `fold_point` folds periodic and
+      reflecting coordinates and then turns a point beyond the seam
+      back, returning the orientation (amended under
+      [Point interpolation](#point-interpolation)); `locate_point`,
+      the kernel and M7's host routing share it. The kernel reads
+      variable `rotvars[v, r + 1]` and the factor column
+      `mirror + 3^D·r`, and contracts with the exchanged multi-indices
+      for an odd `r` (`contract_point!`, split out of
+      `interpolate_point!` so that both calls see constant indices). A
+      set with an asymmetric layout is handed no variable table and
+      refuses a point beyond the seam after the launch, with the reason
+      and the partner named. `inside`, `stencil_hits` and
+      `stencil_position` are unchanged.
+    - *Measured.* Polynomial data of degree 3 per dimension, which every
+      operator and `Lagrange(4)` reproduce, at the images of 60 points
+      under every turn (and the mirror below `z = 0` where `z` reflects),
+      values and all first derivatives against the formula and its
+      complex-step derivatives: within 1.6e-14 in 2D and 2.4e-14 in 3D,
+      cell and vertex, both orders of the pair, the third dimension
+      reflecting below or periodic. The value at a turned point is the
+      preimage's, turned, **bit for bit**, every variable and derivative.
+      Smooth data at 400 random points of the whole plane: within
+      1.3e-16 of the full plane's value at the preimage, turned; at the
+      point itself within 3.4e-14 for cell centering and 4.2e-3 (2D) and
+      5.5e-3 (3D) for vertex centering, values and gradients, about 6e-5 for
+      the values alone, which is the full plane's own lack of covariance
+      (amended under [Point interpolation](#point-interpolation)).
+      `vars = [3, 2]` returns the same numbers bit for bit. Float32: the
+      turned identity holds bit for bit there too, an `exclude` region
+      flags a turned point as its preimage, and the values are within
+      7.9e-6 of Float64's. Deliberately contracting an odd turn with the
+      unexchanged derivatives puts the polynomial comparison off by 3.4.
+    - *The ordinary path* (`bench/interpolate.jl`, laptop, Julia 1.13.1,
+      defaults, two runs each against the 0.1.6 release): unchanged
+      within the noise — at one thread 783–859 ns per point against
+      799–919, at four 217–306 against 226–465, `locate_point` 96 ns
+      against 93–97 — with 64 bytes more per batch (128 at four
+      threads), the two new kernel arguments. The first version of the
+      fold reassigned two tuples that its closures captured, which boxed
+      them: 930 bytes allocated per point and 1.6x the time, on every
+      forest. On a rotating quadrant (2D and 3D, `N = 16`, vertex,
+      value and gradient, 49600 points) a batch allocates what an
+      ordinary one does, and points spread over the whole plane, three
+      quarters of them turned, cost 94 ns per point in 2D and 559 in 3D
+      at one thread, against 75 and 455 for points inside the quadrant.
+    - *Tests*, in `test/rotate_tests.jl`: the turned field in `D = 2` and
+      3 (`turn_matrix`, `turned_values`, `complex_step`), Float32 with a
+      region, and the asymmetric set's refusal, the outside points with
+      the seam named, and `locate_point` beyond the seam. The file holds
+      1388 tests (1334 after step 4) and runs in 60–84 s at one thread
+      and 53–60 s at four. The suite, run once for steps 4 and 5
+      together: 112006 tests at one thread in 8m27 (`Pkg.test`; 111710
+      in 6m51 after step 3, on a machine less loaded), every one
+      passing; the docs build, doctests included.
   - **Step 6 — checkpoint.**
   - **Step 7 — MPI.** The pack and unpack, and the workloads.
   - **Step 8 — threads and device.**
