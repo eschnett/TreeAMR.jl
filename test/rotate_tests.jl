@@ -1,4 +1,6 @@
-# M12: a rotating seam, the forest (step 1).
+# M12: a rotating seam — the forest (step 1), the turned ghosts (steps
+# 2–3), regrid and conservation (step 4), interpolation (step 5), and the
+# wave equation on a quadrant against the full plane (step 8).
 #
 # Only one quadrant of the plane is stored, and the low face of `d1` is
 # glued to the low face of `d2` by a quarter turn. The tree sees the
@@ -1109,4 +1111,273 @@ end
     fs = FieldSet(forest, 1; G=2, rotation=(1,))
     @test_throws "is outside the domain" interpolate(fs, [(-2.5, 0.5)], Lagrange(2))
     @test locate_point(forest, (-2.5, 0.5)) === nothing
+end
+
+# --- M12 step 8: the wave equation on a quadrant ------------------------------
+#
+# The acceptance test of the whole seam: a quadrant evolved through many
+# fills must stay the quarter of the full plane it stands for. The scalar
+# wave and a two-component vector wave (each Cartesian component of a
+# covariant vector field obeys the wave equation, and the turn mixes
+# them) are evolved on the quadrant of `quadrant_and_full` and on the
+# full plane it folds, with the same refinement, the same steps and the
+# exact solution in the hook on the outer faces of both.
+#
+# The exact solution is a sum of the four turns of one standing mode `f`,
+# an eigenfunction of the Laplacian that has no symmetry of its own,
+# so the sum is invariant under the quarter turn and under no mirror.
+# It is summed as `(t₀ + t₂) + (t₁ + t₃)`, `t_r = f(Rʳp)`: at `Rp` the
+# terms come round as `(t₁ + t₃) + (t₂ + t₀)`, which floating-point
+# addition, being commutative, makes the same bits, so the data is
+# invariant bit for bit, not only to roundoff. The vector is its
+# gradient, `∇φ(p) = Σ R⁻ʳ ∇f(Rʳp)`, summed the same way, and covariant
+# bit for bit for the same reason. That is what lets the vertex-centered
+# seam planes, which the quadrant owns twice, start out equal.
+
+const ROTWAVE_α, ROTWAVE_β = π / 2, 3π / 4
+const ROTWAVE_ω = sqrt(ROTWAVE_α^2 + ROTWAVE_β^2)
+
+# `R^r (a, b)`, `R(a, b) = (−b, a)`: exact, signs and swaps only.
+function rotwave_turn((a, b), r::Int)
+    for _ in 1:mod(r, 4)
+        a, b = -b, a
+    end
+    return a, b
+end
+
+rotwave_f((a, b)) = cos(ROTWAVE_α * a + 0.3) * cos(ROTWAVE_β * b + 0.7)
+rotwave_∇f((a, b)) = (-ROTWAVE_α * sin(ROTWAVE_α * a + 0.3) * cos(ROTWAVE_β * b + 0.7),
+                      -ROTWAVE_β * cos(ROTWAVE_α * a + 0.3) * sin(ROTWAVE_β * b + 0.7))
+
+function rotwave_phi(p)
+    t = ntuple(r -> rotwave_f(rotwave_turn(p, r - 1)), 4)
+    return (t[1] + t[3]) + (t[2] + t[4])
+end
+
+function rotwave_gradient(p)
+    w = ntuple(r -> rotwave_turn(rotwave_∇f(rotwave_turn(p, r - 1)), -(r - 1)), 4)
+    return ntuple(e -> (w[1][e] + w[3][e]) + (w[2][e] + w[4][e]), 2)
+end
+
+"""
+The exact standing wave at time `t` as `(x, v) -> value`: with `K = 1`
+the scalar `(u, ∂ₜu)`, with `K = 2` the vector `(v_{d1}, v_{d2}, ∂ₜv_{d1},
+∂ₜv_{d2})` in the coordinates about the axis, `(a, b) = (x_{d1}, x_{d2})`.
+"""
+function rotwave_exact(K::Int, (d1, d2), t)
+    c, s = cos(ROTWAVE_ω * t), -ROTWAVE_ω * sin(ROTWAVE_ω * t)
+    return function (x, v)
+        p = (x[d1], x[d2])
+        k = v > K ? v - K : v
+        value = K == 1 ? rotwave_phi(p) : rotwave_gradient(p)[k]
+        return (v > K ? s : c) * value
+    end
+end
+
+"""
+The rotation map of the wave's state: the scalar's `(1, 2)`, or the
+vector's from `vector_rotation` (the oracle's, written from `v(Rp) =
+Rv(p)`), its components numbered from 1, then the same for `∂ₜv`.
+"""
+function rotwave_rotation(K::Int, rotating)
+    K == 1 && return [1, 2]
+    m = [sign(q) * (abs(q) - 1) for q in vector_rotation(2, rotating)[2:end]]
+    return [m; [sign(q) * (abs(q) + 2) for q in m]]
+end
+
+# The Laplacian of each of `K` components with the two neighbours added
+# first, `(u₊ + u₋) − 2u₀`, so that a point and its image under the turn,
+# whose neighbours are each other's in the other order, compute the same
+# bits; `wave_rhs_kernel!` subtracts first, which only roundoff tells
+# apart.
+@kernel function rotwave_kernel!(du, @Const(work), @Const(spacings), ::Val{D},
+                                 ::Val{G}, ::Val{K}) where {D,G,K}
+    I = @index(Global, NTuple)
+    b = I[D + 1]
+    inner = ntuple(d -> I[d], Val(D))
+    c = ntuple(d -> I[d] + G[d], Val(D))
+    h = spacings[b]
+    for k in 1:K
+        u0 = work[c..., k, b]
+        lap = zero(eltype(du))
+        for d in 1:D
+            up = Base.setindex(c, c[d] + 1, d)
+            um = Base.setindex(c, c[d] - 1, d)
+            lap += (work[up..., k, b] + work[um..., k, b]) - 2 * u0
+        end
+        du[inner..., k, b] = work[c..., K + k, b]
+        du[inner..., K + k, b] = lap / (h * h)
+    end
+end
+
+function rotwave_rhs!(du, u, p, t)
+    scatter!(p.fs, u)
+    fill_ghosts!(p.fs, p.schedule;
+                 boundary=boundary_by_coordinates(rotwave_exact(p.K, p.rotating, t)))
+    map_blocks!(rotwave_kernel!, p.fs, statearray(du, p.fs), p.fs.work, p.spacings,
+                Val(2), p.valG, Val(p.K))
+    return nothing
+end
+
+"""
+Evolve the standing wave with `K` components on the quadrant of
+`quadrant_and_full(Val(2); rotating)` or, with `full = true`, on the full
+plane, by fixed-step RK4 to a quarter period, and return the errors
+against the exact solution, the step count, and the field set holding
+the final state with its ghosts filled.
+"""
+function rotating_wave(; N, C, K, rotating=(1, 2), full::Bool, p=4, cfl=0.25,
+                       periods=0.25)
+    quad, plane = quadrant_and_full(Val(2); rotating=rotating, other=:periodic, N=N)
+    forest = full ? plane : quad
+    G = ghosts_for(C, p)
+    rotation = full ? nothing : rotwave_rotation(K, rotating)
+    fs = FieldSet(forest, 2K; G=G, centering=C, rotation=rotation)
+    schedule = GhostSchedule(fs, Operators(prolongation=p, restriction=p))
+    problem = (; fs, schedule, K, rotating, valG=Val(G),
+               spacings=block_spacings(forest, Float64))
+    fill_by_coordinates!(rotwave_exact(K, rotating, 0.0), fs)
+    u0 = statevector(fs)
+    gather!(u0, fs)
+    h = minimum_spacing(forest)
+    t_end = periods * 2π / ROTWAVE_ω
+    nsteps = ceil(Int, t_end / (cfl * h))
+    prob = ODEProblem(rotwave_rhs!, u0, (0.0, t_end), problem)
+    sol = solve(prob, RK4(); dt=t_end / nsteps, adaptive=false, save_everystep=false)
+    exact = FieldSet(forest, 2K; G=G, centering=C, rotation=rotation)
+    fill_by_coordinates!(rotwave_exact(K, rotating, t_end), exact)
+    uexact = statevector(exact)
+    gather!(uexact, exact)
+    err = sol.u[end] .- uexact
+    scatter!(fs, sol.u[end])
+    fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(rotwave_exact(K, rotating,
+                                                                                t_end)))
+    return (l2=volume_weighted_norm(fs, err), linf=volume_weighted_norm(fs, err; p=Inf),
+            h=h, nsteps=nsteps, nblocks=nleaves(forest), fs=fs)
+end
+
+"""
+The worst difference between the vertex-centered quadrant's two owned
+seam planes, the points `(0, s)` on the low face of `d1` and `(s, 0)` on
+the low face of `d2`, which are one point under the turn: the first must
+be the second's values through the signed map. Returns `(worst, npairs)`,
+`worst` compared with `==` semantics; the axis itself is skipped.
+"""
+function seam_plane_mismatch(fs::FieldSet{T,2}) where {T}
+    d1, d2 = rotating_dims(fs.forest)
+    planes = (Dict{T,Vector{T}}(), Dict{T,Vector{T}}())
+    for b in 1:nblocks(fs), (side, d, e) in ((1, d1, d2), (2, d2, d1))
+        block_extent(fs.forest, blockkey(fs, b))[d][1] == 0 || continue
+        for j in 1:(fs.forest.N)
+            idx = (0, 0)
+            idx = Base.setindex(idx, fs.G[d] + 1, d)
+            idx = Base.setindex(idx, fs.G[e] + j, e)
+            s = coordinates(fs, b, idx)[e]
+            s == 0 && continue
+            planes[side][s] = fs.work[idx..., :, b]
+        end
+    end
+    @assert sort!(collect(keys(planes[1]))) == sort!(collect(keys(planes[2])))
+    worst = 0.0
+    for (s, here) in planes[1]
+        there = planes[2][s]
+        for v in eachindex(here)
+            q = fs.rotation[v]
+            turned = sign(q) * there[abs(q)]
+            worst = here[v] == turned ? worst : max(worst, abs(here[v] - turned))
+        end
+    end
+    return worst, length(planes[1])
+end
+
+"""
+How far the full plane's own solution is from covariant: the worst
+difference, over its owned points `p` in the quadrant `x_{d1}, x_{d2} ≥ 0`
+and each turn `r = 1, 2, 3`, between its values at `Rʳp`, where those are
+owned too, and its values at `p` turned by the signed map `rotation`.
+"""
+function turned_defect(fs::FieldSet{T,2}, rotation) where {T}
+    d1, d2 = 1, 2
+    owned = Dict{NTuple{2,T},Vector{T}}()
+    for b in 1:nblocks(fs)
+        for i in CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), 2))
+            owned[coordinates(fs, b, Tuple(i))] = fs.work[i, :, b]
+        end
+    end
+    worst = 0.0
+    for (p, u) in owned, r in 1:3
+        (p[d1] >= 0 && p[d2] >= 0) || continue
+        there = get(owned, rotwave_turn(p, r), nothing)
+        there === nothing && continue
+        for _ in 1:r
+            u = [sign(q) * u[abs(q)] for q in rotation]
+        end
+        worst = max(worst, maximum(abs.(there .- u)))
+    end
+    return worst
+end
+
+@testset "The wave on a quadrant evolves as the full plane it folds: K=$K" for K in (1, 2)
+    # Many fills compound whatever one fill gets wrong: a wrong turn of
+    # the ghosts, of the vector's components or of their signs, or a
+    # seam treated as an outer face, makes the quadrant's solution drift
+    # from the full plane's. Cell-centered the quadrant owns exactly the
+    # full plane's points in its quarter and the two agree to roundoff at
+    # every stored point. Vertex-centered they cannot: the full plane is
+    # not covariant itself, because which side owns the shared plane of a
+    # coarse-fine face (the block above it) is not turned with the mesh,
+    # so a face whose plane the coarse block evolves becomes, a half turn
+    # away, one whose plane the fine block evolves. The quadrant, which
+    # is covariant by construction, must then lie within the full plane's
+    # own defect of it; and it owns the two seam planes twice, as the
+    # same points, and must keep them equal.
+    rotation = rotwave_rotation(K, (1, 2))
+    for C in (cellcentered(2), vertexcentered(2))
+        full = rotating_wave(; N=16, C=C, K=K, full=true)
+        quad = rotating_wave(; N=16, C=C, K=K, full=false)
+        @test quad.nsteps == full.nsteps
+        @test 4 * quad.nblocks == full.nblocks
+        @test quad.linf ≈ full.linf rtol = 1e-8
+        worst, npoints = compare_matching_blocks(quad.fs, full.fs)
+        defect = turned_defect(full.fs, rotation)
+        @test npoints > 0
+        line = "wave on a quadrant, K=$K, $(C[1]): $(quad.nsteps) steps, " *
+               "linf $(quad.linf) against $(full.linf), every stored point within " *
+               "$worst, the full plane covariant to $defect"
+        if C == cellcentered(2)
+            @test worst < 1e-12
+            @test defect < 1e-12
+        else
+            @test 0 < worst < defect < 1e-2
+            seam, npairs = seam_plane_mismatch(quad.fs)
+            @test npairs > 0
+            @test seam == 0
+            line *= ", seam planes $seam apart over $npairs pairs"
+        end
+        println(line)
+    end
+end
+
+@testset "The wave on a quadrant converges at the interface-order rate" begin
+    # Order-4 operators against the 2nd-order Laplacian: rate 2, as on
+    # the periodic box and the reflecting half box. The turned ghosts are
+    # copies and the prolongations and restrictions next to the seam the
+    # ordinary ones read in the virtual frame, so the seam may cost
+    # nothing; an inconsistency there (a ghost off by one point, a
+    # half-turned edge) shows as a rate below 2 long before a single fill
+    # looks wrong.
+    for C in (cellcentered(2), vertexcentered(2)), K in (1, 2)
+        hs, l2, linf = Float64[], Float64[], Float64[]
+        for N in (8, 16, 32)
+            r = rotating_wave(; N=N, C=C, K=K, full=false)
+            push!(hs, r.h)
+            push!(l2, r.l2)
+            push!(linf, r.linf)
+        end
+        rl2, rlinf = convergence_rate(hs, l2), convergence_rate(hs, linf)
+        @test rl2 ≈ 2.0 atol = 0.15
+        @test rlinf ≈ 2.0 atol = 0.2
+        println("wave on a quadrant, K=$K, $(C[1]): rates $rl2 (l2), $rlinf (linf); " *
+                "l2 $l2")
+    end
 end
