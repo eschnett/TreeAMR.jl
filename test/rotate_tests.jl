@@ -45,15 +45,7 @@ using TreeAMR: oriented_neighbors, virtual_offset, real_direction, rotating_dims
     @test Forest((2, 2); N=4, rotating=(1, 2),
                  extents=((0.0f0, 1.0f0), (0.0f0, 1.0f0))).rotating == (1, 2)
 
-    # Until the checkpoint learns the orientation, it refuses the seam
-    # rather than write a file that would load without it. (The ghost
-    # schedule learned it in step 3, the interface schedule in step 4 and
-    # the interpolation in step 5.)
     forest = Forest((2, 2); N=8, rotating=(1, 2))
-    mktempdir() do dir
-        @test_throws "save_checkpoint over a rotating forest" save_checkpoint(
-            joinpath(dir, "c.h5"), forest; fieldsets=())
-    end
 
     # The digest's brick tells a seam from none, so ranks that disagree
     # about it are refused.

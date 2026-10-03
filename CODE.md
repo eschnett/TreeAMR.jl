@@ -2140,7 +2140,14 @@ forest through the checked `leaves` path, which refuses a leaf list that
 is not conforming at the seam, and the field set through its
 constructor, which refuses a map that is not a valid rotation. A
 `RotationPair` is not saved: like the operators, it is the application's
-input, rebuilt from the two loaded sets.
+input, rebuilt from the two loaded sets. *(Amended in step 6,
+2026-10-03: the attribute and the feature go together, and a file with
+one and not the other — which no TreeAMR writes — is refused as
+damaged, rather than read with the seam or without it. The pair is
+`Int64[2]`, checked by the forest's constructor as a caller's would be;
+a map is checked for its length here and as a map by the field set's.
+The map joins what the ranks agree on about a field set before a save,
+beside the parity.)*
 
 **Element types** (decided).
 
@@ -8035,7 +8042,42 @@ being done now, so it comes before M9b, which follows it.
       together: 112006 tests at one thread in 8m27 (`Pkg.test`; 111710
       in 6m51 after step 3, on a machine less loaded), every one
       passing; the docs build, doctests included.
-  - **Step 6 — checkpoint.**
+  - **Step 6 — checkpoint.** *(Done, 2026-10-03.)*
+    - *What was built.* The step-1 refusal in `save_checkpoint` is gone,
+      and with it the last caller of `refuse_rotating`, which went too.
+      A forest with a seam writes `rotating`, `Int64[d1, d2]`, in
+      `forest/`, and the file lists `features = ["brick", "rotating"]`;
+      one without writes neither and lists `["brick"]`, as before M12,
+      so that every file an unrotated run writes is still readable by
+      0.1.6. The reader knows both features (`FEATURES`) and builds the
+      forest with `rotating` through the checked `leaves` path. A field
+      set with a map writes `rotation`, `Int64[nvars]`, in its group,
+      read back into the constructor; the map is part of the save's
+      agreed layout (`set_layout`). Both attributes are read only where
+      present, so the version-1 fixtures and every version-2 file of
+      0.1.6 load as before (amended under
+      [Checkpoint and restart](#checkpoint-and-restart)).
+    - *Measured.* A quadrant with a symmetric vertex-centered set and
+      a face-centered `RotationPair`, in 2D in `Float32x2` (polynomial
+      data, which has no `sin`) and in 3D in `Float64` with a reflecting
+      low face, round-trips bit for bit: the forest's pair, every set's
+      map, `rotvars` and factor table, the state, and the working arrays
+      after the same fill, the pair's through a pair rebuilt from the
+      loaded sets. A quadrant wave — a ring about the axis, vertex-
+      centered, refined where it is large, with a pair riding through
+      every regrid as a pair — runs four chunks through 136, 142, 148,
+      160 and 178 leaves, 25 to 29 refined blocks on the seam faces, and
+      a restart after the second continues byte for byte, the wave and
+      both members of the pair. The file without its feature, without
+      its seam, with an unknown feature, with a pair out of range or not
+      a pair, with a map that is not a signed permutation, of the wrong
+      length, or missing, is refused with the reason each time.
+    - *Tests*, in `test/checkpoint_tests.jl`, after the restarts: the
+      round trip (`rotating_checkpoint_sets`), the restart
+      (`quadrant_start`, `quadrant_chunk`, `quadrant_restore`, through
+      `interrupted`), and the refusals; the step-1 refusal's test in
+      `rotate_tests.jl` is gone. The file holds 658 tests (593 before)
+      and runs in 77 s alone, the four new testsets about 10 s of it.
   - **Step 7 — MPI.** The pack and unpack, and the workloads.
   - **Step 8 — threads and device.**
   - **Step 9 — measurements**, as listed above.

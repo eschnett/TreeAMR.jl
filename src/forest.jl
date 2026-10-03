@@ -273,28 +273,6 @@ hasrotating(forest::Forest) = forest.rotating[1] != 0
 rotating_dims(forest::Forest) =
     hasrotating(forest) ? (Int(forest.rotating[1]), Int(forest.rotating[2])) : nothing
 
-# M12 is built in steps (CODE.md, the M12 entry under "Milestones"). From
-# step 1 on the neighbor search finds the real leaves across a rotating
-# seam, but what reads from them learns their orientation only in later
-# steps — the ghost schedule in step 3 — and until then each such reader
-# refuses a rotating forest, rather than read across the seam as though
-# it were an ordinary face. It takes the forest or its `rotating_dims`: a
-# build's argument checks run in a closure (`collective_checks`), and one
-# that captures the forest copies it — `GhostSchedule`'s allocated 240
-# bytes more in `bench/ghosts.jl` when it refused this way.
-refuse_rotating(forest::Forest, what::AbstractString) =
-    refuse_rotating(rotating_dims(forest), what)
-refuse_rotating(::Nothing, ::AbstractString) = nothing
-function refuse_rotating(rotating::NTuple{2,Int}, what::AbstractString)
-    throw(ArgumentError(
-        "$what over a rotating forest (rotating = $rotating) is not " *
-        "implemented yet in this step of M12: the forest finds the real leaves " *
-        "across the seam, but $what does not yet turn what it reads from them — " *
-        "their axes and their variables — into the frame of the block that reads, " *
-        "and would deliver wrong data without noticing. See the M12 entry in " *
-        "CODE.md for the steps that add it."))
-end
-
 # Validate a caller's leaf list (the `leaves` keyword), already copied
 # into the candidate `forest`. The storage, the ghost schedule and the
 # regrid all trust `forest.leaves` without looking at it again — that is
