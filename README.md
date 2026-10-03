@@ -9,18 +9,22 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 
 See [CODE.md](CODE.md) for the full design document and the milestone
 roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M7** (after M8's every
+The package is currently at milestone **M12** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
-interpolation to arbitrary points, M9a's checkpoint and restart, and
-M7's distribution over MPI). M7 is done, and measured on a cluster:
-weak scaling to four nodes, the distributed run on CUDA GPUs with and
-without a CUDA-aware MPI, and checkpoints. A first checkpoint, one
-shared file written through MPI-IO, lost data between nodes on the
+interpolation to arbitrary points, M9a's checkpoint and restart, M7's
+distribution over MPI, and M12's rotating symmetry). M7 is measured on a
+cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
+with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
+one shared file written through MPI-IO, lost data between nodes on the
 cluster's BeeGFS, so a distributed checkpoint is now an index and one
 part file per I/O process, none written or opened by more than one
 process, and every checkpoint carries checksums that a load verifies;
-a thousand verified saves on four nodes lost nothing.
+a thousand verified saves on four nodes lost nothing. M12 stores one
+quadrant of a plane and fills the ghosts across its seam as the turned
+image of the data, vector components mixed as each field set declares,
+for a spinning object that no mirror maps onto itself; with a
+reflecting face below `z = 0` it stores an octant.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
@@ -43,7 +47,10 @@ sorted vector of Morton keys, so neighbour finding is just arithmetic
 on keys rather than pointer chasing, and periodic directions are built
 into that arithmetic. Reflecting faces (symmetry planes, solid walls)
 are declared on the domain too, with an even or odd parity per
-variable, and the ghost exchange fills them itself. Other physical
+variable, and the ghost exchange fills them itself; so is a rotating
+symmetry, a quadrant whose two low faces are glued to each other by a
+quarter turn, with a signed map per field set saying how a vector's
+components turn. Other physical
 boundaries need to go through a per-cell hook that the application
 needs to define. The dimension `D`
 is a type parameter, and the same code runs in 1D, 2D, and 3D, and the
