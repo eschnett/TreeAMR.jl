@@ -172,6 +172,26 @@ every dimension or an `NTuple{D,Parity}`; every dimension with a
 reflecting face needs `EvenParity` or `OddParity`. Over a forest without
 reflecting faces it may be omitted, and is ignored if given.
 
+`rotation` says how the variables turn under the quarter turn `R` of a
+rotating seam, and is **required** when the forest has one (M12; see
+[`Forest`](@ref)'s `rotating`), for the reason `parity` is: it is
+physics. It is a signed map with one nonzero integer per variable:
+variable `v` at `Rp` equals `sign(rotation[v])` times variable
+`abs(rotation[v])` at `p` of the set it rotates *from*. That is the set
+itself when its layout is symmetric under exchanging the seam's two
+dimensions `(d1, d2)` — equal `G` and equal centering along both, as for
+a cell- or vertex-centered set — and its partner in a
+[`RotationPair`](@ref) otherwise. For `(ρ, vx, vy, vz)` with
+`rotating = (1, 2)` it is `rotation = (1, -3, 2, 4)`: the turned velocity
+has `vx′ = −vy` and `vy′ = vx`. A 90° turn sends every Cartesian tensor
+component to plus or minus another one, so a signed map covers any
+variable stored in Cartesian components. Refused, with the reason: a map
+that is not a signed permutation of `1:nvars`; for a symmetric set, one
+whose fourth power is not the identity; and one that sends a variable to
+another of a different parity in a reflecting dimension. Over a forest
+without a seam it may be omitted, and if given is checked for its shape
+and otherwise ignored, as `parity` is.
+
 A field set is tied to the forest's *current* leaf array. Block indices
 are deliberately not stable across regridding (M4), which compacts the
 block slots and rebuilds the storage.
@@ -184,6 +204,8 @@ block slots and rebuilds the storage.
              parity = [EvenParity, (OddParity, EvenParity, EvenParity),
                        (EvenParity, OddParity, EvenParity),
                        (EvenParity, EvenParity, OddParity)])
+    FieldSet(quadrant, 4; G = 2,        # the same, on a rotating forest
+             rotation = (1, -3, 2, 4))
 
 # Examples
 
@@ -209,13 +231,23 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const G::NTuple{D,Int}
     const centering::NTuple{D,Symbol}
     const parity::Union{Nothing,Vector{NTuple{D,Parity}}}
-    # The per-variable factor each mirrored transfer multiplies by,
-    # `factors[v, col]` over the `3^D` mirror states of a transfer
-    # group, on the storage's backend (see `parityfactors`). `nothing`
-    # over a forest without reflecting faces. It lives here rather than
+    # The signed variable map of a rotating seam (M12), as checked by
+    # `rotations_of`; `nothing` when none was given.
+    const rotation::Union{Nothing,Vector{Int}}
+    # The per-variable factor each mirrored or rotated transfer
+    # multiplies by, `factors[v, col]`, on the storage's backend: the
+    # `3^D` mirror states of a transfer group (see `parityfactors`), and
+    # over a rotating forest those `3^D` columns once per orientation
+    # `r = 0…3`, column `mirror column + 3^D·r`, each times the sign of
+    # the turned variable (see `seamtables`). `nothing` over a forest
+    # with neither reflecting faces nor a seam. It lives here rather than
     # in the schedule because parity belongs to the variables, while a
     # schedule belongs to a layout and serves every field set of it.
     const factors::Union{Nothing,AbstractMatrix{T}}
+    # The variable a rotated transfer reads for each target variable,
+    # `rotvars[v, r + 1]` (M12; see `seamtables`), as `Int32` on the
+    # storage's backend; `nothing` over a forest without a seam.
+    const rotvars::Union{Nothing,AbstractMatrix{Int32}}
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
@@ -230,7 +262,7 @@ end
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D),
-                     parity=nothing,
+                     parity=nothing, rotation=nothing,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
     G === nothing && throw(ArgumentError(
@@ -243,14 +275,27 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     centers = centerings(centering, Val(D))
     stored = storedsize(forest.N, ghosts, staggers(centers))
     parities = parities_of(parity, forest, Int(nvars))
-    factors = hasreflecting(forest) ?
-              todevice(backend, parityfactors(T, parities, Val(D))) : nothing
+    rotations = rotations_of(rotation, forest, Int(nvars), ghosts, staggers(centers),
+                             parities)
+    factors, rotvars = if hasrotating(forest)
+        # A symmetric set turns into itself, so every orientation applies
+        # its own map; an asymmetric one turns into its partner, whose
+        # map it does not know (see `seamtables`).
+        steps = symmetric_layout(forest, ghosts, staggers(centers)) ?
+                (rotations, rotations, rotations) : nothing
+        f, v = seamtables(T, parities, steps, Int(nvars), Val(D))
+        todevice(backend, f), todevice(backend, v)
+    elseif hasreflecting(forest)
+        todevice(backend, parityfactors(T, parities, Val(D))), nothing
+    else
+        nothing, nothing
+    end
     work = allocate(backend, T, (stored..., Int(nvars), length(blockrange(forest))))
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, parities,
-                                        factors, work)
+                                        rotations, factors, rotvars, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
@@ -320,6 +365,249 @@ end
 # The factor-table column of a mirror state (see `parityfactors`).
 mirrorcolumn(state::NTuple{D,<:Integer}) where {D} =
     1 + sum(Int(state[d]) * 3^(d - 1) for d in 1:D)
+
+# --- Rotating seams (M12) ----------------------------------------------------
+#
+# A ghost region beyond a rotating seam lies in the image `R^r` of real
+# data, and since `u(R^r q) = Q^r u(q)` its values are the composed
+# signed map `Q^r` applied to the data at `R^{-r} p` (CODE.md, "Rotating
+# seams"). A signed map splits into a permutation, which the transfer
+# kernel applies on the source load through `rotvars`, and a sign, which
+# it applies on the target through the factor table, where it applies a
+# parity: the same two places, so a rotated transfer that is also
+# mirrored multiplies one factor.
+
+# Whether a layout turns into itself under the quarter turn: equal ghost
+# widths and equal staggers along the seam's two dimensions. Such a set
+# rotates from itself; any other from its partner.
+function symmetric_layout(forest::Forest, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    d1, d2 = rotating_dims(forest)
+    return G[d1] == G[d2] && c[d1] == c[d2]
+end
+symmetric_layout(fs::FieldSet) = symmetric_layout(fs.forest, fs.G, staggers(fs))
+
+# Validate a user-supplied `rotation` into a `Vector{Int}`, the signed
+# map one quarter turn applies, against the forest's seam. Shape is
+# checked on any forest, as `parity`'s is; the rest needs the seam, and
+# the fourth-power and parity checks need the set the map reads from,
+# which is the set itself only for a symmetric layout. A pair's are made
+# by `RotationPair`.
+function rotations_of(rotation, forest::Forest{D}, nvars::Int, G::NTuple{D,Int},
+                      c::NTuple{D,Int}, parities) where {D}
+    if rotation === nothing
+        hasrotating(forest) && throw(ArgumentError(
+            "this forest has a rotating seam, rotating = $(rotating_dims(forest)), so " *
+            "the field set needs `rotation`: one signed variable index per variable, " *
+            "saying which variable, and with which sign, each one equals a quarter " *
+            "turn away. How a variable turns — a scalar into itself, the x component " *
+            "of a vector into minus its y component — is physics, which the mesh " *
+            "cannot know."))
+        return nothing
+    end
+    (rotation isa AbstractVector || rotation isa Tuple) || throw(ArgumentError(
+        "rotation must be a vector or tuple with one signed variable index per " *
+        "variable, got a $(typeof(rotation))"))
+    length(rotation) == nvars || throw(ArgumentError(
+        "rotation must have one entry per variable: got $(length(rotation)) for " *
+        "nvars = $nvars"))
+    q = map(collect(rotation)) do x
+        x isa Integer || throw(ArgumentError(
+            "each rotation entry must be a nonzero integer, a signed variable index; " *
+            "got $(repr(x))"))
+        return Int(x)
+    end
+    sort!(abs.(q)) == 1:nvars || throw(ArgumentError(
+        "rotation = $(Tuple(q)) is not a signed permutation of 1:$nvars: a quarter " *
+        "turn sends each variable to plus or minus exactly one variable, so the " *
+        "absolute values must name every variable once, and none may be zero"))
+    hasrotating(forest) || return q
+    if symmetric_layout(forest, G, c)
+        steps = (q, q, q, q)
+        σ, s = composed_rotation(steps, nvars)
+        all(v -> σ[v] == v && s[v] == 1, 1:nvars) || throw(ArgumentError(
+            "rotation = $(Tuple(q)) turned four times is not the identity: four " *
+            "quarter turns are no turn at all, so applying the map four times must " *
+            "return every variable to itself with its sign. (This set's layout is " *
+            "symmetric in the seam's dimensions $(rotating_dims(forest)), so it " *
+            "turns into itself.)"))
+        check_rotation_parity(forest, parities, parities, q, "rotation")
+    end
+    return q
+end
+
+# Compose a sequence of signed maps, one per quarter turn: after the
+# steps, target variable `v` reads variable `σ[v]` of the set the last
+# step reads from, times `s[v]`. A step reads the next set's variable
+# `abs(q[v])` with the sign of `q[v]`, so `σ_r = σ_{r−1}` followed by step
+# `r`, and the sign is the product along the way.
+function composed_rotation(steps, nvars::Int)
+    σ = collect(1:nvars)
+    s = ones(Int, nvars)
+    for q in steps, v in 1:nvars
+        x = q[σ[v]]
+        s[v] *= sign(x)
+        σ[v] = abs(x)
+    end
+    return σ, s
+end
+
+# A variable and its image must have one parity in every dimension with
+# a reflecting face, which lies outside the seam's plane: the rotation
+# and the mirror commute, so the two declarations must agree, or a ghost
+# that is both turned and mirrored would depend on which came first.
+function check_rotation_parity(forest::Forest{D}, target, source, q::Vector{Int},
+                               what::AbstractString) where {D}
+    (target === nothing || source === nothing) && return nothing
+    for v in eachindex(q), d in 1:D
+        any(forest.reflecting[d]) || continue
+        w = abs(q[v])
+        target[v][d] == source[w][d] || throw(ArgumentError(
+            "$what sends variable $v to variable $w, but in dimension $d, which has a " *
+            "reflecting face, the first has $(target[v][d]) and the second " *
+            "$(source[w][d]). The rotation and the mirror commute, so a variable and " *
+            "its image under the quarter turn must have the same parity there."))
+    end
+    return nothing
+end
+
+# The factor and variable tables of the rotated transfers that fill one
+# set's ghosts. `steps` holds the signed maps of the first three quarter
+# turns, the set's own three times for a symmetric layout and alternating
+# with its partner's for a pair; then `rotvars[v, r + 1]` is the variable
+# `Q^r` reads for target `v`, and the factor at column `mirror column +
+# 3^D·r` is the target variable's parity factor for that mirror state
+# (see `parityfactors`; 1 without reflecting faces) times the sign of
+# `Q^r`. `r = 0` is the identity, so the first `3^D` columns are the
+# parity table as it was. Each entry is formed in integers and converted
+# once, so a zero is `+0` whatever the sign.
+#
+# An asymmetric set alone, `steps = nothing`, cannot turn into itself:
+# its seam ghosts come from its partner, through the tables
+# `RotationPair` builds. Its own tables hold the `r = 0` columns only,
+# with zero factors and the identity map for `r ≥ 1`, which no fill
+# reads — a schedule that has such transfers is refused for it alone.
+function seamtables(::Type{T}, parities, steps, nvars::Int, ::Val{D}) where {T,D}
+    nstates = 3^D
+    factors = Matrix{T}(undef, nvars, 4 * nstates)
+    rotvars = Matrix{Int32}(undef, nvars, 4)
+    for r in 0:3
+        σ, s = r == 0 ? (collect(1:nvars), ones(Int, nvars)) :
+               steps === nothing ? (collect(1:nvars), zeros(Int, nvars)) :
+               composed_rotation(steps[1:r], nvars)
+        rotvars[:, r + 1] .= σ
+        for v in 1:nvars, col in 1:nstates
+            f = 1
+            for d in 1:D
+                parities === nothing && break
+                state = ((col - 1) ÷ 3^(d - 1)) % 3
+                σd = parities[v][d] === OddParity ? -1 : 1
+                f *= state == 0 ? 1 : state == 1 ? σd : (1 + σd) ÷ 2
+            end
+            factors[v, col + nstates * r] = T(f * s[v])
+        end
+    end
+    return factors, rotvars
+end
+
+"""
+    RotationPair(a::FieldSet, b::FieldSet)
+
+Two field sets over one forest with a rotating seam (M12; see
+[`Forest`](@ref)'s `rotating`), each of which turns into the other: the
+case of a set whose layout is not symmetric under exchanging the seam's
+two dimensions `(d1, d2)`. `B_x`, face-centered along `x`, is `−B_y`
+across the low face of `x`, so `B_x`'s ghosts there come from `B_y`'s
+data, and the other way round.
+
+The two sets must have each other's layout with `d1` and `d2` exchanged
+— ghost widths and centering — and the same number of variables,
+element type and backend. Each declares, with [`FieldSet`](@ref)'s
+`rotation`, how its variables turn into the *other* set's: for
+`a = (B_x,)` and `b = (B_y,)` with `rotating = (1, 2)`,
+`rotation = (-1,)` on `a` and `(1,)` on `b`. Four quarter turns are the
+identity, so the maps must compose to it, `Q_a Q_b Q_a Q_b = I`; a
+mismatched pair, or one whose maps do not, is refused with the reason.
+A set whose layout is symmetric turns into itself and is never part of
+a pair.
+
+The pair holds the tables the rotated transfers of each set read: for
+`a`'s targets the maps `Q_a`, `Q_a Q_b` and `Q_a Q_b Q_a` for one, two
+and three quarter turns, the first and the last reading `b` and the
+middle one `a` itself, since two quarter turns map a layout onto itself;
+and symmetrically for `b`. It is an immutable value: [`regrid!`](@ref)
+replaces each set's storage in place, so a pair stays valid across
+regrids.
+
+Fill it with [`fill_ghosts!`](@ref)`(pair, (schedule_a, schedule_b))`;
+each set keeps its own [`GhostSchedule`](@ref). A set whose ghost widths
+are zero in both dimensions of the plane, as a flux's are, has no ghost
+across the seam at all and needs no partner.
+
+    a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),
+                 rotation = (-1,))                       # B_x
+    b = FieldSet(quadrant, 1; G = (2, 1), centering = facecentered(2, 2),
+                 rotation = (1,))                        # B_y
+    pair = RotationPair(a, b)
+    fill_ghosts!(pair, (GhostSchedule(a, ops), GhostSchedule(b, ops)))
+"""
+struct RotationPair{FA<:FieldSet,FB<:FieldSet,MF<:AbstractMatrix,MV<:AbstractMatrix{Int32}}
+    a::FA
+    b::FB
+    # The tables of `a`'s targets and of `b`'s, as `FieldSet`'s `factors`
+    # and `rotvars` are for a symmetric set (see `seamtables`).
+    afactors::MF
+    bfactors::MF
+    arotvars::MV
+    brotvars::MV
+end
+
+function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
+    a.forest === b.forest || throw(ArgumentError(
+        "the two sets of a RotationPair must be over one forest: each fills its " *
+        "ghosts across the seam from the other's blocks, block for block"))
+    forest = a.forest
+    hasrotating(forest) || throw(ArgumentError(
+        "a RotationPair needs a forest with a rotating seam: without one no set " *
+        "turns into another, and each fills its ghosts alone"))
+    d1, d2 = rotating_dims(forest)
+    swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+    (a.G == swap(b.G) && a.centering == swap(b.centering)) || throw(ArgumentError(
+        "the two sets of a RotationPair must have each other's layout with the " *
+        "seam's dimensions $d1 and $d2 exchanged, since a quarter turn of one is the " *
+        "other: got G = $(a.G) and $(b.G), centering $(a.centering) and " *
+        "$(b.centering)"))
+    symmetric_layout(a) && throw(ArgumentError(
+        "these sets have a layout symmetric in the seam's dimensions $d1 and $d2 " *
+        "(G = $(a.G), centering $(a.centering)), so each turns into itself and fills " *
+        "its ghosts alone; a RotationPair is for two sets whose layouts are each " *
+        "other's swap, such as the face-centered B_x and B_y"))
+    a.nvars == b.nvars || throw(ArgumentError(
+        "the two sets of a RotationPair must have the same number of variables, " *
+        "since each turns variable for variable into the other: got $(a.nvars) and " *
+        "$(b.nvars)"))
+    T === S || throw(ArgumentError(
+        "the two sets of a RotationPair must store one element type, since a " *
+        "transfer reads one and writes the other: got $T and $S"))
+    backend = get_backend(a.work)
+    samebackend(backend, get_backend(b.work)) || throw(ArgumentError(
+        "the two sets of a RotationPair must live on one backend, since a transfer " *
+        "reads one and writes the other: got $(nameof(typeof(backend))) and " *
+        "$(nameof(typeof(get_backend(b.work))))"))
+    qa, qb = a.rotation, b.rotation
+    σ, s = composed_rotation((qa, qb, qa, qb), a.nvars)
+    all(v -> σ[v] == v && s[v] == 1, 1:a.nvars) || throw(ArgumentError(
+        "the rotations of the pair, $(Tuple(qa)) and $(Tuple(qb)), composed four " *
+        "times as Q_a Q_b Q_a Q_b are not the identity: four quarter turns are no " *
+        "turn at all, so a variable carried from one set to the other and back " *
+        "twice must return to itself with its sign"))
+    check_rotation_parity(forest, a.parity, b.parity, qa, "the rotation of the first set")
+    check_rotation_parity(forest, b.parity, a.parity, qb, "the rotation of the second set")
+    af, av = seamtables(T, a.parity, (qa, qb, qa), a.nvars, Val(D))
+    bf, bv = seamtables(T, b.parity, (qb, qa, qb), b.nvars, Val(D))
+    af, bf = todevice(backend, af), todevice(backend, bf)
+    av, bv = todevice(backend, av), todevice(backend, bv)
+    return RotationPair{typeof(a),typeof(b),typeof(af),typeof(av)}(a, b, af, bf, av, bv)
+end
 
 # The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d] +
 # 2c[d]` is what makes a block's high exchange region reachable from one

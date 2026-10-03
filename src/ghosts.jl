@@ -118,6 +118,65 @@ end
 @inline kernelarg(a, dims) = a
 @inline kernelarg(p::PackedSlots, dims) = (buf=p.buf, offsets=p.offsets, dims=dims)
 
+# The real source of a rotated transfer (M12), as a kernel sees it.
+#
+# A rotated transfer's stencils are built in the virtual frame, as though
+# its source sat where the target sees it across the seam; what is left
+# is to read the virtual source's points out of the real array, which
+# this accessor does in the load, beside the packed buffer's ("Rotating
+# seams" in CODE.md). `src` is the real working array — the set's own,
+# or for an odd orientation in a pair its partner's — `perm` and `flip`
+# the axis map of the orientation (see `axismap`), `len` the real array's
+# stored size, `vars` the field set's variable table and `col` the
+# orientation's column of it. Virtual stored index `k` reads the real
+# point whose index along `e` is `k[perm[e]]`, or `len[e] + 1 − k[perm[e]]`
+# where `flip[e]`, and variable `vars[v, col]`. A `NamedTuple` of an
+# array, isbits tuples and an `Int32` table, so KernelAbstractions adapts
+# it to a device as it does the packed buffer.
+const RotatedSource = NamedTuple{(:src, :perm, :flip, :len, :vars, :col)}
+
+@inline transfer_eltype(p::RotatedSource) = eltype(p.src)
+
+Base.@propagate_inbounds transfer_load(p::RotatedSource, idx, v, b) =
+    p.src[rotated_index(p, idx)..., Int(p.vars[v, p.col]), b]
+
+@inline rotated_index(p, idx::NTuple{D,Int}) where {D} =
+    ntuple(Val(D)) do e
+        k = tuplepick(idx, p.perm[e])
+        p.flip[e] ? p.len[e] + 1 - k : k
+    end
+
+# `t[j]` for a run-time `j`, as a chain of selects: indexing a tuple with
+# a run-time index would spill it to local memory on a device.
+@inline tuplepick(t::Tuple{Any}, j::Int) = first(t)
+@inline tuplepick(t::Tuple, j::Int) = _tuplepick(t, j, 1)
+@inline _tuplepick(t::Tuple{Any}, j::Int, d::Int) = first(t)
+@inline _tuplepick(t::Tuple, j::Int, d::Int) =
+    ifelse(j == d, first(t), _tuplepick(Base.tail(t), j, d + 1))
+
+# The axis map of orientation `r` across the seam of the plane `(d1, d2)`:
+# the real stored index along `d1` and `d2` from the virtual one `k`, with
+# `n` the real array's stored size there (CODE.md, "Rotating seams", the
+# axis-map table), and the identity along every other dimension.
+#
+#   r = 1:  real[d1] = k[d2],          real[d2] = n + 1 − k[d1]
+#   r = 2:  real[d1] = n + 1 − k[d1],  real[d2] = n + 1 − k[d2]
+#   r = 3:  real[d1] = n + 1 − k[d2],  real[d2] = k[d1]
+function axismap(r::Integer, (d1, d2)::NTuple{2,Integer}, ::Val{D}) where {D}
+    swapped = isodd(r)
+    perm = ntuple(e -> swapped && e == d1 ? Int(d2) : swapped && e == d2 ? Int(d1) : e,
+                  Val(D))
+    flip = ntuple(e -> e == d1 ? r >= 2 : e == d2 ? (r == 1 || r == 2) : false, Val(D))
+    return perm, flip
+end
+
+# The accessor of a rotated group's real source `src`.
+function rotated_source(group::TransferGroup{T,D}, src, rotvars) where {T,D}
+    perm, flip = axismap(group.orientation, group.plane, Val(D))
+    return (src=src, perm=perm, flip=flip, len=ntuple(d -> size(src, d), Val(D)),
+            vars=rotvars, col=Int(group.orientation) + 1)
+end
+
 # `dest` and `src` are the same array for ghost filling (targets are
 # ghosts, sources interiors, so they never overlap) and different arrays
 # when regridding transfers into freshly allocated storage. Neither is
@@ -134,7 +193,9 @@ end
 # is the identity and the kernel is exactly what it was before M10. A
 # mirrored transfer at a reflecting face passes the field set's
 # parity-factor table and its own column of it: each variable's result
-# is multiplied by -1, 0 or 1, which is exact.
+# is multiplied by -1, 0 or 1, which is exact. So does a rotated
+# transfer across a seam (M12), whose column holds the sign of the turned
+# variable times its parity, if it is also mirrored.
 @inline scaled(acc, ::Nothing, v, col) = acc
 @inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
 
@@ -166,17 +227,26 @@ end
 # that is what lets a phase be one parallel loop over slices rather than
 # a nest of parallel loops.
 #
-# `factors` is the field set's parity-factor table, or `nothing`; only a
-# mirrored group reads it (see `scaled`).
+# `factors` is the field set's factor table, or `nothing`; only a
+# mirrored or rotated group reads it (see `scaled`). A rotated group
+# (M12) reads its real source through `rotated_source`, from `src` for an
+# even orientation and from `altsrc` for an odd one — the partner's
+# working array in a `RotationPair`, the set's own otherwise — with the
+# variable table `rotvars`; an ordinary group launches exactly as before.
 function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backend;
                     range=1:ntransfers(group), single::Bool=false,
-                    factors=nothing) where {T,D}
+                    factors=nothing, altsrc=src, rotvars=nothing) where {T,D}
     n = length(range)
     n == 0 && return nothing
     group.factorcol == 0 || factors !== nothing || throw(ArgumentError(
-        "this schedule mirrors ghosts across a reflecting face, but the field set " *
-        "has no parity to mirror them with. Build the field set over the same " *
-        "forest as the schedule, with `parity`."))
+        "this schedule mirrors ghosts across a reflecting face or turns them across " *
+        "a rotating seam, but the field set has no factor table to do it with. " *
+        "Build the field set over the same forest as the schedule, with `parity` " *
+        "or `rotation`."))
+    group.orientation == 0 || rotvars !== nothing || throw(ArgumentError(
+        "this schedule turns ghosts across a rotating seam, but the field set has " *
+        "no variable table to turn them with. Build the field set over the same " *
+        "forest as the schedule, with `rotation`."))
     gfactors = group.factorcol == 0 ? nothing : factors
     blen = boxsize(group)
     prod(blen) == 0 && return nothing
@@ -196,15 +266,24 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # "What the ghost fill costs" in CODE.md for what that buys and what
     # it does not.
     kernel! = transfer_kernel!(backend)
+    if group.orientation != 0
+        rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
+        kernel!(kdest, rsrc, group.targetblocks, group.sourceblocks,
+                srcstarts, weights, tfirst, first(range) - 1, gfactors,
+                Int(group.factorcol), Val(orders), Val(D);
+                ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
+        return nothing
+    end
     kernel!(kdest, ksrc, group.targetblocks, group.sourceblocks,
-            srcstarts, weights, tfirst, first(range) - 1, gfactors, group.factorcol,
+            srcstarts, weights, tfirst, first(range) - 1, gfactors, Int(group.factorcol),
             Val(orders), Val(D);
             ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
     return nothing
 end
 
 run_group!(fs::FieldSet{T,D}, group::TransferGroup{T,D}, backend) where {T,D} =
-    run_group!(fs.work, fs.work, group, fs.nvars, backend; factors=fs.factors)
+    run_group!(fs.work, fs.work, group, fs.nvars, backend; factors=fs.factors,
+               rotvars=fs.rotvars)
 
 # One phase of the exchange — all the copies and restrictions, or all
 # the prolongations onto one level — as a single parallel loop.
@@ -242,19 +321,22 @@ ownerblocks(group, ::PackedSlots) = group.sourceblocks
 ownercount(dest, src) = size(dest, ndims(dest))
 ownercount(::PackedSlots, src) = size(src, ndims(src))
 
-function run_phase!(dest, src, groups, nvars::Integer, backend; factors=nothing)
+function run_phase!(dest, src, groups, nvars::Integer, backend; factors=nothing,
+                    altsrc=src, rotvars=nothing)
     for group in groups
-        run_group!(dest, src, group, nvars, backend; factors=factors)
+        run_group!(dest, src, group, nvars, backend; factors=factors, altsrc=altsrc,
+                   rotvars=rotvars)
     end
     return nothing
 end
 
 function run_phase!(dest, src, groups, nvars::Integer, backend::CPU;
-                    factors=nothing)
+                    factors=nothing, altsrc=src, rotvars=nothing)
     nb = ownercount(dest, src)
     if length(threadchunks(nb)) <= 1
         for group in groups
-            run_group!(dest, src, group, nvars, backend; factors=factors)
+            run_group!(dest, src, group, nvars, backend; factors=factors, altsrc=altsrc,
+                       rotvars=rotvars)
         end
         return nothing
     end
@@ -264,14 +346,16 @@ function run_phase!(dest, src, groups, nvars::Integer, backend::CPU;
             lo = searchsortedfirst(owners, first(owned))
             hi = searchsortedlast(owners, last(owned))
             lo <= hi && run_group!(dest, src, group, nvars, backend;
-                                   range=lo:hi, single=true, factors=factors)
+                                   range=lo:hi, single=true, factors=factors,
+                                   altsrc=altsrc, rotvars=rotvars)
         end
     end
     return nothing
 end
 
 run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
-    run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors)
+    run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors,
+               rotvars=fs.rotvars)
 
 # --- Stages (M7) -----------------------------------------------------------
 #
@@ -403,20 +487,22 @@ end
 # buffer, then synchronize: a device buffer is safe to hand to MPI only
 # once the kernels writing it have finished. `src` is the array the
 # transfers read: a field set's working array in an exchange, the old
-# mesh's in the regrid transfer.
+# mesh's in the regrid transfer. A rotated pack (M12) reads through the
+# variable table `rotvars`, from `altsrc` for an odd orientation (the
+# partner's array in a `RotationPair`), and computes the unscaled sum.
 function pack_stage!(src::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
-                     backend)
+                     backend; altsrc=src, rotvars=nothing)
     run_phase!((buf=bufs[1], offsets=remote.sendoffsets), src, remote.packs, nvars,
-               backend)
+               backend; altsrc=altsrc, rotvars=rotvars)
     synchronize(backend)
     return nothing
 end
 pack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
-    pack_stage!(fs.work, remote, bufs, fs.nvars, backend)
+    pack_stage!(fs.work, remote, bufs, fs.nvars, backend; rotvars=fs.rotvars)
 
 # Copy every received slot into its target box in `dest`, applying the
-# parity factor of a mirrored transfer here, where the serial kernel
-# applies it.
+# parity factor of a mirrored transfer, or the sign of a rotated one,
+# here, where the serial kernel applies it.
 function unpack_stage!(dest::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
                        factors, backend)
     run_phase!(dest, (buf=bufs[2], offsets=remote.recvoffsets), remote.unpacks, nvars,
@@ -453,11 +539,19 @@ unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
 # and the send mirror is rewritten only after the call's sends have been
 # waited on). A CPU buffer is an `Array` and goes to the communicator
 # directly, as before.
+#
+# `altsrc` and `rotvars` are what a rotated transfer (M12) reads through:
+# the array its odd orientations read — the partner's in a
+# `RotationPair`, `src` itself otherwise — and the variable table. The
+# packs read them as the local groups do; an unpack is a plain copy with
+# the factor column, so it needs neither.
 function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
-                    stage::ExchangeStage, forest::Forest, backend, sends)
+                    stage::ExchangeStage, forest::Forest, backend, sends,
+                    altsrc::AbstractArray=src, rotvars=nothing)
     remote = stage.remote
     if remote === nothing
-        run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
+        run_phase!(dest, src, stage.locals, nvars, backend; factors=factors,
+                   altsrc=altsrc, rotvars=rotvars)
         synchronize(backend)
         return sends
     end
@@ -468,13 +562,14 @@ function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fac
     recvs = Any[irecv(comm, view(wire[2], r), peer, stage.tag)
                 for (peer, r) in zip(remote.recvpeers,
                                      segment_ranges(remote.recvcounts, nvars))]
-    pack_stage!(src, remote, bufs, nvars, backend)
+    pack_stage!(src, remote, bufs, nvars, backend; altsrc=altsrc, rotvars=rotvars)
     staged && copyto!(wire[1], bufs[1])
     sends === nothing && (sends = Any[])
     for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
         push!(sends, isend(comm, view(wire[1], r), peer, stage.tag))
     end
-    run_phase!(dest, src, stage.locals, nvars, backend; factors=factors)
+    run_phase!(dest, src, stage.locals, nvars, backend; factors=factors, altsrc=altsrc,
+               rotvars=rotvars)
     waitall(comm, recvs)
     staged && copyto!(bufs[2], wire[2])
     unpack_stage!(dest, remote, bufs, nvars, factors, backend)
@@ -482,7 +577,8 @@ function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fac
     return sends
 end
 run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
-    run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends)
+    run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends,
+               fs.work, fs.rotvars)
 
 # A whole staged ghost fill: phase 1, the boundary hook on this rank's
 # own blocks, then phase 2 by target level. This is `fill_ghosts!` once
@@ -709,6 +805,7 @@ end
 
 """
     fill_ghosts!(fs::FieldSet, schedule::GhostSchedule; boundary=nothing)
+    fill_ghosts!(pair::RotationPair, (schedule_a, schedule_b); boundary=nothing)
 
 Fill every ghost cell of every block, by replaying `schedule`.
 
@@ -727,6 +824,18 @@ with the parity each variable declares on the field set, and the hook
 never sees them. That includes the upper wall plane of a vertex-like
 dimension, which is derived — zero for an odd variable, the symmetric
 interpolant of the prolongation order for an even one.
+
+A rotating seam needs nothing either (M12): its ghosts are the turned
+image of real data, filled by transfers from the real blocks across it,
+read through the quarter turn and the field set's `rotation`, in the
+same phases. A set whose layout is not symmetric under exchanging the
+seam's two dimensions turns into another set, and if it has ghosts
+there it is refused here: fill it with its partner, as a
+[`RotationPair`](@ref), through the second form. That form runs the two
+schedules — each set's own — merged stage by stage, each set's phase 1,
+then both hooks, then each prolongation level of one set and of the
+other, so that a prolongation may read its partner's coarser ghosts.
+Its `boundary` is one hook for both sets, or a tuple of two.
 
 `boundary` is called once per ghost region facing outside the domain
 through an *outer* face — neither periodic nor reflecting — as
@@ -774,6 +883,38 @@ the price of a uniform `N^D` state layout for every centering; see
 """
 function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
                       boundary=nothing) where {T,D}
+    backend = check_fill(fs, schedule)
+    # A set whose layout is not symmetric in the seam's plane turns into
+    # its partner, so its ghosts across the seam are the partner's data
+    # (M12). It has such ghosts exactly when it has ghosts along either
+    # dimension of the plane — every block on a seam face then has a
+    # region beyond it — which is a property of the layout, the same on
+    # every rank.
+    if hasrotating(fs.forest) && !symmetric_layout(fs) && seam_ghosts(fs)
+        throw(ArgumentError(
+            "this field set's layout is not symmetric in the rotating seam's " *
+            "dimensions $(rotating_dims(fs.forest)) (G = $(fs.G), centering " *
+            "$(fs.centering)), so its ghosts across the seam are a quarter turn of " *
+            "another set's data, which a fill of this set alone does not have. Fill " *
+            "it as a RotationPair with the set of the exchanged layout: " *
+            "`fill_ghosts!(RotationPair(a, b), (schedule_a, schedule_b))`."))
+    end
+    return exchange_ghosts!(fs, schedule, boundary, backend)
+end
+
+# Whether a set has ghost regions across a rotating seam: ghosts along
+# either dimension of the seam's plane. A set with none there, as a
+# flux's `G = 0` along a stagger, has only regions on the high side of
+# its blocks there, and nothing crosses the seam.
+function seam_ghosts(fs::FieldSet)
+    d1, d2 = rotating_dims(fs.forest)
+    return fs.G[d1] > 0 || fs.G[d2] > 0
+end
+
+# The checks every fill makes of a field set and the schedule it is
+# replayed with, returning the backend. Rank-local, on purpose: see
+# "Collective checks" in CODE.md.
+function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
     schedule.forest === fs.forest || throw(ArgumentError(
         "schedule was built for a different forest than the field set"))
     isstale(schedule) && throw(ArgumentError(
@@ -800,8 +941,7 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
         "wrong memory. Build it with " *
         "`GhostSchedule(forest, operators; backend = $(nameof(typeof(backend)))())`, " *
         "or let both default to the CPU."))
-
-    return exchange_ghosts!(fs, schedule, boundary, backend)
+    return backend
 end
 
 # The element types have to agree exactly — the transfer accumulates in
@@ -809,12 +949,60 @@ end
 # mismatch would silently promote in the innermost loop. Caught here with
 # a reason rather than left to a `MethodError`, since the two types are
 # chosen at two different call sites.
-function fill_ghosts!(fs::FieldSet{T}, schedule::GhostSchedule{S};
-                      boundary=nothing) where {T,S}
+fill_ghosts!(fs::FieldSet{T}, schedule::GhostSchedule{S};
+             boundary=nothing) where {T,S} = check_fill(fs, schedule)
+function check_fill(fs::FieldSet{T}, schedule::GhostSchedule{S}) where {T,S}
     throw(ArgumentError(
         "the field set stores $T but this schedule carries $S weights; build " *
         "the schedule with `GhostSchedule(forest, operators; T=$T)`, or let " *
         "both default to the forest's floattype"))
+end
+
+function fill_ghosts!(pair::RotationPair, schedules::Tuple{GhostSchedule,GhostSchedule};
+                      boundary=nothing)
+    a, b = pair.a, pair.b
+    sa, sb = schedules
+    backend = check_fill(a, sa)
+    check_fill(b, sb)
+    hooks = boundary isa Tuple ? boundary : (boundary, boundary)
+    length(hooks) == 2 || throw(ArgumentError(
+        "boundary for a RotationPair is one hook for both sets or a tuple of two, " *
+        "one per set; got a tuple of $(length(hooks))"))
+    return exchange_pair!(pair, sa, sb, hooks, backend)
+end
+
+# The paired fill (M12), once its checks have passed: the two schedules'
+# stages merged by (stage, member). Phase 1 of `a` and then of `b`, then
+# the two hooks, then each phase-2 target level of `a` and then of `b`,
+# a stage that only one member has running alone. A rotated
+# prolongation of one member may read its partner's coarser ghosts,
+# which the partner's earlier stages, phase 1 or a coarser level, have
+# filled by then, as its own coarser ghosts are in a single fill. Under
+# MPI each stage completes its receives before the next starts, so the
+# two members share a stage's tag: messages between two ranks with one
+# tag are matched in the order they were sent.
+function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule, hooks,
+                        backend)
+    a, b = pair.a, pair.b
+    forest = sa.forest
+    runa(stage, sends) = run_stage!(a.work, a.work, a.nvars, pair.afactors, stage, forest,
+                                    backend, sends, b.work, pair.arotvars)
+    runb(stage, sends) = run_stage!(b.work, b.work, b.nvars, pair.bfactors, stage, forest,
+                                    backend, sends, a.work, pair.brotvars)
+    sends = runa(sa.stages[1], nothing)
+    sends = runb(sb.stages[1], sends)
+    hooks[1] === nothing || apply_boundary!(a, hooks[1], sa, backend)
+    hooks[2] === nothing || apply_boundary!(b, hooks[2], sb, backend)
+    tags = sort!(unique!([[st.tag for st in sa.stages[2:end]];
+                          [st.tag for st in sb.stages[2:end]]]))
+    for tag in tags
+        i = findfirst(st -> st.tag == tag, sa.stages)
+        i === nothing || (sends = runa(sa.stages[i], sends))
+        j = findfirst(st -> st.tag == tag, sb.stages)
+        j === nothing || (sends = runb(sb.stages[j], sends))
+    end
+    sends === nothing || waitall(forest.comm, sends)
+    return pair
 end
 
 """

@@ -511,6 +511,17 @@ declared up front:
     reflecting dimension. The rotation and a reflection outside its
     plane commute, so the two declarations must agree.
 
+  *(Step 2, 2026-10-03.)* The fourth-power and parity checks need the
+  set the map reads from, so the field set makes them for a symmetric
+  layout and `RotationPair` makes them, as `Q_a Q_b Q_a Q_b = I` and the
+  parities across the pair, for an asymmetric one; a lone asymmetric
+  set is checked for its shape only. Over a forest without a seam the
+  map may be omitted, and if given is checked for its shape, kept and
+  otherwise ignored, as `parity` is over a forest without reflecting
+  faces, so `factors` and `rotvars` are `nothing` there exactly as
+  before. A `RotationPair` of two symmetric sets is refused: each turns
+  into itself.
+
   Unlike reflection, **the tree sees the seam.** The low face of `d1`
   is glued to the low face of `d2`, and across it neighbor finding
   returns the real leaves, each with an **orientation**, the number of
@@ -977,7 +988,14 @@ the value `−B_y` across the low face of `x`. Two cases:
   fluxes: the set has no seam ghost region at all. None of its
   exchange regions has a negative component in the plane — along its
   stagger the one region is the shared plane at a block's high face —
-  so none crosses the seam, and it fills alone, as today.
+  so none crosses the seam, and it fills alone, as today. *(Amended in
+  step 3, 2026-10-03: "fills alone" is vacuous. An asymmetric layout
+  with `G = 0` along both plane dimensions is cell-centered along one
+  of them, and `check_operators` refuses `G = 0` along a cell-centered
+  dimension for every point-value order and the conservative family
+  along a vertex-like one, so no ghost schedule serves such a set: it
+  is never ghost-filled, and is regridded as `fs => nothing`, as the
+  fluxes are today. The field set takes it without a partner.)*
 - **Otherwise**, as for `B_x` and `B_y` of constrained transport with
   `G > 0` in the plane: the two sets are filled as a
   **`RotationPair(a, b)`**, each from the other across the seam. An
@@ -1004,6 +1022,14 @@ the value `−B_y` across the low face of `x`. Two cases:
   member on the tag is the alternative if it turns out cleaner. A
   plain `fill_ghosts!` on an asymmetric set whose schedule has odd
   orientations refuses, saying to fill it as a `RotationPair`.
+  *(Amended in step 3, 2026-10-03: the schedule records nothing for
+  it. The fill decides from the layout, `G[d1] > 0 || G[d2] > 0`,
+  which holds exactly when the serial schedule has transfers of odd
+  orientation — every block on a seam face then has a nonempty region
+  beyond it — and is the same on every rank, where a schedule's own
+  groups are not: a rank whose blocks are off the seam has none, and a
+  refusal on some ranks only would leave the others waiting in the
+  exchange.)*
   `regrid!` and `adapt_to_initial_data!` take `pair => (sa, sb)` and
   fill the pair before the transfers; the transfers themselves are
   `δ = 0` and never cross the seam.
@@ -1024,7 +1050,12 @@ mirrored rows, or the vertex-like upper wall row — and (M12) an
 orientation shares one set of one-dimensional stencils and so one
 kernel launch. The orientation joins `keyorder` as well, so both ends
 of an MPI message still derive one layout, and a group carries its
-axis map, the identity for an ordinary group. Prolongations are
+axis map, the identity for an ordinary group. *(Amended in step 3,
+2026-10-03: a group carries its orientation and the seam's plane
+`(d1, d2)`, two `Int8`s and a pair of them, and `run_group!` derives the
+axis map at the launch; `factorcol` became an `Int32`, so the three
+share the eight bytes it had alone and a group is no larger than
+before.)* Prolongations are
 additionally batched by *target level* (amended in M5): the batch is
 the unit the phase-2 sweep
 schedules, so a batch spanning two levels would be filed under one of
@@ -7750,11 +7781,109 @@ being done now, so it comes before M9b, which follows it.
       885 tests and runs in about 10 s, nearly all compilation. The
       suite: 111503 tests at one thread in 8m12 (`Pkg.test`), every one
       passing; the docs build, doctests included.
-  - **Step 2 — field sets.** `rotation`, the factor and `rotvars`
-    tables, `RotationPair`.
-  - **Step 3 — schedule and kernel.** The orientation in the group key
-    and the axis map in the group, the rotated source accessor, the
-    oriented source search, the single and paired fills, and `show`.
+  - **Step 2 — field sets.** *(Done, 2026-10-03, with step 3.)*
+    `rotation`, the factor and `rotvars` tables, `RotationPair`.
+    - *What was built.* `FieldSet(…; rotation)`, required on a rotating
+      forest and checked as recorded under
+      [Domain and boundaries](#domain-and-boundaries) (step 2's note
+      there says where each check lives). Two fields, `rotation` (the
+      checked map) and `rotvars` (`nvars × 4` `Int32`, the composed
+      variable `σ_r(v)` in column `r + 1`, on the backend), and
+      `factors` grown on a rotating forest to `nvars × 3^D·4`, column
+      `mirror column + 3^D·r`, each entry the target variable's parity
+      factor times the sign of `Q^r`, formed in integers so that a zero
+      is `+0`; `r = 0` is M10's table unchanged (`seamtables`). A
+      symmetric set composes its own map three times; an asymmetric
+      set alone holds zero factors and the identity for `r ≥ 1`, which
+      no fill reads, since a plain fill refuses it. `RotationPair(a, b)`,
+      exported, with every refusal of the design and one more (two
+      symmetric sets: each turns into itself), builds both members'
+      tables by alternating the maps, `(Q_a, Q_b, Q_a)` for `a`'s
+      targets.
+  - **Step 3 — schedule and kernel.** *(Done, 2026-10-03.)* The
+    orientation in the group key and the axis map in the group, the
+    rotated source accessor, the oriented source search, the single and
+    paired fills, and `show`.
+    - *What was built.* `GroupKey` gained `orientation::Int8`, last in
+      `keyorder` (the old constructors give 0), and `TransferGroup`
+      gained `orientation` and `plane` (see the amendment under "Ghost
+      filling"). `block_sources!` and `mirror_sources!` search with
+      `oriented_neighbors`, take a finer source's offset into the
+      virtual frame (`seam_offset`), filter the wall side on it, and
+      record `r`; a region with no source is the hook's whatever its
+      `r`. `factorcol` is `mirror column + 3^D·r` whenever either is
+      nonzero. In the kernel the source accessor
+      `RotatedSource = (src, perm, flip, len, vars, col)` maps a
+      virtual stored index to the real one (a run-time `perm` is read
+      through a chain of selects, `tuplepick`, not a run-time tuple
+      index) and reads `vars[v, col]`; `run_group!` builds it only for
+      `orientation ≠ 0`, in a branch of its own, so an ordinary launch
+      is the code it was. `altsrc` (the array odd orientations read:
+      the partner's in a pair, the set's own otherwise) and `rotvars`
+      are threaded through `run_group!`, `run_phase!`, `pack_stage!`
+      and `run_stage!` beside `factors`. A rotated pack carries the
+      orientation and the plane and computes the unscaled sum through
+      the accessor; its unpack is the plain width-1 copy with the
+      factor column, now holding the sign, so the serial `−0` stays
+      bitwise. The step-1 refusal is gone from `GhostSchedule`; the
+      plain fill refuses an asymmetric set with ghosts in the plane,
+      naming the pair; `fill_ghosts!(pair, (sa, sb); boundary)` runs
+      the merged stages (`exchange_pair!`), with one hook or two;
+      `show` says "N rotated transfers" when there are any (and counts
+      as mirrored only the groups whose mirror state is nonzero).
+    - *Deviations*, each amended where the design states it: the
+      odd-orientation refusal is decided from the layout, not recorded
+      on the schedule; the group holds the orientation and the plane,
+      not an `AxisMap`; the `G = 0` asymmetric case has no ghost
+      schedule at all; and in 2D a half turn is only ever a copy (a
+      region beyond both low faces belongs to the block at the axis,
+      whose image there is itself), so rotated restrictions and
+      prolongations at `r = 2` occur in 3D only, across the third
+      dimension.
+    - *The schedule build.* Building the groups inline, with the
+      element type a run-time value there, made the new small fields
+      a dynamic call's boxed arguments, 448 bytes more per build in
+      `bench/ghosts.jl`. The groups are now built behind a function
+      barrier (`local_groups`), where the type is static, which also
+      removes the run-time type construction the build always did per
+      group.
+    - *Measured* (laptop, Julia 1.13.1, `-t 4`, `bench/ghosts.jl`
+      defaults, bytes per call, two runs). Fills: uniform 50208 B in
+      0.52–0.53 ms, two-level 310144 B in 3.8–4.2 ms, against 50208 B
+      in 0.51 ms and 310144 B in 3.9 ms before, so unchanged. Schedule
+      builds: 406592 B in 0.18–0.25 ms and 4653648 B in 2.08 ms,
+      against 441888 B in 0.22 ms and 4976688 B in 2.63 ms: 8 % and
+      6 % fewer bytes, and the two-level build 21 % faster, from the
+      barrier. The quadrant against the full plane, every stored point:
+      worst 2.2e-16 in 2D and 8.9e-16 in 3D (cell and vertex, both
+      orders of the pair, the third dimension periodic, reflecting or
+      outer), and 4.4e-16 for the pairs (face-centered `(B, F)` with the
+      variables in swapped orders, `F` odd about a reflecting wall, and
+      a cell-centered pair whose ghost widths alone are swapped) — not
+      zero, since the formula's covariance is itself only to roundoff.
+      The polynomial data of the `NaN` test is reproduced to 1e-10 or
+      better in every case, with no `NaN` left. By hand (not yet in the
+      suite; step 7), the lockstep driver of `exchange_tests.jl` over
+      2, 3 and 5 simulated ranks reproduces the serial fill bit for
+      bit, a symmetric set and a pair, in 2D and 3D, with 40 to 3184
+      rotated `−0`s per case.
+    - *Tests.* In `test/rotate_tests.jl`, with the oracles at the end of
+      `ghost_oracles.jl` (`rotating_data`, `rotating_forest`,
+      `undefined_rotated_ghosts`, `rotating_vs_quadrupled`,
+      `rotating_pair_vs_quadrupled`, `hook_regions_leave`): the
+      refusals of `rotation` and of `RotationPair`; the tables against
+      hand-composed turns, and their `r = 0` block against M10's; the
+      `NaN` test over every symmetric centering, `p = 2` and 4, `D = 2`
+      and 3 with the third dimension periodic, outer and reflecting,
+      every `(kind, r)` met; the quadrant and the pair against the full
+      plane; the write counts and the hook regions, pairs included; and
+      the plain fill's refusal and `show`.The file
+      holds 1092 tests (885 after step 1) and runs in about 30 s at one
+      thread and at four, nearly all compilation (the `NaN` test's 3D
+      cases alone compile 12 s and compute 1.2 s, which is why the
+      other orders of the pair there run cell and vertex only). The
+      suite: 111710 tests at one thread in 6m51 (`Pkg.test`), every one
+      passing; the docs build, doctests included.
   - **Step 4 — regrid, initial data and the interface schedule.**
   - **Step 5 — interpolation.**
   - **Step 6 — checkpoint.**

@@ -873,3 +873,350 @@ function random_rotating_forest(rng, ::Val{D}; rotating, M, other=:outer, nsteps
     end
     return forest
 end
+
+# --- M12: rotated ghosts (steps 2–3) -----------------------------------------
+#
+# The ghosts across a rotating seam are checked against data covariant
+# under the quarter turn, written out by formula, and against the full
+# plane the quadrant is a quarter of, which holds the turned data
+# explicitly and has no seam: the definitional test, as
+# `reflecting_vs_doubled` is for a mirror. The formulas are in the
+# coordinates about the axis, `(a, b) = (x_{d1}, x_{d2})`, where the turn
+# is `R(a, b) = (−b, a)`; the quadrant spans `[0, 2]` in the plane and the
+# full plane `[−2, 2]`.
+
+"""The dimension outside the plane `rotating` in 3D, or 0 in 2D."""
+outofplane(D, rotating) = D == 2 ? 0 : only(setdiff(1:D, rotating))
+
+"""
+The signed map of a quarter turn for a scalar followed by a vector's
+components in Cartesian order: the component along `d1` becomes minus
+the one along `d2`, the one along `d2` the one along `d1`, and anything
+else itself — written from the definition, `v(Rp) = R v(p)`, not from
+the package.
+"""
+function vector_rotation(D, (d1, d2))
+    comp(e) = 1 + e
+    return [1; [e == d1 ? -comp(d2) : e == d2 ? comp(d1) : comp(e) for e in 1:D]]
+end
+
+"""
+The parity of [`vector_rotation`](@ref)'s variables when the dimension
+outside the plane reflects at its low face: the scalar and the in-plane
+components even, the component along the wall's normal odd; `nothing`
+otherwise.
+"""
+function vector_parity(D, rotating, other)
+    other === :reflect_lo || return nothing
+    z = outofplane(D, rotating)
+    return [ntuple(d -> d != z ? NoParity : v == 1 + z ? OddParity : EvenParity, D)
+            for v in 1:(D + 1)]
+end
+
+"""
+The quarter-turn-covariant vector field `k` (1 or 2) at `(a, b)`: a radial
+part `ρ(a, b)` and a swirl `σ(−b, a)`, with `ρ` and `σ` invariant under
+the turn, as `(v_a, v_b)`. Invariants are functions of `a² + b²` and of
+`χ = ab(a² − b²)`, which the turn keeps and a mirror negates, so the
+field is covariant under rotations and not under reflections.
+`poly = p` keeps it a polynomial of degree `< p` per dimension.
+"""
+function covariant_vector(a, b, k::Int; poly::Int=0)
+    if poly > 0
+        ρ2 = poly > 2 ? a^2 + b^2 : zero(a)
+        radial = (k == 1 ? 0.8 : -0.5) + 0.25 * ρ2
+        swirl = (k == 1 ? -0.6 : 0.9) + 0.15 * ρ2
+    else
+        ρ2 = a * a + b * b
+        χ = a * b * (a * a - b * b)
+        radial = k == 1 ? sin(0.9 * ρ2) + 0.5 : cos(0.7 * ρ2) - 0.2 * sin(0.4 * χ)
+        swirl = k == 1 ? 0.7 * cos(0.6 * ρ2) + 0.3 * sin(0.5 * χ) : exp(-0.3 * ρ2)
+    end
+    return radial * a - swirl * b, radial * b + swirl * a
+end
+
+"""
+The quarter-turn-invariant scalar at `(a, b)`, chiral like the vectors.
+"""
+function invariant_scalar(a, b; poly::Int=0)
+    if poly > 0
+        ρ2 = poly > 2 ? a^2 + b^2 : zero(a)
+        χ = poly > 3 ? a^3 * b - a * b^3 : zero(a)
+        return 1.3 + 0.4 * ρ2 + 0.1 * χ
+    end
+    ρ2 = a * a + b * b
+    χ = a * b * (a * a - b * b)
+    return exp(-0.4 * ρ2) + 0.3 * sin(0.7 * χ) + 0.2 * cos(0.5 * (a^4 - 6a^2 * b^2 + b^4))
+end
+
+"""
+The factor along the dimension outside the plane: 1 in 2D; with that
+dimension periodic, outer or reflecting at its low face, a function
+periodic on `[0, 2]`, a general one, or one even (`odd = false`) or odd
+about 0. `poly = p` keeps it a polynomial of degree `< p` (a periodic
+one is then constant).
+"""
+function outofplane_factor(x, D, rotating, other, odd::Bool; poly::Int=0)
+    D == 2 && return one(eltype(x))
+    t = x[outofplane(D, rotating)]
+    keep(e) = poly == 0 || e < poly
+    if poly > 0
+        other === :periodic && return odd ? 0.5 : 1.0
+        other === :outer &&
+            return 0.4 + 0.3t + (keep(2) ? 0.2t^2 : 0.0) + (keep(3) ? 0.05t^3 : 0.0)
+        return odd ? 0.7t + (keep(3) ? 0.2t^3 : 0.0) : 0.5 + (keep(2) ? 0.3t^2 : 0.0)
+    end
+    other === :periodic &&
+        return odd ? 0.6 + 0.3sin(π * t + 0.4) : 1 + 0.3sin(π * t + 0.2)
+    other === :outer && return 1 + 0.3sin(1.7t + 0.2)
+    return odd ? sin(1.3t) : cos(1.1t) + 0.5
+end
+
+"""
+A scalar and a covariant vector, as [`vector_rotation`](@ref) orders
+them, as `f(x, v)`: smooth and not polynomial, or with `poly = p` of
+degree `< p` per dimension, which order-`p` operators reproduce exactly.
+"""
+function rotating_data(D, rotating, other; poly::Int=0)
+    d1, d2 = rotating
+    z = outofplane(D, rotating)
+    return function (x, v)
+        a, b = x[d1], x[d2]
+        v == 1 && return invariant_scalar(a, b; poly=poly) *
+                         outofplane_factor(x, D, rotating, other, false; poly=poly)
+        e = v - 1                                    # the component along e
+        if e == z
+            return (0.9 + 0.2 * invariant_scalar(a, b; poly=min(poly, 3))) *
+                   outofplane_factor(x, D, rotating, other, true; poly=poly)
+        end
+        va, vb = covariant_vector(a, b, 1; poly=poly)
+        return (e == d1 ? va : vb) * outofplane_factor(x, D, rotating, other, false;
+                                                       poly=poly)
+    end
+end
+
+"""
+The refinement both the quadrant and the full plane get: symmetric under
+every quarter turn and every mirror of the plane, so that the seam's
+conformity holds in the full plane by symmetry and the two balance the
+same. Two passes put levels 2, 1 and 0 side by side along each seam
+face, starting at the axis; in 3D they reach the low face of the third
+dimension too, and stop halfway up it.
+"""
+function rotating_refinement(D, rotating)
+    d1, d2 = rotating
+    z = outofplane(D, rotating)
+    low(c, r) = D == 2 || c[z] < r
+    return (c, lvl) -> (lvl == 0 && hypot(c[d1], c[d2]) < 1.2 && low(c, 1.0)) ||
+                       (lvl == 1 && hypot(c[d1], c[d2]) < 0.6 && low(c, 0.5))
+end
+
+"""
+The quadrant of side 2 roots in the plane `rotating` (and 2 along the
+third dimension, which is `other`: `:periodic`, `:outer` or `:reflect_lo`),
+over `[0, 2]` everywhere, refined by [`rotating_refinement`](@ref).
+"""
+function rotating_forest(::Val{D}; rotating, other=:periodic, T::Type=Float64,
+                         N=8) where {D}
+    z = outofplane(D, rotating)
+    forest = Forest{T}(ntuple(_ -> 2, D); N=N,
+                       periodic=ntuple(d -> d == z && other === :periodic, D),
+                       reflecting=ntuple(d -> (d == z && other === :reflect_lo, false), D),
+                       rotating=rotating, extents=ntuple(_ -> (0, 2), D))
+    return refine_where!(forest, rotating_refinement(D, rotating), 2)
+end
+
+"""
+Fill a [`rotating_forest`](@ref) with the polynomial
+[`rotating_data`](@ref) after setting every stored value to `NaN`,
+exchange ghosts once, and report `(nnan, worst, schedule)`: the values
+still `NaN`, the worst deviation of any stored value from the data, and
+the schedule. As for [`undefined_ghosts`](@ref), a ghost never written
+stays `NaN` and one written from an unwritten one becomes `NaN`, and the
+data is reproduced exactly, so a wrong axis map, a wrong variable or a
+wrong sign shows as a deviation.
+"""
+function undefined_rotated_ghosts(::Val{D}; rotating, other, C, p, T::Type=Float64,
+                                  N=8) where {D}
+    forest = rotating_forest(Val(D); rotating=rotating, other=other, T=T, N=N)
+    f = rotating_data(D, rotating, other; poly=p)
+    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C,
+                     rotation=vector_rotation(D, rotating),
+                     parity=vector_parity(D, rotating, other))
+    fill!(fs.work, T(NaN))
+    fill_by_coordinates!(f, fs)
+    schedule = GhostSchedule(fs, Operators(prolongation=p, restriction=p))
+    fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
+    nnan = count(isnan, fs.work)
+    worst = 0.0
+    for b in 1:nblocks(fs), idx in CartesianIndices(size(fs.work)[1:D])
+        x = coordinates(fs, b, Tuple(idx))
+        for v in 1:fs.nvars
+            worst = max(worst, Float64(abs(fs.work[idx, v, b] - f(x, v))))
+        end
+    end
+    return nnan, worst, schedule
+end
+
+"""How many transfers of each `(kind, orientation)` the schedule holds."""
+function rotation_counts(s::GhostSchedule)
+    counts = Dict{Tuple{Symbol,Int},Int}()
+    for g in Iterators.flatten((s.phase1, Iterators.flatten(s.phase2)))
+        key = (g.kind, Int(g.orientation))
+        counts[key] = get(counts, key, 0) + ntransfers(g)
+    end
+    return counts
+end
+
+"""
+Whether every region the schedule hands the hook leaves the domain
+through an outer face, judged on the unfolded plane: its image, the
+block's box stepped by the direction with the reflected components
+dropped, lies beyond `±M` in the plane or beyond a non-periodic face of
+the third dimension. In exact `Rational` units of root cells, with the
+axis at the quadrant's low corner.
+"""
+function hook_regions_leave(schedule::GhostSchedule{T,D}) where {T,D}
+    forest = schedule.forest
+    d1, d2 = TreeAMR.rotating_dims(forest)
+    M = forest.roots[d1]
+    return all(schedule.boundaries) do region
+        k = forest.leaves[region.block]
+        δ′, _ = TreeAMR.reflect_direction(forest, k, region.direction)
+        lo, hi = leafbox(forest, k)
+        s = hi[1] - lo[1]
+        slo, shi = lo .+ s .* δ′, hi .+ s .* δ′
+        any(1:D) do d
+            d == d1 || d == d2 ? (shi[d] > M || slo[d] < -M) :
+            !forest.periodic[d] && (slo[d] < 0 || shi[d] > forest.roots[d])
+        end
+    end
+end
+
+"""
+The worst difference between every stored point of every block of
+`fsq`, ghosts included, and the block of `fsf` at the same level and
+lower corner, with the count of points compared; `nothing` if some block
+of `fsq` has no match, which means the two refinements differ.
+"""
+function compare_matching_blocks(fsq::FieldSet{T,D}, fsf::FieldSet{T,D}) where {T,D}
+    lower(fs, b) = ntuple(d -> block_extent(fs.forest, blockkey(fs, b))[d][1], D)
+    index = Dict((level(blockkey(fsf, b)), lower(fsf, b)) => b for b in 1:nblocks(fsf))
+    worst = 0.0
+    npoints = 0
+    for b in 1:nblocks(fsq)
+        fb = get(index, (level(blockkey(fsq, b)), lower(fsq, b)), nothing)
+        fb === nothing && return nothing
+        for v in 1:fsq.nvars
+            a, c = blockview(fsq, b, v), blockview(fsf, fb, v)
+            for i in CartesianIndices(a)
+                # `==` semantics: −0 and +0 agree, and a `NaN` on either
+                # side is a mismatch that `max` keeps.
+                worst = a[i] == c[i] ? worst : max(worst, Float64(abs(a[i] - c[i])))
+                npoints += 1
+            end
+        end
+    end
+    return worst, npoints
+end
+
+"""
+The quadrant and the full plane it is a quarter of, refined alike by
+[`rotating_refinement`](@ref), the third dimension `other` in both.
+"""
+function quadrant_and_full(::Val{D}; rotating, other, N) where {D}
+    z = outofplane(D, rotating)
+    inplane(d) = d in rotating
+    periodic = ntuple(d -> d == z && other === :periodic, D)
+    reflecting = ntuple(d -> (d == z && other === :reflect_lo, false), D)
+    quad = Forest(ntuple(_ -> 2, D); N=N, periodic=periodic, reflecting=reflecting,
+                  rotating=rotating, extents=ntuple(_ -> (0.0, 2.0), D))
+    full = Forest(ntuple(d -> inplane(d) ? 4 : 2, D); N=N, periodic=periodic,
+                  reflecting=reflecting,
+                  extents=ntuple(d -> inplane(d) ? (-2.0, 2.0) : (0.0, 2.0), D))
+    pred = rotating_refinement(D, rotating)
+    refine_where!(quad, pred, 2)
+    refine_where!(full, pred, 2)
+    return quad, full
+end
+
+"""
+Compare a quadrant with a rotating seam against the full plane holding
+the turned data explicitly, for the smooth [`rotating_data`](@ref) — a
+scalar and a vector, covariant under the quarter turn and not
+polynomial — with `centering`. Both are `NaN`-prefilled, filled and
+exchanged once, the outer faces through the hook from the same formula.
+Returns [`compare_matching_blocks`](@ref)'s `(worst, npoints)`, or
+`nothing` if the refinements failed to correspond.
+"""
+function rotating_vs_quadrupled(::Val{D}; rotating, centering::NTuple{D,Symbol},
+                                other=:periodic, N=8, p=4) where {D}
+    quad, full = quadrant_and_full(Val(D); rotating=rotating, other=other, N=N)
+    ops = Operators(prolongation=p, restriction=p)
+    G = ghosts_for(centering, p)
+    f = rotating_data(D, rotating, other)
+    parity = vector_parity(D, rotating, other)
+    fsq = FieldSet(quad, D + 1; G=G, centering=centering, parity=parity,
+                   rotation=vector_rotation(D, rotating))
+    fsf = FieldSet(full, D + 1; G=G, centering=centering, parity=parity)
+    for fs in (fsq, fsf)
+        fill!(fs.work, NaN)
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+    end
+    return compare_matching_blocks(fsq, fsf)
+end
+
+"""
+The same for a `RotationPair`: by default `a` face-centered normal to
+`d1`, holding `(B_{d1}, F_{d1})`, and `b` normal to `d2`, holding
+`(F_{d2}, B_{d2})` — the order swapped, so that the maps permute — with
+`B` and `F` the two covariant vector fields, `F` odd about a reflecting
+low face of the third dimension and `B` even. `Ca` and `Ga` give `a`
+another layout; `b`'s is its swap. The quadrant fills them as a pair,
+the full plane set by set. Returns `(worst, npoints, (sa, sb))`, or
+`nothing`.
+"""
+function rotating_pair_vs_quadrupled(::Val{D}; rotating, other=:periodic, N=8, p=4,
+                                     Ca=facecentered(D, rotating[1]),
+                                     Ga=ghosts_for(Ca, p)) where {D}
+    d1, d2 = rotating
+    swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+    Cb, Gb = swap(Ca), swap(Ga)
+    quad, full = quadrant_and_full(Val(D); rotating=rotating, other=other, N=N)
+    ops = Operators(prolongation=p, restriction=p)
+    field(x, k) = covariant_vector(x[d1], x[d2], k)
+    zf(x, odd) = outofplane_factor(x, D, rotating, other, odd)
+    B(x, e) = field(x, 1)[e] * zf(x, false)
+    F(x, e) = field(x, 2)[e] * zf(x, true)
+    fa(x, v) = v == 1 ? B(x, 1) : F(x, 1)            # (B_{d1}, F_{d1})
+    fb(x, v) = v == 1 ? F(x, 2) : B(x, 2)            # (F_{d2}, B_{d2})
+    z = outofplane(D, rotating)
+    parity(odd) = other === :reflect_lo ?
+                  [ntuple(d -> d != z ? NoParity : o ? OddParity : EvenParity, D)
+                   for o in odd] : nothing
+    qa = FieldSet(quad, 2; G=Ga, centering=Ca, parity=parity((false, true)),
+                  rotation=(-2, -1))
+    qb = FieldSet(quad, 2; G=Gb, centering=Cb, parity=parity((true, false)),
+                  rotation=(2, 1))
+    sa, sb = GhostSchedule(qa, ops), GhostSchedule(qb, ops)
+    for (fs, f) in ((qa, fa), (qb, fb))
+        fill!(fs.work, NaN)
+        fill_by_coordinates!(f, fs)
+    end
+    fill_ghosts!(RotationPair(qa, qb), (sa, sb);
+                 boundary=(boundary_by_coordinates(fa), boundary_by_coordinates(fb)))
+    worst, npoints = 0.0, 0
+    for (q, C, G, f, par) in ((qa, Ca, Ga, fa, (false, true)),
+                              (qb, Cb, Gb, fb, (true, false)))
+        fsf = FieldSet(full, 2; G=G, centering=C, parity=parity(par))
+        fill!(fsf.work, NaN)
+        fill_by_coordinates!(f, fsf)
+        fill_ghosts!(fsf, GhostSchedule(fsf, ops); boundary=boundary_by_coordinates(f))
+        result = compare_matching_blocks(q, fsf)
+        result === nothing && return nothing
+        worst = max(worst, result[1])
+        npoints += result[2]
+    end
+    return worst, npoints, (sa, sb)
+end

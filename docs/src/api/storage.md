@@ -1,7 +1,7 @@
 # Storage
 
-Block storage over all leaves, its centering and parity, and the views
-into it.
+Block storage over all leaves, its centering, parity and rotation, and
+the views into it.
 
 ```@docs
 FieldSet
@@ -19,5 +19,6 @@ closedview
 fill_by_coordinates!
 AllVariables
 Parity
+RotationPair
 KernelAbstractions.get_backend(::FieldSet)
 ```

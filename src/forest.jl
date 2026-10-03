@@ -276,11 +276,12 @@ rotating_dims(forest::Forest) =
 # M12 is built in steps (CODE.md, the M12 entry under "Milestones"). From
 # step 1 on the neighbor search finds the real leaves across a rotating
 # seam, but what reads from them learns their orientation only in later
-# steps; until then each such reader refuses a rotating forest, rather
-# than read across the seam as though it were an ordinary face. It takes
-# the forest or its `rotating_dims`: a build's argument checks run in a
-# closure (`collective_checks`), and one that captures the forest copies
-# it — `GhostSchedule`'s allocated 240 bytes more in `bench/ghosts.jl`.
+# steps — the ghost schedule in step 3 — and until then each such reader
+# refuses a rotating forest, rather than read across the seam as though
+# it were an ordinary face. It takes the forest or its `rotating_dims`: a
+# build's argument checks run in a closure (`collective_checks`), and one
+# that captures the forest copies it — `GhostSchedule`'s allocated 240
+# bytes more in `bench/ghosts.jl` when it refused this way.
 refuse_rotating(forest::Forest, what::AbstractString) =
     refuse_rotating(rotating_dims(forest), what)
 refuse_rotating(::Nothing, ::AbstractString) = nothing

@@ -44,15 +44,14 @@ using TreeAMR: oriented_neighbors, virtual_offset, real_direction, rotating_dims
     @test Forest((2, 2); N=4, rotating=(1, 2),
                  extents=((0.0f0, 1.0f0), (0.0f0, 1.0f0))).rotating == (1, 2)
 
-    # Until the schedule, the interface schedule, interpolation and the
-    # checkpoint learn the orientation, each refuses the seam rather
-    # than read across it as though it were an ordinary face.
+    # Until the interface schedule, interpolation and the checkpoint
+    # learn the orientation, each refuses the seam rather than read
+    # across it as though it were an ordinary face. (The ghost schedule
+    # learned it in step 3.)
     forest = Forest((2, 2); N=8, rotating=(1, 2))
-    fs = FieldSet(forest, 1; G=1)
-    ops = Operators(prolongation=4, restriction=4)
-    @test_throws "not implemented yet in this step of M12" GhostSchedule(fs, ops)
-    @test_throws "GhostSchedule over a rotating forest" GhostSchedule(fs, ops)
-    vs = FieldSet(forest, 1; G=0, centering=facecentered(2, 1))
+    fs = FieldSet(forest, 1; G=1, rotation=(1,))
+    vs = FieldSet(forest, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
+    @test_throws "not implemented yet in this step of M12" InterfaceSchedule(vs)
     @test_throws "InterfaceSchedule over a rotating forest" InterfaceSchedule(vs)
     @test_throws "interpolate over a rotating forest" interpolate(fs, [(0.5, 0.5)],
                                                                   Lagrange(2))
@@ -270,4 +269,304 @@ end
             @test TreeAMR.remote_neighbors(forest, range) == expected
         end
     end
+end
+
+# --- Steps 2 and 3: the field sets, and the ghosts across the seam ----------
+#
+# A ghost beyond the seam is the turned image of real data: read through
+# the quarter turn's axis map and the field set's signed variable map, in
+# the ordinary phases. Every claim is stated against data covariant under
+# the turn, written out by formula, and against the full plane the
+# quadrant folds, which holds the turned data explicitly.
+
+const ROT_OPS4 = Operators(prolongation=4, restriction=4)
+
+@testset "A field set's rotation is refused where it cannot turn the variables" begin
+    # A map that is not a quarter turn of the variables would fill the
+    # seam's ghosts with the wrong variable or the wrong sign, silently;
+    # it must be refused with the reason.
+    forest = Forest((2, 2); N=8, rotating=(1, 2))
+    @test_throws "needs `rotation`" FieldSet(forest, 3; G=1)
+    @test_throws "one entry per variable" FieldSet(forest, 3; G=1, rotation=(1, -3))
+    @test_throws "vector or tuple" FieldSet(forest, 1; G=1, rotation=1)
+    @test_throws "nonzero integer" FieldSet(forest, 1; G=1, rotation=(1.0,))
+    @test_throws "not a signed permutation" FieldSet(forest, 2; G=1, rotation=(1, 1))
+    @test_throws "not a signed permutation" FieldSet(forest, 2; G=1, rotation=(0, 2))
+    @test_throws "not a signed permutation" FieldSet(forest, 2; G=1, rotation=(1, 3))
+    # Four quarter turns are none: a three-cycle is not a turn of
+    # anything, and a sign that does not come back is not either.
+    @test_throws "turned four times is not the identity" FieldSet(forest, 3; G=1,
+                                                                  rotation=(2, 3, 1))
+    @test_throws "turned four times is not the identity" FieldSet(forest, 4; G=1,
+                                                                  rotation=(2, 3, 4, -1))
+    # A vector, either order of the pair, and an axial vector's pseudo
+    # sign are all quarter turns.
+    @test FieldSet(forest, 3; G=1, rotation=(1, -3, 2)).rotation == [1, -3, 2]
+    @test FieldSet(forest, 3; G=1, rotation=[1, 3, -2]).rotation == [1, 3, -2]
+    @test FieldSet(forest, 1; G=1, rotation=(-1,)).rotation == [-1]
+
+    # The mirror and the turn commute, so a variable and its image need
+    # one parity in a reflecting dimension.
+    octant = Forest((2, 2, 1); N=8, rotating=(1, 2),
+                    reflecting=((false, false), (false, false), (true, false)))
+    @test_throws "must have the same parity there" FieldSet(octant, 2; G=1,
+        rotation=(-2, 1), parity=[(NoParity, NoParity, EvenParity),
+                                  (NoParity, NoParity, OddParity)])
+    @test FieldSet(octant, 2; G=1, rotation=(-2, 1),
+                   parity=[(NoParity, NoParity, OddParity),
+                           (NoParity, NoParity, OddParity)]).rotation == [-2, 1]
+
+    # Over a forest without a seam the rotation may be omitted, and if
+    # given is checked for its shape and otherwise ignored, as parity is,
+    # so nothing written before M12 changes.
+    plain = Forest((2, 2); N=8)
+    @test FieldSet(plain, 1; G=1).rotation === nothing
+    @test FieldSet(plain, 1; G=1).rotvars === nothing
+    @test FieldSet(plain, 2; G=1, rotation=(2, 1)).rotvars === nothing
+    @test FieldSet(plain, 2; G=1, rotation=(2, 1)).factors === nothing
+    @test_throws "not a signed permutation" FieldSet(plain, 2; G=1, rotation=(2, 2))
+    # An asymmetric set's map is its partner's business, so a lone one is
+    # not judged by its fourth power.
+    @test FieldSet(forest, 3; G=(1, 2), rotation=(2, 3, 1)).rotation == [2, 3, 1]
+end
+
+@testset "The rotation tables compose the quarter turns and keep the parity columns" begin
+    # The kernel reads variable `rotvars[v, r+1]` and multiplies by the
+    # factor at column `mirror + 3^D·r`: a wrong composition puts the
+    # wrong component or sign two or three turns away, and a moved
+    # `r = 0` column would change every mirrored transfer of M10.
+    forest = Forest((2, 2, 1); N=8, rotating=(1, 2),
+                    reflecting=((false, false), (false, false), (true, false)))
+    parity = [(NoParity, NoParity, EvenParity), (NoParity, NoParity, EvenParity),
+              (NoParity, NoParity, EvenParity), (NoParity, NoParity, OddParity)]
+    fs = FieldSet(forest, 4; G=1, rotation=(1, -3, 2, 4), parity=parity)
+    @test size(fs.factors) == (4, 4 * 27)
+    @test fs.rotvars == Int32[1 1 1 1; 2 3 2 3; 3 2 3 2; 4 4 4 4]
+    nomirror(r) = fs.factors[:, 1 + 27r]
+    @test nomirror(0) == [1, 1, 1, 1]
+    @test nomirror(1) == [1, -1, 1, 1]           # vx′ = −vy, vy′ = vx
+    @test nomirror(2) == [1, -1, -1, 1]          # a half turn negates the plane
+    @test nomirror(3) == [1, 1, -1, 1]
+    # The mirror columns, block r = 0, are M10's table; a mirrored and
+    # turned column multiplies the two.
+    flat = Forest((2, 2, 1); N=8,
+                  reflecting=((false, false), (false, false), (true, false)))
+    @test fs.factors[:, 1:27] == FieldSet(flat, 4; G=1, parity=parity).factors
+    zmirror = TreeAMR.mirrorcolumn((0, 0, 1))
+    @test fs.factors[:, zmirror + 27] == [1, -1, 1, -1]
+    # A rotating forest without a reflecting face still has the table,
+    # for the signs; a forest with neither has none.
+    @test FieldSet(Forest((2, 2); N=8, rotating=(1, 2)), 1; G=1,
+                   rotation=(1,)).factors == ones(1, 36)
+end
+
+@testset "A RotationPair is refused unless its two sets turn into each other" begin
+    # The pair's tables read one set's data for the other's ghosts; a
+    # mismatched pair would read the wrong layout, variable or sign.
+    forest = Forest((2, 2); N=8, rotating=(1, 2))
+    Bx(; kw...) = FieldSet(forest, 1; G=(1, 2), centering=facecentered(2, 1),
+                           rotation=(-1,), kw...)
+    By(; kw...) = FieldSet(forest, 1; G=(2, 1), centering=facecentered(2, 2),
+                           rotation=(1,), kw...)
+    pair = RotationPair(Bx(), By())
+    @test pair isa RotationPair
+    @test pair.arotvars == Int32[1 1 1 1]
+    @test pair.afactors[1, 1 .+ 9 .* (0:3)] == [1, -1, -1, 1]
+    @test pair.bfactors[1, 1 .+ 9 .* (0:3)] == [1, 1, -1, -1]
+
+    other = Forest((2, 2); N=8, rotating=(1, 2))
+    @test_throws "over one forest" RotationPair(Bx(), FieldSet(other, 1; G=(2, 1),
+        centering=facecentered(2, 2), rotation=(1,)))
+    plain = Forest((2, 2); N=8)
+    @test_throws "needs a forest with a rotating seam" RotationPair(
+        FieldSet(plain, 1; G=(1, 2), centering=facecentered(2, 1)),
+        FieldSet(plain, 1; G=(2, 1), centering=facecentered(2, 2)))
+    @test_throws "each other's layout" RotationPair(Bx(), Bx())
+    @test_throws "each other's layout" RotationPair(Bx(), FieldSet(forest, 1; G=(1, 2),
+        centering=facecentered(2, 2), rotation=(1,)))
+    @test_throws "turns into itself" RotationPair(FieldSet(forest, 1; G=1, rotation=(1,)),
+                                                  FieldSet(forest, 1; G=1, rotation=(1,)))
+    @test_throws "same number of variables" RotationPair(Bx(), FieldSet(forest, 2;
+        G=(2, 1), centering=facecentered(2, 2), rotation=(1, 2)))
+    @test_throws "one element type" RotationPair(Bx(), FieldSet{Float32}(forest, 1;
+        G=(2, 1), centering=facecentered(2, 2), rotation=(1,)))
+    # Q_a Q_b a quarter turn of the variables themselves: its square is
+    # −I, not I.
+    @test_throws "Q_a Q_b Q_a Q_b are not the identity" RotationPair(
+        FieldSet(forest, 2; G=(1, 2), centering=facecentered(2, 1), rotation=(-2, 1)),
+        FieldSet(forest, 2; G=(2, 1), centering=facecentered(2, 2), rotation=(1, 2)))
+    octant = Forest((2, 2, 1); N=8, rotating=(1, 2),
+                    reflecting=((false, false), (false, false), (true, false)))
+    @test_throws "must have the same parity there" RotationPair(
+        FieldSet(octant, 1; G=(1, 2, 1), centering=facecentered(3, 1), rotation=(-1,),
+                 parity=[(NoParity, NoParity, EvenParity)]),
+        FieldSet(octant, 1; G=(2, 1, 1), centering=facecentered(3, 2), rotation=(1,),
+                 parity=[(NoParity, NoParity, OddParity)]))
+end
+
+# The centerings symmetric under exchanging the plane's two dimensions:
+# cell and vertex, and in 3D the two staggered along the third dimension
+# only, the face and the edge normal to and along it.
+function symmetric_centerings(D, rotating)
+    D == 2 && return [cellcentered(2), vertexcentered(2)]
+    z = outofplane(D, rotating)
+    return [cellcentered(3), vertexcentered(3), facecentered(3, z), edgecentered(3, z)]
+end
+
+@testset "Every ghost across the seam is defined and none is read undefined: D=$D" for
+        D in (2, 3)
+    # The seam reads real blocks elsewhere in the tree, at other levels,
+    # through the turn: a region read before it is written, or never
+    # written, stays `NaN`; a wrong axis map, variable or sign shows as a
+    # deviation from data the operators reproduce exactly. Three levels
+    # meet the seam side by side, and the axis, for every symmetric
+    # centering, both orders, and in 3D the third dimension periodic,
+    # outer (the hook's, across the seam's image too) and reflecting.
+    cases = D == 2 ? [((1, 2), :none), ((2, 1), :none)] :
+            [((1, 2), :periodic), ((1, 2), :outer), ((1, 2), :reflect_lo),
+             ((3, 1), :periodic), ((2, 3), :reflect_lo)]
+    bad = []
+    seen = Dict{Tuple{Symbol,Int},Int}()
+    # The staggered centerings are new kernels for each third dimension,
+    # and the suite is compilation-bound, so the other orders of the pair
+    # run cell and vertex only.
+    for (rot, other) in cases, p in (2, 4),
+        C in (rot == cases[1][1] ? symmetric_centerings(D, rot) :
+              [cellcentered(D), vertexcentered(D)])
+        nnan, worst, schedule = undefined_rotated_ghosts(Val(D); rotating=rot,
+                                                         other=other, C=C, p=p)
+        (nnan == 0 && worst < 1e-10) || push!(bad, (rot, other, C, p, nnan, worst))
+        mergewith!(+, seen, rotation_counts(schedule))
+    end
+    @test isempty(bad)
+    isempty(bad) || foreach(println, bad)
+    # Every kind of transfer crosses the seam, in every orientation, so
+    # the claim is not vacuous — but in 2D a half turn is only ever a
+    # copy: a region beyond both low faces belongs to the block at the
+    # axis, whose image there is itself. In 3D the half turn also reaches
+    # that block's neighbors along the third dimension, at other levels.
+    for kind in (:copy, :restrict, :prolong), r in 1:3
+        D == 2 && r == 2 && kind !== :copy && continue
+        @test get(seen, (kind, r), 0) > 0
+    end
+end
+
+@testset "A rotating quadrant reproduces the turned full plane: D=$D" for D in (2, 3)
+    # The definitional test, for data that is covariant under the turn
+    # and no polynomial: every stored point of the quadrant, ghosts
+    # included, equals the full plane's, which has no seam and holds the
+    # turned data written out. The refinement reaches the seam and the
+    # axis with three levels side by side.
+    cases = D == 2 ? [((1, 2), :none), ((2, 1), :none)] :
+            [((1, 2), :periodic), ((2, 1), :reflect_lo), ((3, 1), :outer)]
+    worst = 0.0
+    for (rot, other) in cases, C in (cellcentered(D), vertexcentered(D))
+        result = rotating_vs_quadrupled(Val(D); rotating=rot, centering=C, other=other)
+        @test result !== nothing
+        result === nothing && continue
+        w, npoints = result
+        @test npoints > 0
+        @test w < 1e-13
+        worst = max(worst, w)
+    end
+    println("rotating_vs_quadrupled D=$D: worst deviation $worst")
+end
+
+@testset "A RotationPair reproduces the turned full plane set by set: D=$D" for
+        D in (2, 3)
+    # B_x across the seam is −B_y: a pair fill reads each set's ghosts
+    # there out of the other, through the composed maps, with a
+    # prolongation free to read its partner's coarser ghosts. Face
+    # centering with G > 0 in the plane, with the variables stored in
+    # swapped orders so the maps permute, and a cell-centered pair whose
+    # ghost widths alone are swapped.
+    cases = D == 2 ? [((1, 2), :none), ((2, 1), :none)] :
+            [((1, 2), :reflect_lo), ((3, 2), :periodic)]
+    worst = 0.0
+    for (rot, other) in cases
+        for (Ca, Ga, p) in ((facecentered(D, rot[1]), nothing, 4),
+                            (cellcentered(D), ntuple(d -> d == rot[1] ? 2 : 1, D), 2))
+            G = Ga === nothing ? ghosts_for(Ca, p) : Ga
+            result = rotating_pair_vs_quadrupled(Val(D); rotating=rot, other=other, p=p,
+                                                 Ca=Ca, Ga=G)
+            @test result !== nothing
+            result === nothing && continue
+            w, npoints, (sa, sb) = result
+            @test npoints > 0
+            @test w < 1e-13
+            worst = max(worst, w)
+            # Each set's schedule partitions its own ghosts.
+            for s in (sa, sb)
+                @test occursin("rotated transfers", sprint(show, s))
+                @test hook_regions_leave(s)
+            end
+        end
+    end
+    println("RotationPair vs the full plane D=$D: worst deviation $worst")
+end
+
+@testset "The schedule partitions the ghosts across the seam: D=$D" for D in (2, 3)
+    # Every stored point outside the owned range is written exactly once,
+    # by a transfer — rotated or not — or by the hook, and the hook is
+    # handed only regions whose image leaves through an outer face. A
+    # double write would race; a gap would be stale.
+    cases = D == 2 ? [((1, 2), :none), ((2, 1), :none)] :
+            [((1, 2), :outer), ((1, 2), :reflect_lo), ((2, 3), :periodic)]
+    N = 8
+    for (rot, other) in cases
+        forest = rotating_forest(Val(D); rotating=rot, other=other, N=N)
+        d1, d2 = rot
+        swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+        layouts = [(C, ghosts_for(C, 4)) for C in symmetric_centerings(D, rot)]
+        Cf = facecentered(D, d1)
+        push!(layouts, (Cf, ghosts_for(Cf, 4)), (swap(Cf), swap(ghosts_for(Cf, 4))))
+        for (C, G) in layouts
+            fs = FieldSet(forest, D + 1; G=G, centering=C,
+                          rotation=vector_rotation(D, rot),
+                          parity=vector_parity(D, rot, other))
+            schedule = GhostSchedule(fs, ROT_OPS4)
+            counts = write_counts(schedule)
+            owned = ntuple(d -> (G[d] + 1):(G[d] + N), D)
+            ok = true
+            for b in 1:nleaves(forest), idx in CartesianIndices(size(counts)[1:D])
+                inside = all(d -> Tuple(idx)[d] in owned[d], 1:D)
+                counts[idx, b] == (inside ? 0 : 1) || (ok = false)
+            end
+            @test ok
+            @test hook_regions_leave(schedule)
+        end
+    end
+end
+
+@testset "An asymmetric set is refused alone where its ghosts are its partner's" begin
+    # Filled alone, a set whose layout is not symmetric in the plane would
+    # read its own data where its partner's belongs, the wrong component
+    # in the wrong layout; the plain fill refuses it and says what to do.
+    forest = rotating_forest(Val(2); rotating=(1, 2))
+    Bx = FieldSet(forest, 1; G=(1, 2), centering=facecentered(2, 1), rotation=(-1,))
+    By = FieldSet(forest, 1; G=(2, 1), centering=facecentered(2, 2), rotation=(1,))
+    sx, sy = GhostSchedule(Bx, ROT_OPS4), GhostSchedule(By, ROT_OPS4)
+    @test_throws "Fill it as a RotationPair" fill_ghosts!(Bx, sx)
+    @test_throws "not symmetric in the rotating seam's dimensions" fill_ghosts!(By, sy)
+    # One hook for both sets, or one each; and the schedules in order.
+    hook = CellBoundary((x, v, δ) -> zero(eltype(x)))
+    @test fill_ghosts!(RotationPair(Bx, By), (sx, sy); boundary=hook) isa RotationPair
+    @test_throws "a tuple of two" fill_ghosts!(RotationPair(Bx, By), (sx, sy);
+                                                boundary=(hook, hook, hook))
+    @test_throws "ghost width" fill_ghosts!(RotationPair(Bx, By), (sy, sx))
+    # A symmetric set needs no partner, and says how much it turns.
+    fs = FieldSet(forest, 3; G=2, rotation=(1, -3, 2))
+    s = GhostSchedule(fs, ROT_OPS4)
+    @test occursin("rotated transfers", sprint(show, s))
+    @test !occursin("mirrored", sprint(show, s))
+    @test fill_ghosts!(fs, s) === fs
+    # Off the seam nothing is said.
+    plain = FieldSet(Forest((2, 2); N=8), 1; G=2)
+    @test !occursin("rotated", sprint(show, GhostSchedule(plain, ROT_OPS4)))
+    # A set with no ghosts in the plane has nothing across the seam: a
+    # face-centered flux with G = 0 needs no partner, though no ghost
+    # schedule serves it (check_operators wants G ≥ 1 along a
+    # cell-centered dimension), and it is regridded without one.
+    flux = FieldSet(forest, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
+    @test flux.rotvars == Int32[1 1 1 1]
 end
