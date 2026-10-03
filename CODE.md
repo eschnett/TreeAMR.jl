@@ -5298,8 +5298,8 @@ split for it: its second half, M9b (visualization export), stays after
 M7. M9a's layout was chosen so that M7 need not change it, subject to
 M7's benchmarks (in the end it did change it: format version 2, M7 step
 6b). The list below is in execution order. M7 is done (2026-10-02).
-M12, the rotating symmetry, was added after it on 2026-10-03 and is
-being done now, so it comes before M9b, which follows it.
+M12, the rotating symmetry, was added after it on 2026-10-03 and done
+the same day, so it comes before M9b, which follows it.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -7716,7 +7716,7 @@ being done now, so it comes before M9b, which follows it.
       29 tests of the round trip and two new `buffered_flags`
       assertions. The thread-independence digests are unchanged. The
       docs build.
-- **M12 — Rotating symmetry.** *(Specified 2026-10-03; in progress.)*
+- **M12 — Rotating symmetry.** *(Specified 2026-10-03. Done 2026-10-03.)*
   A 90° rotating symmetry about the axis where the low faces of two
   dimensions meet: one quadrant of the plane is simulated, as Cactus's
   RotatingSymmetry90 does, for a spinning black hole, which no
@@ -8168,12 +8168,119 @@ being done now, so it comes before M9b, which follows it.
       112635 tests at one thread in 7m27 (`Pkg.test`; 112006 in 8m27
       after step 5), every one passing; the docs build, doctests
       included.
-  - **Step 8 — threads and device.**
-  - **Step 9 — measurements**, as listed above.
-  - **Step 10 — documentation and status.** The API pages and a guide
-    section with a doctest, README and the docs' status, a CLAUDE.md
-    architecture bullet, this entry marked *(Done.)*, and the release
-    note.
+  - **Step 8 — threads and device, and the wave.** *(Done, 2026-10-03.)*
+    - *The wave on a quadrant against the full plane*, the acceptance
+      test left from the list above (`test/rotate_tests.jl`,
+      `rotating_wave`): the scalar wave and a two-component vector wave,
+      state `(v_x, v_y, ∂ₜv_x, ∂ₜv_y)` with `rotation = (−2, 1, −4, 3)`,
+      on the quadrant of `quadrant_and_full` (refinement to level 2 along
+      both seam faces and at the axis) and on the full plane, order 4,
+      RK4 to a quarter period, the exact solution in the hook on the
+      outer faces of both. The exact solution is the sum of the four
+      turns of one standing mode with no symmetry of its own, summed as
+      `(t₀ + t₂) + (t₁ + t₃)`: at the turned point the terms come round
+      as `(t₁ + t₃) + (t₂ + t₀)`, the same bits, since floating-point
+      addition commutes; so the data is covariant bit for bit, and so is
+      its gradient, the vector. The Laplacian adds the two neighbours
+      before subtracting `2u₀`, which makes a point and its image compute
+      the same bits too. *Measured* (`N = 16`, 143 steps on both):
+      cell-centered, `linf` 0.0046035106829825 on the quadrant against
+      0.0046035106829834 on the plane, and every stored point, ghosts
+      included, within 1.9e-13 of the plane's (4.2e-13 for the vector).
+      Vertex-centered, `linf` agrees to the last bit, but the stored
+      points differ by 1.9e-4 (vector 3.2e-4), and that is the *full
+      plane's* fault: its solution is not covariant itself, by 2.0e-3
+      (3.7e-3) under a turn, because which block owns the shared plane
+      of a coarse-fine face — the one above it — does not turn with the
+      mesh, so a plane the coarse block evolves becomes, a half turn
+      away, one the fine block evolves. The quadrant is covariant by
+      construction; the test asserts it within the plane's own defect.
+      The vertex-centered quadrant owns both seam planes, `x = 0` and
+      `y = 0`, which are the same 63 points under the turn: after the
+      evolution they are equal **bit for bit**, scalar and vector. Rates
+      on the quadrant over `N = 8, 16, 32`, `l2` and `linf`: cell 2.04
+      and 2.01 (scalar), 2.02 and 2.00 (vector); vertex 2.04 and 2.00,
+      2.02 and 2.00. The two testsets take about 12 s, mostly
+      compilation.
+    - *Threads.* `thread_workload.jl` gained two rotating quadrants,
+      cell-centered with `G = 2` (`D2ocq`) and vertex-centered with
+      `G = 1` (`D2ovq`): a ring about the axis, so that the refinement
+      reaches both seam faces and the axis, through the adapt, evolve,
+      regrid, evolve cycle, interpolation over the whole plane, and a
+      face-centered `RotationPair` filled as a pair (39 rotated
+      transfers in the final schedule). Its output is the same at one
+      thread and at four; the script takes 26.7 and 25.4 s.
+    - *Device.* `gpu_tests.jl` gained a rotating fill — the `NaN` test
+      of `undefined_rotated_ghosts`, cell and vertex, in 2D and in 3D
+      over a reflecting low face, and a face-centered pair against the
+      CPU — and interpolation through the seam against the host. The
+      oracles' formulas had to be made device-clean: their constants are
+      now converted to the argument's real type (`literal`), the data
+      closure carries the third dimension's kind as a `Val` (a `Symbol`
+      is not plain data), and `outofplane` no longer builds a `Set`;
+      `Float64` results are unchanged bit for bit. On this laptop's
+      Metal GPU (`Float32`, a scratch environment that develops this
+      checkout and adds Metal): the rotating testsets pass, 23 tests on
+      Metal and 46 on the CPU in 43 s, compilation included, and the
+      `NaN` fill reproduces the polynomial data to 3.6e-7 in 2D and
+      8.3e-7 in 3D on Metal, as on the CPU in `Float32`.
+      `mpi_device_workload.jl` gained a rotating quadrant (`Q2v`, 15
+      leaves, the vertex-centered wave) and a face-centered pair
+      (`QP2`); `mpi_device_tests.jl` passes on Metal, 60 tests in 1m59
+      (serial 35 s, `-n 2` 41 s, `-n 3` 42 s; 1m45 before M12), with 8
+      staged messages for `Q2v` and 16 for `QP2` at `-n 3`.
+  - **Step 9 — measurements**, as listed above. *(Done, 2026-10-03.)*
+    All on the laptop (Apple silicon, 12 cores), Julia 1.13.1 unless
+    stated.
+    - *The ordinary fill.* `bench/ghosts.jl` at `-t 4` with its defaults
+      (`D = 3`, `N = 8`, 4 roots, 10 variables, `p = 4`), this checkout
+      against a pristine copy of 0.1.6 with the same manifest, run
+      alternately twice each; seconds and bytes per call:
+
+      | | 0.1.6 | M12 |
+      |---|---|---|
+      | uniform `fill_ghosts` | 0.641, 0.635 ms; 50208 B | 0.516, 0.517 ms; 50208 B |
+      | uniform `ghost_schedule` | 0.217, 0.219 ms; 441888 B | 0.143, 0.141 ms; 406592 B |
+      | two-level `fill_ghosts` | 3.81, 3.77 ms; 310144 B | 3.53, 3.53 ms; 310144 B |
+      | two-level `ghost_schedule` | 2.52, 2.50 ms; 4976688 B | 1.86, 1.87 ms; 4653648 B |
+
+      A fill allocates exactly what it did, and it is not slower: 19 %
+      and 7 % faster in these runs, a difference not investigated (step
+      3 measured the fills equal, 0.52 against 0.51 ms, on a quieter
+      machine). The schedule builds are 8 % and 6 % smaller and 35 % and
+      26 % faster, from step 3's function barrier (`local_groups`).
+    - *The quadrant against the full plane*: step 8, and the single
+      fills of steps 3–5.
+    - *The suite.* 112715 tests at one thread in 7m52 (`Pkg.test`, 8m01
+      wall clock) and 112767 at eight threads in 7m33 (7m43), every one
+      passing, against 110606 in 6m32 and 110658 in 6m28 after M7. On
+      Julia 1.11.9, on a copy without manifests (the procedure in
+      `CLAUDE.md`): 112715 tests in 8m09, every one passing. M12 added
+      about 2100 tests; `rotate_tests.jl` holds 1421 of them and takes
+      about 56 s alone at four threads, nearly all compilation.
+    - *Downstream*, each in a scratch copy whose `Project.toml` and
+      `test/Project.toml` name this checkout under `[sources]`, the real
+      repositories untouched: TreeWave 310 tests in 1m17 (1m22 against
+      M7), TreeHydro 12447 tests in 5m08 (5m00), both at one thread and
+      all passing; neither uses the seam. TreeGeneralizedHarmonic's
+      suite takes about 19 minutes, so only its `prerequisite_tests.jl`,
+      which names the unexported TreeAMR functions it relies on, was run:
+      52 tests, passing.
+  - **Step 10 — documentation and status.** *(Done, 2026-10-03.)* The
+    `rotating` keyword is documented in `Forest`'s docstring and
+    `rotation` in `FieldSet`'s, both already on their pages, and
+    `RotationPair` is on the storage page; the guide gained a section,
+    "Rotating symmetry", with a doctest of a quadrant, a velocity's map
+    and a face-centered pair; README and the guide's status say M12;
+    `CLAUDE.md` gained the architecture bullet "Rotating seams are
+    oriented transfers", the oracles and the workloads in its tests
+    paragraph, and the new timings. The docs build, doctests included.
+    The repository keeps no changelog, so the release note waits for
+    the release itself: M12 is additive — the keywords `rotating` and
+    `rotation`, the export `RotationPair`, the pair forms of
+    `fill_ghosts!`, `regrid!` and `adapt_to_initial_data!`, and a
+    checkpoint feature that only a rotating forest writes — so it is a
+    `0.1.x` release.
 - **M9b — Visualization export.** *(Split from M9, "I/O and
   visualization", on 2026-09-29, when its checkpoint half became M9a;
   not designed.)* After M7. The candidates:
