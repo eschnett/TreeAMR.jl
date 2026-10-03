@@ -39,8 +39,9 @@
 # differ from the host's by an ulp. The cases are a subset of
 # `mpi_workload.jl`'s, enough to cross every kind of stage on the device:
 # the wave on three levels with the hook, a reflecting box with an odd
-# variable (the `−0` case), and a 3D periodic mesh, each filled and
-# stepped with RK4; Burgers with the interface fixup; and regrids — the
+# variable (the `−0` case), a rotating quadrant (M12), and a 3D periodic
+# mesh, each filled and stepped with RK4; a face-centered `RotationPair`
+# on the quadrant, filled as a pair; Burgers with the interface fixup; and regrids — the
 # tracked pulse through `firing_boxes` on the device, and a refinement of
 # the first blocks and its coarsening, which move blocks up and down the
 # ranks and coarsen siblings with different owners.
@@ -106,9 +107,11 @@ todev(a::AbstractArray) = (d = allocate(BACKEND, eltype(a), size(a)); copyto!(d,
 # A forest whose coordinates are of the element type, so that every
 # callback computes in `T` on the device; refined twice around `centre`.
 function forest_of(roots::NTuple{D,Int}, N; periodic=ntuple(_ -> false, D),
-                   reflecting=ntuple(_ -> (false, false), D), centre=nothing) where {D}
+                   reflecting=ntuple(_ -> (false, false), D), rotating=nothing,
+                   centre=nothing) where {D}
     forest = Forest(roots; N=N, periodic=periodic, reflecting=reflecting,
-                    extents=ntuple(d -> (zero(T), T(roots[d])), D), comm=COMM)
+                    rotating=rotating, extents=ntuple(d -> (zero(T), T(roots[d])), D),
+                    comm=COMM)
     centre === nothing && return forest
     for lvl in 0:1
         r = 0.6 / 2^lvl
@@ -208,8 +211,9 @@ function pulse(x0::NTuple{D}, σ) where {D}
 end
 
 function wave_case(tag, forest::Forest{D}; G, centering, ops, steps,
-                   parity=nothing) where {D}
-    fs = FieldSet{T}(forest, 2; G=G, centering=centering, parity=parity, backend=BACKEND)
+                   parity=nothing, rotation=nothing) where {D}
+    fs = FieldSet{T}(forest, 2; G=G, centering=centering, parity=parity,
+                     rotation=rotation, backend=BACKEND)
     initial = pulse(ntuple(d -> 0.37 * forest.roots[d] + 0.05d, D), 0.3)
     boundary = hasouter(forest) ? boundary_by_coordinates(initial) : nothing
     fill_by_coordinates!(initial, fs)
@@ -227,6 +231,27 @@ function wave_case(tag, forest::Forest{D}; G, centering, ops, steps,
     emit(tag, "work", digest(gathered(forest, fs.work)))
     reductions(tag, fs, u)
     emit("#", tag, "stages", staging(forest, sched.stages)...)
+    return nothing
+end
+
+# A face-centered `RotationPair` on a rotating quadrant (M12), filled as a
+# pair: odd turns read the partner's array, and a message's pack permutes
+# while its unpack signs. `B = (−x₂, x₁) + (x₁, x₂)|x|²`, covariant under
+# the turn, so that the turned ghosts are smooth.
+function rotating_pair_case(tag, forest::Forest{D}; ops) where {D}
+    Ca, Cb = facecentered(D, 1), facecentered(D, 2)
+    G(C) = ntuple(d -> C[d] === :vertex ? 1 : 2, D)
+    a = FieldSet{T}(forest, 1; G=G(Ca), centering=Ca, rotation=(-1,), backend=BACKEND)
+    b = FieldSet{T}(forest, 1; G=G(Cb), centering=Cb, rotation=(1,), backend=BACKEND)
+    fa = (x, v) -> -x[2] + x[1] * (x[1] * x[1] + x[2] * x[2])
+    fb = (x, v) -> x[1] + x[2] * (x[1] * x[1] + x[2] * x[2])
+    fill_by_coordinates!(fa, a)
+    fill_by_coordinates!(fb, b)
+    sa, sb = GhostSchedule(a, ops), GhostSchedule(b, ops)
+    fill_ghosts!(RotationPair(a, b), (sa, sb);
+                 boundary=(boundary_by_coordinates(fa), boundary_by_coordinates(fb)))
+    emit(tag, "filled", digest(gathered(forest, a.work)), digest(gathered(forest, b.work)))
+    emit("#", tag, "stages", staging(forest, vcat(sa.stages, sb.stages))...)
     return nothing
 end
 
@@ -454,6 +479,12 @@ function main()
     wave_case("R2c", forest_of((3, 3), 8; reflecting=((true, false), (true, false)),
                                centre=(0.4, 0.5)); G=2, centering=cellcentered(2),
               ops=Operators(prolongation=4, restriction=4), steps=4, parity=parity)
+    # A rotating quadrant (M12): the turned transfers on the device and
+    # across ranks, a scalar and a face-centered pair.
+    rotating = forest_of((3, 3), 8; rotating=(1, 2), centre=(0.3, 0.4))
+    wave_case("Q2v", rotating; G=1, centering=vertexcentered(2),
+              ops=Operators(prolongation=4, restriction=4), steps=4, rotation=(1, 2))
+    rotating_pair_case("QP2", rotating; ops=Operators(prolongation=4, restriction=4))
     wave_case("W3c", forest_of((2, 2, 2), 4; periodic=(true, true, true),
                                centre=(0.7, 0.8, 1.2)); G=1, centering=cellcentered(3),
               ops=Operators(prolongation=2, restriction=2), steps=3)

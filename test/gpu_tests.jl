@@ -204,6 +204,74 @@ end
     end
 end
 
+@testset "$bname: a rotating seam is filled on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
+    # M12. Turned transfers are ordinary groups too, read through the
+    # axis map and the variable table, both of which travel to the
+    # device with the factor table; a pair's odd turns read the
+    # partner's array. The NaN-prefilled fill of `undefined_rotated_ghosts`
+    # checks that nothing is left unwritten or read before it is written
+    # in the device's own launch order, and the polynomial data that no
+    # turn, sign or variable went astray; the pair must land on the
+    # CPU's numbers.
+    # (The CPU runs the same fills, and more, in `rotate_tests.jl`; one
+    # third dimension here, the reflecting one, which brings the parity
+    # columns in beside the turns, keeps this file's cost down.)
+    others = D == 2 ? (:periodic,) : (:reflect_lo,)
+    for other in others, C in (cellcentered(D), vertexcentered(D))
+        nnan, worst, s = undefined_rotated_ghosts(Val(D); rotating=(1, 2), other=other,
+                                                  C=C, p=4, T=T, backend=backend)
+        @test nnan == 0
+        @test worst < 16 * gputol(T)
+        @test any(g -> g.orientation != 0, s.phase1)
+    end
+    Ca, Cb = facecentered(D, 1), facecentered(D, 2)
+    fa = (x, v) -> covariant_vector(x[1], x[2], v; poly=4)[1]
+    fb = (x, v) -> covariant_vector(x[1], x[2], 3 - v; poly=4)[2]
+    hook = (boundary_by_coordinates(fa), boundary_by_coordinates(fb))
+    works = map((CPU(), backend)) do bk
+        forest = rotating_forest(Val(D); rotating=(1, 2), T=T)
+        a = FieldSet{T}(forest, 2; G=ghosts_for(Ca, 4), centering=Ca,
+                        rotation=(-2, -1), backend=bk)
+        b = FieldSet{T}(forest, 2; G=ghosts_for(Cb, 4), centering=Cb,
+                        rotation=(2, 1), backend=bk)
+        fill!(a.work, T(NaN))
+        fill!(b.work, T(NaN))
+        fill_by_coordinates!(fa, a)
+        fill_by_coordinates!(fb, b)
+        ops = Operators(prolongation=4, restriction=4)
+        fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops));
+                     boundary=hook)
+        (Array(a.work), Array(b.work))
+    end
+    for (host, dev) in zip(works...)
+        @test count(isnan, dev) == 0
+        @test maximum(abs, host - dev) < gputol(T) * maximum(abs, host)
+    end
+end
+
+@testset "$bname: interpolation through a rotating seam agrees with the host: T=$T" for
+        (bname, backend, types) in BACKENDS, T in types
+    # M12. The kernel folds a point beyond the seam back, reads the
+    # turned variable and sign, and exchanges the derivatives for an odd
+    # turn; the device must give the host's numbers over the whole
+    # plane, three quarters of the points turned.
+    f = rotating_data(2, (1, 2), :periodic; poly=4)
+    xs = [ntuple(d -> T((13j + 5d) % 97 // 97) * T(4) - T(2), 2) for j in 1:97]
+    derivs = ((0, 0), (1, 0), (0, 1))
+    results = map((CPU(), backend)) do bk
+        forest = rotating_forest(Val(2); rotating=(1, 2), T=T)
+        fs = FieldSet{T}(forest, 3; G=2, rotation=vector_rotation(2, (1, 2)), backend=bk)
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                     boundary=boundary_by_coordinates(f))
+        r = interpolate(fs, TreeAMR.todevice(bk, xs), Lagrange(4); derivs=derivs)
+        @test typeof(get_backend(r.values)) === typeof(bk)
+        Array(r.values)
+    end
+    @test maximum(abs, results[1] - results[2]) < gputol(T) * maximum(abs, results[1])
+end
+
 @testset "$bname: point interpolation agrees with the host: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # One kernel per batch, reading the leaves, the geometry, the parity

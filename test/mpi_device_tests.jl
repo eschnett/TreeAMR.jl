@@ -97,7 +97,7 @@ numbers(lines, words...) =
         # Every stage with messages went through host mirrors on a device
         # that is not handed to MPI directly, and none did otherwise.
         stages = [l for l in out if occursin(" stages messages ", l)]
-        @test length(stages) == 5
+        @test length(stages) == 7
         for l in stages
             w = split(l)
             messages, staged = parse(Int, w[end - 2]), parse(Int, w[end])

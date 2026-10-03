@@ -885,8 +885,12 @@ end
 # is `R(a, b) = (−b, a)`; the quadrant spans `[0, 2]` in the plane and the
 # full plane `[−2, 2]`.
 
-"""The dimension outside the plane `rotating` in 3D, or 0 in 2D."""
-outofplane(D, rotating) = D == 2 ? 0 : only(setdiff(1:D, rotating))
+"""
+The dimension outside the plane `rotating` in 3D, or 0 in 2D: by
+arithmetic rather than `setdiff`, which allocates a `Set` that a device
+kernel evaluating the data cannot.
+"""
+outofplane(D, rotating) = D == 2 ? 0 : 6 - rotating[1] - rotating[2]
 
 """
 The signed map of a quarter turn for a scalar followed by a vector's
@@ -919,18 +923,22 @@ part `ρ(a, b)` and a swirl `σ(−b, a)`, with `ρ` and `σ` invariant under
 the turn, as `(v_a, v_b)`. Invariants are functions of `a² + b²` and of
 `χ = ab(a² − b²)`, which the turn keeps and a mirror negates, so the
 field is covariant under rotations and not under reflections.
-`poly = p` keeps it a polynomial of degree `< p` per dimension.
+`poly = p` keeps it a polynomial of degree `< p` per dimension, computed
+in the type of `a`, so that a `Float32` device can evaluate it.
 """
 function covariant_vector(a, b, k::Int; poly::Int=0)
+    c = literal(a)
     if poly > 0
         ρ2 = poly > 2 ? a^2 + b^2 : zero(a)
-        radial = (k == 1 ? 0.8 : -0.5) + 0.25 * ρ2
-        swirl = (k == 1 ? -0.6 : 0.9) + 0.15 * ρ2
+        radial = c(k == 1 ? 0.8 : -0.5) + c(0.25) * ρ2
+        swirl = c(k == 1 ? -0.6 : 0.9) + c(0.15) * ρ2
     else
         ρ2 = a * a + b * b
         χ = a * b * (a * a - b * b)
-        radial = k == 1 ? sin(0.9 * ρ2) + 0.5 : cos(0.7 * ρ2) - 0.2 * sin(0.4 * χ)
-        swirl = k == 1 ? 0.7 * cos(0.6 * ρ2) + 0.3 * sin(0.5 * χ) : exp(-0.3 * ρ2)
+        radial = k == 1 ? sin(c(0.9) * ρ2) + c(0.5) :
+                 cos(c(0.7) * ρ2) - c(0.2) * sin(c(0.4) * χ)
+        swirl = k == 1 ? c(0.7) * cos(c(0.6) * ρ2) + c(0.3) * sin(c(0.5) * χ) :
+                exp(c(-0.3) * ρ2)
     end
     return radial * a - swirl * b, radial * b + swirl * a
 end
@@ -939,14 +947,16 @@ end
 The quarter-turn-invariant scalar at `(a, b)`, chiral like the vectors.
 """
 function invariant_scalar(a, b; poly::Int=0)
+    c = literal(a)
     if poly > 0
         ρ2 = poly > 2 ? a^2 + b^2 : zero(a)
         χ = poly > 3 ? a^3 * b - a * b^3 : zero(a)
-        return 1.3 + 0.4 * ρ2 + 0.1 * χ
+        return c(1.3) + c(0.4) * ρ2 + c(0.1) * χ
     end
     ρ2 = a * a + b * b
     χ = a * b * (a * a - b * b)
-    return exp(-0.4 * ρ2) + 0.3 * sin(0.7 * χ) + 0.2 * cos(0.5 * (a^4 - 6a^2 * b^2 + b^4))
+    return exp(c(-0.4) * ρ2) + c(0.3) * sin(c(0.7) * χ) +
+           c(0.2) * cos(c(0.5) * (a^4 - 6a^2 * b^2 + b^4))
 end
 
 """
@@ -960,17 +970,27 @@ function outofplane_factor(x, D, rotating, other, odd::Bool; poly::Int=0)
     D == 2 && return one(eltype(x))
     t = x[outofplane(D, rotating)]
     keep(e) = poly == 0 || e < poly
+    c = literal(t)
     if poly > 0
-        other === :periodic && return odd ? 0.5 : 1.0
+        z = zero(t)
+        other === :periodic && return c(odd ? 0.5 : 1.0)
         other === :outer &&
-            return 0.4 + 0.3t + (keep(2) ? 0.2t^2 : 0.0) + (keep(3) ? 0.05t^3 : 0.0)
-        return odd ? 0.7t + (keep(3) ? 0.2t^3 : 0.0) : 0.5 + (keep(2) ? 0.3t^2 : 0.0)
+            return c(0.4) + c(0.3) * t + (keep(2) ? c(0.2) * t^2 : z) +
+                   (keep(3) ? c(0.05) * t^3 : z)
+        return odd ? c(0.7) * t + (keep(3) ? c(0.2) * t^3 : z) :
+               c(0.5) + (keep(2) ? c(0.3) * t^2 : z)
     end
     other === :periodic &&
-        return odd ? 0.6 + 0.3sin(π * t + 0.4) : 1 + 0.3sin(π * t + 0.2)
-    other === :outer && return 1 + 0.3sin(1.7t + 0.2)
-    return odd ? sin(1.3t) : cos(1.1t) + 0.5
+        return odd ? c(0.6) + c(0.3) * sin(π * t + c(0.4)) :
+               1 + c(0.3) * sin(π * t + c(0.2))
+    other === :outer && return 1 + c(0.3) * sin(c(1.7) * t + c(0.2))
+    return odd ? sin(c(1.3) * t) : cos(c(1.1) * t) + c(0.5)
 end
+
+# The formulas' constants in the real type of their argument, so that a
+# `Float32` device evaluates them without `Float64`: the identity for
+# `Float64`, and for the complex step, whose real type is `Float64`.
+literal(a) = y -> convert(real(typeof(a)), y)
 
 """
 A scalar and a covariant vector, as [`vector_rotation`](@ref) orders
@@ -980,20 +1000,24 @@ degree `< p` per dimension, which order-`p` operators reproduce exactly.
 function rotating_data(D, rotating, other; poly::Int=0)
     d1, d2 = rotating
     z = outofplane(D, rotating)
+    kind = Val(other)           # a `Symbol` is not plain data; a device kernel takes this
     return function (x, v)
+        o = valsymbol(kind)
         a, b = x[d1], x[d2]
         v == 1 && return invariant_scalar(a, b; poly=poly) *
-                         outofplane_factor(x, D, rotating, other, false; poly=poly)
+                         outofplane_factor(x, D, rotating, o, false; poly=poly)
         e = v - 1                                    # the component along e
         if e == z
-            return (0.9 + 0.2 * invariant_scalar(a, b; poly=min(poly, 3))) *
-                   outofplane_factor(x, D, rotating, other, true; poly=poly)
+            c = literal(a)
+            return (c(0.9) + c(0.2) * invariant_scalar(a, b; poly=min(poly, 3))) *
+                   outofplane_factor(x, D, rotating, o, true; poly=poly)
         end
         va, vb = covariant_vector(a, b, 1; poly=poly)
-        return (e == d1 ? va : vb) * outofplane_factor(x, D, rotating, other, false;
-                                                       poly=poly)
+        return (e == d1 ? va : vb) * outofplane_factor(x, D, rotating, o, false; poly=poly)
     end
 end
+
+valsymbol(::Val{S}) where {S} = S
 
 """
 The refinement both the quadrant and the full plane get: symmetric under
@@ -1037,22 +1061,23 @@ data is reproduced exactly, so a wrong axis map, a wrong variable or a
 wrong sign shows as a deviation.
 """
 function undefined_rotated_ghosts(::Val{D}; rotating, other, C, p, T::Type=Float64,
-                                  N=8) where {D}
+                                  N=8, backend=CPU()) where {D}
     forest = rotating_forest(Val(D); rotating=rotating, other=other, T=T, N=N)
     f = rotating_data(D, rotating, other; poly=p)
     fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C,
                      rotation=vector_rotation(D, rotating),
-                     parity=vector_parity(D, rotating, other))
+                     parity=vector_parity(D, rotating, other), backend=backend)
     fill!(fs.work, T(NaN))
     fill_by_coordinates!(f, fs)
     schedule = GhostSchedule(fs, Operators(prolongation=p, restriction=p))
     fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
-    nnan = count(isnan, fs.work)
+    work = Array(fs.work)
+    nnan = count(isnan, work)
     worst = 0.0
-    for b in 1:nblocks(fs), idx in CartesianIndices(size(fs.work)[1:D])
+    for b in 1:nblocks(fs), idx in CartesianIndices(size(work)[1:D])
         x = coordinates(fs, b, Tuple(idx))
         for v in 1:fs.nvars
-            worst = max(worst, Float64(abs(fs.work[idx, v, b] - f(x, v))))
+            worst = max(worst, Float64(abs(work[idx, v, b] - f(x, v))))
         end
     end
     return nnan, worst, schedule
