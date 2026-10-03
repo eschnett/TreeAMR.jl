@@ -526,8 +526,8 @@ function completed_leaves(forest::Forest{D}, marks::Vector{RegridFlag}) where {D
     # its own, so it has no buffer pool, and would make its own if it
     # exchanged anything.
     scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
-                             forest.extents, forest.N, candidate, ForestState(),
-                             forest.comm)
+                             forest.rotating, forest.extents, forest.N, candidate,
+                             ForestState(), forest.comm)
     balance!(scratch)
     return scratch.leaves
 end

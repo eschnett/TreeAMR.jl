@@ -1147,7 +1147,9 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # The build is collective over a distributed forest (M7): the ranks
     # agree that their forests and layouts are the same, and a refusal
     # on any of them is raised on all of them.
+    seam = rotating_dims(forest)        # not the forest: see `refuse_rotating`
     checked = collective_checks(forest, "GhostSchedule") do
+        refuse_rotating(seam, "GhostSchedule")
         gs = ghostwidths(G, Val(D))
         cs = centerings(centering, Val(D))
         ss = staggers(cs)

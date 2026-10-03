@@ -53,7 +53,8 @@ using CRC32c: crc32c
 using TreeAMR
 using TreeAMR: threaded_foreach, tohost, samebackend, Communicator, commrank, commsize,
                allgather, allgatherv, bcast, commnodes, isend, irecv, waitall,
-               equalsplit, equalsplit_part, ForestDigest, digest_verdict, layouthash
+               equalsplit, equalsplit_part, ForestDigest, digest_verdict, layouthash,
+               refuse_rotating
 import TreeAMR: save_checkpoint, load_checkpoint, write_plain, read_plain,
                 checkpoint_environment
 
@@ -1198,6 +1199,7 @@ function check_save(forest, fieldsets, application, filters, io)
         "application evolves, as `name => (fs, u)` pairs, or `()` for none. Which sets " *
         "are state and which are scratch, rebuilt every step, is the application's to " *
         "say."))
+    refuse_rotating(forest, "save_checkpoint")
     appname, appversion = check_application(application)
     sets = collect_fieldsets(fieldsets, forest)
     storage_of(floattype(forest), "the forest's geometry")

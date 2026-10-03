@@ -636,6 +636,7 @@ end
         box = Mailbox()
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                           reflecting=serial.reflecting, extents=serial.extents,
+                          rotating=TreeAMR.rotating_dims(serial),
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]
         sets = map(forests) do forest
@@ -700,6 +701,7 @@ end
     box = Mailbox()
     forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                       reflecting=serial.reflecting, extents=serial.extents,
+                      rotating=TreeAMR.rotating_dims(serial),
                       leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                for r in 0:(P - 1)]
     @test count(f -> isempty(blockrange(f)), forests) == 1

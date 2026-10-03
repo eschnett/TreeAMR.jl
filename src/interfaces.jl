@@ -129,7 +129,9 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     stags = staggers(fs)
     backend = get_backend(fs.work)
     # Collective over a distributed forest (M7), as `GhostSchedule` is.
+    seam = rotating_dims(forest)        # not the forest: see `refuse_rotating`
     faces::Vector{Int} = collective_checks(forest, "InterfaceSchedule") do
+        refuse_rotating(seam, "InterfaceSchedule")
         fd = filter(d -> stags[d] == 1, collect(1:D))
         isempty(fd) && throw(ArgumentError(
             "a cell-centered field set has no coarse-fine interface to restrict: the " *

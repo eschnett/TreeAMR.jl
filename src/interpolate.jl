@@ -726,6 +726,7 @@ end
 # Every argument check of `interpolate!`, returning the checked `derivs`.
 function check_interpolation(values, excluded, fs::FieldSet{T,D}, xs, basis, derivs,
                              vars) where {T,D}
+    refuse_rotating(fs.forest, "interpolate")
     ms = check_derivs(basis, derivs, Val(D))
     check_stencil_fits(fs, basis)
     all(v -> 1 <= v <= fs.nvars, vars) || throw(ArgumentError(

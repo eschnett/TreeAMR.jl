@@ -47,6 +47,7 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
     nvars = length(EXCHANGE_PARITY)
     forest = Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=serial.reflecting, extents=serial.extents,
+                       rotating=TreeAMR.rotating_dims(serial),
                        leaves=serial.leaves)
     fs = FieldSet{T}(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
     copyto!(fs.work, exchange_data(MersenneTwister(5), T, size(fs.work)))
@@ -363,6 +364,7 @@ end
     end
     reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=serial.reflecting, extents=serial.extents,
+                       rotating=TreeAMR.rotating_dims(serial),
                        leaves=serial.leaves)
     sfs = sets(reference)
     alldata = map(enumerate(sfs)) do (i, fs)
@@ -380,6 +382,7 @@ end
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             owned = blockrange(forest)
             fss = sets(forest)
@@ -409,6 +412,7 @@ end
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = first(sets(forest))
             fs.work .= 1
@@ -476,6 +480,7 @@ TreeAMR.waitall(c::StagingCommunicator, requests::AbstractVector) =
     G = exchange_ghosts(C, PointValue)
     rebuilt(comm) = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                            reflecting=serial.reflecting, extents=serial.extents,
+                           rotating=TreeAMR.rotating_dims(serial),
                            leaves=serial.leaves, comm=comm)
     reference = rebuilt(nothing)
     sfs = FieldSet(reference, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)

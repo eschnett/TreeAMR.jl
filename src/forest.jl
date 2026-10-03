@@ -39,6 +39,17 @@ leaf-only linear octree.
   mirrored transfers. The faces that are neither periodic nor reflecting
   are *outer* faces, and belong to the boundary hook of
   [`fill_ghosts!`](@ref).
+- `rotating = (d1, d2)` declares a **rotating seam** (M12): only one
+  quadrant of the `(d1, d2)` plane is simulated, and the other three are
+  its images under quarter turns about the line where the low faces of
+  `d1` and `d2` meet. The rotation `R` takes `e_{d1}` to `e_{d2}` and
+  `e_{d2}` to `-e_{d1}`, so the order of the pair fixes its sense. Unlike
+  a reflecting face, the tree sees the seam: the low face of `d1` is
+  glued to the low face of `d2`, [`neighbor_keys`](@ref) finds the real
+  leaves across it, and [`balance!`](@ref) keeps the leaves on either
+  side of it at one level (*conformity*). The two dimensions must have
+  as many roots as each other and be neither periodic nor reflecting;
+  their high faces stay outer. See "Rotating seams" in `CODE.md`.
 - `N` is the per-block interior size, and it is even: cells are the
   tree's geometry, so `N` belongs here. The ghost width `G` does **not**
   — it says how far a stencil reaches into a neighbor's data, which is a
@@ -53,7 +64,7 @@ leaf-only linear octree.
 Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
-    Forest(roots; N, periodic=all false, reflecting=all false,
+    Forest(roots; N, periodic=all false, reflecting=all false, rotating=nothing,
            extents=one unit per root, leaves=nothing, comm=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
 
@@ -64,8 +75,8 @@ the new forest is at [`generation`](@ref) 0. That is how a checkpoint
 is restored, and how M7's ranks will build their forests. Everything
 built over a forest trusts its leaves, so the list is refused unless
 every key lies in the brick, the keys strictly increase, they tile the
-brick exactly — no gap, no overlap — and they are 2:1 balanced (see
-[`balance!`](@ref)).
+brick exactly — no gap, no overlap — and they are 2:1 balanced and, on a
+rotating forest, conforming at the seam (see [`balance!`](@ref)).
 
 `comm` is the communicator the forest is distributed over (M7), as
 [`communicator`](@ref) converts it; `nothing`, the default, is a serial
@@ -84,12 +95,23 @@ julia> nleaves(forest)
 4
 
 julia> octant = Forest((1, 1, 1); N = 8, reflecting = ntuple(_ -> (true, false), 3));
+
+julia> quadrant = Forest((2, 2, 1); N = 8, rotating = (1, 2),
+                         reflecting = ((false, false), (false, false), (true, false)));
 ```
 """
 struct Forest{D,T}
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
     reflecting::NTuple{D,Tuple{Bool,Bool}}       # (lo, hi) per dimension
+    # The rotating seam's pair of dimensions `(d1, d2)` (M12), `(0, 0)` for
+    # none; read it through `hasrotating` and `rotating_dims`. `Int8`
+    # because the cost of a ninth field was its size, not its count: two
+    # bytes fit in the padding before `extents` (for D ≤ 4), so the struct
+    # stays as large as it was and so does the schedule build's
+    # allocation, where an `NTuple{2,Int}` added 160 and 4896 bytes to
+    # `bench/ghosts.jl` (CODE.md, "The buffer pool").
+    rotating::NTuple{2,Int8}
     extents::NTuple{D,Tuple{T,T}}
     N::Int
     leaves::Vector{MortonKey{D}}
@@ -132,6 +154,7 @@ function Forest{T}(roots::NTuple{D,Integer};
                    periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
                    reflecting::NTuple{D,Tuple{Bool,Bool}}=
                        ntuple(_ -> (false, false), D),
+                   rotating::Union{Nothing,Tuple{Integer,Integer}}=nothing,
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
                    leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
@@ -147,6 +170,7 @@ function Forest{T}(roots::NTuple{D,Integer};
             "is the first block's neighbor — so there is nothing for a reflection " *
             "to act on. Drop one of the two."))
     end
+    rot = check_rotating(rotating, roots, periodic, reflecting)
 
     ext = ntuple(d -> (T(extents[d][1]), T(extents[d][2])), D)
     all(d -> ext[d][2] > ext[d][1], 1:D) ||
@@ -172,8 +196,8 @@ function Forest{T}(roots::NTuple{D,Integer};
         # array in place, which must never reach the caller's vector.
         list = collect(MortonKey{D}, leaves)
     end
-    forest = Forest{D,T}(rootsI, periodic, reflecting, ext, Int(N), list, ForestState(),
-                         communicator(comm))
+    forest = Forest{D,T}(rootsI, periodic, reflecting, rot, ext, Int(N), list,
+                         ForestState(), communicator(comm))
     leaves === nothing || check_leaves(forest)
     return forest
 end
@@ -185,18 +209,89 @@ function Forest(roots::NTuple{D,Integer};
                 N::Integer,
                 periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
                 reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
+                rotating::Union{Nothing,Tuple{Integer,Integer}}=nothing,
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
                 leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
                 comm=nothing, G=nothing) where {D}
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
         return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                               leaves=leaves, comm=comm)
+                               rotating=rotating, leaves=leaves, comm=comm)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
     return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                     extents=extents, leaves=leaves, comm=comm)
+                     rotating=rotating, extents=extents, leaves=leaves, comm=comm)
+end
+
+# The `rotating` keyword, checked, as the forest stores it: `(0, 0)` for
+# none. Each refusal says why the seam cannot be glued that way (CODE.md,
+# "Rotating" under "Domain and boundaries").
+function check_rotating(rotating, roots::NTuple{D,Integer}, periodic::NTuple{D,Bool},
+                        reflecting::NTuple{D,Tuple{Bool,Bool}}) where {D}
+    rotating === nothing && return (Int8(0), Int8(0))
+    d1, d2 = Int(rotating[1]), Int(rotating[2])
+    D >= 2 || throw(ArgumentError(
+        "rotating = $rotating needs at least two dimensions, and this forest has " *
+        "$D: the rotation turns the plane of two dimensions about the line where " *
+        "their low faces meet, and a $D-dimensional forest has no such plane"))
+    (1 <= d1 <= D && 1 <= d2 <= D) || throw(ArgumentError(
+        "rotating = $rotating names a dimension outside 1:$D: the pair (d1, d2) is " *
+        "the plane of the rotation, two of the forest's own dimensions"))
+    d1 != d2 || throw(ArgumentError(
+        "rotating = $rotating names dimension $d1 twice: the rotation turns the " *
+        "plane of two different dimensions, gluing the low face of the first to the " *
+        "low face of the second"))
+    roots[d1] == roots[d2] || throw(ArgumentError(
+        "rotating = $rotating needs as many roots along dimension $d1 as along $d2, " *
+        "got $(roots[d1]) and $(roots[d2]): the seam glues the low face of $d1 onto " *
+        "the low face of $d2, root for root, so the two faces must be the same " *
+        "length"))
+    for d in (d1, d2)
+        periodic[d] && throw(ArgumentError(
+            "rotating = $rotating, but dimension $d is periodic: its low face is " *
+            "the rotating seam, glued to the other dimension's low face, and a " *
+            "periodic dimension has no faces — its last block is its first block's " *
+            "neighbor. Drop one of the two."))
+        any(reflecting[d]) && throw(ArgumentError(
+            "rotating = $rotating, but dimension $d has a reflecting face, " *
+            "reflecting[$d] = $(reflecting[d]): its low face is the rotating seam, " *
+            "and its high face stays outer, the boundary hook's. A reflecting high " *
+            "wall together with the rotation is an open question in CODE.md, not " *
+            "implemented. Reflect along a dimension outside the plane of the " *
+            "rotation instead, as an octant does."))
+    end
+    return (Int8(d1), Int8(d2))
+end
+
+# Whether the forest has a rotating seam (M12).
+hasrotating(forest::Forest) = forest.rotating[1] != 0
+
+# The rotating pair `(d1, d2)` as the `rotating` keyword takes it: `nothing`
+# when the forest has no seam. What rebuilds a forest from another one's
+# parameters passes on.
+rotating_dims(forest::Forest) =
+    hasrotating(forest) ? (Int(forest.rotating[1]), Int(forest.rotating[2])) : nothing
+
+# M12 is built in steps (CODE.md, the M12 entry under "Milestones"). From
+# step 1 on the neighbor search finds the real leaves across a rotating
+# seam, but what reads from them learns their orientation only in later
+# steps; until then each such reader refuses a rotating forest, rather
+# than read across the seam as though it were an ordinary face. It takes
+# the forest or its `rotating_dims`: a build's argument checks run in a
+# closure (`collective_checks`), and one that captures the forest copies
+# it — `GhostSchedule`'s allocated 240 bytes more in `bench/ghosts.jl`.
+refuse_rotating(forest::Forest, what::AbstractString) =
+    refuse_rotating(rotating_dims(forest), what)
+refuse_rotating(::Nothing, ::AbstractString) = nothing
+function refuse_rotating(rotating::NTuple{2,Int}, what::AbstractString)
+    throw(ArgumentError(
+        "$what over a rotating forest (rotating = $rotating) is not " *
+        "implemented yet in this step of M12: the forest finds the real leaves " *
+        "across the seam, but $what does not yet turn what it reads from them — " *
+        "their axes and their variables — into the frame of the block that reads, " *
+        "and would deliver wrong data without noticing. See the M12 entry in " *
+        "CODE.md for the steps that add it."))
 end
 
 # Validate a caller's leaf list (the `leaves` keyword), already copied
@@ -205,8 +300,8 @@ end
 # what lets them be built once per tree change — so a list read from a
 # file, or received from another rank, is checked here instead: every
 # key in the brick, strictly increasing in curve order, tiling the brick
-# exactly, and 2:1 balanced. Each refusal names the first leaf at which
-# the list goes wrong.
+# exactly, 2:1 balanced and (M12) conforming at a rotating seam. Each
+# refusal names the first leaf at which the list goes wrong.
 function check_leaves(forest::Forest{D}) where {D}
     leaves = forest.leaves
     nroots = prod(forest.roots)
@@ -271,14 +366,26 @@ function check_leaves(forest::Forest{D}) where {D}
     # offending pair runs only once it has failed.
     isbalanced(forest) && return nothing
     dirs = alldirections(Val(D))
-    for (i, k) in enumerate(leaves), δ in dirs, nb in neighbor_keys(forest, k, δ)
-        abs(level(nb) - level(k)) > 1 && throw(ArgumentError(
-            "the leaves are not 2:1 balanced: leaf $i, $k, touches $nb, and their " *
-            "levels differ by more than one. The list is refused rather than " *
-            "rebalanced, because a balanced forest can only ever produce a balanced " *
-            "list, so this one was damaged or made by hand; and because the ghost " *
-            "schedule assumes the balance, and would silently build wrong " *
-            "prolongations from an unbalanced mesh"))
+    for (i, k) in enumerate(leaves), δ in dirs
+        r, nbrs = oriented_neighbors(forest, k, δ)
+        for nb in nbrs
+            balance_slack(r, δ) == 0 && level(nb) != level(k) && throw(ArgumentError(
+                "the leaves are not conforming at the rotating seam: leaf $i, $k, " *
+                "touches $nb across the seam's face in direction $δ, and their levels " *
+                "differ. On a rotating forest a leaf on the low face of one dimension " *
+                "of the plane and its image on the low face of the other are at one " *
+                "level, so that no coarse-fine face crosses the seam (CODE.md, " *
+                "\"Rotating seams\"); balance! keeps a forest so, so this list was " *
+                "damaged, made by hand, or written for a forest without the seam"))
+            abs(level(nb) - level(k)) > 1 || continue
+            throw(ArgumentError(
+                "the leaves are not 2:1 balanced: leaf $i, $k, touches $nb, and their " *
+                "levels differ by more than one. The list is refused rather than " *
+                "rebalanced, because a balanced forest can only ever produce a " *
+                "balanced list, so this one was damaged or made by hand; and because " *
+                "the ghost schedule assumes the balance, and would silently build " *
+                "wrong prolongations from an unbalanced mesh"))
+        end
     end
     return nothing
 end
@@ -410,7 +517,8 @@ isdistributed(forest::Forest) = commsize(forest.comm) > 1
 # rank together, if any differs ("Every forest mutation is collective"
 # in CODE.md). The digest is the generation, the leaf count, a fold of
 # every leaf's hash — not `hash(forest.leaves)`, which for a long
-# vector samples only some of the elements — and the brick. Beside it
+# vector samples only some of the elements — and the brick, the
+# rotating seam (M12) included. Beside it
 # goes a hash of the layout the build is for, since a rank that built
 # its stencils from other operators would deliver wrong ghosts as
 # silently, and a flag saying whether this rank's own argument checks
@@ -431,7 +539,7 @@ function ForestDigest(forest::Forest, layout::UInt, refused::Bool)
         h = hash(k, h)
     end
     brick = hash(string((forest.roots, forest.N, forest.periodic, forest.reflecting,
-                         forest.extents)))
+                         Int.(forest.rotating), forest.extents)))
     return ForestDigest(generation(forest), nleaves(forest), h, brick, layout, refused)
 end
 
@@ -598,27 +706,106 @@ Whether `key` is currently a leaf of `forest`.
 """
 isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) !== nothing
 
-# The same-level anchor node (root, coords) reached by stepping one cell
-# from `k` in direction `δ`, crossing root boundaries and wrapping
-# periodic ones. `nothing` when the step leaves a non-periodic boundary.
-# Since |δ[d]| <= 1, a step crosses at most one root boundary.
-function neighbor_anchor(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D}
-    n = 1 << level(k)
+# --- The rotating seam (M12) ------------------------------------------------
+#
+# The arithmetic of the seam, in one place: every other function sees it
+# through `neighbor_anchor` and `oriented_neighbors`. A step from a block
+# is taken in *global level coordinates* — a node's position at its level
+# counted across the whole brick, so that the axis sits at 0 in both
+# dimensions of the plane — and a naive neighbor that lands beyond the low
+# face of `d1`, of `d2`, or of both, lies in the image `R^r` of real data,
+# `r = 1, 3, 2` respectively. It maps back to the real node by `R^{-r}`
+# about the axis (CODE.md, "Rotating seams", the first table):
+#
+#     r = 1:  (g1, g2) ↦ (g2, -1 - g1)
+#     r = 3:  (g1, g2) ↦ (-1 - g2, g1)
+#     r = 2:  (g1, g2) ↦ (-1 - g1, -1 - g2)
+#
+# with (g1, g2) the coordinates along (d1, d2) and every other one kept.
+# The `-1` is a cell's width: the cell at `g` spans `[g, g + 1)`, and
+# `R^{-1}` takes it to the cell spanning `(-g - 1, -g]` along `d2`.
+
+# The orientation of the naive node at global coordinates `g`: 0 off the
+# seam, or with no seam at all.
+@inline function seam_orientation(forest::Forest{D}, g::NTuple{D,Int}) where {D}
+    hasrotating(forest) || return 0
+    d1, d2 = Int(forest.rotating[1]), Int(forest.rotating[2])
+    a, b = g[d1] < 0, g[d2] < 0
+    return a ? (b ? 2 : 1) : (b ? 3 : 0)
+end
+
+# The real node of the naive node `g` in orientation `r` (the table above).
+@inline function unrotate_node(g::NTuple{D,Int}, r::Int, d1::Int, d2::Int) where {D}
+    g1, g2 = g[d1], g[d2]
+    r1, r2 = r == 1 ? (g2, -1 - g1) : r == 3 ? (-1 - g2, g1) :
+             r == 2 ? (-1 - g1, -1 - g2) : (g1, g2)
+    return Base.setindex(Base.setindex(g, r1, d1), r2, d2)
+end
+
+# The direction `R^{-r} δ`: a ghost direction `δ` of a block as seen from
+# the real leaves across a rotating seam in orientation `r` (M12). It is
+# the linear part of the map from naive to real nodes, so `r = 1` takes
+# `(δ1, δ2)` along `(d1, d2)` to `(δ2, -δ1)`, `r = 3` to `(-δ2, δ1)` and
+# `r = 2` to `(-δ1, -δ2)`; `r = 0` is the identity.
+@inline function real_direction(δ::NTuple{D,Int}, r::Integer, d1::Integer,
+                                 d2::Integer) where {D}
+    a, b = δ[d1], δ[d2]
+    r1, r2 = r == 1 ? (b, -a) : r == 3 ? (-b, a) : r == 2 ? (-a, -b) : (a, b)
+    return Base.setindex(Base.setindex(δ, r1, d1), r2, d2)
+end
+
+# The child offset `o ∈ {0,1}^D` of a real leaf across a rotating seam in
+# orientation `r`, taken into the *virtual* frame, where the asking block
+# sees that leaf (M12): its offset within its virtual parent, which is
+# what a restriction's stencils depend on. The virtual frame is `R^r` of
+# the real one, and the parent of a node maps to the parent of its image
+# (`-1 - g` halves to `-1 - g ÷ 2`), so the offset turns about its
+# parent's centre: `r = 1` takes `(o1, o2)` along `(d1, d2)` to
+# `(1 - o2, o1)`, `r = 3` to `(o2, 1 - o1)` and `r = 2` to
+# `(1 - o1, 1 - o2)`; `r = 0` is the identity.
+@inline function virtual_offset(o::NTuple{D,Int}, r::Integer, d1::Integer,
+                                d2::Integer) where {D}
+    a, b = o[d1], o[d2]
+    v1, v2 = r == 1 ? (1 - b, a) : r == 3 ? (b, 1 - a) :
+             r == 2 ? (1 - a, 1 - b) : (a, b)
+    return Base.setindex(Base.setindex(o, v1, d1), v2, d2)
+end
+
+# The real node one step from `k` in direction `δ`, in global level
+# coordinates, and its orientation: the step taken naively, then mapped
+# back across a rotating seam it crosses. Periodic dimensions are not yet
+# wrapped and a high face not yet tested; `neighbor_anchor` does both.
+@inline function stepped_node(forest::Forest{D}, k::MortonKey{D},
+                              δ::NTuple{D,Int}) where {D}
+    lvl = level(k)
     rootpos = root_position(forest, k.root)
-    # Step, carrying into the root brick where the step leaves the block.
-    stepped = ntuple(d -> Int(k.coords[d]) + δ[d], D)
-    newcoords = ntuple(d -> mod(stepped[d], n), D)
-    newrootpos = ntuple(D) do d
-        stepped[d] < 0 ? rootpos[d] - 1 : stepped[d] >= n ? rootpos[d] + 1 : rootpos[d]
-    end
-    # Wrap periodic dimensions; a step off a non-periodic face leaves the
-    # domain, and there is no neighbor there.
+    g = ntuple(d -> (rootpos[d] << lvl) + Int(k.coords[d]) + δ[d], D)
+    r = seam_orientation(forest, g)
+    r == 0 && return g, 0
+    return unrotate_node(g, r, Int(forest.rotating[1]), Int(forest.rotating[2])), r
+end
+
+# The same-level anchor node reached by stepping one cell from `k` in
+# direction `δ`, as `(root, coords, r)`: crossing root boundaries,
+# wrapping periodic ones, and crossing a rotating seam (M12) into the
+# real node, with `r` the orientation (0 off the seam). `nothing` when the
+# step leaves a non-periodic face that is not the seam, or crosses the
+# seam to a node that lies beyond a high face — a region beyond an outer
+# face either way, and the hook's. Since |δ[d]| <= 1, a step crosses at
+# most one root boundary per dimension. This is the single source of
+# truth for where a step lands: the neighbor search, `balance!` and,
+# through them, everything else go through it.
+function neighbor_anchor(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D}
+    lvl = level(k)
+    g, r = stepped_node(forest, k, δ)
     for d in 1:D
-        outside = newrootpos[d] < 0 || newrootpos[d] >= forest.roots[d]
+        outside = g[d] < 0 || g[d] >= forest.roots[d] << lvl
         outside && !forest.periodic[d] && return nothing
     end
-    wrapped = ntuple(d -> mod(newrootpos[d], forest.roots[d]), D)
-    return (root_index(forest, wrapped), newcoords)
+    wrapped = ntuple(d -> mod(g[d], forest.roots[d] << lvl), D)
+    mask = (1 << lvl) - 1
+    rootpos = ntuple(d -> wrapped[d] >> lvl, D)
+    return (root_index(forest, rootpos), ntuple(d -> wrapped[d] & mask, D), r)
 end
 
 # Whether the forest has any reflecting face at all — what decides
@@ -634,7 +821,10 @@ hasreflecting(forest::Forest) = any(r -> r[1] || r[2], forest.reflecting)
 # whatever lies in direction `δ′` otherwise.
 #
 # Lives here rather than in the schedule because it is brick knowledge:
-# which faces are the domain's, and which of them reflect.
+# which faces are the domain's, and which of them reflect. A rotating
+# seam (M12) is never masked: the constructor refuses a reflecting face
+# in either dimension of its plane, and the tree finds the leaves across
+# the seam, so a `δ` through it is ordinary here.
 function reflect_direction(forest::Forest{D}, k::MortonKey{D},
                            δ::NTuple{D,Int}) where {D}
     n = 1 << level(k)
@@ -707,24 +897,44 @@ Valid on any forest, balanced or not. The result is
 Under 2:1 balance (see [`balance!`](@ref)) the last case is exactly
 `2^(D - count(!=(0), δ))` keys, all one level finer.
 
+Across a rotating seam (M12; see [`Forest`](@ref)) the keys are the real
+leaves whose image under the rotation abuts `k`, the leaves that supply
+that ghost region turned by a quarter turn or two. A block at the axis
+is then its own neighbor in three directions of the plane, as a single
+periodic root is its own neighbor.
+
 Note that this is not symmetric under `δ -> -δ` when levels differ: a
 coarse neighbor found across `k`'s *corner* also spans the face beyond
 it, and reversing the direction from that larger block points elsewhere.
 Adjacency is still mutually discoverable, just not necessarily across
 the opposite direction.
 """
-function neighbor_keys(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D}
+neighbor_keys(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D} =
+    last(oriented_neighbors(forest, k, δ))
+
+# `neighbor_keys` with the orientation (M12): `(r, keys)`, where the
+# keys are the real leaves and `R^r` carries them to where `k` sees them
+# in direction `δ`. All the neighbors of one block in one direction share
+# one `r`, since the seam lies on a root boundary at every level. `r` is
+# 0 off the seam; it is the region's orientation even when `keys` is
+# empty, which across the seam means the real image lies beyond a high
+# face. The search for finer leaves runs in the real frame, in the
+# direction `R^{-r} δ` from them back to `k`'s image.
+function oriented_neighbors(forest::Forest{D}, k::MortonKey{D},
+                            δ::NTuple{D,Int}) where {D}
     δ != ntuple(_ -> 0, D) || throw(ArgumentError("direction must be nonzero"))
     all(d -> -1 <= δ[d] <= 1, 1:D) ||
         throw(ArgumentError("direction components must be in -1:1, got $δ"))
     anchor = neighbor_anchor(forest, k, δ)
-    anchor === nothing && return MortonKey{D}[]
-    nbroot, nbcoords = anchor
+    anchor === nothing && return last(stepped_node(forest, k, δ)), MortonKey{D}[]
+    nbroot, nbcoords, r = anchor
 
     i = find_covering_leaf(forest, nbroot, level(k), nbcoords)
-    i !== nothing && return [forest.leaves[i]]
+    i !== nothing && return r, [forest.leaves[i]]
 
-    return collect_touching_leaves!(MortonKey{D}[], forest, nbroot, level(k), nbcoords, δ)
+    δreal = r == 0 ? δ : real_direction(δ, r, forest.rotating[1], forest.rotating[2])
+    return r, collect_touching_leaves!(MortonKey{D}[], forest, nbroot, level(k), nbcoords,
+                                       δreal)
 end
 
 # Rebuild `forest.leaves` by walking it in order and replacing selected
@@ -810,7 +1020,10 @@ end
 
 Enforce 2:1 balance across every face, edge, and corner: refine any leaf
 that is more than one level coarser than a leaf it touches, repeating
-until the refinement stops rippling outward.
+until the refinement stops rippling outward. On a forest with a rotating
+seam (M12) it also enforces **conformity** there: a leaf across a seam
+*face* that is coarser by any amount is refined, so the leaves on the low
+face of `d1` and their images on the low face of `d2` end at one level.
 
 Afterwards every ghost region of every block touches at most one level
 up or down, which is what bounds the ghost-filling cases and the
@@ -818,25 +1031,28 @@ prolongation stencils.
 """
 function balance!(forest::Forest{D}) where {D}
     dirs = alldirections(Val(D))
+    seam = hasrotating(forest)
     while true
         # The scan is threaded over leaves, each task collecting into its
         # own buffer; the buffers are concatenated in leaf order (M5).
         found = threaded_collect(MortonKey{D}, nleaves(forest)) do hits, b
             k = forest.leaves[b]
             # Only a leaf at level >= 2 can have a neighbor two or more
-            # levels coarser than itself.
-            level(k) >= 2 || return
+            # levels coarser than itself — but across a rotating seam's
+            # face one level coarser is too coarse already, so there a
+            # leaf at level 1 is asked too.
+            level(k) >= 2 || (level(k) == 1 && seam) || return
             for δ in dirs
                 anchor = neighbor_anchor(forest, k, δ)
                 anchor === nothing && continue
-                nbroot, nbcoords = anchor
+                nbroot, nbcoords, r = anchor
                 # Looking only for a *coarser* neighbor, so the covering
                 # leaf suffices — no need to descend into finer ones,
                 # which get checked from their own side.
                 i = find_covering_leaf(forest, nbroot, level(k), nbcoords)
                 i === nothing && continue
                 nb = forest.leaves[i]
-                level(nb) < level(k) - 1 && push!(hits, nb)
+                level(nb) < level(k) - balance_slack(r, δ) && push!(hits, nb)
             end
         end
 
@@ -847,21 +1063,33 @@ function balance!(forest::Forest{D}) where {D}
     return forest
 end
 
+# How many levels two adjacent leaves may differ by: one, but none across
+# a rotating seam's *face* (M12, conformity; CODE.md "Rotating seams").
+# An edge or corner across the seam keeps the ordinary 2:1 rule. A seam
+# face is a direction with one nonzero component in orientation 1 or 3;
+# orientation 2 needs two.
+@inline balance_slack(r::Int, δ::NTuple{D,Int}) where {D} =
+    r != 0 && count(!=(0), δ) == 1 ? 0 : 1
+
 """
     isbalanced(forest)
 
 Whether `forest` satisfies 2:1 balance across all faces, edges, and
-corners — the postcondition of [`balance!`](@ref).
+corners, and conformity at a rotating seam (M12) — the postcondition of
+[`balance!`](@ref).
 """
 function isbalanced(forest::Forest{D}) where {D}
     dirs = alldirections(Val(D))
     ok = fill(true, nleaves(forest))
     threaded_foreach(nleaves(forest)) do b
         k = forest.leaves[b]
-        for δ in dirs, nb in neighbor_keys(forest, k, δ)
-            if abs(level(nb) - level(k)) > 1
-                ok[b] = false
-                return
+        for δ in dirs
+            r, nbrs = oriented_neighbors(forest, k, δ)
+            for nb in nbrs
+                if abs(level(nb) - level(k)) > balance_slack(r, δ)
+                    ok[b] = false
+                    return
+                end
             end
         end
     end

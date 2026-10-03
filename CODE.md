@@ -532,7 +532,13 @@ declared up front:
   buffer pool" under [Distributed meshes](#distributed-meshes)), so
   `bench/ghosts.jl`'s allocation is measured before and after, and if
   the field costs again `reflecting` and `rotating` are folded into one
-  immutable field instead. M12's step 1 records which.
+  immutable field instead. M12's step 1 records which. *(Step 1,
+  2026-10-03: neither. What costs is the struct's size, not its field
+  count. An `NTuple{2,Int}` added 160 and 4896 bytes to the two schedule
+  builds; an `NTuple{2,Int8}` fits in the alignment padding before
+  `extents`, so `sizeof(Forest)` and the allocation are unchanged, and
+  it is what the forest holds. The numbers are under step 1 in the
+  M12 entry.)*
 - **Physical** (per face, neither periodic, reflecting nor a rotating
   seam): ghost cells are filled by a user-supplied boundary condition
   hook. For a vertex-like dimension the domain's upper boundary plane
@@ -810,6 +816,23 @@ search returns it with the keys. In the real frame the search runs in
 the rotated direction `R^{−r} δ`, and a finer neighbor's child offset,
 which a restriction's stencils depend on, is taken back into the
 virtual frame by the same permutation and flip as the coordinates.
+*(Made exact in step 1, 2026-10-03.)* With `(a, b)` the components
+along `(d1, d2)`, the direction from the real leaves (`real_direction`)
+and the virtual child offset of a real offset `o` (`virtual_offset`)
+are
+
+| `r` | `R^{−r} δ` | virtual offset |
+|---|---|---|
+| 1 | `(δ_b, −δ_a)` | `(1 − o_b, o_a)` |
+| 2 | `(−δ_a, −δ_b)` | `(1 − o_a, 1 − o_b)` |
+| 3 | `(−δ_b, δ_a)` | `(o_b, 1 − o_a)` |
+
+The offset follows because the parent of a node maps to the parent of
+its image (`−1 − g` halves to `−1 − ⌊g/2⌋`), so a child turns about its
+parent's centre. The test derives both from turned `Rational` boxes,
+not from these formulas. Where the step finds no leaf, the search
+still returns the orientation of the region it stepped into, the one
+the hook's region lies in.
 
 *The virtual frame.* A transfer's stencils are built exactly as though
 the source sat at its **virtual position**, where the asking block sees
@@ -3999,7 +4022,17 @@ amends the paragraph above:)*
     `rotating`. Its step 1 measures `bench/ghosts.jl` before and after,
     and folds `rotating` and `reflecting` into one immutable field if
     the ninth field costs again; see the M12 entry under
-    [Milestones](#milestones).)*
+    [Milestones](#milestones).)* *(Amended by M12's step 1, 2026-10-03:
+    the cost is the struct's size, as the guess about closures implies,
+    not its field count. A ninth field of 16 bytes, `NTuple{2,Int}`,
+    added 160 and 4896 bytes, twice the 80 the 8-byte one had added to
+    the uniform build; one of 2 bytes, `NTuple{2,Int8}`, fits in the
+    padding before `extents` for `D ≤ 4` and adds nothing. So the ninth
+    field stays, as two `Int8`s. The same measurement found the other
+    half of the guess: a closure that captures a `Forest` copies it,
+    and a seam check that read the forest inside `GhostSchedule`'s
+    argument closure added 240 bytes, twice `sizeof(Forest{3,Float64})`,
+    until it read the pair taken outside it.)*
   - *What it hands out.* A *lease* of at least the length asked for, as
     an object of exactly that length over pooled memory, keyed by role
     (buffer or mirror), array type and backend type. A host vector — a
@@ -7662,13 +7695,61 @@ being done now, so it comes before M9b, which follows it.
   committed, with what it measured in the commit body:
   - **Step 0 — specification.** *(Done, 2026-10-03.)* The sections
     above, before any code.
-  - **Step 1 — forest.** The keyword and its refusals, the oriented
-    neighbor search, conformity in `balance!`, the checked `leaves`
-    path and `isbalanced`, and the forest digest. The field, with
-    `bench/ghosts.jl`'s allocation before and after, and the fold into
-    one field with `reflecting` if a ninth field costs again (see "The
-    buffer pool" under [Distributed meshes](#distributed-meshes)); the
-    outcome is recorded here either way.
+  - **Step 1 — forest.** *(Done, 2026-10-03.)* The keyword and its
+    refusals, the oriented neighbor search, conformity in `balance!`,
+    the checked `leaves` path and `isbalanced`, and the forest digest.
+    The field, with `bench/ghosts.jl`'s allocation before and after, and
+    the fold into one field with `reflecting` if a ninth field costs
+    again (see "The buffer pool" under
+    [Distributed meshes](#distributed-meshes)); the outcome is recorded
+    here either way.
+    - *What was built.* `Forest(…; rotating = (d1, d2))` with every
+      refusal listed under [Domain and boundaries](#domain-and-boundaries);
+      `neighbor_anchor` as the one place the seam's arithmetic lives, in
+      global level coordinates, returning the orientation; the internal
+      `oriented_neighbors(forest, k, δ) -> (r, keys)`, of which
+      `neighbor_keys` returns the keys, so `remote_neighbors`,
+      `buffer_recruits`, `balance!` and `isbalanced` see the seam
+      through it; `real_direction` and `virtual_offset` (the table under
+      "Rotating seams"); the seam rule in `balance!`, whose `level ≥ 2`
+      shortcut now lets a level-1 leaf of a rotating forest through;
+      the conformity refusal in the checked `leaves` path; `rotating` in
+      the digest's brick. Until step 3, `GhostSchedule`,
+      `InterfaceSchedule`, `interpolate` and `save_checkpoint` refuse a
+      rotating forest ("not implemented yet in this step of M12"), so
+      that no commit builds unrotated transfers across the seam or
+      writes a checkpoint that would load without it; the later steps
+      remove each refusal as they teach its reader the orientation.
+    - *The field* (measured on the laptop, Julia 1.13.1, `-t 4`,
+      defaults `D = 3`, `N = 8`, 4 roots, 10 variables, `p = 4`; bytes
+      allocated per call, the median time of two runs). Before:
+      uniform `fill_ghosts` 50208 B in 0.52 ms and `ghost_schedule`
+      441888 B in 0.24–0.27 ms; two-level 310144 B in 4.03–4.06 ms and
+      4976688 B in 2.65 ms. With `rotating::NTuple{2,Int}` the builds
+      allocated 442048 and 4981584 B (+160, +4896). With
+      `NTuple{2,Int8}`, and with the whole of step 1, every number is
+      the baseline's: 50208, 441888, 310144 and 4976688 B, in 0.52,
+      0.24–0.30, 4.1–4.3 and 2.63–2.65 ms, inside the run-to-run noise.
+      The forest keeps its nine fields; no fold.
+    - *Tests.* `test/rotate_tests.jl`, after `reflect_tests.jl`, with
+      the unfolded-forest oracle at the end of `ghost_oracles.jl`
+      (`unfolded_forest`, `seam_neighbor_mismatches`,
+      `seam_conforming`): the refusals; the direction and offset maps
+      against turned boxes; the oriented neighbors against the unfolded
+      forest's, every leaf and every direction, on random quadrants
+      before and after `balance!` in `D = 2` and in `D = 3` with the
+      third dimension outer, periodic or reflecting below, over four
+      orderings of the pair, every `(r, kind)` met; the unfolded forest
+      balanced and the seam conforming; the conformity refusal and its
+      acceptance after `balance!`; `complete_marks` moving no leaf by
+      more than one level across the seam, with a buffer of 0 and 1;
+      and mutual adjacency with `remote_neighbors` over cuts of the
+      leaves. Deliberately breaking `virtual_offset` or
+      `real_direction` (exchanging `r = 1` and `3`) makes the oracle
+      report 58 mismatches on six balanced quadrants. The file holds
+      885 tests and runs in about 10 s, nearly all compilation. The
+      suite: 111503 tests at one thread in 8m12 (`Pkg.test`), every one
+      passing; the docs build, doctests included.
   - **Step 2 — field sets.** `rotation`, the factor and `rotvars`
     tables, `RotationPair`.
   - **Step 3 — schedule and kernel.** The orientation in the group key

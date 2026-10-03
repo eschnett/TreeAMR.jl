@@ -75,6 +75,7 @@ end
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = FieldSet{T}(forest, 3; G=G, centering=C, parity=parity)
             copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])

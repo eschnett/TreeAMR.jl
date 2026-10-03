@@ -704,3 +704,172 @@ function reflecting_vs_doubled(::Val{D}; side::Symbol, centering::NTuple{D,Symbo
     end
     return (worst, ncells)
 end
+
+# --- M12: rotating seams ----------------------------------------------------
+#
+# The quadrant's forest is checked against the *unfolded* forest: the whole
+# plane, with the quadrant's leaves copied into the other three quadrants
+# by turning their boxes, in exact `Rational` arithmetic. The unfolded
+# forest has no seam, so its neighbors are found by the ordinary search,
+# and none of the seam's key arithmetic is reused to build it.
+
+"""
+The box `(lo, hi)` turned by `r` quarter turns, `R^r`, about the axis at
+the origin of the `(d1, d2)` plane, where `R` takes `e_{d1}` to `e_{d2}`
+and `e_{d2}` to `−e_{d1}`: `R(x1, x2) = (−x2, x1)`. A negative `r` turns
+the other way.
+"""
+function rotate_box(box, r::Int, d1::Int, d2::Int)
+    lo, hi = box
+    for _ in 1:mod(r, 4)
+        lo, hi = Base.setindex(Base.setindex(lo, -hi[d2], d1), lo[d1], d2),
+                 Base.setindex(Base.setindex(hi, -lo[d2], d1), hi[d1], d2)
+    end
+    return lo, hi
+end
+
+"""
+Which quarter turn of the quadrant `x_{d1}, x_{d2} ≥ 0` the box lies in,
+with the axis at the origin: 1 for `x_{d1} ≤ 0 ≤ x_{d2}`, 2 for both
+negative, 3 for `x_{d2} ≤ 0 ≤ x_{d1}`, 0 in the quadrant itself.
+"""
+function box_orientation(box, d1::Int, d2::Int)
+    lo, hi = box
+    a, b = hi[d1] <= 0, hi[d2] <= 0
+    return a ? (b ? 2 : 1) : (b ? 3 : 0)
+end
+
+"""
+The key of the node whose box, in root units from the brick's low
+corner, is `(lo, hi)` in a brick of `roots`: its level from its size, its
+root from where it begins, dimension 1 fastest.
+"""
+function box_key(roots::NTuple{D,Int}, (lo, hi)) where {D}
+    size = hi[1] - lo[1]
+    @assert all(d -> hi[d] - lo[d] == size, 1:D) && numerator(size) == 1
+    lvl = trailing_zeros(denominator(size))
+    @assert denominator(size) == 1 << lvl
+    pos = ntuple(d -> floor(Int, lo[d]), D)
+    root = sum((pos[d] * prod(roots[1:(d - 1)]; init=1) for d in 1:D); init=0)
+    coords = ntuple(d -> Int((lo[d] - pos[d]) * (1 << lvl)), D)
+    return MortonKey{D}(root, lvl, coords)
+end
+
+"""
+The unfolded forest of the rotating quadrant `quad`: `2M × 2M` roots in
+the plane of the rotation, the quadrant's `M × M` turned into each of the
+four quarters, the other dimensions as the quadrant's. Its leaves are the
+quadrant's leaves turned by `r = 0, 1, 2, 3`. Returns `(full, image,
+back)`: `image(k, r)` is the key in `full` of quadrant leaf `k` turned by
+`r`, and `back(kf)` is `(r, k)` for a leaf `kf` of `full`. The leaf list is
+installed without the package's checks, since a quadrant drawn at random
+is not balanced.
+"""
+function unfolded_forest(quad::Forest{D}) where {D}
+    d1, d2 = TreeAMR.rotating_dims(quad)
+    M = quad.roots[d1]
+    inplane(d) = d == d1 || d == d2
+    roots = ntuple(d -> inplane(d) ? 2M : quad.roots[d], D)
+    full = Forest(roots; N=quad.N, periodic=quad.periodic, reflecting=quad.reflecting)
+    # From coordinates about the axis to the unfolded brick's, and back.
+    shift = ntuple(d -> inplane(d) ? M : 0, D)
+    image(k, r) = box_key(roots, map(c -> c .+ shift, rotate_box(leafbox(quad, k), r,
+                                                                 d1, d2)))
+    function back(kf)
+        box = map(c -> c .- shift, leafbox(full, kf))
+        r = box_orientation(box, d1, d2)
+        return r, box_key(quad.roots, rotate_box(box, -r, d1, d2))
+    end
+    leaves = sort!([image(k, r) for k in quad.leaves for r in 0:3]; lt=naive_isless)
+    TreeAMR.rebuild_leaves!(full, leaves)
+    return full, image, back
+end
+
+"""A block's offset within its parent, from its coordinates alone."""
+parity_offset(k::MortonKey{D}) where {D} = ntuple(d -> Int(k.coords[d]) & 1, D)
+
+"""
+Compare the quadrant's oriented neighbor search against the unfolded
+forest, for every leaf and every direction: the keys `oriented_neighbors`
+returns must be the unfolded forest's neighbors turned back into the
+quadrant, all of one orientation, which is the `r` it returns; with no
+neighbor, `r` must still be the orientation of the region stepped into.
+Every finer neighbor's `virtual_offset` must be its child offset in the
+unfolded forest, where the asking block sees it. Returns `(mismatches,
+seen)`, `seen` counting the `(r, kind)` cases met, so that a test can
+show that each occurs.
+"""
+function seam_neighbor_mismatches(quad::Forest{D}) where {D}
+    d1, d2 = TreeAMR.rotating_dims(quad)
+    full, image, back = unfolded_forest(quad)
+    mismatches = 0
+    seen = Dict{Tuple{Int,Symbol},Int}()
+    for k in quad.leaves, δ in alldirections(Val(D))
+        r, keys = TreeAMR.oriented_neighbors(quad, k, δ)
+        unfolded = neighbor_keys(full, image(k, 0), δ)
+        expected = map(back, unfolded)
+        ok = if isempty(expected)
+            lo, hi = leafbox(quad, k)
+            s = hi[1] - lo[1]
+            stepped = (lo .+ s .* δ, hi .+ s .* δ)
+            isempty(keys) && r == box_orientation(stepped, d1, d2)
+        else
+            all(e -> first(e) == r, expected) &&
+                sort(keys; lt=naive_isless) == sort(last.(expected); lt=naive_isless) &&
+                all(zip(unfolded, expected)) do (kf, (_, kq))
+                    level(kf) <= level(k) ||
+                        TreeAMR.virtual_offset(parity_offset(kq), r, d1, d2) ==
+                        parity_offset(kf)
+                end
+        end
+        mismatches += !ok
+        kind = isempty(keys) ? :none : level(first(keys)) == level(k) ? :same :
+               level(first(keys)) < level(k) ? :coarser : :finer
+        seen[(r, kind)] = get(seen, (r, kind), 0) + 1
+    end
+    return mismatches, seen
+end
+
+"""
+Whether the unfolded forest `full` is conforming across the images of
+the seam, the lines where `x_{d1}` or `x_{d2}` is zero: every two leaves
+that share a face across one of them are at one level.
+"""
+function seam_conforming(full::Forest{D}, d1::Int, d2::Int) where {D}
+    M = full.roots[d1] ÷ 2
+    for kf in full.leaves, d in (d1, d2), s in (-1, 1)
+        δ = ntuple(e -> e == d ? s : 0, D)
+        hi = leafbox(full, kf)[2][d]
+        for nf in neighbor_keys(full, kf, δ)
+            across = (hi <= M) != (leafbox(full, nf)[2][d] <= M)
+            across && level(nf) != level(kf) && return false
+        end
+    end
+    return true
+end
+
+"""
+A rotating quadrant refined and coarsened at random, unbalanced: `M`
+roots along each dimension of the plane `rotating`, and the other
+dimensions `other` — `:outer`, `:periodic` or `:reflecting` at their
+low face — with one or two roots each.
+"""
+function random_rotating_forest(rng, ::Val{D}; rotating, M, other=:outer, nsteps,
+                                maxlvl) where {D}
+    inplane(d) = d in rotating
+    roots = ntuple(d -> inplane(d) ? M : rand(rng, 1:2), D)
+    periodic = ntuple(d -> !inplane(d) && other === :periodic, D)
+    reflecting = ntuple(d -> (!inplane(d) && other === :reflecting, false), D)
+    forest = Forest(roots; N=4, periodic=periodic, reflecting=reflecting,
+                    rotating=rotating)
+    for _ in 1:nsteps
+        k = rand(rng, forest.leaves)
+        if level(k) < maxlvl && rand(rng) < 0.75
+            refine!(forest, k)
+        elseif level(k) > 0
+            p = parentkey(k)
+            all(c -> isleaf(forest, c), childkeys(p)) && coarsen!(forest, p)
+        end
+    end
+    return forest
+end
