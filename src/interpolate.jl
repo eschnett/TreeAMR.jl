@@ -57,7 +57,11 @@ abstract type InterpolationBasis end
 Tensor-product Lagrange interpolation through `n` consecutive stored
 points per dimension: exact on polynomials of degree `n − 1` in each
 dimension, error `O(hⁿ)` for the value and `O(hⁿ⁻ᵐ)` for an `m`-th
-derivative.
+derivative along one dimension; a mixed derivative converges at the rate
+of its highest single order, `∂ₓ∂ᵧ` as `O(hⁿ⁻¹)`. Near a coarse-fine face
+the stencil reads ghosts, which carry the exchange's `O(hᵖ)` error, and a
+derivative of total order `|m|` divides that by `h^|m|`; so the rate is
+`min(n − maxₐ mₐ, p − |m|)`, and the full mixed rate needs `p ≥ n + 1`.
 
 `n` has no default: the right order follows from what the field is used
 for, as for [`Operators`](@ref). Interpolating an evolved state one order
@@ -67,9 +71,10 @@ solution's.
 The stencil is centered on the query for even `n` and half a point off
 for odd `n`, and in both cases it changes only *at a stored point*, where
 every choice of stencil interpolates the same value. So the interpolant
-is continuous inside a block — `C⁰`, not `C¹`: its derivative jumps at
-the stored points. Near the edge of the stored array the stencil shifts
-inward rather than extrapolate (see [`interpolate`](@ref)).
+is continuous inside a block — `C⁰`, not `C¹`: its first and second
+derivatives jump at the stored points. Near the edge of the stored array
+the stencil shifts inward rather than extrapolate (see
+[`interpolate`](@ref)).
 """
 struct Lagrange{n} <: InterpolationBasis
     function Lagrange{n}() where {n}
@@ -552,7 +557,7 @@ end
 # `derivs` validated into an `NTuple{K,NTuple{D,Int}}`. The machinery is
 # written for any multi-index — weights to any order, the contraction, the
 # `h^|m|` scaling and the mirror signs — and only this check limits it to
-# first derivatives until higher ones are tested.
+# second derivatives, the highest order the tests claim.
 function check_derivs(basis, derivs, ::Val{D}) where {D}
     derivs isa Tuple && !isempty(derivs) || throw(ArgumentError(
         "derivs must be a nonempty tuple of multi-indices, one NTuple{$D,Int} per " *
@@ -563,11 +568,11 @@ function check_derivs(basis, derivs, ::Val{D}) where {D}
             throw(ArgumentError(
                 "each entry of derivs is a multi-index of $D nonnegative integers, the " *
                 "derivative order along each dimension, got $(repr(m))"))
-        sum(m) <= 1 || throw(ArgumentError(
-            "the derivative $(repr(m)) has total order $(sum(m)), and only values and " *
-            "first derivatives are implemented so far. The weights, the contraction " *
-            "and the scaling are written for any order; what second derivatives still " *
-            "need is the tests that would claim them."))
+        sum(m) <= 2 || throw(ArgumentError(
+            "the derivative $(repr(m)) has total order $(sum(m)), and derivatives up to " *
+            "second order are implemented so far. The weights, the contraction and the " *
+            "scaling are written for any order; what third derivatives still need is " *
+            "the tests that would claim them."))
         for c in m
             why = check_derivative(basis, Int(c))
             why === nothing || throw(ArgumentError(why))
@@ -624,10 +629,10 @@ point of `xs`, by tensor-product interpolation in `basis` — today
   the field set's element type and lives on its backend.
 - `derivs` is a tuple of multi-indices, the derivative order along each
   dimension: `(0, 0, 0)` is the value, `(1, 0, 0)` is `∂ₓ`, and the value
-  with the gradient is `((0,0,0), (1,0,0), (0,1,0), (0,0,1))`. Derivatives
-  are in physical units. **Only values and first derivatives are
-  implemented so far**; the multi-index form is there so that `(2,0,0)`
-  and `(1,1,0)` need no change of interface when they are.
+  with the gradient is `((0,0,0), (1,0,0), (0,1,0), (0,0,1))`, and
+  `(2,0,0)` and `(1,1,0)` are `∂ₓ²` and `∂ₓ∂ᵧ`. Derivatives are in
+  physical units. **Values, first and second derivatives are
+  implemented**; a total order of three or more is refused.
 - `exclude` is an optional [`Region`](@ref), and `excluded[j]` says
   whether any point of query `j`'s stencil lies inside it. The value is
   computed either way; what to do with a flagged one is the caller's
@@ -647,8 +652,9 @@ the same polynomials either way — which is what makes a field set with
 A point is wrapped along a periodic dimension and mirrored once across a
 reflecting face; a mirrored value takes the variable's parity sign and a
 derivative across the wall its own sign too, as the ghosts beyond the
-wall do. A point outside the domain after that is an `ArgumentError`,
-raised once the whole batch has run.
+wall do — once per order across it, so `∂ₓ²` across a wall in `x` keeps
+the variable's sign and `∂ₓ∂ᵧ` flips it. A point outside the domain
+after that is an `ArgumentError`, raised once the whole batch has run.
 
 Every query writes only its own slots, so the result does not depend on
 the thread count. The batch is one kernel launch; see "Point

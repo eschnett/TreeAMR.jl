@@ -622,11 +622,12 @@ function interpolate_case(tag)
         fill_ghosts!(fs, GhostSchedule(fs, OPS4); boundary=boundary_by_coordinates(f))
         name = "$tag." * (T === Float64 ? "F64" : "F32x2")
         if T === Float64
-            r = interpolate(fs, xs, Lagrange(4); derivs=((0, 0), (1, 0), (0, 1)),
+            r = interpolate(fs, xs, Lagrange(4);
+                            derivs=((0, 0), (1, 0), (0, 1), (1, 1), (0, 2)),
                             vars=[2, 1], exclude=Ellipsoid((1.4, 0.5), (0.4, 0.3)))
             flags = gathered(forest, r.excluded)
             emit(name, "excluded", count(flags), digest(reinterpret(UInt8, flags)))
-            emit(name, "gradient", digest(gathered(forest, r.values)))
+            emit(name, "derivatives", digest(gathered(forest, r.values)))
         end
         r = interpolate(fs, xs, Lagrange(4))
         emit(name, "values", length(gathered(forest, r.excluded)),

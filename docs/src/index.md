@@ -31,9 +31,9 @@ forest is filled by the ghost exchange itself, with the parity each
 variable declares on its field set (see [Reflecting boundaries](@ref)).
 
 M11 added point interpolation: [`interpolate`](@ref) evaluates a field
-set, and its first derivatives, at an arbitrary batch of points, for a
-horizon finder or any other analysis that asks for values where the mesh
-has none (see [Interpolating to points](@ref)).
+set, and its first and second derivatives, at an arbitrary batch of
+points, for a horizon finder or any other analysis that asks for values
+where the mesh has none (see [Interpolating to points](@ref)).
 
 M9a added checkpoint and restart, ahead of MPI because long runs need to
 resume before they need more nodes: [`save_checkpoint`](@ref) writes the
@@ -405,17 +405,19 @@ julia> schedule = GhostSchedule(fs, Operators(prolongation = 4, restriction = 4)
 julia> fill_ghosts!(fs, schedule; boundary = boundary_by_coordinates(f));
 
 julia> r = interpolate(fs, [(0.3, 0.7), (1.0, 1.0)], Lagrange(4);
-                       derivs = ((0, 0), (1, 0), (0, 1)));
+                       derivs = ((0, 0), (1, 0), (0, 1), (1, 1), (0, 2)));
 
-julia> round.(r.values[1, :, 1]; digits = 12)    # f, ∂ₓf, ∂ᵧf at (0.3, 0.7)
-3-element Vector{Float64}:
+julia> round.(r.values[1, :, 1]; digits = 10)    # f, ∂ₓf, ∂ᵧf, ∂ₓ∂ᵧf, ∂ᵧ²f at (0.3, 0.7)
+5-element Vector{Float64}:
   1.453
   1.51
  -0.42
+ -1.4
+ -0.6
 ```
 
-`derivs` names the derivatives as multi-indices; values and first
-derivatives are implemented. A point is wrapped along a periodic
+`derivs` names the derivatives as multi-indices; values, first and
+second derivatives are implemented. A point is wrapped along a periodic
 dimension and mirrored across a reflecting face, with the variable's
 parity; one outside the domain after that is refused. An `exclude`
 region — an [`Ellipsoid`](@ref) — flags every query whose stencil reaches

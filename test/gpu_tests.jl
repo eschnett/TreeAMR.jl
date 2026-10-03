@@ -216,7 +216,7 @@ end
     roots = D == 1 ? 3 : 2
     xs = [ntuple(d -> T((13j + 5d) % 97 // 97) * (d == 1 ? T(roots + 1) : T(roots)) -
                       (d == 1 ? one(T) : zero(T)), D) for j in 1:97]
-    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D))
+    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D), ntuple(d -> 2Int(d == 1), D))
     ball = Ellipsoid(ntuple(_ -> T(1), D), ntuple(_ -> T(1) / 2, D))
     results = map((CPU(), backend)) do bk
         fs = FieldSet{T}(faces_forest(kinds; T=T), 2; G=2, parity=parity, backend=bk)
