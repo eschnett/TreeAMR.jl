@@ -1019,7 +1019,19 @@ the value `−B_y` across the low face of `x`. Two cases:
   sweep has filled. Under MPI each stage completes before the next
   starts, so the two members can share a stage's tag, MPI's
   non-overtaking order keeping their messages apart; an offset per
-  member on the tag is the alternative if it turns out cleaner. A
+  member on the tag is the alternative if it turns out cleaner.
+  *(Confirmed in step 7, 2026-10-03, and made precise: what a stage
+  completes before the next is its receives — its sends are waited on
+  at the end of the fill, as in every fill since M7 — and that is
+  enough. A stage sends at most one message to each peer, and every
+  rank runs the merged stages in one order, so between two ranks `a`'s
+  message of a tag is sent before `b`'s, and `a`'s receive of it is
+  posted, and completed, before `b`'s is posted; MPI matches two
+  messages of one tag between one pair of ranks in the order they were
+  sent, so `a`'s receive takes `a`'s message. No ordering hazard was
+  found, and the members keep the shared tag; the regrid's transfers of
+  the two members share tag 50 for the same reason, as several field
+  sets' have since M7.)* A
   plain `fill_ghosts!` on an asymmetric set whose schedule has odd
   orientations refuses, saying to fill it as a `RotationPair`.
   *(Amended in step 3, 2026-10-03: the schedule records nothing for
@@ -8078,7 +8090,84 @@ being done now, so it comes before M9b, which follows it.
       `interrupted`), and the refusals; the step-1 refusal's test in
       `rotate_tests.jl` is gone. The file holds 658 tests (593 before)
       and runs in 77 s alone, the four new testsets about 10 s of it.
-  - **Step 7 — MPI.** The pack and unpack, and the workloads.
+  - **Step 7 — MPI.** *(Done, 2026-10-03.)* The pack and unpack, and
+    the workloads.
+    - *What was built.* Nothing in `src/`: the rotated pack and unpack,
+      the merged stages of a pair and the agreed refusals came with
+      steps 3–5, and step 7 is their tests in process and over MPI. The
+      transfer oracles of `exchange_tests.jl` carry the orientation
+      (the pack supplies it, the unpack must be a plain copy with
+      orientation 0), and `lockstep_pair!` runs a pair's stages merged
+      as `fill_ghosts!(pair, …)` merges them. The paired fill's shared
+      tags are safe as specified (amended under "Rotating seams" in
+      [Ghost filling](#ghost-filling)).
+    - *In process.* On the quadrants of `rotating_forest` — 10 leaves in
+      2D, 22 in 3D with the third dimension reflecting below and 29 with
+      it periodic, 21 of 73, 155 of 517 and 217 of 737 transfers
+      rotated — over 2, 3 and 5 simulated ranks, for a scalar and
+      vector, cell- and vertex-centered, and for both members of a
+      face-centered pair: the local and the sent-and-received transfers
+      are the serial ones with their orientations and factor columns,
+      both ends of every message derive one layout, and every point is
+      written once per stage; 6, 8 and 14 rotated transfers cross
+      ranks in 2D at 2, 3 and 5 ranks, 45–125 in 3D. In lockstep, and
+      through `MailboxCommunicator` at 3 and 5 ranks, every rank's
+      array, ghosts included, is the serial fill's bit for bit, the
+      single set's and the pair's, with the turned `−0` of a zero
+      component kept (38 to 609 per serial fill of a single set, 84 to
+      996 of a pair). Over
+      `GatherCommunicator`, `regrid!` of a single set and a pair
+      together at 3 and 5 ranks, and `adapt_to_initial_data!` from one
+      leaf at the axis at 3 ranks (two empty), alone and as a pair, give
+      the serial leaves, passes and arrays bit for bit; routed
+      `interpolate` over the whole plane (three quarters of the points
+      turned back) is the serial one bit for bit at 3 ranks and at more
+      ranks than leaves, and a point beyond the seam of a pair's member
+      on one rank is refused on all three, that rank with its reason.
+    - *Over MPI.* `mpi_workload.jl` gained a rotating quadrant: the
+      wave, vertex-centered in 2D (`Q2v`, 27 leaves) and cell-centered
+      in 3D over a reflecting low face (`Q3c`, an octant, 57 leaves); a
+      single set with a zero `v_2` and a pair with zero second variables
+      through a fill, a regrid that refines along the seam and coarsens
+      off it, interpolation of 257 points of which 193 are turned back,
+      and a checkpoint saved and loaded at this rank count and at the
+      others (`rotating_cross`, `QC`), the pair rebuilt and refilled to
+      the bytes it had (`Q2`); a single leaf at the axis (`QE2`), which
+      leaves every rank but one empty, through the fill, the wave, a
+      pair's fill, interpolation from rank 0 alone, a refinement that
+      gives every rank blocks, the coarsening back and a checkpoint;
+      and two refusals on rank 1 only, a point beyond the seam of a
+      pair's member and such a member regridded alone where the others
+      regrid the pair, each refused on every rank. Run by hand,
+      serially in 53 s and at `-n 3` and `-n 2` (one thread a rank)
+      in 66 s and 63 s against about 55 s before, every line agrees but
+      the `#` lines, and the sums to `rtol = 1e-12`; 66 rotated
+      transfers cross ranks at `-n 3`, 18 at `-n 2`. `mpi_tests.jl`
+      asserts the new lines: 206 tests (179 before), in 1m11 alone on
+      the concurrent path.
+    - *Collective refusals.* Every refusal M12 added was checked for
+      one rank refusing alone. The forest's are local and see the same
+      arguments and the same replicated leaves on every rank. The field
+      set's `rotation` and `RotationPair`'s checks are local, as every
+      field-set check is, and depend only on the arguments; the plain
+      fill's refusal of an asymmetric set depends on the layout alone
+      (amended in step 3), so `fill_ghosts!`'s checks stay rank-local
+      on purpose. `regrid!`'s pair checks and its refusal of an
+      asymmetric set alone run inside `collective_checks`, and
+      `interpolate`'s refusal beyond the seam is decided on the host
+      before the routing and agreed with the outside points; the
+      workload shows both refused on every rank. The checkpoint's map
+      is in the agreed layout (step 6). As with `parity`, a `rotation`
+      that differs between ranks is not caught: the schedule is built
+      from the forest and the layout, not from the map, so it would
+      fill wrong data without a hang; recorded, not changed.
+    - *Tests.* `exchange_tests.jl` 9840 tests (9491 before) in 49 s
+      alone (38 s), `regrid_exchange_tests.jl` 1951 (1857) in 31 s
+      (24 s), `interpolate_exchange_tests.jl` 298 (204) in 16 s (14 s),
+      `mpi_tests.jl` 206 (179). The suite, run once for steps 6 and 7:
+      112635 tests at one thread in 7m27 (`Pkg.test`; 112006 in 8m27
+      after step 5), every one passing; the docs build, doctests
+      included.
   - **Step 8 — threads and device.**
   - **Step 9 — measurements**, as listed above.
   - **Step 10 — documentation and status.** The API pages and a guide

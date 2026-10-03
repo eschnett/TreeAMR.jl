@@ -37,7 +37,10 @@
 # (`TREEAMR_CHECKPOINT_DIR`, and `TREEAMR_CHECKPOINT_FROM` for the rank
 # counts whose files to wait for and load, which lets `mpi_tests.jl` run
 # the launches at once); and the version-1 fixtures, written by the
-# shared-file writer's version, load at every rank count.
+# shared-file writer's version, load at every rank count. From M12 on it
+# runs a rotating quadrant too: the wave, a set that turns into itself
+# and a `RotationPair` through a fill, a regrid, interpolation beyond the
+# seam and a checkpoint, loaded at the other rank counts as well.
 
 using TreeAMR
 using MPI: MPI
@@ -73,9 +76,10 @@ gathered(forest, v) = TreeAMR.allgatherv(forest.comm, collect(vec(v)))
 # A forest refined twice around `centre`, so that three levels meet. A
 # forest mutation is collective: every rank makes the same calls.
 function forest_of(roots::NTuple{D,Int}, N; periodic=ntuple(_ -> false, D),
-                   reflecting=ntuple(_ -> (false, false), D), centre=nothing,
-                   levels=2) where {D}
-    forest = Forest(roots; N=N, periodic=periodic, reflecting=reflecting, comm=COMM)
+                   reflecting=ntuple(_ -> (false, false), D), rotating=nothing,
+                   centre=nothing, levels=2) where {D}
+    forest = Forest(roots; N=N, periodic=periodic, reflecting=reflecting,
+                    rotating=rotating, comm=COMM)
     centre === nothing && return forest
     for lvl in 0:(levels - 1)
         r = 0.6 / 2^lvl
@@ -196,8 +200,8 @@ function perturbed_digest_differs(forest, fs, sched, before)
 end
 
 function wave_case(tag, forest::Forest{D}; G, centering, ops, steps, parity=nothing,
-                   control=false) where {D}
-    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity)
+                   rotation=nothing, control=false) where {D}
+    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity, rotation=rotation)
     initial = pulse(ntuple(d -> 0.37 * forest.roots[d] + 0.05d, D), 0.3)
     boundary = hasouter(forest) ? boundary_by_coordinates(initial) : nothing
     fill_by_coordinates!(initial, fs)
@@ -400,7 +404,12 @@ function regridded(tag, forest, pairs; flags, buffer=0, boundary=nothing)
          digest(string(forest.leaves)))
     for (i, (fs, sched)) in enumerate(pairs)
         sched === nothing && continue
-        emit(tag, "transferred$i", digest(gathered(forest, fs.work)))
+        if fs isa RotationPair                      # both members (M12)
+            emit(tag, "transferred$i", digest(gathered(forest, fs.a.work)),
+                 digest(gathered(forest, fs.b.work)))
+        else
+            emit(tag, "transferred$i", digest(gathered(forest, fs.work)))
+        end
     end
     up, down, straddling = migration(forest, old, forest.leaves)
     emit("#", tag, "migrated", up, "up", down, "down", straddling, "straddling")
@@ -716,6 +725,215 @@ function empty_rank_case(tag)
     return nothing
 end
 
+# --- rotating seams (M12) ---------------------------------------------------
+
+# A quadrant `[0, 3]^2` with a rotating seam, refined at the axis and the
+# seam, through every operation: the fill of a set that turns into itself
+# — a scalar and a vector, cell-centered — and of a `RotationPair` of
+# face-centered sets, `(B_1, F_1)` and `(F_2, B_2)`, whose stages are
+# merged and share their tags; a regrid of both, the pair filled as a pair
+# before its transfer; interpolation over the whole plane, three quarters
+# of the points turned back across the seam; and a checkpoint, saved and
+# loaded at this rank count and at the others (`rotating_cross`). Each
+# set has a variable that is zero everywhere, the vector's `v_2` and each
+# member's second, so the turned ghosts hold `−0`, which a pack that
+# applied the sign would turn into `+0`; the digests are of the bytes.
+const QUAD_DATA = (x, v) -> v + x[1] / 7 - x[2]^2 / 5 + x[1] * x[2] / 11
+const QUAD_HOOK = boundary_by_coordinates(QUAD_DATA)
+
+# The rotated transfers this rank receives from another, summed over the
+# ranks: none serially, some wherever the seam's transfers cross ranks.
+function rotated_received(forest, scheds...)
+    mine = sum(scheds) do sched
+        sum(st -> st.remote === nothing ? 0 :
+                  count(e -> e.key.orientation != 0, st.remote.recvlayout),
+            sched.stages; init=0)
+    end
+    return sum(TreeAMR.allgather(forest.comm, mine))
+end
+
+# Pseudorandom data with variable `zero` set to zero, ghosts included.
+function quad_data!(fs, zero)
+    pseudorandom!(fs)
+    for b in 1:nblocks(fs)
+        blockview(fs, b, zero) .= 0
+    end
+    return fs
+end
+
+negzeros(forest, fs) = count(x -> iszero(x) && signbit(x), gathered(forest, fs.work))
+
+function quad_sets(forest)
+    fs = FieldSet(forest, 3; G=2, rotation=(1, -3, 2))
+    a = FieldSet(forest, 2; G=2, centering=facecentered(2, 1), rotation=(-2, -1))
+    b = FieldSet(forest, 2; G=2, centering=facecentered(2, 2), rotation=(2, 1))
+    return fs, RotationPair(a, b)
+end
+
+function quad_fill!(forest, fs, pair)
+    sched = GhostSchedule(fs, OPS4)
+    pscheds = (GhostSchedule(pair.a, OPS4), GhostSchedule(pair.b, OPS4))
+    fill_ghosts!(fs, sched; boundary=QUAD_HOOK)
+    fill_ghosts!(pair, pscheds; boundary=QUAD_HOOK)
+    return sched, pscheds
+end
+
+quad_digests(forest, fs, pair) =
+    (digest(gathered(forest, fs.work)), digest(gathered(forest, pair.a.work)),
+     digest(gathered(forest, pair.b.work)))
+
+function quad_states(forest, sets...)
+    return map(sets) do fs
+        u = statevector(fs)
+        gather!(u, fs)
+        digest(gathered(forest, u))
+    end
+end
+
+# A global list of points over `[-2.9, 2.9]^2`, three quarters of them
+# beyond the seam, of which rank `r` queries its slice as in
+# `interpolation_points`. (Not `φ` and `φ²` as there: their fractional
+# parts sum to one, which would put every point on one diagonal.)
+seam_points_all(n) = [(-2.9 + 5.8 * mod(j * (sqrt(5.0) - 1) / 2, 1.0),
+                       -2.9 + 5.8 * mod(j * (sqrt(2.0) - 1), 1.0)) for j in 1:n]
+
+function seam_points(n)
+    xs = seam_points_all(n)
+    weights = [(2, 0, 5, 1, 3)[r % 5 + 1] for r in 0:(NRANKS - 1)]
+    cuts = [0; round.(Int, n .* cumsum(weights) ./ sum(weights))]
+    return xs[(cuts[RANK + 1] + 1):cuts[RANK + 2]]
+end
+
+function rotating_case(tag)
+    forest = forest_of((3, 3), 8; rotating=(1, 2), centre=(0.4, 0.5))
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    fs, pair = quad_sets(forest)
+    quad_data!(fs, 3)
+    quad_data!(pair.a, 2)
+    quad_data!(pair.b, 2)
+    sched, pscheds = quad_fill!(forest, fs, pair)
+    emit(tag, "transfers", transfers(forest, sched), transfers(forest, pscheds[1]),
+         transfers(forest, pscheds[2]))
+    emit(tag, "filled", quad_digests(forest, fs, pair)...)
+    emit(tag, "negzero", negzeros(forest, fs), negzeros(forest, pair.a),
+         negzeros(forest, pair.b))
+    emit("#", tag, "rotated received", rotated_received(forest, sched, pscheds...))
+
+    # Refine along the low face of the first dimension, which conformity
+    # carries to the low face of the second, and coarsen the finest
+    # blocks off the seam.
+    flags = map(1:nblocks(fs)) do b
+        k = blockkey(fs, b)
+        ext = block_extent(forest, k)
+        onseam = ext[1][1] == 0 || ext[2][1] == 0
+        level(k) < 2 && ext[1][1] == 0 && ext[2][1] < 2 ? Refine :
+        level(k) == 2 && !onseam ? Coarsen : Keep
+    end
+    regridded("$tag.regrid", forest, (fs => sched, pair => pscheds); flags=flags,
+              boundary=QUAD_HOOK)
+    sched, pscheds = quad_fill!(forest, fs, pair)
+    emit(tag, "refilled", quad_digests(forest, fs, pair)...)
+
+    xs = seam_points(257)
+    r = interpolate(fs, xs, Lagrange(4); derivs=((0, 0), (1, 0), (0, 1)), vars=[2, 3, 1])
+    emit(tag, "interpolated", length(gathered(forest, r.excluded)),
+         count(x -> x[1] < 0 || x[2] < 0, seam_points_all(257)),
+         digest(gathered(forest, r.values)))
+
+    # The checkpoint: the bare form, after the fill; loaded at this rank
+    # count, the pair rebuilt from its two sets and filled again.
+    dir = checkpoint_dir()
+    path = joinpath(dir, "QC-n$NRANKS.h5")
+    emit("QC", "saved", quad_states(forest, fs, pair.a, pair.b)...)
+    save_checkpoint(path, forest; fieldsets=("u" => fs, "a" => pair.a, "b" => pair.b),
+                    application="Quadrant" => 1, io=:all)
+    loaded = quad_load(path, COMM)
+    emit("QC", "loaded", quad_states(loaded...)...)
+    lforest, lfs, lpair = loaded[1], loaded[2], RotationPair(loaded[3], loaded[4])
+    quad_fill!(lforest, lfs, lpair)
+    emit("QC", "refilled", quad_digests(lforest, lfs, lpair)...)
+    RANK == 0 && touch(joinpath(dir, "QC-n$NRANKS.done"))
+    rotating_cross("QC")
+    return nothing
+end
+
+function quad_load(path, comm)
+    ck = load_checkpoint(path; comm=comm)
+    sets = ck.fieldsets
+    return (ck.forest, sets["u"].fieldset, sets["a"].fieldset, sets["b"].fieldset)
+end
+
+# The rotating checkpoints of the runs at other rank counts, loaded at
+# this one and, under MPI, at one rank over `MPI.COMM_SELF`: their states
+# must be the saved ones. `#` lines, as in `checkpoint_cross`.
+function rotating_cross(tag)
+    dir = checkpoint_dir()
+    counts = checkpoint_sources(dir, tag)
+    names = filter(readdir(dir)) do name
+        m = match(r"^(.*)-n(\d+)\.h5$", name)
+        m === nothing && return false
+        n = parse(Int, m[2])
+        m[1] == tag && n != NRANKS && (counts === nothing || n in counts)
+    end
+    comms = USE_MPI ? ((NRANKS, COMM), (1, MPI.COMM_SELF)) : ((1, nothing),)
+    for name in sort(names), (n, comm) in comms
+        loaded = quad_load(joinpath(dir, name), comm)
+        emit("#", replace(name, ".h5" => ""), "at", n, "loaded",
+             quad_states(loaded...)...)
+    end
+    return nothing
+end
+
+# The quadrant wave, as `wave_case` runs it, on a single leaf at the axis
+# — its own neighbor across the seam three times over — so that at two
+# and three ranks only one rank has a block: the fill, the wave, a pair's
+# fill, interpolation beyond the seam from rank 0 alone, regrids that
+# give every rank blocks and take them away again, and a checkpoint.
+function rotating_empty_case(tag)
+    forest = Forest((1, 1); N=8, rotating=(1, 2), comm=COMM)
+    empties() = count(iszero, TreeAMR.allgather(forest.comm, length(blockrange(forest))))
+    emit("#", tag, "empty ranks", empties())
+    fs = FieldSet(forest, 2; G=2, centering=vertexcentered(2), rotation=(1, 2))
+    fill_by_coordinates!(QUAD_DATA, fs)
+    sched = GhostSchedule(fs, OPS4)
+    fill_ghosts!(fs, sched; boundary=QUAD_HOOK)
+    emit(tag, "filled", digest(gathered(forest, fs.work)))
+    u = statevector(fs)
+    gather!(u, fs)
+    rk4!(u, fs, sched, 0.2 * minimum_spacing(forest), 3, Val(2), Val(fs.G), QUAD_HOOK)
+    emit(tag, "state", digest(gathered(forest, u)))
+    scatter!(fs, u)
+    reductions(tag, fs, u)
+    _, pair = quad_sets(forest)
+    fill_by_coordinates!(QUAD_DATA, pair.a)
+    fill_by_coordinates!(QUAD_DATA, pair.b)
+    pscheds = (GhostSchedule(pair.a, OPS4), GhostSchedule(pair.b, OPS4))
+    fill_ghosts!(pair, pscheds; boundary=QUAD_HOOK)
+    emit(tag, "pair", digest(gathered(forest, pair.a.work)),
+         digest(gathered(forest, pair.b.work)))
+    fill_ghosts!(fs, sched; boundary=QUAD_HOOK)
+    pts = [(-0.95 + 1.9 * mod(j * 0.618034, 1.0), -0.95 + 1.9 * mod(j * 0.381966, 1.0))
+           for j in 1:19]
+    r = interpolate(fs, RANK == 0 ? pts : similar(pts, 0), Lagrange(4);
+                    derivs=((0, 0), (0, 1)))
+    emit(tag, "interpolated", digest(gathered(forest, r.values)))
+    regridded("$tag.refine", forest, (fs => sched, pair => pscheds);
+              flags=fill(Refine, length(blockrange(forest))), boundary=QUAD_HOOK)
+    emit("#", tag, "empty ranks after refining", empties())
+    sched = GhostSchedule(fs, OPS4)
+    pscheds = (GhostSchedule(pair.a, OPS4), GhostSchedule(pair.b, OPS4))
+    regridded("$tag.coarsen", forest, (fs => sched, pair => pscheds);
+              flags=fill(Coarsen, length(blockrange(forest))), boundary=QUAD_HOOK)
+    emit("#", tag, "empty ranks after coarsening", empties())
+    path = joinpath(checkpoint_dir(), "$tag-n$NRANKS.h5")
+    save_checkpoint(path, forest; fieldsets=("u" => fs, "a" => pair.a, "b" => pair.b),
+                    application="QuadrantEmpty" => 1)
+    loaded = quad_load(path, COMM)
+    emit(tag, "checkpoint", nleaves(loaded[1]),
+         quad_states(forest, fs, pair.a, pair.b) == quad_states(loaded...))
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -798,6 +1016,22 @@ function refusals()
     n, msg = attempt(() -> interpolate(fs, RANK == 1 ? [(0.5, 0.5), (0.5, 9.0)] :
                                            [(0.5, 0.5)], Lagrange(4)))
     emit("# interpolate outside refused on", n, "of", NRANKS, "ranks:", msg)
+
+    # A rotating seam (M12): a point beyond it on rank 1 only, for a set
+    # that turns into its partner, which `interpolate` does not read; and
+    # such a set regridded alone on rank 1, where the others regrid the
+    # pair. Each refused on every rank, rank 1 with its own reason.
+    forest = Forest((2, 2); N=8, rotating=(1, 2), comm=COMM)
+    _, pair = quad_sets(forest)
+    n, msg = attempt(() -> interpolate(pair.a, RANK == 1 ? [(0.5, 0.5), (-0.5, 0.7)] :
+                                               [(0.5, 0.5)], Lagrange(4)))
+    emit("# rotating interpolate refused on", n, "of", NRANKS, "ranks:", msg)
+    pscheds = (GhostSchedule(pair.a, ops4), GhostSchedule(pair.b, ops4))
+    nb = length(blockrange(forest))
+    n, msg = attempt(() -> regrid!(forest, RANK == 1 ?
+                                           (pair.a => pscheds[1], pair.b => pscheds[2]) :
+                                           (pair => pscheds,); flags=fill(Keep, nb)))
+    emit("# rotating regrid refused on", n, "of", NRANKS, "ranks:", msg)
     return nothing
 end
 
@@ -1272,6 +1506,20 @@ function main()
     interpolate_case("I2")
     # A rank without blocks through everything, at three ranks.
     empty_rank_case("E2")
+    # A rotating quadrant (M12): the vertex-centered wave in 2D, and in 3D
+    # cell-centered over a reflecting low face below the plane, an octant;
+    # a set that turns into itself and a pair through a fill, a regrid,
+    # interpolation and a checkpoint; and a single leaf at the axis, which
+    # leaves every rank but one without blocks.
+    wave_case("Q2v", forest_of((3, 3), 8; rotating=(1, 2), centre=(0.4, 0.5)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6, rotation=(1, 2))
+    wave_case("Q3c", forest_of((2, 2, 2), 4; rotating=(1, 2),
+                               reflecting=((false, false), (false, false), (true, false)),
+                               centre=(0.5, 0.6, 0.4)); G=1,
+              centering=cellcentered(3), ops=OPS2, steps=3, rotation=(1, 2),
+              parity=[ntuple(_ -> EvenParity, 3), ntuple(_ -> EvenParity, 3)])
+    rotating_case("Q2")
+    rotating_empty_case("QE2")
     # Checkpoints: saved and loaded at this rank count, and the files of
     # the runs before this one loaded at it.
     checkpoint_case("C")
