@@ -1220,3 +1220,155 @@ function rotating_pair_vs_quadrupled(::Val{D}; rotating, other=:periodic, N=8, p
     end
     return worst, npoints, (sa, sb)
 end
+
+# --- M12: regrid across the seam (step 4) ------------------------------------
+#
+# A regrid of the quadrant is checked against a regrid of the full plane
+# to the turned image of the quadrant's new leaves: the full plane's
+# flags are derived from where the quadrant went, in exact `Rational`
+# boxes, so that both meshes stay each other's image, and then every
+# stored point of the two is compared, as `rotating_vs_quadrupled` does
+# for a single fill. The transfers move data that the fill before them
+# turned across the seam; a wrong fill there shows in the prolonged
+# blocks.
+
+"""
+The leaf of `quad` (in the quadrant, a key) that the full plane's leaf
+`kf` is the image of, with the turn `r` that carries it there, by the
+boxes: the full plane spans `2M` roots in the plane, with the axis at
+`M`.
+"""
+function quadrant_preimage(quad::Forest{D}, full::Forest{D}, kf) where {D}
+    d1, d2 = TreeAMR.rotating_dims(quad)
+    M = quad.roots[d1]
+    shift = ntuple(d -> d == d1 || d == d2 ? M : 0, D)
+    box = map(c -> c .- shift, leafbox(full, kf))
+    r = box_orientation(box, d1, d2)
+    return r, box_key(quad.roots, rotate_box(box, -r, d1, d2))
+end
+
+"""
+How a leaf `k` of the old leaves became the new leaves `new` (a `Set`):
+`Keep` if it is still a leaf, `Refine` if its children are, `Coarsen` if
+its parent is, and `nothing` for anything else — a move by more than one
+level, which a regrid must never make.
+"""
+function regrid_move(k, new)
+    k in new && return Keep
+    all(c -> c in new, childkeys(k)) && return Refine
+    level(k) > 0 && parentkey(k) in new && return Coarsen
+    return nothing
+end
+
+"""
+A boundary hook that writes `f(x, v)` into the region it is handed, for
+the field set `fs`, and to `other(…)` for any other: a plain function
+hook, so that several sets with different formulas can share one
+`regrid!`.
+"""
+function formula_hook(pairs...)
+    return function (fs, b, key, δ, region)
+        f = last(pairs[findfirst(p -> first(p) === fs, pairs)])
+        for idx in region, v in 1:fs.nvars
+            fs.work[idx, v, b] = f(coordinates(fs, b, Tuple(idx)), v)
+        end
+        return nothing
+    end
+end
+
+"""
+Regrid a rotating quadrant through `passes`, each a `(forest, key) ->
+RegridFlag` rule over the quadrant's leaves, and the full plane after it
+to the turned image of each result; then fill both and compare. With
+`pair = false` the quadrant holds the scalar and vector of
+[`rotating_data`](@ref) with centering `C`; with `pair = true` it holds
+the face-centered `(B, F)` pair of [`rotating_pair_vs_quadrupled`](@ref),
+regridded as a `RotationPair`. Returns per pass `(moved, conforming,
+images, worst, npoints, nleaves)`: whether every quadrant leaf moved by at
+most one level, whether the quadrant is balanced and conforming, whether
+the full plane's leaves are the four turns of the quadrant's, and the
+worst deviation over every stored point.
+"""
+function rotating_regrid_vs_quadrupled(::Val{D}; rotating, other=:periodic, N=8, p=4,
+                                       C=cellcentered(D), pair::Bool=false,
+                                       passes) where {D}
+    d1, d2 = rotating
+    quad, full = quadrant_and_full(Val(D); rotating=rotating, other=other, N=N)
+    ops = Operators(prolongation=p, restriction=p)
+    z = outofplane(D, rotating)
+    if pair
+        Ca = facecentered(D, d1)
+        swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+        Ga = ghosts_for(Ca, p)
+        field(x, k) = covariant_vector(x[d1], x[d2], k)
+        zf(x, odd) = outofplane_factor(x, D, rotating, other, odd)
+        fa = (x, v) -> v == 1 ? field(x, 1)[1] * zf(x, false) : field(x, 2)[1] * zf(x, true)
+        fb = (x, v) -> v == 1 ? field(x, 2)[2] * zf(x, true) : field(x, 1)[2] * zf(x, false)
+        parity(odd) = other === :reflect_lo ?
+                      [ntuple(d -> d != z ? NoParity : o ? OddParity : EvenParity, D)
+                       for o in odd] : nothing
+        qa = FieldSet(quad, 2; G=Ga, centering=Ca, parity=parity((false, true)),
+                      rotation=(-2, -1))
+        qb = FieldSet(quad, 2; G=swap(Ga), centering=swap(Ca),
+                      parity=parity((true, false)), rotation=(2, 1))
+        ffa = FieldSet(full, 2; G=Ga, centering=Ca, parity=parity((false, true)))
+        ffb = FieldSet(full, 2; G=swap(Ga), centering=swap(Ca),
+                       parity=parity((true, false)))
+        qsets, fsets, formulas = [qa, qb], [ffa, ffb], [fa, fb]
+    else
+        f = rotating_data(D, rotating, other)
+        par = vector_parity(D, rotating, other)
+        G = ghosts_for(C, p)
+        qsets = [FieldSet(quad, D + 1; G=G, centering=C, parity=par,
+                          rotation=vector_rotation(D, rotating))]
+        fsets = [FieldSet(full, D + 1; G=G, centering=C, parity=par)]
+        formulas = [f]
+    end
+    for (fs, f) in Iterators.flatten((zip(qsets, formulas), zip(fsets, formulas)))
+        fill_by_coordinates!(f, fs)
+    end
+    qhook = formula_hook((qsets .=> formulas)...)
+    fhook = formula_hook((fsets .=> formulas)...)
+    rpair = pair ? RotationPair(qsets...) : nothing
+    qentries() = pair ? [rpair => Tuple(GhostSchedule(fs, ops) for fs in qsets)] :
+                 [fs => GhostSchedule(fs, ops) for fs in qsets]
+    function fillall!()
+        if pair
+            fill_ghosts!(rpair, Tuple(GhostSchedule(fs, ops) for fs in qsets);
+                         boundary=qhook)
+        else
+            foreach(fs -> fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=qhook), qsets)
+        end
+        foreach(fs -> fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=fhook), fsets)
+    end
+    results = []
+    for rule in passes
+        old = copy(quad.leaves)
+        regrid!(quad, qentries(); flags=[rule(quad, k) for k in quad.leaves],
+                boundary=qhook)
+        new = Set(quad.leaves)
+        moved = all(k -> regrid_move(k, new) !== nothing, old)
+        fflags = map(full.leaves) do kf
+            _, kq = quadrant_preimage(quad, full, kf)
+            something(regrid_move(kq, new), Keep)
+        end
+        regrid!(full, [fs => GhostSchedule(fs, ops) for fs in fsets]; flags=fflags,
+                boundary=fhook)
+        images = sort!([last(quadrant_preimage(quad, full, kf)) for kf in full.leaves];
+                       lt=naive_isless) ==
+                 sort!(repeat(quad.leaves, 4); lt=naive_isless) &&
+                 all(kf -> isleaf(quad, last(quadrant_preimage(quad, full, kf))),
+                     full.leaves)
+        fillall!()
+        worst, npoints = 0.0, 0
+        for (q, f) in zip(qsets, fsets)
+            result = compare_matching_blocks(q, f)
+            result === nothing && (worst = Inf; break)
+            worst = max(worst, result[1])
+            npoints += result[2]
+        end
+        push!(results, (moved=moved, conforming=isbalanced(quad), images=images,
+                        worst=worst, npoints=npoints, nleaves=nleaves(quad)))
+    end
+    return results
+end

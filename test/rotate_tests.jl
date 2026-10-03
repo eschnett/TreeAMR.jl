@@ -8,6 +8,7 @@
 # built from turned `Rational` boxes, never against the seam's own key
 # arithmetic.
 
+using KernelAbstractions: @kernel, @index, @Const
 using TreeAMR: oriented_neighbors, virtual_offset, real_direction, rotating_dims,
                hasrotating
 
@@ -44,15 +45,12 @@ using TreeAMR: oriented_neighbors, virtual_offset, real_direction, rotating_dims
     @test Forest((2, 2); N=4, rotating=(1, 2),
                  extents=((0.0f0, 1.0f0), (0.0f0, 1.0f0))).rotating == (1, 2)
 
-    # Until the interface schedule, interpolation and the checkpoint
-    # learn the orientation, each refuses the seam rather than read
-    # across it as though it were an ordinary face. (The ghost schedule
-    # learned it in step 3.)
+    # Until interpolation and the checkpoint learn the orientation, each
+    # refuses the seam rather than read across it as though it were an
+    # ordinary face. (The ghost schedule learned it in step 3, the
+    # interface schedule in step 4.)
     forest = Forest((2, 2); N=8, rotating=(1, 2))
     fs = FieldSet(forest, 1; G=1, rotation=(1,))
-    vs = FieldSet(forest, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
-    @test_throws "not implemented yet in this step of M12" InterfaceSchedule(vs)
-    @test_throws "InterfaceSchedule over a rotating forest" InterfaceSchedule(vs)
     @test_throws "interpolate over a rotating forest" interpolate(fs, [(0.5, 0.5)],
                                                                   Lagrange(2))
     mktempdir() do dir
@@ -569,4 +567,346 @@ end
     # cell-centered dimension), and it is regridded without one.
     flux = FieldSet(forest, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
     @test flux.rotvars == Int32[1 1 1 1]
+end
+
+# --- M12 step 4: regrid, initial data and the interface schedule -------------
+
+@testset "A regrid across the seam keeps it conforming and the turned full plane: D=$D" for
+        D in (2, 3)
+    # A regrid moves blocks by parent/child transfers that never cross the
+    # seam, but a prolongation reads its parent's ghosts, which do: a
+    # regrid that skipped the fill, or filled a pair alone, would prolong
+    # from stale or wrong seam ghosts. And the completion must keep the
+    # seam conforming while moving no leaf by more than one level. Pass
+    # one refines along the low face of d1 only, near the axis, so that
+    # conformity must refine the image on the low face of d2; pass two
+    # coarsens everything at level 2, as far as balance lets it; pass
+    # three refines along the low face of d2 out to the high faces.
+    lowface(forest, k, d) = leafbox(forest, k)[1][d] == 0
+    near(forest, k, d, w) = leafbox(forest, k)[1][d] < w
+    cases = D == 2 ? [((1, 2), :none), ((2, 1), :none)] :
+            [((1, 2), :reflect_lo), ((3, 1), :periodic)]
+    for (rot, other) in cases
+        d1, d2 = rot
+        passes = [(f, k) -> lowface(f, k, d1) && near(f, k, d2, 1) && level(k) < 3 ?
+                            Refine : Keep,
+                  (f, k) -> level(k) >= 2 ? Coarsen : Keep,
+                  (f, k) -> lowface(f, k, d2) && level(k) < 2 ? Refine : Keep]
+        for (label, kw) in (("cell", (; C=cellcentered(D))),
+                            ("vertex", (; C=vertexcentered(D))),
+                            ("pair", (; pair=true)))
+            results = rotating_regrid_vs_quadrupled(Val(D); rotating=rot, other=other,
+                                                    passes=passes, kw...)
+            counts = [r.nleaves for r in results]
+            for (i, r) in enumerate(results)
+                @test r.moved
+                @test r.conforming
+                @test r.images
+                @test r.npoints > 0
+                @test r.worst < 1e-13
+                (r.worst < 1e-13 && r.images) ||
+                    println("regrid D=$D $rot $other $label pass $i: $r")
+            end
+            # Every pass changed the mesh, so the claim is not vacuous.
+            @test counts[1] > 10 && counts[2] < counts[1] && counts[3] > counts[2]
+            println("regrid across the seam D=$D $rot $other $label: leaves $counts, " *
+                    "worst $(maximum(r -> r.worst, results))")
+        end
+    end
+end
+
+# Refine the level-0 leaves touching the low face of dimension 1.
+lowface_rule(forest, k) = leafbox(forest, k)[1][1] == 0 && level(k) == 0 ? Refine : Keep
+
+@testset "regrid! refuses an asymmetric set alone and takes a pair with its schedules" begin
+    # Moved alone, a set whose ghosts across the seam are its partner's
+    # would be filled from its own data before the transfer; the regrid
+    # must refuse it with the hint, as the fill does, and agree on it on
+    # every rank. Resizing it alone fills nothing and stays allowed.
+    forest = rotating_forest(Val(2); rotating=(1, 2))
+    Bx = FieldSet(forest, 1; G=(1, 2), centering=facecentered(2, 1), rotation=(-1,))
+    By = FieldSet(forest, 1; G=(2, 1), centering=facecentered(2, 2), rotation=(1,))
+    sx, sy = GhostSchedule(Bx, ROT_OPS4), GhostSchedule(By, ROT_OPS4)
+    keep = fill(Keep, nleaves(forest))
+    @test_throws "Regrid the two sets as a pair" regrid!(forest, Bx => sx; flags=keep)
+    @test_throws "Regrid the two sets as a pair" regrid!(forest, [By => sy]; flags=keep)
+    @test_throws "with its two schedules" regrid!(forest, RotationPair(Bx, By) => sx;
+                                                  flags=keep)
+    @test_throws "`pair => (schedule_a, schedule_b)`" regrid!(forest, RotationPair(Bx, By);
+                                                              flags=keep)
+    @test_throws "ghost width" regrid!(forest, RotationPair(Bx, By) => (sy, sx);
+                                       flags=keep)
+    @test regrid!(forest, [Bx => nothing, By => nothing]; flags=keep) == false
+    @test regrid!(forest, RotationPair(Bx, By) => (sx, sy); flags=keep) == false
+    # A refusal changes nothing, and a pair's regrid moves both sets.
+    g = generation(forest)
+    flags = [lowface_rule(forest, k) for k in forest.leaves]
+    pair = RotationPair(Bx, By)
+    @test regrid!(forest, pair => (sx, sy); flags=flags,
+                  boundary=CellBoundary((x, v, δ) -> zero(eltype(x))))
+    @test generation(forest) > g
+    @test nblocks(Bx) == nblocks(By) == nleaves(forest)
+    @test isbalanced(forest)
+    # The pair's tables survive, since the sets' storage was replaced in
+    # place: the pair fills again with fresh schedules.
+    @test fill_ghosts!(pair, (GhostSchedule(Bx, ROT_OPS4), GhostSchedule(By, ROT_OPS4));
+                       boundary=CellBoundary((x, v, δ) -> zero(eltype(x)))) === pair
+end
+
+@testset "The initial-data cycle adapts a rotating quadrant, alone or as a pair" begin
+    # The cycle fills ghosts before it flags, and a pair's ghosts across
+    # the seam are each other's; it must converge to a conforming mesh
+    # and leave data that a fill reproduces exactly.
+    p = 4
+    ops = Operators(prolongation=p, restriction=p)
+    rule(b, key, forest) = begin
+        lo, hi = leafbox(forest, key)
+        c = (lo .+ hi) ./ 2
+        hypot(c[1], c[2]) < 0.8 && level(key) < 2 ? Refine : Keep
+    end
+    f = rotating_data(2, (1, 2), :none; poly=p)
+    forest = Forest((2, 2); N=8, rotating=(1, 2), extents=((0.0, 2.0), (0.0, 2.0)))
+    fs = FieldSet(forest, 3; G=ghosts_for(cellcentered(2), p),
+                  rotation=vector_rotation(2, (1, 2)))
+    schedule, passes, converged = adapt_to_initial_data!(fs, ops; initial=f,
+        flag=(b, key) -> rule(b, key, forest), boundary=boundary_by_coordinates(f))
+    @test converged
+    @test passes == 3
+    @test maxlevel(forest) == 2
+    @test isbalanced(forest)
+    fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
+    worst = maximum(Iterators.flatten(
+        (abs(fs.work[idx, v, b] - f(coordinates(fs, b, Tuple(idx)), v))
+         for idx in CartesianIndices(size(fs.work)[1:2]), v in 1:3) for b in 1:nblocks(fs)))
+    @test worst < 1e-10
+
+    # The pair form: two callbacks, the flags of the whole pair at once.
+    field(x, k) = covariant_vector(x[1], x[2], k; poly=p)
+    fa(x, v) = field(x, v)[1]
+    fb(x, v) = field(x, 3 - v)[2]
+    forest = Forest((2, 2); N=8, rotating=(1, 2), extents=((0.0, 2.0), (0.0, 2.0)))
+    a = FieldSet(forest, 2; G=ghosts_for(facecentered(2, 1), p),
+                 centering=facecentered(2, 1), rotation=(-2, -1))
+    b = FieldSet(forest, 2; G=reverse(ghosts_for(facecentered(2, 1), p)),
+                 centering=facecentered(2, 2), rotation=(2, 1))
+    pair = RotationPair(a, b)
+    @test_throws "Fill it as a RotationPair" adapt_to_initial_data!(a, ops; initial=fa,
+        flag=(b, key) -> Keep)
+    @test_throws "a tuple of two" adapt_to_initial_data!(pair, ops;
+        initial=(fa, fb, fa), flag=(b, key) -> Keep)
+    hooks = (boundary_by_coordinates(fa), boundary_by_coordinates(fb))
+    (sa, sb), passes, converged = adapt_to_initial_data!(pair, ops; initial=(fa, fb),
+        flags=pr -> [rule(i, key, forest) for (i, key) in enumerate(pr.a.forest.leaves)],
+        boundary=hooks)
+    @test converged
+    @test maxlevel(forest) == 2
+    @test isbalanced(forest)
+    fill_ghosts!(pair, (sa, sb); boundary=hooks)
+    worst = 0.0
+    for (fs, g) in ((a, fa), (b, fb)), blk in 1:nblocks(fs),
+        idx in CartesianIndices(size(fs.work)[1:2]), v in 1:2
+        worst = max(worst, abs(fs.work[idx, v, blk] - g(coordinates(fs, blk, Tuple(idx)), v)))
+    end
+    @test worst < 1e-10
+end
+
+@testset "The interface schedule records nothing across the conforming seam: D=$D" for
+        D in (2, 3)
+    # A coarse-fine face across the seam would need a turned restriction,
+    # which the interface schedule does not build; conformity rules it
+    # out. So a rotating forest's schedule must hold no rotated transfer,
+    # and elsewhere restrict exactly as the same leaves without the seam,
+    # whose seam faces are outer faces that nothing restricts either.
+    rot = (1, 2)
+    other = D == 2 ? :none : :periodic
+    forest = rotating_forest(Val(D); rotating=rot, other=other)
+    plain = Forest(forest.roots; N=forest.N, periodic=forest.periodic,
+                   extents=forest.extents, leaves=copy(forest.leaves))
+    rng = Xoshiro(12)
+    nrestrict = 0
+    for d in 1:D
+        rotation = d == 1 ? (-1,) : (1,)
+        fr = FieldSet(forest, 1; G=0, centering=facecentered(D, d), rotation=rotation)
+        fp = FieldSet(plain, 1; G=0, centering=facecentered(D, d))
+        is = InterfaceSchedule(fr)
+        groups = collect(Iterators.flatten(is.phases))
+        @test all(g -> g.orientation == 0, groups)
+        @test !occursin("rotated", sprint(show, is))
+        nrestrict += sum(ntransfers, groups; init=0)
+        fr.work .= randn(rng, size(fr.work))
+        fp.work .= fr.work
+        restrict_interfaces!(fr, is)
+        restrict_interfaces!(fp, InterfaceSchedule(fp))
+        @test fr.work == fp.work
+    end
+    @test nrestrict > 0
+
+    # A seam that is not conforming is a bug the schedule reports, not a
+    # restriction it skips: refine one leaf on the low face of d2 without
+    # balancing, so that its image across the low face of d1 is coarser.
+    broken = Forest((2, 2); N=8, rotating=(1, 2))
+    refine!(broken, only(filter(k -> leafbox(broken, k)[1] == (1, 0), broken.leaves)))
+    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
+    @test_throws "this is a bug" InterfaceSchedule(fx)
+end
+
+# A conservative advection by the rigid rotation `v = (−y, x)` in the
+# plane of the seam, about its axis: the three-step right-hand side of
+# `burgers.jl` with a linear reconstruction and an upwind flux. Mass that
+# leaves the quadrant through the low face of `d1` enters it through the
+# low face of `d2`, and the two faces' fluxes cancel only because they
+# are each other's image: the flux is `F = u v`, a vector, so
+# `F_{d1}(0, s) = −F_{d2}(s, 0)`, and the scheme computes it covariantly.
+# The block on one seam face reconstructs from its cells and its turned
+# ghosts, which are the image block's cells, and the image block
+# reconstructs the same numbers in the other order; the centered slope
+# is antisymmetric under that reversal, `a − b = −(b − a)` exactly, and
+# the upwind choice is made by the sign of the *normal* velocity, which
+# the turn negates on one side, so both pick the same state and the
+# fluxes cancel bit for bit. A Rusanov flux with `|v|` would too; a flux
+# that chose its upwind side by a fixed axis would not. The high faces
+# are walls, a zero normal velocity there, so that nothing else enters or
+# leaves, and the hook fills the outer ghosts with zeros.
+@kernel function advect_flux_kernel!(flux, @Const(work), @Const(vel), ::Val{D},
+                                     ::Val{GU}, ::Val{d}) where {D,GU,d}
+    I = @index(Global, NTuple)                     # (i1..iD, block), face indices
+    b = I[D + 1]
+    c = ntuple(e -> I[e] + GU[e], Val(D))
+    m1 = Base.setindex(c, c[d] - 1, d)
+    m2 = Base.setindex(c, c[d] - 2, d)
+    p1 = Base.setindex(c, c[d] + 1, d)
+    um2, um1 = work[m2..., 1, b], work[m1..., 1, b]
+    u0, up1 = work[c..., 1, b], work[p1..., 1, b]
+    uL = um1 + (u0 - um2) / 4                      # centered slope, halved
+    uR = u0 - (up1 - um1) / 4
+    v = vel[ntuple(e -> I[e], Val(D))..., 1, b]    # G = 0: stored = face index
+    z = zero(v)
+    flux[ntuple(e -> I[e], Val(D))..., 1, b] = max(v, z) * uL + min(v, z) * uR
+end
+
+@kernel function advect_divergence_kernel!(du, fluxes, @Const(spacings),
+                                           ::Val{D}) where {D}
+    I = @index(Global, NTuple)
+    b = I[D + 1]
+    c = ntuple(e -> I[e], Val(D))
+    acc = zero(eltype(du))
+    for d in 1:D
+        hi = Base.setindex(c, c[d] + 1, d)
+        acc += fluxes[d][hi..., 1, b] - fluxes[d][c..., 1, b]
+    end
+    du[c..., 1, b] = -acc / spacings[b]
+end
+
+"""
+The state, flux, velocity and schedules of the rigid-rotation advection
+on a rotating quadrant; `fixup = false` drops `restrict_interfaces!`.
+"""
+function advection_problem(forest::Forest{D}; fixup::Bool) where {D}
+    d1, d2 = TreeAMR.rotating_dims(forest)
+    rotation(d) = d == d1 ? (-1,) : (1,)       # F_{d1} is −F_{d2} a turn away
+    state = FieldSet(forest, 1; G=2, rotation=(1,))
+    fluxes = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d),
+                                  rotation=rotation(d)), D)
+    vel = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d),
+                               rotation=rotation(d)), D)
+    hi = ntuple(d -> forest.extents[d][2], D)
+    for d in 1:D, b in 1:nblocks(vel[d])
+        # The normal velocity on each face of the closed range, both of a
+        # block's own faces, zero on the high walls. (`fill_by_coordinates!`
+        # fills owned points only, which leaves the high face at zero, and
+        # a block whose high face carries no flux leaks.)
+        for idx in CartesianIndices(ntuple(e -> 1:(forest.N + (e == d)), D))
+            x = coordinates(vel[d], b, Tuple(idx))
+            vel[d].work[idx, 1, b] = x[d] > hi[d] - 1e-9 ? 0.0 :
+                                     d == d1 ? -x[d2] : d == d2 ? x[d1] : 0.0
+        end
+    end
+    return (; state, fluxes, vel, fixup, schedule=GhostSchedule(state, ROT_OPS4),
+            ischeds=ntuple(d -> InterfaceSchedule(fluxes[d]), D),
+            spacings=block_spacings(forest, Float64),
+            hook=CellBoundary((x, v, δ) -> zero(eltype(x))))
+end
+
+function advect_rhs!(du, u, p)
+    D = length(p.fluxes)
+    scatter!(p.state, u)
+    fill_ghosts!(p.state, p.schedule; boundary=p.hook)
+    ntuple(Val(D)) do d
+        map_blocks!(advect_flux_kernel!, p.fluxes[d], p.fluxes[d].work, p.state.work,
+                    p.vel[d].work, Val(D), Val(p.state.G), Val(d); closed=true)
+        p.fixup && restrict_interfaces!(p.fluxes[d], p.ischeds[d])
+        nothing
+    end
+    map_blocks!(advect_divergence_kernel!, p.state, statearray(du, p.state),
+                map(f -> f.work, p.fluxes), p.spacings, Val(D))
+    return du
+end
+
+"""
+Advect a compact bump by the rigid rotation for `nsteps` SSPRK3 steps of
+`dt` and return `(mass0, mass1, crossed)`: the total mass before and
+after, and the mass that ended up within 30° of the low face of `d2`,
+having started between 45° and 85° from it, next to the low face of
+`d1`, so that it can only have got there through the seam.
+"""
+function advect_through_seam(forest::Forest{D}; fixup::Bool, nsteps::Int,
+                             dt::Float64) where {D}
+    d1, d2 = TreeAMR.rotating_dims(forest)
+    p = advection_problem(forest; fixup=fixup)
+    centre, w = (cos(1.13), sin(1.13)), 0.35          # 65° from the d1 axis
+    fill_by_coordinates!(p.state) do x, _
+        ρ2 = ((x[d1] - centre[1])^2 + (x[d2] - centre[2])^2) / w^2
+        return ρ2 < 1 ? (1 - ρ2)^3 : 0.0
+    end
+    u = statevector(p.state)
+    gather!(u, p.state)
+    mass() = (scatter!(p.state, u); total_mass(p.state))
+    mass0 = mass()
+    k, u1, u2 = similar(u), similar(u), similar(u)
+    for _ in 1:nsteps
+        advect_rhs!(k, u, p)
+        @. u1 = u + dt * k
+        advect_rhs!(k, u1, p)
+        @. u2 = 3 / 4 * u + 1 / 4 * (u1 + dt * k)
+        advect_rhs!(k, u2, p)
+        @. u = 1 / 3 * u + 2 / 3 * (u2 + dt * k)
+    end
+    mass1 = mass()
+    crossed = 0.0
+    for b in 1:nblocks(p.state)
+        h = spacing(forest, blockkey(p.state, b))
+        for idx in CartesianIndices(ntuple(_ -> 3:(forest.N + 2), D))
+            x = coordinates(p.state, b, Tuple(idx))
+            if x[d2] < tan(π / 6) * x[d1]
+                crossed += p.state.work[idx, 1, b] * h^D
+            end
+        end
+    end
+    return mass0, mass1, crossed
+end
+
+@testset "Rigid rotation conserves mass through the seam and coarse-fine faces" begin
+    # The seam's two faces must exchange exactly the flux one loses and
+    # the other gains, and the coarse-fine faces inside the quadrant need
+    # the fixup, as anywhere: a leak at the seam or at an interface shows
+    # as a drift of the total mass. The bump crosses the seam during the
+    # run and the refinement boundary at radius 1.2 cuts through it; the
+    # negative control drops the fixup and must drift.
+    for rot in ((1, 2), (2, 1))
+        forest = rotating_forest(Val(2); rotating=rot)
+        @test maxlevel(forest) == 2
+        hmin = minimum(k -> spacing(forest, k), forest.leaves)
+        dt = 0.4 * hmin / (2 * sqrt(2.0))
+        nsteps = ceil(Int, 0.45 / dt)               # a quarter of a radian and more
+        m0, m1, crossed = advect_through_seam(forest; fixup=true, nsteps=nsteps, dt=dt)
+        drift = abs(m1 - m0) / m0
+        @test drift < 1e-13
+        @test crossed > 0.1 * m0
+        n0, n1, _ = advect_through_seam(forest; fixup=false, nsteps=nsteps, dt=dt)
+        leak = abs(n1 - n0) / n0
+        @test n0 == m0
+        @test leak > 1e-3
+        println("rigid rotation through the seam $rot: $nsteps steps, crossed " *
+                "$(crossed / m0) of the mass, drift $drift with the fixup, $leak without")
+    end
 end

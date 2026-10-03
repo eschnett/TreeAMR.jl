@@ -1033,6 +1033,20 @@ the value `−B_y` across the low face of `x`. Two cases:
   `regrid!` and `adapt_to_initial_data!` take `pair => (sa, sb)` and
   fill the pair before the transfers; the transfers themselves are
   `δ = 0` and never cross the seam.
+  *(Amended in step 4, 2026-10-03: `regrid!` takes the element
+  `pair => (sa, sb)` beside `fs => schedule` and `fs => nothing`, fills
+  the pair once before either set moves, and moves each set with its
+  own schedule's operators. A plain `fs => schedule` of an asymmetric
+  set with ghosts in the plane is refused there, among the collective
+  checks, with the pair named, since its fill would be refused further
+  down on every rank alike; `fs => nothing` fills nothing and is
+  allowed. `adapt_to_initial_data!` builds its schedules itself, so it
+  takes no `pair => …` element: it has a pair form,
+  `adapt_to_initial_data!(pair, operators; initial, flag | flags, …)`,
+  with `initial` and `boundary` one for both sets or a tuple of two,
+  `flags` called with the pair, and the two schedules returned. It
+  fills ghosts before it flags, for a criterion that reads them, which
+  is why it needs the pair at all.)*
 
 *90° only* (decided 2026-10-03 with Erik). A 180° rotation, the
 π-symmetry, needs the same machinery and one thing more, a face glued
@@ -1510,6 +1524,25 @@ obligation therefore gains one clause: its flux must be covariant
 under the rotation, which a flux written in Cartesian components is.
 The flux sets themselves, with `G = 0`, have no seam ghosts and fill
 alone. The rigid-rotation advection test of M12 puts a number on it.
+*(Step 4, 2026-10-03: the interface schedule searches with
+`oriented_neighbors`, and a finer neighbor with a nonzero orientation
+is an `error` — a bug, since only a forest that bypassed the checked
+paths can have one; the test makes one with `refine!` and no
+`balance!`. Over a balanced rotating forest it is, restriction for
+restriction and bit for bit on random data, the schedule of the same
+leaves without the seam, whose seam faces are outer faces. The
+advection test, a compact bump carried by `v = (−y, x)` across the seam
+and across a refinement boundary, with a linear reconstruction and an
+upwind flux chosen by the sign of the normal velocity, conserves the
+total to a relative 6e-15 over 102 SSPRK3 steps while 55 % of the mass
+crosses the seam, and drifts by 1.9 % without the fixup. The covariance
+is exact there: the two seam faces' fluxes are each other's negatives
+bit for bit, because `a − b = −(b − a)` in IEEE arithmetic and the
+upwind side follows the normal velocity, which the turn negates on one
+side. One sharp edge, the application's, not the seam's: a velocity
+stored on faces must be set on both of a block's faces, the closed
+range; `fill_by_coordinates!` sets owned points only, and a block whose
+high face carries a zero velocity leaks 20 % in the same run.)*
 
 **Construction.** The interface schedule comes out of the same neighbor
 search as the ghost schedule — its transfers are the `:restrict` cases
@@ -7885,6 +7918,45 @@ being done now, so it comes before M9b, which follows it.
       suite: 111710 tests at one thread in 6m51 (`Pkg.test`), every one
       passing; the docs build, doctests included.
   - **Step 4 — regrid, initial data and the interface schedule.**
+    *(Done, 2026-10-03.)*
+    - *What was built.* `regrid!` takes `pair => (sa, sb)` and fills the
+      pair before its two transfers (`regrid_steps`); `check_regrid`
+      checks both members as it checks a set (`check_regrid_set!`), adds
+      the pair to the agreed layout, and refuses a plain asymmetric set
+      with ghosts in the plane, with the pair named.
+      `adapt_to_initial_data!` gained a pair form (amended under "Rotating
+      seams"); both forms share `adapt_criterion`. The interface
+      schedule's step-1 refusal is gone, its search is oriented, and a
+      seam restriction is a bug check (amended under
+      [Conservation](#conservation-at-coarse-fine-faces)).
+    - *Measured.* A regrid of the quadrant against a regrid of the full
+      plane to the turned image of the quadrant's new leaves, the full
+      plane's flags derived from the quadrant's moves in `Rational` boxes
+      (`rotating_regrid_vs_quadrupled`): three passes — refine along the
+      low face of `d1` near the axis, which conformity carries to the
+      low face of `d2`; coarsen everything at level 2; refine along the
+      low face of `d2` — take the 2D quadrant through 31, 16 and 34
+      leaves and the 3D ones through 134 (or 176), 57 and 246. After
+      every pass every leaf moved by at most one level, the quadrant is
+      balanced and conforming, the full plane's leaves are exactly the
+      four turns of the quadrant's, and every stored point after a fill
+      equals the full plane's: worst 1.1e-15 in 2D and 3.6e-15 in 3D,
+      cell, vertex and the face-centered pair, with the third dimension
+      reflecting below or periodic. Without the pair's fill before the
+      transfer the same comparison is off by 1.5. The interface
+      schedule and the conservation test are recorded under
+      [Conservation](#conservation-at-coarse-fine-faces).
+    - *Tests*, in `test/rotate_tests.jl` with the regrid oracle at the
+      end of `ghost_oracles.jl` (`quadrant_preimage`, `regrid_move`,
+      `formula_hook`, `rotating_regrid_vs_quadrupled`): the regrid
+      against the full plane in `D = 2` and 3; the refusals and a pair's
+      regrid, after which the pair fills again; the initial-data cycle
+      on a quadrant, alone (3 passes to level 2) and as a pair, each
+      reproducing polynomial data to 1e-10 after a fill; the interface
+      schedule against the seamless leaves and its bug check; and the
+      rigid-rotation advection, both orders of the pair. The file holds
+      1334 tests (1092 after step 3) and runs in 50 s at one thread and
+      42 s at four.
   - **Step 5 — interpolation.**
   - **Step 6 — checkpoint.**
   - **Step 7 — MPI.** The pack and unpack, and the workloads.
