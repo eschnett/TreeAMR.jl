@@ -1804,6 +1804,12 @@ first step on its own. Decided:
   chain rule through `R^{−r}`: for `r = 1`, `∂_{d1}` at `p` is
   `−∂_{d2}` at `q` and `∂_{d2}` is `∂_{d1}`; for `r = 2` both are
   negated; for `r = 3`, `∂_{d1}` is `∂_{d2}` and `∂_{d2}` is `−∂_{d1}`.
+  A derivative of any order turns once per order, so a second one
+  takes the product of its two signs: for `r = 1`, `∂_{d1}∂_{d2}` is
+  `−∂_{d2}∂_{d1}` and `∂_{d1}²` is `∂_{d2}²` *(amended on merging the
+  second derivatives from `main`; the kernel's sign was already per
+  order, and `rotate_tests.jl` checks the Hessian of the metric's
+  `g_xz` beyond the seam bit for bit)*.
   `PointGeometry` carries the rotation, so `locate_point` and M7's host
   routing share the fold, and a point that the rotation takes beyond a
   high face is outside and refused. A set with an asymmetric layout,
@@ -1859,11 +1865,24 @@ first step on its own. Decided:
   schedule's exact rational weights do not serve: they are cached per
   offset, and a stream of arbitrary offsets would grow the cache without
   bound.
-- **Derivatives as multi-indices, first order for now.** `derivs` is a
-  tuple of `D`-component multi-indices in physical units. The weights,
-  the contraction, the `h^{|m|}` scaling and the mirror signs are all
-  written for any order; one check refuses `|m| ≥ 2` until tests claim
-  it, so second derivatives need no change of interface.
+- **Derivatives as multi-indices, up to second order** *(amended
+  2026-10-03; first order until then)*. `derivs` is a tuple of
+  `D`-component multi-indices in physical units. The weights, the
+  contraction, the `h^{|m|}` scaling and the mirror signs are all
+  written for any order; one check refused `|m| ≥ 2` until tests
+  claimed it, and now refuses `|m| ≥ 3` for the same reason. Second
+  derivatives needed no change of interface and none of the kernel:
+  only the check moved. A derivative across a reflecting wall takes one
+  sign per order across it, so `∂ₓ²` across a wall in `x` keeps the
+  variable's parity and `∂ₓ∂ᵧ` flips it. The rate of an `m`-th
+  derivative is **`min(n − max_a m_a, p − |m|)`**: `Lagrange(n)` loses
+  one order per derivative along a dimension, so a mixed `∂ₓ∂ᵧ` keeps
+  `n − 1`, but near a coarse-fine face the stencil reads ghosts with
+  the exchange's `O(hᵖ)` error, which any derivative of total order
+  `|m|` divides by `h^{|m|}`. So the full mixed rate through
+  `Lagrange(n)` needs `p ≥ n + 1`, and a pure second derivative
+  `p ≥ n`; the usual `p = n` for even `n` holds `∂ₓ∂ᵧ` to `n − 2`
+  (measured below, under M11).
 - **Sum factorization along dimension 1.** Each row of `n` points is
   contracted once per derivative order in `x₁`, and only the partial
   sums meet the other dimensions' weights, whose products — one per row
@@ -5700,6 +5719,42 @@ the same day, so it comes before M9b, which follows it.
     a batch with an outside point copies its block indices back (the
     first version copied them always, 2 MB at 496000 points, and ran at
     12.2 ns per point before the `Val` for the multi-indices).
+  - **Second derivatives** *(amended 2026-10-03)*. The check moved from
+    `|m| ≤ 1` to `|m| ≤ 2`, and the tests now claim: every second
+    derivative of a degree-`(n − 1)` tensor polynomial, through the same
+    three levels, centerings and `n` as the first, and at `G = 0` and
+    `1` where the stencil shifts — worst error 7.4e-12 against
+    8e-14 for first derivatives, the `h⁻²` the roundoff picks up, held
+    to 1e-9; the Hessian beyond a reflecting face in the six face and
+    centering cases; the kernel against the exact rational contraction
+    with the basis polynomials' exact derivatives (expanded, not the
+    package's series); `(2, 0)` and `(1, 1)` in `Float32` and
+    `Float32x2` (at most 1302 `eps(T)` of the value scale, held to
+    16384); `∂ₓ²` on a device against the host; the Hessian through
+    the in-process distributed path and `∂ₓ∂ᵧ`, `∂ᵧ²` in the MPI
+    workload; and the refusal moved to total order 3. `(1, 1)` through
+    `Lagrange(2)` is allowed, being first order along each dimension.
+    *Rates*, the same smooth 2D field, `N = 8 → 16`, cell / vertex:
+
+    | `n` | `p` | `∂ₓ²` | `∂ₓ∂ᵧ` |
+    |---|---|---|---|
+    | 3 | 4 | 0.90 / 0.86 | 1.74 / 1.76 |
+    | 4 | 4 | 1.71 / 2.08 | 3.09 / **2.14** |
+    | 4 | 6 | 2.01 / 2.08 | 3.09 / 2.80 |
+    | 5 | 6 | 2.99 / 2.93 | 3.80 / 3.85 |
+
+    The bold entry is the exchange's limit, `p − |m| = 2`, and is why the
+    rate is written with `p` in it: raising `p` to 6 gives `∂ₓ∂ᵧ` back
+    its `n − 1`. At `N = 16 → 32 → 64` the same case runs 1.69, 2.50
+    at `p = 4` and 3.05, 2.96 at `p = 6`, and the `n = 3, 5` rows do not
+    move with `p`, since `p − 2` does not limit them there. The suite
+    holds `∂ₓ²` to `n − 2.4` and `∂ₓ∂ᵧ` to `min(n − 1, p − 2) − 0.4`.
+    *Cost*: the interpolation file takes 35.4–36.0 s against 33.6–34.9
+    for the previous one on the same `src/` (two runs each, Julia
+    1.13), the extra `M = 2` kernels; the suite 110993 tests in 7m27 at
+    eight threads, against 110658 in 6m28 after M7 step 6b, which is
+    run-to-run noise at this length since the file accounts for 1 s of
+    it. The device test passes on Metal (`Float32`, `∂ₓ²` included).
 - **M9a — Checkpoint and restart.** *(Done.)* Done before M7
   (decided): TreeHydro's long runs and TreeGeneralizedHarmonic's
   production runs, estimated at 38–149 h, outlast any queue's day and

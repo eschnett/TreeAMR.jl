@@ -1105,13 +1105,15 @@ end
               0.05v * x[1] * x[2]
     fill_by_coordinates!(f, fs)
     fill_ghosts!(fs, GhostSchedule(fs, ROT_OPS4); boundary=boundary_by_coordinates(f))
-    derivs = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))
+    derivs = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1),
+              (2, 0, 0), (1, 1, 0), (0, 2, 0))
     q = (0.83, 0.41, 0.57)
     p = (-q[2], q[1], q[3])                         # R q, beyond the low x face
     a = interpolate(fs, [p], Lagrange(4); derivs=derivs, vars=[3]).values[1, :, 1]
     b = interpolate(fs, [q], Lagrange(4); derivs=derivs, vars=[5]).values[1, :, 1]
-    # g_xz(p) = −g_yz(q) with q = (p_y, −p_x, p_z): ∂ₓ ↦ −∂_y, ∂_y ↦ ∂ₓ.
-    @test a == [-b[1], b[3], -b[2], -b[4]]
+    # g_xz(p) = −g_yz(q) with q = (p_y, −p_x, p_z): ∂ₓ ↦ −∂_y, ∂_y ↦ ∂ₓ,
+    # once per order, so ∂ₓ² ↦ ∂_y², ∂_y² ↦ ∂ₓ² and ∂ₓ∂_y ↦ −∂_y∂ₓ.
+    @test a == [-b[1], b[3], -b[2], -b[4], -b[7], b[6], -b[5]]
 end
 
 @testset "A set that turns into its partner refuses points beyond the seam" begin

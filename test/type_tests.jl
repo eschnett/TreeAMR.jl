@@ -286,13 +286,17 @@ end
     forest = nested_forest(Val(D); T=T, N=8)
     poly = makepoly(D, 3)
     dpoly(x, v, a) = sum(0.11 * (a + v) * e * x[a]^(e - 1) for e in 1:3)
+    d2poly(x, v, a) = sum(0.11 * (a + v) * e * (e - 1) * x[a]^(e - 2) for e in 2:3)
     fs = FieldSet(forest, 2; G=2)
     fill_by_coordinates!(poly, fs)
     fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
                  boundary=boundary_by_coordinates(poly))
     xs = [ntuple(d -> T((7j + 3d) % 64 // 16), D) for j in 1:40]
     push!(xs, ntuple(_ -> T(3 // 2), D), ntuple(_ -> T(1 // 8), D))  # in the ball, far
-    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D))
+    # The second derivative, and for D = 2 the mixed one, which vanishes
+    # for this separable polynomial; both divide the roundoff by h².
+    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D), ntuple(d -> 2Int(d == 1), D),
+              (D == 2 ? ((1, 1),) : ())...)
     r = interpolate(fs, xs, Lagrange(4); derivs=derivs,
                     exclude=Ellipsoid(ntuple(_ -> 1.5, D), ntuple(_ -> 0.5, D)))
     @test eltype(r.values) === T
@@ -301,6 +305,15 @@ end
                   for j in eachindex(xs), v in 1:2) < reltol(T, 4096) * scale
     @test maximum(abs(r.values[v, 2, j] - T(dpoly(xs[j], v, 1)))
                   for j in eachindex(xs), v in 1:2) < reltol(T, 65536) * scale
+    e2 = maximum(abs(r.values[v, 3, j] - T(d2poly(xs[j], v, 1)))
+                 for j in eachindex(xs), v in 1:2)
+    exy = D == 2 ? maximum(abs, r.values[:, 4, :]) : zero(T)
+    if get(ENV, "TREEAMR_SHOW_ERRORS", "") == "1"
+        unit = eps(T) * scale
+        @info "second derivatives, in eps(T) * scale" T D e2 / unit exy / unit
+    end
+    @test e2 < reltol(T, 2^14) * scale
+    @test exy < reltol(T, 2^14) * scale
     @test any(r.excluded) && !all(r.excluded)
     @test (@inferred Union{Int,Nothing} locate_point(forest, xs[1])) isa Int
 end

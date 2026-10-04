@@ -64,7 +64,7 @@ end
     mid = ntuple(d -> (serial.extents[d][1] + serial.extents[d][2]) / 2, D)
     ball = Ellipsoid(mid, ntuple(d -> 0.3, D))
     basis = Lagrange(4)
-    derivs = gradient_derivs(D)
+    derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
     full = interpolate(sfs, xs, basis; derivs=derivs, vars=[3, 1], exclude=ball)
     plain = interpolate(sfs, xs, basis)
     @test 0 < count(full.excluded) < length(xs)
@@ -151,8 +151,8 @@ end
     @test occursin("On rank 0, point 1, (NaN, 0.0)", msgs[2])
     # An argument only rank 0's checks refuse, through `interpolate`.
     msgs = attempt((fs, r) -> interpolate(fs, inside, Lagrange(4);
-                                          derivs=r == 1 ? ((2, 0),) : ((0, 0),)))
-    @test occursin("only values and first derivatives", msgs[1])
+                                          derivs=r == 1 ? ((3, 0),) : ((0, 0),)))
+    @test occursin("up to second order", msgs[1])
     @test all(r -> occursin("interpolate was refused on rank(s) 0 of 3", msgs[r]), 2:3)
     # Arguments that differ: the variables on rank 2, the region on rank 1.
     msgs = attempt((fs, r) -> interpolate(fs, inside, Lagrange(4); vars=r == 3 ? [2] : [1]))

@@ -10,15 +10,18 @@
 using TreeAMR: query_stencil, stencil_hits, lagrange_weights, PointGeometry
 
 # A tensor polynomial of degree `deg` in each dimension, per variable,
-# with its gradient: `Π_d p_{v,d}(x_d)`. Coefficients of order one on
-# the domain `[-1, 1]^D`, so an absolute tolerance means something.
+# with its gradient and its derivative for any multi-index `m`:
+# `Π_d p_{v,d}(x_d)`. Coefficients of order one on the domain `[-1, 1]^D`,
+# so an absolute tolerance means something.
 function tensorpoly(D, deg)
     c(v, d, e) = (0.3 + 0.1v + 0.05d) * (-1)^e / (1 + e)
-    p(v, d, y) = sum(c(v, d, e) * y^e for e in 0:deg)
-    dp(v, d, y) = sum(e * c(v, d, e) * y^(e - 1) for e in 1:deg; init=0.0)
-    f(x, v) = prod(p(v, d, x[d]) for d in 1:D)
-    df(x, v, a) = prod(d == a ? dp(v, d, x[d]) : p(v, d, x[d]) for d in 1:D)
-    return f, df
+    # The `k`-th derivative of one factor, `Σ e!/(e−k)! c yᵉ⁻ᵏ`.
+    p(v, d, y, k) = sum(prod((e - k + 1):e; init=1) * c(v, d, e) * y^(e - k)
+                        for e in k:deg; init=0.0)
+    f(x, v) = prod(p(v, d, x[d], 0) for d in 1:D)
+    df(x, v, a) = prod(p(v, d, x[d], Int(d == a)) for d in 1:D)
+    dm(x, v, m) = prod(p(v, d, x[d], m[d]) for d in 1:D)
+    return f, df, dm
 end
 
 # Two roots per dimension over `[-1, 1]^D`, a block refined twice at the
@@ -63,6 +66,27 @@ function probe_points(rng, fs::FieldSet{T,D}; nrandom=60) where {T,D}
 end
 
 gradient_derivs(D) = (ntuple(_ -> 0, D), ntuple(a -> ntuple(d -> Int(d == a), D), D)...)
+
+# Every multi-index of total order two — the Hessian — leaving out the
+# pure ones where `Lagrange(n)` cannot produce them (`n < 3`).
+hessian_derivs(D, n=3) =
+    Tuple(m for m in (ntuple(d -> Int(d == a) + Int(d == b), D) for a in 1:D for b in a:D)
+          if n >= 3 || maximum(m) == 1)
+
+# The largest error of `values` against `dm` per derivative order: the
+# value, the first derivatives, the second.
+function errors_by_order(values, xs, derivs, dm; nvars=2)
+    worst = zeros(3)
+    for (j, x) in enumerate(xs), v in 1:nvars, (k, m) in enumerate(derivs)
+        o = sum(m) + 1
+        worst[o] = max(worst[o], abs(values[v, k, j] - dm(x, v, m)))
+    end
+    return worst
+end
+
+# `TREEAMR_SHOW_ERRORS=1` prints those errors, which is how the bounds
+# below were set.
+showerrors() = get(ENV, "TREEAMR_SHOW_ERRORS", "") == "1"
 
 @testset "locate_point finds the leaf whose half-open box holds the point: D=$D" for
         D in (1, 2, 3)
@@ -115,27 +139,24 @@ end
         n in ns, C in Cs
     # The claim that makes the interpolant usable at all: through a
     # three-level mesh, at nodes, on block faces, at the domain's corners,
-    # every value and first derivative of a degree-(n−1) tensor polynomial
-    # is reproduced to roundoff. It holds only if the stencil is inside
-    # one block's stored array, the weights are right, and the ghosts the
-    # stencil reads are the exchange's.
-    f, df = tensorpoly(D, n - 1)
+    # every value, first and second derivative of a degree-(n−1) tensor
+    # polynomial is reproduced to roundoff. It holds only if the stencil
+    # is inside one block's stored array, the weights are right, and the
+    # ghosts the stencil reads are the exchange's. A second derivative
+    # divides the roundoff by h², hence its looser bound.
+    f, _, dm = tensorpoly(D, n - 1)
     p = n + isodd(n)                         # point-value orders are even
     forest = interp_forest(D; N=D == 3 ? 6 : 8)
     fs = interp_fieldset(forest, f, C, p)
     xs = probe_points(Xoshiro(n + 10D), fs)
-    derivs = gradient_derivs(D)
+    derivs = (gradient_derivs(D)..., hessian_derivs(D, n)...)
     r = interpolate(fs, xs, Lagrange(n); derivs=derivs)
-    @test size(r.values) == (2, D + 1, length(xs))
+    @test size(r.values) == (2, length(derivs), length(xs))
     @test !any(r.excluded)
-    worst = 0.0
-    for (j, x) in enumerate(xs), v in 1:2
-        worst = max(worst, abs(r.values[v, 1, j] - f(x, v)))
-        for a in 1:D
-            worst = max(worst, abs(r.values[v, 1 + a, j] - df(x, v, a)))
-        end
-    end
-    @test worst < 1e-11
+    worst = errors_by_order(r.values, xs, derivs, dm)
+    showerrors() && @info "exactness" D n C worst = Tuple(worst)
+    @test worst[1] < 1e-11 && worst[2] < 1e-11
+    @test worst[3] < 1e-9
 end
 
 @testset "A stencil shifts inward and stays exact where ghosts are narrow: C=$C" for
@@ -143,8 +164,9 @@ end
     # With `G = 0` (a flux) or `G` below `n/2`, the centered stencil would
     # leave the stored array; clamping moves it inward instead of
     # extrapolating or reading another block, and polynomials stay exact.
-    f, df = tensorpoly(2, 3)
+    f, _, dm = tensorpoly(2, 3)
     forest = interp_forest(2)
+    derivs = (gradient_derivs(2)..., hessian_derivs(2)...)
     for G in (0, 1)
         fs = FieldSet(forest, 2; G=G, centering=C)
         # Every stored point from the polynomial itself: no exchange of
@@ -154,11 +176,12 @@ end
             fs.work[idx, v, b] = f(coordinates(fs, b, Tuple(idx)), v)
         end
         xs = probe_points(Xoshiro(7 + G), fs)
-        r = interpolate(fs, xs, Lagrange(4); derivs=gradient_derivs(2))
-        @test maximum(abs(r.values[v, 1, j] - f(xs[j], v))
-                      for j in eachindex(xs), v in 1:2) < 1e-11
-        @test maximum(abs(r.values[v, 1 + a, j] - df(xs[j], v, a))
-                      for j in eachindex(xs), v in 1:2, a in 1:2) < 1e-10
+        r = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+        worst = errors_by_order(r.values, xs, derivs, dm)
+        showerrors() && @info "shifted" C G worst = Tuple(worst)
+        @test worst[1] < 1e-11
+        @test worst[2] < 1e-10
+        @test worst[3] < 1e-9
     end
 end
 
@@ -166,7 +189,14 @@ end
     # The order claim must be sharp: exactness one degree higher would
     # mean the test above proves less than it says. The rates are the
     # numbers a caller chooses `n` by — `n` for the value, `n − 1` for a
-    # first derivative (measured 2026-09-25, recorded in CODE.md).
+    # first derivative (measured 2026-09-25, recorded in CODE.md), `n − 2`
+    # for a pure second derivative and `n − 1` for a mixed one, whose
+    # error is that of one first derivative in each of two dimensions —
+    # but no better than `p − |m|`, since the ghosts a stencil reads near
+    # a coarse-fine face carry the exchange's `O(hᵖ)` error and an `m`-th
+    # derivative divides it by `h^|m|`. So `p = 4` holds `∂ₓ∂ᵧ` through
+    # `Lagrange(4)` to rate 2, and `p = 6` gives it back its 3 (measured
+    # 2026-10-03).
     f, _ = tensorpoly(2, 4)
     fs = interp_fieldset(interp_forest(2), f, cellcentered(2), 6)
     xs = probe_points(Xoshiro(3), fs)
@@ -175,20 +205,25 @@ end
 
     g(x, v) = sin(2x[1] + v) * cos(3x[2] - 0.5)
     gx(x, v) = 2cos(2x[1] + v) * cos(3x[2] - 0.5)
+    gxx(x, v) = -4sin(2x[1] + v) * cos(3x[2] - 0.5)
+    gxy(x, v) = -6cos(2x[1] + v) * sin(3x[2] - 0.5)
     rng = Xoshiro(11)
     xs = [(2rand(rng) - 1, 2rand(rng) - 1) for _ in 1:200]
-    for n in (3, 4, 5), C in (cellcentered(2), vertexcentered(2))
+    for (n, p) in ((3, 4), (4, 4), (4, 6), (5, 6)),
+        C in (cellcentered(2), vertexcentered(2))
         errs = map((8, 16)) do N
-            fs = interp_fieldset(interp_forest(2; N=N), g, C, n + isodd(n))
-            r = interpolate(fs, xs, Lagrange(n); derivs=((0, 0), (1, 0)))
-            (maximum(abs(r.values[1, 1, j] - g(xs[j], 1)) for j in eachindex(xs)),
-             maximum(abs(r.values[1, 2, j] - gx(xs[j], 1)) for j in eachindex(xs)))
+            fs = interp_fieldset(interp_forest(2; N=N), g, C, p)
+            r = interpolate(fs, xs, Lagrange(n); derivs=((0, 0), (1, 0), (2, 0), (1, 1)))
+            map(enumerate((g, gx, gxx, gxy))) do (k, exact)
+                maximum(abs(r.values[1, k, j] - exact(xs[j], 1)) for j in eachindex(xs))
+            end
         end
-        rv = log2(errs[1][1] / errs[2][1])
-        rg = log2(errs[1][2] / errs[2][2])
-        get(ENV, "TREEAMR_SHOW_RATES", "") == "1" && @info "rates" n C rv rg
+        rv, rg, rxx, rxy = ntuple(k -> log2(errs[1][k] / errs[2][k]), 4)
+        get(ENV, "TREEAMR_SHOW_RATES", "") == "1" && @info "rates" n p C rv rg rxx rxy
         @test rv > n - 0.4
         @test rg > n - 1 - 0.4
+        @test rxx > n - 2 - 0.4
+        @test rxy > min(n - 1, p - 2) - 0.4
     end
 end
 
@@ -226,9 +261,11 @@ end
     rng = Xoshiro(5)
     xs = [ntuple(_ -> 2rand(rng) - 1, D) for _ in 1:50]
     shifted = [ntuple(d -> x[d] + 2 * rand(rng, (-2, -1, 1, 3)), D) for x in xs]
-    a = interpolate(fs, xs, Lagrange(4); derivs=gradient_derivs(D)).values
-    b = interpolate(fs, shifted, Lagrange(4); derivs=gradient_derivs(D)).values
-    @test maximum(abs, a - b) < 1e-11
+    derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
+    a = interpolate(fs, xs, Lagrange(4); derivs=derivs).values
+    b = interpolate(fs, shifted, Lagrange(4); derivs=derivs).values
+    @test maximum(abs, a[:, 1:(D + 1), :] - b[:, 1:(D + 1), :]) < 1e-11
+    @test maximum(abs, a - b) < 1e-9
     # And it is the function, to the interpolation error.
     @test maximum(abs(a[v, 1, j] - g(xs[j], v)) for j in eachindex(xs), v in 1:2) < 1e-3
 end
@@ -236,13 +273,15 @@ end
 # Per dimension, a factor of definite parity about the reflecting wall
 # (even for variable 1, odd for variable 2), a general cubic at outer
 # faces, a constant where periodic — the only polynomials those faces
-# admit — with its derivative. Its natural continuation beyond the wall
-# *is* the mirror image, so the analytic polynomial is the oracle there.
+# admit — with its first and second derivatives. Its natural continuation
+# beyond the wall *is* the mirror image, so the analytic polynomial is the
+# oracle there.
 function parity_factor(kind, v, d, y, wall)
     s = y - wall
-    (kind === :periodic || kind === :reflect_both) && return (1 + d / 10, 0.0)
-    kind === :outer && return (0.3 + 0.2y + 0.1y^2 + 0.05y^3, 0.2 + 0.2y + 0.15y^2)
-    return v == 1 ? (0.5 + 0.3s^2, 0.6s) : (0.7s + 0.2s^3, 0.7 + 0.6s^2)
+    (kind === :periodic || kind === :reflect_both) && return (1 + d / 10, 0.0, 0.0)
+    kind === :outer && return (0.3 + 0.2y + 0.1y^2 + 0.05y^3, 0.2 + 0.2y + 0.15y^2,
+                               0.2 + 0.3y)
+    return v == 1 ? (0.5 + 0.3s^2, 0.6s, 0.6) : (0.7s + 0.2s^3, 0.7 + 0.6s^2, 1.2s)
 end
 
 @testset "Beyond a reflecting face the value is the parity-signed mirror: kinds=$kinds, C=$C" for
@@ -254,15 +293,17 @@ end
                        ((:reflect_lo, :periodic), cellcentered(2)))
     # A symmetric run's horizon finder asks for points across the wall.
     # The answer is the mirror image's value times the variable's parity,
-    # and a derivative across the wall flips once more; getting either
-    # sign wrong gives a gradient pointing the wrong way at the wall.
+    # and a derivative across the wall flips once more per order — so
+    # `∂ₓ²` across a wall in x does not flip and `∂ₓ∂ᵧ` does; getting a
+    # sign wrong gives a gradient pointing the wrong way at the wall, or a
+    # curvature of the wrong sign.
     D = length(kinds)
     forest = faces_forest(kinds)
     roots = D == 1 ? 3 : 2
     walls = ntuple(d -> kinds[d] === :reflect_hi ? Float64(roots) : 0.0, D)
     fac(x, v, d) = parity_factor(kinds[d], v, d, x[d], walls[d])
     f(x, v) = prod(fac(x, v, d)[1] for d in 1:D)
-    df(x, v, a) = prod(d == a ? fac(x, v, d)[2] : fac(x, v, d)[1] for d in 1:D)
+    dm(x, v, m) = prod(fac(x, v, d)[m[d] + 1] for d in 1:D)
     single(k) = k === :reflect_lo || k === :reflect_hi
     parity = [ntuple(d -> single(kinds[d]) ? (v == 1 ? EvenParity : OddParity) :
                           kinds[d] === :reflect_both ? EvenParity : NoParity, D)
@@ -281,10 +322,13 @@ end
         end
     end
     push!(xs, ntuple(d -> walls[d] + (single(kinds[d]) ? (walls[d] > 0 ? 0.3 : -0.3) : 0.7), D))
-    r = interpolate(fs, xs, Lagrange(4); derivs=gradient_derivs(D))
-    @test maximum(abs(r.values[v, 1, j] - f(xs[j], v)) for j in eachindex(xs), v in 1:2) < 1e-11
-    @test maximum(abs(r.values[v, 1 + a, j] - df(xs[j], v, a))
-                  for j in eachindex(xs), v in 1:2, a in 1:D) < 1e-10
+    derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
+    r = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+    worst = errors_by_order(r.values, xs, derivs, dm)
+    showerrors() && @info "reflecting" kinds C worst = Tuple(worst)
+    @test worst[1] < 1e-11
+    @test worst[2] < 1e-10
+    @test worst[3] < 1e-9
     # A point beyond the wall by more than the domain is still outside.
     far = ntuple(d -> single(kinds[d]) ? (walls[d] > 0 ? 3roots + 0.5 : -2roots - 0.5) :
                                          0.5, D)
@@ -345,17 +389,38 @@ end
     @test_throws "one semiaxis per dimension" Ellipsoid((0, 0), (1, 1, 1))
 end
 
+# The `m`-th derivative of every Lagrange basis polynomial on `nodes` at
+# `ξ`, exactly: each `ℓₖ` expanded into its coefficients, differentiated
+# `m` times and evaluated — independent of the package's truncated
+# series.
+function lagrange_derivative_weights(nodes, ξ, m)
+    return map(eachindex(nodes)) do k
+        c = [one(ξ)]                         # lowest order first
+        for j in eachindex(nodes)
+            j == k && continue
+            c = ([zero(ξ); c] .- nodes[j] .* [c; zero(ξ)]) ./ (nodes[k] - nodes[j])
+        end
+        for _ in 1:m
+            c = [i * c[i + 1] for i in 1:(length(c) - 1)]
+        end
+        sum(c[i] * ξ^(i - 1) for i in eachindex(c); init=zero(ξ))
+    end
+end
+
 @testset "The kernel reads the stencil query_stencil names, with exact weights" begin
     # Everything else checks the answer; this checks the mechanism. With
     # random data no polynomial can mask a stencil one point off: the
-    # kernel's value must be the contraction of *this* block's stored
-    # points over the stencil, with exact rational Lagrange weights.
+    # kernel's value and derivatives must be the contraction of *this*
+    # block's stored points over the stencil, with exact rational Lagrange
+    # weights and their exact derivatives, scaled by h^|m|.
     forest = interp_forest(2)
+    derivs = ((0, 0), (0, 1), (1, 1), (0, 2))
     for (C, n) in ((cellcentered(2), 4), (vertexcentered(2), 3), (facecentered(2, 1), 5))
         fs = FieldSet(forest, 1; G=2, centering=C)
         fs.work .= rand(Xoshiro(n), size(fs.work)...)
         xs = probe_points(Xoshiro(n + 1), fs)
-        r = interpolate(fs, xs, Lagrange(n); derivs=((0, 0), (0, 1)))
+        r = interpolate(fs, xs, Lagrange(n); derivs=derivs)
+        nodes = Rational{BigInt}.(0:(n - 1))
         worst = 0.0
         for (j, x) in enumerate(xs)
             b = locate_point(forest, x)
@@ -364,19 +429,15 @@ end
             first, _, _, ξ = query_stencil(Lagrange(n), x, block_origin(forest, k), h,
                                            Val(fs.G), Val(staggers(fs)),
                                            Val(size(fs.work)[1:2]))
-            nodes = Rational{BigInt}.(0:(n - 1))
-            w = [lagrange_weights(nodes, Rational{BigInt}(ξ[d])) for d in 1:2]
-            # The y-derivative weights, by the exact derivative of each
-            # basis polynomial: d/dξ ∏(ξ − j)/(k − j) = ℓ_k Σ 1/(ξ − j),
-            # evaluated by a symmetric rational difference quotient.
-            δ = Rational{BigInt}(1, 10^30)
-            dw = (lagrange_weights(nodes, Rational{BigInt}(ξ[2]) + δ) -
-                  lagrange_weights(nodes, Rational{BigInt}(ξ[2]) - δ)) / (2δ)
+            w = [[lagrange_derivative_weights(nodes, Rational{BigInt}(ξ[d]), o)
+                  for o in 0:2] for d in 1:2]
+            @test w[1][1] == lagrange_weights(nodes, Rational{BigInt}(ξ[1]))
             u = view(fs.work, first[1]:(first[1] + n - 1), first[2]:(first[2] + n - 1), 1, b)
-            val = sum(w[1][i] * w[2][l] * Rational{BigInt}(u[i, l]) for i in 1:n, l in 1:n)
-            der = sum(w[1][i] * dw[l] * Rational{BigInt}(u[i, l]) for i in 1:n, l in 1:n) / h
-            worst = max(worst, abs(r.values[1, 1, j] - Float64(val)),
-                        h * abs(r.values[1, 2, j] - Float64(der)))
+            for (kd, m) in enumerate(derivs)
+                exact = sum(w[1][m[1] + 1][i] * w[2][m[2] + 1][l] *
+                            Rational{BigInt}(u[i, l]) for i in 1:n, l in 1:n)
+                worst = max(worst, abs(h^sum(m) * r.values[1, kd, j] - Float64(exact)))
+            end
         end
         @test worst < 1e-12
     end
@@ -393,10 +454,12 @@ end
     @test_throws "outside the domain" interpolate(fs, [(NaN, 0.0)], Lagrange(4))
     @test_throws "stores only 12" interpolate(fs, xs, Lagrange(13))
     @test_throws "identically zero" interpolate(fs, xs, Lagrange(1); derivs=((1, 0),))
-    @test_throws "only values and first derivatives" interpolate(fs, xs, Lagrange(4);
-                                                                derivs=((2, 0),))
-    @test_throws "only values and first derivatives" interpolate(fs, xs, Lagrange(4);
-                                                                derivs=((1, 1),))
+    @test_throws "up to second order" interpolate(fs, xs, Lagrange(4); derivs=((3, 0),))
+    @test_throws "up to second order" interpolate(fs, xs, Lagrange(4); derivs=((2, 1),))
+    @test_throws "identically zero" interpolate(fs, xs, Lagrange(2); derivs=((2, 0),))
+    # A mixed second derivative is first order in each dimension, which
+    # two points per dimension produce.
+    @test size(interpolate(fs, xs, Lagrange(2); derivs=((1, 1),)).values) == (2, 1, 2)
     @test_throws "multi-index of 2" interpolate(fs, xs, Lagrange(4); derivs=((0, 0, 0),))
     @test_throws "nonempty tuple" interpolate(fs, xs, Lagrange(4); derivs=())
     @test_throws "vars must name" interpolate(fs, xs, Lagrange(4); vars=1:3)

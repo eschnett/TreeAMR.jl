@@ -349,7 +349,7 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
-| interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first derivatives, periodic wrap and reflecting fold, `exclude` region flags |
+| interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first and second derivatives, periodic wrap and reflecting fold, `exclude` region flags |
 | checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension — serial HDF5 only, over a distributed forest the I/O groups, part files and index of M7 step 6b, the data moved by the communicator verbs |
 
 The ideas that span several files and are easy to violate:
@@ -518,8 +518,11 @@ The ideas that span several files and are easy to violate:
   points of the block `locate_point` finds, ghosts included, so ghosts
   must be current. The kernel sees a basis only through `stencilwidth`,
   `stencilstart` and `basisweights` — the extension point for smooth
-  bases — and `derivs` are multi-indices with only `|m| ≤ 1` accepted
-  until higher orders are tested. Outside points are reported by the
+  bases — and `derivs` are multi-indices with only `|m| ≤ 2` accepted
+  until higher orders are tested. A derivative's rate is
+  `min(n − max mₐ, p − |m|)`: the ghosts carry the exchange's `O(hᵖ)`
+  error, so `∂ₓ∂ᵧ` through `Lagrange(4)` with `p = 4` converges at 2,
+  not 3. Outside points are reported by the
   host after the launch (no throwing in kernels), and `exclude` flags
   rather than throws. `locate_point` and `isless` share `curve_less`
   in `morton.jl`, so the search and the leaf order cannot disagree.
