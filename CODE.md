@@ -7790,7 +7790,8 @@ the same day, so it comes before M9b, which follows it.
   ordinary transfers they are, the rotated ones are distributed by M12
   itself; the MPI path needs the pack to permute and the unpack to
   sign, and nothing else. The change is additive — new
-  keywords and one new export — so it is a `0.1.x` release. *Accept:*
+  keywords and one new export — so it is a `0.1.x` release, 0.1.7.
+  *Accept:*
   - **refusals**, each with its reason: every case listed for the
     forest and the field set under
     [Domain and boundaries](#domain-and-boundaries), a leaf list that
@@ -8330,12 +8331,13 @@ the same day, so it comes before M9b, which follows it.
     `CLAUDE.md` gained the architecture bullet "Rotating seams are
     oriented transfers", the oracles and the workloads in its tests
     paragraph, and the new timings. The docs build, doctests included.
-    The repository keeps no changelog, so the release note waits for
-    the release itself: M12 is additive — the keywords `rotating` and
+    The repository keeps no changelog; the release commit says what
+    changed. M12 is additive — the keywords `rotating` and
     `rotation`, the export `RotationPair`, the pair forms of
     `fill_ghosts!`, `regrid!` and `adapt_to_initial_data!`, and a
     checkpoint feature that only a rotating forest writes — so it is a
-    `0.1.x` release.
+    `0.1.x` release: *released as 0.1.7 (2026-10-04)*, together with the
+    interpolator's second derivatives from `main`.
 - **M9b — Visualization export.** *(Split from M9, "I/O and
   visualization", on 2026-09-29, when its checkpoint half became M9a;
   not designed.)* After M7. The candidates:

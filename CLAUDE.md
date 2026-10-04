@@ -824,7 +824,7 @@ When a milestone lands, update the status in `README.md` and
 ## Repository facts
 
 - Remote: `github.com/eschnett/TreeAMR.jl`, branches `main` and `gh-pages`
-  only. **Registered in General** since 2026-09-21; 0.1.6 is the current
+  only. **Registered in General** since 2026-09-21; 0.1.7 is the current
   release. TagBot (`.github/workflows/TagBot.yml`) creates the tag and the
   GitHub release for each registered version, and needs the write deploy
   key behind `DOCUMENTER_KEY` to push them — the file says why. All
@@ -881,8 +881,8 @@ of the *public API only*. Facts that matter here:
   calls none of the checkpoint functions yet. Against the M9a checkout
   its suite is unchanged, 310 tests in 1m12 (2026-09-29).
 - **M7 reaches it with 0.1.5 and changes nothing serially**:
-  310 tests in 1m22 against the M7 checkout (2026-10-02); M12 changes
-  nothing either, 310 tests in 1m17 against the M12 checkout
+  310 tests in 1m22 against the M7 checkout (2026-10-02); M12, released
+  in 0.1.7, changes nothing either, 310 tests in 1m17 against the M12 checkout
   (2026-10-03). It does not
   pass `comm` to any `Forest` yet, so under `mpiexec` each rank would
   run a whole serial copy. Once it does, the step-9 audit (CODE.md, M7
@@ -976,7 +976,7 @@ histories as plain data; its `src/checkpoint.jl` (`run_state`,
 `rotate_checkpoints!`) has since implemented it.
 
 **M7 changes nothing for it serially**: 12447 tests in 5m00 against the
-M7 checkout, at one thread (2026-10-02); nor does M12, 12447 tests in
+M7 checkout, at one thread (2026-10-02); nor does M12 (0.1.7), 12447 tests in
 5m08 against the M12 checkout (2026-10-03). It does not pass `comm` to a
 `Forest` yet. Once it does, the step-9 audit found it the most exposed
 of the three, all through five host combinations of `block_mapreduce`
@@ -1035,7 +1035,7 @@ is where limiters go (Shu–Osher against Butcher form).
 minutes, so step 9 ran a subset against the M7 checkout — `precision_`,
 `prerequisite_`, `stencils_`, `stepping_`, `interface_`, `refinement_`,
 `horizon_`, `checkpoint_` and `type_tests.jl`, 1760 tests in 7m04 at one
-thread, all passing (2026-10-02); against the M12 checkout its
+thread, all passing (2026-10-02); against the M12 checkout (0.1.7) its
 `prerequisite_tests.jl` alone, which names the unexported TreeAMR names
 it relies on, passes, 52 tests (2026-10-03). Its production runs are the
 reason M7
