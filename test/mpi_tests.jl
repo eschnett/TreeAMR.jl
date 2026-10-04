@@ -14,8 +14,12 @@
 # blocks through every operation (added in 0.1.6); then (steps 6
 # and 6b) a run checkpointed after a regrid, with a part file per rank,
 # per I/O group and per node, and continued from each, and the files of
-# the earlier runs, written at other rank counts, loaded and continued —
-# and prints
+# the earlier runs, written at other rank counts, loaded and continued;
+# and (M12) a rotating quadrant: the wave in 2D and over a reflecting low
+# face in 3D, a set that turns into itself and a `RotationPair` filled,
+# regridded, interpolated beyond the seam and checkpointed, the pair's
+# merged stages sharing their tags, and a single leaf at the axis that
+# leaves every rank but one empty — and prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
 # reductions and the floating-point sums. Run serially in this
@@ -112,7 +116,7 @@ end
     @test any(l -> startswith(l, "B2 conserved true"), lines)
     # The regrid cycles (step 4) changed the mesh every time, Burgers'
     # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 14
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 17
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
     @test count(l -> occursin(" unchanged false", l), lines) == 3
@@ -145,6 +149,16 @@ end
     @test words("E2 checkpoint")[3:4] == ["2", "true"]
     @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
               filter(startswith("E2 adapted "), lines))
+    # The rotating quadrant (M12): the turned ghosts hold `−0` in all
+    # three sets, three quarters of the points were turned back across
+    # the seam, the checkpoint loads what was saved and fills to what was
+    # filled, and so does the single leaf's.
+    @test all(w -> parse(Int, w) > 0, words("Q2 negzero")[3:5])
+    @test words("Q2 interpolated")[3:4] == ["257", "193"]
+    qsaved = words("QC saved")[3:5]
+    @test words("QC loaded")[3:5] == qsaved
+    @test words("QC refilled")[3:5] == words("Q2 refilled")[3:5]
+    @test words("QE2 checkpoint")[3:4] == ["1", "true"]
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.
@@ -169,6 +183,8 @@ end
         end
         c1 = filter(startswith("# C1-n$from at $at loaded "), hashes)
         @test length(c1) == 1 && split(only(c1))[end] == words("C1 saved")[3]
+        qc = filter(startswith("# QC-n$from at $at loaded "), hashes)
+        @test length(qc) == 1 && split(only(qc))[(end - 2):end] == qsaved
     end
 
     outs = Dict{Int,String}()
@@ -196,6 +212,14 @@ end
         # its regrids and after them.
         @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
         @test "# E2 empty ranks after the regrids $(n == 3 ? 1 : 0)" in hashes
+        # The rotating quadrant (M12): seam transfers crossed ranks, and the
+        # single leaf left all ranks but one empty before its regrids and
+        # after them, and none in between.
+        @test parse(Int, split(only(filter(startswith("# Q2 rotated received"),
+                                           hashes)))[end]) > 0
+        @test "# QE2 empty ranks $(n - 1)" in hashes
+        @test "# QE2 empty ranks after refining 0" in hashes
+        @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
         for from in (n == 3 ? (1,) : (1, 3)), at in (n, 1)
             crossed(hashes, from, at)
         end
@@ -291,6 +315,18 @@ end
                          "rank(s) 1 of $n passed a point outside the domain")
         @test occursin("On rank 1, point 2, (0.5, 9.0), is outside the domain",
                        refused("interpolate outside"))
+        # M12: a point beyond the seam of a set that turns into its
+        # partner, on rank 1 only, and such a set regridded alone on rank 1
+        # where the others regrid the pair; refused on every rank.
+        @test startswith(refused("rotating interpolate"),
+                         "# rotating interpolate refused on $n of $n ranks: interpolate " *
+                         "is refused on every rank, this one (rank 0) included, since " *
+                         "rank(s) 1 of $n passed a point")
+        @test occursin("On rank 1, point 2, (-0.5, 0.7), lies 1 quarter turn(s) away " *
+                       "across the rotating seam", refused("rotating interpolate"))
+        @test startswith(refused("rotating regrid"),
+                         "# rotating regrid refused on $n of $n ranks: regrid! was " *
+                         "refused on rank(s) 1 of $n")
         # What the regrid acceptance asks for actually happened at this
         # rank count: blocks moved up the ranks when the first ones were
         # refined and down again when they were coarsened, and a coarsened
@@ -304,6 +340,7 @@ end
     # The files of both distributed runs, loaded serially in this process.
     withenv("TREEAMR_CHECKPOINT_DIR" => dir, "TREEAMR_CHECKPOINT_FROM" => "2 3") do
         Base.invokelatest(workload.checkpoint_cross, "C")
+        Base.invokelatest(workload.rotating_cross, "QC")
     end
     hashes = workload_lines(String(take!(io)))
     for from in (2, 3)

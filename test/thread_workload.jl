@@ -83,18 +83,25 @@ One full cycle — initial-data adaptation, evolution, a regrid with data
 transfer, more evolution — reduced to a handful of printed lines.
 """
 function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
-                  centering=cellcentered(D), reflecting=nothing, x0=0.35) where {D}
+                  centering=cellcentered(D), reflecting=nothing, x0=0.35,
+                  rotating=nothing) where {D}
     L = 1.0
     walls = reflecting === nothing ? ntuple(_ -> (false, false), D) : reflecting
     forest = Forest(ntuple(_ -> roots, D); N=N,
                     periodic=ntuple(_ -> periodic, D), reflecting=walls,
-                    extents=ntuple(_ -> (0.0, L), D))
+                    rotating=rotating, extents=ntuple(_ -> (0.0, L), D))
     # A wall normal to x₁ that the pulse runs into: odd along x₁, even
     # along the rest, for both variables.
     parity = reflecting === nothing ? nothing :
              [ntuple(d -> d == 1 ? OddParity : EvenParity, D) for _ in 1:2]
-    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity)
-    initial = workload_pulse(D, L, x0, σ, 0.0)
+    # A rotating seam (M12) turns a scalar into itself, and the pulse is
+    # a ring about the axis, so that the refinement follows the seam
+    # faces and reaches the axis.
+    rotation = rotating === nothing ? nothing : (1, 2)
+    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity,
+                  rotation=rotation)
+    initial = rotating === nothing ? workload_pulse(D, L, x0, σ, 0.0) :
+              workload_ring(x0, σ)
     outer = !periodic && !all(w -> w[1] && w[2], walls)
     boundary = outer ? boundary_by_coordinates(initial) : nothing
 
@@ -127,11 +134,15 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     rk4!(u, fs, schedule, dt, steps, Val(D), Val(fs.G), boundary)
 
     tag = "D$(D)$(periodic ? "p" : "o")$(all(==(:cell), centering) ? "c" : "v")" *
-          (reflecting === nothing ? "" : "r")
+          (reflecting === nothing ? "" : "r") * (rotating === nothing ? "" : "q")
     println(tag, " passes ", passes, " ", converged, " changed ", changed)
     println(tag, " leaves ", nleaves(forest), " ", digest(string(forest.leaves)))
     println(tag, " schedule ", length(schedule.phase1), " ", schedule.levels, " ",
             length(schedule.boundaries))
+    rotating === nothing ||
+        println(tag, " rotated ", sum(g -> g.orientation == 0 ? 0 : TreeAMR.ntransfers(g),
+                                      Iterators.flatten((schedule.phase1,
+                                                         schedule.phase2...))))
     println(tag, " state ", digest(u))
     println(tag, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
     println(tag, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
@@ -142,14 +153,47 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     # across the wall where there is one so the fold runs too.
     scatter!(fs, u)
     fill_ghosts!(fs, schedule; boundary=boundary)
-    below = walls[1][1] ? 0.2 : 0.0
+    # Beyond a rotating seam the points spread over the whole plane, so
+    # that three quarters of them are turned back.
+    below(d) = rotating !== nothing && d in rotating ? L :
+               d == 1 && walls[1][1] ? 0.2 : 0.0
     xs = [ntuple(d -> mod(0.6180339887498949 * j * (d + 1) + 0.1d, 1.0) *
-                      (d == 1 ? L + below : L) - (d == 1 ? below : 0.0), D)
+                      (L + below(d)) - below(d), D)
           for j in 1:257]
     derivs = (ntuple(_ -> 0, D), ntuple(a -> ntuple(d -> Int(d == a), D), D)...)
     r = interpolate(fs, xs, Lagrange(4); derivs=derivs,
                     exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
     println(tag, " interp ", digest(vec(r.values)), " ", count(r.excluded))
+    rotating === nothing || rotating_pair(forest, tag, rotating, ops)
+    return nothing
+end
+
+"""A ring about the axis travelling outwards, as an `(x, v) -> value` callback."""
+function workload_ring(ρ0, σ)
+    return function (x, var)
+        d = hypot(x[1], x[2]) - ρ0
+        g = exp(-d^2 / (2σ^2))
+        return var == 1 ? g : (d / σ^2) * g
+    end
+end
+
+# A face-centered `RotationPair` (M12) on the final mesh, filled once as a
+# pair: odd turns read the partner's array, so this is the one fill whose
+# transfers read two arrays, dealt out by the same `run_phase!`.
+function rotating_pair(forest::Forest{D}, tag, (d1, d2), ops) where {D}
+    swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+    Ca = facecentered(D, d1)
+    Ga = ntuple(d -> Ca[d] === :vertex ? 1 : 2, D)
+    a = FieldSet(forest, 1; G=Ga, centering=Ca, rotation=(-1,))
+    b = FieldSet(forest, 1; G=swap(Ga), centering=swap(Ca), rotation=(1,))
+    # B = (−x₂, x₁) + (x₁, x₂) |x|², covariant under the turn.
+    fa = (x, v) -> -x[d2] + x[d1] * (x[d1]^2 + x[d2]^2)
+    fb = (x, v) -> x[d1] + x[d2] * (x[d1]^2 + x[d2]^2)
+    fill_by_coordinates!(fa, a)
+    fill_by_coordinates!(fb, b)
+    fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops));
+                 boundary=(boundary_by_coordinates(fa), boundary_by_coordinates(fb)))
+    println(tag, " pair ", digest(vec(a.work)), " ", digest(vec(b.work)))
     return nothing
 end
 
@@ -182,6 +226,16 @@ workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12,
          reflecting=((true, false), (true, false)), x0=0.12)
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2), reflecting=((true, true), (true, true)), x0=0.12)
+
+# A rotating seam (M12): the turned transfers are ordinary groups in the
+# same phases too, but read through the axis map and the variable map,
+# and a pair's odd turns read the partner's array. A ring about the axis
+# puts the refinement on both seam faces and at the axis, and the
+# interpolation points spread over the whole plane.
+workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         rotating=(1, 2), x0=0.3)
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2), rotating=(1, 2), x0=0.3)
 
 # --- the conservative cycle (M8b) ----------------------------------------
 #

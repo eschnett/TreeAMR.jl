@@ -7,7 +7,7 @@ no physics.
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
 for the full design and the milestone roadmap.
 
-The package has completed milestone **M7**: the tree core (Morton keys over a
+The package has completed milestone **M12**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -58,7 +58,14 @@ shared file written through MPI-IO, lost data between nodes on the
 cluster's BeeGFS, so a distributed checkpoint is now an index and one
 part file per I/O process, none of them written or opened by more than
 one process, and every checkpoint carries checksums that a load
-verifies. Next is visualization export (M9b).
+verifies.
+
+M12 added a rotating symmetry: a forest declared `rotating = (d1, d2)`
+stores one quadrant of the plane, and the exchange fills the ghosts
+across the seam as the turned image of the data, mixing the components
+of vectors as each field set's `rotation` says, on every backend and
+across ranks (see [Rotating symmetry](@ref)). Next is visualization
+export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -281,6 +288,75 @@ In a vertex-like dimension the upper wall point is shared with nobody,
 and a mirror maps it onto itself; the exchange derives it — zero for an
 odd variable, the symmetric interpolant of the prolongation order for an
 even one. See "Domain and boundaries" and "Ghost filling" in the design
+document.
+
+## Rotating symmetry
+
+A pair of dimensions `(d1, d2)` can be declared **rotating** on the
+forest: only the quadrant `x_{d1}, x_{d2} ≥ 0` is stored, and the other
+three are its images under quarter turns about the axis where the two
+low faces meet, as for a spinning star or black hole, which no mirror
+maps onto itself. The low face of `d1` is glued to the low face of `d2`,
+so the ghosts there are the turned image of data elsewhere in the tree.
+Together with a reflecting low face in `z` that gives an octant. The
+two sides of the seam are kept at one level ([`balance!`](@ref) refines
+across it), so no coarse-fine face crosses it.
+
+A quarter turn `R` takes `e_{d1}` to `e_{d2}` and `e_{d2}` to `−e_{d1}`,
+and it mixes the components of a vector: `v_x` at the turned point is
+`−v_y` at the original one. Each field set says how its variables turn
+with `rotation`, a signed permutation: variable `v` beyond the seam is
+`sign(rotation[v])` times variable `abs(rotation[v])` at the preimage.
+It is required on a rotating forest, as `parity` is on a reflecting one:
+
+```jldoctest rotating
+julia> using TreeAMR
+
+julia> quadrant = Forest((2, 2); N = 4, rotating = (1, 2));
+
+julia> fs = FieldSet(quadrant, 3; G = 1, rotation = (1, -3, 2));   # (ρ, v_x, v_y)
+
+julia> fill_by_coordinates!((x, v) -> v == 1 ? x[1]^2 + x[2]^2 : x[v - 1], fs);
+
+julia> ops = Operators(prolongation = 2, restriction = 2);
+
+julia> fill_ghosts!(fs, GhostSchedule(fs, ops));
+
+julia> coordinates(fs, 1, (1, 2))     # a ghost beyond the low face of x
+(-0.125, 0.125)
+
+julia> fs.work[1, 2, :, 1]            # ρ = |x|² and v = x, turned from (0.125, 0.125)
+3-element Vector{Float64}:
+  0.03125
+ -0.125
+  0.125
+```
+
+A set whose layout is not symmetric under exchanging `d1` and `d2` — a
+face-centered `B_x` beside `B_y`, as in constrained transport — turns
+into its partner, so the two are filled together as a
+[`RotationPair`](@ref), each `rotation` naming the partner's variables:
+
+```jldoctest rotating
+julia> a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),
+                    rotation = (-1,));                                  # B_x
+
+julia> b = FieldSet(quadrant, 1; G = (2, 1), centering = facecentered(2, 2),
+                    rotation = (1,));                                   # B_y
+
+julia> fill_by_coordinates!((x, v) -> -x[2], a); fill_by_coordinates!((x, v) -> x[1], b);
+
+julia> fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops)));
+
+julia> coordinates(a, 1, (2, 1)), a.work[2, 1, 1, 1]   # B = (−y, x) beyond the low face of y
+((0.0, -0.375), 0.375)
+```
+
+Regridding ([`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref) take
+`pair => (schedule_a, schedule_b)`), point interpolation (which folds a
+point beyond the seam back and turns its value and gradient),
+checkpoints and MPI all know the seam. See "Rotating" under "Domain and
+boundaries" and "Rotating seams" under "Ghost filling" in the design
 document.
 
 ## Conservation at coarse-fine faces

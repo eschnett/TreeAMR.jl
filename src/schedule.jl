@@ -67,21 +67,36 @@ is **non-decreasing**, which every builder guarantees by collecting
 transfers in block order, so that a thread's part is one contiguous run.
 
 `factorcol` is nonzero for the mirrored transfers at a reflecting face
-(M10): the column of the field set's parity-factor table the kernel
-multiplies each variable's result by. Zero means an ordinary transfer,
-which the kernel leaves unscaled.
+(M10) and the rotated ones across a rotating seam (M12): the column of
+the field set's factor table the kernel multiplies each variable's
+result by. Zero means an ordinary transfer, which the kernel leaves
+unscaled.
+
+`orientation` is the number of quarter turns `r` that carry a rotated
+transfer's real source to where the target sees it, across the seam of
+the forest's `plane`, `(d1, d2)` (M12; see "Rotating seams" in
+`CODE.md`). Its stencils are built in that virtual frame, and the kernel
+reads the real source through the axis map of `r` (see `axismap`) and the
+field set's variable table. Zero means an ordinary source, read as it
+is. The three small fields share the eight bytes `factorcol` had alone,
+so a group is no larger than before M12.
 """
 struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     kind::Symbol                      # :copy, :restrict, or :prolong
     stencils::NTuple{D,S}
     targetblocks::VB
     sourceblocks::VB
-    factorcol::Int                    # 0, or the parity-factor column
+    factorcol::Int32                  # 0, or the factor-table column
+    orientation::Int8                 # 0, or the quarter turns of the source
+    plane::NTuple{2,Int8}             # the seam's (d1, d2), or (0, 0)
 end
 
 TransferGroup{T,D}(kind::Symbol, stencils::NTuple{D,S},
-                   targetblocks::VB, sourceblocks::VB, factorcol::Int=0) where {T,D,S,VB} =
-    TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks, factorcol)
+                   targetblocks::VB, sourceblocks::VB, factorcol::Integer=0,
+                   orientation::Integer=0,
+                   plane::NTuple{2,Integer}=(0, 0)) where {T,D,S,VB} =
+    TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks,
+                            Int32(factorcol), Int8(orientation), Int8.(plane))
 
 boxsize(g::TransferGroup{T,D}) where {T,D} = ntuple(d -> ntarget(g.stencils[d]), D)
 ntransfers(g::TransferGroup) = length(g.targetblocks)
@@ -93,7 +108,8 @@ ntransfers(g::TransferGroup) = length(g.targetblocks)
 todevice(backend::Backend, g::TransferGroup{T,D}) where {T,D} =
     TransferGroup{T,D}(g.kind, ntuple(d -> todevice(backend, g.stencils[d]), D),
                        todevice(backend, g.targetblocks),
-                       todevice(backend, g.sourceblocks), g.factorcol)
+                       todevice(backend, g.sourceblocks), g.factorcol, g.orientation,
+                       g.plane)
 # The concrete group type on a given backend, so that a schedule's
 # `phase1`/`phase2` are concretely typed even when they are empty (a
 # uniform single-root forest has no restrictions and no prolongations).
@@ -222,17 +238,27 @@ end
 # vertex-like dimension. It changes the stencils, and — through the
 # parity factor — what the kernel does with their result, so it is part
 # of the key. Everything that is not a mirror transfer has all zeros.
+#
+# `orientation` is the number of quarter turns that carry the source
+# across a rotating seam to where the target sees it (M12): it changes
+# where the kernel reads and the sign it applies, so it is part of the
+# key too. The direction and the offset are the *virtual* ones, as the
+# target sees them, since those fix the stencils. Zero off the seam.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
     offset::NTuple{D,Int}
     level::Int
     mirror::NTuple{D,Int8}
+    orientation::Int8
 end
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
-    GroupKey{D}(kind, direction, offset, level, ntuple(_ -> Int8(0), D))
+    GroupKey{D}(kind, direction, offset, level, ntuple(_ -> Int8(0), D), Int8(0))
+GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
+            level::Int, mirror::NTuple{D,Int8}) where {D} =
+    GroupKey{D}(kind, direction, offset, level, mirror, Int8(0))
 
 # A total order over group keys (M7). Within a single rank the order in
 # which groups run does not matter, and phase 1's come out of a `Dict`.
@@ -244,7 +270,8 @@ GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
 kindrank(kind::Symbol) =
     kind === :copy ? 1 : kind === :restrict ? 2 : kind === :prolong ? 3 :
     throw(ArgumentError("no transfer kind $kind"))
-keyorder(k::GroupKey) = (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror)
+keyorder(k::GroupKey) =
+    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -263,9 +290,9 @@ Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyo
 
 One transfer of a stage's message buffer, as both of its ends describe
 it: the peer rank at the other end, the transfer's group key (the
-kind, direction, child offset, target level and mirror state that fix
-its stencils), its target and source as *global* leaf indices, and where
-it sits in the buffer.
+kind, direction, child offset, target level, mirror state and
+orientation that fix its stencils and how it reads), its target and
+source as *global* leaf indices, and where it sits in the buffer.
 
 `offset` is the transfer's first point, counted from the start of the
 stage buffer, and `npoints` the size of its target box; both are in
@@ -424,7 +451,12 @@ faces (M10) are ordinary transfers too, from mirrored sources: a copy,
 restriction or prolongation with its target rows remapped across the
 wall, whose result the kernel multiplies by each variable's parity
 sign. They sit in the same two phases as every other transfer, so the
-hook never sees them; see "Ghost filling" in `CODE.md`.
+hook never sees them; see "Ghost filling" in `CODE.md`. So are the
+ghosts across a rotating seam (M12): each is a transfer from the real
+leaf across the seam, built as though that leaf sat where the block sees
+it and read through the quarter turns between the two, which `show`
+reports as rotated transfers. A region whose turned image leaves through
+an outer face is the hook's.
 
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
@@ -801,6 +833,13 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 # domain and so belong to the boundary hook instead. Depends on the tree
 # alone, which is what makes it the part that threads — each task owns
 # its own `pairs` and `boundaries`.
+#
+# Across a rotating seam (M12) the search returns the real leaves with
+# their orientation `r`, and a transfer is recorded as the target sees
+# it, in the *virtual* frame: a finer source's child offset is turned
+# into its virtual one, and `r` goes into the key, which the kernel reads
+# the real source by. A region whose image leaves through an outer face
+# is the hook's, as any other such region is.
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
@@ -808,8 +847,10 @@ function block_sources!(pairs::TransferPairs{D},
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
-    record!(kind, δ, offset, lvl, s) =
-        push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl), (Int32[], Int32[])),
+    record!(kind, δ, offset, lvl, s, r) =
+        push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
+                                       Int8(r)),
+                    (Int32[], Int32[])),
                (Int32(b), Int32(s)))
     for δ in dirs
         region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0,
@@ -826,29 +867,39 @@ function block_sources!(pairs::TransferPairs{D},
             mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, mask, region)
             continue
         end
-        nbrs = neighbor_keys(forest, k, δ)
+        r, nbrs = oriented_neighbors(forest, k, δ)
         if isempty(nbrs)
             push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
             continue
         end
         nblevel = level(first(nbrs))
         if nblevel == level(k)
-            record!(:copy, δ, zerooffset, 0, find_leaf(forest, only(nbrs)))
+            record!(:copy, δ, zerooffset, 0, find_leaf(forest, only(nbrs)), r)
         elseif nblevel < level(k)
             # Coarser neighbor: this block's ghosts are prolongated. The
             # stencil geometry depends on where this block sits inside
             # its own parent.
-            record!(:prolong, δ, childoffset(k), level(k), find_leaf(forest, only(nbrs)))
+            record!(:prolong, δ, childoffset(k), level(k), find_leaf(forest, only(nbrs)),
+                    r)
         else
             # Finer neighbors: each supplies one part of this block's
-            # ghost region, selected by its offset within its parent.
+            # ghost region, selected by its offset within its parent —
+            # its virtual parent, where this block sees it.
             for nbr in nbrs
-                record!(:restrict, δ, childoffset(nbr), 0, find_leaf(forest, nbr))
+                record!(:restrict, δ, seam_offset(forest, nbr, r), 0,
+                        find_leaf(forest, nbr), r)
             end
         end
     end
     return nothing
 end
+
+# The child offset of a finer source as the target sees it: its own
+# offset off the seam, and across it in orientation `r` the offset turned
+# into the virtual frame (M12).
+seam_offset(forest::Forest, nbr::MortonKey, r::Integer) =
+    r == 0 ? childoffset(nbr) :
+    virtual_offset(childoffset(nbr), r, forest.rotating[1], forest.rotating[2])
 
 # The sources of a ghost region that crosses a reflecting face (M10; see
 # "Ghost filling" in CODE.md). Mirrored along the masked dimensions, the
@@ -876,36 +927,39 @@ function mirror_sources!(pairs::TransferPairs{D},
         return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
     end
     states = vec(collect(Iterators.product(choices...)))
-    record!(kind, offset, lvl, s) =
+    record!(kind, offset, lvl, s, r) =
         for state in states
-            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state),
+            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, Int8(r)),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         end
 
     if δ′ == zerooffset
-        record!(:copy, zerooffset, 0, b)
+        record!(:copy, zerooffset, 0, b, 0)
         return nothing
     end
-    nbrs = neighbor_keys(forest, k, δ′)
+    # `δ′` may still cross a rotating seam (M12), the mirror being outside
+    # its plane: the two compose, the source turned and then mirrored.
+    r, nbrs = oriented_neighbors(forest, k, δ′)
     if isempty(nbrs)
         push!(boundaries, BoundaryRegion{D}(Int32(b), δ, region))
         return nothing
     end
     nblevel = level(first(nbrs))
     if nblevel == level(k)
-        record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)))
+        record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), r)
     elseif nblevel < level(k)
-        record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)))
+        record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)), r)
     else
         # Only the children on the wall side along every masked dimension
         # cover the mirror image; the others supply the half of the
-        # tangential extent it does not reach.
+        # tangential extent it does not reach. The side is the virtual
+        # one, where the target sees the child.
         wallside = ntuple(d -> δ[d] < 0 ? 0 : 1, D)
         for nbr in nbrs
-            o = childoffset(nbr)
+            o = seam_offset(forest, nbr, r)
             all(d -> !mask[d] || o[d] == wallside[d], 1:D) || continue
-            record!(:restrict, o, 0, find_leaf(forest, nbr))
+            record!(:restrict, o, 0, find_leaf(forest, nbr), r)
         end
     end
     return nothing
@@ -1047,7 +1101,11 @@ end
 #
 # `stencils(key)` builds a group's host stencils and `factorcol(key)`
 # its parity column, exactly as the builder does for its local groups,
-# so a pack evaluates the serial transfer. `targetowner(t)` and
+# so a pack evaluates the serial transfer. `plane` is the forest's
+# rotating seam (M12): a rotated pack reads its source through the axis
+# map and the variable table, as the serial group does, and computes the
+# unscaled sum; its unpack applies the sign through the factor column, as
+# it applies a parity. `targetowner(t)` and
 # `sourceowner(s)` are the ranks of a global target and source, and
 # `targetrange` / `sourcerange` this rank's own leaves in the partitions
 # the targets and the sources are local to. For the ghost and interface
@@ -1057,7 +1115,8 @@ end
 function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
                       sent::TransferPairs{D}, received::TransferPairs{D}, stencils,
                       factorcol; targetowner, sourceowner, targetrange::UnitRange{Int},
-                      sourcerange::UnitRange{Int}) where {RS<:RemoteStage,T,D}
+                      sourcerange::UnitRange{Int},
+                      plane::NTuple{2,Int8}=(Int8(0), Int8(0))) where {RS<:RemoteStage,T,D}
     isempty(sent) && isempty(received) && return nothing
     built = Dict{GroupKey{D},Any}()
     host(key) = get!(() -> stencils(key), built, key)
@@ -1070,8 +1129,9 @@ function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
     GRP = eltype(fieldtype(RS, :packs))
     # A pack is the serial transfer with its target box moved to the
     # start of a buffer slot: the same source windows, the same weights,
-    # summed in the same order, and no parity factor. Sorted by source
-    # block, so that on the CPU the owner of the source runs it.
+    # summed in the same order, read through the same rotation, and no
+    # factor. Sorted by source block, so that on the CPU the owner of the
+    # source runs it.
     packs = GRP[]
     sendslots = slots_by_key(sendlayout)
     for key in sort!(collect(keys(sendslots)))
@@ -1079,7 +1139,8 @@ function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
                        for slot in sendslots[key]])
         st = map(s -> Stencil1D{T}(1, s.srcstart, s.weights), host(key))
         push!(packs, todevice(backend, TransferGroup{T,D}(
-            key.kind, st, Int32[o[2] for o in order], Int32[o[1] for o in order], 0)))
+            key.kind, st, Int32[o[2] for o in order], Int32[o[1] for o in order], 0,
+            key.orientation, plane)))
     end
     # An unpack is a width-1, weight-1 transfer from a slot into the
     # target box the serial group writes, carrying its parity column.
@@ -1114,7 +1175,8 @@ remotetype(::Type{ExchangeStage{GRP,RS}}) where {GRP,RS} = RS
 function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, localsof,
                       sentby::Dict{Int,TransferPairs{D}},
                       receivedby::Dict{Int,TransferPairs{D}}, stencils, factorcol,
-                      forest::Forest{D}; required=Int[]) where {ST,T,D}
+                      forest::Forest{D}; required=Int[],
+                      plane::NTuple{2,Int8}=(Int8(0), Int8(0))) where {ST,T,D}
     owned = blockrange(forest)
     owner(i) = leafowner(forest, i)
     tags = sort!(unique!([required; localtags; collect(keys(sentby));
@@ -1124,7 +1186,7 @@ function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, locals
                  remote_stage(remotetype(ST), T, backend, get(sentby, tag, nopairs),
                               get(receivedby, tag, nopairs), stencils, factorcol;
                               targetowner=owner, sourceowner=owner, targetrange=owned,
-                              sourcerange=owned))
+                              sourcerange=owned, plane=plane))
               for tag in tags]
 end
 
@@ -1133,6 +1195,31 @@ function localize_boundaries(boundaries::Vector{BoundaryRegion{D}},
     offset = Int32(first(range) - 1)
     iszero(offset) && return boundaries
     return [BoundaryRegion{D}(r.block - offset, r.direction, r.region) for r in boundaries]
+end
+
+# A schedule's local groups from its transfer lists: phase 1, and the
+# prolongations by target level. Behind a function barrier, since the
+# builder takes its element type as a run-time value: here `T` is static,
+# so each group is built by a static call. (Built inline, M12's small
+# fields made the call box them once per group, which `bench/ghosts.jl`
+# showed as 448 bytes more per build.)
+function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::TransferPairs{D},
+                      build, factorcol, plane) where {GRP,T,D}
+    phase1 = GRP[]
+    bylevel = Dict{Int,Vector{GRP}}()
+    for (key, (targets, sources)) in pairs
+        # The stencils come out of a `Dict{…,Any}`.
+        stencils = build(key)::NTuple{D,Stencil1D{T,Vector{Int32},Matrix{T}}}
+        group = todevice(backend, TransferGroup{T,D}(key.kind, stencils, targets, sources,
+                                                     factorcol(key), key.orientation,
+                                                     plane))
+        if key.kind === :prolong
+            push!(get!(bylevel, key.level, GRP[]), group)
+        else
+            push!(phase1, group)
+        end
+    end
+    return phase1, bylevel
 end
 
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
@@ -1219,20 +1306,15 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # again for the keys the local groups were built from.
     built = Dict{GroupKey{D},Any}()
     build(key) = get!(() -> ntuple(d -> build1(key, d), D), built, key)
-    factorcol(key) = any(!iszero, key.mirror) ? mirrorcolumn(key.mirror) : 0
+    # The factor column covers the mirror state and the orientation
+    # (M12): `mirror column + 3^D·r`, so an ordinary transfer keeps 0 and
+    # a mirrored one off the seam the column it had.
+    factorcol(key) = any(!iszero, key.mirror) || key.orientation != 0 ?
+                     mirrorcolumn(key.mirror) + 3^D * Int(key.orientation) : 0
+    plane = forest.rotating
 
     GRP = grouptype(backend, T, Val(D))
-    phase1 = GRP[]
-    bylevel = Dict{Int,Vector{GRP}}()
-    for (key, (targets, sources)) in pairs
-        group = todevice(backend, TransferGroup{T,D}(key.kind, build(key),
-                                                     targets, sources, factorcol(key)))
-        if key.kind === :prolong
-            push!(get!(bylevel, key.level, GRP[]), group)
-        else
-            push!(phase1, group)
-        end
-    end
+    phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, plane)
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
@@ -1247,7 +1329,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     ST = stagetype(backend, T, Val(D))
     stages = build_stages(ST, T, backend, leveltags, localsof, bystage(stageof, sent),
                           bystage(stageof, received), build, factorcol, forest;
-                          required=[PHASE1_TAG])
+                          required=[PHASE1_TAG], plane=plane)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, operators, backend, phase1,
         phase2, levels, boundaries, bplan, stages)
@@ -1257,16 +1339,24 @@ function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
     ncopy = sum(ntransfers, filter(g -> g.kind === :copy, s.phase1); init=0)
     nrest = sum(ntransfers, filter(g -> g.kind === :restrict, s.phase1); init=0)
     nprol = sum(gs -> sum(ntransfers, gs; init=0), s.phase2; init=0)
-    # Of all of those, the ones mirrored across a reflecting face (M10),
-    # said only when there are any, so a schedule without reflecting
-    # faces prints as it always has.
+    # Of all of those, the ones mirrored across a reflecting face (M10)
+    # and the ones rotated across a seam (M12), each said only when there
+    # are any, so a schedule without either prints as it always has.
     groups = Iterators.flatten((s.phase1, Iterators.flatten(s.phase2)))
-    nmirror = sum(g -> g.factorcol == 0 ? 0 : ntransfers(g), groups; init=0)
+    nmirror = sum(g -> ismirrored(g) ? ntransfers(g) : 0, groups; init=0)
+    nrot = sum(g -> g.orientation == 0 ? 0 : ntransfers(g), groups; init=0)
     print(io, "GhostSchedule{", T, ",", D, "}(", ncopy, " copies, ", nrest,
           " restrictions, ", nprol, " prolongations over ", length(s.phase2),
           " level(s), ", nmirror == 0 ? "" : "$nmirror mirrored transfers, ",
+          nrot == 0 ? "" : "$nrot rotated transfers, ",
           length(s.boundaries), " boundary regions", messages_summary(s.stages), ")")
 end
+
+# Whether a group mirrors across a reflecting face: a factor column
+# whose mirror state, the column within its orientation's block of `3^D`,
+# is not the unmirrored one.
+ismirrored(g::TransferGroup{T,D}) where {T,D} =
+    g.factorcol != 0 && mod(g.factorcol - 1, 3^D) != 0
 
 # What a distributed schedule (M7) sends and receives, said only when it
 # does, so that a serial schedule prints as it always has.

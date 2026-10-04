@@ -12,11 +12,12 @@ are the way they are, and it is kept in sync with the code (see "Spec-first
 workflow"). `README.md` and `docs/src/index.md` carry the public status
 summary.
 
-Current state: milestones M0–M8, M10, M11 and M9a are done (tree core,
-ghost exchange, ODE coupling, regridding, multi-threading, GPU; then every
-centering, per-field-set ghost widths, and conservation at coarse-fine
-faces; then reflecting boundaries; then point interpolation; then
-checkpoint and restart, through an HDF5 package extension; then MPI).
+Current state: milestones M0–M8, M10, M11, M9a and M12 are done (tree
+core, ghost exchange, ODE coupling, regridding, multi-threading, GPU; then
+every centering, per-field-set ghost widths, and conservation at
+coarse-fine faces; then reflecting boundaries; then point interpolation;
+then checkpoint and restart, through an HDF5 package extension; then MPI;
+then a 90° rotating symmetry).
 M7 (done 2026-10-02): the forest replicated on every rank, the blocks
 distributed in contiguous curve ranges, and the ghost exchange,
 interface restriction, reductions, regrid, interpolation and
@@ -31,26 +32,37 @@ listed under "Performance work left for later" in CODE.md. It came after
 M8 and M10 so the distributed exchange was built once over a
 layout-generic schedule that already held the mirrored transfers, and
 after M9a because the downstream runs needed to restart before they
-needed MPI. Everything is `D`-generic and floating-point-type generic.
-Next is visualization export (M9b), the other half of the old M9.
+needed MPI. M12 (done 2026-10-03, decided with Erik, after M7 and before
+M9b): `Forest(…; rotating = (d1, d2))` stores one quadrant of a plane
+whose two low faces are glued by a quarter turn, `FieldSet(…; rotation)`
+declares how its variables turn, and `RotationPair` fills two sets whose
+layouts are each other's swap; the ghost exchange, regrid, interface
+schedule, interpolation, checkpoints and MPI all know the seam, and it
+runs on devices. 180° and reflecting high walls beside the seam are
+left open (CODE.md, "Open questions"). Everything is `D`-generic and
+floating-point-type generic. Next is visualization export (M9b), the
+other half of the old M9.
 
 `TODO.md` is Erik's personal to-do list. **Do not modify it.**
 
 ## Commands
 
-Full test suite (about 6½ min at one thread and at eight — 110606 tests
-in 6m32 and 110658 in 6m28 after M7's step 6b, against M9a's 93686 in
-4m16 — of
+Full test suite (about 8 min at one thread and at eight — 112715 tests
+in 7m52 and 112767 in 7m33 after M12, against 110606 in 6m32 and 110658
+in 6m28 after M7's step 6b and M9a's 93686 in 4m16 — of
 which the thread-independence test spends ~50 s running
-`test/thread_workload.jl` in two subprocesses, `exchange_tests.jl` ~33 s,
-M10's `reflect_tests.jl` ~30 s, and M9a's `checkpoint_tests.jl` ~28 s).
-The MPI test's two `mpiexec` jobs, ~55 s each and nearly all
+`test/thread_workload.jl` in two subprocesses (~26 s each since M12's
+rotating cycles), M10's `reflect_tests.jl` ~30 s, and, each run alone
+with its own compilation, `exchange_tests.jl` ~49 s, M12's
+`rotate_tests.jl` ~60 s and M9a's `checkpoint_tests.jl` ~77 s).
+The MPI test's two `mpiexec` jobs, ~65 s each (~55 s before M12) and nearly all
 compilation, run *beside* the suite where the machine has 8+ threads and
 24+ GB (`test/mpi_jobs.jl`), so `mpi_tests.jl` itself costs ~15 s here;
 on a smaller machine, CI's runners among them, they run one after the
-other and the suite takes about 8 min (7m52 here with
-`TREEAMR_TEST_MPI_CONCURRENT=0`, CI's path). The per-file times before
-and after M7's trim are in CODE.md's M7 step 9.
+other and the suite took about 8 min after M7 (7m52 here with
+`TREEAMR_TEST_MPI_CONCURRENT=0`, CI's path; not re-measured after M12).
+The per-file times before and after M7's trim are in CODE.md's M7 step
+9, M12's in its steps.
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
 shorten it by making the kernels faster. Measured: annotating the test
@@ -203,7 +215,8 @@ follow deterministically from the setup. `juliaup` has 1.11 installed, but
 checking a suspect test on it is not simply `Pkg.test()` in this checkout:
 an older Julia may not read a `Manifest.toml` a newer one resolved. Copy the
 tree without any manifest and run the test file directly (the procedure was
-worked out, and measured at 97744 tests in ~2m55 after M10, on 1.10, whose
+worked out, and measured at 97744 tests in ~2m55 after M10, on 1.10, and
+at 112715 tests in 8m09 after M12, on 1.11.9, whose
 `Pkg.test()` also died with "can not merge projects" whenever
 `test/Manifest.toml` existed):
 
@@ -328,9 +341,9 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 | threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
 | communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
-| tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding, `refine!`/`coarsen!`, `balance!` |
+| tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding (oriented across a rotating seam), `refine!`/`coarsen!`, `balance!` (conformity at the seam) |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates |
-| storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest |
+| storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest, and so do `parity`, `rotation` and their tables; `RotationPair` |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
@@ -393,6 +406,45 @@ The ideas that span several files and are easy to violate:
   The unowned upper wall plane of a vertex-like dimension is derived by
   `wall_stencil` (odd → 0, even → the folded order-`p` interpolant).
   The boundary hook sees only *outer* faces.
+- **Rotating seams are oriented transfers** (M12, CODE.md "Rotating
+  seams" under "Ghost filling"). `rotating = (d1, d2)` is a property of
+  the `Forest` (a ninth field, `NTuple{2,Int8}` because an `Int` pair
+  made the schedule build allocate more; `(0, 0)` for none), `rotation`
+  a signed permutation per variable on the `FieldSet` (required on a
+  rotating forest; variable `v` beyond the seam is `sign(rotation[v])`
+  times variable `abs(rotation[v])` at the preimage). The low faces of
+  `d1` and `d2` are glued: `neighbor_anchor` is the one place the seam's
+  arithmetic lives, and `oriented_neighbors` returns the real leaves
+  with the orientation `r ∈ 0:3` (quarter turns), of which
+  `neighbor_keys` returns the keys, so everything built on it sees the
+  seam. `balance!` and the checked `leaves` path keep the seam
+  **conforming** (equal levels across a seam face), so no coarse-fine
+  face crosses it and the interface restriction never does. A turned
+  transfer's stencils are built in the *virtual frame*, as if the
+  source sat at its turned position (`virtual_offset`, `seam_offset`),
+  so the stencil builders are unchanged; `GroupKey` carries the
+  orientation (last in `keyorder`) and `TransferGroup` the orientation
+  and the plane, and the kernel reads the source through the accessor
+  `RotatedSource` (`(src, perm, flip, len, vars, col)`: the axis map
+  from virtual to real stored index, a run-time `perm` read through
+  `tuplepick`, and the variable from `fs.rotvars`, `nvars × 4`), built
+  by `run_group!` only for `orientation ≠ 0` so an ordinary launch is
+  unchanged. The sign goes through `fs.factors`, grown to `3^D·4`
+  columns, column `mirror + 3^D·r` (`r = 0` is M10's table): a 90°
+  turn of any Cartesian component is a signed permutation, so it is
+  the permutation on the load and the sign on the target, and nothing
+  is fixed up afterwards. A set whose layout is not symmetric under
+  `d1 ↔ d2` (and has ghosts in the plane) turns into a partner and is
+  filled as a `RotationPair`, whose odd turns read the partner's array
+  (`altsrc`) and whose two schedules' stages run merged
+  (`exchange_pair!`); a plain fill refuses it. Under MPI the pack
+  permutes and the unpack, a plain width-1 copy, applies the sign, which
+  keeps the serial `−0`. `interpolate` folds a point beyond the seam
+  back and turns its value and gradient; a checkpoint writes `rotating`
+  and each set's `rotation`, and lists the `"rotating"` feature only
+  when used, so unrotated files still load in 0.1.6. A vertex-like set
+  owns both seam planes (the same points under the turn) and evolves
+  them at one level.
 - **Neighbor finding is asymmetric across levels** (CODE.md, "Neighbor
   asymmetry"). Ghost filling is formulated as each block asking for its own
   sources, never as reversing a neighbor lookup.
@@ -568,7 +620,9 @@ The ideas that span several files and are easy to violate:
   page-locking it again. A lease is an `Array` (`Base.wrap` over pooled
   `Memory`) or a contiguous device `view`, never a `SubArray` of host
   memory. Do not add a field to `Forest`: put mutable state in
-  `ForestState` (a ninth field made the schedule build allocate more).
+  `ForestState` (a ninth field made the schedule build allocate more;
+  M12's `rotating` is one only because two `Int8`s fit in padding, and
+  `bench/ghosts.jl` measured it at zero bytes).
   MPI is called from the calling task only, never in a threaded loop or
   kernel, and needs `THREAD_SERIALIZED`.
 - **Reductions are an allgather of per-rank partials**, folded in rank
@@ -608,6 +662,7 @@ ghost slab.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
+`rotate_tests.jl` (M12),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -680,7 +735,21 @@ files are not tests:
   (three levels against the walls), `parity_data` (polynomials of
   definite parity), `undefined_ghosts` (the `NaN`-prefill check that
   catches a ghost read before it is written) and `reflecting_vs_doubled`
-  (a half domain against the doubled domain it folds).
+  (a half domain against the doubled domain it folds). The M12 oracles
+  follow them: `unfolded_forest` (the full plane built from the
+  quadrant's leaves turned in exact `Rational` boxes),
+  `seam_neighbor_mismatches` and `seam_conforming` against it;
+  `rotating_data` (a scalar and a vector covariant under the turn and
+  under no mirror, smooth or polynomial, its constants in the argument's
+  real type so a `Float32` device evaluates it), `rotating_forest`,
+  `undefined_rotated_ghosts`, `rotating_vs_quadrupled` and
+  `rotating_pair_vs_quadrupled` (the quadrant against the full plane
+  `quadrant_and_full` builds, every stored point), `hook_regions_leave`,
+  and the regrid oracle `rotating_regrid_vs_quadrupled`. Beyond those,
+  `rotate_tests.jl` holds the rigid-rotation advection (conservation
+  through the seam), interpolation beyond it, and the wave on a quadrant
+  against the full plane (`rotating_wave`, scalar and vector, which the
+  vertex-centered seam planes keep equal bit for bit).
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.
@@ -700,7 +769,10 @@ files are not tests:
   this in subprocesses at two thread counts and compares their output byte
   for byte. It is deliberately self-contained (its own RK4 and SSPRK3, no
   ODE package) so a subprocess starts in a couple of seconds; keep it that
-  way, and keep everything it prints deterministic.
+  way, and keep everything it prints deterministic. Its cycles cover
+  periodic and outer boxes, both centerings, reflecting walls (`…r`),
+  rotating quadrants with a `RotationPair` fill (`…q`, M12) and the
+  conservative Burgers cycle (`B…`).
 - `mpi_workload.jl` — the M7 counterpart, standalone too: the argument
   `mpi` makes its forests distributed over `MPI.COMM_WORLD`, and rank 0
   prints the digests gathered in block order. `mpi_tests.jl` also runs
@@ -809,7 +881,9 @@ of the *public API only*. Facts that matter here:
   calls none of the checkpoint functions yet. Against the M9a checkout
   its suite is unchanged, 310 tests in 1m12 (2026-09-29).
 - **M7 reaches it with 0.1.5 and changes nothing serially**:
-  310 tests in 1m22 against the M7 checkout (2026-10-02). It does not
+  310 tests in 1m22 against the M7 checkout (2026-10-02); M12 changes
+  nothing either, 310 tests in 1m17 against the M12 checkout
+  (2026-10-03). It does not
   pass `comm` to any `Forest` yet, so under `mpiexec` each rank would
   run a whole serial copy. Once it does, the step-9 audit (CODE.md, M7
   step 9) found what would go wrong: `field_scales`
@@ -902,7 +976,8 @@ histories as plain data; its `src/checkpoint.jl` (`run_state`,
 `rotate_checkpoints!`) has since implemented it.
 
 **M7 changes nothing for it serially**: 12447 tests in 5m00 against the
-M7 checkout, at one thread (2026-10-02). It does not pass `comm` to a
+M7 checkout, at one thread (2026-10-02); nor does M12, 12447 tests in
+5m08 against the M12 checkout (2026-10-03). It does not pass `comm` to a
 `Forest` yet. Once it does, the step-9 audit found it the most exposed
 of the three, all through five host combinations of `block_mapreduce`
 — `max_signal_speed` (`src/evolution.jl:477`), `floor_hits` (`:505`),
@@ -960,7 +1035,10 @@ is where limiters go (Shu–Osher against Butcher form).
 minutes, so step 9 ran a subset against the M7 checkout — `precision_`,
 `prerequisite_`, `stencils_`, `stepping_`, `interface_`, `refinement_`,
 `horizon_`, `checkpoint_` and `type_tests.jl`, 1760 tests in 7m04 at one
-thread, all passing (2026-10-02). Its production runs are the reason M7
+thread, all passing (2026-10-02); against the M12 checkout its
+`prerequisite_tests.jl` alone, which names the unexported TreeAMR names
+it relies on, passes, 52 tests (2026-10-03). Its production runs are the
+reason M7
 was wanted, and of the three it is the closest to ready: its reductions
 are already `mesh_mapreduce` and its integrator is fixed-step. It does
 not pass `comm` yet (`gh_forest`, `src/initialdata.jl`; `load_run`,

@@ -330,6 +330,273 @@ end
     @test bytes(u′) == bytes(u)
 end
 
+# --- rotating forests (M12) ----------------------------------------------------
+
+# A rotating quadrant with a symmetric set — a scalar and a vector, which
+# the seam turns into themselves — and a `RotationPair` of face-centered
+# sets, `(B_{d1}, F_{d1})` and `(F_{d2}, B_{d2})`, which turn into each
+# other: the sets of `rotating_vs_quadrupled` and
+# `rotating_pair_vs_quadrupled` (`ghost_oracles.jl`), in element type `T`.
+function rotating_checkpoint_sets(::Val{D}, ::Type{T}; other, p=4, poly=0) where {D,T}
+    rotating = (1, 2)
+    d1, d2 = rotating
+    z = outofplane(D, rotating)
+    forest = rotating_forest(Val(D); rotating=rotating, other=other, N=D == 3 ? 4 : 8)
+    f = rotating_data(D, rotating, other; poly=poly)
+    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(vertexcentered(D), p),
+                     centering=vertexcentered(D), rotation=vector_rotation(D, rotating),
+                     parity=vector_parity(D, rotating, other))
+    field(x, k) = covariant_vector(x[d1], x[d2], k; poly=poly)
+    zf(x, odd) = outofplane_factor(x, D, rotating, other, odd; poly=poly)
+    fa = (x, v) -> v == 1 ? field(x, 1)[1] * zf(x, false) : field(x, 2)[1] * zf(x, true)
+    fb = (x, v) -> v == 1 ? field(x, 2)[2] * zf(x, true) : field(x, 1)[2] * zf(x, false)
+    parity(odd) = other === :reflect_lo ?
+                  [ntuple(d -> d != z ? NoParity : o ? OddParity : EvenParity, D)
+                   for o in odd] : nothing
+    Ca = facecentered(D, d1)
+    swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+    a = FieldSet{T}(forest, 2; G=ghosts_for(Ca, p), centering=Ca,
+                    parity=parity((false, true)), rotation=(-2, -1))
+    b = FieldSet{T}(forest, 2; G=swap(ghosts_for(Ca, p)), centering=swap(Ca),
+                    parity=parity((true, false)), rotation=(2, 1))
+    hooks = (boundary_by_coordinates(f), boundary_by_coordinates(fa),
+             boundary_by_coordinates(fb))
+    return forest, (fs, a, b), (f, fa, fb), hooks
+end
+
+file_features(path) = h5open(file -> read_attribute(file["TreeAMR.jl"], "features"), path)
+
+@testset "A rotating checkpoint round-trips bit for bit, a pair included: D=$D, $T" for
+        (D, T, other) in ((2, Float32x2, :outer), (3, Float64, :reflect_lo))
+    # The failure: a load that drops the seam — the forest comes back with
+    # two outer faces where the seam was, or a set without its rotation —
+    # which only the next fill would show, as ghosts the hook wrote
+    # instead of the turned data; or a reader that does not know the seam
+    # and reads it all the same. So the forest's pair, every set's map and
+    # tables, the state, and the working arrays after both sides fill the
+    # same way, the pair through a pair rebuilt from the two loaded sets,
+    # are compared as bytes; and the file lists the feature `rotating`,
+    # which a reader from before M12 does not know and so refuses.
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    # Polynomial data in `Float32x2`, which has no `sin`; the noise below
+    # makes every value structureless all the same.
+    forest, sets, formulas, hooks = rotating_checkpoint_sets(Val(D), T; other=other, p=p,
+                                                             poly=T === Float64 ? 0 : p)
+    rng = MersenneTwister(12)
+    states = map(sets, formulas) do fs, f
+        fill_by_coordinates!(f, fs)
+        u = statevector(fs)
+        gather!(u, fs)
+        u .+= T.(rand(rng, length(u))) ./ 64
+        scatter!(fs, u)
+        u
+    end
+    names = ("u", "a", "b")
+    path = joinpath(mktempdir(), "rotating.h5")
+    save_checkpoint(path, forest; fieldsets=Tuple(n => (fs, u) for (n, fs, u) in
+                                                  zip(names, sets, states)),
+                    application="Rotating" => 1)
+    @test file_features(path) == ["brick", "rotating"]
+    ck = load_checkpoint(path; types=(Float32x2,))
+    @test ck.forest.rotating == forest.rotating
+    @test TreeAMR.rotating_dims(ck.forest) == (1, 2)
+    @test ck.forest.leaves == forest.leaves
+    @test ck.forest.reflecting == forest.reflecting
+    loaded = map(n -> ck.fieldsets[n].fieldset, names)
+    for (fs, back, n, u) in zip(sets, loaded, names, states)
+        @test back.rotation == fs.rotation
+        @test (back.G, back.centering, back.parity) == (fs.G, fs.centering, fs.parity)
+        @test Array(back.rotvars) == Array(fs.rotvars)
+        @test bytes(back.factors) == bytes(fs.factors)
+        @test bytes(ck.fieldsets[n].state) == bytes(u)
+    end
+
+    fs, a, b = sets
+    fs′, a′, b′ = loaded
+    for (s, set) in ((fs, sets), (fs′, loaded))
+        fill_ghosts!(set[1], GhostSchedule(set[1], ops); boundary=hooks[1])
+        fill_ghosts!(RotationPair(set[2], set[3]),
+                     (GhostSchedule(set[2], ops), GhostSchedule(set[3], ops));
+                     boundary=hooks[2:3])
+    end
+    @test bytes(fs′.work) == bytes(fs.work)
+    @test bytes(a′.work) == bytes(a.work)
+    @test bytes(b′.work) == bytes(b.work)
+end
+
+# The quadrant wave as a chunked driver, as `pulse_start` and
+# `pulse_chunk` are the periodic one's: a ring around the axis, which the
+# seam turns into itself, vertex-centered, with outer high faces whose
+# ghosts the hook writes from the initial data. Beside it a `RotationPair`
+# rides through every regrid unevolved, so that what a pair's fill and
+# transfer do after a restart is compared too.
+const QUADRANT = (; D=2, N=8, G=2, roots=4, L=1.0, σ=0.08, r0=0.45, chunk=0.04,
+                  cfl=0.25, maxlevel=2, threshold=0.1, buffer=3,
+                  ops=Operators(prolongation=4, restriction=4))
+
+quadrant_ring(P) = (x, v) -> v == 1 ? exp(-(hypot(x[1], x[2]) - P.r0)^2 / (2 * P.σ^2)) :
+                                 0.0
+quadrant_pair(x, v) = v == 1 ? covariant_vector(x[1], x[2], 1)[1] :
+                      covariant_vector(x[1], x[2], 1)[2]
+
+struct QuadrantWave{W,H}
+    wave::W
+    hook::H
+end
+
+function quadrant_rhs!(du, u, q, t)
+    p = q.wave
+    scatter!(p.fs, u)
+    fill_ghosts!(p.fs, p.schedule; boundary=q.hook)
+    map_blocks!(wave_rhs_kernel!, p.fs, statearray(du, p.fs), p.fs.work, p.spacings,
+                p.valD, p.valG)
+    return nothing
+end
+
+function quadrant_run(forest, fs, pair, t, chunk, P)
+    hook = formula_hook(fs => quadrant_ring(P), pair.a => quadrant_pair,
+                        pair.b => quadrant_pair)
+    return (; forest, fs, pair, schedule=GhostSchedule(fs, P.ops),
+            pairschedules=(GhostSchedule(pair.a, P.ops), GhostSchedule(pair.b, P.ops)),
+            hook, t, chunk)
+end
+
+function quadrant_start(P)
+    forest = Forest((P.roots, P.roots); N=P.N, rotating=(1, 2),
+                    extents=((0.0, P.L), (0.0, P.L)))
+    fs = FieldSet(forest, 2; G=P.G, centering=vertexcentered(2), rotation=(1, 2))
+    ring = quadrant_ring(P)
+    hook = boundary_by_coordinates(ring)
+    adapt_to_initial_data!(fs, P.ops; initial=ring, boundary=hook,
+                           flags=_ -> pulse_flags(fs, P), buffer=P.buffer, maxpasses=8)
+    # The pair starts on the adapted mesh, which its regrids carry on.
+    a = FieldSet(forest, 1; G=ghosts_for(facecentered(2, 1), 4),
+                 centering=facecentered(2, 1), rotation=(-1,))
+    b = FieldSet(forest, 1; G=ghosts_for(facecentered(2, 2), 4),
+                 centering=facecentered(2, 2), rotation=(1,))
+    fill_by_coordinates!(quadrant_pair, a)
+    fill_by_coordinates!((x, v) -> covariant_vector(x[1], x[2], 1)[2], b)
+    pair = RotationPair(a, b)
+    return quadrant_run(forest, fs, pair, 0.0, 0, P)
+end
+
+function quadrant_chunk(run, P)
+    (; forest, fs, pair, schedule, pairschedules, hook, t, chunk) = run
+    stop = (chunk + 1) * P.chunk
+    u = statevector(fs)
+    gather!(u, fs)
+    dt = P.cfl * minimum_spacing(forest)
+    nsteps = max(1, ceil(Int, (stop - t) / dt))
+    problem = QuadrantWave(WaveProblem(fs, schedule), hook)
+    sol = solve(ODEProblem(quadrant_rhs!, u, (t, stop), problem), RK4();
+                dt=(stop - t) / nsteps, adaptive=false, save_everystep=false)
+    scatter!(fs, sol.u[end])
+    fill_ghosts!(fs, schedule; boundary=hook)
+    regrid!(forest, (fs => schedule, pair => pairschedules); flags=pulse_flags(fs, P),
+            buffer=P.buffer, boundary=hook)
+    return quadrant_run(forest, fs, pair, stop, chunk + 1, P)
+end
+
+quadrant_save(path, run) =
+    save_checkpoint(path, run.forest;
+                    fieldsets=("wave" => run.fs, "a" => run.pair.a, "b" => run.pair.b),
+                    application="QuadrantRestart" => 1, data=(; t=run.t, chunk=run.chunk))
+
+function quadrant_restore(path, P)
+    ck = load_checkpoint(path)
+    sets = ck.fieldsets
+    return quadrant_run(ck.forest, sets["wave"].fieldset,
+                        RotationPair(sets["a"].fieldset, sets["b"].fieldset), ck.data.t,
+                        ck.data.chunk, P)
+end
+
+@testset "A restart of a rotating quadrant continues bit-identically through regrids" begin
+    # The failure: a restarted quadrant that drifts from the uninterrupted
+    # one — a seam lost or a map dropped on the way through the file,
+    # which turns the ghosts across the seam into the hook's, or a pair
+    # that a load cannot rebuild as it was. The mesh moves after the
+    # restart point, and the ring reaches the seam, so the regrids there
+    # are conforming ones; the pair is filled and transferred as a pair
+    # in every regrid, before and after the restart.
+    P = QUADRANT
+    n, k = 4, 2
+    run, resumed, history = interrupted(quadrant_start, quadrant_chunk, quadrant_save,
+                                        quadrant_restore, P, n, k)
+    @test any(c -> history[c + 1] != history[c], (k + 1):n)
+    @test all(h -> isbalanced(Forest((P.roots, P.roots); N=P.N, rotating=(1, 2),
+                                     leaves=h)), history)
+    @test resumed.chunk == run.chunk == n
+    @test resumed.t === run.t
+    @test resumed.forest.leaves == run.forest.leaves
+    for (x, y) in ((run.fs, resumed.fs), (run.pair.a, resumed.pair.a),
+                   (run.pair.b, resumed.pair.b))
+        u, u′ = statevector(x), statevector(y)
+        gather!(u, x)
+        gather!(u′, y)
+        @test bytes(u′) == bytes(u)
+    end
+end
+
+@testset "A rotating file without its feature or its seam is refused, saying why" begin
+    # The failure: a file whose seam and feature disagree, or whose maps
+    # are damaged, read anyway — with the seam as two outer faces, or a
+    # map the constructor would refuse from a caller. And a file without
+    # a seam must not list the feature, so that every reader of its
+    # format version still reads it.
+    forest, sets, formulas, _ = rotating_checkpoint_sets(Val(2), Float64; other=:outer)
+    foreach(fill_by_coordinates!, formulas, sets)
+    dir = mktempdir()
+    path = joinpath(dir, "rotating.h5")
+    save_checkpoint(path, forest; fieldsets=("u" => sets[1], "a" => sets[2]),
+                    application="Rotating" => 1)
+    @test load_checkpoint(path).forest.rotating == forest.rotating
+    plain = joinpath(dir, "plain.h5")
+    save_checkpoint(plain, Forest((2, 2); N=4); fieldsets=(),
+                    application="Rotating" => 1)
+    @test file_features(plain) == ["brick"]
+
+    unlisted = edited_copy(path, "unlisted.h5") do file
+        replace_attribute!(file["TreeAMR.jl"], "features", ["brick"])
+    end
+    @test_throws "does not list the feature \"rotating\"" load_checkpoint(unlisted)
+    @test_throws "checkpoint_environment(path, dir)" load_checkpoint(unlisted)
+    seamless = edited_copy(path, "seamless.h5") do file
+        delete_attribute(file["TreeAMR.jl/forest"], "rotating")
+    end
+    @test_throws "lists the feature \"rotating\", but its forest has no" (
+        load_checkpoint(seamless))
+    unknown = edited_copy(path, "unknown.h5") do file
+        replace_attribute!(file["TreeAMR.jl"], "features",
+                           ["brick", "rotating", "halfturn"])
+    end
+    @test_throws "the feature \"halfturn\"" load_checkpoint(unknown)
+    # The pair as stored is checked by the forest: a dimension out of
+    # range, and the seam on a periodic dimension.
+    outside = edited_copy(path, "outside.h5") do file
+        replace_attribute!(file["TreeAMR.jl/forest"], "rotating", [1, 3])
+    end
+    @test_throws "names a dimension outside 1:2" load_checkpoint(outside)
+    unpaired = edited_copy(path, "unpaired.h5") do file
+        replace_attribute!(file["TreeAMR.jl/forest"], "rotating", [1, 2, 3])
+    end
+    @test_throws "is not a pair of dimensions" load_checkpoint(unpaired)
+    # A map that is not a signed permutation, one of the wrong length, and
+    # none at all on a rotating forest.
+    unturned = edited_copy(path, "unturned.h5") do file
+        replace_attribute!(file["TreeAMR.jl/fieldsets/u"], "rotation", [1, 2, 2])
+    end
+    @test_throws "is not a signed permutation" load_checkpoint(unturned)
+    short = edited_copy(path, "short.h5") do file
+        replace_attribute!(file["TreeAMR.jl/fieldsets/a"], "rotation", [-2])
+    end
+    @test_throws "field set \"a\" has the rotation [-2], not 2 signed" load_checkpoint(short)
+    mapless = edited_copy(path, "mapless.h5") do file
+        delete_attribute(file["TreeAMR.jl/fieldsets/u"], "rotation")
+    end
+    @test_throws "so the field set needs `rotation`" load_checkpoint(mapless)
+end
+
 # --- refusals ----------------------------------------------------------------
 
 @testset "A file this version cannot interpret is refused, saying why" begin

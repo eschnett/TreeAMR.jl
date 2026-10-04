@@ -75,6 +75,7 @@ end
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = FieldSet{T}(forest, 3; G=G, centering=C, parity=parity)
             copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
@@ -167,4 +168,100 @@ end
                                                     balance!(forest)))
     @test all(m -> startswith(m, "the forest differs between ranks, so interpolate is " *
                                  "refused on every rank"), msgs)
+end
+
+# --- Rotating seams (M12) ---------------------------------------------------
+
+# Points over the whole plane of a quadrant `[0, 2]^2`, three quarters of
+# them beyond the seam, turned back by one, two or three quarter turns;
+# and the turned images of every leaf's lower corner, which put a point
+# on the first block of every rank seen through each turn. The third
+# dimension runs half its length beyond a reflecting or periodic face.
+function seam_points(rng, forest::Forest{D}; nrandom=160) where {D}
+    turn(x, r) = r == 0 ? x : turn(Base.setindex(Base.setindex(x, -x[2], 1), x[1], 2),
+                                   r - 1)
+    third(t) = D == 2 ? () :
+               (forest.periodic[3] || forest.reflecting[3][1] ? 3.0 * t - 1.0 : 2.0 * t,)
+    xs = NTuple{D,Float64}[(4.0 * rand(rng) - 2.0, 4.0 * rand(rng) - 2.0,
+                            third(rand(rng))...) for _ in 1:nrandom]
+    for (i, k) in enumerate(forest.leaves)
+        corner = ntuple(d -> Float64(block_extent(forest, k)[d][1]), D)
+        push!(xs, turn(corner, i % 4))
+    end
+    return xs
+end
+
+@testset "A distributed interpolate through a rotating seam is the serial one: D=$D" for
+        D in (2, 3)
+    # Routing turns a point beyond the seam back into the quadrant on the
+    # host, to find its owner, and the owner's kernel turns it again to
+    # evaluate it; a rank that turned it otherwise, or another rank's
+    # point routed to the preimage's owner and answered unturned, gives a
+    # wrong value or a wrong sign. Random data over every stored point;
+    # every value and first derivative, bit for bit, over 3 ranks and
+    # more ranks than leaves.
+    other = D == 3 ? :reflect_lo : :outer
+    serial = rotating_forest(Val(D); rotating=(1, 2), other=other, N=D == 3 ? 6 : 8)
+    layout = rotating_exchange_layouts(D, other)[2]           # vertex-centered
+    sfs = rotating_set(serial, layout)
+    data = rand(MersenneTwister(40 + D), size(sfs.work)...) .- 0.5
+    copyto!(sfs.work, data)
+    xs = seam_points(Xoshiro(41 + D), serial)
+    basis = Lagrange(4)
+    derivs = gradient_derivs(D)
+    full = interpolate(sfs, xs, basis; derivs=derivs, vars=[3, 1, 2])
+    nturned = count(x -> x[1] < 0 || x[2] < 0, xs)
+    @test nturned > length(xs) ÷ 2
+    for P in (3, nleaves(serial) + 2)
+        parts = uneven_parts(length(xs), P)
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                            reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
+                            leaves=serial.leaves, comm=comms[r])
+            fs = rotating_set(forest, layout)
+            copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+            (interpolate(fs, xs[parts[r]], basis; derivs=derivs, vars=[3, 1, 2]),
+             nblocks(fs))
+        end
+        P > nleaves(serial) && @test any(res -> res[2] == 0, results)
+        for (r, (a, _)) in enumerate(results)
+            @test bitwise_equal(a.values, full.values[:, :, parts[r]])
+            @test !any(a.excluded)
+        end
+    end
+end
+
+@testset "A point beyond the seam of a set that turns into its partner is refused on every rank" begin
+    # The value there is the partner's, which `interpolate` does not read.
+    # The host marks such a point when it locates it, before anything is
+    # routed, so a point on one rank only must be refused on every rank
+    # together — the others waiting in the routing would hang — the rank
+    # that passed it with its own reason and the others naming it.
+    serial = rotating_forest(Val(2); rotating=(1, 2))
+    layout = rotating_exchange_layouts(2, :outer)[3]          # B_x, alone
+    P = 3
+    comms = gather_ranks(P)
+    msgs = on_ranks(P) do r
+        forest = Forest(serial.roots; N=serial.N, extents=serial.extents,
+                        rotating=(1, 2), leaves=serial.leaves, comm=comms[r])
+        fs = rotating_set(forest, layout)
+        try
+            interpolate(fs, r == 2 ? [(0.5, 0.5), (-0.5, 0.7)] : [(1.5, 0.25)],
+                        Lagrange(4))
+            ""
+        catch err
+            err isa ArgumentError || rethrow()
+            err.msg
+        end
+    end
+    @test startswith(msgs[2], "point 2, (-0.5, 0.7), lies 1 quarter turn(s) away across " *
+                              "the rotating seam (1, 2)")
+    @test occursin("rank(s) 1 of 3 passed a point outside the domain", msgs[2])
+    for r in (1, 3)
+        @test occursin("this one (rank $(r - 1)) included", msgs[r])
+        @test occursin("On rank 1, point 2, (-0.5, 0.7), lies 1 quarter turn(s) away",
+                       msgs[r])
+    end
 end

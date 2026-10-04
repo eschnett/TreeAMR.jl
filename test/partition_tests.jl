@@ -32,6 +32,7 @@ TreeAMR.allgather(c::PartitionCommunicator, d::TreeAMR.ForestDigest) = fill(d, c
 rank_forest(serial::Forest{D,T}, r, P) where {D,T} =
     Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
               reflecting=serial.reflecting, extents=serial.extents,
+              rotating=TreeAMR.rotating_dims(serial),
               leaves=serial.leaves, comm=PartitionCommunicator(r, P))
 
 # The equal-count split as `threadchunks` computed it through 0.1.4, a

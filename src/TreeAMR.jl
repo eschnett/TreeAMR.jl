@@ -47,6 +47,9 @@ export AllVariables
 # Reflecting boundaries (M10)
 export Parity, EvenParity, OddParity, NoParity
 
+# Rotating symmetry (M12)
+export RotationPair
+
 # Point interpolation
 export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
        Region, Ellipsoid

@@ -47,6 +47,7 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
     nvars = length(EXCHANGE_PARITY)
     forest = Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=serial.reflecting, extents=serial.extents,
+                       rotating=TreeAMR.rotating_dims(serial),
                        leaves=serial.leaves)
     fs = FieldSet{T}(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
     copyto!(fs.work, exchange_data(MersenneTwister(5), T, size(fs.work)))
@@ -363,6 +364,7 @@ end
     end
     reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=serial.reflecting, extents=serial.extents,
+                       rotating=TreeAMR.rotating_dims(serial),
                        leaves=serial.leaves)
     sfs = sets(reference)
     alldata = map(enumerate(sfs)) do (i, fs)
@@ -380,6 +382,7 @@ end
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             owned = blockrange(forest)
             fss = sets(forest)
@@ -409,6 +412,7 @@ end
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = first(sets(forest))
             fs.work .= 1
@@ -476,6 +480,7 @@ TreeAMR.waitall(c::StagingCommunicator, requests::AbstractVector) =
     G = exchange_ghosts(C, PointValue)
     rebuilt(comm) = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                            reflecting=serial.reflecting, extents=serial.extents,
+                           rotating=TreeAMR.rotating_dims(serial),
                            leaves=serial.leaves, comm=comm)
     reference = rebuilt(nothing)
     sfs = FieldSet(reference, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
@@ -731,4 +736,131 @@ end
     @test all(e -> e isa ArgumentError &&
                    occursin("the forest differs between ranks, so regrid! is refused",
                             e.msg), errs)
+end
+
+# --- Rotating seams (M12) ---------------------------------------------------
+
+@testset "regrid! over a distributed rotating quadrant is the serial regrid: D=$D" for
+        D in (2, 3)
+    # A pair is filled as a pair before its transfers, each member's
+    # ghosts across the seam being the other's data, and the conforming
+    # seam is kept by the replicated completion. Over 3 and 5 ranks, a
+    # set that turns into itself and a `RotationPair` regridded together
+    # — refining at the seam, which conformity carries from one face to
+    # the other, and coarsening the finest blocks — must end with the
+    # serial leaves and the serial arrays on every rank's new blocks, bit
+    # for bit.
+    N = D == 3 ? 4 : 8
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    other = D == 3 ? :reflect_lo : :outer
+    serial = rotating_forest(Val(D); rotating=(1, 2), other=other, N=N)
+    layouts = rotating_exchange_layouts(D, other; p=p)
+    chosen = layouts[[1, 3, 4]]
+    hook = exchange_hook()
+    colons = ntuple(_ -> :, D + 1)
+    rng = MersenneTwister(30 + D)
+    sizes = map(l -> size(rotating_set(serial, l).work), chosen)
+    alldata = [rotating_exchange_data(rng, Float64, sz, l[2] == 2 ? 2 : 3)
+               for (sz, l) in zip(sizes, chosen)]
+    # Refine the coarsest leaves on the low face of the first dimension,
+    # coarsen the finest anywhere.
+    mark(forest, k) = level(k) == maxlevel(forest) ? Coarsen :
+                      level(k) == 0 && block_extent(forest, k)[1][1] == 0 ? Refine : Keep
+    function entries(forest)
+        fs, a, b = map(l -> rotating_set(forest, l), chosen)
+        for (s, d) in zip((fs, a, b), alldata)
+            copyto!(s.work, d[colons..., blockrange(forest)])
+        end
+        pair = RotationPair(a, b)
+        return (fs => GhostSchedule(fs, ops),
+                pair => (GhostSchedule(a, ops), GhostSchedule(b, ops))), (fs, a, b)
+    end
+    reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                       reflecting=serial.reflecting, extents=serial.extents,
+                       rotating=TreeAMR.rotating_dims(serial), leaves=serial.leaves)
+    rentries, rsets = entries(reference)
+    old = copy(reference.leaves)
+    @test regrid!(reference, rentries; flags=[mark(reference, k) for k in reference.leaves],
+                  boundary=hook)
+    @test reference.leaves != old
+    @test isbalanced(reference)
+
+    for P in (3, 5)
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                            reflecting=serial.reflecting, extents=serial.extents,
+                            rotating=TreeAMR.rotating_dims(serial),
+                            leaves=serial.leaves, comm=comms[r])
+            es, sets = entries(forest)
+            flags = Any[mark(forest, forest.leaves[i]) for i in blockrange(forest)]
+            got = regrid!(forest, es; flags=flags, boundary=hook)
+            (got, copy(forest.leaves), blockrange(forest), map(s -> copy(s.work), sets))
+        end
+        @test first(comms).mail.box.nmessages > 0
+        @test all(isempty ∘ last, first(comms).mail.box.channels)
+        @test all(res -> res[1], results)
+        @test all(res -> res[2] == reference.leaves, results)
+        for (_, _, owned, works) in results, (w, s) in zip(works, rsets)
+            @test bitwise_equal(w, s.work[colons..., owned])
+        end
+    end
+end
+
+@testset "adapt_to_initial_data! over a distributed rotating quadrant, alone or as a pair" begin
+    # From a single leaf at the axis, every rank but one starts empty and
+    # the leaf is its own neighbor across the seam three times over. The
+    # cycle — a fill, the flags, the regrid, the data re-evaluated — must
+    # reach the serial mesh in the serial number of passes, with the
+    # serial data, for a set that turns into itself and for a pair.
+    p = 4
+    ops = Operators(prolongation=p, restriction=p)
+    rotating = (1, 2)
+    f = rotating_data(2, rotating, :outer)
+    field(x, k) = covariant_vector(x[1], x[2], k)
+    fa(x, v) = field(x, v)[1]
+    fb(x, v) = field(x, 3 - v)[2]
+    flag(forest) = (b, k) -> begin
+        ext = block_extent(forest, k)
+        level(k) == 0 ||
+            level(k) < 2 && hypot((ext[1][1] + ext[1][2]) / 2,
+                                  (ext[2][1] + ext[2][2]) / 2) < 0.5 ? Refine : Keep
+    end
+    quadrant(comm) = Forest((1, 1); N=8, rotating=rotating,
+                            extents=((0.0, 1.0), (0.0, 1.0)), comm=comm)
+    layouts = rotating_exchange_layouts(2, :outer; p=p)
+    single(forest) = rotating_set(forest, layouts[1])
+    pairof(forest) = RotationPair(rotating_set(forest, layouts[3]),
+                                  rotating_set(forest, layouts[4]))
+    hooks = (boundary_by_coordinates(fa), boundary_by_coordinates(fb))
+    cases = (("alone", single, f, boundary_by_coordinates(f), fs -> (fs,)),
+             ("pair", pairof, (fa, fb), hooks, q -> (q.a, q.b)))
+    for (name, make, initial, boundary, members) in cases
+        reference = quadrant(nothing)
+        sx = make(reference)
+        _, spasses, sconv = adapt_to_initial_data!(sx, ops; initial=initial,
+                                                   boundary=boundary,
+                                                   flag=flag(reference))
+        @test sconv && spasses > 1
+        @test maxlevel(reference) == 2
+        P = 3
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = quadrant(comms[r])
+            x = make(forest)
+            empty = isempty(blockrange(forest))
+            _, passes, conv = adapt_to_initial_data!(x, ops; initial=initial,
+                                                     boundary=boundary, flag=flag(forest))
+            (empty, passes, conv, copy(forest.leaves), blockrange(forest),
+             map(s -> copy(s.work), members(x)))
+        end
+        @test count(res -> res[1], results) == P - 1
+        for (_, passes, conv, leaves, owned, works) in results
+            @test (passes, conv) == (spasses, sconv)
+            @test leaves == reference.leaves
+            @test all(((w, s),) -> bitwise_equal(w, s.work[:, :, :, owned]),
+                      zip(works, members(sx)))
+        end
+    end
 end

@@ -266,19 +266,22 @@ end
 
 # What locating a point needs of the forest, as an `isbits` value a kernel
 # can take: the domain in the field set's type, the brick, the face
-# kinds, and the finest level present (an `O(nleaves)` scan, done once
-# per batch on the host).
+# kinds, the rotating seam's pair of dimensions (M12; `(0, 0)` for none),
+# and the finest level present (an `O(nleaves)` scan, done once per batch
+# on the host).
 struct PointGeometry{D,T}
     extents::NTuple{D,Tuple{T,T}}
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
     reflecting::NTuple{D,Tuple{Bool,Bool}}
+    rotating::NTuple{2,Int}
     L::Int
 end
 
 PointGeometry(::Type{T}, forest::Forest{D}) where {T,D} =
     PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]), T(forest.extents[d][2])), D),
                        forest.roots, forest.periodic, forest.reflecting,
+                       (Int(forest.rotating[1]), Int(forest.rotating[2])),
                        maxlevel(forest))
 
 # One coordinate brought into the domain: wrapped along a periodic
@@ -307,11 +310,52 @@ PointGeometry(::Type{T}, forest::Forest{D}) where {T,D} =
     return y, folded, lo <= y <= hi
 end
 
+# A point brought into the domain: each coordinate folded on its own
+# (`fold_coordinate`), then, across a rotating seam (M12), the plane's two
+# coordinates turned back into the quadrant. Returns `(y, folded, r,
+# inside)`, with `folded` the dimensions mirrored once and `r` the number
+# of quarter turns the point lay away, `y = R^{-r}` of it about the axis
+# at the low corner of the plane (CODE.md, "Folding through a rotating
+# seam"):
+#
+#   r = 1 (beyond the low face of d1 only):  (a, b) ↦ (b, −a)
+#   r = 2 (beyond both):                     (a, b) ↦ (−a, −b)
+#   r = 3 (beyond the low face of d2 only):  (a, b) ↦ (−b, a)
+#
+# with `(a, b)` the coordinates along `(d1, d2)` from the axis. The plane's
+# dimensions are neither periodic nor reflecting, so the per-coordinate
+# folds leave them alone and the order of the two steps is a convention.
+# A point the turn takes beyond a high face is outside. The plane's
+# indices are run-time values, so the tuples are rebuilt by comparison
+# rather than indexed, which a device would spill; and nothing a closure
+# captures is assigned twice, which would box it (see `lagrange_series`).
 @inline function fold_point(g::PointGeometry{D,T}, x) where {D,T}
     f = ntuple(d -> fold_coordinate(T(x[d]), g.extents[d][1], g.extents[d][2],
                                     g.periodic[d], g.reflecting[d]), Val(D))
-    return ntuple(d -> f[d][1], Val(D)), ntuple(d -> f[d][2], Val(D)),
-           all(ntuple(d -> f[d][3], Val(D)))
+    y = ntuple(d -> f[d][1], Val(D))
+    folded = ntuple(d -> f[d][2], Val(D))
+    inside = all(ntuple(d -> f[d][3], Val(D)))
+    d1, d2 = g.rotating
+    d1 == 0 && return y, folded, 0, inside
+    lo1, lo2 = g.extents[d1][1], g.extents[d2][1]
+    a, b = y[d1] - lo1, y[d2] - lo2
+    r = a < zero(T) ? (b < zero(T) ? 2 : 1) : (b < zero(T) ? 3 : 0)
+    r == 0 && return y, folded, 0, inside
+    return turn_point(g, y, folded, f, d1, d2, r, a, b)
+end
+
+# The turn of `fold_point` by `r ≠ 0` quarter turns in the plane `(d1, d2)`,
+# with `(a, b)` the point's coordinates from the axis.
+@inline function turn_point(g::PointGeometry{D,T}, y, folded, f, d1::Int, d2::Int,
+                            r::Int, a::T, b::T) where {D,T}
+    lo1, lo2 = g.extents[d1][1], g.extents[d2][1]
+    q1, q2 = r == 1 ? (b, -a) : r == 2 ? (-a, -b) : (-b, a)
+    y1, y2 = lo1 + q1, lo2 + q2
+    in1 = lo1 <= y1 <= g.extents[d1][2]
+    in2 = lo2 <= y2 <= g.extents[d2][2]
+    z = ntuple(d -> d == d1 ? y1 : d == d2 ? y2 : y[d], Val(D))
+    inside = all(ntuple(d -> d == d1 ? in1 : d == d2 ? in2 : f[d][3], Val(D)))
+    return z, folded, r, inside
 end
 
 # The block index of the leaf containing the in-domain point `x`.
@@ -370,15 +414,17 @@ block is stored by the rank whose [`blockrange`](@ref) contains it.
 Leaves own half-open boxes, so a point on a face shared by two leaves
 belongs to the upper one; a point on the domain's upper face belongs to
 the last leaf there. Along a periodic dimension `x` is wrapped into the
-domain first, and beyond a reflecting face it is mirrored once — which is
-where [`interpolate`](@ref) reads its value. `O(D·maxlevel + log nleaves)`:
+domain first, beyond a reflecting face it is mirrored once, and beyond a
+rotating seam (M12) it is turned back into the quadrant by as many
+quarter turns as it lay away — which is where [`interpolate`](@ref)
+reads its value. `O(D·maxlevel + log nleaves)`:
 one binary search over the sorted leaves.
 """
 function locate_point(forest::Forest{D,R}, x) where {D,R}
     length(x) == D || throw(ArgumentError(
         "a point in a $D-dimensional forest has $D coordinates, got $(length(x))"))
     g = PointGeometry(R, forest)
-    xf, _, ok = fold_point(g, x)
+    xf, _, _, ok = fold_point(g, x)
     ok || return nothing
     return locate_leaf(forest.leaves, g, xf)
 end
@@ -413,14 +459,32 @@ end
 # block: zero serially, where the two coincide, and under M7 the shift a
 # point routed to the owner of its block takes to reach it ("Point
 # interpolation" under "Distributed meshes" in CODE.md).
+#
+# Across a rotating seam (M12) the point is turned back by `r` quarter
+# turns (`fold_point`), and the value of target variable `v` is variable
+# `rotvars[v, r + 1]` there, times the sign at column `mirror + 3^D·r` of
+# `factors` — the two tables the rotated transfers read. A derivative
+# along `d1` or `d2` turns with the point: an odd `r` exchanges the two
+# (the contraction runs with `swapped`, the requested multi-indices with
+# `d1` and `d2` exchanged, a constant like `derivs`), and each picks up
+# the sign of the turn (`r = 1`: `∂_{d1} → −∂_{d2}`, `∂_{d2} → ∂_{d1}`;
+# `r = 2`: both negated; `r = 3`: `∂_{d1} → ∂_{d2}`, `∂_{d2} → −∂_{d1}`).
+# `rotvars` is `nothing` for a set that has no turn of its own — over a
+# forest without a seam, where `r` is always 0, and for a set whose
+# layout is not symmetric in the plane, whose value beyond the seam is
+# its partner's: such a point is recorded as `-1` and refused by the host.
 @inline function interpolate_point!(values, excluded, blocks, xs, leaves, origins,
-                                    spacings, work, factors, vars, region, basis,
-                                    g::PointGeometry{D,T}, derivs::NTuple{K},
+                                    spacings, work, factors, rotvars, vars, region, basis,
+                                    g::PointGeometry{D,T}, derivs::NTuple{K}, swapped,
                                     ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
                                     boffset, j) where {D,T,K,M,G,C,S}
-    x, fold, ok = fold_point(g, xs[j])
+    x, fold, r, ok = fold_point(g, xs[j])
     if !ok
         blocks[j] = 0
+        return nothing
+    end
+    if r != 0 && rotvars === nothing
+        blocks[j] = -1
         return nothing
     end
     b = locate_leaf(leaves, g, x)
@@ -434,8 +498,9 @@ end
     W = ntuple(d -> basisweights(basis, ξ[d], Val(M)), Val(D))
 
     # Physical units, and the sign a derivative picks up across each wall
-    # the point was mirrored over.
+    # the point was mirrored over and through each quarter turn.
     ih = inv(h)
+    d1, d2 = g.rotating
     scale = ntuple(Val(K)) do k
         s = one(T)
         flips = 0
@@ -444,6 +509,8 @@ end
                 s *= ih
             end
             fold[d] && (flips += derivs[k][d])
+            (r == 1 || r == 2) && d == d1 && (flips += derivs[k][d])
+            (r == 3 || r == 2) && d == d2 && (flips += derivs[k][d])
         end
         isodd(flips) ? -s : s
     end
@@ -452,16 +519,34 @@ end
         fold[d] && (col += stride)
         stride *= 3
     end
+    col += stride * r
 
-    # Sum factorization along dimension 1: each row of `n` points is
-    # contracted once per derivative order in `x₁`, and only those partial
-    # sums meet the other dimensions' weights. Everything that does not
-    # depend on the variable is formed once per point: the product of the
-    # outer dimensions' weights for every row and requested derivative,
-    # and each row's offset into the working array, which is indexed
-    # linearly from there. `derivs` arrives as a constant (the kernel takes
-    # it as a `Val`): with run-time multi-indices the selections below are
-    # dynamic tuple indexing, which cost 21 % serially.
+    if swapped !== nothing && isodd(r)
+        contract_point!(values, work, vars, rotvars, factors, W, scale, swapped, first, b,
+                        col, r, j, Val(n), Val(M))
+    else
+        contract_point!(values, work, vars, rotvars, factors, W, scale, derivs, first, b,
+                        col, r, j, Val(n), Val(M))
+    end
+    return nothing
+end
+
+# The contraction of one query's stencil, for every requested variable,
+# with the weights' derivatives taken by the multi-indices `derivs`.
+#
+# Sum factorization along dimension 1: each row of `n` points is
+# contracted once per derivative order in `x₁`, and only those partial
+# sums meet the other dimensions' weights. Everything that does not
+# depend on the variable is formed once per point: the product of the
+# outer dimensions' weights for every row and requested derivative,
+# and each row's offset into the working array, which is indexed
+# linearly from there. `derivs` arrives as a constant (the kernel takes
+# it as a `Val`, and this is inlined): with run-time multi-indices the
+# selections below are dynamic tuple indexing, which cost 21 % serially.
+@inline function contract_point!(values, work, vars, rotvars, factors, W, scale,
+                                 derivs::NTuple{K}, first::NTuple{D,Int}, b, col, r, j,
+                                 ::Val{n}, ::Val{M}) where {K,D,n,M}
+    T = eltype(values)
     vNR = rowcount(Val(n), Val(D))
     rows = rows_of(Val(n), Val(D))
     st = strides_of(size(work))
@@ -472,10 +557,10 @@ end
     corner = 1 + sum(ntuple(d -> (first[d] - 1) * st[d], Val(D))) + (b - 1) * st[D + 2]
     for iv in eachindex(vars)
         v = Int(vars[iv])
-        vcorner = corner + (v - 1) * st[D + 1]
+        vcorner = corner + (rotvar(rotvars, v, r) - 1) * st[D + 1]
         acc = ntuple(_ -> zero(T), Val(K))
         for jr in 1:length(rows)
-            r = ntuple(_ -> zero(T), Val(M + 1))
+            r1 = ntuple(_ -> zero(T), Val(M + 1))
             for i1 in 1:n
                 # In bounds by construction: the start is clamped into
                 # `1 : S − n + 1` in every dimension (`query_stencil`), and
@@ -483,9 +568,9 @@ end
                 # that owns the block it lies in. As in `stencil_sum`, a CI run with
                 # `check_bounds = yes` still checks it.
                 @inbounds u = work[vcorner + rowoff[jr] + (i1 - 1)]
-                r = row_update(r, W[1], i1, u)
+                r1 = row_update(r1, W[1], i1, u)
             end
-            acc = outer_update(acc, r, sel, wouter, jr)
+            acc = outer_update(acc, r1, sel, wouter, jr)
         end
         σ = paritysign(factors, v, col, T)
         for k in 1:K
@@ -494,6 +579,10 @@ end
     end
     return nothing
 end
+
+# The variable a target variable `v` reads `r` quarter turns away (M12).
+@inline rotvar(::Nothing, v, r) = v
+@inline rotvar(rotvars, v, r) = r == 0 ? v : Int(@inbounds rotvars[v, r + 1])
 
 # The two accumulations of the contraction, as functions of their
 # accumulators rather than closures over them, for the boxing reason in
@@ -536,19 +625,20 @@ end
 
 # The parity sign of variable `v` in mirror state `col` — the table the
 # mirrored transfers multiply by, whose single-fold entries are the
-# products of the variable's signs. A forest without reflecting faces has
-# no table and no folds.
+# products of the variable's signs, and (M12) whose columns past `3^D`
+# carry the sign of each quarter turn too. A forest without reflecting
+# faces or a seam has no table and no folds.
 @inline paritysign(::Nothing, v, col, ::Type{T}) where {T} = one(T)
 @inline paritysign(factors, v, col, ::Type{T}) where {T} = factors[v, col]
 
 @kernel function interpolate_kernel!(values, excluded, blocks, @Const(xs),
                                      @Const(leaves), @Const(origins), @Const(spacings),
-                                     @Const(work), factors, @Const(vars), region, basis,
-                                     g, ::Val{DV}, ::Val{M}, ::Val{G}, ::Val{C},
-                                     ::Val{S}, boffset) where {DV,M,G,C,S}
+                                     @Const(work), factors, rotvars, @Const(vars), region,
+                                     basis, g, ::Val{DV}, ::Val{DS}, ::Val{M}, ::Val{G},
+                                     ::Val{C}, ::Val{S}, boffset) where {DV,DS,M,G,C,S}
     j = @index(Global, Linear)
     interpolate_point!(values, excluded, blocks, xs, leaves, origins, spacings, work,
-                       factors, vars, region, basis, g, DV, Val(M), Val(G),
+                       factors, rotvars, vars, region, basis, g, DV, DS, Val(M), Val(G),
                        Val(C), Val(S), boffset, j)
 end
 
@@ -598,20 +688,36 @@ function check_stencil_fits(fs::FieldSet{T,D}, basis) where {T,D}
     return nothing
 end
 
+# The refusal of point `j`, `x`, which the kernel marked: outside the
+# domain after every fold, or (M12) beyond a rotating seam of a set that
+# cannot turn it. Decided again here, by the same fold.
 function outside_error(fs::FieldSet, x, j)
     forest = fs.forest
+    seam = rotating_dims(forest)
+    if seam !== nothing
+        _, _, r, ok = fold_point(PointGeometry(eltype(fs.work), forest), x)
+        ok && r != 0 && return ArgumentError(
+            "point $j, $(Tuple(x)), lies $r quarter turn(s) away across the rotating " *
+            "seam $seam, where this field set's value is a turn of its partner's " *
+            "data: its layout (G = $(fs.G), centering $(fs.centering)) is not " *
+            "symmetric in the seam's dimensions, so it turns into the set of the " *
+            "exchanged layout, which interpolate does not read. Interpolate the " *
+            "partner at the turned point instead, or ask for points inside the " *
+            "quadrant.")
+    end
     kinds = ntuple(length(forest.extents)) do d
         forest.periodic[d] ? "periodic" :
+        seam !== nothing && d in seam ? "rotating seam below" :
         forest.reflecting[d] == (true, true) ? "reflecting" :
         forest.reflecting[d][1] ? "reflecting below" :
         forest.reflecting[d][2] ? "reflecting above" : "outer"
     end
     return ArgumentError(
         "point $j, $(Tuple(x)), is outside the domain $(forest.extents) (faces " *
-        "$(kinds)), so no block holds data there. A periodic dimension wraps and a " *
-        "reflecting face mirrors a point once; beyond an outer face there is " *
-        "nothing to interpolate from, and taking the nearest block would " *
-        "extrapolate without saying so.")
+        "$(kinds)), so no block holds data there. A periodic dimension wraps, a " *
+        "reflecting face mirrors a point once and a rotating seam turns it back by " *
+        "quarter turns; beyond an outer face there is nothing to interpolate from, " *
+        "and taking the nearest block would extrapolate without saying so.")
 end
 
 """
@@ -653,8 +759,19 @@ A point is wrapped along a periodic dimension and mirrored once across a
 reflecting face; a mirrored value takes the variable's parity sign and a
 derivative across the wall its own sign too, as the ghosts beyond the
 wall do — once per order across it, so `∂ₓ²` across a wall in `x` keeps
-the variable's sign and `∂ₓ∂ᵧ` flips it. A point outside the domain
-after that is an `ArgumentError`, raised once the whole batch has run.
+the variable's sign and `∂ₓ∂ᵧ` flips it. Beyond a rotating seam (M12;
+see [`Forest`](@ref)'s `rotating`) the point is turned back into the
+quadrant by the `r` quarter turns it lay away, after those folds, and
+its value is the field set's `rotation` applied `r` times there — the
+variable it names, with its sign — as the ghosts across the seam are;
+each derivative turns with it, once per order (for `r = 1`, `∂_{d1}` is
+`−∂_{d2}` there and `∂_{d2}` is `∂_{d1}`, so `∂_{d1}∂_{d2}` is
+`−∂_{d2}∂_{d1}`). A set whose layout is not symmetric in the seam's
+plane turns into its partner, so it refuses a point beyond the seam,
+saying so. A point outside the domain after all that is an
+`ArgumentError`, raised once the whole batch has run. `exclude` is
+tested against the stencil's points where they are, in the block that
+is read, after every fold.
 
 Every query writes only its own slots, so the result does not depend on
 the thread count. The batch is one kernel launch; see "Point
@@ -721,9 +838,10 @@ function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldS
 
     # Reduced where the indices are, so that a device batch copies back one
     # flag rather than an index per point; only a batch that has an
-    # outside point pays for finding which.
-    if any(iszero, blocks)
-        j = findfirst(iszero, tohost(blocks))
+    # outside point pays for finding which. A point beyond a rotating seam
+    # of a set that cannot turn it is marked `-1` and refused the same way.
+    if any(<=(0), blocks)
+        j = findfirst(<=(0), tohost(blocks))
         throw(outside_error(fs, tohost(xs)[j], j))
     end
     return values, excluded
@@ -788,11 +906,30 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, xs, g, basis
               interpolate_kernel!(backend, max(MIN_POINTS_PER_TASK,
                                                cld(npts, Threads.nthreads()))) :
               interpolate_kernel!(backend)
+    rotvars = seam_rotvars(fs)
+    swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
     kernel!(values, excluded, blocks, xs, leaves, origins, spacings, fs.work,
-            fs.factors, vs, region, basis, g, Val(ms), Val(M), Val(fs.G),
-            Val(staggers(fs)), Val(S), boffset; ndrange=npts)
+            fs.factors, rotvars, vs, region, basis, g, Val(ms), Val(swapped), Val(M),
+            Val(fs.G), Val(staggers(fs)), Val(S), boffset; ndrange=npts)
     synchronize(backend)
     return blocks
+end
+
+# The variable table the kernel turns a point beyond a rotating seam with
+# (M12): the set's own, or `nothing` where no point is turned — over a
+# forest without a seam, and for a set whose layout is not symmetric in
+# the seam's plane, whose value there is its partner's, so that such a
+# point is refused.
+seam_rotvars(fs::FieldSet) = seam_turns(fs) ? fs.rotvars : nothing
+
+# Whether a point beyond the seam can be answered from `fs` itself.
+seam_turns(fs::FieldSet) = hasrotating(fs.forest) && symmetric_layout(fs)
+
+# The requested multi-indices with the seam's two dimensions exchanged:
+# what an odd number of quarter turns contracts with.
+function swapped_derivs(forest::Forest, ms)
+    d1, d2 = rotating_dims(forest)
+    return map(m -> ntuple(d -> d == d1 ? m[d2] : d == d2 ? m[d1] : m[d], length(m)), ms)
 end
 
 # --- over a distributed forest (M7) ------------------------------------------
@@ -814,7 +951,11 @@ end
 
 # Fold, convert and locate this rank's points on the host: the points as
 # the kernel will read them, and each one's global leaf, `0` outside.
-function locate_on_host(forest::Forest, g::PointGeometry{D,T}, xh) where {D,T}
+#
+# `turns` says whether a point beyond a rotating seam can be answered
+# (`seam_turns`); one that cannot is marked `-1`, as the kernel marks it.
+function locate_on_host(forest::Forest, g::PointGeometry{D,T}, xh,
+                        turns::Bool=true) where {D,T}
     n = length(xh)
     for j in 1:n
         length(xh[j]) == D || throw(ArgumentError(
@@ -827,8 +968,8 @@ function locate_on_host(forest::Forest, g::PointGeometry{D,T}, xh) where {D,T}
     locate!(j) = begin
         p = ntuple(d -> T(xh[j][d]), Val(D))
         pts[j] = p
-        xf, _, ok = fold_point(g, p)
-        leafof[j] = ok ? locate_leaf(leaves, g, xf) : 0
+        xf, _, r, ok = fold_point(g, p)
+        leafof[j] = !ok ? 0 : r != 0 && !turns ? -1 : locate_leaf(leaves, g, xf)
         nothing
     end
     # A search is some tens of nanoseconds, so a batch the size of a
@@ -880,12 +1021,13 @@ function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, xs, basis
         layout = layouthash(string(basis), ms, collect(Int, vars),
                             string(convertregion(T, exclude)), fs.nvars, fs.G,
                             fs.centering, T, nameof(typeof(get_backend(fs.work))))
-        pts, leafof = locate_on_host(forest, g, tohost(xs))
+        pts, leafof = locate_on_host(forest, g, tohost(xs),
+                                     !hasrotating(forest) || seam_turns(fs))
     catch err
         err isa ArgumentError || rethrow()
         refusal = err
     end
-    outside = something(findfirst(iszero, leafof), 0)
+    outside = something(findfirst(<=(0), leafof), 0)
     x0 = outside > 0 ? pts[outside] : ntuple(_ -> zero(T), Val(D))
     # Not the full forest digest: its fold over every leaf is `O(nleaves)`,
     # which at analysis cadence would cost as much as the interpolation.

@@ -43,14 +43,15 @@ exchange_ghosts(C, family) = ghosts_for(C, family === Conservative ? 3 : 4)
 stencil_values(s) = (s.targetfirst, Vector(s.srcstart), Matrix(s.weights))
 
 # Every transfer of a serial schedule, filed by the stage it runs in:
-# `(tag, kind, factorcol, stencils, target, source)`.
+# `(tag, kind, factorcol, orientation, stencils, target, source)`, the
+# orientation that of a rotating seam (M12), 0 elsewhere.
 function serial_transfers(sched)
     out = Set{Any}()
     for st in sched.stages, g in st.locals
         sv = map(stencil_values, g.stencils)
         for t in 1:ntransfers(g)
-            push!(out, (st.tag, g.kind, g.factorcol, sv, Int(g.targetblocks[t]),
-                        Int(g.sourceblocks[t])))
+            push!(out, (st.tag, g.kind, g.factorcol, Int(g.orientation), sv,
+                        Int(g.targetblocks[t]), Int(g.sourceblocks[t])))
         end
     end
     return out
@@ -60,8 +61,9 @@ end
 # wrong on the way. Local groups are shifted to global indices; a sent
 # transfer is matched to its received half by `(tag, key, target,
 # source)`, and the pair is the serial transfer: the pack supplies the
-# kind, the source windows and the weights, the unpack the target box
-# and the parity column. `bad` counts every inconsistency between a
+# kind, the orientation, the source windows and the weights, the unpack
+# the target box and the factor column — the parity, and the sign of a
+# rotated transfer. `bad` counts every inconsistency between a
 # group and the layout entry of its slot.
 function distributed_transfers(scheds)
     locals = Any[]
@@ -75,7 +77,7 @@ function distributed_transfers(scheds)
             for g in st.locals
                 sv = map(stencil_values, g.stencils)
                 for t in 1:ntransfers(g)
-                    push!(locals, (st.tag, g.kind, g.factorcol, sv,
+                    push!(locals, (st.tag, g.kind, g.factorcol, Int(g.orientation), sv,
                                    Int(g.targetblocks[t]) + offset,
                                    Int(g.sourceblocks[t]) + offset))
                 end
@@ -93,12 +95,14 @@ function distributed_transfers(scheds)
                     bad += e.npoints != prod(boxsize(g))
                     key = (st.tag, e.key, e.target, e.source)
                     bad += haskey(sends, key)
-                    sends[key] = (g.kind, map(s -> (Vector(s.srcstart), Matrix(s.weights)),
-                                              g.stencils))
+                    sends[key] = (g.kind, Int(g.orientation),
+                                  map(s -> (Vector(s.srcstart), Matrix(s.weights)),
+                                      g.stencils))
                 end
             end
             for g in remote.unpacks
                 bad += !issorted(g.targetblocks)    # run by owner of the target
+                bad += g.orientation != 0           # an unpack is a plain copy
                 bad += count(s -> Vector(s.srcstart) != 1:ntarget(s) ||
                                   !all(isone, s.weights), g.stencils)
                 for t in 1:ntransfers(g)
@@ -120,12 +124,12 @@ function distributed_transfers(scheds)
         end
     end
     remote = Any[]
-    for (key, (kind, sw)) in sends
+    for (key, (kind, orientation, sw)) in sends
         haskey(recvs, key) || continue
         factorcol, firsts = recvs[key]
         tag, _, target, source = key
         sv = ntuple(d -> (firsts[d], sw[d]...), length(sw))
-        push!(remote, (tag, kind, factorcol, sv, target, source))
+        push!(remote, (tag, kind, factorcol, orientation, sv, target, source))
     end
     unmatched = length(symdiff(keys(sends), keys(recvs)))
     return locals, remote, unmatched, bad, length(sends)
@@ -346,7 +350,7 @@ end
                                        parity=[OddParity]), XOPS4)
         readers = [Set{Int}() for _ in 1:n]          # who reads each leaf
         for t in serial_transfers(sched)
-            push!(readers[t[6]], t[5])
+            push!(readers[t[7]], t[6])
         end
         @test isempty(remote_neighbors(serial, 1:n))  # serially, no search at all
         for P in (2, 3, 5), r in 0:(P - 1)
@@ -636,6 +640,7 @@ end
         box = Mailbox()
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                           reflecting=serial.reflecting, extents=serial.extents,
+                          rotating=TreeAMR.rotating_dims(serial),
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]
         sets = map(forests) do forest
@@ -700,6 +705,7 @@ end
     box = Mailbox()
     forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                       reflecting=serial.reflecting, extents=serial.extents,
+                      rotating=TreeAMR.rotating_dims(serial),
                       leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                for r in 0:(P - 1)]
     @test count(f -> isempty(blockrange(f)), forests) == 1
@@ -716,6 +722,315 @@ end
     @test all(r -> bitwise_equal(sets[r].work,
                                  sfs.work[ntuple(_ -> :, D + 1)...,
                                           blockrange(forests[r])]), 1:P)
+end
+
+# --- Rotating seams (M12) ---------------------------------------------------
+#
+# A rotated transfer whose source and target are on two ranks is packed
+# by the source's rank — the axis map and the variable permutation, the
+# unscaled sum — and unpacked by the target's, with the factor column
+# that holds the sign of the turn, as a mirrored one holds the parity.
+# The quadrant of `rotating_forest` (`ghost_oracles.jl`), refined to
+# three levels at the seam and the axis, split over 2, 3 and 5 ranks,
+# puts seam transfers of every kind on rank boundaries. The same claims
+# as above: the transfers, the layouts, one write per point, and the
+# values bit for bit — for a set that turns into itself and for a
+# `RotationPair`, whose stages are merged by (stage, member).
+
+# The layouts over a quadrant with `other` the third dimension: a scalar
+# and a vector, cell- and vertex-centered, which turn into themselves;
+# and the two face-centered members of a pair, `(B_{d1}, F_{d1})` and
+# `(F_{d2}, B_{d2})`, as in `rotating_pair_vs_quadrupled`. Each is
+# `(name, nvars, G, centering, parity, rotation)`.
+function rotating_exchange_layouts(D, other; p=4)
+    rotating = (1, 2)
+    z = outofplane(D, rotating)
+    swap(t) = (t[2], t[1], t[3:end]...)
+    parity(odd) = other === :reflect_lo ?
+                  [ntuple(d -> d != z ? NoParity : o ? OddParity : EvenParity, D)
+                   for o in odd] : nothing
+    vector = vector_rotation(D, rotating)
+    Ca = facecentered(D, 1)
+    return [("cell", D + 1, ghosts_for(cellcentered(D), p), cellcentered(D),
+             vector_parity(D, rotating, other), vector),
+            ("vertex", D + 1, ghosts_for(vertexcentered(D), p), vertexcentered(D),
+             vector_parity(D, rotating, other), vector),
+            ("a", 2, ghosts_for(Ca, p), Ca, parity((false, true)), [-2, -1]),
+            ("b", 2, swap(ghosts_for(Ca, p)), swap(Ca), parity((true, false)), [2, 1])]
+end
+
+rotating_set(forest, (_, nvars, G, C, parity, rotation), ::Type{T}=Float64) where {T} =
+    FieldSet{T}(forest, nvars; G=G, centering=C, parity=parity, rotation=rotation)
+
+# The quadrants: in 2D, and in 3D with the third dimension reflecting at
+# its low face — so that a transfer can be mirrored and turned at once —
+# or periodic.
+const ROTATING_OTHERS = Dict(2 => (:outer,), 3 => (:reflect_lo, :periodic))
+
+@testset "Across a rotating seam the ranks hold the serial transfers, laid out alike and written once: D=$D" for
+        D in (2, 3)
+    # A rotated transfer lost between ranks leaves a ghost unwritten; one
+    # whose orientation a rank derives differently from its peer reads
+    # its source through the wrong turn; one filed under another stage
+    # runs before what it reads. So over 2, 3 and 5 ranks, for every
+    # layout a quadrant takes, the transfers of all ranks together —
+    # local, and sent matched with received — are the serial ones with
+    # their orientations and factor columns, both ends of every message
+    # derive one layout, and every point is written once per stage, as
+    # serially. A rotated pack is unscaled; its unpack is a plain copy.
+    nrotated = 0
+    N = D == 3 ? 4 : 8
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    for other in ROTATING_OTHERS[D], layout in rotating_exchange_layouts(D, other; p=p)
+        serial = rotating_forest(Val(D); rotating=(1, 2), other=other, N=N)
+        sched = GhostSchedule(rotating_set(serial, layout), ops)
+        stransfers = serial_transfers(sched)
+        @test any(t -> t[4] != 0, stransfers)
+        _, _, G, C, _, _ = layout
+        stored = ntuple(d -> N + 2G[d] + (C[d] === :vertex), D)
+        scounts = stage_write_counts([sched], stored, nleaves(serial))
+        for P in (2, 3, 5)
+            scheds = [GhostSchedule(rotating_set(rank_forest(serial, r, P), layout), ops)
+                      for r in 0:(P - 1)]
+            locals, remote, unmatched, bad, nsent = distributed_transfers(scheds)
+            @test bad == 0
+            @test unmatched == 0
+            @test length(locals) + length(remote) == length(stransfers)
+            @test Set(locals) ∪ Set(remote) == stransfers
+            nrotated += count(t -> t[4] != 0, remote)
+            @test layout_mismatches(scheds)[1] == 0
+            counts = stage_write_counts(scheds, stored, nleaves(serial))
+            @test counts == scounts
+            @test all(c -> maximum(c) <= 1, values(counts))
+        end
+    end
+    @test nrotated > 0
+end
+
+# Random data over every stored value, ghosts included, with the
+# variable `zero` identically zero: a component whose turned image is
+# negated, so that the serial fill writes `−0` across the seam.
+function rotating_exchange_data(rng, ::Type{T}, dims, zero) where {T}
+    data = T.(rand(rng, dims...) .- 0.5)
+    data[ntuple(_ -> :, length(dims) - 2)..., zero, :] .= T(0)
+    return data
+end
+
+# The pair's stages in lockstep, merged as `fill_ghosts!(pair, …)` merges
+# them: per tag, `a`'s stage on every rank — pack, deliver, local groups
+# and unpack — then `b`'s, the hooks of both after phase 1. Each member
+# packs from its partner for an odd turn and reads its own pair tables.
+function lockstep_pair!(pairs, schedsa, schedsb, backend; hooks)
+    P = length(pairs)
+    member(r, m) = m == 1 ?
+                   (pairs[r].a, pairs[r].b, pairs[r].afactors, pairs[r].arotvars, schedsa[r]) :
+                   (pairs[r].b, pairs[r].a, pairs[r].bfactors, pairs[r].brotvars, schedsb[r])
+    stageat(sched, tag) = (i = findfirst(st -> st.tag == tag, sched.stages);
+                           i === nothing ? nothing : sched.stages[i])
+    tags = sort!(unique!([st.tag for s in [schedsa; schedsb] for st in s.stages]))
+    bad = 0
+    for (k, tag) in enumerate(tags), m in 1:2
+        for r in 1:P
+            fs, alt, _, rotvars, sched = member(r, m)
+            st = stageat(sched, tag)
+            (st === nothing || st.remote === nothing) && continue
+            pack_stage!(fs.work, st.remote, stagebuffers(st.remote, fs.nvars, backend),
+                        fs.nvars, backend; altsrc=alt.work, rotvars=rotvars)
+        end
+        for r in 1:P
+            fs, _, _, _, sched = member(r, m)
+            st = stageat(sched, tag)
+            (st === nothing || st.remote === nothing) && continue
+            nv = fs.nvars
+            sendbuf = stagebuffers(st.remote, nv, backend)[1]
+            for (peer, range) in zip(st.remote.sendpeers,
+                                     segment_ranges(st.remote.sendcounts, nv))
+                other = stageat(member(peer + 1, m)[5], tag).remote
+                i = findfirst(==(r - 1), other.recvpeers)
+                into = segment_ranges(other.recvcounts, nv)[i]
+                bad += length(into) != length(range)
+                copyto!(view(stagebuffers(other, nv, backend)[2], into),
+                        view(sendbuf, range))
+            end
+        end
+        for r in 1:P
+            fs, alt, factors, rotvars, sched = member(r, m)
+            st = stageat(sched, tag)
+            st === nothing && continue
+            run_phase!(fs.work, fs.work, st.locals, fs.nvars, backend; factors=factors,
+                       altsrc=alt.work, rotvars=rotvars)
+            st.remote === nothing ||
+                unpack_stage!(fs.work, st.remote,
+                              stagebuffers(st.remote, fs.nvars, backend), fs.nvars,
+                              factors, backend)
+            synchronize(backend)
+        end
+        if k == 1 && m == 2
+            for r in 1:P
+                apply_boundary!(pairs[r].a, hooks[1], schedsa[r], backend)
+                apply_boundary!(pairs[r].b, hooks[2], schedsb[r], backend)
+            end
+        end
+    end
+    return bad
+end
+
+# Received rotated transfers, over the schedules of every rank: those
+# whose pack turned them.
+nrotated_remote(scheds) =
+    sum(scheds) do sched
+        sum(st -> st.remote === nothing ? 0 :
+                  sum(g -> g.orientation == 0 ? 0 : ntransfers(g), st.remote.packs; init=0),
+            sched.stages; init=0)
+    end
+
+@testset "Packing and unpacking across a rotating seam reproduces the serial fill bitwise: D=$D" for
+        D in (2, 3)
+    # The values. A pack that applied the turn's sign would turn the
+    # serial fill's `−0` — a component that is zero, negated by the turn
+    # — into `+0`; one that read the wrong member of a pair, or turned
+    # the wrong way, a whole region. So every rank's working array,
+    # ghosts included, must equal the serial fill on its blocks bit for
+    # bit, the hook between the stages included, for a set that turns into
+    # itself (its `v_{d2}` zero) and for a pair (the second variable of
+    # each member zero), with `−0` present and rotated transfers received
+    # across rank boundaries.
+    N = D == 3 ? 4 : 8
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    hook = exchange_hook()
+    colons = ntuple(_ -> :, D + 1)
+    nnegzero = npairzero = nrot = 0
+    for other in ROTATING_OTHERS[D]
+        serial = rotating_forest(Val(D); rotating=(1, 2), other=other, N=N)
+        layouts = rotating_exchange_layouts(D, other; p=p)
+        for layout in layouts[1:2]
+            sfs = rotating_set(serial, layout)
+            data = rotating_exchange_data(MersenneTwister(21), Float64, size(sfs.work), 3)
+            copyto!(sfs.work, data)
+            fill_ghosts!(sfs, GhostSchedule(sfs, ops); boundary=hook)
+            reference = Array(sfs.work)
+            nnegzero += count(x -> iszero(x) && signbit(x), reference)
+            for P in (2, 3, 5)
+                sets = map(0:(P - 1)) do r
+                    fs = rotating_set(rank_forest(serial, r, P), layout)
+                    copyto!(fs.work, data[colons..., blockrange(fs.forest)])
+                    fs
+                end
+                scheds = [GhostSchedule(fs, ops) for fs in sets]
+                bad = lockstep!(sets, scheds, CPU();
+                                between=r -> apply_boundary!(sets[r], hook, scheds[r],
+                                                             CPU()))
+                @test bad == 0
+                @test all(r -> bitwise_equal(sets[r].work,
+                                             reference[colons...,
+                                                       blockrange(sets[r].forest)]), 1:P)
+                nrot += nrotated_remote(scheds)
+            end
+        end
+        # The pair, each member's second variable zero.
+        la, lb = layouts[3], layouts[4]
+        sa, sb = rotating_set(serial, la), rotating_set(serial, lb)
+        rng = MersenneTwister(22)
+        da = rotating_exchange_data(rng, Float64, size(sa.work), 2)
+        db = rotating_exchange_data(rng, Float64, size(sb.work), 2)
+        copyto!(sa.work, da)
+        copyto!(sb.work, db)
+        fill_ghosts!(RotationPair(sa, sb), (GhostSchedule(sa, ops), GhostSchedule(sb, ops));
+                     boundary=hook)
+        npairzero += count(x -> iszero(x) && signbit(x), sa.work) +
+                     count(x -> iszero(x) && signbit(x), sb.work)
+        for P in (2, 3, 5)
+            pairs = map(0:(P - 1)) do r
+                forest = rank_forest(serial, r, P)
+                a, b = rotating_set(forest, la), rotating_set(forest, lb)
+                copyto!(a.work, da[colons..., blockrange(forest)])
+                copyto!(b.work, db[colons..., blockrange(forest)])
+                RotationPair(a, b)
+            end
+            schedsa = [GhostSchedule(q.a, ops) for q in pairs]
+            schedsb = [GhostSchedule(q.b, ops) for q in pairs]
+            @test lockstep_pair!(pairs, schedsa, schedsb, CPU(); hooks=(hook, hook)) == 0
+            @test all(1:P) do r
+                range = blockrange(pairs[r].a.forest)
+                bitwise_equal(pairs[r].a.work, sa.work[colons..., range]) &&
+                    bitwise_equal(pairs[r].b.work, sb.work[colons..., range])
+            end
+            nrot += nrotated_remote(schedsa) + nrotated_remote(schedsb)
+        end
+    end
+    @test nnegzero > 0
+    @test npairzero > 0
+    @test nrot > 0
+end
+
+@testset "The staged driver over a communicator fills across a rotating seam: D=$D" for
+        D in (2, 3)
+    # The composition through the communicator verbs, every rank its own
+    # task: the single fill of a set that turns into itself, and the
+    # pair's fill, whose two members share each stage's tag — the
+    # mailbox, like MPI, delivers the messages between two ranks with one
+    # tag in the order they were sent, which is the order of the merged
+    # stages on both ends. Bit for bit the serial fills.
+    N = D == 3 ? 4 : 8
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    other = D == 3 ? :reflect_lo : :outer
+    serial = rotating_forest(Val(D); rotating=(1, 2), other=other, N=N)
+    layouts = rotating_exchange_layouts(D, other; p=p)
+    hook = exchange_hook()
+    colons = ntuple(_ -> :, D + 1)
+    sfs = rotating_set(serial, layouts[1])
+    data = rotating_exchange_data(MersenneTwister(23), Float64, size(sfs.work), 3)
+    copyto!(sfs.work, data)
+    fill_ghosts!(sfs, GhostSchedule(sfs, ops); boundary=hook)
+    sa, sb = rotating_set(serial, layouts[3]), rotating_set(serial, layouts[4])
+    da = rotating_exchange_data(MersenneTwister(24), Float64, size(sa.work), 2)
+    db = rotating_exchange_data(MersenneTwister(25), Float64, size(sb.work), 2)
+    copyto!(sa.work, da)
+    copyto!(sb.work, db)
+    fill_ghosts!(RotationPair(sa, sb), (GhostSchedule(sa, ops), GhostSchedule(sb, ops));
+                 boundary=hook)
+    for P in (3, 5)
+        box = Mailbox()
+        forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                          reflecting=serial.reflecting, extents=serial.extents,
+                          rotating=TreeAMR.rotating_dims(serial),
+                          leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
+                   for r in 0:(P - 1)]
+        sets = map(forests) do forest
+            fs = rotating_set(forest, layouts[1])
+            copyto!(fs.work, data[colons..., blockrange(forest)])
+            fs
+        end
+        scheds = [GhostSchedule(fs, ops) for fs in sets]
+        @sync for r in 1:P
+            @async fill_ghosts!(sets[r], scheds[r]; boundary=hook)
+        end
+        @test box.nmessages > 0
+        @test all(isempty ∘ last, box.channels)
+        @test all(r -> bitwise_equal(sets[r].work,
+                                     sfs.work[colons..., blockrange(forests[r])]), 1:P)
+        pairs = map(forests) do forest
+            a, b = rotating_set(forest, layouts[3]), rotating_set(forest, layouts[4])
+            copyto!(a.work, da[colons..., blockrange(forest)])
+            copyto!(b.work, db[colons..., blockrange(forest)])
+            RotationPair(a, b)
+        end
+        pscheds = [(GhostSchedule(q.a, ops), GhostSchedule(q.b, ops)) for q in pairs]
+        before = box.nmessages
+        @sync for r in 1:P
+            @async fill_ghosts!(pairs[r], pscheds[r]; boundary=(hook, hook))
+        end
+        @test box.nmessages > before
+        @test all(isempty ∘ last, box.channels)
+        @test all(1:P) do r
+            range = blockrange(forests[r])
+            bitwise_equal(pairs[r].a.work, sa.work[colons..., range]) &&
+                bitwise_equal(pairs[r].b.work, sb.work[colons..., range])
+        end
+    end
 end
 
 @testset "A serial schedule's stages are its phases, and send nothing" begin

@@ -461,13 +461,102 @@ declared up front:
   So reflection runs on every backend, in the same kernel and the same
   phases as every other transfer, and the boundary hook never sees a
   reflecting face.
-- **Physical** (per face, neither periodic nor reflecting): ghost cells
-  are filled by a user-supplied boundary condition hook. For a
-  vertex-like dimension the domain's upper boundary plane is the first
-  plane of an outward-facing region and is filled by the hook too (M8;
-  see [Centerings](#centerings)). Until M10 the hook was also the only
-  way to express a reflection, which it could not do correctly at every
-  edge and corner; see [Ghost filling](#ghost-filling).
+- **Rotating** (a pair of dimensions; M12, designed 2026-10-03 before
+  implementation): a quarter-plane symmetry. Only one quadrant of the
+  `(d1, d2)` plane is simulated, and the other three are its images
+  under rotations by 90° about the line where the low faces of `d1` and
+  `d2` meet. The models are Cactus's RotatingSymmetry90 and a spinning
+  black hole, for which a reflection in `x` or in `y` is not a
+  symmetry; together with M10's reflection at the low face of a third
+  dimension it gives an octant. It is declared on the forest as
+  `rotating = (d1, d2)`, default `nothing`. The rotation `R` takes
+  `e_{d1}` to `e_{d2}` and `e_{d2}` to `−e_{d1}`, a quarter turn
+  counterclockwise in the `(d1, d2)` plane, and leaves every other
+  dimension alone; its axis is the line where the two low faces meet,
+  at the domain's low corner in the plane. The order of the pair fixes
+  the sense of `R`, and with it the meaning of the variable map below.
+  The forest refuses, each time saying why:
+
+  - `D < 2`;
+  - `d1 == d2`, or either dimension out of range;
+  - `roots[d1] ≠ roots[d2]`, since the low face of `d1` must map onto
+    the low face of `d2` (once the root counts agree, the cube check
+    makes the extents' lengths agree);
+  - `d1` or `d2` periodic;
+  - a reflecting face on either side of `d1` or `d2`. The two low faces
+    are the seam, and the two high faces stay outer, the hook's;
+    reflecting high walls together with the rotation are an open
+    question (see [Open questions](#open-questions)).
+
+  Every field set over such a forest declares its **rotation**, a
+  signed variable map with one entry per variable, required with no
+  default, since it is physics (decided, as `parity` is). Variable `v`
+  at `Rp` equals `sign(rotation[v])` times variable `|rotation[v]|` at
+  `p`, of the set it rotates from: the set itself when its layout is
+  symmetric under exchanging `d1` and `d2`, its partner otherwise (see
+  "Rotating seams" under [Ghost filling](#ghost-filling)). For
+  `(ρ, vx, vy, vz)` with `rotating = (1, 2)` it is
+  `rotation = (1, −3, 2, 4)`: `ρ` and `vz` are unchanged, and the
+  rotated velocity has `vx′ = −vy` and `vy′ = vx`. A 90° rotation maps
+  every Cartesian tensor component, of any rank, to plus or minus
+  another component, so a signed map is enough for any variable an
+  application stores in Cartesian components. The field set refuses,
+  saying why:
+
+  - a map that is not a signed permutation;
+  - a map of the wrong length;
+  - for a set that rotates into itself, a map `Q` with `Q⁴ ≠ I`, since
+    four quarter turns are the identity;
+  - a map that sends a variable to one of another parity in a
+    reflecting dimension. The rotation and a reflection outside its
+    plane commute, so the two declarations must agree.
+
+  *(Step 2, 2026-10-03.)* The fourth-power and parity checks need the
+  set the map reads from, so the field set makes them for a symmetric
+  layout and `RotationPair` makes them, as `Q_a Q_b Q_a Q_b = I` and the
+  parities across the pair, for an asymmetric one; a lone asymmetric
+  set is checked for its shape only. Over a forest without a seam the
+  map may be omitted, and if given is checked for its shape, kept and
+  otherwise ignored, as `parity` is over a forest without reflecting
+  faces, so `factors` and `rotvars` are `nothing` there exactly as
+  before. A `RotationPair` of two symmetric sets is refused: each turns
+  into itself.
+
+  Unlike reflection, **the tree sees the seam.** The low face of `d1`
+  is glued to the low face of `d2`, and across it neighbor finding
+  returns the real leaves, each with an **orientation**, the number of
+  quarter turns that carry it to where the asking block sees it.
+  `balance!` and `isbalanced` see the seam through the neighbor search,
+  as they see a periodic wrap, and a block at the axis is its own
+  neighbor in three directions of the plane, as a single periodic root
+  is its own neighbor.
+  Balance gains one rule, **conformity at the seam** (decided
+  2026-10-03 with Erik): a leaf on the low face of `d1` and its image
+  on the low face of `d2` are at the same level, so no coarse-fine face
+  crosses the seam. Why, and what it leaves, is under "Rotating seams"
+  in [Ghost filling](#ghost-filling). A leaf list handed to
+  `Forest(roots; …, leaves)` that is not conforming is refused there,
+  as an unbalanced one is.
+
+  The forest gains a field for it, `rotating`, with `(0, 0)` for none.
+  A ninth field once made the schedule build allocate more (see "The
+  buffer pool" under [Distributed meshes](#distributed-meshes)), so
+  `bench/ghosts.jl`'s allocation is measured before and after, and if
+  the field costs again `reflecting` and `rotating` are folded into one
+  immutable field instead. M12's step 1 records which. *(Step 1,
+  2026-10-03: neither. What costs is the struct's size, not its field
+  count. An `NTuple{2,Int}` added 160 and 4896 bytes to the two schedule
+  builds; an `NTuple{2,Int8}` fits in the alignment padding before
+  `extents`, so `sizeof(Forest)` and the allocation are unchanged, and
+  it is what the forest holds. The numbers are under step 1 in the
+  M12 entry.)*
+- **Physical** (per face, neither periodic, reflecting nor a rotating
+  seam): ghost cells are filled by a user-supplied boundary condition
+  hook. For a vertex-like dimension the domain's upper boundary plane
+  is the first plane of an outward-facing region and is filled by the
+  hook too (M8; see [Centerings](#centerings)). Until M10 the hook was
+  also the only way to express a reflection, which it could not do
+  correctly at every edge and corner; see [Ghost filling](#ghost-filling).
 
 ### Data layout
 
@@ -701,16 +790,300 @@ wall point forced to zero. It stays zero if the right-hand side respects
 the parity, as a centered stencil does, since the mirrored ghosts give
 `u(−h) = −u(h)` exactly.
 
+**Rotating seams** (M12; designed 2026-10-03, before implementation).
+A rotating seam (see [Domain and boundaries](#domain-and-boundaries))
+is harder than a reflecting face in two ways. It is **non-local**: the
+low face of `d1` is glued to the low face of `d2`, so the source of a
+ghost lies elsewhere in the tree and can be at another level. And it
+**mixes variables**: `vx′ = −vy` and `vy′ = vx`. The transfer kernel as
+M10 left it can express neither. Its stencils are separable — the
+source index along `d` depends on the target index along `d` alone —
+so it cannot exchange axes, and it reads target variable `v` from
+source variable `v`. The design keeps the stencils, the phases and the
+kernel's arithmetic, and changes only where the kernel loads from.
+
+*Orientation.* A ghost region of a block lies in the image `R^r` of
+real data, `r ∈ {0, 1, 2, 3}`: `r = 1` when it lies beyond the low face
+of `d1` only, `r = 3` beyond the low face of `d2` only, `r = 2` beyond
+both, and `r = 0` otherwise. Since `u(R^r q) = Q^r u(q)`, with `Q` the
+field set's rotation map, the ghost at `p` is `Q^r` applied to the data
+at `R^{−r} p`. In global level coordinates `g` — a node's integer
+position at its level, counted across the brick, with the axis at 0 —
+the naive neighbor that the brick arithmetic gives maps back to a real
+node as follows, every other coordinate unchanged:
+
+| `r` | the naive neighbor `(g_{d1}, g_{d2})` | the real node |
+|---|---|---|
+| 1 | `g_{d1} < 0 ≤ g_{d2}` | `(g_{d2}, −1 − g_{d1})` |
+| 3 | `g_{d2} < 0 ≤ g_{d1}` | `(−1 − g_{d2}, g_{d1})` |
+| 2 | both negative | `(−1 − g_{d1}, −1 − g_{d2})` |
+
+A real node beyond a high face leaves the domain, and the region is the
+hook's, as for M10's `δ′`: the hook sees outer faces only, never the
+seam. All the neighbors of one block in one direction share one `r`,
+since the seam lies on a root boundary at every level, so the
+orientation belongs to a (block, direction) pair and the neighbor
+search returns it with the keys. In the real frame the search runs in
+the rotated direction `R^{−r} δ`, and a finer neighbor's child offset,
+which a restriction's stencils depend on, is taken back into the
+virtual frame by the same permutation and flip as the coordinates.
+*(Made exact in step 1, 2026-10-03.)* With `(a, b)` the components
+along `(d1, d2)`, the direction from the real leaves (`real_direction`)
+and the virtual child offset of a real offset `o` (`virtual_offset`)
+are
+
+| `r` | `R^{−r} δ` | virtual offset |
+|---|---|---|
+| 1 | `(δ_b, −δ_a)` | `(1 − o_b, o_a)` |
+| 2 | `(−δ_a, −δ_b)` | `(1 − o_a, 1 − o_b)` |
+| 3 | `(−δ_b, δ_a)` | `(o_b, 1 − o_a)` |
+
+The offset follows because the parent of a node maps to the parent of
+its image (`−1 − g` halves to `−1 − ⌊g/2⌋`), so a child turns about its
+parent's centre. The test derives both from turned `Rational` boxes,
+not from these formulas. Where the step finds no leaf, the search
+still returns the orientation of the region it stepped into, the one
+the hook's region lies in.
+
+*The virtual frame.* A transfer's stencils are built exactly as though
+the source sat at its **virtual position**, where the asking block sees
+it across the seam, with the target's layout. A same-level source is
+then a copy, a coarser one a prolongation and finer ones a restriction,
+with the ordinary one-dimensional stencils for that kind, direction
+and child offset, so the stencil builders do not change. What is left
+is to read the virtual source's points out of the real array.
+
+*The axis map.* The kernel turns a source point's virtual stored index
+`k` into the real stored index with an `AxisMap`, a permutation of the
+dimensions and a flip per dimension, applied in the source load. Along
+a flipped dimension `k ↦ n_d + 1 − k`, with `n_d` the source array's
+stored size along `d`. One formula serves cell and vertex centering
+alike, because the flip reverses the stored array, ghosts onto ghosts
+and the closed range onto itself. In the plane:
+
+| `r` | real index along `d1` | real index along `d2` |
+|---|---|---|
+| 1 | `k[d2]` | `n + 1 − k[d1]` |
+| 2 | `n + 1 − k[d1]` | `n + 1 − k[d2]` |
+| 3 | `n + 1 − k[d2]` | `k[d1]` |
+
+and the identity elsewhere. The flipped dimensions are always the real
+source's dimensions normal to the seam. The variable map is applied in
+the same load: for target variable `v` the kernel reads source variable
+`σ_r(v)`, from a table `rotvars` on the field set, `nvars × 4`, of the
+composed map per orientation, which lives beside the parity factors
+and moves to the device with them.
+
+*Why no fix-up pass.* Erik asked whether the seam ghosts should be
+filled as ordinary copies and then mixed by a second pass. That is not
+needed. A 90° rotation of any Cartesian tensor component is a **signed
+permutation** of components, so `Q^r` splits into two halves, each of
+which goes where M10 already put something:
+
+- the **permutation** is a variable remap on the source load, beside
+  the axis map;
+- the **sign** is a column of the factor table on the target, where M10
+  puts the parity. The table gains the orientation as a second axis,
+  column `mirror column + 3^D·r`, so `r = 0` keeps every existing
+  column, and a seam transfer that is also mirrored (a reflecting low
+  face in `z` with the rotation in `xy`) multiplies one factor, the
+  parity times the rotation's sign.
+
+So a rotated transfer is part of one replay of the schedule, in the
+ordinary phases, on every backend; no ghost is written twice, and none
+is read in a provisional state. A fix-up pass would have had to run
+inside the phases, not after them, since a prolongation may read a
+coarse source's rotated ghosts. The kernel reaches a rotated source
+through an accessor, as it reaches M7's packed buffers, and an ordinary
+group launches it unchanged. Under MPI the pack applies the axis map
+and the permutation and computes the unscaled sum, and the unpack
+applies the sign through the factor column, as it applies the parity,
+so the serial fill's `−0` is kept bit for bit (see "The parity factor
+is applied when unpacking" under
+[Distributed meshes](#distributed-meshes)).
+
+*Conformity* (decided 2026-10-03 with Erik). Leaves across a seam face
+are at the same level: `balance!` refines a leaf across a seam face
+that is coarser by any amount, not only by two levels or more, and the
+checked `leaves` path and `isbalanced` enforce the same rule. A family
+on one seam face is coarsened only together with its image, since
+completion undoes any other coarsening there, as it undoes every
+coarsening balance cannot support. Two things follow:
+
+- No coarse-fine face crosses the seam, so the interface restriction
+  never does (see [Conservation](#conservation-at-coarse-fine-faces)).
+  Otherwise it would have to overwrite a block's owned seam plane from
+  the rotated image of a finer neighbor's, a transfer with no other
+  use.
+- The two owned seam planes of a vertex-like set (below) are evolved at
+  one resolution, from same-level ghosts that are each other's images,
+  so the objection M8 raised against two copies of a point — at a
+  coarse-fine face their ghosts differ and they drift apart — does not
+  arise.
+
+The cost is that refinement at one seam face refines its image at the
+other, which a problem with this symmetry wants anyway: a feature at
+the seam is at both faces. Edge and corner regions across the seam,
+such as a block on the low face of `d1` asking in direction `(−1, +1)`
+in the plane, are not covered by the rule, and can still meet a
+difference of one level. They are prolongations and restrictions
+through the rotation, which the virtual frame builds like any other.
+A single regrid still moves a block by at most one level. Before it the
+forest is conforming, so a leaf and its image are at one level; the
+marks move each of them by at most one; and the seam rule raises a
+leaf only to its image's new level, at most one above its own old one.
+The transfer asserts this, as it does today, and a test exercises it.
+
+*Phase 1 stays race free.* A rotated copy or restriction reads only the
+real source's **owned** points, as an ordinary one does. The flipped
+dimension is the real source's dimension normal to the seam, and the
+target reads the virtual source's points nearest itself, which are the
+real source's points nearest the seam: its low owned points. In a
+vertex-like set the virtual source's high shared plane, flipped, is the
+real source's owned seam plane. It lies where the target's own owned
+seam plane lies, which is not a ghost, so no copy targets that position
+and none reads the plane. The tangential dimension is not flipped and is
+read as an ordinary transfer reads it. That was checked by hand in the
+design, and the `NaN` test checks it again. Phase 2 needs no new rule: a
+rotated prolongation targets the block's own level and joins the sweep
+there. The ghosts it reads in its coarse source are the virtual
+source's, which the flip maps to the real source's ghosts — the virtual
+high ghosts facing the target are the real low ghosts beyond the seam —
+and these are filled in phase 1 or in an earlier step of the sweep, as
+for any prolongation.
+
+*Two owned seam planes* (decided). In a vertex-like set the low plane
+of `d1` and the low plane of `d2` are both owned, as every low boundary
+plane is under M8's half-open ownership, and both are evolved, although
+they are the same points under `R`. The alternative, deriving one from
+the other as M10 derives the upper wall point, would have the blocks on
+one seam face own `N − 1` points across it, and the uniform state
+layout would be gone; that is the reason M8 gave for accepting
+asymmetric walls. Under conformity the two copies see same-level
+ghosts that are each other's images, so a covariant right-hand side
+evolves them identically: to roundoff in general, and bit for bit when
+its arithmetic is itself invariant under the rotation. IEEE addition
+commutes, so `a + b` against `b + a` is exact, but a longer sum taken
+in another order is not. The wave test asserts what it measures. The
+axis, a point in 2D and a line along the third dimension in 3D, is
+its own image and is owned once, by the blocks along it. A sum
+over owned points, such as `volume_weighted_norm`, holds the seam's
+points once per face, so it is not exactly a quarter of the full
+domain's. A vertex-like set carries no conserved total (the
+conservative family is refused along a stagger), so this is recorded
+rather than corrected. The choice is about ownership only and assumes
+nothing about aligned axes.
+
+*Asymmetric layouts, and pairs* (in scope now, decided 2026-10-03 with
+Erik). The virtual frame needs the rotated source to have the target's
+layout. A set whose layout is symmetric under exchanging `d1` and `d2`
+— `G[d1] == G[d2]` and `c[d1] == c[d2]`, which holds for cell- and
+vertex-centered sets and for any set staggered alike along `d1` and
+`d2`, such as the `z`-face and the `z`-edge, at equal ghost widths
+there — rotates into itself. One that is not has its rotated image
+in the set with the swapped layout: `B_x`, face-centered in `x`, takes
+the value `−B_y` across the low face of `x`. Two cases:
+
+- **`G = 0` in both plane dimensions**, as for TreeHydro's and Burgers'
+  fluxes: the set has no seam ghost region at all. None of its
+  exchange regions has a negative component in the plane — along its
+  stagger the one region is the shared plane at a block's high face —
+  so none crosses the seam, and it fills alone, as today. *(Amended in
+  step 3, 2026-10-03: "fills alone" is vacuous. An asymmetric layout
+  with `G = 0` along both plane dimensions is cell-centered along one
+  of them, and `check_operators` refuses `G = 0` along a cell-centered
+  dimension for every point-value order and the conservative family
+  along a vertex-like one, so no ghost schedule serves such a set: it
+  is never ghost-filled, and is regridded as `fs => nothing`, as the
+  fluxes are today. The field set takes it without a partner.)*
+- **Otherwise**, as for `B_x` and `B_y` of constrained transport with
+  `G > 0` in the plane: the two sets are filled as a
+  **`RotationPair(a, b)`**, each from the other across the seam. An
+  orientation of 1 or 3 reads the partner's working array, and 2 reads
+  the set's own, since two quarter turns map a layout onto itself.
+  `RotationPair` is a new exported immutable value: two field sets over
+  one forest with each other's swapped layout, the same `nvars`,
+  element type and backend, and maps with `Q_a Q_b Q_a Q_b = I`; it
+  refuses anything else, with the reason. It builds the composed tables
+  — for `a`'s targets `Q_a`, `Q_a Q_b` and `Q_a Q_b Q_a` for
+  `r = 1, 2, 3`, the first and last reading `b` — and symmetrically for
+  `b`. `regrid!` swaps `work` in place, so a pair stays valid across
+  regrids. Each set keeps its own schedule and operators; a transfer's
+  stencils are its target's.
+
+  `fill_ghosts!(pair, (sa, sb); boundary)`, with one hook for both sets
+  or one each, runs the two schedules' stages merged by (stage,
+  member): phase 1 for `a` and then `b`, then the hooks, then each
+  phase-2 target level for `a` and then `b`. A prolongation may read
+  its partner's coarser ghosts, which an earlier step of the merged
+  sweep has filled. Under MPI each stage completes before the next
+  starts, so the two members can share a stage's tag, MPI's
+  non-overtaking order keeping their messages apart; an offset per
+  member on the tag is the alternative if it turns out cleaner.
+  *(Confirmed in step 7, 2026-10-03, and made precise: what a stage
+  completes before the next is its receives — its sends are waited on
+  at the end of the fill, as in every fill since M7 — and that is
+  enough. A stage sends at most one message to each peer, and every
+  rank runs the merged stages in one order, so between two ranks `a`'s
+  message of a tag is sent before `b`'s, and `a`'s receive of it is
+  posted, and completed, before `b`'s is posted; MPI matches two
+  messages of one tag between one pair of ranks in the order they were
+  sent, so `a`'s receive takes `a`'s message. No ordering hazard was
+  found, and the members keep the shared tag; the regrid's transfers of
+  the two members share tag 50 for the same reason, as several field
+  sets' have since M7.)* A
+  plain `fill_ghosts!` on an asymmetric set whose schedule has odd
+  orientations refuses, saying to fill it as a `RotationPair`.
+  *(Amended in step 3, 2026-10-03: the schedule records nothing for
+  it. The fill decides from the layout, `G[d1] > 0 || G[d2] > 0`,
+  which holds exactly when the serial schedule has transfers of odd
+  orientation — every block on a seam face then has a nonempty region
+  beyond it — and is the same on every rank, where a schedule's own
+  groups are not: a rank whose blocks are off the seam has none, and a
+  refusal on some ranks only would leave the others waiting in the
+  exchange.)*
+  `regrid!` and `adapt_to_initial_data!` take `pair => (sa, sb)` and
+  fill the pair before the transfers; the transfers themselves are
+  `δ = 0` and never cross the seam.
+  *(Amended in step 4, 2026-10-03: `regrid!` takes the element
+  `pair => (sa, sb)` beside `fs => schedule` and `fs => nothing`, fills
+  the pair once before either set moves, and moves each set with its
+  own schedule's operators. A plain `fs => schedule` of an asymmetric
+  set with ghosts in the plane is refused there, among the collective
+  checks, with the pair named, since its fill would be refused further
+  down on every rank alike; `fs => nothing` fills nothing and is
+  allowed. `adapt_to_initial_data!` builds its schedules itself, so it
+  takes no `pair => …` element: it has a pair form,
+  `adapt_to_initial_data!(pair, operators; initial, flag | flags, …)`,
+  with `initial` and `boundary` one for both sets or a tuple of two,
+  `flags` called with the pair, and the two schedules returned. It
+  fills ghosts before it flags, for a criterion that reads them, which
+  is why it needs the pair at all.)*
+
+*90° only* (decided 2026-10-03 with Erik). A 180° rotation, the
+π-symmetry, needs the same machinery and one thing more, a face glued
+to itself and flipped about the domain's centre line; it is an open
+question (see [Open questions](#open-questions)).
+
 Edge and corner ghost regions are always filled — some stencils don't
 need them, but filling unconditionally is simpler, and cross-derivative
 stencils do. Application kernels are strictly block-local: neighbor data
 is visible only through ghost cells.
 
 Transfers are **batched by stencil**: everything sharing a kind, a
-direction, a child offset and (M10) a mirror state per dimension — none,
-mirrored rows, or the vertex-like upper wall row — shares one set of
-one-dimensional stencils and so one kernel launch. Prolongations are additionally batched by
-*target level* (amended in M5): the batch is the unit the phase-2 sweep
+direction, a child offset, (M10) a mirror state per dimension — none,
+mirrored rows, or the vertex-like upper wall row — and (M12) an
+orientation shares one set of one-dimensional stencils and so one
+kernel launch. The orientation joins `keyorder` as well, so both ends
+of an MPI message still derive one layout, and a group carries its
+axis map, the identity for an ordinary group. *(Amended in step 3,
+2026-10-03: a group carries its orientation and the seam's plane
+`(d1, d2)`, two `Int8`s and a pair of them, and `run_group!` derives the
+axis map at the launch; `factorcol` became an `Int32`, so the three
+share the eight bytes it had alone and a group is no larger than
+before.)* Prolongations are
+additionally batched by *target level* (amended in M5): the batch is
+the unit the phase-2 sweep
 schedules, so a batch spanning two levels would be filed under one of
 them and the coarsest-target-first order would be quietly lost wherever
 three levels meet. The original keying did span levels; it was found
@@ -1145,6 +1518,44 @@ Hence the domain integral of every conserved variable changes only by
 roundoff per RHS evaluation, in any Runge–Kutta stage. No flux registers,
 no time accumulation: that is what the global `dt` bought.
 
+**Across a rotating seam** (M12 design, 2026-10-03). Nothing crosses it
+here. Conformity at the seam (see "Rotating seams" under
+[Ghost filling](#ghost-filling)) makes every seam face a same-level
+face, so the interface schedule records no transfer across it; it is
+built from the oriented neighbor search, and asserts that no
+restriction with a nonzero orientation was recorded. Edge directions
+are absent from it by design (above), so the seam's level differences
+at edges and corners never reach it. What remains is the same-level
+argument with the rotation in it. The block on the low face of `d1`
+computes the flux through that face from its cells and its rotated
+ghosts, and its image on the low face of `d2` computes the flux
+through its face from the same numbers; the two are each other's
+image, `F_{d1}(0, s) = −F_{d2}(s, 0)` in the plane, so the mass that
+leaves through one face enters through the other. The application's
+obligation therefore gains one clause: its flux must be covariant
+under the rotation, which a flux written in Cartesian components is.
+The flux sets themselves, with `G = 0`, have no seam ghosts and fill
+alone. The rigid-rotation advection test of M12 puts a number on it.
+*(Step 4, 2026-10-03: the interface schedule searches with
+`oriented_neighbors`, and a finer neighbor with a nonzero orientation
+is an `error` — a bug, since only a forest that bypassed the checked
+paths can have one; the test makes one with `refine!` and no
+`balance!`. Over a balanced rotating forest it is, restriction for
+restriction and bit for bit on random data, the schedule of the same
+leaves without the seam, whose seam faces are outer faces. The
+advection test, a compact bump carried by `v = (−y, x)` across the seam
+and across a refinement boundary, with a linear reconstruction and an
+upwind flux chosen by the sign of the normal velocity, conserves the
+total to a relative 6e-15 over 102 SSPRK3 steps while 55 % of the mass
+crosses the seam, and drifts by 1.9 % without the fixup. The covariance
+is exact there: the two seam faces' fluxes are each other's negatives
+bit for bit, because `a − b = −(b − a)` in IEEE arithmetic and the
+upwind side follows the normal velocity, which the turn negates on one
+side. One sharp edge, the application's, not the seam's: a velocity
+stored on faces must be set on both of a block's faces, the closed
+range; `fill_by_coordinates!` sets owned points only, and a block whose
+high face carries a zero velocity leaks 20 % in the same run.)*
+
 **Construction.** The interface schedule comes out of the same neighbor
 search as the ghost schedule — its transfers are the `:restrict` cases
 of the neighbor walk for the admissible directions, with the target
@@ -1382,6 +1793,52 @@ first step on its own. Decided:
   and each derivative across the wall one sign more. A point outside the
   domain after that is refused rather than taken from the nearest block,
   which would extrapolate without saying so.
+- **Folding through a rotating seam** (M12 design, 2026-10-03). After
+  the periodic and reflecting folds, a point beyond the seam, in
+  `R^r` of the domain, is rotated back, `q = R^{−r} p`, and the stencil
+  is built at `q`. The rotating dimensions are neither periodic nor
+  reflecting, so the folds act on different coordinates and their order
+  is a convention. The value of variable `v` is variable `σ_r(v)` at `q`
+  times the sign from the factor table, the two tables the rotated
+  transfers use. Each first derivative is remapped as well, by the
+  chain rule through `R^{−r}`: for `r = 1`, `∂_{d1}` at `p` is
+  `−∂_{d2}` at `q` and `∂_{d2}` is `∂_{d1}`; for `r = 2` both are
+  negated; for `r = 3`, `∂_{d1}` is `∂_{d2}` and `∂_{d2}` is `−∂_{d1}`.
+  A derivative of any order turns once per order, so a second one
+  takes the product of its two signs: for `r = 1`, `∂_{d1}∂_{d2}` is
+  `−∂_{d2}∂_{d1}` and `∂_{d1}²` is `∂_{d2}²` *(amended on merging the
+  second derivatives from `main`; the kernel's sign was already per
+  order, and `rotate_tests.jl` checks the Hessian of the metric's
+  `g_xz` beyond the seam bit for bit)*.
+  `PointGeometry` carries the rotation, so `locate_point` and M7's host
+  routing share the fold, and a point that the rotation takes beyond a
+  high face is outside and refused. A set with an asymmetric layout,
+  one of a `RotationPair` or a ghost-free flux set, refuses a point
+  beyond the seam with the reason: its value there is its partner's,
+  which the kernel does not read (an open question, see
+  [Open questions](#open-questions)).
+  *(Step 5, 2026-10-03: as specified, with these details.
+  `fold_point` returns the orientation with the folded point, and the
+  turn is taken about the low corner of the plane, `(a, b) ↦ (b, −a)`,
+  `(−a, −b)` and `(−b, a)` for `r = 1, 2, 3`. An odd `r` contracts with
+  the requested multi-indices with `d1` and `d2` exchanged, a second
+  compile-time tuple beside `derivs`, so that the selections stay
+  static (run-time ones cost M11 21 %); each derivative takes the turn's
+  sign `(−1)^{m_{d1}}`, `(−1)^{m_{d1}+m_{d2}}` or `(−1)^{m_{d2}}`, which
+  holds at any order, so second derivatives need nothing more here. A set that cannot turn a point — an asymmetric layout — gets no
+  variable table in the kernel, which marks such a point `−1` beside an
+  outside point's `0`; the host decides which refusal it is with the
+  same fold (`outside_error`, whose face labels now name the seam). M7's
+  host routing marks it the same way. `exclude` is tested where the
+  stencil is read, as for a mirrored point. One finding about the
+  comparison, not the fold: the full plane agrees with the quadrant at a
+  turned point to roundoff for cell centering, but only to
+  interpolation accuracy for vertex centering, since a vertex-like full
+  plane is not itself covariant under the turn where levels meet — its
+  ghost stencils depend on the side, half-open ownership putting the
+  shared plane on a block's high one — while the quadrant is covariant
+  by construction. The test therefore compares with the full plane at
+  the preimage, turned; the numbers are under step 5 of M12.)*
 - **The basis is the extension point.** `Lagrange(n)` is the one
   implemented. The kernel knows a basis only through `stencilwidth`,
   `stencilstart` (which `n` points, from the query's continuous stored
@@ -1500,13 +1957,13 @@ what cannot be recomputed, and nothing else:
 
 | Item | Handling | Why |
 |---|---|---|
-| Forest: `D`, the geometry type, `roots`, `periodic`, `reflecting`, `extents` (bitwise, in the geometry type), `N` | saved | the inputs the forest was built from |
+| Forest: `D`, the geometry type, `roots`, `periodic`, `reflecting`, `rotating` (M12), `extents` (bitwise, in the geometry type), `N` | saved | the inputs the forest was built from |
 | Forest: the leaf list | saved | the only record of the mesh's history |
 | Forest: `generation` | not saved | a staleness counter, meaningless in another process |
-| Field set: element type, `nvars`, `G`, `centering`, `parity` | saved | its layout |
+| Field set: element type, `nvars`, `G`, `centering`, `parity`, `rotation` (M12) | saved | its layout |
 | Field set: the **owned** points, in state-vector layout `(N, …, N, nvars, nblocks)` | saved | the authoritative data |
 | Ghosts, shared vertex planes, the derived wall plane | rebuilt by `scatter!` and `fill_ghosts!` with the application's hook | derived from the owned points |
-| `GhostSchedule`, `InterfaceSchedule`, `Operators`, the parity factors | rebuilt | derived, or the application's inputs |
+| `GhostSchedule`, `InterfaceSchedule`, `Operators`, the parity factors, the rotation tables, a `RotationPair` (M12) | rebuilt | derived, or the application's inputs |
 | Regridding | nothing to save | it keeps no state between calls |
 | Scratch field sets (fluxes, primitives) | the application's choice | it passes only the sets it evolves |
 
@@ -1699,6 +2156,30 @@ range, so block `b` of the forest is entry `b − first_block + 1` of the
 part that holds it. The parts tile `1:nleaves` in order, as the ranks'
 ranges do.
 
+**Rotating forests** (M12 design, 2026-10-03; no format bump). A forest
+with a rotating seam writes a `rotating` attribute in `forest/`, the
+pair `(d1, d2)`, beside `reflecting`, and each of its field sets a
+`rotation` attribute in `fieldsets/<name>/`, the signed map as
+`Int64[nvars]`, beside `parity`. Such a file also lists `rotating` in
+`features`, so a reader from before M12 refuses it, with the reason,
+instead of loading the seam as two outer faces; a forest without a seam
+writes neither the attributes nor the feature, so every file it writes
+is readable by every earlier reader of its version. A file without the
+attributes loads as non-rotating, which is the only reading of their
+absence, so the version-1 fixtures still load. The load builds the
+forest through the checked `leaves` path, which refuses a leaf list that
+is not conforming at the seam, and the field set through its
+constructor, which refuses a map that is not a valid rotation. A
+`RotationPair` is not saved: like the operators, it is the application's
+input, rebuilt from the two loaded sets. *(Amended in step 6,
+2026-10-03: the attribute and the feature go together, and a file with
+one and not the other — which no TreeAMR writes — is refused as
+damaged, rather than read with the seam or without it. The pair is
+`Int64[2]`, checked by the forest's constructor as a caller's would be;
+a map is checked for its length here and as a map by the field set's.
+The map joins what the ranks agree on about a field set before a save,
+beside the parity.)*
+
 **Element types** (decided).
 
 - **Native types** — `Float16`, `Float32`, `Float64`, the signed and
@@ -1744,7 +2225,8 @@ with the reason, and defaults are supplied where they are obvious.
   reader refuses a file that names a feature it does not know. This is
   Zarr v3's `must_understand` idea, with every listed feature
   must-understand: what may be ignored is simply not listed. Version 1
-  lists one, `brick`.
+  lists one, `brick`. M12 adds `rotating`, listed only by a file whose
+  forest has the seam (see "Rotating forests" above).
 - **Refusals are `ArgumentError`s that say why.** They name the TreeAMR
   version that wrote the file, from `provenance`, and point to
   `checkpoint_environment(path, dir)`. That writes the stored
@@ -3660,7 +4142,21 @@ amends the paragraph above:)*
     allocate 80 and 4816 bytes more in `bench/ghosts.jl` (presumably
     closures that capture a `Forest` by value growing by a word; not
     traced), and with the fold its 392832 and 4656880 are unchanged. A
-    serial forest never makes a pool.
+    serial forest never makes a pool. *(M12 adds a ninth field,
+    `rotating`. Its step 1 measures `bench/ghosts.jl` before and after,
+    and folds `rotating` and `reflecting` into one immutable field if
+    the ninth field costs again; see the M12 entry under
+    [Milestones](#milestones).)* *(Amended by M12's step 1, 2026-10-03:
+    the cost is the struct's size, as the guess about closures implies,
+    not its field count. A ninth field of 16 bytes, `NTuple{2,Int}`,
+    added 160 and 4896 bytes, twice the 80 the 8-byte one had added to
+    the uniform build; one of 2 bytes, `NTuple{2,Int8}`, fits in the
+    padding before `extents` for `D ≤ 4` and adds nothing. So the ninth
+    field stays, as two `Int8`s. The same measurement found the other
+    half of the guess: a closure that captures a `Forest` copies it,
+    and a seam check that read the forest inside `GhostSchedule`'s
+    argument closure added 240 bytes, twice `sizeof(Forest{3,Float64})`,
+    until it read the pair taken outside it.)*
   - *What it hands out.* A *lease* of at least the length asked for, as
     an object of exactly that length over pooled memory, keyed by role
     (buffer or mirror), array type and backend type. A host vector — a
@@ -4592,6 +5088,27 @@ before it is built):
   restriction's path.
 - The checkpoint stores no partition.
 
+*(Amended by the M12 design, 2026-10-03.)* M12's rotating seam is a
+step toward a multi-block forest, not an obstacle to one: it removes
+the assumption that a source's axes line up with its target's. An
+oriented neighbor search, which returns the real leaves with the
+quarter turns that carry them to where the asking block sees them, and
+an axis-permuting source map in the kernel's load are the p4est
+orientation mechanism in miniature, for the one gluing of two root
+faces that a quadrant needs. It also corrects the third bullet above
+in one respect: an oriented face does not change the stencils, which
+are built in the virtual frame as for an aligned neighbor, but the
+source index map, a permutation and a flip per dimension. The unpack
+is still a copy into a target box whatever the orientation, carrying
+the sign as it carries a parity. The one new ownership rule, both seam
+planes of a vertex-like set owned, is about ownership only and assumes
+nothing about aligned axes; it is recorded as a choice under "Rotating
+seams" in [Ghost filling](#ghost-filling). Conformity at the seam is
+the seam's own rule and not something a multi-block forest inherits:
+there a glued face would be 2:1 balanced like any other, and the
+interface restriction would have to cross it with an orientation,
+which the seam avoids.
+
 ## Ecosystem integration
 
 - **Time integration:** OrdinaryDiffEq.jl via the flat state vector (see
@@ -4656,6 +5173,26 @@ Remaining, none blocking before their milestone:
     directory, rather than with a reason. The loader could read the
     data set's filter pipeline first and name the filter and the
     package that provides it.
+- **What M12 leaves open** (2026-10-03; see "Rotating seams" under
+  [Ghost filling](#ghost-filling)).
+  - *A 180° rotation, the π-symmetry* (deferred 2026-10-03 with Erik).
+    Half of the plane is simulated, and the low face of `d1` is glued to
+    itself, flipped about the domain's centre line in `d2`. It needs the
+    machinery of M12 — the oriented search, the virtual frame, the axis
+    map with orientation 2 only, the signed variable map — and one thing
+    more, a face that is its own neighbor across the seam, which a
+    leaf's image on the same face can make coarse-fine unless
+    conformity is extended to it.
+  - *Reflecting high walls together with the rotation*, a symmetric box
+    rather than a quadrant open at its high faces. `R` carries the high
+    face of `d1` onto that of `d2`, so both would have to reflect, the
+    parities along `d1` and `d2` would have to agree with the map (`vx`
+    odd in `x` exactly when `vy` is odd in `y`), and a mirrored transfer
+    across one high wall can then also cross the seam. Refused for now.
+  - *Interpolation of a paired set beyond the seam.* The value there is
+    the partner's, so the kernel would need both working arrays, or the
+    host would route the folded point to the partner and swap the
+    variables. Refused, with the reason, until an application asks.
 - **The integrator's own passes are not owner-based** (raised by
   TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
   policy of [Parallelism](#parallelism); decided the same day not to
@@ -4779,8 +5316,9 @@ applications need to restart long runs before they need MPI. M9 is
 split for it: its second half, M9b (visualization export), stays after
 M7. M9a's layout was chosen so that M7 need not change it, subject to
 M7's benchmarks (in the end it did change it: format version 2, M7 step
-6b). The list below is in execution order. M7 is done (2026-10-02), so
-M9b is next.
+6b). The list below is in execution order. M7 is done (2026-10-02).
+M12, the rotating symmetry, was added after it on 2026-10-03 and done
+the same day, so it comes before M9b, which follows it.
 
 - **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
   *(Skeleton exists.)*
@@ -7233,6 +7771,571 @@ M9b is next.
       29 tests of the round trip and two new `buffered_flags`
       assertions. The thread-independence digests are unchanged. The
       docs build.
+- **M12 — Rotating symmetry.** *(Specified 2026-10-03. Done 2026-10-03.)*
+  A 90° rotating symmetry about the axis where the low faces of two
+  dimensions meet: one quadrant of the plane is simulated, as Cactus's
+  RotatingSymmetry90 does, for a spinning black hole, which no
+  reflection in `x` or `y` maps onto itself; with M10's reflection at
+  `z = 0` it gives an octant. `rotating = (d1, d2)` on the forest,
+  `rotation` on the field set, the oriented neighbor search with
+  conformity at the seam, the virtual-frame transfers with the axis map
+  and the signed variable map, and `RotationPair` for the field sets
+  whose layout is not symmetric in the plane, all as specified under
+  [Domain and boundaries](#domain-and-boundaries) and "Rotating seams"
+  in [Ghost filling](#ghost-filling), with the additions under
+  [Conservation](#conservation-at-coarse-fine-faces),
+  [Point interpolation](#point-interpolation) and
+  [Checkpoint and restart](#checkpoint-and-restart). It comes after
+  M7, so unlike M10's mirrored transfers, which M7 distributed as the
+  ordinary transfers they are, the rotated ones are distributed by M12
+  itself; the MPI path needs the pack to permute and the unpack to
+  sign, and nothing else. The change is additive — new
+  keywords and one new export — so it is a `0.1.x` release. *Accept:*
+  - **refusals**, each with its reason: every case listed for the
+    forest and the field set under
+    [Domain and boundaries](#domain-and-boundaries), a leaf list that
+    is not conforming at the seam, an asymmetric set filled alone where
+    it has seam ghosts, and a `RotationPair` that is mismatched or
+    whose maps compose to anything but the identity;
+  - **the neighbor oracle**: the quadrant's oriented neighbors equal the
+    images of the neighbors in an independently built *unfolded* forest
+    of `2M × 2M` roots over `[−L, L]²`, made by rotating the quadrant's
+    leaves with exact `Rational` boxes rather than with the package's
+    arithmetic, on random refinements and then after `balance!`; the
+    unfolded forest is 2:1 balanced by the oracle, and the seam is
+    conforming;
+  - **no ghost undefined, and none read before it is defined**:
+    `NaN`-prefilled storage with finite owned data has no `NaN` after
+    one fill, in `D = 2` and in `D = 3` with `z` periodic, outer or
+    reflecting at its low face, for every centering symmetric under the
+    swap;
+  - **`rotating_vs_quadrupled`**, the definitional test after
+    `reflecting_vs_doubled`: data covariant under the quarter turn and
+    not polynomial — a scalar built from invariants such as
+    `x⁴ − 6x²y² + y⁴`, and a vector field — on a refinement symmetric
+    under the rotation that reaches the seam and the axis, where every
+    stored point, ghosts included, equals the full domain's within
+    `1e-13`, compared with `==` semantics so that `−0` counts; cell and
+    vertex centering, `D = 2` and `3`; and the same for a paired
+    face-centered `(B_x, B_y)` with `G > 0`, against the full domain
+    filled set by set;
+  - **write counts**: the schedule partitions the stored points, zero
+    writes at owned points and one everywhere else, and every hook
+    region's virtual position leaves through an outer face;
+  - **the wave equation on a quadrant against the full box**, a scalar
+    and a two-component vector wave that exercises the mixing: the same
+    number of steps, `linf` equal to the full box's to `rtol = 1e-8`,
+    the vertex-centered seam planes at `x = 0` and `y = 0` equal to each
+    other — asserted as measured, bitwise if it holds — and the rate 2;
+  - **a regrid across the seam**: conformity kept, no block moved by
+    more than one level, and the ghosts afterwards equal to the
+    oracle's;
+  - **conservation through the seam**: advection by the rigid rotation
+    `v = (−y, x)`, with face flux sets (`G = 0`, asymmetric, filled
+    alone) and the fixup, conserves mass to roundoff while the field
+    crosses the seam;
+  - **interpolation beyond the seam**: the value and first derivatives
+    of the covariant vector field at `r = 1, 2, 3`;
+  - **checkpoints**: a round trip, a restart that continues byte for
+    byte, and the old fixtures still loading;
+  - **MPI in process**: a lockstep rotated pack and unpack in
+    `exchange_tests.jl`, bitwise, with a rotated `−0`, and rotating
+    cases in `regrid_exchange_tests.jl` and
+    `interpolate_exchange_tests.jl`;
+  - **the MPI workload**: a rotating case and a pair case in
+    `mpi_workload.jl` at `-n 2` and `-n 3`, with seam transfers that
+    cross ranks and a rank without blocks;
+  - a rotating cycle in `thread_workload.jl`, and a rotating fill in
+    `gpu_tests.jl`; `mpi_device_tests.jl` run by hand on Metal.
+
+  Measured, as for every milestone: ordinary fills unchanged in time and
+  allocation in `bench/ghosts.jl`, the quadrant against the full domain,
+  the suite's cost, and TreeWave and TreeHydro against a scratch copy
+  that develops this checkout. In steps, each ending green and
+  committed, with what it measured in the commit body:
+  - **Step 0 — specification.** *(Done, 2026-10-03.)* The sections
+    above, before any code.
+  - **Step 1 — forest.** *(Done, 2026-10-03.)* The keyword and its
+    refusals, the oriented neighbor search, conformity in `balance!`,
+    the checked `leaves` path and `isbalanced`, and the forest digest.
+    The field, with `bench/ghosts.jl`'s allocation before and after, and
+    the fold into one field with `reflecting` if a ninth field costs
+    again (see "The buffer pool" under
+    [Distributed meshes](#distributed-meshes)); the outcome is recorded
+    here either way.
+    - *What was built.* `Forest(…; rotating = (d1, d2))` with every
+      refusal listed under [Domain and boundaries](#domain-and-boundaries);
+      `neighbor_anchor` as the one place the seam's arithmetic lives, in
+      global level coordinates, returning the orientation; the internal
+      `oriented_neighbors(forest, k, δ) -> (r, keys)`, of which
+      `neighbor_keys` returns the keys, so `remote_neighbors`,
+      `buffer_recruits`, `balance!` and `isbalanced` see the seam
+      through it; `real_direction` and `virtual_offset` (the table under
+      "Rotating seams"); the seam rule in `balance!`, whose `level ≥ 2`
+      shortcut now lets a level-1 leaf of a rotating forest through;
+      the conformity refusal in the checked `leaves` path; `rotating` in
+      the digest's brick. Until step 3, `GhostSchedule`,
+      `InterfaceSchedule`, `interpolate` and `save_checkpoint` refuse a
+      rotating forest ("not implemented yet in this step of M12"), so
+      that no commit builds unrotated transfers across the seam or
+      writes a checkpoint that would load without it; the later steps
+      remove each refusal as they teach its reader the orientation.
+    - *The field* (measured on the laptop, Julia 1.13.1, `-t 4`,
+      defaults `D = 3`, `N = 8`, 4 roots, 10 variables, `p = 4`; bytes
+      allocated per call, the median time of two runs). Before:
+      uniform `fill_ghosts` 50208 B in 0.52 ms and `ghost_schedule`
+      441888 B in 0.24–0.27 ms; two-level 310144 B in 4.03–4.06 ms and
+      4976688 B in 2.65 ms. With `rotating::NTuple{2,Int}` the builds
+      allocated 442048 and 4981584 B (+160, +4896). With
+      `NTuple{2,Int8}`, and with the whole of step 1, every number is
+      the baseline's: 50208, 441888, 310144 and 4976688 B, in 0.52,
+      0.24–0.30, 4.1–4.3 and 2.63–2.65 ms, inside the run-to-run noise.
+      The forest keeps its nine fields; no fold.
+    - *Tests.* `test/rotate_tests.jl`, after `reflect_tests.jl`, with
+      the unfolded-forest oracle at the end of `ghost_oracles.jl`
+      (`unfolded_forest`, `seam_neighbor_mismatches`,
+      `seam_conforming`): the refusals; the direction and offset maps
+      against turned boxes; the oriented neighbors against the unfolded
+      forest's, every leaf and every direction, on random quadrants
+      before and after `balance!` in `D = 2` and in `D = 3` with the
+      third dimension outer, periodic or reflecting below, over four
+      orderings of the pair, every `(r, kind)` met; the unfolded forest
+      balanced and the seam conforming; the conformity refusal and its
+      acceptance after `balance!`; `complete_marks` moving no leaf by
+      more than one level across the seam, with a buffer of 0 and 1;
+      and mutual adjacency with `remote_neighbors` over cuts of the
+      leaves. Deliberately breaking `virtual_offset` or
+      `real_direction` (exchanging `r = 1` and `3`) makes the oracle
+      report 58 mismatches on six balanced quadrants. The file holds
+      885 tests and runs in about 10 s, nearly all compilation. The
+      suite: 111503 tests at one thread in 8m12 (`Pkg.test`), every one
+      passing; the docs build, doctests included.
+  - **Step 2 — field sets.** *(Done, 2026-10-03, with step 3.)*
+    `rotation`, the factor and `rotvars` tables, `RotationPair`.
+    - *What was built.* `FieldSet(…; rotation)`, required on a rotating
+      forest and checked as recorded under
+      [Domain and boundaries](#domain-and-boundaries) (step 2's note
+      there says where each check lives). Two fields, `rotation` (the
+      checked map) and `rotvars` (`nvars × 4` `Int32`, the composed
+      variable `σ_r(v)` in column `r + 1`, on the backend), and
+      `factors` grown on a rotating forest to `nvars × 3^D·4`, column
+      `mirror column + 3^D·r`, each entry the target variable's parity
+      factor times the sign of `Q^r`, formed in integers so that a zero
+      is `+0`; `r = 0` is M10's table unchanged (`seamtables`). A
+      symmetric set composes its own map three times; an asymmetric
+      set alone holds zero factors and the identity for `r ≥ 1`, which
+      no fill reads, since a plain fill refuses it. `RotationPair(a, b)`,
+      exported, with every refusal of the design and one more (two
+      symmetric sets: each turns into itself), builds both members'
+      tables by alternating the maps, `(Q_a, Q_b, Q_a)` for `a`'s
+      targets.
+  - **Step 3 — schedule and kernel.** *(Done, 2026-10-03.)* The
+    orientation in the group key and the axis map in the group, the
+    rotated source accessor, the oriented source search, the single and
+    paired fills, and `show`.
+    - *What was built.* `GroupKey` gained `orientation::Int8`, last in
+      `keyorder` (the old constructors give 0), and `TransferGroup`
+      gained `orientation` and `plane` (see the amendment under "Ghost
+      filling"). `block_sources!` and `mirror_sources!` search with
+      `oriented_neighbors`, take a finer source's offset into the
+      virtual frame (`seam_offset`), filter the wall side on it, and
+      record `r`; a region with no source is the hook's whatever its
+      `r`. `factorcol` is `mirror column + 3^D·r` whenever either is
+      nonzero. In the kernel the source accessor
+      `RotatedSource = (src, perm, flip, len, vars, col)` maps a
+      virtual stored index to the real one (a run-time `perm` is read
+      through a chain of selects, `tuplepick`, not a run-time tuple
+      index) and reads `vars[v, col]`; `run_group!` builds it only for
+      `orientation ≠ 0`, in a branch of its own, so an ordinary launch
+      is the code it was. `altsrc` (the array odd orientations read:
+      the partner's in a pair, the set's own otherwise) and `rotvars`
+      are threaded through `run_group!`, `run_phase!`, `pack_stage!`
+      and `run_stage!` beside `factors`. A rotated pack carries the
+      orientation and the plane and computes the unscaled sum through
+      the accessor; its unpack is the plain width-1 copy with the
+      factor column, now holding the sign, so the serial `−0` stays
+      bitwise. The step-1 refusal is gone from `GhostSchedule`; the
+      plain fill refuses an asymmetric set with ghosts in the plane,
+      naming the pair; `fill_ghosts!(pair, (sa, sb); boundary)` runs
+      the merged stages (`exchange_pair!`), with one hook or two;
+      `show` says "N rotated transfers" when there are any (and counts
+      as mirrored only the groups whose mirror state is nonzero).
+    - *Deviations*, each amended where the design states it: the
+      odd-orientation refusal is decided from the layout, not recorded
+      on the schedule; the group holds the orientation and the plane,
+      not an `AxisMap`; the `G = 0` asymmetric case has no ghost
+      schedule at all; and in 2D a half turn is only ever a copy (a
+      region beyond both low faces belongs to the block at the axis,
+      whose image there is itself), so rotated restrictions and
+      prolongations at `r = 2` occur in 3D only, across the third
+      dimension.
+    - *The schedule build.* Building the groups inline, with the
+      element type a run-time value there, made the new small fields
+      a dynamic call's boxed arguments, 448 bytes more per build in
+      `bench/ghosts.jl`. The groups are now built behind a function
+      barrier (`local_groups`), where the type is static, which also
+      removes the run-time type construction the build always did per
+      group.
+    - *Measured* (laptop, Julia 1.13.1, `-t 4`, `bench/ghosts.jl`
+      defaults, bytes per call, two runs). Fills: uniform 50208 B in
+      0.52–0.53 ms, two-level 310144 B in 3.8–4.2 ms, against 50208 B
+      in 0.51 ms and 310144 B in 3.9 ms before, so unchanged. Schedule
+      builds: 406592 B in 0.18–0.25 ms and 4653648 B in 2.08 ms,
+      against 441888 B in 0.22 ms and 4976688 B in 2.63 ms: 8 % and
+      6 % fewer bytes, and the two-level build 21 % faster, from the
+      barrier. The quadrant against the full plane, every stored point:
+      worst 2.2e-16 in 2D and 8.9e-16 in 3D (cell and vertex, both
+      orders of the pair, the third dimension periodic, reflecting or
+      outer), and 4.4e-16 for the pairs (face-centered `(B, F)` with the
+      variables in swapped orders, `F` odd about a reflecting wall, and
+      a cell-centered pair whose ghost widths alone are swapped) — not
+      zero, since the formula's covariance is itself only to roundoff.
+      The polynomial data of the `NaN` test is reproduced to 1e-10 or
+      better in every case, with no `NaN` left. By hand (not yet in the
+      suite; step 7), the lockstep driver of `exchange_tests.jl` over
+      2, 3 and 5 simulated ranks reproduces the serial fill bit for
+      bit, a symmetric set and a pair, in 2D and 3D, with 40 to 3184
+      rotated `−0`s per case.
+    - *Tests.* In `test/rotate_tests.jl`, with the oracles at the end of
+      `ghost_oracles.jl` (`rotating_data`, `rotating_forest`,
+      `undefined_rotated_ghosts`, `rotating_vs_quadrupled`,
+      `rotating_pair_vs_quadrupled`, `hook_regions_leave`): the
+      refusals of `rotation` and of `RotationPair`; the tables against
+      hand-composed turns, and their `r = 0` block against M10's; the
+      `NaN` test over every symmetric centering, `p = 2` and 4, `D = 2`
+      and 3 with the third dimension periodic, outer and reflecting,
+      every `(kind, r)` met; the quadrant and the pair against the full
+      plane; the write counts and the hook regions, pairs included; and
+      the plain fill's refusal and `show`.The file
+      holds 1092 tests (885 after step 1) and runs in about 30 s at one
+      thread and at four, nearly all compilation (the `NaN` test's 3D
+      cases alone compile 12 s and compute 1.2 s, which is why the
+      other orders of the pair there run cell and vertex only). The
+      suite: 111710 tests at one thread in 6m51 (`Pkg.test`), every one
+      passing; the docs build, doctests included.
+  - **Step 4 — regrid, initial data and the interface schedule.**
+    *(Done, 2026-10-03.)*
+    - *What was built.* `regrid!` takes `pair => (sa, sb)` and fills the
+      pair before its two transfers (`regrid_steps`); `check_regrid`
+      checks both members as it checks a set (`check_regrid_set!`), adds
+      the pair to the agreed layout, and refuses a plain asymmetric set
+      with ghosts in the plane, with the pair named.
+      `adapt_to_initial_data!` gained a pair form (amended under "Rotating
+      seams"); both forms share `adapt_criterion`. The interface
+      schedule's step-1 refusal is gone, its search is oriented, and a
+      seam restriction is a bug check (amended under
+      [Conservation](#conservation-at-coarse-fine-faces)).
+    - *Measured.* A regrid of the quadrant against a regrid of the full
+      plane to the turned image of the quadrant's new leaves, the full
+      plane's flags derived from the quadrant's moves in `Rational` boxes
+      (`rotating_regrid_vs_quadrupled`): three passes — refine along the
+      low face of `d1` near the axis, which conformity carries to the
+      low face of `d2`; coarsen everything at level 2; refine along the
+      low face of `d2` — take the 2D quadrant through 31, 16 and 34
+      leaves and the 3D ones through 134 (or 176), 57 and 246. After
+      every pass every leaf moved by at most one level, the quadrant is
+      balanced and conforming, the full plane's leaves are exactly the
+      four turns of the quadrant's, and every stored point after a fill
+      equals the full plane's: worst 1.1e-15 in 2D and 3.6e-15 in 3D,
+      cell, vertex and the face-centered pair, with the third dimension
+      reflecting below or periodic. Without the pair's fill before the
+      transfer the same comparison is off by 1.5. The interface
+      schedule and the conservation test are recorded under
+      [Conservation](#conservation-at-coarse-fine-faces).
+    - *Tests*, in `test/rotate_tests.jl` with the regrid oracle at the
+      end of `ghost_oracles.jl` (`quadrant_preimage`, `regrid_move`,
+      `formula_hook`, `rotating_regrid_vs_quadrupled`): the regrid
+      against the full plane in `D = 2` and 3; the refusals and a pair's
+      regrid, after which the pair fills again; the initial-data cycle
+      on a quadrant, alone (3 passes to level 2) and as a pair, each
+      reproducing polynomial data to 1e-10 after a fill; the interface
+      schedule against the seamless leaves and its bug check; and the
+      rigid-rotation advection, both orders of the pair. The file holds
+      1334 tests (1092 after step 3) and runs in 50 s at one thread and
+      42 s at four.
+  - **Step 5 — interpolation.** *(Done, 2026-10-03.)*
+    - *What was built.* The step-1 refusal is gone. `PointGeometry`
+      carries the seam's pair; `fold_point` folds periodic and
+      reflecting coordinates and then turns a point beyond the seam
+      back, returning the orientation (amended under
+      [Point interpolation](#point-interpolation)); `locate_point`,
+      the kernel and M7's host routing share it. The kernel reads
+      variable `rotvars[v, r + 1]` and the factor column
+      `mirror + 3^D·r`, and contracts with the exchanged multi-indices
+      for an odd `r` (`contract_point!`, split out of
+      `interpolate_point!` so that both calls see constant indices). A
+      set with an asymmetric layout is handed no variable table and
+      refuses a point beyond the seam after the launch, with the reason
+      and the partner named. `inside`, `stencil_hits` and
+      `stencil_position` are unchanged.
+    - *Measured.* Polynomial data of degree 3 per dimension, which every
+      operator and `Lagrange(4)` reproduce, at the images of 60 points
+      under every turn (and the mirror below `z = 0` where `z` reflects),
+      values and all first derivatives against the formula and its
+      complex-step derivatives: within 1.6e-14 in 2D and 2.4e-14 in 3D,
+      cell and vertex, both orders of the pair, the third dimension
+      reflecting below or periodic. The value at a turned point is the
+      preimage's, turned, **bit for bit**, every variable and derivative.
+      Smooth data at 400 random points of the whole plane: within
+      1.3e-16 of the full plane's value at the preimage, turned; at the
+      point itself within 3.4e-14 for cell centering and 4.2e-3 (2D) and
+      5.5e-3 (3D) for vertex centering, values and gradients, about 6e-5 for
+      the values alone, which is the full plane's own lack of covariance
+      (amended under [Point interpolation](#point-interpolation)).
+      `vars = [3, 2]` returns the same numbers bit for bit. Float32: the
+      turned identity holds bit for bit there too, an `exclude` region
+      flags a turned point as its preimage, and the values are within
+      7.9e-6 of Float64's. Deliberately contracting an odd turn with the
+      unexchanged derivatives puts the polynomial comparison off by 3.4.
+    - *The ordinary path* (`bench/interpolate.jl`, laptop, Julia 1.13.1,
+      defaults, two runs each against the 0.1.6 release): unchanged
+      within the noise — at one thread 783–859 ns per point against
+      799–919, at four 217–306 against 226–465, `locate_point` 96 ns
+      against 93–97 — with 64 bytes more per batch (128 at four
+      threads), the two new kernel arguments. The first version of the
+      fold reassigned two tuples that its closures captured, which boxed
+      them: 930 bytes allocated per point and 1.6x the time, on every
+      forest. On a rotating quadrant (2D and 3D, `N = 16`, vertex,
+      value and gradient, 49600 points) a batch allocates what an
+      ordinary one does, and points spread over the whole plane, three
+      quarters of them turned, cost 94 ns per point in 2D and 559 in 3D
+      at one thread, against 75 and 455 for points inside the quadrant.
+    - *Tests*, in `test/rotate_tests.jl`: the turned field in `D = 2` and
+      3 (`turn_matrix`, `turned_values`, `complex_step`), Float32 with a
+      region, and the asymmetric set's refusal, the outside points with
+      the seam named, and `locate_point` beyond the seam. The file holds
+      1388 tests (1334 after step 4) and runs in 60–84 s at one thread
+      and 53–60 s at four. The suite, run once for steps 4 and 5
+      together: 112006 tests at one thread in 8m27 (`Pkg.test`; 111710
+      in 6m51 after step 3, on a machine less loaded), every one
+      passing; the docs build, doctests included.
+  - **Step 6 — checkpoint.** *(Done, 2026-10-03.)*
+    - *What was built.* The step-1 refusal in `save_checkpoint` is gone,
+      and with it the last caller of `refuse_rotating`, which went too.
+      A forest with a seam writes `rotating`, `Int64[d1, d2]`, in
+      `forest/`, and the file lists `features = ["brick", "rotating"]`;
+      one without writes neither and lists `["brick"]`, as before M12,
+      so that every file an unrotated run writes is still readable by
+      0.1.6. The reader knows both features (`FEATURES`) and builds the
+      forest with `rotating` through the checked `leaves` path. A field
+      set with a map writes `rotation`, `Int64[nvars]`, in its group,
+      read back into the constructor; the map is part of the save's
+      agreed layout (`set_layout`). Both attributes are read only where
+      present, so the version-1 fixtures and every version-2 file of
+      0.1.6 load as before (amended under
+      [Checkpoint and restart](#checkpoint-and-restart)).
+    - *Measured.* A quadrant with a symmetric vertex-centered set and
+      a face-centered `RotationPair`, in 2D in `Float32x2` (polynomial
+      data, which has no `sin`) and in 3D in `Float64` with a reflecting
+      low face, round-trips bit for bit: the forest's pair, every set's
+      map, `rotvars` and factor table, the state, and the working arrays
+      after the same fill, the pair's through a pair rebuilt from the
+      loaded sets. A quadrant wave — a ring about the axis, vertex-
+      centered, refined where it is large, with a pair riding through
+      every regrid as a pair — runs four chunks through 136, 142, 148,
+      160 and 178 leaves, 25 to 29 refined blocks on the seam faces, and
+      a restart after the second continues byte for byte, the wave and
+      both members of the pair. The file without its feature, without
+      its seam, with an unknown feature, with a pair out of range or not
+      a pair, with a map that is not a signed permutation, of the wrong
+      length, or missing, is refused with the reason each time.
+    - *Tests*, in `test/checkpoint_tests.jl`, after the restarts: the
+      round trip (`rotating_checkpoint_sets`), the restart
+      (`quadrant_start`, `quadrant_chunk`, `quadrant_restore`, through
+      `interrupted`), and the refusals; the step-1 refusal's test in
+      `rotate_tests.jl` is gone. The file holds 658 tests (593 before)
+      and runs in 77 s alone, the four new testsets about 10 s of it.
+  - **Step 7 — MPI.** *(Done, 2026-10-03.)* The pack and unpack, and
+    the workloads.
+    - *What was built.* Nothing in `src/`: the rotated pack and unpack,
+      the merged stages of a pair and the agreed refusals came with
+      steps 3–5, and step 7 is their tests in process and over MPI. The
+      transfer oracles of `exchange_tests.jl` carry the orientation
+      (the pack supplies it, the unpack must be a plain copy with
+      orientation 0), and `lockstep_pair!` runs a pair's stages merged
+      as `fill_ghosts!(pair, …)` merges them. The paired fill's shared
+      tags are safe as specified (amended under "Rotating seams" in
+      [Ghost filling](#ghost-filling)).
+    - *In process.* On the quadrants of `rotating_forest` — 10 leaves in
+      2D, 22 in 3D with the third dimension reflecting below and 29 with
+      it periodic, 21 of 73, 155 of 517 and 217 of 737 transfers
+      rotated — over 2, 3 and 5 simulated ranks, for a scalar and
+      vector, cell- and vertex-centered, and for both members of a
+      face-centered pair: the local and the sent-and-received transfers
+      are the serial ones with their orientations and factor columns,
+      both ends of every message derive one layout, and every point is
+      written once per stage; 6, 8 and 14 rotated transfers cross
+      ranks in 2D at 2, 3 and 5 ranks, 45–125 in 3D. In lockstep, and
+      through `MailboxCommunicator` at 3 and 5 ranks, every rank's
+      array, ghosts included, is the serial fill's bit for bit, the
+      single set's and the pair's, with the turned `−0` of a zero
+      component kept (38 to 609 per serial fill of a single set, 84 to
+      996 of a pair). Over
+      `GatherCommunicator`, `regrid!` of a single set and a pair
+      together at 3 and 5 ranks, and `adapt_to_initial_data!` from one
+      leaf at the axis at 3 ranks (two empty), alone and as a pair, give
+      the serial leaves, passes and arrays bit for bit; routed
+      `interpolate` over the whole plane (three quarters of the points
+      turned back) is the serial one bit for bit at 3 ranks and at more
+      ranks than leaves, and a point beyond the seam of a pair's member
+      on one rank is refused on all three, that rank with its reason.
+    - *Over MPI.* `mpi_workload.jl` gained a rotating quadrant: the
+      wave, vertex-centered in 2D (`Q2v`, 27 leaves) and cell-centered
+      in 3D over a reflecting low face (`Q3c`, an octant, 57 leaves); a
+      single set with a zero `v_2` and a pair with zero second variables
+      through a fill, a regrid that refines along the seam and coarsens
+      off it, interpolation of 257 points of which 193 are turned back,
+      and a checkpoint saved and loaded at this rank count and at the
+      others (`rotating_cross`, `QC`), the pair rebuilt and refilled to
+      the bytes it had (`Q2`); a single leaf at the axis (`QE2`), which
+      leaves every rank but one empty, through the fill, the wave, a
+      pair's fill, interpolation from rank 0 alone, a refinement that
+      gives every rank blocks, the coarsening back and a checkpoint;
+      and two refusals on rank 1 only, a point beyond the seam of a
+      pair's member and such a member regridded alone where the others
+      regrid the pair, each refused on every rank. Run by hand,
+      serially in 53 s and at `-n 3` and `-n 2` (one thread a rank)
+      in 66 s and 63 s against about 55 s before, every line agrees but
+      the `#` lines, and the sums to `rtol = 1e-12`; 66 rotated
+      transfers cross ranks at `-n 3`, 18 at `-n 2`. `mpi_tests.jl`
+      asserts the new lines: 206 tests (179 before), in 1m11 alone on
+      the concurrent path.
+    - *Collective refusals.* Every refusal M12 added was checked for
+      one rank refusing alone. The forest's are local and see the same
+      arguments and the same replicated leaves on every rank. The field
+      set's `rotation` and `RotationPair`'s checks are local, as every
+      field-set check is, and depend only on the arguments; the plain
+      fill's refusal of an asymmetric set depends on the layout alone
+      (amended in step 3), so `fill_ghosts!`'s checks stay rank-local
+      on purpose. `regrid!`'s pair checks and its refusal of an
+      asymmetric set alone run inside `collective_checks`, and
+      `interpolate`'s refusal beyond the seam is decided on the host
+      before the routing and agreed with the outside points; the
+      workload shows both refused on every rank. The checkpoint's map
+      is in the agreed layout (step 6). As with `parity`, a `rotation`
+      that differs between ranks is not caught: the schedule is built
+      from the forest and the layout, not from the map, so it would
+      fill wrong data without a hang; recorded, not changed.
+    - *Tests.* `exchange_tests.jl` 9840 tests (9491 before) in 49 s
+      alone (38 s), `regrid_exchange_tests.jl` 1951 (1857) in 31 s
+      (24 s), `interpolate_exchange_tests.jl` 298 (204) in 16 s (14 s),
+      `mpi_tests.jl` 206 (179). The suite, run once for steps 6 and 7:
+      112635 tests at one thread in 7m27 (`Pkg.test`; 112006 in 8m27
+      after step 5), every one passing; the docs build, doctests
+      included.
+  - **Step 8 — threads and device, and the wave.** *(Done, 2026-10-03.)*
+    - *The wave on a quadrant against the full plane*, the acceptance
+      test left from the list above (`test/rotate_tests.jl`,
+      `rotating_wave`): the scalar wave and a two-component vector wave,
+      state `(v_x, v_y, ∂ₜv_x, ∂ₜv_y)` with `rotation = (−2, 1, −4, 3)`,
+      on the quadrant of `quadrant_and_full` (refinement to level 2 along
+      both seam faces and at the axis) and on the full plane, order 4,
+      RK4 to a quarter period, the exact solution in the hook on the
+      outer faces of both. The exact solution is the sum of the four
+      turns of one standing mode with no symmetry of its own, summed as
+      `(t₀ + t₂) + (t₁ + t₃)`: at the turned point the terms come round
+      as `(t₁ + t₃) + (t₂ + t₀)`, the same bits, since floating-point
+      addition commutes; so the data is covariant bit for bit, and so is
+      its gradient, the vector. The Laplacian adds the two neighbours
+      before subtracting `2u₀`, which makes a point and its image compute
+      the same bits too. *Measured* (`N = 16`, 143 steps on both):
+      cell-centered, `linf` 0.0046035106829825 on the quadrant against
+      0.0046035106829834 on the plane, and every stored point, ghosts
+      included, within 1.9e-13 of the plane's (4.2e-13 for the vector).
+      Vertex-centered, `linf` agrees to the last bit, but the stored
+      points differ by 1.9e-4 (vector 3.2e-4), and that is the *full
+      plane's* fault: its solution is not covariant itself, by 2.0e-3
+      (3.7e-3) under a turn, because which block owns the shared plane
+      of a coarse-fine face — the one above it — does not turn with the
+      mesh, so a plane the coarse block evolves becomes, a half turn
+      away, one the fine block evolves. The quadrant is covariant by
+      construction; the test asserts it within the plane's own defect.
+      The vertex-centered quadrant owns both seam planes, `x = 0` and
+      `y = 0`, which are the same 63 points under the turn: after the
+      evolution they are equal **bit for bit**, scalar and vector. Rates
+      on the quadrant over `N = 8, 16, 32`, `l2` and `linf`: cell 2.04
+      and 2.01 (scalar), 2.02 and 2.00 (vector); vertex 2.04 and 2.00,
+      2.02 and 2.00. The two testsets take about 12 s, mostly
+      compilation.
+    - *Threads.* `thread_workload.jl` gained two rotating quadrants,
+      cell-centered with `G = 2` (`D2ocq`) and vertex-centered with
+      `G = 1` (`D2ovq`): a ring about the axis, so that the refinement
+      reaches both seam faces and the axis, through the adapt, evolve,
+      regrid, evolve cycle, interpolation over the whole plane, and a
+      face-centered `RotationPair` filled as a pair (39 rotated
+      transfers in the final schedule). Its output is the same at one
+      thread and at four; the script takes 26.7 and 25.4 s.
+    - *Device.* `gpu_tests.jl` gained a rotating fill — the `NaN` test
+      of `undefined_rotated_ghosts`, cell and vertex, in 2D and in 3D
+      over a reflecting low face, and a face-centered pair against the
+      CPU — and interpolation through the seam against the host. The
+      oracles' formulas had to be made device-clean: their constants are
+      now converted to the argument's real type (`literal`), the data
+      closure carries the third dimension's kind as a `Val` (a `Symbol`
+      is not plain data), and `outofplane` no longer builds a `Set`;
+      `Float64` results are unchanged bit for bit. On this laptop's
+      Metal GPU (`Float32`, a scratch environment that develops this
+      checkout and adds Metal): the rotating testsets pass, 23 tests on
+      Metal and 46 on the CPU in 43 s, compilation included, and the
+      `NaN` fill reproduces the polynomial data to 3.6e-7 in 2D and
+      8.3e-7 in 3D on Metal, as on the CPU in `Float32`.
+      `mpi_device_workload.jl` gained a rotating quadrant (`Q2v`, 15
+      leaves, the vertex-centered wave) and a face-centered pair
+      (`QP2`); `mpi_device_tests.jl` passes on Metal, 60 tests in 1m59
+      (serial 35 s, `-n 2` 41 s, `-n 3` 42 s; 1m45 before M12), with 8
+      staged messages for `Q2v` and 16 for `QP2` at `-n 3`.
+  - **Step 9 — measurements**, as listed above. *(Done, 2026-10-03.)*
+    All on the laptop (Apple silicon, 12 cores), Julia 1.13.1 unless
+    stated.
+    - *The ordinary fill.* `bench/ghosts.jl` at `-t 4` with its defaults
+      (`D = 3`, `N = 8`, 4 roots, 10 variables, `p = 4`), this checkout
+      against a pristine copy of 0.1.6 with the same manifest, run
+      alternately twice each; seconds and bytes per call:
+
+      | | 0.1.6 | M12 |
+      |---|---|---|
+      | uniform `fill_ghosts` | 0.641, 0.635 ms; 50208 B | 0.516, 0.517 ms; 50208 B |
+      | uniform `ghost_schedule` | 0.217, 0.219 ms; 441888 B | 0.143, 0.141 ms; 406592 B |
+      | two-level `fill_ghosts` | 3.81, 3.77 ms; 310144 B | 3.53, 3.53 ms; 310144 B |
+      | two-level `ghost_schedule` | 2.52, 2.50 ms; 4976688 B | 1.86, 1.87 ms; 4653648 B |
+
+      A fill allocates exactly what it did, and it is not slower: 19 %
+      and 7 % faster in these runs, a difference not investigated (step
+      3 measured the fills equal, 0.52 against 0.51 ms, on a quieter
+      machine). The schedule builds are 8 % and 6 % smaller and 35 % and
+      26 % faster, from step 3's function barrier (`local_groups`).
+    - *The quadrant against the full plane*: step 8, and the single
+      fills of steps 3–5.
+    - *The suite.* 112715 tests at one thread in 7m52 (`Pkg.test`, 8m01
+      wall clock) and 112767 at eight threads in 7m33 (7m43), every one
+      passing, against 110606 in 6m32 and 110658 in 6m28 after M7. On
+      Julia 1.11.9, on a copy without manifests (the procedure in
+      `CLAUDE.md`): 112715 tests in 8m09, every one passing. M12 added
+      about 2100 tests; `rotate_tests.jl` holds 1421 of them and takes
+      about 56 s alone at four threads, nearly all compilation.
+    - *Downstream*, each in a scratch copy whose `Project.toml` and
+      `test/Project.toml` name this checkout under `[sources]`, the real
+      repositories untouched: TreeWave 310 tests in 1m17 (1m22 against
+      M7), TreeHydro 12447 tests in 5m08 (5m00), both at one thread and
+      all passing; neither uses the seam. TreeGeneralizedHarmonic's
+      suite takes about 19 minutes, so only its `prerequisite_tests.jl`,
+      which names the unexported TreeAMR functions it relies on, was run:
+      52 tests, passing.
+  - **Step 10 — documentation and status.** *(Done, 2026-10-03.)* The
+    `rotating` keyword is documented in `Forest`'s docstring and
+    `rotation` in `FieldSet`'s, both already on their pages, and
+    `RotationPair` is on the storage page; the guide gained a section,
+    "Rotating symmetry", with a doctest of a quadrant, a velocity's map
+    and a face-centered pair; README and the guide's status say M12;
+    `CLAUDE.md` gained the architecture bullet "Rotating seams are
+    oriented transfers", the oracles and the workloads in its tests
+    paragraph, and the new timings. The docs build, doctests included.
+    The repository keeps no changelog, so the release note waits for
+    the release itself: M12 is additive — the keywords `rotating` and
+    `rotation`, the export `RotationPair`, the pair forms of
+    `fill_ghosts!`, `regrid!` and `adapt_to_initial_data!`, and a
+    checkpoint feature that only a rotating forest writes — so it is a
+    `0.1.x` release.
 - **M9b — Visualization export.** *(Split from M9, "I/O and
   visualization", on 2026-09-29, when its checkpoint half became M9a;
   not designed.)* After M7. The candidates:

@@ -85,6 +85,13 @@ layout as they were when it was built, and
 [`GhostSchedule`](@ref) does, and for the same reason: every target range
 in it is wrong for another mesh or another `G`.
 
+A rotating seam (M12) is never a coarse-fine face, since the forest is
+conforming there (see [`balance!`](@ref)), so nothing is restricted
+across it: the two sides of a seam face compute the same flux, each the
+other's image, as long as the application's flux is covariant under the
+quarter turn, which a flux in Cartesian components is. A flux set over
+such a forest, with `G = 0`, needs no partner.
+
 Unlike a [`GhostSchedule`](@ref) this takes no [`Operators`](@ref). The
 transfer is not interpolation: it is injection and the exact two-cell
 average, fixed by the geometry, so there is no order to choose.
@@ -106,13 +113,26 @@ isstale(s::InterfaceSchedule) = generation(s.forest) != s.generation
 # *coarse* side of. A block whose neighbor across a face is coarser does
 # nothing — that face is the coarser block's target — and a face at the
 # domain boundary carries whatever flux the application computed there.
+#
+# A rotating seam (M12) is never a coarse-fine face: `balance!` keeps the
+# leaves on its two sides at one level (conformity), so the search across
+# it finds a same-level neighbor and records nothing. A finer neighbor
+# with a nonzero orientation would need a turned restriction, which this
+# schedule does not build; it can only mean a forest that is not
+# conforming, which the checked paths refuse, so it is a bug, not an
+# argument error.
 function interface_sources!(pairs::TransferPairs{D}, forest::Forest{D},
                             faces::Vector{Int}, b::Int) where {D}
     k = forest.leaves[b]
     for d in faces, s in (-1, 1)
         δ = ntuple(e -> e == d ? s : 0, D)
-        nbrs = neighbor_keys(forest, k, δ)
+        r, nbrs = oriented_neighbors(forest, k, δ)
         (isempty(nbrs) || level(first(nbrs)) <= level(k)) && continue
+        r == 0 || error(
+            "the interface schedule found a finer neighbor of $k across the rotating " *
+            "seam (orientation $r, direction $δ), but the seam is conforming, so " *
+            "every face across it is a same-level face. The forest is not balanced " *
+            "as `balance!` leaves it; this is a bug.")
         for nbr in nbrs
             push!.(get!(pairs, GroupKey{D}(:restrict, δ, childoffset(nbr), 0),
                         (Int32[], Int32[])),

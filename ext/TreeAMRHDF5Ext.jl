@@ -53,7 +53,8 @@ using CRC32c: crc32c
 using TreeAMR
 using TreeAMR: threaded_foreach, tohost, samebackend, Communicator, commrank, commsize,
                allgather, allgatherv, bcast, commnodes, isend, irecv, waitall,
-               equalsplit, equalsplit_part, ForestDigest, digest_verdict, layouthash
+               equalsplit, equalsplit_part, ForestDigest, digest_verdict, layouthash,
+               hasrotating, rotating_dims
 import TreeAMR: save_checkpoint, load_checkpoint, write_plain, read_plain,
                 checkpoint_environment
 
@@ -66,7 +67,13 @@ const FORMAT_VERSION = 2
 const READ_VERSIONS = (1, 2)
 # Every feature listed in a file must be understood by its reader; one
 # that may be ignored is simply not listed (Zarr v3's `must_understand`).
-const FEATURES = ("brick",)
+# `rotating` (M12) is listed only by a file whose forest has a rotating
+# seam, so that a reader from before M12 refuses that file instead of
+# loading the seam as two outer faces, and still reads every other one.
+const FEATURES = ("brick", "rotating")
+
+# The features a file over `forest` lists.
+features_of(forest::Forest) = hasrotating(forest) ? ["brick", "rotating"] : ["brick"]
 
 # --- element types -------------------------------------------------------
 
@@ -679,6 +686,10 @@ function write_forest(root, forest::Forest{D,R}) where {D,R}
         # (lo, hi) per dimension: a (2, D) array, which C sees as (D, 2).
         write_attribute(g, "reflecting",
                         UInt8[forest.reflecting[d][s] for s in 1:2, d in 1:D])
+        # The rotating seam's pair `(d1, d2)` (M12), only where there is one:
+        # its absence is the only reading a file without it has.
+        hasrotating(forest) &&
+            write_attribute(g, "rotating", Int64[rotating_dims(forest)...])
         write_typeattrs(g, R, GEOMETRY_ATTRS)
         F, limbs = storage_of(R, "the forest's geometry")
         extents = R[forest.extents[d][s] for s in 1:2, d in 1:D]
@@ -707,7 +718,7 @@ function write_forest(root, forest::Forest{D,R}) where {D,R}
     return nothing
 end
 
-function read_forest(g, types, context, comm, version)
+function read_forest(g, types, context, comm, version, features)
     note = writer_note(context)
     connectivity = read_attribute(g, "connectivity")
     connectivity == "brick" || throw(ArgumentError(
@@ -717,14 +728,14 @@ function read_forest(g, types, context, comm, version)
     (D isa Integer && D >= 1) || throw(ArgumentError(
         "the forest's dimension, D = $(repr(D)), is not a positive integer: the file is " *
         "damaged. " * note))
-    return read_forest(g, Val(Int(D)), types, context, comm, version)
+    return read_forest(g, Val(Int(D)), types, context, comm, version, features)
 end
 
 # Every rank reads every leaf, since the forest is replicated — over
 # several ranks from its own copy of the index's image, so every rank
 # reaches the same verdict on it without a message — and builds it over
 # `comm`.
-function read_forest(g, ::Val{D}, types, context, comm, version) where {D}
+function read_forest(g, ::Val{D}, types, context, comm, version, features) where {D}
     note = writer_note(context)
     N = read_attribute(g, "N")
     roots = read_attribute(g, "roots")
@@ -733,6 +744,7 @@ function read_forest(g, ::Val{D}, types, context, comm, version) where {D}
         note))
     periodic = read_flags(g, "periodic", (D,), note)
     reflecting = read_flags(g, "reflecting", (2, D), note)
+    rotating = read_rotating(g, "rotating" in features, note)
     R, F, limbs = read_typeattrs(g, GEOMETRY_ATTRS, types, "the forest's geometry",
                                  context)
     extents = read_array!(Matrix{R}(undef, 2, D), g["extents"], F, (limbs..., 2, D),
@@ -766,8 +778,33 @@ function read_forest(g, ::Val{D}, types, context, comm, version) where {D}
                      reflecting=ntuple(D) do d
                          (reflecting[1, d] == 1, reflecting[2, d] == 1)
                      end,
+                     rotating=rotating,
                      extents=ntuple(d -> (extents[1, d], extents[2, d]), D),
                      leaves=leaves, comm=comm)
+end
+
+# The rotating seam's pair (M12), `nothing` for a forest without one. The
+# attribute and the feature go together: a file with one and not the
+# other was not written by any TreeAMR, and is refused rather than read
+# with or without a seam. The pair itself is checked by the forest, as a
+# caller's would be.
+function read_rotating(g, listed::Bool, note)
+    if !hasattr(g, "rotating")
+        listed && throw(ArgumentError(
+            "the file lists the feature \"rotating\", but its forest has no " *
+            "`rotating` attribute, the pair of dimensions of the seam, which every " *
+            "file with the feature stores: the file is damaged. " * note))
+        return nothing
+    end
+    listed || throw(ArgumentError(
+        "the forest has a rotating seam, but the file does not list the feature " *
+        "\"rotating\", which every file with a seam lists so that a reader that does " *
+        "not know it refuses the file: the file is damaged. " * note))
+    pair = read_attribute(g, "rotating")
+    (pair isa AbstractVector{<:Integer} && length(pair) == 2) || throw(ArgumentError(
+        "the forest's rotating seam, $(repr(pair)), is not a pair of dimensions: the " *
+        "file is damaged. " * note))
+    return (Int(pair[1]), Int(pair[2]))
 end
 
 # --- field sets ------------------------------------------------------------
@@ -797,6 +834,8 @@ function write_layout(parent, name, fs::FieldSet{T,D}) where {T,D}
         # (D, nvars), which C sees as (nvars, D).
         fs.parity === nothing ||
             write_attribute(g, "parity", [parity_name(p[d]) for d in 1:D, p in fs.parity])
+        # The signed variable map of a rotating seam (M12), where there is one.
+        fs.rotation === nothing || write_attribute(g, "rotation", Int64[fs.rotation...])
         write_attribute(g, "range", "owned")
     finally
         close(g)
@@ -826,7 +865,17 @@ function read_layout(g, name, ::Val{D}, types, context) where {D}
             "is damaged. " * note))
         parity = [ntuple(d -> parity_of(names[d, v], note), D) for v in 1:nvars]
     end
-    return (; name=String(name), T, F, limbs, nvars, G, centering, parity)
+    # Checked as a map by the field set's constructor, as a caller's is.
+    rotation = nothing
+    if hasattr(g, "rotation")
+        rotation = read_attribute(g, "rotation")
+        (rotation isa AbstractVector{<:Integer} && length(rotation) == nvars) ||
+            throw(ArgumentError(
+                "$what has the rotation $(repr(rotation)), not $nvars signed variable " *
+                "indices, one per variable: the file is damaged. " * note))
+        rotation = Int.(rotation)
+    end
+    return (; name=String(name), T, F, limbs, nvars, G, centering, parity, rotation)
 end
 
 # How a field set's blocks are stored: the dimensions of one block in the
@@ -1210,7 +1259,7 @@ end
 set_layout((name, fs, u)) =
     (name, typename(eltype(fs.work)), fs.nvars, fs.G, string.(fs.centering),
      fs.parity === nothing ? "" : string(map(p -> map(parity_name, p), fs.parity)),
-     u === nothing)
+     fs.rotation === nothing ? "" : string(fs.rotation), u === nothing)
 
 # The steps of "Checkpoints without parallel I/O" in CODE.md: the parts,
 # the index, the commit, the cleanup. Every rank runs this; each step
@@ -1371,7 +1420,7 @@ function write_index!(file, path, saveid, forest, sets, appname, reports, k, nra
     try
         write_attribute(root, "format", FORMAT)
         write_attribute(root, "format_version", Int64(FORMAT_VERSION))
-        write_attribute(root, "features", collect(String, FEATURES))
+        write_attribute(root, "features", features_of(forest))
         write_attribute(root, "application", appname)
         write_attribute(root, "save_id", saveid)
         write_provenance(root, provenance_values(nranks, k))
@@ -1615,7 +1664,7 @@ function check_format(root, context)
         "$(join(repr.(unknown), ", ")), which this version of TreeAMR does not know. A " *
         "feature is listed only when a reader must understand it to read the file " *
         "correctly, so a file with an unknown one is refused rather than misread. " * note))
-    return Int(version)
+    return Int(version), collect(String, features)
 end
 
 function select_fieldsets(group, fieldsets, context)
@@ -1828,8 +1877,8 @@ end
 function load_from(f, meta, real, r::Ranks, path, types, backend, fieldsets)
     root = meta[GROUP]
     context = context_of(root, path)
-    version = check_format(root, context)
-    forest = read_forest(root["forest"], types, context, r.comm, version)
+    version, features = check_format(root, context)
+    forest = read_forest(root["forest"], types, context, r.comm, version, features)
     D = dimension(forest)
     n = nleaves(forest)
     group = root["fieldsets"]
@@ -1840,7 +1889,7 @@ function load_from(f, meta, real, r::Ranks, path, types, backend, fieldsets)
     # is what decides their NUMA domain; the reads below only fill them.
     sets = map(layouts) do l
         fs = FieldSet{l.T}(forest, l.nvars; G=l.G, centering=l.centering, parity=l.parity,
-                           backend=backend)
+                           rotation=l.rotation, backend=backend)
         return (; fieldset=fs, state=statevector(fs))
     end
     table = read_parttable(root, version, n, names, context)
