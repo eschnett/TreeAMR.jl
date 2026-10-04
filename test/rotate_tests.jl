@@ -1087,6 +1087,33 @@ end
     println("Float32 beyond the seam: within $(maximum(abs.(res[2] .- res[1]))) of Float64")
 end
 
+@testset "A turned point reads variables it was not asked for" begin
+    # The failure mode: the turn takes a requested component to one that is
+    # not in `vars` — the metric's g_xz to g_yz — and an implementation that
+    # only loaded the requested variables would read the wrong one. The
+    # kernel reads the turned variable from the whole field set, so `vars`
+    # needs no closure under the rotation. (Metric order xx, xy, xz, yy, yz,
+    # zz; under R, g_xz′ = −g_yz.)
+    rot = (4, -2, -5, 1, 3, 6)
+    par = [ntuple(d -> d == 3 && v in (3, 5) ? OddParity : EvenParity, 3) for v in 1:6]
+    forest = Forest((2, 2, 2); N=8, rotating=(1, 2),
+                    reflecting=((false, false), (false, false), (true, false)))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    fs = FieldSet(forest, 6; G=2, centering=vertexcentered(3), parity=par, rotation=rot)
+    f(x, v) = sin(0.7x[1] + 0.3v) * cos(0.4x[2] - 0.2v) * (1 + 0.1v * x[3]^2) +
+              0.05v * x[1] * x[2]
+    fill_by_coordinates!(f, fs)
+    fill_ghosts!(fs, GhostSchedule(fs, ROT_OPS4); boundary=boundary_by_coordinates(f))
+    derivs = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))
+    q = (0.83, 0.41, 0.57)
+    p = (-q[2], q[1], q[3])                         # R q, beyond the low x face
+    a = interpolate(fs, [p], Lagrange(4); derivs=derivs, vars=[3]).values[1, :, 1]
+    b = interpolate(fs, [q], Lagrange(4); derivs=derivs, vars=[5]).values[1, :, 1]
+    # g_xz(p) = −g_yz(q) with q = (p_y, −p_x, p_z): ∂ₓ ↦ −∂_y, ∂_y ↦ ∂ₓ.
+    @test a == [-b[1], b[3], -b[2], -b[4]]
+end
+
 @testset "A set that turns into its partner refuses points beyond the seam" begin
     # A face-centered set's value beyond the seam is its partner's, turned;
     # read from itself it would be the wrong component in the wrong
