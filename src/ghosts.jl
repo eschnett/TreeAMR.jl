@@ -65,6 +65,18 @@
     end
 end
 
+# A copy: a group whose stencils are all one point of weight one (see
+# `Stencil1D`'s `unit`) is launched with `weights = nothing`, and loads
+# its one value without the `D` weight loads and the product. The sum
+# above starts from zero, and `0 + 1·x` is `x` for every `x` but `-0`,
+# which it makes `+0`; so does this, which keeps a fill bit-identical to
+# what the general path computed, and keeps the distributed exchange's
+# `-0` rule ("The sender computes" in CODE.md) as it was.
+@inline function stencil_sum(src, ::Nothing, base::NTuple{D,Int}, wcol::NTuple{D,Int}, v,
+                             sblock, ::Val{Ps}) where {D,Ps}
+    return @inbounds zero(transfer_eltype(src)) + transfer_load(src, base, v, sblock)
+end
+
 # The packed buffer of a distributed exchange (M7), as a kernel sees it.
 #
 # Pack and unpack are transfers like any other, so they go through the
@@ -182,12 +194,18 @@ end
 # when regridding transfers into freshly allocated storage. Neither is
 # marked @Const, so the aliasing case stays well defined.
 #
-# The launch is over the target box itself — `ndrange = (blen…, nvars,
-# ntransfers)` — so the backend supplies the per-axis position and the
-# kernel does no index arithmetic to recover it. Flattening the box into
-# one axis and unflattening it here cost an integer `div` and `rem` per
-# dimension per ghost point per variable: 9 % of a copy-dominated fill's
-# self time, and the single largest entry after the bounds checks.
+# On the CPU the launch is over the target box itself — `ndrange =
+# (blen…, nvars, ntransfers)` — so the backend supplies the per-axis
+# position by iterating the workgroup, and the kernel does no index
+# arithmetic to recover it. Flattening the box into one axis and
+# unflattening it here cost an integer `div` and `rem` per dimension per
+# ghost point per variable: 9 % of a copy-dominated fill's self time, and
+# the single largest entry after the bounds checks. On a device that same
+# division happens anyway, in KernelAbstractions' own forming of the
+# global index, and as a 64-bit division emulated in software it held the
+# fill to 0.65 of an H200's 4.8 TB/s; so a device launch is flat,
+# and the position comes from `shape`'s precomputed inverses instead
+# (`launch_positional!`, and "The copy kernels on a device" in CODE.md).
 #
 # `factors` is `nothing` for every ordinary transfer, and then `scaled`
 # is the identity and the kernel is exactly what it was before M10. A
@@ -199,13 +217,14 @@ end
 @inline scaled(acc, ::Nothing, v, col) = acc
 @inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
 
-@kernel function transfer_kernel!(dest, src,
+@kernel function transfer_kernel!(shape, dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
                                   srcstarts, weights,
                                   targetfirst::NTuple{D,Int}, toffset::Int,
                                   factors, fcol::Int,
                                   ::Val{Ps}, ::Val{D}) where {Ps,D}
-    I = @index(Global, NTuple)
+    J = @index(Global, NTuple)
+    I = kernel_position(shape, J)
     # `I[1:D]` is the position within the target region, one-based.
     v = I[D + 1]
     t = I[D + 2] + toffset
@@ -233,9 +252,12 @@ end
 # even orientation and from `altsrc` for an odd one — the partner's
 # working array in a `RotationPair`, the set's own otherwise — with the
 # variable table `rotvars`; an ordinary group launches exactly as before.
+# `flat` is the launch's form, flat on a device and shaped on the CPU
+# unless a test asks otherwise (see `launch_shape`).
 function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backend;
                     range=1:ntransfers(group), single::Bool=false,
-                    factors=nothing, altsrc=src, rotvars=nothing) where {T,D}
+                    factors=nothing, altsrc=src, rotvars=nothing,
+                    flat::Bool=flatlaunch(backend)) where {T,D}
     n = length(range)
     n == 0 && return nothing
     group.factorcol == 0 || factors !== nothing || throw(ArgumentError(
@@ -254,8 +276,10 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # One width per dimension, not one shared width: see the kernel.
     orders = ntuple(d -> stencilorder(group.stencils[d]), Val(D))
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
-    weights = ntuple(d -> group.stencils[d].weights, Val(D))
-    ndrange = (blen..., Int(nvars), n)
+    # A copy goes without its weights: see the `Nothing` `stencil_sum`.
+    weights = all(s -> s.unit, group.stencils) ? nothing :
+              ntuple(d -> group.stencils[d].weights, Val(D))
+    shape, ndrange = launch_shape(flat, (blen..., Int(nvars), n))
     kdest = kernelarg(dest, (blen..., Int(nvars)))
     ksrc = kernelarg(src, (blen..., Int(nvars)))
 
@@ -268,13 +292,13 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     kernel! = transfer_kernel!(backend)
     if group.orientation != 0
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
-        kernel!(kdest, rsrc, group.targetblocks, group.sourceblocks,
+        kernel!(shape, kdest, rsrc, group.targetblocks, group.sourceblocks,
                 srcstarts, weights, tfirst, first(range) - 1, gfactors,
                 Int(group.factorcol), Val(orders), Val(D);
                 ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
         return nothing
     end
-    kernel!(kdest, ksrc, group.targetblocks, group.sourceblocks,
+    kernel!(shape, kdest, ksrc, group.targetblocks, group.sourceblocks,
             srcstarts, weights, tfirst, first(range) - 1, gfactors, Int(group.factorcol),
             Val(orders), Val(D);
             ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))

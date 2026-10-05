@@ -46,26 +46,50 @@ sharing memory. This is the layout application kernels write `du` in;
 the index order matches the working array, minus the ghosts.
 """
 function statearray(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
-    length(u) == statelength(fs) || throw(DimensionMismatch(
-        "state vector has $(length(u)) entries but this field set needs " *
-        "$(statelength(fs))"))
+    check_statelength(u, fs)
     return reshape(u, ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs))
 end
 
-@kernel function scatter_kernel!(work, @Const(state), ::Val{D}, ::Val{G}) where {D,G}
-    I = @index(Global, NTuple)                     # (i1..iD, var, block)
-    work[ntuple(d -> I[d] + G[d], Val(D))..., I[D + 1], I[D + 2]] = state[I...]
+function check_statelength(u::AbstractVector, fs::FieldSet)
+    length(u) == statelength(fs) || throw(DimensionMismatch(
+        "state vector has $(length(u)) entries but this field set needs " *
+        "$(statelength(fs))"))
+    return nothing
 end
 
-@kernel function gather_kernel!(state, @Const(work), ::Val{D}, ::Val{G}) where {D,G}
-    I = @index(Global, NTuple)
-    state[I...] = work[ntuple(d -> I[d] + G[d], Val(D))..., I[D + 1], I[D + 2]]
+# The two copies between the state vector and the working array. On a
+# device they launch over one linear axis, the state vector's own index,
+# and recover `(i1..iD, var, block)` through `shape` (see
+# `launch_positional!`): the block-shaped launch made a device divide
+# twice per axis per value to form the index, which held these copies to a
+# fifth of the memory bandwidth ("The copy kernels on a device" in
+# CODE.md). On the CPU the launch is block-shaped as before. The state
+# vector is read and written linearly either way, at the launch's own
+# linear index, which is the state vector's under both launches.
+@kernel function scatter_kernel!(shape, work, @Const(state), ::Val{D},
+                                 ::Val{G}) where {D,G}
+    J = @index(Global, NTuple)           # (KA's CPU emitter wants it on its own)
+    n = @index(Global, Linear)
+    I = kernel_position(shape, J)                  # (i1..iD, var, block)
+    @inbounds work[ntuple(d -> I[d] + G[d], Val(D))..., I[D + 1], I[D + 2]] = state[n]
 end
 
-function run_over_interiors!(kernel, fs::FieldSet{T,D}, a, b) where {T,D}
+@kernel function gather_kernel!(shape, state, @Const(work), ::Val{D},
+                                ::Val{G}) where {D,G}
+    J = @index(Global, NTuple)
+    n = @index(Global, Linear)
+    I = kernel_position(shape, J)
+    @inbounds state[n] = work[ntuple(d -> I[d] + G[d], Val(D))..., I[D + 1], I[D + 2]]
+end
+
+# The indices are the launch's own and the shape's, so the accesses are
+# `@inbounds`, which CI's `check_bounds=yes` overrides as it does for the
+# transfer kernel.
+function run_over_interiors!(kernel, fs::FieldSet{T,D}, a, b;
+                             flat::Bool=flatlaunch(get_backend(fs.work))) where {T,D}
     backend = get_backend(fs.work)
-    launch_by_owner!(kernel, backend, a, b, Val(D), Val(fs.G);
-                     ndrange=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
+    launch_positional!(kernel, backend, a, b, Val(D), Val(fs.G); flat=flat,
+                       extents=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
     return nothing
 end
@@ -78,7 +102,8 @@ ghosts untouched. The first step of every RHS evaluation; follow it with
 [`fill_ghosts!`](@ref).
 """
 function scatter!(fs::FieldSet{T,D}, u::AbstractVector) where {T,D}
-    run_over_interiors!(scatter_kernel!, fs, fs.work, statearray(u, fs))
+    check_statelength(u, fs)
+    run_over_interiors!(scatter_kernel!, fs, fs.work, u)
     return fs
 end
 
@@ -93,7 +118,8 @@ directly, fusing this away; `gather!` is for setting up initial data and
 for reading results back out.
 """
 function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
-    run_over_interiors!(gather_kernel!, fs, statearray(u, fs), fs.work)
+    check_statelength(u, fs)
+    run_over_interiors!(gather_kernel!, fs, u, fs.work)
     return u
 end
 

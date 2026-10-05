@@ -34,23 +34,37 @@ are exact rational arithmetic, which is precisely the kind of work a
 device should not be asked to do — and uploaded once, when the schedule
 is built. `targetfirst` is a plain `Int` passed by value and stays on
 the host.
+
+`unit` says that the stencil is a plain copy along its dimension: one
+point, weight exactly one. A group whose stencils are all unit is
+launched without its weights, so that a copy does no stencil arithmetic
+(see `stencil_sum`). It is decided from the weights themselves on the
+host, where they are built, and carried to a device with them. It is
+not the group's kind: a mirrored copy at a vertex-like high wall derives
+the wall plane it does not own by interpolation (`wall_stencil`), and a
+vertex-centered `PointValue` restriction is an injection, which is unit.
 """
 struct Stencil1D{T,VI<:AbstractVector{Int32},MW<:AbstractMatrix{T}}
     targetfirst::Int
     srcstart::VI
     weights::MW
+    unit::Bool
 end
 
 Stencil1D{T}(targetfirst::Int, srcstart::AbstractVector{Int32},
-             weights::AbstractMatrix{T}) where {T} =
-    Stencil1D{T,typeof(srcstart),typeof(weights)}(targetfirst, srcstart, weights)
+             weights::Matrix{T}) where {T} =
+    Stencil1D{T}(targetfirst, srcstart, weights,
+                 size(weights, 1) == 1 && all(isone, weights))
+Stencil1D{T}(targetfirst::Int, srcstart::AbstractVector{Int32},
+             weights::AbstractMatrix{T}, unit::Bool) where {T} =
+    Stencil1D{T,typeof(srcstart),typeof(weights)}(targetfirst, srcstart, weights, unit)
 
 ntarget(s::Stencil1D) = length(s.srcstart)
 Base.@propagate_inbounds stencilorder(s::Stencil1D) = size(s.weights, 1)
 
 todevice(backend::Backend, s::Stencil1D{T}) where {T} =
     Stencil1D{T}(s.targetfirst, todevice(backend, s.srcstart),
-                 todevice(backend, s.weights))
+                 todevice(backend, s.weights), s.unit)
 
 """
     TransferGroup{T,D}

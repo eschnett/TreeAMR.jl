@@ -192,6 +192,100 @@ function launch_by_owner!(kernel, backend::CPU, args...; ndrange)
     return nothing
 end
 
+# A launch flattened to one axis on a device, for the copy kernels.
+#
+# KernelAbstractions forms `@index(Global, NTuple)` on a device by indexing
+# two `CartesianIndices` — the workgroup's position in the grid, and the
+# item's in the workgroup — with linear ids, which costs two integer
+# divisions per axis when the extents are run-time values: a 64-bit
+# division, emulated in software, per axis per work item. In a kernel whose
+# work is one load and one store that is nearly everything — about 1200
+# SASS instructions to copy one value on an H200 ("The copy kernels on a
+# device" in CODE.md). A one-dimensional ndrange needs no division at all,
+# so on a device the copy kernels launch over one axis and recover their
+# position themselves, by multiplying with each extent's precomputed
+# inverse (`Base.MultiplicativeInverses`, the arithmetic a compiler applies
+# to a division by a constant) rather than dividing.
+#
+# The CPU keeps the shaped launch. There the backend iterates a
+# workgroup's `CartesianIndices` by incrementing, with no division, and
+# the innermost axis runs along a contiguous row; a flat launch made the
+# CPU scatter 2.3x slower (measured 38.8 → 89 ns a point at `16³`, 20
+# variables), half of it the inverses and half the stores no longer
+# running along a row. So a kernel launched through `launch_positional!`
+# takes its position from `kernel_position(shape, I)`: `shape` is
+# `nothing` on the CPU, where `I` is already the position, and a
+# `LinearShape` on a device, where the launch is flat. One kernel serves
+# both.
+#
+# `LinearShape` holds the inverses of the first `K` extents of a `K + 1`-
+# axis shape; the last extent needs none, since nothing is divided by it.
+# It is isbits, so it is a kernel argument on every backend. Building one
+# costs about 9 ns an extent, so it is built at each launch. Its arithmetic
+# is `Int32` whenever the whole launch fits, and `Int` otherwise: measured
+# for a scatter's index (D = 3), the 32-bit form took 3.0 ns a point on
+# Metal against 5.0; signed, because Base's unsigned inverse branches. A
+# launch past 2³¹ items (a 17 GB state vector of `Float64`) takes the `Int`
+# form and is still exact.
+struct LinearShape{K,I<:Union{Int32,Int}}
+    inverses::NTuple{K,SignedMultiplicativeInverse{I}}
+end
+
+function LinearShape(extents::Tuple{Vararg{Integer}})
+    I = prod(Int, extents) <= typemax(Int32) ? Int32 : Int
+    inverses = map(e -> SignedMultiplicativeInverse{I}(I(e)), Base.front(extents))
+    return LinearShape{length(inverses),I}(inverses)
+end
+
+# The one-based position `(i₁, …, i_{K+1})` of the one-based linear index
+# `n`, column-major as `CartesianIndices` orders it, as `Int`s. Recursion
+# over the tuple rather than a loop, so that it unrolls in a device kernel
+# too.
+@inline linear_position(s::LinearShape{K,I}, n::Integer) where {K,I} =
+    map(Int, _position(s.inverses, (n - 1) % I))
+@inline _position(::Tuple{}, x::Integer) = (x + one(x),)
+@inline function _position(inverses::Tuple, x::Integer)
+    q = div(x, first(inverses))
+    r = x - q * first(inverses).divisor
+    return (r + one(x), _position(Base.tail(inverses), q)...)
+end
+
+# A kernel's position from its global index tuple `I`: the tuple itself
+# under a shaped launch, the position of its one linear index under a flat
+# one.
+@inline kernel_position(::Nothing, I::Tuple) = I
+@inline kernel_position(s::LinearShape, I::Tuple{Integer}) = linear_position(s, first(I))
+
+# The launch of `kernel_position`'s two forms: the shape and the ndrange for
+# `extents`. `nothing` and the extents themselves for a shaped launch, a
+# `LinearShape` and the product for a flat one. A device launches flat and
+# the CPU shaped (`flatlaunch`); the callers take `flat` as a keyword, so
+# that the suite runs the device's form on the CPU, where CI has no device.
+flatlaunch(::CPU) = false
+flatlaunch(::Backend) = true
+launch_shape(flat::Bool, extents::Tuple) =
+    flat ? (LinearShape(extents), prod(Int, extents)) : (nothing, extents)
+
+# `launch_by_owner!` for a kernel that takes its position through
+# `kernel_position`: `shape` is its first argument, and `extents` the shaped
+# ndrange, block index last. A shaped launch goes by owner as it is; a flat
+# one on the CPU, which only the suite asks for, is one block per workgroup
+# on KernelAbstractions' default schedule, not by owner.
+function launch_positional!(kernel, backend::Backend, args...; extents::Tuple,
+                            flat::Bool=flatlaunch(backend))
+    any(iszero, extents) && return nothing          # a rank without blocks (M7)
+    shape, ndrange = launch_shape(flat, extents)
+    if !flat
+        launch_by_owner!(kernel, backend, shape, args...; ndrange=ndrange)
+    elseif backend isa CPU
+        kernel(backend)(shape, args...; ndrange=ndrange,
+                        workgroupsize=prod(Int, Base.front(extents)))
+    else
+        kernel(backend)(shape, args...; ndrange=ndrange)
+    end
+    return nothing
+end
+
 """
     threaded_collect(f!, T, n) -> Vector{T}
 

@@ -12,6 +12,7 @@ module TreeAMR
 using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize,
                           Backend, CPU, allocate, supports_float64
 import KernelAbstractions
+using Base.MultiplicativeInverses: SignedMultiplicativeInverse
 
 # Tree core (M1)
 export MortonKey, MAX_LEVEL, level, parentkey, childkeys, sortedchildkeys, isancestor
