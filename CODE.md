@@ -1160,7 +1160,12 @@ self time, and the largest entry after the bounds checks. It is now
 position and no division happens at all. `map_blocks!` already launched
 a `D + 1`-dimensional ndrange, so this is not new ground for the device
 backends; on a GPU the division moves into KernelAbstractions' own
-`expand`, where it belongs. The two boundary kernels had the same
+`expand`, where it belongs. *(Amended 2026-10-05: on a GPU it does not
+belong there. KernelAbstractions forms the index with run-time 64-bit
+divisions, emulated in software, and that held the fill and the scatter
+to a fifth of an H200's bandwidth; a device now launches flat and
+divides by precomputed inverses, while the CPU keeps this launch — see
+[The copy kernels on a device](#the-copy-kernels-on-a-device).)* The two boundary kernels had the same
 flattening and got the same treatment. Since this is the one change that
 alters launch geometry, it was checked on real hardware and not only
 argued: the whole suite passes on Metal (Apple M3 Pro, `Float32`).
@@ -1215,6 +1220,120 @@ KernelAbstractions' own `CartesianIndices` iteration over the workgroup
 — which is now the single largest entry in a copy-dominated fill, where
 each ghost point does exactly one stencil point of work. That is KA's
 loop, not ours, and removing it would mean not using KA's CPU emitter.
+
+### The copy kernels on a device
+
+*(Measured and changed 2026-10-05.)* TreeGeneralizedHarmonic made its
+right-hand-side kernel 8× faster on an H200, 8.5 → 1.1 ns a point, and
+then found what was left of an evaluation to be TreeAMR's: `scatter!`
+and `fill_ghosts!` were 0.73 of its 1.81 ns a point at `32³`, and 1.39 of
+2.61 at `16³` (its `CODE.md`, "Upstream prerequisites", item 5, and "The
+right-hand side on an H200"). The scatter ran at 0.96 TB/s and the
+transfer kernel at 0.65, of the H200's 4.8.
+
+**The index was the cost.** Both kernels launched over a `D + 2`-axis
+ndrange with run-time extents and read `@index(Global, NTuple)`. On a
+device KernelAbstractions forms that by indexing two `CartesianIndices`
+— the workgroup's place in the grid, the item's in the workgroup — with
+linear ids (`expand` in its `nditeration.jl`): two integer divisions per
+axis, in 64 bits, which a GPU emulates in software. The downstream
+counted about 1200 SASS instructions to copy one value. On the CPU none
+of this happens: the backend iterates a workgroup's `CartesianIndices` by
+incrementing.
+
+**A device launches flat; the CPU keeps the shaped launch.** One kernel
+serves both (`launch_positional!` and `kernel_position` in
+`threading.jl`). On a device the ndrange is one axis, which `expand`
+forms without dividing, and the kernel recovers its position by
+multiplying with each extent's precomputed inverse
+(`Base.MultiplicativeInverses.SignedMultiplicativeInverse`, the
+arithmetic a compiler applies to a division by a constant), carried in a
+`LinearShape` kernel argument built at each launch (about 9 ns an
+extent). Its arithmetic is `Int32` when the launch has at most 2³¹ − 1
+items and `Int` otherwise. On the CPU the launch is the shaped one by
+owner, as before, because a flat launch there cost the scatter 2.3×
+(38.8 → 89 ns a point at `16³`, 20 variables, one thread): half of that
+was the inverses, and half was stores that no longer ran along a row. The
+suite runs the flat form on the CPU too (`flat = true`), since CI has no
+device, and requires it to fill bit for bit as the shaped form does.
+
+**A copy skips its weights.** `Stencil1D` records whether it is one point
+of weight exactly one (`unit`, decided on the host from the weights), and
+a group whose stencils are all unit launches with `weights = nothing`:
+one load, no `D` weight loads, no product. It computes `0 + x`, not `x`,
+because the general sum starts from zero and `0 + 1·x` turns `−0` into
+`+0`; so fills are bit-identical to 0.1.7, which was checked by digest of
+the whole working array (ghosts included) over `D = 1, 2, 3`, both
+centerings, both operator families, reflecting walls and rotating seams,
+in `Float64` and `Float32`, and by `thread_workload.jl` and the serial
+`mpi_workload.jl`, whose outputs are unchanged. `unit` comes from the
+weights, not from the kind: a mirrored copy at a vertex-like high wall
+interpolates the wall plane it does not own (`wall_stencil`), and a
+vertex-centered `PointValue` restriction is an injection, so it is unit.
+
+**What it buys on an H200** (job 570290, `bench/copies.jl` from
+`bench/symmetry_copies.sh`: a uniform periodic mesh, 20 variables,
+`G = 3`, vertex-centered, `Float64`; 0.1.7 measured in the same job
+reproduces the downstream's numbers to the digit):
+
+| ns per owned point | 512 × `16³` | 512 × `32³` | 8 × `128³` |
+|---|---|---|---|
+| `scatter!`, 0.1.7 → now | 0.358 → **0.182** | 0.335 → **0.140** | 0.329 → **0.116** |
+| `gather!` | 0.382 → **0.147** | 0.441 → **0.136** | 0.330 → **0.134** |
+| `fill_ghosts!` | 1.031 → **0.816** | 0.399 → **0.296** | 0.081 → **0.060** |
+| a linear copy of the state, the floor | 0.100 | 0.093 | 0.093 |
+
+On a two-level mesh (960 blocks of `32³`) the fill went 0.481 → 0.362.
+The scatter reaches the downstream's static-stride prototype (0.14 at
+`32³`) without a block size in the type. On Metal (Apple M3 Pro,
+`Float32`, 64 blocks of `16³`) the scatter went 12.4 → 3.1 ns a point
+against a floor of 1.9, and the fill 38.9 → 11.8. On the CPU the shaped
+launch is kept, and the scatter still gained, from reading the state
+vector linearly and `@inbounds`: 38.8 → 11.7 ns a point at one thread,
+9.1 → 6.2 at six; the fill of `bench/ghosts.jl` 2.85 → 1.87 ms uniform
+and 14.2 → 11.0 ms two-level at one thread, 0.52 → 0.37 ms uniform and
+3.70 → 3.76 two-level at four.
+
+**How the index is formed no longer matters** (`bench/copy_index.jl`,
+the scatter's copy written seven ways, H200, `16³`, `Float64`): the
+`NTuple` index 0.341 ns a point, 64-bit inverses 0.232, 32-bit inverses
+0.181, the same with the store's linear index in 32 bits 0.181, shifts
+and masks for a power-of-two `N` 0.181, and no arithmetic at all, the
+store index read from a table, 0.189; a plain copy 0.100. At `32³` the same
+seven are 0.395, 0.225, 0.140, 0.139, 0.139, 0.148 and 0.093. So a
+power-of-two block size would buy nothing, and the remaining 1.8× is the
+store pattern: rows of `N` values written at an offset of `G` into rows
+of `N + 2G + c`. That is the layout's, an open question below
+([Open questions](#open-questions), "The working array's layout").
+
+**The fill gained less, and the layout is why** (job 570298,
+`bench/copy_groups.jl`: each of the 26 groups of the uniform fill alone,
+flat, shaped as through 0.1.7, and through its weights). By the length
+of a group's innermost run, which is what the memory system sees:
+
+| H200, `Float64`, 20 variables | 512 × `16³` | 512 × `32³` |
+|---|---|---|
+| innermost run `N` (faces and edges along the first dimension) | 579 µs, 1.24 TB/s | 1690 µs, 1.54 TB/s |
+| innermost run `G + 1` = 4 | 637 µs, 0.54 TB/s | 1562 µs, 0.64 TB/s |
+| innermost run `G` = 3 | 619 µs, 0.42 TB/s | 1862 µs, 0.40 TB/s |
+| the whole fill | 1716 µs | 4969 µs |
+
+- The groups with long rows are where the index cost was: shaped, the
+  `16 × 16 × 4` face took 281 µs, flat 126, and the `32 × 32 × 4` one 1009
+  against 424. They now run at a third to a half of the floor.
+- The groups with short rows took as long shaped as flat — the index was
+  hidden behind their memory traffic — and run at a tenth of the floor.
+  They are two thirds of the fill. A warp's 32 values there lie in about
+  eleven rows a whole stored row apart, 24 or 32 bytes of each, on both
+  the read and the write side, so most of every sector moved is not
+  wanted. No way of forming the index changes that; a different layout
+  could, which is the open question.
+- Skipping a copy's weights is worth 3–10 % of a group (`16 × 16 × 4`: 131
+  through the weights, 126 without).
+
+So the downstream's "a fill at copy bandwidth, about 4× faster" is not
+reachable by the kernel alone: what the kernel could gain it has, 1.26×
+on the fill at `16³` and 1.35× at `32³`, and the rest is the layout's.
 
 ### Operators
 
@@ -5193,6 +5312,31 @@ Remaining, none blocking before their milestone:
     the partner's, so the kernel would need both working arrays, or the
     host would route the folded point to the partner and swap the
     variables. Refused, with the reason, until an application asks.
+- **The working array's layout** (2026-10-05, from
+  [The copy kernels on a device](#the-copy-kernels-on-a-device); to be
+  revisited with Erik as future work). Once their index was cheap, the
+  copy kernels were left at what the layout `(i₁ … i_D, var, block)`
+  allows. The scatter writes rows of `N` at an offset of `G` into rows of
+  `N + 2G + c` — 1.8× a plain copy on an H200, and no way of forming the
+  index changes that — and a ghost slab normal to the first dimension
+  is runs of `G` values, a stride of a whole row apart.
+  Candidates, none measured: padding the stored first extent so that
+  owned rows start on a 128-byte boundary (the downstream predicted
+  about 10 % on its stencil kernels from the same padding); a
+  block-of-blocks or variable-innermost layout for the ghost slabs; a
+  separate, packed store for the ghost layers. Any of them changes
+  `blockview`, `statearray`, the checkpoint's in-memory side and every
+  application kernel's indexing, so it is a design decision, not a
+  tuning.
+- **A state that lives in the working array** (2026-10-05, the third step
+  of TreeGeneralizedHarmonic's item 5). An integrator whose stage vectors
+  are field sets needs no scatter at all, and a native stepper could write
+  the next stage's input straight into a second working array from the
+  right-hand side's epilogue. It costs `(N + 2G + c)^D / N^D` of memory
+  per stage vector (1.81 at `32³`, `G = 3`) unless the stage arithmetic
+  skips the ghosts, and it changes "Interiors-only state vector" under
+  [Time integration](#time-integration). The downstream estimated it at
+  10–15 % of a step once the kernel and the copies are fast.
 - **The integrator's own passes are not owner-based** (raised by
   TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
   policy of [Parallelism](#parallelism); decided the same day not to

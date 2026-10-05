@@ -268,6 +268,24 @@ finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
 cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
 on an H200. CODE.md's M11 entry has the numbers.
 
+`bench/copies.jl` times `scatter!`, `gather!` and `fill_ghosts!` per
+owned point and in TB/s against a linear copy, at the downstream
+TreeGeneralizedHarmonic's sizes by default (uniform, 20 variables, `G =
+3`, vertex-centered); `bench/copy_index.jl` prices seven ways of forming
+the scatter's index; `bench/copy_groups.jl` times the fill group by
+group, flat against shaped. `bench/symmetry_copies.sh` runs all three on
+an H200 for a baseline checkout beside this one (`TREEAMR_BASE`,
+`TREEAMR_COPIES_STAGES`), then the suite on CUDA. CODE.md's "The copy
+kernels on a device" has the numbers.
+
+The Symmetry jobs write SimWatch status files through `bench/simwatch.sh`
+(`simwatch_begin DIR NAME NSTAGES`, `simwatch_stage MESSAGE`, an exit
+trap for `finished`/`failed`, a 60 s heartbeat; `simwatch_queued` on the
+submit side), into `$SLURM_SUBMIT_DIR/$SLURM_JOB_NAME-$SLURM_JOB_ID`, so
+`simwatch <submit dir>` on Symmetry shows them; `bench/symmetry_copies.sh`
+is the first to use it. Give a new job script the same few lines, and
+never point a new job at a directory or environment a running job uses.
+
 `bench/mpi.jl` is M7's weak-scaling smoke test: a fixed number of blocks
 per rank (`TILES` stacked tiles, one a rank), timed in synchronized
 windows, minimum and median; `bench/mpiscan.sh P…` launches each rank
@@ -382,7 +400,24 @@ The ideas that span several files and are easy to violate:
   Transfers sharing `(kind, direction, child offset)` share stencils and are
   batched into one `TransferGroup` = one kernel launch. Stencil construction
   lives in `schedule.jl`; `regrid.jl` reuses `prolongation_stencil` and
-  `restriction_stencil` so the two cannot drift apart.
+  `restriction_stencil` so the two cannot drift apart. A group whose
+  stencils are all `unit` (one point, weight exactly one — decided from
+  the weights, not the kind) launches with `weights = nothing` and does
+  no stencil arithmetic, computing `0 + x` so that `−0` still becomes
+  `+0` as the weighted sum makes it.
+- **The copy kernels launch flat on a device, shaped on the CPU**
+  (CODE.md, "The copy kernels on a device"). `transfer_kernel!`,
+  `scatter_kernel!` and `gather_kernel!` take a `shape` first and read
+  their position through `kernel_position(shape, @index(Global,
+  NTuple))`: `nothing` and the block-shaped ndrange on the CPU, a
+  `LinearShape` (precomputed `Int32` inverses) and a one-axis ndrange on
+  a device, where KernelAbstractions' own `NTuple` index costs two 64-bit
+  divisions per axis per item. A flat CPU launch was 2.3x slower, which
+  is why the CPU keeps the shaped one. `launch_positional!` and
+  `run_group!` take `flat` so that the suite runs the device form on the
+  CPU and compares bit for bit; a new copy-like kernel goes the same way.
+  KA's CPU emitter only rewrites `@index` at statement level, so assign
+  it before passing it to a function.
 - **Phased ghost fill.** Phase 1: copies and restrictions (they read
   interiors only, so they are race free). Then the physical-boundary hook.
   Phase 2: prolongations, coarsest target level first, because a
