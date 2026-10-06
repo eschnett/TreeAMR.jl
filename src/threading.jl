@@ -274,14 +274,17 @@ launch_shape(flat::Bool, extents::Tuple) =
 function launch_positional!(kernel, backend::Backend, args...; extents::Tuple,
                             flat::Bool=flatlaunch(backend))
     any(iszero, extents) && return nothing          # a rank without blocks (M7)
-    shape, ndrange = launch_shape(flat, extents)
-    if !flat
-        launch_by_owner!(kernel, backend, shape, args...; ndrange=ndrange)
-    elseif backend isa CPU
-        kernel(backend)(shape, args...; ndrange=ndrange,
-                        workgroupsize=prod(Int, Base.front(extents)))
+    flat || return launch_by_owner!(kernel, backend, nothing, args...; ndrange=extents)
+    # The flat launch's shape is `Int32` or `Int` by the launch's size, and
+    # on the CPU the flat launch runs only in the suite: hidden from
+    # inference, so that a call site is compiled for the launch it makes,
+    # not for all three (see `run_group!`).
+    shape, ndrange = launch_shape(true, extents)
+    launch = Base.inferencebarrier(kernel(backend))
+    if backend isa CPU
+        launch(shape, args...; ndrange=ndrange, workgroupsize=prod(Int, Base.front(extents)))
     else
-        kernel(backend)(shape, args...; ndrange=ndrange)
+        launch(shape, args...; ndrange=ndrange)
     end
     return nothing
 end

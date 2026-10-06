@@ -37,8 +37,8 @@ the host.
 
 `unit` says that the stencil is a plain copy along its dimension: one
 point, weight exactly one. A group whose stencils are all unit is
-launched without its weights, so that a copy does no stencil arithmetic
-(see `stencil_sum`). It is decided from the weights themselves on the
+launched with a flag that skips them, so that a copy does no stencil
+arithmetic (see `copy_load`). It is decided from the weights themselves on the
 host, where they are built, and carried to a device with them. It is
 not the group's kind: a mirrored copy at a vertex-like high wall derives
 the wall plane it does not own by interpolation (`wall_stencil`), and a
