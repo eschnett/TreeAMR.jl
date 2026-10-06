@@ -1284,7 +1284,9 @@ for 0.1.7, at 0.3–0.6 GB more peak memory (`--trace-compile-timing`:
 were the same 108). On CI's macOS runners, 3 cores and 7 GB with Julia
 1.13, the three-rank job runs beside its serial reference and was
 already near its 900 s deadline — it had missed it once on `main`, on
-2026-10-04 — and now missed it in both macOS cells. So the copy is a
+2026-10-04 — and now missed it in both macOS cells. With the fix below
+it still missed it in one cell, so on a small machine the three-rank job
+now runs after the reference instead (M7 step 9, amended). So the copy is a
 `Bool` argument (folded away for any stencil wider than one point, `Ps`
 being a type parameter), the CPU's shaped launch is type-stable, and
 only the flat launch hides its kernel from inference
@@ -7771,7 +7773,16 @@ the same day, so it comes before M9b, which follows it.
       beside it — eight threads and 24 GB, since a rank measured about
       2 GB resident — and `mpi_tests.jl` collects them; elsewhere, a CI
       runner among them, the three-rank job runs beside the serial
-      reference and the two-rank job after it.
+      reference and the two-rank job after it. *(Amended 2026-10-06:
+      there the three ranks now start after the reference. Beside it,
+      on CI's macOS runners — 3 cores, 7 GB, Julia 1.13 — three ranks
+      of about 2.4 GB each compiling beside the reference and the
+      suite's process missed the job's 900 s deadline: once on `main`
+      on 2026-10-04, and in two cells of the copy-kernel change, whose
+      first version had also slowed the workload's compilation (see
+      [The copy kernels on a device](#the-copy-kernels-on-a-device)).
+      On a laptop the MPI test alone takes 3m46 that way, against 1m47
+      with both jobs beside the reference.)*
       `TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice. Two
       type repeats went, each of a path covered elsewhere: the
       workload's `Float32` regrid case (`Float32` crosses MPI as a

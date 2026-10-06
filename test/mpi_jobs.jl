@@ -10,8 +10,8 @@
 # while the rest of it runs; each then waits at its checkpoint loads for
 # the serial reference that `mpi_tests.jl` writes (`TREEAMR_CHECKPOINT_FROM`
 # in the workload), sleeping, not spinning in MPI. Elsewhere — a CI runner
-# — nothing starts here, and `mpi_tests.jl` runs the three-rank job beside
-# its serial reference and the two-rank job after it, as before step 9.
+# — nothing starts here, and `mpi_tests.jl` runs the serial reference, the
+# three-rank job and the two-rank job one after the other.
 
 using MPI: MPI
 

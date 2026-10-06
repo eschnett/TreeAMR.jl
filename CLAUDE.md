@@ -101,7 +101,9 @@ binary MPIPreferences selects for the load path: MPICH_jll by default
 `LocalPreferences.toml` in the global v1.13 environment selects — with
 `setenv(cmd, mpiexec().env)`, since interpolating `mpiexec()` into a
 larger command drops its library paths. On its own (it needs no helper
-file; about 1m47 on the sequential path):
+file; 1m47 here, where both jobs start beside the serial reference, and
+3m46 on CI's one-after-the-other path, `TREEAMR_TEST_MPI_CONCURRENT=0`,
+measured 2026-10-06):
 
 ```bash
 julia --project=test -e 'using Test, TreeAMR, HDF5; @testset "mpi" begin include("test/mpi_tests.jl") end'
@@ -737,8 +739,10 @@ the checkpoint cross loads, the migrations and the negative control,
 each asserted on its own. The launches are compilation-bound (about
 55 s each), so `test/mpi_jobs.jl` starts both at the start of the
 suite where the machine has room (`concurrent_launches`: 8+ threads and
-24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and runs them beside the
-serial reference otherwise; the workload's `TREEAMR_CHECKPOINT_FROM`
+24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and otherwise runs the
+serial reference, the three-rank job and the two-rank job one after the
+other (the three ranks beside the reference outgrew CI's 7 GB macOS
+runners and timed out); the workload's `TREEAMR_CHECKPOINT_FROM`
 and its marker files order the cross loads either way. Keep
 `mpi_workload.jl` self-contained like `thread_workload.jl`, its
 non-`#` output independent of the rank count, and a new case's lines
