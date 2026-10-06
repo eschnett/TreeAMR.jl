@@ -1223,7 +1223,8 @@ loop, not ours, and removing it would mean not using KA's CPU emitter.
 
 ### The copy kernels on a device
 
-*(Measured and changed 2026-10-05.)* TreeGeneralizedHarmonic made its
+*(Measured and changed 2026-10-05; released as 0.1.8, 2026-10-06.)*
+TreeGeneralizedHarmonic made its
 right-hand-side kernel 8× faster on an H200, 8.5 → 1.1 ns a point, and
 then found what was left of an evaluation to be TreeAMR's: `scatter!`
 and `fill_ghosts!` were 0.73 of its 1.81 ns a point at `32³`, and 1.39 of
