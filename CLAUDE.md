@@ -101,7 +101,9 @@ binary MPIPreferences selects for the load path: MPICH_jll by default
 `LocalPreferences.toml` in the global v1.13 environment selects — with
 `setenv(cmd, mpiexec().env)`, since interpolating `mpiexec()` into a
 larger command drops its library paths. On its own (it needs no helper
-file; about 1m47 on the sequential path):
+file; 1m47 here, where both jobs start beside the serial reference, and
+3m46 on CI's one-after-the-other path, `TREEAMR_TEST_MPI_CONCURRENT=0`,
+measured 2026-10-06):
 
 ```bash
 julia --project=test -e 'using Test, TreeAMR, HDF5; @testset "mpi" begin include("test/mpi_tests.jl") end'
@@ -268,6 +270,24 @@ finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
 cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
 on an H200. CODE.md's M11 entry has the numbers.
 
+`bench/copies.jl` times `scatter!`, `gather!` and `fill_ghosts!` per
+owned point and in TB/s against a linear copy, at the downstream
+TreeGeneralizedHarmonic's sizes by default (uniform, 20 variables, `G =
+3`, vertex-centered); `bench/copy_index.jl` prices seven ways of forming
+the scatter's index; `bench/copy_groups.jl` times the fill group by
+group, flat against shaped. `bench/symmetry_copies.sh` runs all three on
+an H200 for a baseline checkout beside this one (`TREEAMR_BASE`,
+`TREEAMR_COPIES_STAGES`), then the suite on CUDA. CODE.md's "The copy
+kernels on a device" has the numbers.
+
+The Symmetry jobs write SimWatch status files through `bench/simwatch.sh`
+(`simwatch_begin DIR NAME NSTAGES`, `simwatch_stage MESSAGE`, an exit
+trap for `finished`/`failed`, a 60 s heartbeat; `simwatch_queued` on the
+submit side), into `$SLURM_SUBMIT_DIR/$SLURM_JOB_NAME-$SLURM_JOB_ID`, so
+`simwatch <submit dir>` on Symmetry shows them; `bench/symmetry_copies.sh`
+is the first to use it. Give a new job script the same few lines, and
+never point a new job at a directory or environment a running job uses.
+
 `bench/mpi.jl` is M7's weak-scaling smoke test: a fixed number of blocks
 per rank (`TILES` stacked tiles, one a rank), timed in synchronized
 windows, minimum and median; `bench/mpiscan.sh P…` launches each rank
@@ -382,7 +402,32 @@ The ideas that span several files and are easy to violate:
   Transfers sharing `(kind, direction, child offset)` share stencils and are
   batched into one `TransferGroup` = one kernel launch. Stencil construction
   lives in `schedule.jl`; `regrid.jl` reuses `prolongation_stencil` and
-  `restriction_stencil` so the two cannot drift apart.
+  `restriction_stencil` so the two cannot drift apart. A group whose
+  stencils are all `unit` (one point, weight exactly one — decided from
+  the weights, not the kind) passes the kernel `unit = true` and does no
+  stencil arithmetic, computing `0 + x` so that `−0` still becomes `+0`
+  as the weighted sum makes it. A flag, not `weights = nothing`: **a
+  run-time choice of an argument's type is compiled at every launch site
+  for every member of the union**, which made the compilation-bound MPI
+  workload a fifth slower and timed out CI's macOS cells (CODE.md, "The
+  copy kernels on a device"). Keep the CPU launch path type-stable, and
+  hide unavoidable unions behind `Base.inferencebarrier` on the device
+  path only (a barrier or a closure on the CPU path raises the fill's
+  allocation). Compare `--trace-compile-timing` of `test/mpi_workload.jl`
+  against `main` for any change to a launch path.
+- **The copy kernels launch flat on a device, shaped on the CPU**
+  (CODE.md, "The copy kernels on a device"). `transfer_kernel!`,
+  `scatter_kernel!` and `gather_kernel!` take a `shape` first and read
+  their position through `kernel_position(shape, @index(Global,
+  NTuple))`: `nothing` and the block-shaped ndrange on the CPU, a
+  `LinearShape` (precomputed `Int32` inverses) and a one-axis ndrange on
+  a device, where KernelAbstractions' own `NTuple` index costs two 64-bit
+  divisions per axis per item. A flat CPU launch was 2.3x slower, which
+  is why the CPU keeps the shaped one. `launch_positional!` and
+  `run_group!` take `flat` so that the suite runs the device form on the
+  CPU and compares bit for bit; a new copy-like kernel goes the same way.
+  KA's CPU emitter only rewrites `@index` at statement level, so assign
+  it before passing it to a function.
 - **Phased ghost fill.** Phase 1: copies and restrictions (they read
   interiors only, so they are race free). Then the physical-boundary hook.
   Phase 2: prolongations, coarsest target level first, because a
@@ -694,8 +739,10 @@ the checkpoint cross loads, the migrations and the negative control,
 each asserted on its own. The launches are compilation-bound (about
 55 s each), so `test/mpi_jobs.jl` starts both at the start of the
 suite where the machine has room (`concurrent_launches`: 8+ threads and
-24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and runs them beside the
-serial reference otherwise; the workload's `TREEAMR_CHECKPOINT_FROM`
+24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and otherwise runs the
+serial reference, the three-rank job and the two-rank job one after the
+other (the three ranks beside the reference outgrew CI's 7 GB macOS
+runners and timed out); the workload's `TREEAMR_CHECKPOINT_FROM`
 and its marker files order the cross loads either way. Keep
 `mpi_workload.jl` self-contained like `thread_workload.jl`, its
 non-`#` output independent of the rank count, and a new case's lines

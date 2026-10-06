@@ -327,6 +327,118 @@ end
     @test !all(iszero, fs.work)
 end
 
+@testset "A flat launch recovers every position, past 2³¹ too" begin
+    # A device launches the copy kernels over one axis and recovers the
+    # position by multiplying with inverses: an off-by-one there writes
+    # a neighbouring ghost silently, and an extent of 1 (D = 1, one
+    # variable, a width-1 slab) is the inverse's special case.
+    for extents in ((5,), (1, 7), (3, 1, 4), (7, 1, 1, 3, 2), (4, 4, 4, 20, 3),
+                    (1, 1, 1, 1, 1))
+        shape = TreeAMR.LinearShape(extents)
+        @test shape isa TreeAMR.LinearShape{length(extents) - 1,Int32}
+        @test [TreeAMR.linear_position(shape, n) for n in 1:prod(extents)] ==
+              [Tuple(I) for I in vec(CartesianIndices(extents))]
+    end
+    # Past `typemax(Int32)` items the arithmetic is `Int`, and still exact.
+    extents = (39, 39, 39, 20, 30_000)
+    shape = TreeAMR.LinearShape(extents)
+    @test shape isa TreeAMR.LinearShape{4,Int}
+    ci = CartesianIndices(extents)
+    for n in (1, 2^31 - 1, 2^31, 2^31 + 1, 2^32 + 12345, prod(extents))
+        @test TreeAMR.linear_position(shape, n) == Tuple(ci[n])
+    end
+end
+
+# A group with every stencil marked not unit: the same transfer, computed
+# through the weights.
+function weighted(g::TreeAMR.TransferGroup{T,D}) where {T,D}
+    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, false),
+                   g.stencils)
+    return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
+                                      g.factorcol, g.orientation, g.plane)
+end
+
+# Every value a copy could meet that an arithmetic shortcut could change:
+# signed zeros, NaN, infinities, subnormals, ordinary numbers.
+function awkward_fill!(work::AbstractArray{T}) where {T}
+    specials = T[-zero(T), zero(T), T(NaN), -T(Inf), floatmin(T) / 4, -floatmin(T) / 3]
+    for (i, I) in enumerate(eachindex(work))
+        work[I] = iszero(i % 7) ? specials[1 + (i ÷ 7) % length(specials)] :
+                  T(sin(i))
+    end
+    return work
+end
+
+@testset "The flat launch and the copy path fill bit for bit: D=$D" for D in (1, 2, 3)
+    # The device's form of the transfer launch (flat, the position from
+    # inverses) runs on no device in CI, and the copy path skips the
+    # weights: either one going wrong would show as a ghost that is
+    # right to roundoff, or off by a sign of zero. Every group of a
+    # schedule with copies, restrictions, prolongations, mirrored and
+    # turned transfers is run three ways from the same array, and the
+    # arrays must agree in every bit.
+    N = D == 3 ? 6 : 8
+    setups = Any[]
+    two = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
+    refine!(two, two.leaves[1]); balance!(two)
+    push!(setups, FieldSet(two, 3; G=2))
+    push!(setups, FieldSet(two, 3; G=2, centering=vertexcentered(D)))
+    kinds = ntuple(d -> d == 1 ? :reflect_hi : :periodic, D)
+    walls = faces_forest(kinds; N=N)
+    push!(setups, FieldSet(walls, 2; G=2, centering=vertexcentered(D),
+                           parity=[ntuple(d -> d == 1 ? OddParity : NoParity, D),
+                                   ntuple(d -> d == 1 ? EvenParity : NoParity, D)]))
+    if D >= 2
+        quad = rotating_forest(Val(D); rotating=(1, 2), N=N)
+        push!(setups, FieldSet(quad, D + 1; G=2, centering=cellcentered(D),
+                               rotation=vector_rotation(D, (1, 2))))
+    end
+    ops = Operators(prolongation=4, restriction=4)
+    nunit = 0
+    for fs in setups
+        schedule = GhostSchedule(fs, ops)
+        for g in Iterators.flatten((schedule.phase1, schedule.phase2...))
+            fillwith(group; flat) = begin
+                work = awkward_fill!(similar(fs.work))
+                TreeAMR.run_group!(work, work, group, fs.nvars, TreeAMR.CPU(); flat=flat,
+                                   factors=fs.factors, rotvars=fs.rotvars)
+                reinterpret(UInt64, vec(work))
+            end
+            unit = all(s -> s.unit, g.stencils)
+            nunit += unit
+            shaped = fillwith(g; flat=false)
+            @test fillwith(g; flat=true) == shaped
+            unit && @test fillwith(weighted(g); flat=false) == shaped
+        end
+    end
+    @test nunit > 0                                # the copy path was taken
+    # A copy at a vertex-like high wall derives the wall plane it does not
+    # own by interpolation, so a `:copy` group is not unit by its kind.
+    wallsched = GhostSchedule(setups[3], ops)
+    @test any(g -> g.kind === :copy && !all(s -> s.unit, g.stencils),
+              wallsched.phase1)
+end
+
+@testset "The flat scatter and gather match the shaped ones: D=$D" for D in (1, 2, 3)
+    # The same for the state copies, which a device also launches flat.
+    forest = Forest(ntuple(_ -> 2, D); N=6, periodic=ntuple(_ -> true, D))
+    refine!(forest, forest.leaves[1]); balance!(forest)
+    fs = FieldSet(forest, 3; G=ntuple(d -> d == 1 ? 1 : 2, D), centering=vertexcentered(D))
+    u = awkward_fill!(statevector(fs))
+    works = map((false, true)) do flat
+        fill!(fs.work, 0)
+        TreeAMR.run_over_interiors!(TreeAMR.scatter_kernel!, fs, fs.work, u; flat=flat)
+        copy(fs.work)
+    end
+    @test reinterpret(UInt64, vec(works[1])) == reinterpret(UInt64, vec(works[2]))
+    back = map((false, true)) do flat
+        v = statevector(fs)
+        TreeAMR.run_over_interiors!(TreeAMR.gather_kernel!, fs, v, works[1]; flat=flat)
+        reinterpret(UInt64, v)
+    end
+    @test back[1] == back[2] == reinterpret(UInt64, u)
+end
+
 @testset "Schedule staleness" begin
     forest = Forest((2, 2); N=4, periodic=(true, true))
     fs = FieldSet(forest, 1; G=1)

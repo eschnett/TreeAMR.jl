@@ -45,10 +45,16 @@
 # loads another's files waits for that run's marker
 # (`TREEAMR_CHECKPOINT_FROM`), so the runs need not follow one another.
 # Where they start is `mpi_jobs.jl`'s: at the start of the suite where
-# the machine has room for both jobs beside it. Otherwise the three-rank
-# job starts here, beside the serial reference, and the two-rank job
-# beside it too where there is room (this file run on its own), or after
-# it (a CI runner).
+# the machine has room for both jobs beside it. Otherwise both start
+# here, beside the serial reference, where there is room for them (this
+# file run on its own on a large machine), or one after the other, each
+# after the run before it, where there is not (a CI runner). There the
+# three ranks of about 2.4 GB each compiling beside the reference and
+# the suite's own process outgrew a 7 GB macOS runner, and the job missed
+# its 900 s deadline on Julia 1.13 (on `main` on 2026-10-04, and in the
+# copy-kernel change's CI on 2026-10-06); one at a time costs the
+# reference's minute or two of wall clock and keeps the three ranks from
+# competing with it on one runner.
 
 isdefined(@__MODULE__, :MPI_JOBS) || include("mpi_jobs.jl")
 
@@ -100,15 +106,20 @@ end
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
     early = take_mpi_jobs!()
     dir = early === nothing ? mktempdir() : early.dir
-    three = early === nothing ? launch_workload(3, dir; from=(1,)) : early.three
+    # Beside the serial reference only where there is room; on a small
+    # machine the three ranks start once it is done (see the header).
+    room = early !== nothing || concurrent_launches()
+    three = early !== nothing ? early.three :
+            room ? launch_workload(3, dir; from=(1,)) : nothing
     two = early !== nothing ? early.two :
-          concurrent_launches() ? launch_workload(2, dir; from=(1, 3)) : nothing
+          room ? launch_workload(2, dir; from=(1, 3)) : nothing
     serial, workload, io = try
         serial_workload(dir)
     catch
         foreach(j -> j === nothing || kill(j.proc), (three, two))
         rethrow()
     end
+    three === nothing && (three = launch_workload(3, dir; from=(1,)))
     lines = workload_lines(serial)
     @test first(lines) == "# ranks 1"
     @test count(l -> occursin(" state ", l), lines) >= 7

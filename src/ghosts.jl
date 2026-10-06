@@ -65,6 +65,16 @@
     end
 end
 
+# A copy: a group whose stencils are all one point of weight one (see
+# `Stencil1D`'s `unit`) loads its one value without the `D` weight loads
+# and the product. The sum above starts from zero, and `0 + 1·x` is `x`
+# for every `x` but `-0`, which it makes `+0`; so does this, which keeps a
+# fill bit-identical to what the general path computed, and keeps the
+# distributed exchange's `-0` rule ("The sender computes" in CODE.md) as
+# it was.
+Base.@propagate_inbounds copy_load(src, base, v, sblock) =
+    zero(transfer_eltype(src)) + transfer_load(src, base, v, sblock)
+
 # The packed buffer of a distributed exchange (M7), as a kernel sees it.
 #
 # Pack and unpack are transfers like any other, so they go through the
@@ -182,12 +192,18 @@ end
 # when regridding transfers into freshly allocated storage. Neither is
 # marked @Const, so the aliasing case stays well defined.
 #
-# The launch is over the target box itself — `ndrange = (blen…, nvars,
-# ntransfers)` — so the backend supplies the per-axis position and the
-# kernel does no index arithmetic to recover it. Flattening the box into
-# one axis and unflattening it here cost an integer `div` and `rem` per
-# dimension per ghost point per variable: 9 % of a copy-dominated fill's
-# self time, and the single largest entry after the bounds checks.
+# On the CPU the launch is over the target box itself — `ndrange =
+# (blen…, nvars, ntransfers)` — so the backend supplies the per-axis
+# position by iterating the workgroup, and the kernel does no index
+# arithmetic to recover it. Flattening the box into one axis and
+# unflattening it here cost an integer `div` and `rem` per dimension per
+# ghost point per variable: 9 % of a copy-dominated fill's self time, and
+# the single largest entry after the bounds checks. On a device that same
+# division happens anyway, in KernelAbstractions' own forming of the
+# global index, and as a 64-bit division emulated in software it held the
+# fill to 0.65 of an H200's 4.8 TB/s; so a device launch is flat,
+# and the position comes from `shape`'s precomputed inverses instead
+# (`launch_positional!`, and "The copy kernels on a device" in CODE.md).
 #
 # `factors` is `nothing` for every ordinary transfer, and then `scaled`
 # is the identity and the kernel is exactly what it was before M10. A
@@ -199,13 +215,14 @@ end
 @inline scaled(acc, ::Nothing, v, col) = acc
 @inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
 
-@kernel function transfer_kernel!(dest, src,
+@kernel function transfer_kernel!(shape, dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
-                                  srcstarts, weights,
+                                  srcstarts, weights, unit::Bool,
                                   targetfirst::NTuple{D,Int}, toffset::Int,
                                   factors, fcol::Int,
                                   ::Val{Ps}, ::Val{D}) where {Ps,D}
-    I = @index(Global, NTuple)
+    J = @index(Global, NTuple)
+    I = kernel_position(shape, J)
     # `I[1:D]` is the position within the target region, one-based.
     v = I[D + 1]
     t = I[D + 2] + toffset
@@ -217,7 +234,12 @@ end
     tidx = ntuple(d -> targetfirst[d] + I[d] - 1, Val(D))
     @inbounds base = ntuple(d -> Int(srcstarts[d][I[d]]), Val(D))
 
-    acc = stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
+    # `unit` is the same for every item of a launch, so the branch costs
+    # nothing on a device, where it is uniform across a warp. Only a
+    # one-point stencil can be a copy, and `Ps` is a type parameter, so
+    # every other kernel compiles without the branch.
+    acc = all(isone, Ps) && unit ? (@inbounds copy_load(src, base, v, sblock)) :
+          stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
     @inbounds transfer_store!(dest, scaled(acc, factors, v, fcol), tidx, v, tblock)
 end
 
@@ -233,9 +255,12 @@ end
 # even orientation and from `altsrc` for an odd one — the partner's
 # working array in a `RotationPair`, the set's own otherwise — with the
 # variable table `rotvars`; an ordinary group launches exactly as before.
+# `flat` is the launch's form, flat on a device and shaped on the CPU
+# unless a test asks otherwise (see `launch_shape`).
 function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backend;
                     range=1:ntransfers(group), single::Bool=false,
-                    factors=nothing, altsrc=src, rotvars=nothing) where {T,D}
+                    factors=nothing, altsrc=src, rotvars=nothing,
+                    flat::Bool=flatlaunch(backend)) where {T,D}
     n = length(range)
     n == 0 && return nothing
     group.factorcol == 0 || factors !== nothing || throw(ArgumentError(
@@ -255,7 +280,10 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     orders = ntuple(d -> stencilorder(group.stencils[d]), Val(D))
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
     weights = ntuple(d -> group.stencils[d].weights, Val(D))
-    ndrange = (blen..., Int(nvars), n)
+    # A copy goes without its weights: see `copy_load`. A run-time flag
+    # rather than `weights = nothing`, which would make every launch site
+    # compile both forms of the kernel (see below).
+    unit = all(s -> s.unit, group.stencils)
     kdest = kernelarg(dest, (blen..., Int(nvars)))
     ksrc = kernelarg(src, (blen..., Int(nvars)))
 
@@ -265,19 +293,45 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # launch, and two `SubArray`s are the largest arguments here. See
     # "What the ghost fill costs" in CODE.md for what that buys and what
     # it does not.
-    kernel! = transfer_kernel!(backend)
+    #
+    # The flat launch's shape is a `LinearShape` of `Int32` or of `Int`, by
+    # the launch's size: a run-time choice of type. Seen by inference,
+    # every call site would be compiled for both, and on the CPU for a flat
+    # launch only the suite makes; together with a `nothing`/weights union
+    # that this kernel once had, that made the compilation-bound MPI
+    # workload a fifth slower and pushed its three-rank job past CI's
+    # deadline on a small runner ("The copy kernels on a device" in
+    # CODE.md). So a flat launch hides the kernel from inference and is
+    # dispatched on the values it gets — one dynamic call, on a device
+    # where a launch costs microseconds — while the CPU's shaped launch
+    # stays type-stable and allocates no more than it did.
+    extents = (blen..., Int(nvars), n)
     if group.orientation != 0
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
-        kernel!(kdest, rsrc, group.targetblocks, group.sourceblocks,
-                srcstarts, weights, tfirst, first(range) - 1, gfactors,
-                Int(group.factorcol), Val(orders), Val(D);
-                ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
+        launch_transfer!(backend, flat, extents, single, kdest, rsrc, group.targetblocks,
+                         group.sourceblocks, srcstarts, weights, unit, tfirst,
+                         first(range) - 1, gfactors, Int(group.factorcol), Val(orders),
+                         Val(D))
         return nothing
     end
-    kernel!(kdest, ksrc, group.targetblocks, group.sourceblocks,
-            srcstarts, weights, tfirst, first(range) - 1, gfactors, Int(group.factorcol),
-            Val(orders), Val(D);
-            ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
+    launch_transfer!(backend, flat, extents, single, kdest, ksrc, group.targetblocks,
+                     group.sourceblocks, srcstarts, weights, unit, tfirst,
+                     first(range) - 1, gfactors, Int(group.factorcol), Val(orders), Val(D))
+    return nothing
+end
+
+# The launch itself, in its two forms (see above). Each branch makes its
+# own call, so that the shaped one stays type-stable; a closure over the
+# arguments instead was allocated at every launch.
+@inline function launch_transfer!(backend, flat::Bool, extents, single::Bool, args...)
+    if flat
+        shape, ndrange = launch_shape(true, extents)
+        kernel! = Base.inferencebarrier(transfer_kernel!(backend))
+        kernel!(shape, args...; ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
+    else
+        transfer_kernel!(backend)(nothing, args...; ndrange=extents,
+                                  workgroupsize=(single ? extents : nothing))
+    end
     return nothing
 end
 
