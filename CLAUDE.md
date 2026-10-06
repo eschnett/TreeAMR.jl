@@ -402,9 +402,17 @@ The ideas that span several files and are easy to violate:
   lives in `schedule.jl`; `regrid.jl` reuses `prolongation_stencil` and
   `restriction_stencil` so the two cannot drift apart. A group whose
   stencils are all `unit` (one point, weight exactly one — decided from
-  the weights, not the kind) launches with `weights = nothing` and does
-  no stencil arithmetic, computing `0 + x` so that `−0` still becomes
-  `+0` as the weighted sum makes it.
+  the weights, not the kind) passes the kernel `unit = true` and does no
+  stencil arithmetic, computing `0 + x` so that `−0` still becomes `+0`
+  as the weighted sum makes it. A flag, not `weights = nothing`: **a
+  run-time choice of an argument's type is compiled at every launch site
+  for every member of the union**, which made the compilation-bound MPI
+  workload a fifth slower and timed out CI's macOS cells (CODE.md, "The
+  copy kernels on a device"). Keep the CPU launch path type-stable, and
+  hide unavoidable unions behind `Base.inferencebarrier` on the device
+  path only (a barrier or a closure on the CPU path raises the fill's
+  allocation). Compare `--trace-compile-timing` of `test/mpi_workload.jl`
+  against `main` for any change to a launch path.
 - **The copy kernels launch flat on a device, shaped on the CPU**
   (CODE.md, "The copy kernels on a device"). `transfer_kernel!`,
   `scatter_kernel!` and `gather_kernel!` take a `shape` first and read

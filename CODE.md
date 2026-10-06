@@ -1259,8 +1259,9 @@ device, and requires it to fill bit for bit as the shaped form does.
 
 **A copy skips its weights.** `Stencil1D` records whether it is one point
 of weight exactly one (`unit`, decided on the host from the weights), and
-a group whose stencils are all unit launches with `weights = nothing`:
-one load, no `D` weight loads, no product. It computes `0 + x`, not `x`,
+the kernel of a group whose stencils are all unit takes a branch, chosen
+by a run-time flag that is the same for every item of a launch: one
+load, no `D` weight loads, no product. It computes `0 + x`, not `x`,
 because the general sum starts from zero and `0 + 1·x` turns `−0` into
 `+0`; so fills are bit-identical to 0.1.7, which was checked by digest of
 the whole working array (ghosts included) over `D = 1, 2, 3`, both
@@ -1270,6 +1271,30 @@ in `Float64` and `Float32`, and by `thread_workload.jl` and the serial
 weights, not from the kind: a mirrored copy at a vertex-like high wall
 interpolates the wall plane it does not own (`wall_stencil`), and a
 vertex-centered `PointValue` restriction is an injection, so it is unit.
+
+**Every run-time choice of type is compiled at every launch site**
+*(found 2026-10-06, when the change failed CI)*. The first version passed
+`weights = nothing` for a copy and chose the shape — `nothing`, or a
+`LinearShape` of `Int32` or of `Int` — by a run-time `flat`. Inference
+follows each member of such a union at every call site, so every launch
+site compiled up to six launches of which it ran one, and the
+compilation-bound `mpi_workload.jl` took 75–85 s serially against 62–65
+for 0.1.7, at 0.3–0.6 GB more peak memory (`--trace-compile-timing`:
+62.4 → 73.8 s of compilation, all of it in host code; the kernels run
+were the same 108). On CI's macOS runners, 3 cores and 7 GB with Julia
+1.13, the three-rank job runs beside its serial reference and was
+already near its 900 s deadline — it had missed it once on `main`, on
+2026-10-04 — and now missed it in both macOS cells. So the copy is a
+`Bool` argument (folded away for any stencil wider than one point, `Ps`
+being a type parameter), the CPU's shaped launch is type-stable, and
+only the flat launch hides its kernel from inference
+(`Base.inferencebarrier`), which costs one dynamic call in a launch that
+KernelAbstractions already dispatches dynamically. A barrier on every
+launch had doubled the CPU fill's allocation, and a closure over the
+launch's arguments raised it further; the form kept allocates what 0.1.7
+did, plus the flag (11312 B a uniform fill against 10896). Compilation
+is 65.4 s against 63.0, within its noise, and the workload's output is
+unchanged.
 
 **What it buys on an H200** (job 570290, `bench/copies.jl` from
 `bench/symmetry_copies.sh`: a uniform periodic mesh, 20 variables,
@@ -1288,11 +1313,20 @@ The scatter reaches the downstream's static-stride prototype (0.14 at
 `32³`) without a block size in the type. On Metal (Apple M3 Pro,
 `Float32`, 64 blocks of `16³`) the scatter went 12.4 → 3.1 ns a point
 against a floor of 1.9, and the fill 38.9 → 11.8. On the CPU the shaped
-launch is kept, and the scatter still gained, from reading the state
-vector linearly and `@inbounds`: 38.8 → 11.7 ns a point at one thread,
-9.1 → 6.2 at six; the fill of `bench/ghosts.jl` 2.85 → 1.87 ms uniform
-and 14.2 → 11.0 ms two-level at one thread, 0.52 → 0.37 ms uniform and
-3.70 → 3.76 two-level at four.
+launch is kept, and the copies still gained, from reading the state
+vector linearly and `@inbounds` (re-timed 2026-10-06 on a quiet machine,
+alternating with 0.1.7; Apple M3 Pro, `bench/copies.jl` at 64 blocks of
+`16³`, ns a point):
+
+| CPU | scatter | gather | fill | copy floor |
+|---|---|---|---|---|
+| one thread, 0.1.7 → now | 35.8 → **11.2** | 38.2 → **11.4** | 175 → **138** | 3.0 |
+| six threads | 6.7 → **6.0** | 7.0 → **4.5** | 46.7 → **44** | 2.5 |
+
+`bench/ghosts.jl` (10 variables, `8³`): the uniform fill 2.78 → 1.98 ms at
+one thread and 0.64 → 0.41 at four; the two-level fill 14.2–15.1 → 12.8
+and 4.1–4.6 → 3.73. The full suite took 9m49 for 0.1.7 and 9m57 here at
+one thread (1627 more tests), and 9m20 against 8m00 at eight.
 
 **How the index is formed no longer matters** (`bench/copy_index.jl`,
 the scatter's copy written seven ways, H200, `16³`, `Float64`): the
