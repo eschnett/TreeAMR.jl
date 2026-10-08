@@ -1,7 +1,7 @@
 #!/bin/bash
 # The distributed checkpoint throughput of M7 on Symmetry, on the
 # parallel file system (BeeGFS, /mnt/beegfs): the shared file of step 6
-# (the measurement "Parallel I/O and M7" in CODE.md asked for) until step
+# (the measurement "Parallel I/O and M7" in HISTORY.md asked for) until step
 # 6b replaced it with a part file per I/O process and an index; since
 # then each setting runs once per `io` in TREEAMR_CKPT_IO (default "node
 # all"), which the benchmark's TREEAMR_BENCH_IO takes.

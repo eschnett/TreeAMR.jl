@@ -9,7 +9,7 @@
 # checkpoint_stress.jl, 0 or 1 for STRESS_SYNC, a set of ROMIO hints from
 # the list below (default none), its own iteration count, and for the
 # `treeamr` modes STRESS_IO (default `node`). For example the
-# measurement of CODE.md ("Parallel checkpoints", M7 step 6):
+# measurement of HISTORY.md ("Parallel checkpoints", M7 step 6):
 #
 #     sbatch --nodes=4 bench/symmetry_checkpoint_stress.sh 200 \
 #         treeamr-filt treeamr-filt:0:dsoff sieve-ind:0:default:2000 \

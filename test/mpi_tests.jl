@@ -31,7 +31,7 @@
 #
 # The ranks run one thread each: a CI runner has three or four cores,
 # and MPICH polls while it waits, so two threads a rank at three ranks
-# would oversubscribe it (CODE.md, "What an MPI test costs"). The
+# would oversubscribe it (HISTORY.md, "What an MPI test costs"). The
 # launcher is `MPI.mpiexec()` of this process, so that the ranks load
 # the MPI binary this process's preferences select — MPICH_jll by
 # default, MPIABI_jll where a `LocalPreferences.toml` in the load path

@@ -2,7 +2,7 @@
 # dataset's address and size, and each chunked dataset's chunks, merged
 # into runs in file order. This is what showed that HDF5 had placed the
 # first chunks of a filtered dataset before the leaf columns, so that a
-# rank's write of its chunks spanned them (M7 step 6; CODE.md, "Parallel
+# rank's write of its chunks spanned them (M7 step 6; HISTORY.md, "Parallel
 # checkpoints").
 #
 #     julia --project=<env with HDF5 and the filter packages> \

@@ -3,7 +3,7 @@
 # block by block and variable by variable, each bad run reported with the
 # rank that wrote it at `nranks` ranks and its byte range in the file.
 # This is how the damaged file of job 567855 was found to have lost one
-# rank's leaf coordinates and nothing else (M7 step 6; CODE.md, "Parallel
+# rank's leaf coordinates and nothing else (M7 step 6; HISTORY.md, "Parallel
 # checkpoints"); bench/checkpoint_layout.jl shows where the chunks lie.
 #
 #     julia --project=<env with HDF5 and the filter packages> \

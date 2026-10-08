@@ -24,7 +24,7 @@
 # the rank's share as `regrid!` runs it, its own search with the
 # gathered recruits applied (`regrid_marks`) and then the completion —
 # with the recruits gathered, and the bytes the marks' `allgatherv`
-# brings every rank. CODE.md's M7 step 7 entry has the numbers.
+# brings every rank. HISTORY.md's M7 step 7 entry has the numbers.
 using TreeAMR
 using TreeAMR: ForestDigest, buffered_flags, complete_marks, regrid_sources,
                split_regrid, remote_neighbors, equalsplit, RegridMark, Recruit,

@@ -5,7 +5,8 @@ Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
-for the full design and the milestone roadmap.
+for the full design, and [PLAN.md](https://github.com/eschnett/TreeAMR.jl/blob/main/PLAN.md)
+for the milestone roadmap.
 
 The package has completed milestone **M12**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1

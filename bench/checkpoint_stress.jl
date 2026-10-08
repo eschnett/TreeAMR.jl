@@ -1,6 +1,6 @@
 # The multi-node checkpoint corruption of M7 step 6, reproduced at every
-# layer from TreeAMR down to POSIX (CODE.md, "Parallel checkpoints" under
-# "Distributed meshes", which has the jobs and the numbers); and, since
+# layer from TreeAMR down to POSIX (HISTORY.md, "Parallel checkpoints" under
+# "Parallelism", which has the jobs and the numbers); and, since
 # step 6b replaced the shared file, the regression job for the writer
 # that replaced it, whose files each have one writer and one opener.
 #

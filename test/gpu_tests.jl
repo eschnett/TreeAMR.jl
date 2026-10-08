@@ -736,7 +736,7 @@ end
 
 @testset "$bname: M3 convergence reproduced: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
-    # `CODE.md`'s M6 acceptance criterion: the M3 convergence result, on
+    # `HISTORY.md`'s M6 acceptance criterion: the M3 convergence result, on
     # a device. Order-4 operators with G = 2 over a two-level mesh give
     # 2nd order, by the interface-order rule. Cell-centered, spelled out:
     # this is the M3 study, and `wave_errors` is vertex-centered by

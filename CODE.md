@@ -4,6 +4,46 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
+**Status.** Milestones M0–M8, M10, M11, M9a, M7 and M12 are done;
+next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+How the package got here — who decided what and when, the alternatives
+tried, measurements that later ones replaced, and the milestone records
+— is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
+"step 8" below names a step of the milestone records there
+([HISTORY.md](HISTORY.md#milestones)).
+
+**Contents**
+
+- [Goals](#goals)
+- [Scope and non-goals](#scope-and-non-goals)
+- [Core concepts](#core-concepts)
+  - [Blocks](#blocks)
+  - [Centerings](#centerings)
+  - [Tree structure](#tree-structure)
+  - [Domain and boundaries](#domain-and-boundaries)
+  - [Data layout](#data-layout)
+  - [Precision](#precision)
+- [Operations](#operations)
+  - [Ghost filling](#ghost-filling)
+  - [What the ghost fill costs](#what-the-ghost-fill-costs)
+  - [The copy kernels on a device](#the-copy-kernels-on-a-device)
+  - [Operators](#operators)
+  - [Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces)
+  - [Regridding](#regridding)
+  - [Point interpolation](#point-interpolation)
+  - [Checkpoint and restart](#checkpoint-and-restart)
+- [Application interface (sketch)](#application-interface-sketch)
+- [Time integration](#time-integration)
+- [Parallelism](#parallelism)
+  - [Distributed meshes](#distributed-meshes)
+- [Code structure](#code-structure)
+  - [Rules that span several files](#rules-that-span-several-files)
+  - [Index conventions](#index-conventions)
+- [Tests](#tests)
+- [Ecosystem integration](#ecosystem-integration)
+  - [Downstream applications](#downstream-applications)
+- [Open questions](#open-questions)
+
 ## Goals
 
 - Simple design, as far as the problem allows.
@@ -28,11 +68,7 @@ equation, simple hydro), the Einstein equations, relativistic GRMHD.
   ODE integrators, and reduces conservation at coarse-fine faces to a
   purely spatial condition. The cost is wasted coarse-level work, which we
   accept.
-- **Every centering, from M8 on.** Through M6 the package was
-  cell-centered only, deliberately: the original plan scheduled
-  face-centered variables for M8 and left vertex and edge centering
-  unscheduled, accepting that the retrofit would touch the core (array
-  shapes, ghost rules). The M8 design (decided) does all `2^D` centerings
+- **Every centering.** The package does all `2^D` centerings
   at once — in 3D: cell, vertex, three faces, three edges — because once
   the storage and the one-dimensional stencil builders know about one
   staggered dimension they know about any subset of them, and
@@ -59,42 +95,39 @@ block; other centerings are one plane longer per staggered dimension
 - `D` is generic (1, 2, 3, ...) and compile-time (it is the array rank).
 - `N` is likely 32 or 64 and belongs to the **forest**: cells are the
   tree's geometry. `G` is small (0–4) and belongs to the **field set**,
-  per dimension (amended in the M8 design; through M6 it was a forest
-  parameter). It says how far a stencil reaches into a neighbor's data,
+  per dimension. It says how far a stencil reaches into a neighbor's data,
   which is a property of what is stored, not of how space is cut up: a
   flux field reaches nowhere, an evolved vertex-centered field reaches
   differently from a cell-centered one at the same order, and two field
-  sets over one forest with different `G` is the normal case from M8 on.
+  sets over one forest with different `G` is the normal case.
   Both are runtime values (no recompilation when they change), validated
   at construction against the invariants below.
 
-Ghosts are stored on all sides of every block (decided; the earlier
-ideas of x-only or unstored ghosts are dropped). Ghost cells exist only
+Ghosts are stored on all sides of every block. Ghost cells exist only
 in the working array, not in the ODE state vector (see
 [Time integration](#time-integration)).
 
 Invariants tying the parameters together (per dimension, against that
-dimension's `G_d`, from M8 on):
+dimension's `G_d`):
 
 - `N` is even (a fine block covers `N/2` cells at its parent's spacing).
 - Shifted restriction of order `p` reads fine interior cells up to depth
   `2G + p/2 − 1`: `N ≥ 2G + p/2 − 1` (at `p = 2` this is the basic
   `N ≥ 2G`).
 - The restriction window itself must fit inside a fine block's interior:
-  `N ≥ p` (found in M2; binding when `G` is small).
+  `N ≥ p` (binding when `G` is small).
 - Symmetric prolongation of order `p` reads up to `p/2` of the source
   block's own ghost layers: `G ≥ p/2`. (Worst case is the first fine
   ghost layer: its target sits a quarter coarse cell from the interface,
   between the coarse nodes straddling it, and the node across the
   interface is already ghost layer 1.)
 - The two restriction bullets and the `p/2` above are for the
-  point-value family. The conservative family (measured in its
-  implementation): prolongation orders are *odd* (the reconstruction is
+  point-value family. The conservative family: prolongation orders are *odd* (the reconstruction is
   centered on a cell, not a quarter cell off one) with `G ≥ (p−1)/2` —
   one fewer ghost layer at comparable order — and restriction is the
   fixed 2-cell exact average, needing only `N ≥ 2G`.
 - All of the above is for a cell-centered dimension. In a vertex-like
-  dimension (measured in M8a step 2): the exchange region must fit
+  dimension: the exchange region must fit
   within one ring of finer neighbors, `N ≥ 2G + 2` (the shared boundary
   plane makes the high-side region one plane longer, and `N` is even);
   restriction is injection and needs nothing further; point-value
@@ -107,11 +140,6 @@ dimension's `G_d`, from M8 on):
 
 ### Centerings
 
-*(Designed in M8, before implementation, and implemented in M8a steps
-1, 2 and 3. "Decided" below records the design discussion; the three
-"Implemented in M8a" notes at the end of this section record what the
-implementation settled or had to correct.)*
-
 **The model.** Per dimension, a variable lives either at **cell centers**
 — `N` values per block, at half-integer positions — or at **cell
 boundaries** — the integer positions, `N + 1` per block counting both
@@ -122,12 +150,12 @@ boundary planes. A centering is therefore a `D`-tuple of `:cell` /
 :vertex)` — an `x`-edge runs *along* `x`, so it is cell-like there and the
 complement of the `x`-face. `cellcentered(D)`, `vertexcentered(D)`,
 `facecentered(D, d)` and `edgecentered(D, d)` construct them. A tuple
-rather than an enumeration of the `2^D` cases (decided) because of the
+rather than an enumeration of the `2^D` cases because of the
 tensor-product structure everything rests on: every transfer is a product
 of `D` one-dimensional stencils, and the stencil for dimension `d`
 depends on the centering *in that dimension* alone.
 
-**Shared points and half-open ownership** (decided). A vertex-like
+**Shared points and half-open ownership**. A vertex-like
 dimension's boundary points are shared — block `b`'s point `N` is the
 next block's point `0` — and the state vector must hold every degree of
 freedom exactly once. In every dimension a block **owns its points
@@ -150,20 +178,11 @@ tie-breaking. Consequences:
   evolved. A vertex-centered application with physical boundaries sees
   this asymmetry; a periodic domain has no boundary and none. At a
   *reflecting* upper face the exchange derives the wall points instead
-  of the hook (M10; see [Ghost filling](#ghost-filling)), and the
+  of the hook (see [Ghost filling](#ghost-filling)), and the
   asymmetry remains: the low wall evolves, the high one interpolates.
-  Accepted
-  (decided): treating both boundary planes alike would have the lowest
+  Accepted: treating both boundary planes alike would have the lowest
   blocks own `N − 1` points in that dimension and the uniform state
   layout would be gone.
-
-Rejected: closed ownership, both copies of a shared point in the state
-vector. At a coarse-fine face the two copies see different ghosts — one
-side's injected, the other's prolongated — so their right-hand sides
-differ and the copies drift; keeping them consistent needs an exchange of
-`du`, or of `u` inside the RHS, which the RHS contract forbids (AMReX's
-`OverrideSync` exists to repair exactly this). The volume-weighted norm
-would also count every shared point twice.
 
 **Stored layout.** Per dimension `d`, with `c_d = 1` for `:vertex` and
 `0` for `:cell`, a field set with ghost width `G_d` stores `N + 2G_d +
@@ -185,18 +204,11 @@ regions, `1 … G` below and `G+N+1 … N+2G+c_d` above — `G` and `G + c_d`
 points. Everything above the owned range is exchange-filled, so the
 asymmetry is bookkeeping in the target ranges and nothing more.
 `coordinates(fs, b, idx)` maps a stored index to a position for any
-centering and replaces `cell_center`, which took the forest's `G` and
-assumed cell centering; `fill_by_coordinates!` and
+centering; `fill_by_coordinates!` and
 `boundary_by_coordinates` evaluate their callbacks at the field set's own
 points — face centers for a face field.
 
-Rejected: one shape for every centering, `(N+2G)^D`, with the shared
-plane doubling as the first high ghost. Every index convention would
-have stayed literally as it is, but a ghost-free face field becomes
-impossible — there is no slot for the high face when `G = 0` — and
-ghost-free fluxes are the reason `G` moved to the field set at all. The
-extra plane costs `(N+2G+1)/(N+2G)` per vertex-like dimension and buys
-`G = 0`.
+The alternatives rejected here — closed ownership, and one shape for every centering — are recorded with their reasons in [HISTORY.md](HISTORY.md#centerings).
 
 **Invariant.** The exchange region on a block's high side spans positions
 `N … N+G_d+c_d−1` and must lie within one ring of neighbors, including
@@ -207,7 +219,7 @@ same condition as "restriction reads owned points only": the last coarse
 ghost at position `N+G` is fine point `2G`, stored at `3G + 1`, owned iff
 `3G + 1 ≤ G + N`. Checked when the field set is built.
 
-**`G` is per dimension** (decided): an `NTuple{D,Int}`, with a plain
+**`G` is per dimension**: an `NTuple{D,Int}`, with a plain
 integer as the uniform shorthand. Nothing in the package needs the ghost
 width to be the same in every dimension — every target range, stencil
 and invariant is written per dimension already — so the tuple costs a
@@ -245,26 +257,24 @@ the long-deferred "per-variable operator selection" is delivered:
 conservative operators for a density and point-value ones for a velocity
 are two field sets over one forest, each with its own schedule.
 
-**Implemented in M8a step 1** (`G` alone; centering follows in step 2).
 `G` is a required `FieldSet` keyword with no default — an integer or an
 `NTuple{D,Integer}`, stored as `NTuple{D,Int}` — for the same reason
 `Operators` has no default order, and refusing it says so. `Forest` no
 longer takes `G`, and still accepts the keyword only in order to throw a
-message naming where it went; `regrid!` likewise keeps the M6
+message naming where it went; `regrid!` likewise keeps the old
 three-argument form as a method that throws. Four things the design left
 open, settled by the implementation:
 
 - **`GhostSchedule` belongs to a layout, not to a forest.** The
   documented form is `GhostSchedule(fs, ops)`. The forest form survives
-  as `GhostSchedule(forest, ops; G, T, backend)` — `centering` joined
-  its keywords in step 2 — because it costs nothing: it is the body, and
+  as `GhostSchedule(forest, ops; G, T, backend)` because it costs nothing: it is the body, and
   the field-set form is one line spelling the triple out of `fs`, and it
   is what a caller with no field set in hand uses. `fill_ghosts!`
   compares `fs.G` against the schedule's and refuses a mismatch,
   alongside the existing forest, generation, element type and backend
   checks: every target range in a schedule is wrong for another `G`, and
-  nothing else would have caught it. Step 2 added the centering to that
-  same check, for the same reason — the stored extent, the target ranges
+  nothing else would have caught it. The check covers the centering too,
+  for the same reason — the stored extent, the target ranges
   and the one-dimensional operators all differ between a cell-centered
   and a vertex-like dimension.
 - **`coordinates` defaults to the *field set's* element type**, not the
@@ -277,16 +287,13 @@ open, settled by the implementation:
   subtracts it, so one ghost width could not have distinguished them.
 - **`check_operators` takes the field set** and checks every constraint
   per dimension against that dimension's `G_d`, naming the dimension in
-  the message. It kept M2's blanket `G_d ≥ 1` in every dimension, so
-  that a ghost-free field set could not have a ghost schedule at all;
-  step 2 relaxed that along a stagger and a review after step 2 removed
-  it altogether — see the step-2 record below for why it was never
-  needed.
+  the message. There is no blanket `G_d ≥ 1` (see below for why
+  none is needed).
 - **`regrid!` allocates per field set from that set's own `G`**, and
   fills ghosts per field set from that set's own schedule, rather than
   once from a shared one.
 
-**Implemented in M8a step 2** (the centering itself). `centering` is a
+`centering` is a
 `FieldSet` keyword defaulting to `cellcentered(D)` — unlike `G` it *does*
 get a default, because cell-centered is what a field set was through M6
 and what everything not deliberately staggered wants. It is validated
@@ -294,12 +301,9 @@ into an `NTuple{D,Symbol}`; `staggers` turns it into the `c_d` tuple the
 arithmetic uses, and is exported so that an application can size its own
 loops. `closedview` and `map_blocks!(…; closed = true)` are the closed
 range's two faces. The cell-centered stencils are the same rational
-weights as before, so no measured number moved: the whole suite passes
-unchanged, the M3 wave tables included, and the thread-independence
-digests still agree byte for byte. What the step settled or corrected:
+weights as before.
 
-- **There is no blanket `G_d ≥ 1` at all** (amended after step 2; the
-  step itself only relaxed it along a stagger). Step 1's rule — a
+- **There is no blanket `G_d ≥ 1` at all**. Step 1's rule — a
   dimension without ghosts has nothing to exchange, so a ghost-filled
   field set needs `G_d ≥ 1` everywhere — was M2's uniform-`G` check made
   per dimension, and it is redundant with the operator table wherever
@@ -315,8 +319,7 @@ digests still agree byte for byte. What the step settled or corrected:
   regrids: `regrid!` needs a schedule, and the schedule needs
   `check_operators` to pass. Its ghost exchange is simply empty (the
   builder already skipped empty regions), and the conservative regrid
-  test now runs `p = 1` at `G = 0`. Along a stagger the reasoning is the
-  one step 2 gave: the block still has its shared plane, which is
+  test now runs `p = 1` at `G = 0`. Along a stagger: the block still has its shared plane, which is
   exactly the whole exchange of a second-order evolved face field —
   `G = (0, g, g)` at `p = 2` builds a schedule and fills it, and in
   `D = 1` that schedule is *entirely* injection, so the exchange is then
@@ -334,32 +337,22 @@ digests still agree byte for byte. What the step settled or corrected:
   (Reachable through the front door since the blanket `G_d ≥ 1` went: a
   ghost-free cell-centered set with conservative `(1, 2)` operators has
   an entirely empty schedule.)
-- **The oracle generalization the plan expected was not needed.** The
-  plan anticipated teaching `cell_average` to average along cell-like
-  dimensions only, so that a staggered field set could be checked as the
-  mixed average-and-point-value object it is. Nothing needs it: that
-  reading belongs to the conservative family, which is refused along a
-  stagger, so every staggered set under test is point-value throughout
-  and is compared at `coordinates`. The oracle was left alone.
 
-**Implemented in M8a step 3** (the application). The wave equation is
-vertex-centered from here on — `centering` is a keyword on every entry
+The test wave equation is vertex-centered — `centering` is a keyword on every entry
 point of `test/wave.jl`, defaulting to `vertexcentered(D)`, and the M3
 study survives verbatim in `test/wave_cell_tests.jl` saying
 `cellcentered(D)` out loud at every call. The measured table is under
-[Operators](#operators); no cell-centered number moved. What the step
-settled:
+[Operators](#operators). What follows from it:
 
 - **Nothing in the application knows the centering.**
-  `wave_rhs_kernel!` takes no `Val(C)`, as the plan predicted: it reads
+  `wave_rhs_kernel!` takes no `Val(C)`: it reads
   its own point and its neighbours a spacing away, which is the same
   stencil wherever those points sit. `WaveProblem` needs no centering
   either, since it carries the field set. So the whole staggered study
   is the cell-centered one with one keyword changed at the
   `FieldSet` calls — which is the claim a centering that is "a property
   of the field set and nothing else" has to make good on.
-- **`wave_forest` deliberately does not take a centering**, against the
-  plan's list. It builds the forest, and how space is cut into blocks is
+- **`wave_forest` deliberately does not take a centering**. It builds the forest, and how space is cut into blocks is
   exactly what a centering does not change; a keyword that is accepted
   and ignored would say otherwise.
 - **The staggered `Float32` wave case lives in `gpu_tests.jl`, not
@@ -387,8 +380,7 @@ simplest case). This admits non-cubic rectangular domains. Morton keys
 carry the root index; neighbor finding across root boundaries is
 arithmetic on the brick. Refinement is
 **all-or-nothing**: a block is either a leaf or is fully refined into
-exactly `2^D` children of half the spacing. *(Amended from the original
-sketch's "up to 2^D children": leaf-only storage requires it.)*
+exactly `2^D` children of half the spacing.
 
 - **Leaf-only data.** Only leaves carry data; the leaves tile the domain
   exactly, with no overlapping coarse data underneath refined regions.
@@ -403,17 +395,15 @@ sketch's "up to 2^D children": leaf-only storage requires it.)*
   ghost region then touches at most one level up or down, which bounds
   the ghost-filling cases and prolongation stencils.
 
-**Key encoding** (decided): a key is an `isbits` struct — root index
+**Key encoding**: a key is an `isbits` struct — root index
 (`Int32`), level (`Int8`), and per-dimension coordinates
 (`NTuple{D, UInt32}`, the block's integer position at its own level).
 Curve order is root index first, then Morton order, with the bit
 interleaving computed on the fly during comparison — no packed-integer
 format, and no practical depth limit (32 levels). The curve is plain
-Morton; Hilbert was considered and rejected (better MPI partition
-locality, but the rotation arithmetic is not worth it at realistic rank
-counts).
+Morton.
 
-**Neighbor asymmetry** (recorded from M1): neighbor finding is not
+**Neighbor asymmetry**: neighbor finding is not
 symmetric under reversing the direction when levels differ — a coarse
 block found across a fine block's corner also spans the face beyond it,
 so the reversed direction from the coarse side points elsewhere. Exact
@@ -437,7 +427,7 @@ declared up front:
   ordinary copy/prolongation/restriction machinery with no special
   boundary code. With `M_i = 1` a block can be its own periodic
   neighbor; this is supported.
-- **Reflecting** (per face; M10): a face across which the solution is
+- **Reflecting** (per face): a face across which the solution is
   its own mirror image. That covers a symmetry plane and, equally, a
   hydrodynamic solid wall, which does the same thing to the ghosts. It is
   declared on the forest as `reflecting = ((lo, hi), …)`, one pair per
@@ -448,7 +438,7 @@ declared up front:
   elsewhere, and a product of components takes the product of their
   parities. The parity is required, with no default, since it is physics.
   `NoParity` exists for dimensions without a reflecting face and is
-  refused in one that has one (decided). A variable without a parity has
+  refused in one that has one. A variable without a parity has
   no value beyond the wall, and ghosts without a value do not stay in the
   ghosts: the first regrid prolongation that reads them carries them into
   the interior.
@@ -461,8 +451,7 @@ declared up front:
   So reflection runs on every backend, in the same kernel and the same
   phases as every other transfer, and the boundary hook never sees a
   reflecting face.
-- **Rotating** (a pair of dimensions; M12, designed 2026-10-03 before
-  implementation): a quarter-plane symmetry. Only one quadrant of the
+- **Rotating** (a pair of dimensions): a quarter-plane symmetry. Only one quadrant of the
   `(d1, d2)` plane is simulated, and the other three are its images
   under rotations by 90° about the line where the low faces of `d1` and
   `d2` meet. The models are Cactus's RotatingSymmetry90 and a spinning
@@ -490,7 +479,7 @@ declared up front:
 
   Every field set over such a forest declares its **rotation**, a
   signed variable map with one entry per variable, required with no
-  default, since it is physics (decided, as `parity` is). Variable `v`
+  default, since it is physics, as `parity` is. Variable `v`
   at `Rp` equals `sign(rotation[v])` times variable `|rotation[v]|` at
   `p`, of the set it rotates from: the set itself when its layout is
   symmetric under exchanging `d1` and `d2`, its partner otherwise (see
@@ -511,7 +500,7 @@ declared up front:
     reflecting dimension. The rotation and a reflection outside its
     plane commute, so the two declarations must agree.
 
-  *(Step 2, 2026-10-03.)* The fourth-power and parity checks need the
+  The fourth-power and parity checks need the
   set the map reads from, so the field set makes them for a symmetric
   layout and `RotationPair` makes them, as `Q_a Q_b Q_a Q_b = I` and the
   parities across the pair, for an asymmetric one; a lone asymmetric
@@ -530,33 +519,22 @@ declared up front:
   as they see a periodic wrap, and a block at the axis is its own
   neighbor in three directions of the plane, as a single periodic root
   is its own neighbor.
-  Balance gains one rule, **conformity at the seam** (decided
-  2026-10-03 with Erik): a leaf on the low face of `d1` and its image
+  Balance gains one rule, **conformity at the seam**: a leaf on the low face of `d1` and its image
   on the low face of `d2` are at the same level, so no coarse-fine face
   crosses the seam. Why, and what it leaves, is under "Rotating seams"
   in [Ghost filling](#ghost-filling). A leaf list handed to
   `Forest(roots; …, leaves)` that is not conforming is refused there,
   as an unbalanced one is.
 
-  The forest gains a field for it, `rotating`, with `(0, 0)` for none.
-  A ninth field once made the schedule build allocate more (see "The
-  buffer pool" under [Distributed meshes](#distributed-meshes)), so
-  `bench/ghosts.jl`'s allocation is measured before and after, and if
-  the field costs again `reflecting` and `rotating` are folded into one
-  immutable field instead. M12's step 1 records which. *(Step 1,
-  2026-10-03: neither. What costs is the struct's size, not its field
-  count. An `NTuple{2,Int}` added 160 and 4896 bytes to the two schedule
-  builds; an `NTuple{2,Int8}` fits in the alignment padding before
-  `extents`, so `sizeof(Forest)` and the allocation are unchanged, and
-  it is what the forest holds. The numbers are under step 1 in the
-  M12 entry.)*
+  The forest has a field for it, `rotating`, with `(0, 0)` for none:
+  two `Int8`s, which fit in the struct's alignment padding (what a
+  field of `Forest` costs is under "The buffer pool" in
+  [Distributed meshes](#distributed-meshes)).
 - **Physical** (per face, neither periodic, reflecting nor a rotating
   seam): ghost cells are filled by a user-supplied boundary condition
   hook. For a vertex-like dimension the domain's upper boundary plane
   is the first plane of an outward-facing region and is filled by the
-  hook too (M8; see [Centerings](#centerings)). Until M10 the hook was
-  also the only way to express a reflection, which it could not do
-  correctly at every edge and corner; see [Ghost filling](#ghost-filling).
+  hook too (see [Centerings](#centerings)).
 
 ### Data layout
 
@@ -570,17 +548,17 @@ Two arrays exist:
       work :: Array{T, D+2}   # size (N+2G₁+c₁, ..., N+2G_D+c_D, nvars, nblocks)
 
   with `c_d = 1` in a vertex-like dimension and `0` in a cell-centered
-  one, and `G_d` the field set's ghost width in dimension `d` (M8; see
+  one, and `G_d` the field set's ghost width in dimension `d` (see
   [Centerings](#centerings)). The state vector holds `N^D` per block per
   variable for every centering.
 
-- One array for all variables of one field set (decided against
-  per-variable arrays). Variables that differ in centering, ghost width,
-  or operator choice go in different field sets (M8).
+- One array for all variables of one field set, not per-variable
+  arrays. Variables that differ in centering, ghost width, or operator
+  choice go in different field sets.
 - Cell indices vary fastest (GPU coalescing); blocks are ordered by
   Morton key.
 - Element type `T` is generic; `Float64` default, `Float32` relevant for
-  GPUs. See "Precision" below for what carries `T` (amended in M5).
+  GPUs. See "Precision" below for what carries `T`.
 - Block slots are compacted at each regridding; block indices are **not**
   stable across regridding, and no stable region identifiers are offered
   (applications refer to space via keys or coordinates, not block
@@ -596,14 +574,9 @@ ODE state vector.
 ### Precision
 
 **The mesh is generic in its floating-point type, and the arithmetic is
-generic, not just the storage** (decided; amended in M5, when the
-implementation showed the original one-line rule was not enough).
+generic, not just the storage**.
 
-The original specification said only that the working array's element
-type is generic. That is too weak. Geometry was computed from `Float64`
-extents and *converted* at the end, so a `Float32` field set still needed
-hardware fp64 to find a cell center — and fp64 is exactly what a device
-may not have. So:
+A generic storage type alone is too weak, since fp64 is exactly what a device may not have; how that was found is in [HISTORY.md](HISTORY.md#precision). So:
 
 - **`Forest{D,T}` carries the geometry type**, and every geometry
   function computes in it from the first operation. Each takes an
@@ -671,7 +644,7 @@ Under 2:1 balance there are exactly three cases per ghost region:
 3. **Finer neighbor** (coarse ghosts): **restriction** — interpolation
    from fine cells.
 
-**In a vertex-like dimension** (implemented in M8a step 2; see
+**In a vertex-like dimension** (see
 [Centerings](#centerings)) the three cases keep their names and change
 their one-dimensional stencils. A copy is a shift by `N` as before, with
 the high-side target one plane longer. Restriction is **injection**: a coarse point at
@@ -691,7 +664,7 @@ so the source's high exchange region (`G + 1` points) must hold `p/2` of
 them, `G ≥ p/2 − 1`, against `G ≥ p/2` for cell centering. Tangentially
 the window is clamped inward at the source's edges exactly as today.
 
-**Stencil widths are per dimension** from M8 on: the transfer kernel
+**Stencil widths are per dimension**: the transfer kernel
 takes a `Val{NTuple{D,Int}}` where it took one `Val{P}`. Not cosmetic —
 an injection padded to width `p` with zero weights reads `p − 1` slots
 that need not hold data (a `G = 0` face field has no slot at all beyond
@@ -712,7 +685,7 @@ Periodic boundaries need no special handling here — the tree wraps
 around (see [Domain and boundaries](#domain-and-boundaries)). Physical
 (outer) boundaries are filled by the user-supplied boundary hook,
 invoked per outward-facing ghost region (faces, edges, and corners)
-**between phase 1 and the prolongation sweep** — amended in M2: a block
+**between phase 1 and the prolongation sweep**, because a block
 at the domain edge has prolongation stencils that reach *tangentially*
 past the edge into the coarse source's own outer ghosts, so running the
 hook last would feed unwritten memory into the interpolation. The hook
@@ -720,7 +693,7 @@ may therefore read its block's interior (as extrapolating conditions
 do) but not other blocks' ghosts, and not ghosts that prolongation has
 yet to fill.
 
-**Reflecting faces** (M10) are transfers, not hook calls. A ghost region
+**Reflecting faces** are transfers, not hook calls. A ghost region
 in direction `δ` that crosses reflecting faces in the dimensions of a
 mask `m` is the mirror image of a region that lies inside the domain.
 Zero the masked components of `δ` to get `δ′`. The mirror image is then
@@ -765,8 +738,7 @@ do. At a mixed edge or corner region whose tangential neighbor is
 coarser, the mirrored values are the block's *own* prolongated ghosts,
 and the hook, which runs before the sweep, would have read them stale.
 
-**The upper wall point in a vertex-like dimension** (decided in the M10
-design). On a high reflecting face the wall plane `G + N + 1` belongs to
+**The upper wall point in a vertex-like dimension**. On a high reflecting face the wall plane `G + N + 1` belongs to
 nobody (see [Centerings](#centerings)), and the mirror maps it onto
 itself, so reflection alone does not determine it. It is derived:
 
@@ -790,7 +762,7 @@ wall point forced to zero. It stays zero if the right-hand side respects
 the parity, as a centered stencil does, since the mirrored ghosts give
 `u(−h) = −u(h)` exactly.
 
-**Rotating seams** (M12; designed 2026-10-03, before implementation).
+**Rotating seams.**
 A rotating seam (see [Domain and boundaries](#domain-and-boundaries))
 is harder than a reflecting face in two ways. It is **non-local**: the
 low face of `d1` is glued to the low face of `d2`, so the source of a
@@ -827,7 +799,7 @@ search returns it with the keys. In the real frame the search runs in
 the rotated direction `R^{−r} δ`, and a finer neighbor's child offset,
 which a restriction's stencils depend on, is taken back into the
 virtual frame by the same permutation and flip as the coordinates.
-*(Made exact in step 1, 2026-10-03.)* With `(a, b)` the components
+With `(a, b)` the components
 along `(d1, d2)`, the direction from the real leaves (`real_direction`)
 and the virtual child offset of a real offset `o` (`virtual_offset`)
 are
@@ -874,9 +846,8 @@ the same load: for target variable `v` the kernel reads source variable
 composed map per orientation, which lives beside the parity factors
 and moves to the device with them.
 
-*Why no fix-up pass.* Erik asked whether the seam ghosts should be
-filled as ordinary copies and then mixed by a second pass. That is not
-needed. A 90° rotation of any Cartesian tensor component is a **signed
+*Why no fix-up pass.* Filling the seam ghosts as ordinary copies and
+then mixing them by a second pass is not needed. A 90° rotation of any Cartesian tensor component is a **signed
 permutation** of components, so `Q^r` splits into two halves, each of
 which goes where M10 already put something:
 
@@ -902,7 +873,7 @@ so the serial fill's `−0` is kept bit for bit (see "The parity factor
 is applied when unpacking" under
 [Distributed meshes](#distributed-meshes)).
 
-*Conformity* (decided 2026-10-03 with Erik). Leaves across a seam face
+*Conformity*. Leaves across a seam face
 are at the same level: `balance!` refines a leaf across a seam face
 that is coarser by any amount, not only by two levels or more, and the
 checked `leaves` path and `isbalanced` enforce the same rule. A family
@@ -952,7 +923,7 @@ high ghosts facing the target are the real low ghosts beyond the seam —
 and these are filled in phase 1 or in an earlier step of the sweep, as
 for any prolongation.
 
-*Two owned seam planes* (decided). In a vertex-like set the low plane
+*Two owned seam planes*. In a vertex-like set the low plane
 of `d1` and the low plane of `d2` are both owned, as every low boundary
 plane is under M8's half-open ownership, and both are evolved, although
 they are the same points under `R`. The alternative, deriving one from
@@ -974,8 +945,7 @@ conservative family is refused along a stagger), so this is recorded
 rather than corrected. The choice is about ownership only and assumes
 nothing about aligned axes.
 
-*Asymmetric layouts, and pairs* (in scope now, decided 2026-10-03 with
-Erik). The virtual frame needs the rotated source to have the target's
+*Asymmetric layouts, and pairs*. The virtual frame needs the rotated source to have the target's
 layout. A set whose layout is symmetric under exchanging `d1` and `d2`
 — `G[d1] == G[d2]` and `c[d1] == c[d2]`, which holds for cell- and
 vertex-centered sets and for any set staggered alike along `d1` and
@@ -988,20 +958,19 @@ the value `−B_y` across the low face of `x`. Two cases:
   fluxes: the set has no seam ghost region at all. None of its
   exchange regions has a negative component in the plane — along its
   stagger the one region is the shared plane at a block's high face —
-  so none crosses the seam, and it fills alone, as today. *(Amended in
-  step 3, 2026-10-03: "fills alone" is vacuous. An asymmetric layout
+  so none crosses the seam. An asymmetric layout
   with `G = 0` along both plane dimensions is cell-centered along one
   of them, and `check_operators` refuses `G = 0` along a cell-centered
   dimension for every point-value order and the conservative family
   along a vertex-like one, so no ghost schedule serves such a set: it
   is never ghost-filled, and is regridded as `fs => nothing`, as the
-  fluxes are today. The field set takes it without a partner.)*
+  fluxes are today. The field set takes it without a partner.
 - **Otherwise**, as for `B_x` and `B_y` of constrained transport with
   `G > 0` in the plane: the two sets are filled as a
   **`RotationPair(a, b)`**, each from the other across the seam. An
   orientation of 1 or 3 reads the partner's working array, and 2 reads
   the set's own, since two quarter turns map a layout onto itself.
-  `RotationPair` is a new exported immutable value: two field sets over
+  `RotationPair` is an exported immutable value: two field sets over
   one forest with each other's swapped layout, the same `nvars`,
   element type and backend, and maps with `Q_a Q_b Q_a Q_b = I`; it
   refuses anything else, with the reason. It builds the composed tables
@@ -1017,10 +986,8 @@ the value `−B_y` across the low face of `x`. Two cases:
   phase-2 target level for `a` and then `b`. A prolongation may read
   its partner's coarser ghosts, which an earlier step of the merged
   sweep has filled. Under MPI each stage completes before the next
-  starts, so the two members can share a stage's tag, MPI's
-  non-overtaking order keeping their messages apart; an offset per
-  member on the tag is the alternative if it turns out cleaner.
-  *(Confirmed in step 7, 2026-10-03, and made precise: what a stage
+  starts, so the two members share a stage's tag, MPI's
+  non-overtaking order keeping their messages apart. What a stage
   completes before the next is its receives — its sends are waited on
   at the end of the fill, as in every fill since M7 — and that is
   enough. A stage sends at most one message to each peer, and every
@@ -1028,27 +995,24 @@ the value `−B_y` across the low face of `x`. Two cases:
   message of a tag is sent before `b`'s, and `a`'s receive of it is
   posted, and completed, before `b`'s is posted; MPI matches two
   messages of one tag between one pair of ranks in the order they were
-  sent, so `a`'s receive takes `a`'s message. No ordering hazard was
-  found, and the members keep the shared tag; the regrid's transfers of
+  sent, so `a`'s receive takes `a`'s message. The regrid's transfers of
   the two members share tag 50 for the same reason, as several field
-  sets' have since M7.)* A
+  sets' have since M7. A
   plain `fill_ghosts!` on an asymmetric set whose schedule has odd
   orientations refuses, saying to fill it as a `RotationPair`.
-  *(Amended in step 3, 2026-10-03: the schedule records nothing for
+  The schedule records nothing for
   it. The fill decides from the layout, `G[d1] > 0 || G[d2] > 0`,
   which holds exactly when the serial schedule has transfers of odd
   orientation — every block on a seam face then has a nonempty region
   beyond it — and is the same on every rank, where a schedule's own
   groups are not: a rank whose blocks are off the seam has none, and a
   refusal on some ranks only would leave the others waiting in the
-  exchange.)*
-  `regrid!` and `adapt_to_initial_data!` take `pair => (sa, sb)` and
-  fill the pair before the transfers; the transfers themselves are
-  `δ = 0` and never cross the seam.
-  *(Amended in step 4, 2026-10-03: `regrid!` takes the element
+  exchange.
+  `regrid!` takes the element
   `pair => (sa, sb)` beside `fs => schedule` and `fs => nothing`, fills
   the pair once before either set moves, and moves each set with its
-  own schedule's operators. A plain `fs => schedule` of an asymmetric
+  own schedule's operators; the transfers themselves are
+  `δ = 0` and never cross the seam. A plain `fs => schedule` of an asymmetric
   set with ghosts in the plane is refused there, among the collective
   checks, with the pair named, since its fill would be refused further
   down on every rank alike; `fs => nothing` fills nothing and is
@@ -1058,9 +1022,9 @@ the value `−B_y` across the low face of `x`. Two cases:
   with `initial` and `boundary` one for both sets or a tuple of two,
   `flags` called with the pair, and the two schedules returned. It
   fills ghosts before it flags, for a criterion that reads them, which
-  is why it needs the pair at all.)*
+  is why it needs the pair at all.
 
-*90° only* (decided 2026-10-03 with Erik). A 180° rotation, the
+*90° only*. A 180° rotation, the
 π-symmetry, needs the same machinery and one thing more, a face glued
 to itself and flipped about the domain's centre line; it is an open
 question (see [Open questions](#open-questions)).
@@ -1071,26 +1035,21 @@ stencils do. Application kernels are strictly block-local: neighbor data
 is visible only through ghost cells.
 
 Transfers are **batched by stencil**: everything sharing a kind, a
-direction, a child offset, (M10) a mirror state per dimension — none,
-mirrored rows, or the vertex-like upper wall row — and (M12) an
+direction, a child offset, a mirror state per dimension — none,
+mirrored rows, or the vertex-like upper wall row — and an
 orientation shares one set of one-dimensional stencils and so one
 kernel launch. The orientation joins `keyorder` as well, so both ends
-of an MPI message still derive one layout, and a group carries its
-axis map, the identity for an ordinary group. *(Amended in step 3,
-2026-10-03: a group carries its orientation and the seam's plane
+of an MPI message still derive one layout. A group carries its
+orientation and the seam's plane
 `(d1, d2)`, two `Int8`s and a pair of them, and `run_group!` derives the
-axis map at the launch; `factorcol` became an `Int32`, so the three
+axis map at the launch, the identity for an ordinary group; `factorcol` is an `Int32`, so the three
 share the eight bytes it had alone and a group is no larger than
-before.)* Prolongations are
-additionally batched by *target level* (amended in M5): the batch is
+it would be without them. Prolongations are
+additionally batched by *target level*: the batch is
 the unit the phase-2 sweep
 schedules, so a batch spanning two levels would be filed under one of
 them and the coarsest-target-first order would be quietly lost wherever
-three levels meet. The original keying did span levels; it was found
-while threading the schedule build, and no configuration could be
-constructed in which it actually produced wrong ghosts — but the
-ordering the sweep exists to guarantee was not in fact enforced, which
-is enough reason to fix it. Batching is an implementation detail of a
+three levels meet. Batching is an implementation detail of a
 phase, not the unit of parallelism: see
 [Parallelism](#parallelism) for how a phase is actually run.
 
@@ -1110,33 +1069,9 @@ coarse" step, since no overlapping coarse data exists.
 
 ### What the ghost fill costs
 
-Profiling a downstream solve (TreeGeneralizedHarmonic, a uniform mesh of
-120 blocks of `8^3`) found that **the ghost machinery owned most of the
-non-compilation run time and essentially all of the remaining heap
-allocation**: the floating-point work of the physics was about 22 % of
-run self time and the transfer kernel's addressing about 19 %. That is
-the right order of magnitude to care about — and it understates the
-refined case, where the same application measures the fill at 79 % of an
-evaluation at a coarse-fine face against 22 % uniform. Four costs were
-named; all four are real, one was diagnosed wrongly, and a fifth turned
-out to be the largest. Measured here with `bench/ghosts.jl`, one thread,
-`D = 3`, `N = 8`, 4 roots per edge, 10 variables, `p = 4`, flat *self*
-time:
+The downstream profile that led to the changes below, and their before-and-after numbers, are in [HISTORY.md](HISTORY.md#what-the-ghost-fill-costs). The kernel's costs, and what was done about each:
 
-| | before | after |
-|---|---|---|
-| uniform mesh, 64 blocks, one fill | 5.12 ms, 17552 B | **2.90 ms, 10896 B** |
-| two-level mesh, 120 blocks, one fill | 28.4 ms, 157408 B | **15.4 ms, 97504 B** |
-| two-level mesh, schedule build | 19.6 ms, 39.1 MiB | **3.15 ms, 4.28 MiB** |
-| `p = 6` schedule build | 89.5 ms, 104.4 MiB | **4.2 ms, 6.28 MiB** |
-
-The same fills at four threads, where a phase runs as slices rather than
-as one launch per group, gain slightly more: 1.01 ms → **0.53 ms**
-uniform and 6.57 ms → **2.85 ms** two-level. So this is a change to what
-the kernel does per point, not an accident of the serial schedule.
-
-**Bounds checking was the largest cost, and was not on the list**
-(found here). `checkbounds_indices` and its `size` calls were 15 % of
+**Bounds checking was the largest cost.** `checkbounds_indices` and its `size` calls were 15 % of
 the uniform fill's self time and 25 % of the two-level one — more than
 the interpolation arithmetic. Every index the transfer kernel forms is
 constructed by the schedule, whose whole job is to guarantee it: a
@@ -1159,16 +1094,12 @@ self time, and the largest entry after the bounds checks. It is now
 `ndrange = (boxlen…, nvars, ntransfers)`, so the backend supplies the
 position and no division happens at all. `map_blocks!` already launched
 a `D + 1`-dimensional ndrange, so this is not new ground for the device
-backends; on a GPU the division moves into KernelAbstractions' own
-`expand`, where it belongs. *(Amended 2026-10-05: on a GPU it does not
-belong there. KernelAbstractions forms the index with run-time 64-bit
+backends; on a GPU it does not
+belong in KernelAbstractions' own `expand`. KernelAbstractions forms the index with run-time 64-bit
 divisions, emulated in software, and that held the fill and the scatter
 to a fifth of an H200's bandwidth; a device now launches flat and
 divides by precomputed inverses, while the CPU keeps this launch — see
-[The copy kernels on a device](#the-copy-kernels-on-a-device).)* The two boundary kernels had the same
-flattening and got the same treatment. Since this is the one change that
-alters launch geometry, it was checked on real hardware and not only
-argued: the whole suite passes on Metal (Apple M3 Pro, `Float32`).
+[The copy kernels on a device](#the-copy-kernels-on-a-device). The two boundary kernels launch the same way.
 
 **The tensor-product sum is generated, not iterated.** `for m in
 CartesianIndices(Ps)` cost its trip count in `__inc` even though `Ps` is
@@ -1180,14 +1111,9 @@ to the same accuracy: `m_1` runs innermost, as column-major
 `CartesianIndices` iteration did, so the contributions are summed in the
 same order, and the weight product is still formed as
 `((w₁ · w₂) · …) · w_D`, since floating-point multiplication does not
-associate. Only the loads move. Ghost fills are bit-identical to the
-previous implementation across `D = 1, 2, 3`, both centerings and both
-operator families — checked by digest against the previous commit, not
-inferred.
+associate. Only the loads move. 
 
-**The per-launch allocation is KernelAbstractions', not ours**
-(corrects the downstream brief, which put it on `run_group!`
-reassembling the group's geometry). Rebuilding the geometry tuples costs
+**The per-launch allocation is KernelAbstractions', not ours.** Rebuilding the geometry tuples costs
 nothing measurable; what allocates is the argument tuple that
 `Kernel{CPU}`'s varargs call boxes on the way into KA's `__run`
 inference barrier — 672 B per launch, of which the group geometry
@@ -1223,7 +1149,6 @@ loop, not ours, and removing it would mean not using KA's CPU emitter.
 
 ### The copy kernels on a device
 
-*(Measured and changed 2026-10-05; released as 0.1.8, 2026-10-06.)*
 TreeGeneralizedHarmonic made its
 right-hand-side kernel 8× faster on an H200, 8.5 → 1.1 ns a point, and
 then found what was left of an evaluation to be TreeAMR's: `scatter!`
@@ -1273,21 +1198,8 @@ weights, not from the kind: a mirrored copy at a vertex-like high wall
 interpolates the wall plane it does not own (`wall_stencil`), and a
 vertex-centered `PointValue` restriction is an injection, so it is unit.
 
-**Every run-time choice of type is compiled at every launch site**
-*(found 2026-10-06, when the change failed CI)*. The first version passed
-`weights = nothing` for a copy and chose the shape — `nothing`, or a
-`LinearShape` of `Int32` or of `Int` — by a run-time `flat`. Inference
-follows each member of such a union at every call site, so every launch
-site compiled up to six launches of which it ran one, and the
-compilation-bound `mpi_workload.jl` took 75–85 s serially against 62–65
-for 0.1.7, at 0.3–0.6 GB more peak memory (`--trace-compile-timing`:
-62.4 → 73.8 s of compilation, all of it in host code; the kernels run
-were the same 108). On CI's macOS runners, 3 cores and 7 GB with Julia
-1.13, the three-rank job runs beside its serial reference and was
-already near its 900 s deadline — it had missed it once on `main`, on
-2026-10-04 — and now missed it in both macOS cells. With the fix below
-it still missed it in one cell, so on a small machine the three-rank job
-now runs after the reference instead (M7 step 9, amended). So the copy is a
+**Every run-time choice of type is compiled at every launch site.**
+Inference follows each member of a union at every call site. So the copy is a
 `Bool` argument (folded away for any stencil wider than one point, `Ps`
 being a type parameter), the CPU's shaped launch is type-stable, and
 only the flat launch hides its kernel from inference
@@ -1410,10 +1322,9 @@ two operator families:
   weights, so they run through the same tensor-product stencil
   machinery; the family-specific invariants are under
   [Blocks](#blocks). How the interface-order rule below transfers to
-  this family is predicted below and measured in M8.
+  this family is predicted and measured below.
 
-There is **no default order** (amended after M3, which showed the
-original default of 2 silently producing first-order convergence): the
+There is **no default order**: the
 right order depends on the application's differencing order via the
 interface-order rule below, which the mesh library cannot know, so
 `Operators` requires both orders explicitly. The application chooses
@@ -1421,12 +1332,10 @@ interface-order rule below, which the mesh library cannot know, so
 requested operator orders satisfy the invariants listed under
 [Blocks](#blocks). Physics-specific operators —
 hydro-aware limited interpolation, primitive-variable-based prolongation
-— live in application packages and plug into the same interface. *(This
-resolves the original sketch's open question about where hydro-specific
-operators belong.)*
+— live in application packages and plug into the same interface.
 
-Operators are configured per field set, not per variable — and from M8
-on that *is* per-variable selection (decided): a field set is the unit of
+Operators are configured per field set, not per variable — and that
+*is* per-variable selection: a field set is the unit of
 centering, ghost width and operators alike, so conservative operators for
 a density and point-value ones for a velocity are two field sets over one
 forest, each with its own schedule (see [Centerings](#centerings)). The
@@ -1434,7 +1343,7 @@ schedule is built from a field set, `GhostSchedule(fs, operators)`, and
 records the layout it was built for; field sets with the same layout may
 share it, and `fill_ghosts!` checks.
 
-**Interface-order rule** (measured in M3): the interpolation order `p`
+**Interface-order rule:** the interpolation order `p`
 must exceed the application's differencing order by two, for *both*
 operators. A ghost filled by an order-`p` operator carries an `O(hᵖ)`
 error; a second-derivative stencil divides it by `h²`, leaving an
@@ -1448,7 +1357,7 @@ mesh unrefined converges at 2.0 with order-2 operators, which pins this
 on the interface rather than the scheme. The tests assert all four
 rates.
 
-**The same rule along a stagger** (measured in M8a step 3). Repeating
+**The same rule along a stagger.** Repeating
 that study on a **vertex-centered** field set — same equation, same
 Laplacian, same two-level mesh, values moved from the cell centers to
 the cell boundaries — changes the table in exactly the way the vertex
@@ -1483,7 +1392,7 @@ orders are odd, the prediction is therefore rates **1, 2, 2** for
 prolongation orders `p = 1, 3, 5` under a second-order finite-volume
 scheme, and `p = 3` is the first order that does not degrade it.
 
-**Measured in M8b step 5**, with the Burgers study of `test/burgers.jl`:
+**Measured** with the Burgers study of `test/burgers.jl`:
 the smooth sine run to half its breaking time on the M3 two-level mesh,
 unlimited linear reconstruction, Rusanov flux, `SSPRK33`, conservative
 restriction (which is exact and therefore never enters), over
@@ -1501,8 +1410,7 @@ scheme's own rate, and order 5 buys nothing further — the refined runs at
 `p = 3` and `p = 5` land on the *unrefined control's* rate, which is the
 sharper statement that the interface has stopped being what limits them.
 
-**The norm is part of the result** (measured in M8b step 5; the design
-did not anticipate it). The rule shows in `L∞` and **not** in an integral
+**The norm is part of the result**. The rule shows in `L∞` and **not** in an integral
 norm: every L1 column above is the scheme's own rate, `p = 1` included.
 An order-`p` prolongation leaves a flux defect on the coarse-fine face
 and nowhere else, and the solution error it causes stays in a
@@ -1516,8 +1424,7 @@ all. Both norms are asserted in `burgers_tests.jl`, in both directions,
 precisely because picking one and believing it is the easy mistake.
 
 **Why the defect stays local is conservation, not the flux-divergence
-form** (amended after step 5, when the record credited the form; the
-prediction below was made before the run). The residual the defect
+form.** The residual the defect
 creates is a *dipole*: after the fixup both sides of the face use the
 same flux, so the fine cell loses exactly what the coarse cell gains and
 the residual has zero net mass. A first-order hyperbolic operator carries
@@ -1536,7 +1443,7 @@ scheme: a non-conservative flux-divergence scheme radiates its interface
 defect as the wave equation does, and its L1 rate says so. The negative
 control on the rate is asserted alongside the one on the drift.
 
-**Interface stencils** (decided in M2): near a coarse-fine interface the
+**Interface stencils:** near a coarse-fine interface the
 symmetric restriction window cannot exist — fine data across the
 interface would itself be prolongated coarse data, a circularity.
 Restriction therefore **shifts** its window inward (by `p/2 − 1` fine
@@ -1544,11 +1451,9 @@ cells at the ghost layer nearest the interface). Shifting preserves
 polynomial exactness (Lagrange interpolation through any `p` distinct
 nodes is exact for degree `< p`) and keeps the target inside the node
 hull — interpolation, never extrapolation; the implementation asserts
-this. Reducing the order instead was rejected: a symmetric window at the
-first ghost layer collapses to order 2 regardless of `p` — and by the
-interface-order rule above, order-2 ghost data feeding a
-second-derivative stencil leaves an `O(1)` interface truncation error,
-capping global convergence at *first* order (measured in M3). Prolongation, by
+this. 
+
+Prolongation, by
 contrast, stays symmetric: it may read the source block's ghosts (that
 is what the level-ordered sweep guarantees), at the cost of `G ≥ p/2`.
 The conservative family never shifts at all: its restriction window is
@@ -1559,8 +1464,9 @@ Stability does not discriminate between the choices here
 (global `dt`, 2:1 balance); damping high-frequency interface modes
 remains the job of the application's usual Kreiss–Oliger dissipation.
 
-**Operators per centering** (decided in the M8 design; the vertex rows
-measured in M8a steps 2 and 3). Because the operator is a tensor
+(Why the order is not reduced instead is in [HISTORY.md](HISTORY.md#operators).)
+
+**Operators per centering**. Because the operator is a tensor
 product, a family is a rule giving one-dimensional operators per
 dimension's centering, and every constraint is checked per dimension
 against that dimension's `G_d`:
@@ -1576,10 +1482,10 @@ The first two rows are the cell-centered ones; the third follows from
 [Ghost filling](#ghost-filling) and is measured twice — as exactness to
 degree `p − 1` and no further, over all `2^D` centerings in `D = 1, 2, 3`
 at `p = 2` and `p = 4`, with `G = p/2 − 1` accepted where `G = p/2 − 2`
-is refused (M8a step 2); and as the convergence rate of an application
+is refused; and as the convergence rate of an application
 that reads those ghosts, in the vertex-centered wave table under
-[the interface-order rule](#operators) above (M8a step 3). The last row
-is deliberately empty (decided). What a face- or
+[the interface-order rule](#operators) above. The last row
+is deliberately empty. What a face- or
 edge-centered quantity stores is an *average* along its cell-like
 dimensions and a *point value* along its vertex-like ones, so along a
 vertex dimension the conservative family has nothing to conserve and
@@ -1587,7 +1493,7 @@ would merely interpolate — at an even order that the family's odd `p`
 does not name (`p + 1` was the candidate). Rather than
 fix that rule before anything exercises it, `GhostSchedule` refuses a
 conservative field set with a vertex-like dimension, with a message
-saying why. Nothing in M8 needs it: fluxes and EMFs are never
+saying why. Nothing needs it: fluxes and EMFs are never
 ghost-filled or transferred, and constrained-transport `B` needs a
 divergence-preserving operator that is not a tensor product in any case.
 
@@ -1599,15 +1505,11 @@ the `2^(D-1)` fine-face fluxes — a purely spatial condition, enforced
 within a single RHS evaluation. No flux registers or time-accumulated
 corrections are needed (they only exist to bridge subcycled timesteps).
 
-Mechanically this makes a conservative RHS **three steps** (the "two
-phases" of the original sketch, with the fixup named): (i) all blocks
+Mechanically this makes a conservative RHS **three steps**: (i) all blocks
 compute face fluxes, (ii) fluxes at coarse-fine faces are restricted
-onto the coarse side, (iii) all blocks apply the flux divergence. The
-original plan tied this to M8 and left applications non-conservative at
-coarse-fine interfaces until then (fine for the wave equation and the
-Einstein equations); the M8 design of step (ii) follows.
+onto the coarse side, (iii) all blocks apply the flux divergence.
 
-**Interface restriction** (M8 design, implemented in M8b step 4; the
+**Interface restriction** (the
 "flux fixup"). A mesh operation on any field set with a vertex-like
 dimension:
 
@@ -1634,8 +1536,7 @@ needed, which is what lets a flux field have `G = 0`. For a
 cell-centered field set there is no admissible direction, and the
 constructor says so rather than silently building nothing.
 
-*Face directions only* (decided, correcting a first draft that also
-listed edge directions for edge-centered fields). The
+*Face directions only*. The
 constrained-transport consistency condition — a coarse cell's `∇·B`
 stays zero only if, on every edge of a coarse face that is a
 *coarse-fine* face, the coarse EMF equals the average of the fine EMFs —
@@ -1674,7 +1575,7 @@ Hence the domain integral of every conserved variable changes only by
 roundoff per RHS evaluation, in any Runge–Kutta stage. No flux registers,
 no time accumulation: that is what the global `dt` bought.
 
-**Across a rotating seam** (M12 design, 2026-10-03). Nothing crosses it
+**Across a rotating seam**. Nothing crosses it
 here. Conformity at the seam (see "Rotating seams" under
 [Ghost filling](#ghost-filling)) makes every seam face a same-level
 face, so the interface schedule records no transfer across it; it is
@@ -1692,7 +1593,7 @@ obligation therefore gains one clause: its flux must be covariant
 under the rotation, which a flux written in Cartesian components is.
 The flux sets themselves, with `G = 0`, have no seam ghosts and fill
 alone. The rigid-rotation advection test of M12 puts a number on it.
-*(Step 4, 2026-10-03: the interface schedule searches with
+The interface schedule searches with
 `oriented_neighbors`, and a finer neighbor with a nonzero orientation
 is an `error` — a bug, since only a forest that bypassed the checked
 paths can have one; the test makes one with `refine!` and no
@@ -1710,7 +1611,7 @@ upwind side follows the normal velocity, which the turn negates on one
 side. One sharp edge, the application's, not the seam's: a velocity
 stored on faces must be set on both of a block's faces, the closed
 range; `fill_by_coordinates!` sets owned points only, and a block whose
-high face carries a zero velocity leaks 20 % in the same run.)*
+high face carries a zero velocity leaks 20 % in the same run.
 
 **Construction.** The interface schedule comes out of the same neighbor
 search as the ghost schedule — its transfers are the `:restrict` cases
@@ -1720,10 +1621,10 @@ the same `TransferGroup` / `run_phase!` machinery on any backend. It
 records the forest generation and the field set's layout, and refuses to
 run stale or on a different layout, as the ghost schedule does.
 
-**Implemented in M8b step 4.** `InterfaceSchedule(fs)` and
+`InterfaceSchedule(fs)` and
 `restrict_interfaces!(fs, isched)`, in `src/interfaces.jl`; no new
-kernel, no new struct beyond the schedule itself. The design above
-survived contact with the code; four things it left open, settled here:
+kernel, no new struct beyond the schedule itself. Four things the design above leaves
+open are settled in it:
 
 - **The schedule takes no `Operators`**, unlike the ghost schedule. The
   transfer is injection and the exact two-cell average, both fixed by
@@ -1738,7 +1639,7 @@ survived contact with the code; four things it left open, settled here:
   that have to be separated, because the line where two coarse-fine
   faces of a block meet is a target of both.
 - **The phases commute, for two reasons, and 2:1 balance is one of
-  them** (measured). No plane the fixup writes is a plane it reads, over
+  them**. No plane the fixup writes is a plane it reads, over
   all phases: a point where that could happen lies on the line where two
   faces of a fine block meet, so the level-`l+2` block that wrote it and
   the level-`l` block that would read it touch across an edge or a
@@ -1774,7 +1675,7 @@ of the two fine ones — which is the analytic claim the device test rests
 on. On Metal in `Float32` the fixup reproduces the CPU result bit for
 bit: it adds no arithmetic, only target ranges.
 
-**Measured in M8b step 5.** Burgers' equation (`test/burgers.jl`) is the
+**Measured.** Burgers' equation (`test/burgers.jl`) is the
 application that puts a number on all of this, and every number below has
 its negative control — the identical run with step (ii) skipped, which is
 a keyword on the test problem and the *only* difference between the two.
@@ -1818,9 +1719,7 @@ the strongest available statement that nothing in it is fp64-dependent.
    `Refine`, `Coarsen`, or `Keep` (per block; per-cell criteria are
    reduced to a block verdict inside the application's flag function —
    the same shape the device-side flagging kernel takes in M6).
-2. **Buffering** (added post-M4; amended to *box-as-source* after the
-   first implementation measured Refine-keyed dilation to be inert at a
-   steady-state frontier): a flagging function may report, with **any**
+2. **Buffering**: a flagging function may report, with **any**
    flag, the **bounding box of the cells where its criterion fired**
    (interior indices). A block is a **dilation source** iff it
    explicitly reports a box — with a bare flag, only `Refine` is a
@@ -1867,7 +1766,7 @@ the strongest available statement that nothing in it is fp64-dependent.
    are restricted from their children — the `δ = 0` cases of the same
    stencil machinery ghost filling uses. Ghosts must be filled
    immediately before the transfer, because prolongation from a parent
-   reads that parent's ghost layers. From M8 on each field set moves
+   reads that parent's ghost layers. Each field set moves
    with its own schedule — `regrid!(forest, (state => schedule, aux =>
    aux_schedule); flags, …)` — since operators are per field set; a set
    paired with `nothing` is **resized without transfer**, which is what
@@ -1883,7 +1782,7 @@ adds at most one more, never two. This is what makes parent/child-only
 transfer sufficient; the transfer asserts it rather than trusting the
 argument.
 
-**Conservation of the transfer** (measured in M4): coarsening conserves
+**Conservation of the transfer**: coarsening conserves
 the volume integral of *any* field exactly when restriction is the
 order-2 average; untouched blocks are copied bit for bit; refinement
 conserves exactly those fields the operators reproduce exactly, and
@@ -1893,7 +1792,7 @@ parent's ghosts without those neighbors giving anything up
 (percent-level drift measured for a field discontinuous across a
 periodic seam). Selecting the **conservative operator family** (see
 [Operators](#operators)) makes the transfer exactly conservative for
-any field; that family landed early (pre-M5), verified exactly
+any field; that family is verified exactly
 conservative for random data under random regrids where the point-value
 family drifts at the percent level.
 
@@ -1910,15 +1809,14 @@ Runge–Kutta schemes.
 
 ### Point interpolation
 
-(Added in M11, for the horizon finder of TreeGeneralizedHarmonic, which
-carried a stopgap of its own; `src/interpolate.jl`.) Everything above
+(`src/interpolate.jl`.) Everything above
 moves data between the mesh's own points. An analysis needs the other
 direction as well — the field, and its gradient, at points the mesh did
 not choose: a horizon finder's trial surface, asked for some 500 points
 about 55 times per find; a tracer; a sampled ray. `interpolate(fs, xs,
 basis; derivs, vars, exclude)` answers that for a whole batch in one
 launch on the field set's backend, and `locate_point(forest, x)` is its
-first step on its own. Decided:
+first step on its own.
 
 - **The stencil of a query** is the `n^D` stored points of one block the
   interpolant reads: `n` consecutive stored indices per dimension, in the
@@ -1934,22 +1832,20 @@ first step on its own. Decided:
   an integer in `T` — and the covering leaf is the *last leaf not after
   that node* in curve order. That is correct because the leaves tile the
   domain and an ancestor sorts immediately before its contiguous subtree,
-  so no leaf lies between the covering leaf and the node. The stopgap
-  searched each ancestor in turn, `maxlevel` searches per point. The
+  so no leaf lies between the covering leaf and the node. The
   comparison is `curve_less` on `(root, padded coordinates, level)`, the
   same function `isless` on keys now calls, because the checking key
   constructor cannot run in a kernel.
 - **Folding at faces.** Along a periodic dimension the point is wrapped
   into the domain — and the *wrapped* point is what the stencil is built
-  from (the stopgap wrapped for location only, a latent bug no Dirichlet
-  case could see). Beyond a reflecting face it is mirrored once, `x →
-  2w − x` (decided with Erik: a symmetric run's horizon finder queries
+  from. Beyond a reflecting face it is mirrored once, `x →
+  2w − x` (a symmetric run's horizon finder queries
   across the wall), and the value takes the variable's parity sign from
   `fs.factors` — the table the mirrored transfers already multiply by —
   and each derivative across the wall one sign more. A point outside the
   domain after that is refused rather than taken from the nearest block,
   which would extrapolate without saying so.
-- **Folding through a rotating seam** (M12 design, 2026-10-03). After
+- **Folding through a rotating seam**. After
   the periodic and reflecting folds, a point beyond the seam, in
   `R^r` of the domain, is rotated back, `q = R^{−r} p`, and the stencil
   is built at `q`. The rotating dimensions are neither periodic nor
@@ -1962,10 +1858,9 @@ first step on its own. Decided:
   negated; for `r = 3`, `∂_{d1}` is `∂_{d2}` and `∂_{d2}` is `−∂_{d1}`.
   A derivative of any order turns once per order, so a second one
   takes the product of its two signs: for `r = 1`, `∂_{d1}∂_{d2}` is
-  `−∂_{d2}∂_{d1}` and `∂_{d1}²` is `∂_{d2}²` *(amended on merging the
-  second derivatives from `main`; the kernel's sign was already per
+  `−∂_{d2}∂_{d1}` and `∂_{d1}²` is `∂_{d2}²`; the kernel's sign is per
   order, and `rotate_tests.jl` checks the Hessian of the metric's
-  `g_xz` beyond the seam bit for bit)*.
+  `g_xz` beyond the seam bit for bit.
   `PointGeometry` carries the rotation, so `locate_point` and M7's host
   routing share the fold, and a point that the rotation takes beyond a
   high face is outside and refused. A set with an asymmetric layout,
@@ -1973,7 +1868,6 @@ first step on its own. Decided:
   beyond the seam with the reason: its value there is its partner's,
   which the kernel does not read (an open question, see
   [Open questions](#open-questions)).
-  *(Step 5, 2026-10-03: as specified, with these details.
   `fold_point` returns the orientation with the folded point, and the
   turn is taken about the low corner of the plane, `(a, b) ↦ (b, −a)`,
   `(−a, −b)` and `(−b, a)` for `r = 1, 2, 3`. An odd `r` contracts with
@@ -1994,7 +1888,7 @@ first step on its own. Decided:
   ghost stencils depend on the side, half-open ownership putting the
   shared plane on a block's high one — while the quadrant is covariant
   by construction. The test therefore compares with the full plane at
-  the preimage, turned; the numbers are under step 5 of M12.)*
+  the preimage, turned; the numbers are under step 5 of M12 in [HISTORY.md](HISTORY.md#m12--rotating-symmetry).
 - **The basis is the extension point.** `Lagrange(n)` is the one
   implemented. The kernel knows a basis only through `stencilwidth`,
   `stencilstart` (which `n` points, from the query's continuous stored
@@ -2021,8 +1915,7 @@ first step on its own. Decided:
   schedule's exact rational weights do not serve: they are cached per
   offset, and a stream of arbitrary offsets would grow the cache without
   bound.
-- **Derivatives as multi-indices, up to second order** *(amended
-  2026-10-03; first order until then)*. `derivs` is a tuple of
+- **Derivatives as multi-indices, up to second order**. `derivs` is a tuple of
   `D`-component multi-indices in physical units. The weights, the
   contraction, the `h^{|m|}` scaling and the mirror signs are all
   written for any order; one check refused `|m| ≥ 2` until tests
@@ -2052,9 +1945,7 @@ first step on its own. Decided:
   version take 505 ms.
 - **Excluded regions flag, they do not throw.** An optional `exclude`
   region marks every query whose stencil has a point inside it; the
-  value is computed either way and the caller decides. The stopgap's
-  guard threw, because a horizon inside the damping layer is a bug
-  there; a sampler may want to ignore the flag. The region is an
+  value is computed either way and the caller decides. A sampler may want to ignore the flag. The region is an
   axis-aligned `Ellipsoid` (a ball is the round case), and its test is
   exact and `O(D·n)` rather than `O(n^D)`: the scaled distance is a sum
   of per-dimension terms, so the stencil point nearest the center is the
@@ -2067,9 +1958,7 @@ first step on its own. Decided:
 - **Errors after the launch.** A point outside the domain writes block
   `0` into its own slot, and the host reports the first such point once
   the batch is done. A device kernel cannot throw, and on the CPU an
-  exception would arrive wrapped in a `TaskFailedException` — the
-  stopgap moved to `threaded_foreach` precisely so that its refusal
-  reached the caller readable.
+  exception would arrive wrapped in a `TaskFailedException`.
 - **One launch over points.** Points are not blocks, so this is a plain
   launch, not a by-owner one; on the CPU the workgroup is sized to give
   every thread a share, since a batch of a few hundred points would
@@ -2079,25 +1968,19 @@ first step on its own. Decided:
   leaves, origins and spacings are uploaded per call, which at analysis
   cadence costs nothing that matters.
 
-Under M7 the leaves a rank holds are its own, so a query must first be
-routed to the rank that owns its block — the one place this design will
-change. The location already produces exactly the block index that
-routing needs. *(Designed 2026-10-01 under
-[Distributed meshes](#distributed-meshes): the location stays on the
-host against the replicated leaves, two `alltoallv`s route the points
-to their owners and the values back, and the kernel is unchanged.
-Implemented in M7's step 5, with the kernel unchanged except for one
-argument, the block offset, which is 0 serially. Over a distributed
-forest an outside point is found on the host before anything is
-routed, and refused on every rank there, rather than after the launch.
-A device batch goes through the host for the messages. The serial path
-measured the same before and after.)*
+Over a distributed forest the leaves a rank holds are its own, so a
+query must first be routed to the rank that owns its block. The
+location already produces exactly the block index that routing needs:
+the location stays on the host against the replicated leaves, two
+`alltoallv`s route the points to their owners and the values back, and
+the kernel is unchanged except for one argument, the block offset,
+which is 0 serially (see [Distributed meshes](#distributed-meshes)).
+Over a distributed forest an outside point is found on the host before
+anything is routed, and refused on every rank there, rather than after
+the launch. A device batch goes through the host for the messages.
 
 ### Checkpoint and restart
 
-*(Designed 2026-09-29 as M9a, before implementation, and decided with
-Erik the same day except where marked; implemented, and its throughput
-measured, the same day — see "Throughput and filters" below.)*
 Long runs outlast a queue's day: TreeHydro's showcase on an H200 at
 10–20 levels, and TreeGeneralizedHarmonic's production runs, estimated
 at 38–149 h. An application calls one function at a chunk boundary to
@@ -2108,18 +1991,18 @@ see "Loading" below). A file this version cannot interpret is refused
 with the reason, and with a way to recreate the environment that wrote
 it.
 
-**What is saved and what is rebuilt** (decided). A checkpoint holds
+**What is saved and what is rebuilt**. A checkpoint holds
 what cannot be recomputed, and nothing else:
 
 | Item | Handling | Why |
 |---|---|---|
-| Forest: `D`, the geometry type, `roots`, `periodic`, `reflecting`, `rotating` (M12), `extents` (bitwise, in the geometry type), `N` | saved | the inputs the forest was built from |
+| Forest: `D`, the geometry type, `roots`, `periodic`, `reflecting`, `rotating`, `extents` (bitwise, in the geometry type), `N` | saved | the inputs the forest was built from |
 | Forest: the leaf list | saved | the only record of the mesh's history |
 | Forest: `generation` | not saved | a staleness counter, meaningless in another process |
-| Field set: element type, `nvars`, `G`, `centering`, `parity`, `rotation` (M12) | saved | its layout |
+| Field set: element type, `nvars`, `G`, `centering`, `parity`, `rotation` | saved | its layout |
 | Field set: the **owned** points, in state-vector layout `(N, …, N, nvars, nblocks)` | saved | the authoritative data |
 | Ghosts, shared vertex planes, the derived wall plane | rebuilt by `scatter!` and `fill_ghosts!` with the application's hook | derived from the owned points |
-| `GhostSchedule`, `InterfaceSchedule`, `Operators`, the parity factors, the rotation tables, a `RotationPair` (M12) | rebuilt | derived, or the application's inputs |
+| `GhostSchedule`, `InterfaceSchedule`, `Operators`, the parity factors, the rotation tables, a `RotationPair` | rebuilt | derived, or the application's inputs |
 | Regridding | nothing to save | it keeps no state between calls |
 | Scratch field sets (fluxes, primitives) | the application's choice | it passes only the sets it evolves |
 
@@ -2137,9 +2020,8 @@ so there is no hidden mesh state to lose. (Parthenon, by contrast,
 warns that an AMR run restarted without its per-block derefinement
 counters may not be bitwise exact.)
 
-**File layout, format version 1** (decided; written through M7's step
-6, and read by every later version — version 2, the files per I/O
-process of step 6b, follows the version-1 bullets). One HDF5 file. Everything
+**File layout, format version 1** (read by every later version — version 2, the files per I/O
+process, follows the version-1 bullets). One HDF5 file. Everything
 TreeAMR writes lives under one top-level group, `/TreeAMR.jl`, and the
 application gets a top-level group of its own, named after it:
 
@@ -2202,14 +2084,13 @@ application gets a top-level group of its own, named after it:
   HDF5.jl filter objects, none by default, and TreeAMR depends on no
   filter package. **None is also the recommendation, and `Shuffle()`
   followed by H5Zzstd's `ZstdFilter(1)` the one filter to name when
-  size matters** (measured 2026-09-29; the numbers and the reasons are
+  size matters** (the numbers and the reasons are
   under "Throughput and filters" below).
 - `range = "owned"` says the data are the owned points only, and leaves
   room for a file that stores more, which a version-1 reader would
   refuse by value.
-- **Checksums** (added in M7, 2026-10-02, decided with Erik after a
-  parallel file came back damaged; the account is under "Parallel
-  checkpoints" in [Distributed meshes](#distributed-meshes)).
+- **Checksums** (why they were added is under "Parallel
+  checkpoints" in [HISTORY.md](HISTORY.md#distributed-meshes)).
   `leaves_crc32c` is the CRC-32C (Castagnoli) of the bytes of `root`,
   then `level`, then `coords`, each column whole, as stored; entry `b`
   of `data_crc32c` is the CRC-32C of block `b`'s bytes in `data`, the
@@ -2220,14 +2101,12 @@ application gets a top-level group of its own, named after it:
   was written; over several ranks each rank checks the blocks it reads,
   and the verdict is agreed. A file without them, from before, loads
   unchecked.
-  - *No format change* (decided). They are an additive change with an
+  - *No format change*. They are an additive change with an
     obvious default, "not checked", so `format_version` stays 1 and
     nothing joins `features`: a reader that ignores them reads the file
     exactly as before. A feature would have made every file M7 writes
     unreadable to 0.1.4 for nothing a reader must understand. The 0.1.4
     reader was checked to load files with them, filtered and not.
-    *(Step 6b bumps the version to 2 after all, for the part files,
-    which a reader must understand; the checksums alone would not have.)*
   - *CRC-32C*, because it is in Julia's standard library (`CRC32c`,
     which TreeAMR now depends on), runs in hardware on x86-64 and
     AArch64 (13.7 GB/s on one thread of the development laptop, against
@@ -2238,8 +2117,7 @@ application gets a top-level group of its own, named after it:
     the same slab. The leaf list, which every rank reads whole, has one.
   - *Not covered*: the extents, the provenance and the plain data, which
     are small and written by rank 0 alone, and HDF5's own metadata.
-  - *Not HDF5's own checksums* (decided 2026-10-02 with Erik, checked
-    the same day). HDF5's Fletcher-32 filter was considered and is not
+  - *Not HDF5's own checksums*. HDF5's Fletcher-32 filter was considered and is not
     used, for four reasons. It accepts an all-zero chunk, trailer
     included: on libhdf5 2.2.0 a chunk overwritten with zeros through
     `H5Dwrite_chunk` read back without an error, while one nonzero byte
@@ -2252,13 +2130,13 @@ application gets a top-level group of its own, named after it:
     it is weaker: 16-bit words, with 0x0000 and 0xFFFF ambiguous. HDF5's
     checksums of its own metadata, which the newer format structures
     carry (through the library-version bounds), are not enabled either.
-  - *Over the parts* (step 6b). A part file stores each field set's
+  - *Over the parts*. A part file stores each field set's
     `data_crc32c` for its blocks, and the index's part table stores a
     CRC-32C of each of those arrays, so the index vouches for the
     per-block checksums and they for the data: a part from another save,
     or one whose checksums were damaged, is refused before its data are
     read.
-- **Spellings** (fixed by the implementation). Shapes above are in
+- **Spellings**. Shapes above are in
   Julia's order, which C sees reversed. Every `Bool` in the file —
   `periodic`, `reflecting`, a plain-data `Bool` — is a `UInt8`, 0 or 1,
   because HDF5.jl would write an HDF5 bitfield, which other readers
@@ -2268,8 +2146,7 @@ application gets a top-level group of its own, named after it:
   not predefine, is the IEEE half type built as h5py builds it, and a
   `Complex` is the compound `(r, i)`, as HDF5.jl and h5py spell it.
 
-**File layout, format version 2** (M7 step 6b, decided 2026-10-02 with
-Erik; the design is "Checkpoints without parallel I/O" under
+**File layout, format version 2** (the design is "Checkpoints without parallel I/O" under
 [Distributed meshes](#distributed-meshes)). A checkpoint is an *index
 file* `path` and one *part file* per I/O process, `path.<saveid>.<j>.h5`;
 with one I/O process the single part lives inside the index, so a
@@ -2312,7 +2189,7 @@ range, so block `b` of the forest is entry `b − first_block + 1` of the
 part that holds it. The parts tile `1:nleaves` in order, as the ranks'
 ranges do.
 
-**Rotating forests** (M12 design, 2026-10-03; no format bump). A forest
+**Rotating forests** (no format bump). A forest
 with a rotating seam writes a `rotating` attribute in `forest/`, the
 pair `(d1, d2)`, beside `reflecting`, and each of its field sets a
 `rotation` attribute in `fieldsets/<name>/`, the signed map as
@@ -2327,16 +2204,15 @@ forest through the checked `leaves` path, which refuses a leaf list that
 is not conforming at the seam, and the field set through its
 constructor, which refuses a map that is not a valid rotation. A
 `RotationPair` is not saved: like the operators, it is the application's
-input, rebuilt from the two loaded sets. *(Amended in step 6,
-2026-10-03: the attribute and the feature go together, and a file with
+input, rebuilt from the two loaded sets. The attribute and the feature go together, and a file with
 one and not the other — which no TreeAMR writes — is refused as
 damaged, rather than read with the seam or without it. The pair is
 `Int64[2]`, checked by the forest's constructor as a caller's would be;
 a map is checked for its length here and as a map by the field set's.
 The map joins what the ranks agree on about a field set before a save,
-beside the parity.)*
+beside the parity.
 
-**Element types** (decided).
+**Element types**.
 
 - **Native types** — `Float16`, `Float32`, `Float64`, the signed and
   unsigned integers, `Bool`, and `Complex` of those — are stored as
@@ -2347,8 +2223,7 @@ beside the parity.)*
   `nlimbs` the count. MultiFloats' `Float32x2`, which the test suite
   uses (see [Precision](#precision)), is two `Float32` limbs. The name
   is the type as a module importing nothing but Base prints it,
-  `MultiFloats.MultiFloat{Float32, 2}` (amended in the implementation:
-  the design said `string(T)`, which qualifies a name or not according
+  `MultiFloats.MultiFloat{Float32, 2}` (not `string(T)`, which qualifies a name or not according
   to what the writer had imported into `Main`, so one type would be
   recorded under two names depending on how the run was started). The
   loader cannot name such a type without its package, so the caller
@@ -2362,7 +2237,7 @@ beside the parity.)*
   type it was saved in, since exactness is the point of a checkpoint;
   loading into a narrower type is an open question.
 
-**Versioning** (decided). This is also the answer to how files from
+**Versioning**. This is also the answer to how files from
 older versions are treated: what cannot be interpreted is rejected,
 with the reason, and defaults are supplied where they are obvious.
 
@@ -2402,18 +2277,17 @@ with the reason, and defaults are supplied where they are obvious.
   NamedTuples, so keyword defaults on the application's side are the
   good-default path for a field it adds later.
 
-**Writing** (decided).
+**Writing**.
 
 - **Atomically.** The file is written to `path * ".partial"` and moved
   over `path` when it is complete; on any error the partial file is
   removed and the error rethrown. A crash while writing then cannot
   destroy the previous checkpoint, which is the one a restart needs.
-  *(Step 6b: with part files, the parts are written and flushed first,
+  With part files, the parts are written and flushed first,
   under a fresh save id that no index names, and the rename of the index
   is the commit point; the previous index's parts are deleted only after
-  it. See "Checkpoints without parallel I/O".)*
-- **Durably, by default** (`sync = true`; added 2026-09-29, after the
-  first implementation, which left it as an open question). Closing a
+  it. See "Checkpoints without parallel I/O".
+- **Durably, by default** (`sync = true`). Closing a
   file only hands its data to the operating system's page cache, which
   survives the process but not a power loss or a kernel crash; and the
   rename is a separate update of the directory, which can reach the
@@ -2442,7 +2316,7 @@ with the reason, and defaults are supplied where they are obvious.
   (`===`), as for `regrid!`.
 - **Filters are the caller's**, as above.
 
-**Loading** (decided).
+**Loading**.
 
 1. The forest is built through the validated leaves path,
    `Forest{R}(roots; N, periodic, reflecting, extents, leaves)`, which
@@ -2555,10 +2429,9 @@ is why `sync = true` is the default.
 - **Compression is serial.** HDF5 runs the filter pipeline chunk by
   chunk on the calling thread, so a filtered save gains nothing from
   threads, and a filtered load gains only the part of it that is not
-  HDF5's. Under M7 each rank compresses its own chunks, which is where
-  a filter parallelizes. *(Step 6b: each I/O process compresses its
+  HDF5's. Over a distributed forest each I/O process compresses its
   group's chunks, so a filter parallelizes over the I/O processes —
-  every rank under `io = :all`, one per node under the default.)*
+  every rank under `io = :all`, one per node under the default.
 - **Where an unfiltered load goes.** For the 540 MB state at one
   thread, 470 ms: the field set's allocation and zero fill 157, the
   state vector's first touch 84, the HDF5 read 87, `scatter!` 134, the
@@ -2571,71 +2444,13 @@ is why `sync = true` is the default.
   Linux, both root-only) and was not measured. The numbers that matter
   for a production run are the cluster file system's, which
   `TREEAMR_BENCH_DIR` points the benchmark at, and belong to M7's
-  parallel-I/O measurement. *(They are in M7's steps 6, for the shared
-  file, and 6b, for the part files that replaced it.)*
+  parallel-I/O measurement. (They are under M7's steps 6, for the shared
+  file, and 6b, for the part files that replaced it, in
+  [HISTORY.md](HISTORY.md#milestones).)
 
-**Parallel I/O and M7** (the facts checked 2026-09-29 against the HDF
-Group's "Collective Calling Requirements in Parallel HDF5
-Applications", "A Brief Introduction to Parallel HDF5" and "HDF5
-Parallel Compression", and HDF5.jl's MPI page; the design is not
-decided).
+The facts about parallel HDF5 checked before M7, the shared-file design they led to, and why it was replaced by the part files are in [HISTORY.md](HISTORY.md#checkpoint-and-restart) and under "Checkpoints without parallel I/O" in [Distributed meshes](#distributed-meshes).
 
-- In parallel HDF5 only raw data transfers — `H5Dwrite`, `H5Dread` —
-  may run independently per rank, and any number of them. Every call
-  that creates or changes the file's structure or metadata is
-  collective: creating, opening, flushing and closing the file;
-  creating groups, datasets and attributes; writing an attribute;
-  extending a dataset. All ranks make the same call with the same
-  arguments, so every rank pays for every object, and that cost does
-  not fall as ranks are added. A layout whose object count grows with
-  the blocks or the ranks — one dataset per variable, level and
-  component, as in CarpetIOHDF5 — makes metadata the part that does not
-  scale.
-- Writing a filtered (compressed) dataset in parallel needs HDF5 ≥
-  1.10.2 and collective writes. A chunk that several ranks write is
-  given one owner, and the others send it their parts.
-- This layout keeps the object count fixed: about a dozen, two more per
-  field set, plus the application's plain data, and none of it depends
-  on the number of blocks or ranks. Each rank's blocks are one
-  contiguous hyperslab of every dataset, since an M7 rank holds a
-  contiguous range of the curve and the curve is the block axis. And a
-  chunk is one block, so under compression every chunk has one writer
-  and none moves between ranks.
-- The alternative many codes use is one file per I/O process plus a
-  wrapper file (CarpetIOHDF5's per-process output, AthenaK's per-rank
-  restart, a Conduit Blueprint root file). It is easy to write and
-  needs no collective metadata, but it is awkward to read back on a
-  different rank count, where each reader must find the files that
-  hold its range; SAMRAI's restart requires the same process count
-  unless a separate redistribution tool is run.
-- **Decided:** M9a is serial. Which parallel design M7 uses is
-  benchmarked first, on Symmetry and other HPC systems; this layout is
-  the candidate, not a commitment. If the shared file does not hold up,
-  M7 bumps `format_version`, and that is accepted. *(Amended
-  2026-10-01, decided with Erik: parallel HDF5 into this layout is part
-  of M7, with `format_version` unchanged, and the benchmark became M7's
-  step 6 instead of a precondition — the shared file is built and then
-  measured, and the per-process files remain the fallback if it does
-  not hold up. The design, and the check that the stock HDF5_jll is
-  already a parallel build, are under
-  [Distributed meshes](#distributed-meshes).)* *(Step 6 of M7 built it:
-  the version-1 layout written and read by every rank of a distributed
-  forest at once, a file loading on any rank count; what it settled is
-  under "Parallel checkpoints" there.)* *(Measured on Symmetry's
-  BeeGFS in step 6, 2026-10-02: the shared file lost data between
-  nodes until ROMIO's read-modify-write was turned off, and its rate
-  did not grow with nodes; it is to be replaced by files per I/O
-  process, decided that day with Erik. The account is under "Parallel
-  checkpoints".)* *(Step 6b, decided 2026-10-02 with Erik: the shared
-  file is replaced by one file per I/O process and an index — the
-  alternative of the fourth bullet — with every file written by one
-  process and opened by one, and `format_version` becomes 2. The
-  awkwardness that bullet names is met by an index that lists every
-  part's block range, so a reader on any rank count knows which part
-  holds which blocks; the design is "Checkpoints without parallel I/O"
-  in [Distributed meshes](#distributed-meshes).)*
-
-**Multi-block** (checked). Keys are relative to their root,
+**Multi-block**. Keys are relative to their root,
 `connectivity = "brick"` is a tagged record rather than an assumption,
 and no coordinates are stored. A conforming multi-block forest, the
 likely route to spherical domains, is then a new connectivity kind,
@@ -2644,26 +2459,9 @@ feature name. Nothing in the format obstructs it. Parthenon's layout
 would: it stores global tree locations in one virtual tree over the
 root grid, which a multi-block forest cannot express.
 
-**Formats considered** (a survey, 2026-09-29). No existing standard
-fits a leaf-only octree checkpoint. VTKHDF has no non-overlapping AMR
-type: its `OverlappingAMR` must be sorted by level, and VTK's
-non-overlapping AMR exists only in the XML `.vthb` format. Conduit
-Blueprint associates fields with vertices or elements only, so it has
-no face or edge centering. openPMD's mesh-refinement extension is still
-an open pull request. AMReX, Chombo and Carpet store overlapping
-hierarchies, with coarse data under fine. For checkpoints the norm is a
-code's own versioned HDF5 schema — Parthenon, FLASH, Athena++,
-CarpetIOHDF5 — or its own binary format (AMReX, AthenaK, p4est).
-Parthenon's `.rhdf` is the closest model, and the one followed here:
-one dataset per variable over all blocks in Z-order, a block table,
-collective hyperslab writes with one block per chunk, restart on any
-rank count, and one integer format version. What is done differently
-is keys relative to their root, no stored coordinates, and a features
-list beside the version. JLD2 is set aside because it records Julia
-type names, which ties a file to the definitions that wrote it, and
-because it has no MPI.
+The survey of existing formats that this layout follows from (formats considered, and the one modelled) is in [HISTORY.md](HISTORY.md#checkpoint-and-restart).
 
-**The API in brief** (as implemented). HDF5 is a **package extension**,
+**The API in brief**. HDF5 is a **package extension**,
 `TreeAMRHDF5Ext` (`ext/TreeAMRHDF5Ext.jl`) over the weak dependency
 HDF5 (`[compat]` 0.17), because the only hard dependency today is
 KernelAbstractions, and an application that never checkpoints should
@@ -2681,7 +2479,7 @@ load HDF5 while the extension is not loaded. `fieldsets` and
                     application = "TreeHydro" => 1,  # name => its version
                     data = (; t, chunk, recipe), filters = (),
                     sync = true,                     # flush to stable storage
-                    io = :node)                      # I/O processes (M7 step 6b)
+                    io = :node)                      # I/O processes
     save_checkpoint(path, forest; …) do app::HDF5.Group
         # further datasets in the application's group, beside `data`
     end
@@ -2725,7 +2523,7 @@ load HDF5 while the extension is not loaded. `fieldsets` and
   Rationals store exactly, and TreeHydro already states its parameters
   as Rationals, so a case recipe round-trips exactly.
 
-**Where a checkpoint belongs in a chunked driver** (decided). The
+**Where a checkpoint belongs in a chunked driver**. The
 downstream drivers integrate in chunks: `solve` over a fixed number of
 steps, then flag, regrid, rebuild the schedules and restart the
 integrator (see [Regridding](#regridding)). A checkpoint goes at a
@@ -2743,9 +2541,7 @@ application's run state — the time or chunk index, histories, trackers
 
 ## Application interface (sketch)
 
-Indicative only — names and signatures will evolve (updated for the M8
-design; through M6 `G` was a forest keyword and `regrid!` took bare
-field sets; `reflecting` and `parity` are M10's):
+Indicative only — names and signatures will evolve:
 
     # mesh: cells are the tree's geometry, ghosts are not
     forest = Forest(roots; N, periodic, reflecting, extents)   # (lo, hi) walls
@@ -2788,9 +2584,9 @@ face itself is stored at `i + G_f` — the off-by-`G` sharp edge TreeWave's
 notes already warn about, now with two `G`s; the Burgers kernels in the
 tests are the worked example.
 
-**Three launch ranges, not two** (amended for TreeHydro). `map_blocks!`
-launched over the owned range `N` or, with `closed = true`, the closed
-range `N + c_d`. It gains a third: `stored = true` launches over every
+**Three launch ranges, not two.** `map_blocks!`
+launches over the owned range `N` or, with `closed = true`, the closed
+range `N + c_d`, and a third: `stored = true` launches over every
 *stored* point of every block, ghosts included — `N + 2G_d + c_d` per
 dimension, which is exactly `size(fs.work)`. The consumer is the
 primitive recovery of a finite-volume hydrodynamics code: the exchange
@@ -2811,11 +2607,10 @@ and not merely how many were written. `stored = true` with
 stored one, so asking for both names two different loops rather than an
 intersection.
 
-**An all-variables form of the coordinate callbacks** (amended for
-TreeHydro). `fill_by_coordinates!(f, fs)` calls `f(x, v)` once per point
+**An all-variables form of the coordinate callbacks**. `fill_by_coordinates!(f, fs)` calls `f(x, v)` once per point
 *and variable* — its kernel has a variable axis in the ndrange — and
 `CellBoundary(g)` calls `g(x, v, δ)` the same way. Beside those, and
-without changing them, there is now a form called once per *point* that
+without changing them, there is a form called once per *point* that
 returns every variable at once, selected by wrapping the callback in
 `AllVariables`:
 
@@ -2871,7 +2666,7 @@ The whole hierarchy advances with one global `dt` (finest-level CFL). The
 state is one flat vector; standard integrators (OrdinaryDiffEq.jl) drive
 it unmodified.
 
-**The state vector contains interiors only** (decided). Each RHS
+**The state vector contains interiors only**. Each RHS
 evaluation:
 
 1. scatters `u` into the working array,
@@ -2881,13 +2676,10 @@ evaluation:
    compute kernels, since they write interior cells only.
 
 The integrator never sees ghosts and the RHS never mutates `u`; the cost
-is one scatter per RHS evaluation, which we accept. (The alternative —
-handing the padded working array to the integrator, with `du = 0` in
-ghost cells — was rejected: it makes the RHS mutate `u` and spends
-integrator bandwidth on ghost memory.)
+is one scatter per RHS evaluation, which we accept. (The rejected alternative is in
+[HISTORY.md](HISTORY.md#time-integration).)
 
-**Several field sets in one state vector** (specified in the M8 design,
-implemented with the first application that needs it). Burgers has one
+**Several field sets in one state vector**. Burgers has one
 evolved set, but constrained-transport MHD evolves cell-centered hydro
 variables *and* face-centered `B`, and the integrator must see both as
 one vector. The state functions accept a tuple of field sets and lay them
@@ -2902,16 +2694,16 @@ Because external integrators own the stages, ghosts are filled at
 optimization is unavailable by construction. This is an accepted cost,
 alongside the wasted coarse-level work.
 
-Coupling details (decided): the application writes `f!(du, u, p, t)`
+Coupling details: the application writes `f!(du, u, p, t)`
 itself, calling `scatter!` → `fill_ghosts!` → `map_blocks!` explicitly —
 no `semidiscretize`-style wrapper until the pattern has stabilized. The
 flat vector `u` is the authoritative data; the working array is scratch,
 refreshed at every RHS evaluation (output and analysis scatter and
-ghost-fill first). Through M3 only fixed-`dt` integrators are exercised,
-with `dt` chosen by the application from a minimum-spacing query.
+ghost-fill first). 
+
 Adaptive integrators need a volume-weighted `internalnorm` — the default
 norm weights fine regions more, simply because they contribute more
-entries per volume — documented here, implemented post-M3.
+entries per volume.
 
 ## Parallelism
 
@@ -2925,8 +2717,7 @@ entries per volume — documented here, implemented post-M3.
   regridding, the boundary hook, the diagnostic reductions) are
   threaded the same way.
 
-  **Bit-identical results, not merely equal to roundoff** (decided in
-  M5; narrowed after M8, next paragraph). No parallel loop shares an
+  **Bit-identical results, not merely equal to roundoff** (narrowed by the next paragraph). No parallel loop shares an
   accumulator: each writes its own slot, and every reduction forms one
   partial per block and sums the partials in block order. The chunking
   is a function of the item count and the thread count alone. So a
@@ -2937,8 +2728,7 @@ entries per volume — documented here, implemented post-M3.
   fills a buffer of its own, and the buffers are concatenated in block
   order.
 
-  **Floating-point sums are promised to roundoff only** (narrowed after
-  M8). The paragraph above bundles two rules under one name, and only
+  **Floating-point sums are promised to roundoff only**. The paragraph above bundles two rules under one name, and only
   one of them is about reductions. That every work item owns its output
   slot, and every collecting pass fills one buffer per task and
   concatenates in block order, is race freedom: it costs nothing, it
@@ -2977,24 +2767,21 @@ entries per volume — documented here, implemented post-M3.
   handed, and nothing else). This is the same contract M6 imposes
   anyway, since two of the three become device kernels.
 
-  **A phase is one parallel loop, not a sequence of launches** (amended
-  in M5). Ghost transfers are batched by stencil, and the batches differ
+  **A phase is one parallel loop, not a sequence of launches.** Ghost
+  transfers are batched by stencil, and the batches differ
   in size by orders of magnitude — a face slab is `G·N^(D-1)` cells, a
   corner `G^D`. Launching the batches one after another leaves the small
   ones with a single workgroup each, i.e. serial, which measured as a
   hard ceiling of ~2.5x on the ghost fill however many threads were
   available, while the single-launch parts of the same step scaled
-  fine. Each phase was therefore flattened into slices of roughly equal
-  cell count, never crossing a batch, dealt out largest first, one task
-  per thread, each slice launching as a single inline workgroup. The
-  regrid transfer uses the same machinery for the same reason. A device
-  backend keeps the plain per-batch launches: there a launch *is* the
-  parallel unit. *(Amended 2026-09-23:* the phase is still one parallel
-  loop and every batch is still split across all threads, but by owner
-  rather than by size. Each thread takes the transfers whose target
+  fine. So the phase is one parallel
+  loop and every batch is split across all threads, by owner. Each thread takes the transfers whose target
   blocks it owns, because slices dealt to whichever task was free moved
   every block's ghosts to a new core in every fill; see "What one
-  process loses".)
+  process loses". The
+  regrid transfer uses the same machinery for the same reason. A device
+  backend keeps the plain per-batch launches: there a launch *is* the
+  parallel unit.
 
   **Page placement dominates everything else on a NUMA node** (measured
   in M5, 64-core AMD EPYC 7532, 8 NUMA domains; 960 blocks of `32^3`,
@@ -3017,20 +2804,17 @@ entries per volume — documented here, implemented post-M3.
   Interleaving the pages (`numactl --interleave=all`) is thus worth
   2–6x at high thread counts, and is a process-level policy the library
   cannot set for itself — so it is documented as the way to run rather
-  than implemented. *(Amended 2026-09-23:* since every per-block
-  pass now runs each block on its owner's thread, first touch lands a
+  than implemented. (Since every per-block
+  pass runs each block on its owner's thread, first touch lands a
   block on the domain that computes on it, and with pinned threads that
-  beats interleaving; see "What one process loses".) Pinning KernelAbstractions to its *static* schedule,
-  so that a chunk of an ndrange always lands on the same thread, was
-  measured as the alternative and rejected: with first-touch placement
-  it reproduced the left-hand column to within noise (RHS 10.0, scatter
-  5.5, norm 19.3), for exactly the reason above — stability within one
-  kernel does not make a page local to all the kernels that touch it.
-  *(Revisited 2026-09-23:* right for the reason given and for one kernel
-  alone, but most of what it was meant to fix was not placement. With
-  the ghost fill given the same block-to-thread map as the kernels, the
-  static schedule recovers 2.4x on the RHS; see "What one process
-  loses" below.)
+  beats interleaving; see "What one process loses".)
+
+  (Pinning KernelAbstractions to its static schedule alone, the alternative measured and rejected before the ownership policy, is in [HISTORY.md](HISTORY.md#parallelism).)
+
+  **Inconsistent:** CLAUDE.md said that running unpinned under
+  `numactl --interleave=all`, "which is what the M5 numbers in CODE.md
+  were taken with", "is worth 3–7x over unpinned first touch there",
+  against the 2–6x stated above.
 
   The compute-bound pass (initial data, a sine per cell) scales past the
   memory-bound ones, as it should. Two pieces do not scale, both by
@@ -3066,7 +2850,7 @@ entries per volume — documented here, implemented post-M3.
   | volume-weighted norm  | 0.27 | 0.44 | 0.28 | 0.26 | — |
   | triad reference       | 0.71 | 0.92 | 0.34 | 0.28 | 0.18 |
 
-  *(Amended the same day.)* The copies of the last three columns were
+  The copies of the last three columns were
   started together but not synchronized, and each reports its own best
   of twenty repetitions per phase, so a copy whose repetitions fell
   while the others were compiling or in another phase reports bandwidth
@@ -3128,18 +2912,18 @@ entries per volume — documented here, implemented post-M3.
     contends only at high thread counts. It is none of the three; the
     next paragraph but one has it.
 
-  What this means for the plan (decided): NUMA-aware page placement
+  What this means for the plan: NUMA-aware page placement
   inside one process is not worth building; it buys 1.2x and
   duplicates M7. One MPI rank per NUMA domain would recover the gap,
-  but so does one process: *(amended the same day)* the gap is 2.2x,
+  but so does one process: the gap is 2.2x,
   not 3x, and it is not a per-process limit but the loss of
   data-to-core affinity between launches, which a block-ownership
   launch policy recovers entirely inside one process (next paragraph).
   M7 therefore gains no bandwidth argument from this, and loses none
-  *(confirmed in M7's step 7: on one Symmetry node one pinned 64-thread
+  (on one Symmetry node one pinned 64-thread
   process runs the RHS 1.5–1.6 times as fast as 8 ranks of 8 threads
   over the same mesh, the ranks paying the packs and unpacks of their
-  halos)*:
+  halos):
   its partition of blocks over ranks and the ownership partition over
   threads are the same contiguous Morton ranges, one level apart. The
   M5 finding that pages must be interleaved stands as advice for Rome
@@ -3253,7 +3037,7 @@ entries per volume — documented here, implemented post-M3.
   | scatter        | 0.75 | 0.44 | 0.30 | **0.27** | 0.27 | 0.28 | 0.30 | 0.28 |
   | RHS kernel     | 0.75 | 0.40 | 0.29 | **0.28** | 0.28 | 0.29 | 0.28 | 0.27 |
 
-  V0 is the package as it is. V1 puts every package launch on the
+  V0 is the package before the change below. V1 puts every package launch on the
   backend's static schedule, so repeated launches of one kernel give
   thread t the same blocks. V3 adds the ghost fill by owner: each
   group's transfers sorted by target block, and the task on thread c
@@ -3270,7 +3054,7 @@ entries per volume — documented here, implemented post-M3.
   the ownership makes domain-local without `numactl`. Unpinned, V3
   still gains 2x (1.23), and pinning adds the rest.
 
-  *What changed (implemented the same day, measured below).* One
+  *What changed (measured below).* One
   partition of blocks over threads, `threadchunks(nblocks)`, is used by
   every per-block pass for the lifetime of a forest generation:
 
@@ -3370,7 +3154,7 @@ entries per volume — documented here, implemented post-M3.
   data transfer (copy/prolongate/restrict into the new array) runs on
   the device.
 
-  **The backend is chosen once, at allocation** (decided in M6). It is
+  **The backend is chosen once, at allocation**. It is
   a keyword on `FieldSet` and on `GhostSchedule`, and nothing else takes
   one: every kernel in the package already read its backend off the
   storage it was handed (`get_backend(fs.work)`), so the storage
@@ -3380,8 +3164,7 @@ entries per volume — documented here, implemented post-M3.
   literally the same code on a device. No device package is a dependency
   of TreeAMR; `KernelAbstractions.allocate` is the whole interface.
 
-  **The schedule has to move with the data** (found in M6; the paragraph
-  above did not anticipate it). "All kernels are KA kernels" is
+  **The schedule has to move with the data**. "All kernels are KA kernels" is
   necessary but not sufficient: a kernel also dereferences things that
   are not field data. The transfer kernel reads the 1D stencils'
   `srcstart` and `weights` and the group's block-index vectors, and
@@ -3394,7 +3177,7 @@ entries per volume — documented here, implemented post-M3.
   exact `Rational{BigInt}` arithmetic, which is a strength here: bignum
   interpolation is exactly the work a device should not be asked to do.
 
-  **Two application callbacks needed a second form** (found in M6). M5
+  **Two application callbacks needed a second form**. M5
   already required every callback to be a pure function of its
   arguments, and expected that to be enough for M6 — "the same contract
   M6 imposes anyway, since two of the three become device kernels". It
@@ -3414,15 +3197,15 @@ entries per volume — documented here, implemented post-M3.
     kernel forms the position from the same per-block origin and spacing
     `cell_center` uses, so M5's thread-independence digests did not
     move. The region form is kept and is still what a condition reading
-    the block's interior needs — reflecting, extrapolating outflow — and
+    the block's interior needs — extrapolating outflow — and
     is CPU-only, which it says if handed a device field set. That
     limitation is real and is not papered over: outer boundaries that
     read their own interior are a CPU-only capability until the cell
-    form grows an interior accessor. *(Amended in M10: reflection has
-    left this list. It is a property of the domain and a transfer in
+    form grows an interior accessor. Reflection is not among them: it
+    is a property of the domain and a transfer in
     the schedule, so it runs on every backend; see
     [Ghost filling](#ghost-filling). Extrapolating outflow, and anything
-    else that reads the interior, is what remains CPU-only.)*
+    else that reads the interior, is what remains CPU-only.
   - The **flagging function** received `(b, key)` and no data, so an
     application closed over its field set and read it on the host.
     `firing_boxes(fires, fs)` is the device form: `fires(work, idx, b, x)`
@@ -3433,14 +3216,11 @@ entries per volume — documented here, implemented post-M3.
     against which maximum level — stays with the application, because
     that is physics. This is exactly the split step 1 of
     [Regridding](#regridding) describes, and the box is exactly what
-    step 2 dilates. One work item per block, each looping its own cells:
-    integer min/max is order-independent and every item owns its output
-    slots, so the M5 determinism discipline carries over with nothing
-    added. (Amended after M8: it is now the two-launch reduction under
-    "**Implemented**" below, 256 lanes per block, and still exact.)
+    step 2 dilates. It is the two-launch reduction under
+    "**Implemented**" below, 256 lanes per block, and exact: integer
+    min/max is order-independent.
 
-  **The coordinate callbacks got a third form, over the variable axis**
-  (amended for TreeHydro). The two forms above are about *where* a
+  **The coordinate callbacks got a third form, over the variable axis**. The two forms above are about *where* a
   callback runs; this one is about *how much it returns*. `AllVariables(f)`
   makes `fill_by_coordinates!` and `CellBoundary` call their callback
   once per point instead of once per point and variable, with the whole
@@ -3469,7 +3249,7 @@ entries per volume — documented here, implemented post-M3.
   rested on; since the narrowing above it is how the code happens to be
   written, not a promise.)
 
-  **The reduction became public, as `block_mapreduce` (amended).** It
+  **The reduction became public, as `block_mapreduce`.** It
   was an internal helper, on the reasoning that the package ships the
   diagnostics an application needs. That reasoning was wrong, and the
   downstream application found it from the outside: the diagnostics it
@@ -3512,7 +3292,7 @@ entries per volume — documented here, implemented post-M3.
     meant different things on the two backends. It is now an
     `ArgumentError` saying why.
 
-  The guarantee is stated as what it is (and narrowed after M8, see
+  The guarantee is stated as what it is (narrowed, see
   above): each block's value is bit-identical across thread counts,
   because every block owns its output slot; the combination is the
   caller's, and a floating-point one is promised to roundoff. Identical
@@ -3551,26 +3331,14 @@ entries per volume — documented here, implemented post-M3.
   should deliver and is the whole claim. Three rows deserve their
   explanation rather than a footnote:
 
-  - **The two per-block reductions are the weak rows, by choice**
-    (revisited after M8, below). `volume_weighted_norm` and
-    `firing_boxes` both run one work item per *block*, so 960 work items
-    on a device that wants tens of thousands. A hierarchical reduction
-    would fix that and would give up the property that makes these
-    functions trustworthy: one work item per block, each accumulating
-    its own cells in its own order, is deterministic without a word of
-    extra care, which is the M5 discipline. Neither is on the
-    per-evaluation path — one is a diagnostic, the other runs at regrid
-    frequency — so the trade is paid where it is cheap. It would have to
-    be revisited if `volume_weighted_norm` were ever wired in as an
-    adaptive integrator's `internalnorm`, which is still an open
-    question above.
-
-    *Revisited after M8.* The trade is no longer cheap and the property
-    is no longer promised. TreeHydro takes a signal-speed maximum at
+  - **The two per-block reductions were the weak rows.** One work item
+    per block was chosen for determinism (the argument is in
+    [HISTORY.md](HISTORY.md#parallelism)); the trade is no longer cheap
+    and the property is no longer promised. TreeHydro takes a signal-speed maximum at
     every step for its CFL condition, through `block_mapreduce`; at the
     table's sizes that is 3.3 RHS evaluations per step on the device,
     which under a three-stage integrator doubles the step. And the
-    argument above was only half right on its own terms: `firing_boxes`
+    argument was only half right on its own terms: `firing_boxes`
     reduces an integer count and integer min/max, which are
     order-independent, so a hierarchical form of it is bit-identical
     anyway — it was one item per block by simplicity, not by necessity.
@@ -3598,8 +3366,7 @@ entries per volume — documented here, implemented post-M3.
   that part it is one memory system either way.
 
   **Implemented: the two-launch device reduction and the global scalar
-  form** (decided after M8, amended before implementation, implemented
-  and measured 2026-09-22). Two pieces, both made admissible by the
+  form.** Two pieces, both made admissible by the
   narrowing of the bit-identity claim above and both wanted before M7.
 
   - **`block_mapreduce` stays as it is**: per-block, local to the
@@ -3610,9 +3377,7 @@ entries per volume — documented here, implemented post-M3.
     its contract changed, as stated above; its *device path* is what
     gets rewritten.
   - **The device path becomes 256 lanes per block, in two launches and
-    with no barrier** (amended before implementation; the first version of
-    this block said a tree in local memory, see below; and amended after
-    review, see the end of this bullet). The first launch has an `ndrange`
+    with no barrier**. The first launch has an `ndrange`
     of lanes times blocks, and reads block and lane off the global index.
     Lane `l` of block `b` strides over the block's `N^D · nvars` entries —
     cells fastest, then variables — in linear order, `l, l + 256, …`,
@@ -3625,7 +3390,7 @@ entries per volume — documented here, implemented post-M3.
     `nblocks` values. Each partial is a function of the block's cells and
     the stride alone, and the lane fold has a fixed order, so the result is
     reproducible from run to run and exact for `max`, `min` and integer
-    sums. *After review:* the lanes were first a static workgroup of 256 and
+    sums. The lanes were first a static workgroup of 256 and
     the stride restarted for each variable. Metal.jl launches a static
     workgroup without checking the pipeline's own thread limit, so a
     register-heavy `f` could have failed to launch; with no barrier the
@@ -3674,27 +3439,23 @@ entries per volume — documented here, implemented post-M3.
   - **A global scalar form, `mesh_mapreduce`.** `mesh_mapreduce(f, op,
     init, fs[, u]; vars, weight = nothing)` returns one number: the
     per-block values of `block_mapreduce`, each scaled by `weight(key)`
-    when a weight is given, combined over the local blocks and — once
-    M7 exists — across ranks with `Allreduce`. The weight is a host
+    when a weight is given, combined over the local blocks and across
+    ranks. The weight is a host
     function of the block's key, applied on the host to the per-block
     values before they are combined, because that is where the geometry
     is and because the cross-block stage is `nblocks` numbers and not
     worth a launch; it is meant for sums (a cell volume,
     `spacing(key)^D`) and is documented as such. `volume_weighted_norm`
-    and `total_mass` become calls to it, which is how they turn global
-    in M7 without changing signature; the M7 `Allreduce` lives in
+    and `total_mass` become calls to it, which is how they are global
+    without changing signature; the cross-rank step lives in
     `mesh_mapreduce`'s combination step and nowhere else — the norm's
-    domain volume goes through the same step (amended after review,
-    which found it summed separately) — since the mesh owns the
-    communicator and an application must not be asked to. `+`, `max`
-    and `min` map to the builtin operations, anything else to a custom
-    one. The name sits beside `block_mapreduce`: one returns a value per
-    block, the other one value for the mesh. *(Amended 2026-10-01: the
-    site stays, but what it does across ranks is an `allgather` of one
+    domain volume goes through the same step — since the mesh owns the
+    communicator and an application must not be asked to. The name sits beside `block_mapreduce`: one returns a value per
+    block, the other one value for the mesh. What it does across ranks is an `allgather` of one
     partial per rank, folded in rank order, with no MPI operation at
     all — custom operations fail on ARM, and a builtin one exists only
     for MPI's native types. See "Reductions" under
-    [Distributed meshes](#distributed-meshes).)*
+    [Distributed meshes](#distributed-meshes).
 
     *The combination is `mapreduce(identity, op, values)` with no
     `init`, and `init` is returned only for an empty vector.* This is
@@ -3801,32 +3562,20 @@ entries per volume — documented here, implemented post-M3.
   measurement.
 - **MPI:** the sorted Morton curve is split into contiguous per-rank
   ranges. Ghost exchange communicates face/edge/corner cell data between
-  ranks; prolongation/restriction happen on the owner of the finer data.
+  ranks; a transfer is evaluated on the owner of its **source** — the sender
+  computes — so a restriction runs on the fine side and a prolongation
+  on the coarse side (see [Distributed meshes](#distributed-meshes)).
   Regridding rebuilds and repartitions the curve. With a global `dt` and
   uniform blocks every block costs the same, so partitioning by equal
   block counts along the curve is already load-balanced. The exchange is
-  layout-generic before MPI exists (M8 precedes M7, decided), so ghost
+  layout-generic before MPI exists, so ghost
   fill, interface restriction and regrid transfer for every centering
   are distributed by one design. CUDA-aware MPI
-  for GPU+MPI. *(Amended 2026-10-01, when M7 was specified under
-  [Distributed meshes](#distributed-meshes) below: a transfer is
-  evaluated on the owner of its **source**, not of the finer data —
-  the sender computes — so a restriction runs on the fine side, as
-  this said, but a prolongation runs on the coarse side.)*
+  for GPU+MPI.
 
 ### Distributed meshes
 
-*(Designed 2026-10-01 as M7, before implementation. Four choices were
-decided with Erik that day and are marked so; the rest follows from
-them and from the sections cited, and is open to amendment as the
-implementation measures it. The steps are in the M7 entry under
-[Milestones](#milestones). Implemented in them by 2026-10-02, the
-amendments marked where they were made. Measured on Symmetry the same
-day: steps 7 and 8 in full, and step 6, whose multi-node run lost data
-and led to the decision to replace the shared-file checkpoint; the
-findings are in the steps, and amend the bullets below where marked.
-The replacement, checkpoints without parallel I/O, was specified,
-built and measured the same day as step 6b.)* M7 runs one forest over several
+M7 runs one forest over several
 processes. It came after M8 and M10 on purpose: every centering, the
 interface restriction and the mirrored transfers at reflecting faces
 are now entries of one schedule, so distributing the schedule
@@ -3837,8 +3586,7 @@ and integer reduction are bit-identical to a serial run at any rank
 count. A floating-point sum is reproducible to roundoff across rank
 counts, and at one rank it is exactly the serial value.
 
-**What is replicated and what is distributed** (decided 2026-10-01 with
-Erik). Every rank holds the whole forest, `forest.leaves` included, and
+**What is replicated and what is distributed**. Every rank holds the whole forest, `forest.leaves` included, and
 only field data are distributed.
 
 - *Why it is affordable.* A leaf is a key of about 20 bytes in 3D (see
@@ -3857,25 +3605,18 @@ only field data are distributed.
   send no messages. The same arithmetic on the same leaves gives every
   rank the same answer, and the message layouts below rely on that.
 
-What replication costs at thousands of ranks — the replicated regrid
-bookkeeping above all — is for the weak-scaling smoke test (step 7) to
-measure, not for this section to assume. *(Measured in step 7, in one
-process at up to 180224 leaves: the schedule build stays flat at a fixed
-number of blocks per rank, and of the replicated passes two grow to
-dominate a rank's regrid — the buffer's neighbour search when many
-blocks report boxes, and the classification of every new leaf — both of
-which can be made `O(local)` without changing a result; see step 7 under
-[Milestones](#milestones). Both were, the same day: each rank now
-searches the buffer from its own sources and classifies only the new
-leaves it needs, and a rank's regrid stayed at its 1408-leaf cost up to
-180224 leaves.)* *(On Symmetry, step 7: at up to 32 ranks on four nodes
-the schedule build and the refining regrid are flat from 2 ranks on, and
-`bench/replicated.jl` on a rank's domain reproduces the flat regrid to
-180224 leaves; the replicated completion after the buffer, 20 ms there
-when every block is a source, is what still grows.)*
+What replication costs at thousands of ranks, measured in one process
+at up to 180224 leaves: the schedule build stays flat at a fixed
+number of blocks per rank; each rank searches the buffer from its own
+sources and classifies only the new leaves it needs, and a rank's
+regrid stayed at its 1408-leaf cost up to 180224 leaves. On Symmetry,
+at up to 32 ranks on four nodes the schedule build and the refining
+regrid are flat from 2 ranks on, and `bench/replicated.jl` on a rank's
+domain reproduces the flat regrid to 180224 leaves; the replicated
+completion after the buffer, 20 ms there when every block is a source,
+is what still grows.
 
-**The communicator layer** (MPI a weak dependency, decided 2026-10-01
-with Erik). A new file, `src/communicator.jl`, sits after `device.jl`
+**The communicator layer** (MPI a weak dependency). A file, `src/communicator.jl`, sits after `device.jl`
 in the layer order.
 
 - It defines an abstract `Communicator` and the default
@@ -3883,16 +3624,16 @@ in the layer order.
 - The package talks to it through a few internal verbs: `commrank`,
   `commsize`, `allgather` of one `isbits` value, `allgatherv` of a
   vector, `alltoallv`, and nonblocking `isend` / `irecv` with
-  `waitall` over flat buffers. *(Amended in step 6b: two more,
+  `waitall` over flat buffers. Two more,
   `commnodes`, the number of shared-memory nodes, and `bcast` of one
-  rank's vector, for the checkpoints without parallel I/O.)*
+  rank's vector, serve the checkpoints without parallel I/O.
 - Every verb has a serial method, so `src/` never branches on whether
   MPI is there. A serial run takes the distributed code path with every
   message empty, and the existing suite is its test.
 - The MPI methods live in a package extension, `TreeAMRMPIExt`,
   triggered by MPI.jl, as HDF5 is for checkpoints: an application that
   never runs distributed does not load MPI. It adds `MPICommunicator`,
-  which holds `MPI.Comm_dup(comm)` of the application's communicator,
+  which holds a duplicate of the application's communicator (below),
   so that TreeAMR's messages can never match the application's.
 - An application writes `Forest(…; comm = MPI.COMM_WORLD)`, and
   `communicator(::MPI.Comm)` converts it.
@@ -3906,19 +3647,19 @@ Three details follow from this:
   a test that builds a thousand forests over `COMM_WORLD` holds one
   duplicate and not a thousand. MPICH_jll 5.0.2 gives a process 2046
   duplicates and then fails (measured 2026-10-01, on Julia 1.11 and
-  1.13). *(Step 3: MPI.jl's own `Comm_dup` attaches a finalizer that
+  1.13). MPI.jl's own `Comm_dup` attaches a finalizer that
   frees the duplicate, so the extension calls `MPI_Comm_dup` through
   `MPI.API` and attaches none. The cache is keyed by the handle; since
   MPI may reuse a handle once the application frees its communicator, a
   hit is used only while `MPI_Comm_compare` still finds the duplicate
   `CONGRUENT` with the communicator passed — a local call whose answer
-  is the same on every rank of the group.)*
+  is the same on every rank of the group.
 - *MPI is called from the calling task only*, never inside a threaded
   loop or a kernel. A Julia task may still migrate between OS threads
   between two calls, so the extension requires
   `MPI_THREAD_SERIALIZED` or better — `MPI.Init()`'s default — and
   refuses a communicator initialized with less, saying why.
-- *Why the field is abstract.* `Forest` gains `comm::Communicator`,
+- *Why the field is abstract.* `Forest` has `comm::Communicator`,
   abstract-typed, so `Forest{D,T}` keeps its two parameters and every
   `FieldSet{…}` and `GhostSchedule{…}` signature downstream is
   unchanged. The price is a dynamic dispatch per verb: a few per ghost
@@ -3933,13 +3674,10 @@ everywhere without a message. Checking that at every call would cost a
 collective each, so the operations that would go wrong silently on a
 diverged forest check it instead: `GhostSchedule`, `InterfaceSchedule`
 and `regrid!` `allgather` a digest of the forest — its generation,
-`nleaves` and `hash(forest.leaves)`, which for `MortonKey` is defined
-from the fields. A forest whose digest differs between ranks is
+`nleaves` and a fold of the leaves' hashes (below). A forest whose digest differs between ranks is
 refused, naming the ranks and saying that every forest mutation is
 collective. At regrid frequency that is one `O(nleaves)` pass and one
 collective.
-
-*(Amended in step 3, where the check was implemented.)*
 
 - *Not `hash(forest.leaves)`.* Base's hash of a long vector samples its
   elements rather than reading them all: on Julia 1.11 and 1.13 alike,
@@ -3962,17 +3700,17 @@ collective.
   ranks that refused. Without that, one rank's `ArgumentError` would
   leave the others waiting in the gather, or in their first exchange.
   Only `ArgumentError`s are agreed this way; anything else is a bug and
-  is rethrown at once. *(Amended in step 4: `regrid!`'s checks run
+  is rethrown at once. `regrid!`'s checks run
   through the same gather, and the `DimensionMismatch` it raises
   serially for a flag vector of the wrong length is agreed too, so that
-  error keeps its type on the rank that raised it.)*
+  error keeps its type on the rank that raised it.
 - *Serially nothing is gathered*: a forest over one rank skips the
   digest and its `O(nleaves)` pass, so a serial build is unchanged.
 - *The verdict is the same on every rank* because it is computed from
   the same gathered digests: the message names rank 0's forest and the
   ranks that differ from it, whichever rank prints it.
 
-**The partition** (decided). Rank `r` owns the contiguous leaf range
+**The partition**. Rank `r` owns the contiguous leaf range
 `blockrange(forest)`, an equal-count split of `1:nleaves(forest)` over
 `commsize`. The arithmetic is `threadchunks`'s — `divrem`, the
 remainder to the first ranks — and both are written over one shared
@@ -3998,27 +3736,20 @@ change only the helper, at both levels.
   downstream changes and no 0.2 is needed. What becomes wrong only
   under MPI is code that sizes a per-block array by `nleaves`, or
   indexes `forest.leaves` by a block index. The docstrings say "local
-  block", and step 9 audits the three downstreams for both.
+  block".
 - **Ranks without blocks are allowed.** Such a rank takes part in every
   collective, enters no exchange stage, and contributes nothing to a
   reduction (below). Every launch guards an empty `ndrange`. Empty
   ranks occur whenever ranks outnumber leaves, which a coarse initial
   mesh on many ranks does for a while, and the workload tests one.
-  *(Amended in 0.1.6.)* One host-side step did not guard: the
-  `AllVariables` boundary hook checks its callback's tuple length at a
-  point of block 1, and an empty rank has none, so it threw there while
-  the other ranks went on to the next collective. TreeHydro, the only
-  caller of that form, found it when it first ran over MPI; the
-  workload's empty rank had been on a periodic line, where no hook runs.
-  The check now returns early on an empty rank, as
-  `fill_by_coordinates!` already did. A search of `src/` for any other
-  step that assumes a block 1, and a scratch run of every public
-  operation at four ranks over two leaves (CPU and Metal), found
-  nothing else. The workload gained a case, `E2`, with the same reach
+
+
+The workload has a case, `E2`, with the same reach
   at three ranks: two leaves against a wall and outer faces, through
   both all-variables forms, the wave equation, the interface
   restriction, interpolation, regrids that give the empty rank blocks
   and take them away, the initial-data cycle and a checkpoint.
+
 - **What an application must make global itself.** `block_mapreduce`
   stays local by design, so a value an application combines from it —
   TreeHydro's CFL signal speed, TreeWave's per-variable refinement
@@ -4029,7 +3760,7 @@ change only the helper, at both levels.
   to be a global one (`volume_weighted_norm`, the open `internalnorm`
   question), or each rank chooses its own step.
 
-**The exchange: the sender computes** (decided 2026-10-01 with Erik). A
+**The exchange: the sender computes**. A
 transfer whose source and target blocks live on different ranks is
 evaluated on the source's rank, into a packed buffer, which is sent.
 The target's rank only copies it into place. Three reasons:
@@ -4067,7 +3798,7 @@ its leaves.
   transfer has a remote target and a local source, and becomes a pack.
 - *What is checked.* The union over ranks of the local, recv and send
   transfers is the serial schedule's transfer set exactly; that is
-  step 2's acceptance.
+  what the tests check.
 - *Cost.* The build is `O(local + halo)` per rank, the halo being the
   remote neighbors. The digest check above is the one `O(nleaves)`
   pass.
@@ -4100,9 +3831,9 @@ A stage runs in five steps:
 5. `waitall` on the receives, then unpack.
 
 The sends are waited on at the end of the call, before any buffer is
-reused. *(Step 2: `run_stage!` in `ghosts.jl` runs these five steps
+reused. `run_stage!` in `ghosts.jl` runs these five steps
 through the communicator verbs. A stage without messages is the serial
-phase, the same launch and the same barrier.)* Within a stage, nothing a pack or a local group reads is
+phase, the same launch and the same barrier. Within a stage, nothing a pack or a local group reads is
 written by an unpack:
 
 - phase 1 reads interiors and writes ghosts;
@@ -4147,7 +3878,7 @@ buffer, each divided into one contiguous segment per peer.
 - Phase 1's groups come out of a `Dict` today, in an order that does
   not matter there. The remote groups are sorted explicitly, since for
   them it does.
-- Step 2 checks that rank `r`'s send layout to `s` is `s`'s receive
+- The tests check that rank `r`'s send layout to `s` is `s`'s receive
   layout from `r`.
 
 **Pack and unpack are transfers.** Both go through `transfer_kernel!`,
@@ -4156,14 +3887,14 @@ which keeps "one kernel for every transfer" true.
 - *The packed buffer is a kernel argument.* It is passed in place of
   the working array as a small `NamedTuple` — the flat buffer and each
   transfer's offset into it — which KernelAbstractions adapts to a
-  device without a new dependency. *(Amended in step 2: the kernel's
+  device without a new dependency. The kernel's
   tuple has a third field, `dims`, the target box times `nvars`, since
   a slot's linear index needs the box's shape. The offsets are stored
   in points, not elements, and multiplied by `nvars` when the buffer is
   addressed, because a schedule belongs to a layout and serves field
   sets of any variable count. A driver passes `(buf, offsets)`, and
   `run_group!` adds the group's `dims`. The "block" index the kernel
-  hands the accessor is the slot.)*
+  hands the accessor is the slot.
 - *Three accessor methods, not two.* The kernel reaches `dest` and
   `src` through a load, a store and the element type that
   `stencil_sum` starts its accumulator from, `zero(eltype(src))` today.
@@ -4178,8 +3909,7 @@ which keeps "one kernel for every transfer" true.
   target, as every group does today. On the CPU, `run_phase!`'s
   bisection is then over whichever block list says who owns the
   transfer.
-- **The parity factor is applied when unpacking** (amended while
-  specifying; the first draft applied it when packing). An unpack goes
+- **The parity factor is applied when unpacking**. An unpack goes
   through the kernel's sum, `0 + 1·x`. That is the identity on every
   value a stencil sum produces, because the sum starts at `+0` and so
   never yields `−0`. It is not the identity on `−0` itself, which it
@@ -4191,9 +3921,9 @@ which keeps "one kernel for every transfer" true.
   pack computes the unscaled sum, and the unpack group carries the
   mirrored group's `factorcol`. The value written is then
   `scaled(0 + 1·acc) == scaled(acc)`, bit for bit what the serial
-  kernel writes. Step 2's round trip checks this bitwise, `Float32x2`
+  kernel writes. The round trip test checks this bitwise, `Float32x2`
   included, for which it also needs `0 + 1·x` to be the identity on
-  normalized limbs. *(Measured in step 2. With the factor moved to the
+  normalized limbs. (Measured: with the factor moved to the
   pack, the `Float64` round trip fails in every 2D case tried, as
   argued. `Float32x2` cannot tell the two apart: MultiFloats' product
   returns `+0` for `0 · (−1)`, so its serial fill has no `−0` to lose.
@@ -4201,7 +3931,7 @@ which keeps "one kernel for every transfer" true.
   to `(+0, +0)` — but it held on every value a pack produced in the
   round trip, which is a check over the tested cases and not a proof.
   In 1D every mirrored transfer is the block's own reflection,
-  so the remote `−0` case exists from 2D on.)*
+  so the remote `−0` case exists from 2D on.)
 - **Why the ghosts are bit-identical.** Every ghost is written once, by
   the same kernel, from the same source values and the same stencil,
   summed in the same order as in the serial fill; the unpack adds an
@@ -4214,27 +3944,21 @@ which keeps "one kernel for every transfer" true.
   costs" fixed its summation order.
 
 **MPI+GPU.** The pack and receive buffers live on the field set's
-backend and are allocated once per schedule (amended in step 2: once
-per schedule *and variable count*, on first use, for the reason the
-offsets are in points). They go to MPI directly
-when MPI is device-aware (`MPI.has_cuda()` for CUDA). Otherwise they
+backend and are allocated once per schedule and variable count, on
+first use, for the reason the offsets are in points. They go to MPI
+directly when the communicator is device-aware (below). Otherwise they
 are staged through host buffers of the same layout, which is the path
 Metal always takes and the one the suite tests. The synchronization
 after the pack is what makes a device buffer safe to send.
 `MPI.has_cuda()` asks only Open MPI (and answers `true` for IBM
 Spectrum MPI); for any MPICH it is `false` unless the environment
 variable `JULIA_MPI_HAS_CUDA` says otherwise (MPI.jl 0.20.27's
-`environment.jl`). So on a CUDA-aware MPICH the direct path is opted
-into by that variable, and step 8 records whether the MPI on
-Symmetry's H200 nodes is CUDA-aware at all. *(It is: HPC-X 2.20's Open
-MPI 4.1.7, for which `MPI.has_cuda()` is `true`; both paths pass there,
-and the direct one saves the two copies, 0.16–0.2 ms of a 2.5 ms fill
-on four H200s. See step 8.)*
+`environment.jl`). The MPI on Symmetry's H200 nodes is CUDA-aware:
+HPC-X 2.20's Open MPI 4.1.7, for which `MPI.has_cuda()` is `true`; both
+paths pass there, and the direct one saves the two copies, 0.16–0.2 ms
+of a 2.5 ms fill on four H200s.
 
-*(Step 8, where this was implemented; what it settled, and where it
-amends the paragraph above:)*
-
-- *Who decides* (amended: the paragraph had `MPI.has_cuda()` decide). The
+- *Who decides*. The
   caller does, when it converts its communicator:
   `communicator(comm; deviceaware = true)` hands MPI the device buffers,
   and the default, `false`, stages every device message through host
@@ -4258,7 +3982,7 @@ amends the paragraph above:)*
   the device. Nothing is gathered for it, and it is not part of the
   layout hash.
 - *A verb, not a type test in the driver.* `hoststaging(comm, buffer)`
-  is a new verb of the communicator layer, and the only one whose
+  is a verb of the communicator layer, and the only one whose
   fallback on the abstract type answers rather than refuses: `true` for anything but a host `Array`.
   The MPI extension answers `false` for a device buffer only when the
   communicator was made device-aware. The CPU's buffers are `Array`s, so
@@ -4276,15 +4000,13 @@ amends the paragraph above:)*
   (since KernelAbstractions 0.9.40, inside the `[compat]` floor of
   0.9.42): CUDA pins them, which lets the copies run at the bus's rate
   rather than through the driver's bounce buffer; the CPU and Metal do
-  nothing, Metal's memory being unified. A regrid stage is built per
-  regrid, so its mirrors are too, and CUDA unpins them when they are
-  collected. No weak dependency on a device package was needed.
-  *(Amended after step 8: a regrid stage's buffers and mirrors, and those
-  of the schedules rebuilt after a regrid, now come from the forest's
+  nothing, Metal's memory being unified. No weak dependency on a device package was needed.
+  A regrid stage's buffers and mirrors, and those
+  of the schedules rebuilt after a regrid, come from the forest's
   buffer pool, the next bullet, so they are allocated and page-locked
-  once rather than at every regrid.)*
-- *The buffer pool* (added after step 8, 2026-10-02, for the staged
-  regrid Symmetry measured at 48 ms against 8.7 ms direct; see step 8).
+  once rather than at every regrid.
+- *The buffer pool* (for the staged
+  regrid, which Symmetry measured at 48 ms against 8.7 ms direct).
   Every regrid built its transfer stage afresh, and the schedules an
   application rebuilds after it start without buffers, so every
   distributed regrid allocated and zero-filled the device buffers of
@@ -4298,12 +4020,7 @@ amends the paragraph above:)*
     allocate 80 and 4816 bytes more in `bench/ghosts.jl` (presumably
     closures that capture a `Forest` by value growing by a word; not
     traced), and with the fold its 392832 and 4656880 are unchanged. A
-    serial forest never makes a pool. *(M12 adds a ninth field,
-    `rotating`. Its step 1 measures `bench/ghosts.jl` before and after,
-    and folds `rotating` and `reflecting` into one immutable field if
-    the ninth field costs again; see the M12 entry under
-    [Milestones](#milestones).)* *(Amended by M12's step 1, 2026-10-03:
-    the cost is the struct's size, as the guess about closures implies,
+    serial forest never makes a pool. The cost is the struct's size, as the guess about closures implies,
     not its field count. A ninth field of 16 bytes, `NTuple{2,Int}`,
     added 160 and 4896 bytes, twice the 80 the 8-byte one had added to
     the uniform build; one of 2 bytes, `NTuple{2,Int8}`, fits in the
@@ -4312,7 +4029,7 @@ amends the paragraph above:)*
     half of the guess: a closure that captures a `Forest` copies it,
     and a seam check that read the forest inside `GhostSchedule`'s
     argument closure added 240 bytes, twice `sizeof(Forest{3,Float64})`,
-    until it read the pair taken outside it.)*
+    until it read the pair taken outside it.
   - *What it hands out.* A *lease* of at least the length asked for, as
     an object of exactly that length over pooled memory, keyed by role
     (buffer or mirror), array type and backend type. A host vector — a
@@ -4372,12 +4089,12 @@ amends the paragraph above:)*
 - *Interpolation and checkpoints* stay as steps 5 and 6 left them: both
   go through the host, at analysis and checkpoint cadence.
 
-**Reductions: an allgather of per-rank partials** (decided).
+**Reductions: an allgather of per-rank partials**.
 `combine_blocks` in `state.jl` is already the single site where M7's
 communication was to go. It folds the local blocks as today,
 `mapreduce(identity, op, values)`, then `allgather`s one partial per
-rank, which every rank folds in rank order. This supersedes the
-`Allreduce` that the `mesh_mapreduce` bullet above planned, for four
+rank, which every rank folds in rank order. It is not an
+`Allreduce`, for four
 reasons:
 
 - *The association is the package's, not the library's.* MPI leaves
@@ -4404,18 +4121,16 @@ Three consequences:
 
 - **An empty rank contributes no partial, not `init`.** `init` need
   only satisfy `op(init, init) == init` (the `init` bullet under
-  "**Implemented**" above). So `max` over negative data from
-  `init = 0` is right serially, and would be wrong if an empty rank's
-  `0` entered the fold. Each rank therefore gathers `(hasvalue, value)`, and the fold
-  skips the empty ones; `init` is returned only if every rank is empty.
-  *(Amended in step 3: the example is wrong. `init` starts every
+  "**Implemented**" above). `init` starts every
   block's fold, so with an associative `op` and `op(init, init) ==
   init`, one more `init` cannot change the result: `max` from 0 over
   negative data is 0 on every rank count. What an empty rank's `init`
   would change is a weighted reduction, since the weight scales a
   block's value and not `init`: `max` from 1 over values below 1,
   weight ½, is ½, and 1 with an empty rank's `init` in the fold. The
-  workload checks exactly that, at a rank count with an empty rank.)*
+  workload checks exactly that, at a rank count with an empty rank.
+  Each rank therefore gathers `(hasvalue, value)`, and the fold
+  skips the empty ones; `init` is returned only if every rank is empty.
 - **What is exact.** Max, min and integer reductions are bit-identical
   across rank counts. A floating-point sum is reproducible to roundoff,
   since each rank's partial is associated differently when the
@@ -4440,28 +4155,21 @@ Three consequences:
    `O(nleaves)` per rank, as AMReX and Parthenon do. Every rank arrives
    at the same new leaves, so `regrid!` returns the same `Bool`
    everywhere. `buffered_flags` and `complete_marks` remain public over
-   the *global* flag vector, which serially is the only one. *(Amended
-   after step 7: the buffer's neighbour search is not replicated. Each
+   the *global* flag vector, which serially is the only one. The buffer's neighbour search is not replicated. Each
    rank searches from its own sources, and the recruits are gathered in
    a second `allgatherv` and applied on every rank, which gives the
    marks the replicated search gives; the rest of the completion is
-   replicated as described.)*
+   replicated as described.
 4. The ghost fill before the transfer is the distributed fill, so a
    parent's ghosts are current on its owner.
-5. The transfer is one stage over the new partition. `transfer_groups`
-   classifies every new leaf as today, from the replicated old and new
-   leaf arrays. The old owner of each source evaluates the transfer —
+5. The transfer is one stage over the new partition. A rank
+   classifies only the new leaves it will own and those whose sources
+   it owns, from the replicated old and new leaf arrays. The old owner of each source evaluates the transfer —
    a copy, a prolongation from the parent, or one child's share of a
    restriction — into a buffer shaped like that transfer's target box,
-   and the new owner unpacks it. *(Amended while specifying: the
-   first draft said a buffer shaped like the new block's owned box.
-   That is right for a copy and a prolongation; a restriction's target
-   is one child's part of it, and a coarsened block's children may have
-   had up to `2^D` different owners.)* Sender computes is what makes this
+   and the new owner unpacks it. Sender computes is what makes this
    simple: the prolongation reads the parent's ghost layers, which only
-   the parent's old owner holds. *(Amended after step 7: a rank
-   classifies only the new leaves it will own and those whose sources
-   it owns, not every new leaf.)*
+   the parent's old owner holds.
 6. That stage is also the repartitioning: a kept block whose owner
    changes is a copy between ranks. When `k` blocks are added near the
    start of the curve, an equal-count split shifts every later rank's
@@ -4473,8 +4181,6 @@ Three consequences:
 
 `adapt_to_initial_data!` and `total_mass` follow unchanged: the first
 is a loop of collective calls, the second a `mesh_mapreduce`.
-
-*(Step 4, where this was implemented; what it settled:)*
 
 - *The canonical mark* is `RegridMark{D}`: the flag, whether the caller
   reported a box (`explicit`, which decides whether a `Keep` is a
@@ -4497,10 +4203,9 @@ is a loop of collective calls, the second a `mesh_mapreduce`.
   digest carries every refusal, and the flags follow in an
   `allgatherv` only once all ranks have passed. Serially nothing is
   gathered and every refusal keeps its serial type and message.
-- *The stage is `remote_stage`'s*, as step 2 left it to be.
-  `regrid_sources` classifies every new leaf once per regrid (amended
-  after step 7: only the new leaves this rank needs), not once
-  per field set as before, into a `TransferPairs` under `GroupKey`s
+- *The stage is `remote_stage`'s*.
+  `regrid_sources` classifies the new leaves this rank needs once per
+  regrid, not once per field set, into a `TransferPairs` under `GroupKey`s
   with direction zero and level 0 — targets new leaves, sources old,
   both global — and `regrid_stage` splits it by the new partition for
   the targets and the old for the sources, builds the local groups and
@@ -4509,12 +4214,12 @@ is a loop of collective calls, the second a `mesh_mapreduce`.
   their own sources, so children with different owners are simply
   received from different peers; nothing about them is special. Over
   one rank both ranges are every leaf, nothing is split, and the stage
-  is the serial groups with no messages. `run_stage!` gained a form
+  is the serial groups with no messages. `run_stage!` has a form
   over a separate `dest` and `src` — the new mesh's array and the old
   one's — which the exchange's form now calls with `fs.work` twice.
   `transfer_groups` keeps its signature, as the serial stage's groups,
   for `thread_tests.jl` and `bench/gpu.jl`.
-- *The ghost fill's checks stay rank-local* (decided in step 4).
+- *The ghost fill's checks stay rank-local*.
   `fill_ghosts!` refuses a stale schedule, a field set over another
   forest, a block count that does not match, another layout or
   backend, each on the rank that sees it, and does not agree. Two
@@ -4546,12 +4251,9 @@ passes its own points, possibly none.
 
 Each value comes from the same kernel, block and stencil as serially,
 so it is bit-identical. Outside points are agreed by an `allgather` of
-each rank's first one, so every rank throws the same `ArgumentError`
+each rank's first one, so every rank throws an `ArgumentError`
 together, instead of one rank throwing while the others wait in the
 next collective. Ghosts must be current, as now.
-
-*(Step 5, where this was implemented; what it settled, and where it
-amends the four steps above:)*
 
 - *The contract.* Every rank passes the same field set, basis, `derivs`,
   `vars` and `exclude`, and its own points, any number or none; it gets
@@ -4559,8 +4261,7 @@ amends the four steps above:)*
   backend. An owner evaluates the points it receives with its *own*
   arguments, so those that shape the evaluation must agree, and are
   hashed for the check below; the points are the only per-rank input.
-- *One `allgather` before anything is sent* (amended: the four steps had
-  the outside points agreed after the values returned). The location runs
+- *One `allgather` before anything is sent*. The location runs
   on the host, before the routing, so a rank knows its outside points
   before it sends anything, and the same gather that agrees on them can
   carry everything else a refusal on one rank would leave hanging. It is
@@ -4579,8 +4280,7 @@ amends the four steps above:)*
   the interpolation, while the generation and the leaf count catch every
   mutation made on one rank only, and the schedule builds and regrids
   check the leaves themselves.
-- *Not the same message on every rank* (amended: the design said every
-  rank throws the same `ArgumentError`). A rank that passed an outside
+- *Not the same message on every rank*. A rank that passed an outside
   point raises the serial message for its own first one, with a sentence
   naming the ranks that passed any; every other rank names the first such
   rank, its point index and the point. A rank's own point is what its
@@ -4619,7 +4319,7 @@ amends the four steps above:)*
   the kernel, its results downloaded for the return, and the answers
   uploaded into the caller's arrays. At analysis cadence, hundreds of
   points of `nvars × K` values, those copies are small, and the device
-  location stays the serial path's. Step 8's device buffers are for the
+  location stays the serial path's. The device buffers of MPI+GPU are for the
   exchange; nothing here needs them. Checked once on Metal in process
   (`Float32`, three simulated ranks, one with no points, value, gradient
   and an excluded ball): bitwise equal to the serial Metal call. That
@@ -4629,114 +4329,12 @@ amends the four steps above:)*
   it runs serially below 4096 points and through `threaded_foreach`
   above, every point writing only its own slot.
 
-**Parallel checkpoints** (parallel HDF5 in M7, decided 2026-10-01 with
-Erik; *superseded 2026-10-02*, decided with Erik, by "Checkpoints
-without parallel I/O" below, after the four-node account at the end of
-this item. What follows is kept as the record of the design that was
-built in step 6 and measured, and as the reason for its replacement.)
-One shared file, with the version-1 layout unchanged:
-`format_version` stays 1, and a file restarts on any rank count, serial
-included, which is what "No coordinates, and no partition" was for.
+**Parallel checkpoints.** The shared-file checkpoint that preceded
+"Checkpoints without parallel I/O" — one file written through parallel
+HDF5 and MPI-IO — its four-node account on Symmetry and the ROMIO
+findings that led to its replacement are in
+[HISTORY.md](HISTORY.md#parallel-checkpoints). What carries over from it:
 
-- *Where the code goes.* The MPI-specific calls —
-  `h5open(path, mode, comm, info)`, the `mpio` file access, the
-  collective transfer property — come from HDF5.jl's own MPI
-  extension, which loads only with MPI. So they go into a second
-  extension, `TreeAMRHDF5MPIExt`, triggered by HDF5 and MPI together.
-  `TreeAMRHDF5Ext` gains hooks, dispatched on the forest's communicator
-  type, for opening the file, for creating objects and for the slab
-  each rank reads and writes, with today's code as the serial methods.
-- *Collective metadata.* Every rank creates every group, dataset and
-  attribute with the same arguments, which the layout keeps to a fixed
-  dozen or so at any rank count (see "Parallel I/O and M7" under
-  [Checkpoint and restart](#checkpoint-and-restart)). Attribute values
-  must agree, so the provenance is formed on rank 0 and broadcast,
-  since `created`, `hostname` and `nthreads` differ between ranks. It
-  gains `nranks` (decided 2026-10-01 with Erik), an additive field
-  whose obvious default for an older file is 1, so the format does not
-  change.
-- *Raw data by hyperslab.* Each rank writes and reads the last-axis
-  hyperslab of its own blocks, `blockrange`, in every dataset: the leaf
-  columns `root`, `level` and `coords`, and each field set's `data`.
-  The transfers are collective, as a filtered dataset requires. With
-  filters a chunk is one block and variable, so every chunk has exactly
-  one writer. A rank with no blocks takes part with an empty slab.
-- *Durability.* The write still goes to `path * ".partial"`. Under
-  `sync = true` the flush has to reach every rank's writes, not only
-  rank 0's: on a parallel file system each client caches its own, and
-  an `fsync` on rank 0 flushes none of the others'. So the ranks make a
-  collective `H5Fflush`, which the MPI-IO driver turns into
-  `MPI_File_sync` on every rank (confirmed in step 6 against libhdf5
-  2.2.0's source, below), and then close the file collectively. Rank 0 then
-  flushes the file itself as today (`F_FULLFSYNC` on macOS, where a
-  plain `fsync` does not reach the drive), renames it and flushes the
-  directory. A barrier follows, so that no rank returns before the
-  rename.
-- *Errors.* Everything that can be refused — the field sets, the
-  forest, the path, the plain data — is checked before the first
-  collective HDF5 call, and the verdict is agreed by `allgather`, so a
-  refusal is raised on every rank with the same reason. An error inside
-  a collective HDF5 call on one rank cannot be recovered portably,
-  since the others are waiting in it. It is fatal to the job, as in any
-  MPI code, and documented as such.
-- *Plain data and the do-block are collective.* `write_plain` and the
-  `f(app)` callback run on every rank with the same data, because an
-  attribute written collectively has one value. `write_plain` checks
-  this by gathering a digest of the encoded bytes, and refuses data
-  that differ between ranks; that is step 6's refusal test.
-- *Loading.* Every rank reads all of the leaf columns, since the forest
-  is replicated, builds the forest with `comm` through the validated
-  `leaves` path, and reads its own slab of each field set into its
-  state vector.
-
-*(Step 6, where this was implemented; what it settled, and where it
-amends the bullets above:)*
-
-- *Where the code goes* (amended). `TreeAMRHDF5MPIExt` holds one call,
-  `open_parallel_file(::MPI.Comm, path, mode)`, which is HDF5.jl's
-  `h5open(path, mode, comm, info)`. The collective transfer property is
-  HDF5.jl's own `dxpl_mpio = :collective`, which needs no MPI, and
-  everything else is in `TreeAMRHDF5Ext` beside the serial code. The
-  hooks dispatch not on the communicator type, which the HDF5 extension
-  cannot name (it is `TreeAMRMPIExt`'s, and the load order of two
-  extensions is not defined), but on an `Access` chosen by `commsize`:
-  `Alone` for one rank, whose methods are M9a's calls unchanged, and
-  `Ranked` otherwise. The extension reaches MPI through two stubs in
-  `src/`: `librarycomm(comm)`, whose method in `TreeAMRMPIExt` returns
-  the duplicate, and `open_parallel_file`, whose fallback refuses with
-  the reason. A forest over a one-rank MPI communicator takes the
-  serial path, and its file is a serial file with `nranks = 1`.
-- *Who writes what.* Every rank creates every group, dataset and
-  attribute with the same arguments, and writes every attribute. A
-  dataset over the blocks — `root`, `level`, `coords` and each `data` —
-  is written by last-axis hyperslab in one collective transfer, an
-  empty rank with an empty selection (`H5Sselect_none`, which HDF5.jl
-  does not wrap). Every other dataset — the extents, the provenance,
-  the plain data — is written by rank 0 alone with an independent
-  transfer, and read by every rank. That is legal because parallel
-  HDF5 allocates an unfiltered dataset's storage when it creates it
-  (`H5D__create` in `H5Dint.c`), and it keeps a value from being written
-  `P` times over to the same bytes.
-- *No variable-length data in a parallel file* (found in step 6).
-  libhdf5 refuses to write variable-length data through the MPI-IO
-  driver (`H5D__write`: "Parallel IO does not support writing VL or
-  region reference datatypes yet"), from any number of ranks, and
-  HDF5.jl stores an array of strings as variable-length. Attributes are
-  not affected (the `features`, `centering` and `parity` arrays wrote
-  and read back), nor are scalar strings, which HDF5.jl stores at a
-  fixed length. So in a parallel file a plain-data array of strings is
-  fixed-length UTF-8, NUL-padded to its longest string; `read` returns
-  the same `Array{String}`, so the item reads back the same, with the
-  same `type` and `eltype`, and the format version is unchanged. A
-  string in such an array that holds a NUL is refused before anything
-  is written, since the padding would lose it. The M9a reader (0.1.4)
-  reads a parallel file, fixed-length strings and filtered data
-  included (checked).
-- *Provenance* is rank 0's, gathered to every rank by an `allgatherv` to
-  which the other ranks contribute nothing, so no broadcast verb was
-  added. `nranks` follows `nthreads`; a serial file carries `nranks = 1`
-  (decided here: the field is then in every file M7 writes, and a file
-  without it is from before M7, which `read_provenance` reads as 1).
 - *The agreement.* Before the file is created every rank runs the
   serial checks — the field sets, `application`, the geometry type —
   and walks `data` the way `write_plain` will write it, refusing what it
@@ -4752,7 +4350,7 @@ amends the bullets above:)*
   Serially the walk runs too, so a value outside the plain-data types is
   now refused before the file is created rather than while it is
   written, with the same message.
-- *How much of the plain data is checked* (decided here): all of it, by
+- *How much of the plain data is checked*: all of it, by
   that hash, once per `save_checkpoint` and once per `write_plain` in
   the do-block. Two reasons. Under the collective contract a value that
   differs between ranks need not fail: an attribute written with
@@ -4763,99 +4361,8 @@ amends the bullets above:)*
   cost is a walk over values that are small next to the field data, plus
   one collective per call. What the do-block writes through HDF5 itself
   is not checked; the docstring says it must be the same on every rank.
-- *Durability, confirmed.* In libhdf5 2.2.0, `H5Fflush` reaches
-  `H5F__flush` (`H5VLnative_file.c`), which calls `H5F__flush_phase2`
-  with `closing = false` and so `H5FD_flush` and the driver's
-  `H5FD__mpio_flush`, which calls `MPI_File_sync` unless the file is
-  closing (`H5FDmpio.c`). So a flush as the file closes does not sync,
-  and the explicit collective flush before the close is needed. In
-  MPICH's ROMIO, `MPI_File_sync` is `ADIOI_GEN_Flush`, an `fsync` on
-  each rank that wrote through its own descriptor, which under
-  collective buffering are the aggregators that did the writing. Then
-  rank 0 does what a serial save does — `F_FULLFSYNC` on macOS, where
-  the ranks' `fsync` stops short of the drive, then the rename, then the
-  directory — and an `allgather` of whether it succeeded is the barrier,
-  so every rank returns once the checkpoint is in place, or throws.
-  Whether BeeGFS honours each client's `fsync` is the file system's,
-  and is not something a test here can see.
-- *Collective metadata reads are not enabled.* Each rank reads the
-  file's metadata independently, which is always correct, and keeps a
-  do-block that reads on rank 0 alone legal. At thousands of ranks the
-  independent reads of one small object header may become the cost
-  (`H5Pset_all_coll_metadata_ops` is the remedy); the Symmetry
-  measurement is where that would show. *(At up to 8 ranks on one node,
-  and at 32 on four nodes, step 6, it did not.)*
-- *Errors inside a collective call* remain fatal, as above. A
-  `write_plain` refused in the do-block is agreed, so every rank leaves
-  the block together and closes the file collectively, and the partial
-  file is removed (tested).
 
-*(Step 6 on four nodes of Symmetry, 2026-10-02: what amends the bullets
-above, and withdraws the step's earlier reading that its one-node
-measurement stood for the design. The account, with the jobs, is in the step's record under
-[Milestones](#milestones).)* **The shared file is to be replaced**
-(decided 2026-10-02 with Erik, after what follows): writing one file
-from several nodes is judged not reliable enough, and the parallel
-checkpoint becomes one without parallel I/O — a subset of the ranks are
-I/O processes, each writes a file of its own, an index file ties them
-together, and on reading each file is opened by one process. The
-checksums and the reproducers below carry over to it; the hints and the
-shared-file layout need not.
-
-- *No read-modify-write* (amends "Raw data by hyperslab", which took a
-  rank writing only its own bytes to be enough). A checkpoint saved by
-  32 ranks on four nodes came back with one rank's slab of the leaf
-  coordinates zeroed. ROMIO, the MPI-IO of MPICH and MPICH_jll, knows
-  no BeeGFS and drives it with its generic POSIX driver ("UFS"), which
-  turns some writes into a read-modify-write of a wider range: data
-  sieving, for an independent write with a noncontiguous file view,
-  under an `fcntl` write lock over the extent; and collective
-  buffering, which writes each aggregator's whole file domain after
-  reading it if anything in it is not being written, under no lock
-  outside atomic mode (read in MPICH 5.0's `ad_write_str.c` and
-  `ad_write_coll.c`). On a POSIX file system that is safe, since a
-  write that has returned is visible to every reader and a lock
-  excludes every other locker. Symmetry's BeeGFS clients break both:
-  they hold a node's writes until a flush (`tuneFileCacheType =
-  buffered`), and their `fcntl` locks are local to the node
-  (`tuneUseGlobalFileLocks = false`, in `/etc/beegfs/beegfs-client.conf`
-  and the client's `/proc` view). The first is shown directly: a rank's
-  completed `write`, read after a barrier by a rank on another node,
-  was not there in 5 of 300 trials, and never between ranks of one
-  node (28 of the 32 pairs tried). The second is read from the
-  configuration and was not tested. HDF5 had placed the first chunks of the filtered data before the leaf
-  columns, so rank 0's write of its chunks spanned the columns; data
-  sieving read them while another node still held a rank's
-  coordinates, and wrote the zeros back. The explanation is the one
-  consistent with all of the evidence in the step's record — under data
-  sieving the loss is always whole slabs of ranks on nodes other than
-  rank 0's, the rank whose write spans them, and under collective
-  buffering whole file domains of aggregators; it vanishes with both off,
-  it appears below HDF5 with nothing but MPI-IO calls, and the file
-  system's configuration and visibility are as described — but no
-  trace of an individual write's journey was taken. The destroyed write
-  itself took no lock, so global locks alone would not have saved it.
-- *The hints* (the remedy for ROMIO). Every parallel file is opened
-  with `romio_ds_write = disable` and `romio_cb_write = disable`, so
-  each rank writes exactly its own bytes. On the reproducer (four nodes,
-  32 ranks, filtered saves through `save_checkpoint`) damaged saves went
-  from 12 in 200 (6 %) to 0 in 1000, where the old rate predicts about
-  60; and at two nodes, in the throughput benchmark, saves without the
-  hints were refused by the checksums in both of two rounds and saves
-  with them never. The cost is in filtered saves of data that compress
-  well, where each chunk becomes a write of its own: blast with zstd(1)
-  at 16 ranks saved at 1.40 GB/s with the hints against 1.88 without,
-  while unfiltered saves and pulse did not change (the step's record).
-  **Not covered: Open MPI.** Its own MPI-IO, OMPIO, the default of the
-  HPC-X that step 7 measured between nodes, ignores the
-  `romio_` keys; whether OMPIO reads or writes back anything it was
-  not given was not established, since HDF5_jll's Open MPI build loads
-  its own Open MPI rather than HPC-X's and the run was stopped by the
-  change of plan above. Enabling `tuneUseGlobalFileLocks` on the BeeGFS
-  clients, which only the administrators can do, would restore ROMIO's
-  locking between data-sieving ranks, but not, by the reading above,
-  the visibility of unlocked writes that the observed loss needed.
-- *Checksums* (decided with Erik after it). The leaf list and every
+- *Checksums*. The leaf list and every
   block of every field set carry a CRC-32C, verified on load, with the
   verdict agreed across ranks; the format and the reasons are under
   "Checksums" in [Checkpoint and restart](#checkpoint-and-restart).
@@ -4866,19 +4373,10 @@ shared-file layout need not.
   damaged field set would have been restored: only the leaf list's own
   validation caught this one, and only because zeros broke the curve
   order.
-- *NFS, for comparison.* ROMIO on the NFS `/home` of the same nodes —
-  whose NFS driver locks around its writes, though which driver ran was
-  not checked — lost nothing with data sieving (0 damaged in 1000) or with collective
-  buffering forced on (0 in 200). Plain `pwrite`s of adjacent ranges
-  from several nodes, no MPI-IO involved, lost whole pages there in 98
-  of 200 trials — NFS's page cache, and the reason ROMIO locks — while
-  on BeeGFS the same `pwrite`s were exact in 200 of 200. Neither file
-  system is coherent between nodes; they fail differently, and a
-  shared file is safe only when the MPI-IO layer knows how each fails.
 
-**Checkpoints without parallel I/O** (decided 2026-10-02 with Erik; it
+**Checkpoints without parallel I/O** (it
 replaces the shared file of "Parallel checkpoints" above, whose
-four-node account is the reason, and is M7's step 6b). Writing one file
+four-node account is the reason). Writing one file
 from several nodes was not reliable on Symmetry, and the remedy found
 there — two ROMIO hints — is specific to one MPI-IO implementation on
 one file system, while the same measurement showed NFS losing whole
@@ -4886,12 +4384,12 @@ pages to plain `pwrite`s from several nodes. Smaller clusters may fail
 in ways of their own, and a checkpoint that can be lost is not one. So
 no file of a checkpoint is ever shared between processes:
 
-- **One writer and one opener per file** (decided). Every file a
+- **One writer and one opener per file**. Every file a
   checkpoint consists of is created and written by exactly one process,
   and on reading opened by exactly one process. HDF5 is used serially
   only, so nothing depends on MPI-IO, its hints, or a file system's
   coherence between clients. `TreeAMRHDF5MPIExt`, `open_parallel_file`,
-  `librarycomm` and the hints are removed (decided), and HDF5_jll need
+  `librarycomm` and the hints are removed, and HDF5_jll need
   no longer be a parallel build or match the MPI: the stock one still
   is, which is harmless, and any other serves.
 - **I/O groups.** The ranks are split into `k` contiguous groups in rank
@@ -4901,17 +4399,17 @@ no file of a checkpoint is ever shared between processes:
   rank order, so a group's blocks are one contiguous run of the curve,
   and its part of every field set is one range of blocks. The keyword
   `io` of `save_checkpoint` chooses `k`:
-  - `io = :node`, the default (decided): one per shared-memory node.
-    `k` is the number of nodes, which a new verb, `commnodes`, counts
+  - `io = :node`, the default: one per shared-memory node.
+    `k` is the number of nodes, which a verb, `commnodes`, counts
     from `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)`; its serial method
     answers 1. A node's client is the unit a cluster file system caches
     and is fed by, and one file per node keeps the number of files, and
     the metadata server's load, at the number of nodes.
   - `io = :all`: every rank writes its own part, and nothing is sent.
   - An integer `k ≥ 1`, used as it is up to the rank count and clamped
-    to it beyond (decided here: an I/O process with no member is a rank
+    to it beyond (an I/O process with no member is a rank
     writing its own part, so a larger `k` can mean nothing else).
-  - *Nodes whose ranks are not contiguous* (decided here). The groups
+  - *Nodes whose ranks are not contiguous*. The groups
     are always contiguous, equal-count rank ranges; `:node` sets `k`
     only. Under the usual block placement of ranks (SLURM's `block`
     distribution, `mpiexec`'s by-slot default) the groups are then
@@ -4921,7 +4419,7 @@ no file of a checkpoint is ever shared between processes:
     and nothing else. Contiguity is worth more than locality: it is what
     makes a part one range of blocks, which one reader can send back
     out as contiguous ranges at any other rank count.
-- **Files** (decided). Beside the *index file* `path`, which rank 0
+- **Files**. Beside the *index file* `path`, which rank 0
   writes, each I/O process writes one *part file*,
   `path.<saveid>.<j>.h5` for its group `j in 0:k-1`, in the index's
   directory. The save id is 128 random bits drawn by rank 0
@@ -4935,8 +4433,8 @@ no file of a checkpoint is ever shared between processes:
   version 2" in [Checkpoint and restart](#checkpoint-and-restart).
 - **Writing.**
   1. Every refusal is decided before anything is created and agreed
-     across the ranks, as in step 6.
-  2. Rank 0 draws the save id and broadcasts it (a new verb, `bcast`,
+     across the ranks.
+  2. Rank 0 draws the save id and broadcasts it (the verb `bcast`,
      with a serial method).
   3. Each member sends its owned data — the state vector, on the host;
      a device field set through `tohost` as before — to its I/O
@@ -5015,10 +4513,10 @@ no file of a checkpoint is ever shared between processes:
      piece for itself it reads in place. A reader whose read fails goes
      on sending, so no owner waits forever, and the damage and failure
      verdict is agreed afterwards: a block that fails its checksum is
-     refused on every rank, as in step 6.
+     refused on every rank.
 
   A version-1 file is read as one inline part covering every block, by
-  rank 0, which already has it open; so a file written before step 6b,
+  rank 0, which already has it open; so a version-1 file, written
   serially or by the shared-file writer, loads on any rank count.
   Loading on a different rank count, and serially, works for every
   combination, as it did.
@@ -5031,7 +4529,7 @@ no file of a checkpoint is ever shared between processes:
   itself is kept from rank 0 alone and must be the same on every rank.
   On loading, each rank's block gets the application group of its
   image.
-- **External links for tools** (recommended to Erik, included). For
+- **External links for tools**. For
   each part file the index holds an HDF5 external link,
   `/TreeAMR.jl/parts/0003` → `ckpt.h5.<saveid>.3.h5:/TreeAMR.jl`, so
   that `h5dump`, h5py and HDFView navigate from the index into every
@@ -5056,7 +4554,7 @@ no file of a checkpoint is ever shared between processes:
   version-2 file with its format-version refusal, saying it was written
   by a newer TreeAMR and naming `checkpoint_environment` (accepted, by
   the versioning rules).
-- **What carries over from step 6**: the CRC-32C checksums per block and
+- **What carries over from the shared file**: the CRC-32C checksums per block and
   of the leaf list, now with a checksum per part and field set in the
   index above them; the refusals agreed before anything is created; the
   plain-data agreement; the self-checking benchmark, which loads every
@@ -5065,9 +4563,6 @@ no file of a checkpoint is ever shared between processes:
   remain as regression jobs for the file system. The shared-file
   layout, the collective transfers, the fixed-length string arrays
   (parallel HDF5 wrote no variable-length data) and the hints do not.
-
-*(Step 6b, where this was implemented, 2026-10-02; what it settled, and
-where it amends the bullets above:)*
 
 - *The save id* is drawn from `Base.Libc.getrandom!`, which is what
   `RandomDevice` reads, and not from `rand`: an application that seeds
@@ -5082,17 +4577,13 @@ where it amends the bullets above:)*
   blocks, and its own error comes in the verdict, so its I/O process
   never waits for blocks that are not coming. The I/O process holds two
   receive buffers of at most one piece each and writes its own blocks
-  straight from its state vector. *(Amended after the first Symmetry
-  run, job 568077: there each member's blocks were one message,
-  received and then written with nothing in flight, and one I/O process
-  for eight ranks on a node saved at 0.80 GB/s, against 1.47 for step
-  6's shared file. Now the I/O process receives every member's
+  straight from its state vector. The I/O process receives every member's
   checksums first, queues all the members' pieces in curve order, and
   keeps the next piece in flight while it writes the current one — the
   first while it writes its own blocks — and a piece is at most 64 MiB,
-  so a member's blocks are several. Measured again, it made no
-  difference that the noise lets one see; it is kept for the memory it
-  bounds, and the likelier reason is under step 6b's record.)*
+  so a member's blocks are several. It is kept for the memory it
+  bounds (the measurements are under M7 step 6b in
+  [HISTORY.md](HISTORY.md#m7--mpi)).
 - *An empty part is stored contiguously*, without filters: HDF5 refuses
   a chunk larger than a fixed dataset whose extent is 0, which a group
   whose ranks hold no blocks would otherwise need.
@@ -5136,51 +4627,9 @@ where it amends the bullets above:)*
   written: HDF5 stores a C string, and HDF5.jl refused it in the middle
   of the write.
 
-**What the feasibility check found** (2026-10-01, in a scratch
-environment on the development machine: Apple M3 Pro, HDF5.jl 0.17.4,
-HDF5_jll 2.2.2+0, which is libhdf5 2.2.0, and MPI.jl 0.20.27).
+The feasibility check of parallel HDF5 and the first measurement of what an MPI test costs, both from before M7 was built, are in [HISTORY.md](HISTORY.md#distributed-meshes).
 
-- *Parallel HDF5 needs nothing chosen.* Every one of HDF5_jll 2.2.2's
-  60 artifacts is an MPI build, tagged by MPI ABI: `mpich`, `mpiabi`,
-  `openmpi` and `mpitrampoline`, all four on `x86_64-linux-gnu` and on
-  `aarch64-apple-darwin`, and `microsoftmpi` on Windows. MPIPreferences
-  selects the one matching the MPI binary. So `HDF5.has_parallel()` is
-  `true` out of the box, and has been all along under M9a, which loads
-  the same MPI build and never opens a file in parallel.
-- *Both binaries work.* On Julia 1.11.9 with the default binary,
-  MPICH_jll 5.0.2, the `mpich` artifact loads. On Julia 1.13.1 it is
-  MPIABI_jll with the `mpiabi` artifact, because a `LocalPreferences.toml`
-  in the global v1.13 environment selects it on this machine. That
-  preference stacks into every project, and subprocesses must see the
-  same one as the `mpiexec` that launches them; launching them with
-  `MPI.mpiexec()` from a parent with the same load path ensures that.
-- *What was run.* Under `mpiexec -n 2` and `-n 3`,
-  `h5open(path, "w", comm, info)` created a file with an attribute and
-  a dataset written by column, on both Julia versions. On 1.13, a
-  contiguous dataset and a chunked one with `Deflate(1)` were written
-  collectively by last-axis hyperslab, one chunk per column, with one
-  rank's slab empty, and read back correctly, serially and in
-  parallel.
-- *What was not.* Linux CI was not run. Its artifact exists for the
-  default binary, and step 3, which adds MPI to the test environment,
-  will show it there. `MPI.has_cuda()` exists in MPI.jl 0.20.27 and
-  returns `false` for MPICH_jll here.
-
-**What an MPI test costs** (measured the same day). One `mpiexec -n 3`
-subprocess, two threads per rank, that loads MPI and TreeAMR, builds a
-forest and does one `Allreduce`, takes 1.7–1.8 s of wall clock in three
-runs, 1.04 s of it inside the script on rank 0. The M5 workload,
-`test/thread_workload.jl`, run under `-n 3` with each rank doing the
-whole of it, takes 29.8 s, against 24.0 s for one process at two
-threads. The ranks compile in parallel, so a rank count costs about one
-serial workload plus a quarter. Two such subprocesses (`-n 2`, `-n 3`)
-would add about a minute to the suite, and the serial reference can run
-in-process. CI runners have three or four cores, while `-n 3` at two
-threads wants six, and MPICH polls while it waits; on CI the ranks
-should therefore run one thread each.
-
-**Performance work left for later** (to do, recorded 2026-10-02 after
-the buffer pool; none of it blocks M7, and each item is to be measured
+**Performance work left for later** **(open)** (each item is to be measured
 before it is built):
 
 - *The H200 re-measurement of the staged regrid with the pool* is
@@ -5212,7 +4661,7 @@ before it is built):
   0.6–0.9 at 2–16 ranks under HPC-X's Open MPI, and a median of 9.9 ms
   already at 16; the HCOLL on/off job (567858) was never collected, and
   the cause is open.
-- *Compression where the data are* (added in step 6b). With `io =
+- *Compression where the data are*. With `io =
   :node` one process per node runs HDF5's filter pipeline for the
   node's blocks, serially, so a filtered save is bounded by one core's
   compression per node (blast with zstd(1) on four nodes: 1.45 GB/s,
@@ -5230,8 +4679,7 @@ before it is built):
   by every checked call, the number of peers and messages per rank on
   a deeper hierarchy, and GPUs across nodes, which no run has used.
 
-**The multi-block check** (the standing instruction, checked
-2026-10-01). Nothing here obstructs a conforming multi-block forest.
+**The multi-block check** (the standing instruction). Nothing here obstructs a conforming multi-block forest.
 
 - Ownership is by curve index, whatever the roots' connectivity.
 - Candidate peers come from `neighbor_keys`, in `forest.jl`, which is
@@ -5244,7 +4692,7 @@ before it is built):
   restriction's path.
 - The checkpoint stores no partition.
 
-*(Amended by the M12 design, 2026-10-03.)* M12's rotating seam is a
+M12's rotating seam is a
 step toward a multi-block forest, not an obstacle to one: it removes
 the assumption that a source's axes line up with its target's. An
 oriented neighbor search, which returns the real leaves with the
@@ -5265,6 +4713,525 @@ there a glued face would be 2:1 balanced like any other, and the
 interface restriction would have to cross it with an orientation,
 which the seam avoids.
 
+## Code structure
+
+Fifteen source files, included in dependency order from `src/TreeAMR.jl`, plus
+two package extensions in `ext/`; each layer uses only the ones before it:
+
+| layer | files | what |
+|---|---|---|
+| threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
+| residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
+| communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
+| tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding (oriented across a rotating seam), `refine!`/`coarsen!`, `balance!` (conformity at the seam) |
+| geometry | `geometry.jl` | key + stored cell index → physical coordinates |
+| storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest, and so do `parity`, `rotation` and their tables; `RotationPair` |
+| operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
+| exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
+| conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm` |
+| regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
+| interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first and second derivatives, periodic wrap and reflecting fold, `exclude` region flags |
+| checkpoint | `checkpoint.jl`; `ext/TreeAMRHDF5Ext.jl` | `save_checkpoint`, `load_checkpoint`, `write_plain`/`read_plain`, `checkpoint_environment`: the stubs, docstrings and the load-HDF5 error hint in `src/`, the HDF5 implementation in the extension — serial HDF5 only, over a distributed forest the I/O groups, part files and index of M7 step 6b, the data moved by the communicator verbs |
+
+### Rules that span several files
+
+The ideas that span several files and are easy to violate:
+
+- **Linear octree, leaf-only data.** `forest.leaves` *is* the tree: no node
+  objects, no pointers, no coarse data under refined regions. Block `b` of
+  any `FieldSet` is `blockkey(fs, b)`, leaf `first(blockrange(forest)) + b
+  - 1`: since M7 step 1 every block index is **local to the rank**, while
+  tree queries (`nleaves`, `find_leaf`, `locate_point`, `neighbor_keys`)
+  stay global. Serially the two coincide, so a site that indexes
+  `forest.leaves` by a block index, or sizes a per-block array by
+  `nleaves`, passes every serial test and is wrong under MPI; walk
+  `blockrange` and size by `nblocks`. Block indices are **not** stable
+  across a regrid (slots are compacted), and `FieldSet` is a `mutable struct`
+  precisely so that `regrid!` can swap `fs.work` wholesale while callers keep
+  their reference.
+- **Staleness is by generation, not size.** `rebuild_leaves!` bumps
+  `Forest.generation` on every leaf change; a `GhostSchedule` records the
+  generation it was built for, and `fill_ghosts!`/`regrid!` refuse a stale
+  one. A refine-then-coarsen returns to the same leaf count with different
+  leaves, which is why a count check is not enough.
+- **Two time scales.** Neighbor finding (`neighbor_keys`, `find_leaf`) is a
+  regrid-frequency operation; ghost filling runs at every RHS evaluation.
+  Tree queries must never appear in the per-evaluation path — that is the
+  whole point of the schedule.
+- **One kernel for every transfer.** Same-level copy, restriction,
+  prolongation, and the regrid transfer (the `δ = 0` case) are all tensor
+  products of `D` one-dimensional `Stencil1D`s, so `transfer_kernel!` in
+  `ghosts.jl` serves all of them; a copy is a width-1 stencil with weight 1.
+  Transfers sharing `(kind, direction, child offset)` share stencils and are
+  batched into one `TransferGroup` = one kernel launch. Stencil construction
+  lives in `schedule.jl`; `regrid.jl` reuses `prolongation_stencil` and
+  `restriction_stencil` so the two cannot drift apart. A group whose
+  stencils are all `unit` (one point, weight exactly one — decided from
+  the weights, not the kind) passes the kernel `unit = true` and does no
+  stencil arithmetic, computing `0 + x` so that `−0` still becomes `+0`
+  as the weighted sum makes it. A flag, not `weights = nothing`: **a
+  run-time choice of an argument's type is compiled at every launch site
+  for every member of the union**, which made the compilation-bound MPI
+  workload a fifth slower and timed out CI's macOS cells (see "The
+  copy kernels on a device"). Keep the CPU launch path type-stable, and
+  hide unavoidable unions behind `Base.inferencebarrier` on the device
+  path only (a barrier or a closure on the CPU path raises the fill's
+  allocation). Compare `--trace-compile-timing` of `test/mpi_workload.jl`
+  against `main` for any change to a launch path.
+- **The copy kernels launch flat on a device, shaped on the CPU**
+  (see "The copy kernels on a device"). `transfer_kernel!`,
+  `scatter_kernel!` and `gather_kernel!` take a `shape` first and read
+  their position through `kernel_position(shape, @index(Global,
+  NTuple))`: `nothing` and the block-shaped ndrange on the CPU, a
+  `LinearShape` (precomputed `Int32` inverses) and a one-axis ndrange on
+  a device, where KernelAbstractions' own `NTuple` index costs two 64-bit
+  divisions per axis per item. A flat CPU launch was 2.3x slower, which
+  is why the CPU keeps the shaped one. `launch_positional!` and
+  `run_group!` take `flat` so that the suite runs the device form on the
+  CPU and compares bit for bit; a new copy-like kernel goes the same way.
+  KA's CPU emitter only rewrites `@index` at statement level, so assign
+  it before passing it to a function.
+- **Phased ghost fill.** Phase 1: copies and restrictions (they read
+  interiors only, so they are race free). Then the physical-boundary hook.
+  Phase 2: prolongations, coarsest target level first, because a
+  prolongation may read its coarse source's *own ghosts*, which an earlier
+  sweep filled. The hook runs *between* the phases, not last: prolongation
+  stencils at a domain edge reach tangentially into the source's outer
+  ghosts.
+- **Reflecting faces are transfers, not hooks** (M10). `reflecting` is a
+  per-face `(lo, hi)` property of the `Forest`, `parity` a per-variable,
+  per-dimension property of the `FieldSet` (required when the forest has
+  a reflecting face; `NoParity` refused in a reflected dimension). The
+  tree does not see the walls — `neighbor_keys` finds nothing across
+  them — but `block_sources!` asks `reflect_direction` (in `forest.jl`,
+  since it is brick knowledge) for `δ′`, the direction with the masked
+  components zeroed, and takes the source that `δ′` finds. Along a
+  masked dimension the stencil is the *tangential* one with its target
+  rows remapped across the wall (`mirror_rows`), and the kernel
+  multiplies by a parity factor from `fs.factors` (column
+  `TransferGroup.factorcol`; 0 = an ordinary transfer, left unscaled).
+  So mirrored transfers sit in the ordinary phases and run on devices.
+  The unowned upper wall plane of a vertex-like dimension is derived by
+  `wall_stencil` (odd → 0, even → the folded order-`p` interpolant).
+  The boundary hook sees only *outer* faces.
+- **Rotating seams are oriented transfers** (M12, see "Rotating
+  seams" under "Ghost filling"). `rotating = (d1, d2)` is a property of
+  the `Forest` (a ninth field, `NTuple{2,Int8}` because an `Int` pair
+  made the schedule build allocate more; `(0, 0)` for none), `rotation`
+  a signed permutation per variable on the `FieldSet` (required on a
+  rotating forest; variable `v` beyond the seam is `sign(rotation[v])`
+  times variable `abs(rotation[v])` at the preimage). The low faces of
+  `d1` and `d2` are glued: `neighbor_anchor` is the one place the seam's
+  arithmetic lives, and `oriented_neighbors` returns the real leaves
+  with the orientation `r ∈ 0:3` (quarter turns), of which
+  `neighbor_keys` returns the keys, so everything built on it sees the
+  seam. `balance!` and the checked `leaves` path keep the seam
+  **conforming** (equal levels across a seam face), so no coarse-fine
+  face crosses it and the interface restriction never does. A turned
+  transfer's stencils are built in the *virtual frame*, as if the
+  source sat at its turned position (`virtual_offset`, `seam_offset`),
+  so the stencil builders are unchanged; `GroupKey` carries the
+  orientation (last in `keyorder`) and `TransferGroup` the orientation
+  and the plane, and the kernel reads the source through the accessor
+  `RotatedSource` (`(src, perm, flip, len, vars, col)`: the axis map
+  from virtual to real stored index, a run-time `perm` read through
+  `tuplepick`, and the variable from `fs.rotvars`, `nvars × 4`), built
+  by `run_group!` only for `orientation ≠ 0` so an ordinary launch is
+  unchanged. The sign goes through `fs.factors`, grown to `3^D·4`
+  columns, column `mirror + 3^D·r` (`r = 0` is M10's table): a 90°
+  turn of any Cartesian component is a signed permutation, so it is
+  the permutation on the load and the sign on the target, and nothing
+  is fixed up afterwards. A set whose layout is not symmetric under
+  `d1 ↔ d2` (and has ghosts in the plane) turns into a partner and is
+  filled as a `RotationPair`, whose odd turns read the partner's array
+  (`altsrc`) and whose two schedules' stages run merged
+  (`exchange_pair!`); a plain fill refuses it. Under MPI the pack
+  permutes and the unpack, a plain width-1 copy, applies the sign, which
+  keeps the serial `−0`. `interpolate` folds a point beyond the seam
+  back and turns its value and gradient; a checkpoint writes `rotating`
+  and each set's `rotation`, and lists the `"rotating"` feature only
+  when used, so unrotated files still load in 0.1.6. A vertex-like set
+  owns both seam planes (the same points under the turn) and evolves
+  them at one level.
+- **Neighbor finding is asymmetric across levels** (see "Neighbor
+  asymmetry"). Ghost filling is formulated as each block asking for its own
+  sources, never as reversing a neighbor lookup.
+- **Two operator families.** `PointValue`: even orders, both operators are
+  Lagrange interpolation at the target center, and restriction *shifts* its
+  window inward near an interface. `Conservative`: odd prolongation orders
+  built through the primitive function, restriction fixed at the exact
+  2-cell average, nothing ever shifts. `Operators` has **no default order** —
+  the right one follows from the application's differencing order (the
+  interface-order rule: `p` must exceed it by two, for *both* operators). Do
+  not add one. `check_operators` ties the orders to `N` and `G`; the
+  constraints are listed under [Blocks](#blocks).
+- **Interiors-only state vector.** An RHS is `scatter!` → `fill_ghosts!` →
+  `map_blocks!`, with kernels writing `du` in state layout via `statearray`.
+  `u` is never mutated; the working array is scratch. There is deliberately
+  no `semidiscretize`-style wrapper.
+- **No subcycling.** One global `dt` from `minimum_spacing`.
+- **A regrid moves a block by at most one level**, which is what makes
+  parent/child-only transfer sufficient; the transfer asserts it. After
+  `regrid!` the schedule is stale and the state vector has a new length, so
+  callers rebuild both and `reinit!` (or restart) the integrator.
+  `adapt_to_initial_data!` *re-evaluates* the initial data on each new mesh
+  rather than interpolating it.
+- **KernelAbstractions from the start.** All per-cell work in `src/` is a
+  `@kernel` launched through `get_backend(fs.work)`, with `D` and `G` as
+  `Val` parameters. The CPU implementation is meant to already be the GPU
+  implementation (M6). Don't write plain nested loops for cell work in
+  `src/`; host-side driver logic (mark completion, balance, key rebuild)
+  stays ordinary Julia — but *threaded* ordinary Julia, via
+  `threading.jl`.
+- **Bit-identical across thread counts, except floating-point sums.**
+  Every work item owns its output slot, no parallel loop shares an
+  accumulator, and collecting passes fill one buffer per task and
+  concatenate in block order. That is race freedom and a hard invariant:
+  the state vector, the leaf array, the schedule and every max or
+  integer reduction are bit-identical whatever the thread count.
+  Floating-point sums are promised to roundoff only (narrowed after M8,
+  so that a device can reduce hierarchically — it does, in two launches
+  with 256 lanes per block and no barrier — and ranks can fold their own
+  blocks, which M7 does);
+  the CPU fold is still one `mapreduce` per block summed in block
+  order, and so still exact, which is why `test/thread_tests.jl`'s
+  acceptance test — `test/thread_workload.jl` in subprocesses at two
+  thread counts, digests compared byte for byte — passes unchanged. A
+  new parallel loop that races on a slot breaks it; a reassociated sum
+  would move only its `l2` and `mass` lines, which are the ones to give
+  a tolerance if that day comes.
+- **A ghost phase is one parallel loop, by owner.** `run_phase!` in
+  `ghosts.jl` gives each thread the part of *every* transfer batch
+  whose target blocks it owns; a batch is *not* the unit of
+  parallelism, because batch sizes differ by orders of magnitude (face
+  slab vs corner) and per-batch launches capped the ghost fill at
+  ~2.5x. That needs each group's `targetblocks` non-decreasing, which
+  every builder guarantees by collecting in block order and
+  `test/thread_tests.jl` asserts. Only the CPU backend does this —
+  `run_phase!` has a generic method that keeps per-batch launches for
+  devices.
+- **Every per-block pass runs a block on its owner's thread.** Block
+  `b` belongs to the thread whose chunk of `threadchunks(nblocks)`
+  contains it. `threaded_chunks` puts chunk `c` on thread `c` with
+  sticky tasks, and `launch_by_owner!` runs block-shaped kernels on
+  KernelAbstractions' static schedule with one block per workgroup,
+  which splits the blocks identically. A new block-shaped CPU launch
+  in `src/` goes through `launch_by_owner!`, and a new host loop over
+  blocks through `threaded_chunks`. A bare `kernel(backend)(…)` or
+  `Threads.@spawn` puts blocks on arbitrary cores and costs up to 2.4x
+  on a many-core node (see "What one process loses").
+
+- **Point interpolation reads one block** (M11, see "Point
+  interpolation"). A query's *stencil* is `n^D` consecutive stored
+  points of the block `locate_point` finds, ghosts included, so ghosts
+  must be current. The kernel sees a basis only through `stencilwidth`,
+  `stencilstart` and `basisweights` — the extension point for smooth
+  bases — and `derivs` are multi-indices with only `|m| ≤ 2` accepted
+  until higher orders are tested. A derivative's rate is
+  `min(n − max mₐ, p − |m|)`: the ghosts carry the exchange's `O(hᵖ)`
+  error, so `∂ₓ∂ᵧ` through `Lagrange(4)` with `p = 4` converges at 2,
+  not 3. Outside points are reported by the
+  host after the launch (no throwing in kernels), and `exclude` flags
+  rather than throws. `locate_point` and `isless` share `curve_less`
+  in `morton.jl`, so the search and the leaf order cannot disagree.
+
+- **A checkpoint stores what cannot be recomputed** (M9a, see "Checkpoint and restart"): the forest's parameters and its leaves, in
+  curve order, and each field set's layout and **owned points only**,
+  in state-vector layout. Ghosts, shared planes and schedules are the
+  application's to rebuild with its own operators and hook. A load
+  builds the forest through the validated `leaves` path
+  (`Forest(roots; …, leaves)`, which refuses a list that does not tile
+  the brick or is not balanced) and the field set through its
+  constructor, so nothing read is trusted before they check it.
+  Compatibility is the file's `format_version` plus a must-understand
+  `features` list, never package versions; each refusal says why and
+  points to `checkpoint_environment`. TreeAMR writes only under
+  `/TreeAMR.jl` and the application only under its own top-level group,
+  leaving the root free for M9b's sidecars. The write goes to
+  `path * ".partial"` and is renamed over `path` with
+  `Base.Filesystem.rename` — not `mv(…; force = true)`, which on 1.11
+  removes the target first — and, under the default `sync = true`, the
+  partial file is flushed to stable storage before the rename and its
+  directory after (`F_FULLFSYNC` on macOS, `fsync` elsewhere), since
+  closing a file ends in the page cache and a rename can reach the disk
+  before the data it names. Element types are HDF5 natives or *limbs*
+  (`Float32x2` as two `Float32`), named as a Base-only module prints
+  them and matched against the loader's `types`. No Julia type
+  definition reaches the file, so a converter can read an old file
+  without the old package; do not add JLD2 or `Serialization`. Every
+  file carries CRC-32C checksums — the leaf list's (`leaves_crc32c`)
+  and one per block of each field set (`data_crc32c`), and the index
+  one per part and field set over those — verified on load; HDF5's own
+  Fletcher-32 is deliberately not used (it accepts an all-zero chunk).
+- **No file of a checkpoint has two writers or two openers** (M7 step
+  6b, see "Checkpoints without parallel I/O"). A shared file
+  written from several nodes through MPI-IO lost data on Symmetry's
+  BeeGFS (step 6), so HDF5 is used serially only and the data travel
+  as messages: the ranks form `k` contiguous I/O groups (`io = :node`,
+  the default, by `commnodes`; `:all`; or a number), each group's first
+  rank writes a part file `path.<saveid>.<j>.h5` from its members'
+  streamed blocks, and rank 0 writes the index (format version 2) last;
+  its rename is the commit point, after which rank 0 removes the
+  previous parts and orphans. Loading, only rank 0 opens the index and
+  broadcasts an in-memory image of it without the data (`bcast`), each
+  part is read by one rank, which sends the blocks to their owners, and
+  every step that runs on some ranks only ends in `agree_errors`, so a
+  failure anywhere throws everywhere and nobody waits on a message. The
+  index's external links to the parts are for tools; the loader must
+  never follow them (that opens the target). One part lives inside the
+  index, so a serial checkpoint is one file; version-1 files (the
+  fixtures in `test/fixtures/`) still load. Do not reintroduce parallel
+  HDF5 or MPI-IO.
+- **The forest is replicated, the blocks are distributed** (M7, see "Distributed meshes"). Every rank holds `forest.leaves` whole; rank
+  `r` stores the contiguous curve range `blockrange(forest)`
+  (`equalsplit`, the arithmetic `threadchunks` uses one level down), and
+  every block index of a field set is local (the first bullet). Every
+  forest mutation is **collective**: the same call with the same
+  arguments on every rank, which is what keeps the copies equal without
+  a message, since every host pass is deterministic. `GhostSchedule`,
+  `InterfaceSchedule` and `regrid!` check it through
+  `collective_checks` in `forest.jl` (`interpolate` and the checkpoint
+  functions through the same `ForestDigest` and `digest_verdict`): one
+  `allgather` of a
+  `ForestDigest` (generation, `nleaves`, a fold of `hash(key, h)` over
+  every leaf — not `hash(leaves)`, which samples a long vector — the
+  brick, a layout hash and a refusal flag), so a diverged forest, a
+  layout that differs, or an `ArgumentError` on some ranks is refused on
+  all of them together. `fill_ghosts!`'s checks stay rank-local on
+  purpose (a collective per fill would sit on the per-evaluation path);
+  a one-rank refusal there is a hang, never wrong data. Serially nothing
+  is gathered. Any new check that can fire on some ranks only goes
+  through `collective_checks`.
+- **The sender computes; messages are stages of packed buffers.** A
+  transfer whose source and target live on different ranks is evaluated
+  on the source's rank by the one kernel into a packed buffer (a
+  `NamedTuple` `(buf, offsets, dims)` that `transfer_kernel!` reaches
+  through three accessor methods), sent, and unpacked on the target's
+  rank by a width-1, weight-1 transfer that carries the mirrored
+  group's **parity factor**: applied when packing, the factor would
+  turn the serial fill's `−0` into `+0`. Every ordering point of the
+  serial fill is a stage with its own tag — phase 1 (1), each phase-2
+  target level (`2 + ℓ`), each interface dimension (`40 + d`), the
+  regrid (50) — run by `run_stage!` in five steps (post receives, pack
+  and synchronize, send, run the local groups, wait and unpack). Both
+  ends derive a message's layout from the replicated forest, sorted by
+  `keyorder`, so no descriptor is ever sent and `Dict` order must never
+  reach a layout. Device buffers are staged through page-locked host
+  mirrors unless `communicator(comm; deviceaware = true)` (`hoststaging`).
+  Stage buffers and mirrors are **leased from the forest's buffer pool**
+  (`bufferpool(forest)`, in `forest.state` beside the generation): the
+  regrid stage releases its leases after its sends are waited on, and a
+  schedule's are reclaimed once the generation has moved on, so a
+  regrid reuses what earlier stages held instead of allocating and
+  page-locking it again. A lease is an `Array` (`Base.wrap` over pooled
+  `Memory`) or a contiguous device `view`, never a `SubArray` of host
+  memory. Do not add a field to `Forest`: put mutable state in
+  `ForestState` (a ninth field made the schedule build allocate more;
+  M12's `rotating` is one only because two `Int8`s fit in padding, and
+  `bench/ghosts.jl` measured it at zero bytes).
+  MPI is called from the calling task only, never in a threaded loop or
+  kernel, and needs `THREAD_SERIALIZED`.
+- **Reductions are an allgather of per-rank partials**, folded in rank
+  order on every rank (`combine_blocks` in `state.jl`, the only site),
+  not an `Allreduce`: the association is the package's, so every rank
+  gets the same bits, any `op` and `isbits` partial works (MPI.jl
+  refuses custom operators off Intel), and one rank is exactly serial. An
+  empty rank contributes nothing, not `init`. `block_mapreduce` and
+  `firing_boxes` stay per local block; a number combined from them is
+  rank-local, which is the downstream hazard the step-9 audit found
+  everywhere (HISTORY.md, M7 step 9).
+- **MPI is a weak dependency** (`[weakdeps]`, `[compat]` 0.20), like
+  HDF5: `src/` never names MPI and never branches on it — a serial run
+  takes the distributed code path with every message empty, and the
+  serial suite is its test. Do not make MPI a hard dependency, do not
+  call MPI from `src/`, and do not use `MPI.Comm_dup` (MPI.jl's attaches
+  a finalizer that frees collectively at different moments on each
+  rank; the extension calls `MPI.API.MPI_Comm_dup` and caches one
+  duplicate per communicator, checked with `MPI_Comm_compare`).
+
+### Index conventions
+
+Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
+(`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
+**owned** range is `G_d+1:G_d+N` and the **closed** range `G_d+1:G_d+N+c_d`.
+`coordinates(fs, b, idx)` — which replaced `cell_center` in M8, and takes the
+field set rather than the forest — takes **stored** indices, so owned point
+`i` is `idx = i + G_d`. Kernels launched by `map_blocks!` get the global index
+`(i1, …, iD, b)` with each `i` in `1:N` (or `1:N+c_d` under `closed = true`)
+and add `G_d` to reach the working array — **except** under
+`stored = true`, the third range, where the loop runs over `1:N+2G_d+c_d`
+and the global index already *is* the stored index, so the kernel adds
+nothing. A kernel written for one form is wrong under the other and still
+in bounds. Directions are
+`δ ∈ {-1, 0, 1}^D` from `alldirections(Val(D))`; `+1` names the high
+ghost slab.
+
+The API reference is split by layer, `docs/src/api/{tree,storage,exchange,ode,regrid,interpolate,io,distributed,internals}.md`;
+`docs/src/index.md` is the guide (prose and doctests, plus the status) and
+holds no `@docs` blocks. The split is there because Documenter's HTML writer
+fails the build on any page over 200 KiB (`size_threshold`), and the single
+page had reached 178 KiB; the largest page is now about 40 KiB.
+
+HDF5 and MPI are weak dependencies (`[weakdeps]`): the checkpoint
+implementation is the package extension `TreeAMRHDF5Ext`, which Julia
+loads only once HDF5 is loaded beside TreeAMR, and the MPI methods are
+`TreeAMRMPIExt`. The test and docs environments list HDF5, and
+`docs/make.jl` does `using HDF5`, so the suite and the checkpoint doctest
+see the extension. Without it the five checkpoint functions have no
+methods, and an error hint registered in TreeAMR's `__init__` says to
+load HDF5.
+
+## Tests
+
+`test/runtests.jl` holds the M1 tests inline and `include`s
+`ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
+`rotate_tests.jl` (M12),
+`interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
+M7 files `partition_tests.jl`, `exchange_tests.jl`,
+`regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
+`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
+`wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`, `type_tests.jl`,
+`checkpoint_tests.jl` (M9a), `thread_tests.jl`, `mpi_tests.jl` (M7) and
+`gpu_tests.jl` (M2–M8).
+
+The M7 tests come in two kinds. **In process**, simulated ranks over
+test-only communicators, each answering only the verbs its test needs:
+`PartitionCommunicator(rank, size)` (`partition_tests.jl`: rank and size,
+and the digest gather by replication) for the partition and each rank's
+local schedule; `exchange_tests.jl`'s lockstep, which builds every
+simulated rank's stages and wires their buffers directly, for the
+classification, the layouts, write-once and the bitwise pack/unpack
+round trip (the `−0` parity case included), and its
+`MailboxCommunicator`, one task per rank with a channel per message,
+for the staged driver itself; `regrid_exchange_tests.jl`'s
+`GatherCommunicator` (collectives as rendezvous between the tasks, the
+mailbox for messages) for `regrid!`, `adapt_to_initial_data!`, the
+per-rank buffer search and the refusals, and its `StagingCommunicator`
+for the host-mirror path; `interpolate_exchange_tests.jl` over the same
+for routed interpolation. **Over MPI**, `mpi_tests.jl` runs the
+standalone `mpi_workload.jl` serially in process (the reference) and
+under `MPI.mpiexec()` at `-n 3` and `-n 2`, one thread a rank, and
+requires every line byte for byte except the `sum` lines (`rtol =
+1e-12`); `#` lines depend on the rank count and carry the refusals,
+the checkpoint cross loads, the migrations and the negative control,
+each asserted on its own. The launches are compilation-bound (about
+55 s each), so `test/mpi_jobs.jl` starts both at the start of the
+suite where the machine has room (`concurrent_launches`: 8+ threads and
+24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and otherwise runs the
+serial reference, the three-rank job and the two-rank job one after the
+other (the three ranks beside the reference outgrew CI's 7 GB macOS
+runners and timed out); the workload's `TREEAMR_CHECKPOINT_FROM`
+and its marker files order the cross loads either way. Keep
+`mpi_workload.jl` self-contained like `thread_workload.jl`, its
+non-`#` output independent of the rank count, and a new case's lines
+deterministic. `mpi_device_workload.jl` and `mpi_device_tests.jl` are
+its device counterpart, run by hand (see Commands), never by
+`Pkg.test`.
+`checkpoint_tests.jl` checks a bitwise round trip over every centering,
+`Float64`/`Float32`/`Float32x2` and every face kind, restarts of the
+wave and Burgers studies that continue byte for byte through regrids,
+the refusals with their reasons, the checksums (a damaged block, a
+recomputed one, missing ones), the atomic write and a failing I/O
+process, plain data and `checkpoint_environment`, and that the
+version-1 files in `test/fixtures/` (written by the step-6 writer)
+still load; the leaf-list `Forest` it loads through is tested inline in
+`runtests.jl`, against the oracles. The part files themselves are
+`mpi_workload.jl`'s: saves with `io = :all`, `2` and `:node`, a part
+from another save, a missing part, orphans, a failed I/O process, and
+the `OPEN_LOG` hook showing that no file is opened by two processes. The wave
+study comes in two halves: `wave_tests.jl` is the **vertex-centered**
+one (M8a), and `wave_cell_tests.jl` is the M3 cell-centered study kept
+verbatim so its numbers stay under test. `imex_tests.jl` runs the wave
+and Burgers studies a second time through IMEXRungeKutta's explicit
+`RK4` and `SSPRK33`, by owner, with a `state_partition` helper built
+from `threadchunks`; it also asserts that a stage limiter's correction
+never reaches the state (the drift of a conserved total is the step
+limiter's injection) and that OrdinaryDiffEq's Shu–Osher SSPRK33 is
+different there. Its names clash with OrdinaryDiffEq's (`RK4`,
+`SSPRK33`), so it uses `import IMEXRungeKutta as IRK`. Seven helper
+files are not tests:
+
+- `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
+  reference implementations (bit-plane Morton comparison, exact `Rational`
+  box geometry, analytic polynomials, Gauss–Legendre cell averages). Property
+  tests compare the package against *these*, never against the package's own
+  neighbor search or geometry. Keep that independence when adding oracles.
+  The M10 oracles live at the end of `ghost_oracles.jl`: `faces_forest`
+  (three levels against the walls), `parity_data` (polynomials of
+  definite parity), `undefined_ghosts` (the `NaN`-prefill check that
+  catches a ghost read before it is written) and `reflecting_vs_doubled`
+  (a half domain against the doubled domain it folds). The M12 oracles
+  follow them: `unfolded_forest` (the full plane built from the
+  quadrant's leaves turned in exact `Rational` boxes),
+  `seam_neighbor_mismatches` and `seam_conforming` against it;
+  `rotating_data` (a scalar and a vector covariant under the turn and
+  under no mirror, smooth or polynomial, its constants in the argument's
+  real type so a `Float32` device evaluates it), `rotating_forest`,
+  `undefined_rotated_ghosts`, `rotating_vs_quadrupled` and
+  `rotating_pair_vs_quadrupled` (the quadrant against the full plane
+  `quadrant_and_full` builds, every stored point), `hook_regions_leave`,
+  and the regrid oracle `rotating_regrid_vs_quadrupled`. Beyond those,
+  `rotate_tests.jl` holds the rigid-rotation advection (conservation
+  through the seam), interpolation beyond it, and the wave on a quadrant
+  against the full plane (`rotating_wave`, scalar and vector, which the
+  vertex-centered seam planes keep equal bit for bit).
+- `wave.jl` — the scalar wave equation as an application of the mesh
+  (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
+  `uniform_pulse`). It lives in the tests because the package has no physics.
+  Every entry point takes `centering`, defaulting to `vertexcentered(D)`;
+  `wave_forest` does not, because a centering does not change how space is
+  cut into blocks.
+- `burgers.jl` — Burgers' equation as a **conservative** application
+  (`BurgersProblem`, `burgers_rhs!`, `burgers_errors`, `track_shock`,
+  `uniform_shock`), the M8b counterpart of `wave.jl`: the three-step
+  right-hand side, a cell-centered state with `G = 2` and `D`
+  face-centered flux sets with `G = 0`, and `fixup = false` as the
+  negative control for conservation. It reuses `to_backend` and
+  `convergence_rate` from `wave.jl` and `cell_average` from
+  `ghost_oracles.jl`, so `runtests.jl` includes it after both.
+- `thread_workload.jl` — a standalone script, not `include`d. The thread
+  count is a command-line argument to Julia, so the M5 acceptance test runs
+  this in subprocesses at two thread counts and compares their output byte
+  for byte. It is deliberately self-contained (its own RK4 and SSPRK3, no
+  ODE package) so a subprocess starts in a couple of seconds; keep it that
+  way, and keep everything it prints deterministic. Its cycles cover
+  periodic and outer boxes, both centerings, reflecting walls (`…r`),
+  rotating quadrants with a `RotationPair` fill (`…q`, M12) and the
+  conservative Burgers cycle (`B…`).
+- `mpi_workload.jl` — the M7 counterpart, standalone too: the argument
+  `mpi` makes its forests distributed over `MPI.COMM_WORLD`, and rank 0
+  prints the digests gathered in block order. `mpi_tests.jl` also runs
+  it in process, in a module of its own, printing into the `IOBuffer`
+  it defines as `WORKLOAD_IO`.
+- `mpi_jobs.jl` — the launcher of those `mpiexec` jobs
+  (`launch_workload`, `finish_workload`, `concurrent_launches`), which
+  `runtests.jl` includes before the first test so that the jobs can
+  start early.
+
+**The suite is compilation-bound, not kernel-bound.** Measured: annotating the test
+applications' kernels `@inbounds` made `wave_rhs_kernel!` 6.8x faster
+and left the suite at 3m11 against 3m14, inside the 7 % run-to-run
+noise; the same treatment of `test/thread_workload.jl` moved its 18.8 s
+by 2 %. CI gains nothing from such a change in any case, since
+`check_bounds: yes` overrides `@inbounds` package-wide.
+
+**CI and coverage.** `julia-actions/julia-runtest` defaults `coverage`
+to `true`; CI.yml ties coverage to `threads == 1`, which keeps
+it on the four cheap cells (both operating systems, both Julia
+versions, merged by Codecov) and drops it from the expensive threaded
+ones. Instrumentation cost **2.61x** locally
+(measured: 3m23.6s → 8m51.8s, 88819 tests, 4 threads both times) —
+though that is not the CI factor, because the action also defaults
+`check_bounds` to `yes` and a plain `Pkg.test` no longer does.
+`Base.julia_cmd()` forwards `--code-coverage` to the subprocesses the
+thread-independence test spawns, so those are instrumented too — three
+PIDs write `.cov` files and `julia-processcoverage` merges them per
+source file, which is why a single-threaded cell still sees the
+threaded code paths. The MPI test's five ranks launch through
+`Base.julia_cmd()` too, so the MPI extension's coverage comes from them
+(not measured in step 9).
+
 ## Ecosystem integration
 
 - **Time integration:** OrdinaryDiffEq.jl via the flat state vector (see
@@ -5274,22 +5241,149 @@ which the seam avoids.
   operators. (Multigrid on the tree hierarchy would require overlapping
   coarse data, which leaf-only storage does not provide — out of scope.)
 - **I/O:** checkpoint and restart through HDF5.jl, as a package
-  extension — M9a, done, as specified under
+  extension, as specified under
   [Checkpoint and restart](#checkpoint-and-restart). Visualization
   export is M9b; an ADIOS2 backend only if parallel HDF5 does not scale
   at M7 (see [Open questions](#open-questions)).
-- **Visualization:** export is M9b, after M7, with its candidates
-  listed under [Milestones](#milestones). The original plan here, VTK's
+
+  **Inconsistent:** the I/O bullet makes an ADIOS2 backend conditional on parallel HDF5 not scaling at M7, but M7 replaced the parallel-HDF5 checkpoint by part files written serially ("Checkpoints without parallel I/O" under [Distributed meshes](#distributed-meshes)).
+
+- **Visualization:** export is M9b, with its candidates
+  listed in [PLAN.md](PLAN.md#m9b--visualization-export). The original plan here, VTK's
   non-overlapping AMR format, does not exist in VTKHDF (see "Formats
-  considered" under [Checkpoint and restart](#checkpoint-and-restart)).
+  considered" under "Checkpoint and restart" in
+  [HISTORY.md](HISTORY.md#checkpoint-and-restart)).
+
+### Downstream applications
+
+Three applications use TreeAMR; mesh machinery belongs here and physics
+there. What each calls is what a rename or a re-signature here breaks.
+How each was checked against this package's milestones, and the audit of
+what each would get wrong once it distributes (M7 step 9), are in
+[HISTORY.md](HISTORY.md#downstream-checks).
+
+**TreeWave** (`~/src/jl/TreeWave`, github.com/eschnett/TreeWave.jl) is the sample
+application: the scalar wave equation with a Löhner refinement criterion,
+ported from `test/wave.jl`. It exists so that there is a real downstream user
+of the *public API only*. Facts that matter here:
+
+- It takes TreeAMR from the **General registry**, not from `main` and not
+  from this checkout: `Project.toml` bounds it with `TreeAMR = "0.1.0"`
+  under `[compat]`, and `bin/Project.toml` inherits that bound through
+  its `TreeWave = {path = ".."}` source. So neither a push to `main` nor an uncommitted change
+  here reaches it; a change arrives with the next release.
+- It takes `FieldSet(forest,
+  nvars; G, centering, backend)`, the `fs => schedule` form of `regrid!`,
+  `GhostSchedule(fs, ops)`, and `coordinates(fs, b, idx)` in `bin/`.
+  `bin/` is outside `src/` and `test/`, so `Pkg.test` never runs it; its
+  CI's `viewer` job renders every figure on each push, which is what
+  catches breakage there.
+- Its `src/` calls: `Forest`, `refine!`, `balance!`, `nleaves`, `level`,
+  `maxlevel`, `spacing`, `minimum_spacing`, `block_spacings`,
+  `block_extent`, `MortonKey`, `FieldSet`, `nblocks`, `blockkey`,
+  `fill_by_coordinates!`, `Operators`, `GhostSchedule`, `fill_ghosts!`,
+  `statelength`, `statevector`, `statearray`, `scatter!`, `gather!`,
+  `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`, `flag_blocks`,
+  `firing_boxes`, `regrid!`, `adapt_to_initial_data!`, `cellcentered`,
+  `vertexcentered`, the `RegridFlag` values, and the `(flag, box)` flag
+  form; `bin/` adds `blockview`, `interiorview` and `coordinates`, and
+  its tests add `buffered_flags`, `complete_marks` and `block_origin`.
+  `hostcopy` is its own, in its `device.jl`, and it does not use
+  `todevice`. Renaming or re-signaturing any of these breaks it.
+- `using HDF5` beside TreeAMR loads the checkpoint extension, and
+  nothing else is needed. It calls none of the checkpoint functions yet.
+- It does not pass `comm` to any `Forest` yet, so under `mpiexec` each
+  rank would run a whole serial copy. Once it does, the fix for what
+  the audit found is `mesh_mapreduce`. It indexes nothing by a global
+  `b` and sizes nothing by `nleaves`.
+- Its `CLAUDE.md` and `CODE.md` record API sharp edges found from the
+  outside — a keyword named `maxlevel` shadows the exported
+  `maxlevel(forest)` inside a function body; `coordinates` taking stored
+  indices is an easy off-by-`G`. Read them when changing anything
+  user-facing.
+
+**TreeHydro** (`~/src/jl/TreeHydro`, github.com/eschnett/TreeHydro.jl) is the second
+worked application: Newtonian ideal hydrodynamics with a
+high-resolution shock-capturing finite-volume scheme — the
+*conservative* counterpart of TreeWave, and the heaviest downstream user
+of M8.
+
+It pins **neither `main` nor this checkout**: its `Project.toml` and `bin/Project.toml` have no
+`[sources]` entry for TreeAMR, only `TreeAMR = "0.1.3"` under `[compat]`.
+A change here reaches its tests only once it is tagged and registered,
+a higher bar than a push; to try one sooner, `Pkg.develop` this checkout
+into a scratch copy of TreeHydro, never the real one.
+
+It is the only caller of several things, which makes it the only test
+of them outside this repo: `InterfaceSchedule` / `restrict_interfaces!`,
+the physical-boundary hook at all (`boundary_by_coordinates` over an
+`AllVariables` callback; TreeWave is periodic throughout),
+`map_blocks!(…; stored = true)`, `facecentered` field sets with `G = 0`,
+`total_mass`, and `regrid!` over several `fs => schedule` pairs including
+`fs => nothing`. Beyond those its `src/` calls `Forest`, `refine!`,
+`balance!`, `nleaves`, `level`, `spacing`, `minimum_spacing`,
+`block_spacings`, `block_extent`, `FieldSet`, `nblocks`, `blockkey`,
+`coordinates`, `fill_by_coordinates!`, `Operators`, `GhostSchedule`,
+`fill_ghosts!`, `statelength`, `statevector`, `statearray`, `scatter!`,
+`gather!`, `map_blocks!`, `block_mapreduce`, `volume_weighted_norm`,
+`firing_boxes` with the `(flag, box)` form of `Refine`/`Keep`/`Coarsen`,
+and `adapt_to_initial_data!`. Its tests add `Conservative` (every
+`Operators` they build), `maxlevel`, `block_origin`, `cellcentered`,
+`staggers`, `RegridFlag` and `buffered_flags`; `bin/` adds
+`interiorview`. It uses neither `todevice` nor a TreeAMR `hostcopy`:
+`to_backend` and `hostcopy` are its own, in its `device.jl`.
+
+Which of its tests reach TreeAMR: `prerequisite_tests.jl` tests the mesh
+directly — `AllVariables` runs once per point, a `stored = true` launch
+reaches every ghost, and a name list asserts the resolved release still
+exports the M8 surface. The rest go through the scheme:
+`interface_tests.jl` (the fixup is what conserves at a coarse-fine face;
+the interface-order rule for a system), `sod_tests.jl` and
+`sedov_tests.jl` (the Dirichlet hook on a face, and at a corner and an
+edge — the M2 ordering case), `refinement_tests.jl` (`firing_boxes`, the
+four marks, `buffered_flags`), `driver_tests.jl` and
+`kelvinhelmholtz_tests.jl` (`regrid!`, `adapt_to_initial_data!`,
+conservation through the regrids), `evolution_tests.jl` and
+`reset_tests.jl` (`fill_ghosts!` and `map_blocks!` over `statearray`,
+through the right-hand side and the reset). `eos_`, `riemann_`,
+`exact_riemann_` and `precision_tests.jl` are pointwise physics and touch
+nothing here. Its `bin/`, like TreeWave's, is run by its CI's `viewer`
+job rather than by `Pkg.test`.
+
+It does not pass `comm` to a `Forest` yet. Once it does, it is the most
+exposed of the three: its CFL speed, its floor counts and its refinement
+scales combine `block_mapreduce` on the host, and its wall-clock
+checkpoint triggers decide per rank whether to enter the collective
+`save_checkpoint`. The fixes are `mesh_mapreduce`, and an agreed trigger.
+It needs TreeAMR 0.1.6 or later over MPI, for the fix to the
+`AllVariables` boundary hook on a rank without blocks (see "Ranks without
+blocks are allowed" in [Distributed meshes](#distributed-meshes)).
+
+**TreeGeneralizedHarmonic** (`~/src/jl/TreeGeneralizedHarmonic`,
+github.com/eschnett/TreeGeneralizedHarmonic.jl) is the third application:
+the vacuum Einstein equations in the generalized harmonic formulation, a
+black hole on the octree. It takes TreeAMR from **General**,
+`TreeAMR = "0.1.4"` under `[compat]`, so a change here reaches it only
+with a release. Every kernel it has goes through `map_blocks!`. Its
+`test/prerequisite_tests.jl` names the four unexported TreeAMR names it
+relies on — `threadchunks` (its integrator's partition) and M11's
+`Region` extension points `inside`, `stencil_hits` and
+`stencil_position` — so renaming one breaks that suite at the top. Its
+restart stores, beyond `(t, u)`, its horizon tracking and interior fits,
+through its `src/checkpoint.jl`. Of the three it is the closest to ready
+for MPI: its reductions are already `mesh_mapreduce` and its integrator
+is fixed-step. It does not pass `comm` yet (`gh_forest`,
+`src/initialdata.jl`; `load_run`, `src/checkpoint.jl`). Its horizon
+finder passing every point on every rank is correct under the
+collective `interpolate`, only redundant.
 
 ## Open questions
 
 All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
 
-- Wiring `volume_weighted_norm` (implemented in M3) into adaptive
-  integrators as `internalnorm` (post-M3). Its cost objection on a
+- Wiring `volume_weighted_norm` into adaptive
+  integrators as `internalnorm`. Its cost objection on a
   device — the norm at one work item per block cost three RHS
   evaluations — went with the two-launch reduction: the norm is 7 % of
   an RHS evaluation on Metal and 10 % on the H200, measured under
@@ -5301,7 +5395,7 @@ Remaining, none blocking before their milestone:
 - A state vector spanning several field sets: specified under
   [Time integration](#time-integration), implemented with the first
   application that needs it (constrained-transport MHD).
-- **What M9a leaves open** (2026-09-29; see
+- **What M9a leaves open** (see
   [Checkpoint and restart](#checkpoint-and-restart)). None of it is
   needed to restart a run.
   - Conversion on load, such as `Float64` into `Float32` for a device
@@ -5310,28 +5404,20 @@ Remaining, none blocking before their milestone:
   - Partial loads: a subset of a field set's variables, or a range of
     blocks.
   - Appendable time series: several states in one file.
-  - The parallel I/O design for M7: one shared file, as the version-1
-    layout allows, against one file per I/O process plus a wrapper
-    file. It is benchmarked on Symmetry and other HPC systems first.
-    *(Decided 2026-10-01 with Erik: the shared file, specified under
-    [Distributed meshes](#distributed-meshes). What stays open is its
-    throughput on a cluster file system, measured in M7's step 6.)*
-    *(Measured there, 2026-10-02: on BeeGFS the shared file lost data
-    between nodes until ROMIO's read-modify-write was turned off, and
-    did not get faster with nodes; it is to be replaced by one file per
-    I/O process with an index file, decided that day with Erik.)*
   - An ADIOS2 backend, if parallel HDF5 does not scale at M7. The data
     model maps one-to-one onto ADIOS2 variables (the datasets) and
     attributes.
-  - A refusal for a missing filter (found 2026-09-29, measuring M9a). A
+    **Inconsistent:** this item is conditional on parallel HDF5 at M7,
+    which M7 replaced by part files written serially.
+  - A refusal for a missing filter. A
     file saved with H5Zzstd's filter and loaded without `using H5Zzstd`
     fails with HDF5's `H5Error`, a plugin it cannot find in a build
     directory, rather than with a reason. The loader could read the
     data set's filter pipeline first and name the filter and the
     package that provides it.
-- **What M12 leaves open** (2026-10-03; see "Rotating seams" under
+- **What M12 leaves open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
-  - *A 180° rotation, the π-symmetry* (deferred 2026-10-03 with Erik).
+  - *A 180° rotation, the π-symmetry* (deferred).
     Half of the plane is simulated, and the low face of `d1` is glued to
     itself, flipped about the domain's centre line in `d2`. It needs the
     machinery of M12 — the oriented search, the virtual frame, the axis
@@ -5349,7 +5435,7 @@ Remaining, none blocking before their milestone:
     the partner's, so the kernel would need both working arrays, or the
     host would route the folded point to the partner and swap the
     variables. Refused, with the reason, until an application asks.
-- **The working array's layout** (2026-10-05, from
+- **The working array's layout** (from
   [The copy kernels on a device](#the-copy-kernels-on-a-device); to be
   revisited with Erik as future work). Once their index was cheap, the
   copy kernels were left at what the layout `(i₁ … i_D, var, block)`
@@ -5365,7 +5451,7 @@ Remaining, none blocking before their milestone:
   `blockview`, `statearray`, the checkpoint's in-memory side and every
   application kernel's indexing, so it is a design decision, not a
   tuning.
-- **A state that lives in the working array** (2026-10-05, the third step
+- **A state that lives in the working array** (the third step
   of TreeGeneralizedHarmonic's item 5). An integrator whose stage vectors
   are field sets needs no scatter at all, and a native stepper could write
   the next stage's input straight into a second working array from the
@@ -5375,9 +5461,9 @@ Remaining, none blocking before their milestone:
   [Time integration](#time-integration). The downstream estimated it at
   10–15 % of a step once the kernel and the copies are fast.
 - **The integrator's own passes are not owner-based** (raised by
-  TreeGeneralizedHarmonic, 2026-09-25, after it adopted the ownership
-  policy of [Parallelism](#parallelism); decided the same day not to
-  optimise it further, below). An external
+  TreeGeneralizedHarmonic after it adopted the ownership
+  policy of [Parallelism](#parallelism); not to be optimised further,
+  below). An external
   integrator forms its stage vectors itself, and OrdinaryDiffEq's `RK4()`
   does so with FastBroadcast's `@..` on one thread (`thread = Serial()`),
   over the whole state, between every two `map_blocks!` launches — so on
@@ -5419,7 +5505,7 @@ Remaining, none blocking before their milestone:
   settle it; if it holds, the first-touch advice needs "and nothing serial
   touches the state" attached.
 
-  *Polyester: not pursued further* (decided 2026-09-25), for what the
+  *Polyester: not pursued further*, for what the
   same job measured. Its stage
   update is no faster than the owner-mapped kernel (6.0 ms against 6.2),
   and it does not compose with this package's launches: after every
@@ -5435,7 +5521,7 @@ Remaining, none blocking before their milestone:
   matches the block ownership only by coincidence (when every block has
   the same size).
 
-  *Not pursued further* (decided 2026-09-25). The integrator's passes
+  *Not pursued further.* The integrator's passes
   stay as measured above: no Polyester (`thread = True()`), no
   owner-aware state vector type to route OrdinaryDiffEq's broadcasts
   through `launch_by_owner!` (the suggestion this item first made,
@@ -5484,3064 +5570,3 @@ Remaining, none blocking before their milestone:
   machine at 6 threads (960 blocks of `16³`, a 63 MB state) the RHS is
   most of a step and the two integrators are within 6 %; it is the
   Symmetry run that will say what the serial passes cost there.
-
-## Milestones
-
-Each milestone has a concrete acceptance test; serial correctness is
-established before any parallelism. The numbers are the order the
-milestones were planned in; **M8 is done before M7** (decided in the M8
-design, see the M8 entry), and so are M10, which was added after M8,
-and M11, added after M10 for a downstream horizon finder. **So is M9a,
-checkpoint and restart** (decided 2026-09-29), because the downstream
-applications need to restart long runs before they need MPI. M9 is
-split for it: its second half, M9b (visualization export), stays after
-M7. M9a's layout was chosen so that M7 need not change it, subject to
-M7's benchmarks (in the end it did change it: format version 2, M7 step
-6b). The list below is in execution order. M7 is done (2026-10-02).
-M12, the rotating symmetry, was added after it on 2026-10-03 and done
-the same day, so it comes before M9b, which follows it.
-
-- **M0 — Scaffolding.** Package skeleton, test harness, CI, docs stub.
-  *(Skeleton exists.)*
-- **M1 — Tree core (serial, D-generic).** Morton keys over a brick of
-  roots, sorted leaf array, neighbor finding, refine/coarsen, 2:1
-  balance enforcement, block storage, periodic wraparound. *Accept:*
-  hand-rolled property tests with a seeded RNG (tiling, balance,
-  neighbor soundness/completeness — exact reciprocity only at equal
-  levels, see neighbor asymmetry above — and periodicity) on random
-  refinement patterns in D = 1, 2, 3. *(Done.)*
-- **M2 — Ghost exchange and default operators.** The cached exchange
-  schedule, the phased ghost fill (three cases, level-ordered
-  prolongation), periodic boundaries, physical-boundary hooks, default
-  operators of configurable order with the `G`-sufficiency check —
-  written as KernelAbstractions kernels (CPU backend). *Accept:*
-  polynomial data reproduced exactly up to operator order (degree
-  `p − 1` and no further) across all face/edge/corner and three-level
-  configurations. Periodic wraparound is tested by its definition
-  instead — an `M`-root periodic domain reproduces the middle tile of an
-  explicit `3M`-root tiling bit for bit (amended in M2: polynomials are
-  not periodic, so polynomial exactness across the seam is unattainable;
-  only constants are periodic polynomials). *(Done.)*
-- **M3 — Wave equation + OrdinaryDiffEq.** Scalar wave in 2nd-order
-  form (state `(u, ∂ₜu)`, 2nd-order centered Laplacian), periodic cube,
-  static two-level refinement over a sub-box, manual `f!`, fixed-`dt`
-  RK4. *Accept:* volume-weighted L2/L∞ errors against the exact
-  sine-mode solution converge at 2nd order — which requires **order-4
-  operators and `G = 2`** (amended in M3; see the interface-order rule
-  under [Operators](#operators)), verified in D = 1, 2 with a 3D smoke
-  test. The wave equation lives in the tests: the package has no
-  physics. *(Done.)* *(Amended in M8a: the wave study is
-  **vertex-centered** from M8 on — `test/wave_tests.jl`, with its own
-  rate table under [Operators](#operators) — and this cell-centered
-  study is kept verbatim as `test/wave_cell_tests.jl` so the M3 numbers
-  stay under test.)*
-- **M4 — Regridding.** Flag → balance → rebuild → transfer; the
-  initial-data cycle; integrator reinit. *Accept:* the initial-data
-  cycle converges to a fixed-point hierarchy; a moving refined region
-  tracks a travelling pulse with the accuracy of the *uniformly finest*
-  mesh at fewer cells (measured error ratio 1.00 — matching that
-  reference is what "without artifacts" means operationally); transfer
-  conservation as stated under [Regridding](#regridding) (amended in M4
-  from the original blanket "conservation of transferred data", which
-  refinement cannot deliver without conservative operators). *(Done.)*
-- **M5 — Multi-threading.** Threaded loops over blocks. *Accept:*
-  results match serial to roundoff; scaling measurement on a many-core
-  node. Delivered stronger than asked on the first count: results are
-  **bit-identical** across thread counts, checked by running a full
-  adapt/evolve/regrid/evolve cycle in subprocesses at different thread
-  counts and comparing digests of the state vector, the leaf array, the
-  schedule shape and the reductions — the floating-point sums among
-  those narrowed to a roundoff promise after M8, see
-  [Parallelism](#parallelism); the digests still agree, because the CPU
-  fold did not change. Scaling on a 64-core AMD EPYC 7532
-  (8 NUMA domains, 960 blocks of `32^3`): **36.3x** on the RHS path,
-  59.5x on the compute-bound initial-data pass, with the table and the
-  two findings that got it there — a phase must be one parallel loop,
-  and pages must be interleaved — under [Parallelism](#parallelism).
-  `bench/scan.sh` reproduces the measurement. Re-measured on a Milan
-  node on 2026-09-23 ("Where the 64-thread efficiency goes" and "What
-  one process loses", same section): the remaining gap is not page
-  placement but the loss of data-to-core affinity between launches,
-  which the block-ownership launch policy recovers in one process
-  (implemented the same day: 38.6x on the RHS path at 64 threads,
-  pinned). *(Done.)*
-- **M6 — GPU.** CUDA backend via KernelAbstractions; device-resident
-  data. Floating-point-type genericity *(landed early, after M5)* is a
-  prerequisite that is now in place: the geometry and the interpolation
-  weights no longer evaluate in `Float64` on their way into a `Float32`
-  field, so nothing on the per-cell path needs hardware fp64. See
-  "Precision" under [Core concepts](#core-concepts). *Accept:* M3
-  convergence results reproduced on GPU; kernel benchmarks. The backend
-  is a keyword on `FieldSet` and `GhostSchedule` and nothing else; what
-  the milestone did *not* anticipate, and what most of the work was, is
-  that the exchange schedule has to become device-resident and that two
-  application callbacks — the boundary hook and the flagging function —
-  needed a second, cell-wise form, both recorded under
-  [Parallelism](#parallelism). The whole suite passes on CUDA (NVIDIA
-  H200) in `Float64` *and* `Float32`, and on Metal (Apple M3 Pro) in
-  `Float32`, a backend with no hardware fp64 at all. The M3 convergence
-  result is reproduced on both: L2 rate **1.99** in `Float64` and
-  **1.99** in `Float32`, with order-4 operators and `G = 2` over the
-  two-level mesh. The `Float32` study has to be run at coarser
-  resolutions, and for a reason worth recording: the error measured is a
-  truncation error, the same number in every precision, while the
-  roundoff floor it must clear moves — and the step count grows with
-  `N`, so in `D = 1` the floor is already reached at `N = 64` (the rate
-  over `N = 16…128` collapses to 0.73). That is the positive-assertion
-  form of the caveat "Precision" records for negative ones.
-  `bench/gpu.jl` produces the kernel benchmarks in the format
-  `bench/threads.jl` uses, so a device run and a host run read side by
-  side; `bench/symmetry_gpu.sh` is the cluster job that runs both.
-  *(Done.)*
-- **M8 — Every centering, per-field-set ghost width, conservation,
-  Burgers.** *(Done.)* Done before M7 (decided): the MPI exchange is
-  built over the schedule, and with the schedule layout-generic first, M7
-  distributes ghost fill, interface restriction and regrid transfer for
-  every centering in one design, instead of building the cell-centered
-  exchange and retrofitting it twice. The design is under
-  [Centerings](#centerings), [Ghost filling](#ghost-filling),
-  [Operators](#operators) and
-  [Conservation](#conservation-at-coarse-fine-faces); the conservative
-  cell-data operator family *(landed early, pre-M5, with its
-  regrid-transfer conservation already verified)* is its foundation. The
-  test problem is Burgers' equation, in the tests, as the wave equation
-  is; an Euler hydro toy is a separate package, as TreeWave is for the
-  wave equation. Two halves:
-  - **M8a — layout.** `G` (per dimension) and `centering` on the field
-    set, `Forest` without `G`, `coordinates` in place of `cell_center`,
-    `GhostSchedule(fs, ops)`, per-dimension stencil widths, the vertex
-    rows of the operator table, `regrid!` over `fs => schedule` pairs,
-    and the wave test split into vertex- and cell-centered halves.
-    *(Done.)* See "**Implemented in M8a step 1**", "**step 2**" and
-    "**step 3**" under [Centerings](#centerings) for what the design
-    left open and the implementation settled. Nothing changed a measured
-    cell-centered number, as predicted: the whole suite passes at one
-    and eight threads with the M3 wave tables unchanged, and the
-    thread-independence digests still agree byte for byte. The
-    centering's own acceptance tests pass — the M2 exactness claim over
-    all `2^D` centerings in `D = 1, 2, 3` at `p = 2` and `p = 4`, the
-    write-count partition of the stored points including the shared
-    plane and with `G = 0` along a stagger, bit-for-bit injection on
-    position-determined data (with the cell-centered control showing
-    *no* coincident points across levels at all), the `G ≥ p/2 − 1`
-    bound, the conservative refusal, and the regrid transfer exact for
-    every centering — and so does the wave equation on top of them: the
-    predicted rates **1 and 2** at prolongation orders 2 and 4, measured
-    0.99 / 1.99 in `D = 1` and 1.01 / 1.99 in `D = 2`, at **`G = 1`**,
-    with the restriction order and the second ghost plane both
-    bit-for-bit inert, the M4 pulse tracked to the uniformly finest
-    mesh's accuracy (0.0240 against 0.0233, at 176 cells against 256),
-    and two staggered cycles in the thread workload. The table is under
-    [Operators](#operators).
-    *Accept:* the M2 exactness test (degree `p − 1`, face/edge/corner,
-    three levels) over all `2^D` centerings in `D = 1, 2, 3`, the oracle
-    averaging along cell-like dimensions and sampling along vertex-like
-    ones *(amended in M8a step 2: the averaging half has no consumer,
-    since the conservative family is refused along a stagger — see
-    [Centerings](#centerings))*; vertex restriction bit-for-bit
-    injection on arbitrary data; **the wave equation is vertex-centered
-    from here on**, with the M3 study
-    repeated on it — predicted rates **1 and 2** for prolongation orders
-    2 and 4 at *any* restriction order, since restriction is exact, and
-    `G = 1` sufficient at order 4 where cell centering needs 2 — while
-    the cell-centered study is kept verbatim as `wave_cell` so the M3
-    numbers stay under test; the thread digests. The cell-centered
-    stencils are the same rational weights as before, so M8a changes no
-    measured number. *(All of this is measured; see above.)*
-  - **M8b — conservation.** *(Done.)* `InterfaceSchedule` /
-    `restrict_interfaces!`
-    *(step 4; see "**Implemented in M8b step 4**" under
-    [Conservation](#conservation-at-coarse-fine-faces))*,
-    `map_blocks!(…; closed = true)`, and Burgers' equation
-    `∂ₜu + Σ_d ∂_d(u²/2) = 0` on a periodic box in `test/burgers.jl`:
-    finite volume, linear reconstruction (unlimited for the smooth
-    studies, so the measured rate isolates the interface and not a
-    limiter's clipping at extrema; minmod wherever there is a shock),
-    Rusanov flux, `SSPRK33` from `OrdinaryDiffEqSSPRK` (a new test
-    dependency — conservation to roundoff holds for any Runge–Kutta
-    method, since every stage's `du` sums to zero, but only a
-    strong-stability-preserving one keeps the shock monotone), `G = 2` on
-    the state and `G = 0` on the fluxes, a gradient criterion through
-    `firing_boxes` with the M4 travelling margin. Data depending on
-    `s = Σ_d x_d` solve the one-dimensional equation in `s` with speed
-    factor `D`, so `u = u₀(s − D·u·t)` with `u₀ = ū + a·sin(2πs/L)` is
-    exact in any `D` up to `t_b = L/(2πaD)`, solved per cell by Newton and
-    compared as *cell averages*; after `t_b` a shock travels at `D·ū`.
-    *Accept:* **total mass conserved to roundoff across coarse-fine
-    faces** — a shock crossing a refined region that follows it, regrids
-    in between, `|Δ Σ h^D u| ≤ c·eps(T)·Σ h^D|u|·nsteps` — with the
-    negative control (fixup skipped) measured and its drift recorded
-    here; the interface-order rule for the conservative family measured
-    (predicted rates 1, 2, 2 for `p = 1, 3, 5`) and tabulated under
-    [Operators](#operators); a tracked shock matching the uniformly fine
-    reference at fewer cells, as the M4 pulse did; the interface
-    restriction equal to a hand-computed average over the finer
-    neighbors, and each target written exactly once per phase; the
-    Burgers cycle in the thread-independence workload and in the device
-    suite. *(All of this is measured, in M8b step 5;
-    `test/burgers.jl` and `test/burgers_tests.jl` are the study.)*
-    **Mass is conserved to 0.5-2.5 ulp** of the domain integral, and the
-    drift does not grow with the step count; the negative control leaks
-    3.8e-5 to 3.2e-4 in the same runs, eleven orders of magnitude more,
-    with the full table and the `Float32` caveat under
-    [Conservation](#conservation-at-coarse-fine-faces). A **uniform**
-    mesh conserves with or without the fixup, which is what pins that on
-    the coarse-fine faces rather than on the scheme. The interface-order
-    rule comes out as predicted — L∞ rates **1.00 / 1.97 / 1.97** in
-    `D = 1` and **0.84 / 1.81 / 1.77** in `D = 2` for `p = 1, 3, 5`,
-    with `p = 3` and `p = 5` matching the *unrefined control's* own rate
-    — and the **norm turned out to be part of the result**: an integral
-    norm sees none of it, because a flux divergence leaves the defect on
-    the interface instead of radiating it as a second derivative does
-    (both under [Operators](#operators)). The tracked shock matches the
-    uniformly fine reference at **6.6e-4** against that mesh, where the
-    uniform coarse mesh is **5.2e-3** — 7.9x worse — using 80 cells
-    against 128, and with the travelling buffer removed the refined
-    region falls off the shock entirely. The Burgers cycle is in the
-    thread workload (bit-identical at 1 and 8 threads) and in the device
-    suite, where Metal in `Float32` reproduces the CPU numbers bit for
-    bit.
-- **M10 — Reflecting boundaries.** *(Done.)* Done before M7, for M8's reason: M7
-  then distributes mirror transfers as the ordinary transfers they are,
-  rather than retrofitting them. `reflecting` per face on the forest,
-  `parity` per variable and dimension on the field set, and the mirror
-  transfers and the derived upper wall point under
-  [Ghost filling](#ghost-filling). Until now a reflection could only be
-  written as a region-form boundary hook. That form is CPU-only, has to
-  repeat the mirror index arithmetic per centering, and reads stale
-  ghosts at a mixed edge or corner region whose tangential neighbor is
-  coarser. *Accept:*
-  - refusals, each saying why: periodic and reflecting in one dimension,
-    a missing parity, `NoParity` in a reflected dimension;
-  - the M2 exactness test with data even or odd about the wall, of
-    per-dimension degree `p − 1`, over three levels touching the wall,
-    at `p = 2, 4`, for every centering. It covers the derived upper wall
-    point: zero for odd data, exact for even. The conservative family
-    is tested on cell averages;
-  - a reflecting domain reproducing the mirrored doubled domain on
-    arbitrary data, to roundoff, including a coarser tangential neighbor
-    at the wall;
-  - every ghost written exactly once, the hook never handed a
-    reflecting region;
-  - **no ghost undefined, and none read before it is defined**, for
-    every combination of periodic, outer and reflecting faces in
-    `D = 1, 2, 3` and every centering: `NaN`-prefilled storage with
-    finite owned data, checked for `NaN` after one fill;
-  - the regrid transfer exact at a wall;
-  - the wave equation with odd and with even data on a reflecting half
-    domain agreeing with the full domain, and converging at the
-    predicted rate at a vertex-centered upper wall;
-  - a reflecting cycle in the thread workload and in the device suite.
-
-  *(All of this is measured; `test/reflect_tests.jl` is the study, with
-  its oracles at the end of `test/ghost_oracles.jl`.)* The design needed
-  no amendment: the mechanism above went in as specified, and every
-  mirror point landed inside the tangential stencil's range, as
-  `N ≥ 2G + 2c` promises. Four things are worth recording.
-
-  - **The doubled domain is reproduced to roundoff.** It is bit for bit
-    in `D = 1`, and within 4.4e-16 in `D = 2` and 1.6e-15 in `D = 3` over
-    up to 221184 stored values, on arbitrary data. That holds cell-centered
-    at either wall and vertex-centered at the low one. The residue is
-    summation order: a mirrored stencil adds the same terms as the
-    doubled domain's, reversed.
-  - **The `NaN` test catches the ordering bug it is there for.** It
-    covers 235 cases: 10 in `D = 1`, 100 in `D = 2`, and in `D = 3` the
-    125 face combinations with the centering rotating. All are clean, and
-    the values are exact to 1.2e-14. As a check that the test is not
-    vacuous, mirrored prolongations were moved into phase 1, where the
-    hook used to run: it then failed 39 to 41 of the 42 2D cases with a
-    reflecting face, and all 234 in 3D. 1D has no mirrored prolongation
-    to misplace. The 2D count varies between processes because the order
-    of the groups within a phase does: a misplaced prolongation reads its
-    source stale only if it runs before the group that fills it. That
-    order is free precisely because phase 1 is order independent. It costs about 11 s warm, most of it the 3D sweep.
-  - **The wave equation keeps its rate.** Order-4 operators on a box
-    with reflecting walls at `x₁ = 0` and `L/2`, `N = 8, 16, 32`, give
-    L2 rates **1.91 / 2.02** (vertex, odd / even) and **1.99 / 2.00**
-    (cell) in `D = 1`, and **1.96 / 1.99** and **1.99 / 2.00** in
-    `D = 2`. The periodic box with the same refinement gives 1.99–2.00.
-    The derived upper wall point therefore costs no order, as the
-    interface-order rule predicts. The lowest of the eight, vertex-odd in
-    1D at 1.91, is inside the 0.15 the periodic studies are held to; its
-    L∞ rate is 1.95. Why that one case sits lowest was not
-    investigated.
-
-    The half box also evolves as the periodic box it folds.
-    Cell-centered, at `N = 16`, the L∞ errors of the two agree to a
-    relative 3.0e-11 (`D = 1`) and 2.6e-13 (`D = 2`) after 128 and 91
-    RK4 steps, on half the blocks.
-  - **Cost.** The suite went from 89168 tests in 3m31 to 89961 in 4m49,
-    at 8 threads. The M10 testsets add up to about 42 s of that, and the
-    device subset (Float32 compilation on the CPU backend) and the two
-    reflecting cycles in each thread-workload subprocess about 8 s more.
-    The rest is inside the run-to-run noise at this length. On Julia 1.10,
-    in one thread, it was 97744 tests in 2m53. The 3D order-4 exactness
-    sweep was then dropped as a duplicate of the `NaN` test's, which left
-    89836 tests in 3m37 in one thread on the current Julia.
-- **M11 — Point interpolation.** *(Done.)* `interpolate` and
-  `locate_point`, as specified under [Point
-  interpolation](#point-interpolation). Asked for by
-  TreeGeneralizedHarmonic, whose apparent-horizon provider carried a
-  stopgap — 3D, vertex-centered, host-only, `maxlevel` searches per
-  point — and listed it as its first upstream prerequisite; porting it
-  onto this is that package's next step. *Accept:*
-  - `locate_point` agreeing with exact rational leaf boxes (half-open,
-    the upper domain face to the last leaf, a periodic upper face to the
-    first) on random forests in `D = 1, 2, 3`, on the finest lattice as
-    well as at random;
-  - exactness on tensor polynomials of degree `n − 1`, value and every
-    first derivative, through three levels, at nodes, on block faces and
-    at the domain's corners, for `n = 2…6` in `D = 1, 2` and `n = 3, 4`
-    in `D = 3`, for cell, vertex and face centering; and at `G = 0` and
-    `G = 1`, where the stencil shifts;
-  - not exact one degree higher, and converging at rate `n` (value) and
-    `n − 1` (gradient);
-  - continuity inside a block on random data, across nodes and
-    midpoints;
-  - a point one period away agreeing to roundoff; beyond a reflecting
-    face the parity-signed mirror, gradients included, exactly for data
-    of definite parity, over six combinations of face kinds and
-    centerings;
-  - the ellipsoid test agreeing with enumeration bit for bit, and the
-    flags through `interpolate` agreeing with the stencils
-    `query_stencil` names;
-  - the kernel's value equal to the contraction, with exact rational
-    weights, of the block's own stored points over that stencil, on
-    random data;
-  - refusals with reasons; `Float32` and `Float32x2` exact and never
-    widened; device agreement with the host; a line in the thread
-    workload.
-
-  *(Measured 2026-09-25; `test/interpolate_tests.jl`, `bench/interpolate.jl`.)*
-  The design needed no amendment. Five things are worth recording.
-
-  - **Allocation and hidden arithmetic, audited.** For `Float64` and
-    `Float32` a batch allocates a fixed ~3 KB of host setup (the origins
-    and spacings vectors, the variable list) plus the 4-byte block index
-    per point, and nothing per point in the kernel; the kernel's LLVM
-    IR calls no `Rational`, `BigInt` or `BigFloat` code and no generic
-    dispatch. `Float32x2` did not pass at first: 535 bytes and 15 µs per
-    point, from `pointoffsets` (`storage.jl`) converting `1//2` through
-    `BigFloat` at run time — which every position-forming kernel in the
-    package shares, `fill_by_coordinates!` included. It is now `one(h) /
-    2`, the same value in every binary type, and `Float32x2` allocates
-    what `Float64` does; with the innermost closures marked `@inline` it
-    takes 12 µs per point, 14 times `Float64`, against 10.5 times for a
-    bare double-float multiply-add loop.
-
-  - **Rates.** A smooth 2D field, `N = 8 → 16`, over a three-level
-    mesh: value **2.96 / 3.20** at `n = 3` (cell / vertex), **3.97 /
-    4.08** at `n = 4`, **5.04 / 5.11** at `n = 5`; gradient **1.79 /
-    2.06**, **3.05 / 3.27** and **3.86 / 4.01**. The suite holds them to
-    `n − 0.4` and `n − 1.4`.
-  - **Cost against the stopgap** (`bench/interpolate.jl`,
-    `bench/symmetry_interpolate.sh`; the stopgap is a verbatim copy of
-    TreeGeneralizedHarmonic's core run on the same batches). The
-    horizon finder's workload: points in a shell through three levels,
-    20 variables, value and gradient, `Lagrange(4)`, vertex-centered with
-    `G = 2`, 176 leaves, a 249 MiB working array; best of 50 whole
-    `interpolate!` calls. On a Symmetry AMD EPYC 7532 node (64 cores, 8
-    NUMA domains, threads pinned), in ns per point:
-
-    | threads | 496 points | stopgap | 49600 points | stopgap |
-    |---|---|---|---|---|
-    | 1 | 2083 | 1926 | 2214 | 1904 |
-    | 8 | 356 | 312 | 267 | 258 |
-    | 16 | 256 | | 135 | |
-    | 64 | 288 | 643 | 42.1 | 43.9 |
-
-    So the finder's own batch takes **0.13–0.14 ms from 16 threads up**,
-    against the stopgap's 0.32 ms at 64; a large batch scales 53-fold
-    to 64 threads. Serially this is 8–16 % behind the stopgap on the
-    EPYC, and 25 % ahead on an Apple laptop (781 against 1042 ns): the
-    stopgap accumulates all 20 variables in one `SVector`, which AVX2
-    vectorizes across the variables, where this contracts one variable
-    at a time. Contracting the variables in static chunks is the
-    recorded way to close that if it ever matters; at eight threads the
-    gap is 3 %, and at 64 it has reversed. Three measured causes were
-    fixed on the way: a `Val` for the derivative multi-indices (run-time
-    ones made the selections dynamic tuple indexing, 21 % serially), the
-    closure boxing above, and a floor of 32 points per CPU task (the
-    496-point batch took 0.29 ms at 64 threads without it, 0.14 at 16).
-
-    **NUMA does not matter here.** A point is not owned by any thread,
-    so a query reads its block from wherever first touch put it — and
-    eight threads bound to one domain with their memory there run at
-    the pinned eight-thread rate (264 against 267 ns), and 64 pinned
-    threads beat `numactl --interleave=all` (42.1 against 49.7). A batch
-    touches too little of the array for remote reads to show.
-
-    `locate_point` is 113 ns per point on the laptop and 125 on the
-    EPYC, against 249 for the per-level descent. The allocation is a
-    fixed ~10–20 KB of host setup per batch plus four bytes per point,
-    against the stopgap's 890 bytes per point.
-  - **Suite cost.** 92054 tests in 4m35–4m54 at eight threads after M11,
-    against 4m49 for M10 (within the run-to-run noise at this length);
-    the new file takes about 20 s on its own, almost all of it
-    compiling one kernel per (dimension, order, centering) case, and
-    the thread-workload subprocesses about 2 s each. On Julia 1.10, in
-    one thread, 99962 tests in 3m10. The device suite passes on Metal
-    (`Float32`) and on an H200 (`bench/symmetry_gpu.sh`: 93348 tests,
-    `Float64` and `Float32`, in 10m09), the interpolation's agreement
-    with the host included.
-  - **On a device** (one H200, `bench/symmetry_interpolate.sh cuda`), the
-    same batches: 496 points in **0.26 ms** (`Float64`) and 0.28
-    (`Float32`), which is latency — the small uploads of the leaves and
-    the geometry, the launch, the on-device check for outside points,
-    the synchronization — and so no better than the node's 16 host
-    cores (0.12 ms). Large batches are throughput: **6.4 ns per point**
-    in `Float64` and 4.7 in `Float32` at 496000 points, against 178 on
-    the 16 cores. For a device-resident run the comparison that matters
-    is with the stopgap's `hostcopy` of the whole field set per find;
-    caching the uploads per forest generation would take the small
-    batch down further, and is not done. The host allocates a constant
-    17 KB per batch: the outside check is reduced on the device, so only
-    a batch with an outside point copies its block indices back (the
-    first version copied them always, 2 MB at 496000 points, and ran at
-    12.2 ns per point before the `Val` for the multi-indices).
-  - **Second derivatives** *(amended 2026-10-03)*. The check moved from
-    `|m| ≤ 1` to `|m| ≤ 2`, and the tests now claim: every second
-    derivative of a degree-`(n − 1)` tensor polynomial, through the same
-    three levels, centerings and `n` as the first, and at `G = 0` and
-    `1` where the stencil shifts — worst error 7.4e-12 against
-    8e-14 for first derivatives, the `h⁻²` the roundoff picks up, held
-    to 1e-9; the Hessian beyond a reflecting face in the six face and
-    centering cases; the kernel against the exact rational contraction
-    with the basis polynomials' exact derivatives (expanded, not the
-    package's series); `(2, 0)` and `(1, 1)` in `Float32` and
-    `Float32x2` (at most 1302 `eps(T)` of the value scale, held to
-    16384); `∂ₓ²` on a device against the host; the Hessian through
-    the in-process distributed path and `∂ₓ∂ᵧ`, `∂ᵧ²` in the MPI
-    workload; and the refusal moved to total order 3. `(1, 1)` through
-    `Lagrange(2)` is allowed, being first order along each dimension.
-    *Rates*, the same smooth 2D field, `N = 8 → 16`, cell / vertex:
-
-    | `n` | `p` | `∂ₓ²` | `∂ₓ∂ᵧ` |
-    |---|---|---|---|
-    | 3 | 4 | 0.90 / 0.86 | 1.74 / 1.76 |
-    | 4 | 4 | 1.71 / 2.08 | 3.09 / **2.14** |
-    | 4 | 6 | 2.01 / 2.08 | 3.09 / 2.80 |
-    | 5 | 6 | 2.99 / 2.93 | 3.80 / 3.85 |
-
-    The bold entry is the exchange's limit, `p − |m| = 2`, and is why the
-    rate is written with `p` in it: raising `p` to 6 gives `∂ₓ∂ᵧ` back
-    its `n − 1`. At `N = 16 → 32 → 64` the same case runs 1.69, 2.50
-    at `p = 4` and 3.05, 2.96 at `p = 6`, and the `n = 3, 5` rows do not
-    move with `p`, since `p − 2` does not limit them there. The suite
-    holds `∂ₓ²` to `n − 2.4` and `∂ₓ∂ᵧ` to `min(n − 1, p − 2) − 0.4`.
-    *Cost*: the interpolation file takes 35.4–36.0 s against 33.6–34.9
-    for the previous one on the same `src/` (two runs each, Julia
-    1.13), the extra `M = 2` kernels; the suite 110993 tests in 7m27 at
-    eight threads, against 110658 in 6m28 after M7 step 6b, which is
-    run-to-run noise at this length since the file accounts for 1 s of
-    it. The device test passes on Metal (`Float32`, `∂ₓ²` included).
-- **M9a — Checkpoint and restart.** *(Done.)* Done before M7
-  (decided): TreeHydro's long runs and TreeGeneralizedHarmonic's
-  production runs, estimated at 38–149 h, outlast any queue's day and
-  need to stop and resume before they need MPI, and
-  TreeGeneralizedHarmonic and TreeGRRMHD were waiting for M9.
-  Serial. A forest from a validated leaf list, and `save_checkpoint`,
-  `load_checkpoint`, `write_plain` / `read_plain` and
-  `checkpoint_environment` in the package extension `TreeAMRHDF5Ext`,
-  as specified under [Checkpoint and restart](#checkpoint-and-restart).
-  *Accept:*
-  - the forest from a leaf list: random refinement patterns round-trip,
-    checked against the oracles, and a gap, an overlap, a duplicate, an
-    unsorted list, an unbalanced list and a root out of range are each
-    refused with the reason;
-  - **the round trip is bitwise**, in `D = 1, 2, 3`, for cell, vertex,
-    face and edge centering, in `Float64`, `Float32` and `Float32x2`,
-    with periodic, reflecting (with parity) and outer faces: after
-    `scatter!` and `fill_ghosts!`, the leaves, the forest's parameters,
-    the field-set metadata, the state vector byte for byte and the
-    working arrays all equal the saved ones;
-  - **a restart continues bit-identically through regrids**: a chunked
-    driver saves after chunk `k`, drops every object, loads into fresh
-    ones and continues, and its leaves and state vector equal an
-    uninterrupted run's byte for byte. This is checked for the
-    vertex-centered wave study (`test/wave.jl`, RK4) and for the
-    conservative Burgers study (`test/burgers.jl`, `SSPRK33`, the
-    interface fixup), whose face flux sets with `G = 0` are not saved.
-    The time is part of the plain data;
-  - refusals, each saying why: a newer `format_version`, an unknown
-    feature, a `Float32x2` file loaded without `types`, a field set
-    over another forest, a value outside the plain-data types;
-  - an atomic write: a do-block that throws leaves the earlier file
-    intact and no `.partial` file behind;
-  - plain data round-tripped exactly (`Rational`s, `Symbol`s, nested
-    NamedTuples and Dicts, tuples, arrays, `nothing`,
-    `VersionNumber`s), and `checkpoint_environment` writing the
-    `Project.toml` and `Manifest.toml` that were stored;
-  - a device round trip in the device suite;
-  - **throughput measured** (`bench/checkpoint.jl`): save and load rates
-    and file sizes, uncompressed and with `Shuffle` + `Deflate(1)`, and
-    with zstd and bitshuffle where those packages are available, on a
-    smooth wave pulse and on a Burgers shock, recorded here with the
-    recommended filter chosen from them;
-  - TreeWave and TreeHydro still green against it, the change being
-    additive.
-
-  *(Measured 2026-09-29; `test/checkpoint_tests.jl`,
-  `bench/checkpoint.jl`.)* The design needed one amendment, the name a
-  limb type is recorded under (see "Element types" under
-  [Checkpoint and restart](#checkpoint-and-restart)); the
-  implementation fixed the spellings the design had left to it, and
-  chose `rename` over `mv(…; force = true)`, which on Julia 1.11 removes
-  the old file before the new one is in place. Four things are worth
-  recording.
-
-  - **Restarts are bit-identical, and the test would see it if they
-    were not.** Both studies continue byte for byte through regrids
-    after the restart point, and both fail on a one-ulp error in the
-    restored time, which was checked. The device round trip passes on
-    the CPU backend in the suite, and on Metal in `Float32` (the testset
-    run on its own).
-  - **Throughput** (the table and the reasons are under "Throughput and
-    filters" in [Checkpoint and restart](#checkpoint-and-restart)). On
-    the development laptop an unfiltered save reaches the page cache at
-    5–7 GB/s and stable storage at 3–5, and a load of the 540 MB state
-    runs at 3.6 GB/s on six threads, half of that time the HDF5 read. The
-    recommendation is no filter, and `Shuffle()` with `ZstdFilter(1)`
-    when size matters: 6.1-fold at 1.0 GB/s on a state that is mostly
-    atmosphere, and 1.3-fold on a smooth one.
-  - **Suite cost.** 93686 tests in 4m16 at one thread and 93738 in 4m47
-    at eight threads, against 92054 in 4m35–4m54 at eight after M11;
-    93686 in 3m48 on Julia 1.11.9 (with `sync`, 2026-09-29; 93677,
-    93729 and 93677 before it). `checkpoint_tests.jl` (541 tests) adds
-    about 30 s at one thread inside the suite, and takes about 57 s on
-    its own, most of it compilation.
-  - **The downstreams are green.** Against the M9a checkout, developed
-    into scratch copies, at one thread: TreeWave 310 tests in 1m12, and
-    TreeHydro 11893 in 4m16. Neither calls the new functions yet; each
-    gains them with `using HDF5` once a release carries them.
-- **M7 — MPI.** *(Done, 2026-10-02. Measured on Symmetry the same day:
-  the weak-scaling table of step 7 at up to four nodes and the H200 run
-  of step 8, both paths, pass. The checkpoint of step 6, measured on
-  four nodes the same day, lost data on BeeGFS until ROMIO's
-  read-modify-write was turned off, and was replaced the same day by
-  one without parallel I/O — part files per I/O process and an index
-  file, decided with Erik — which is step 6b, measured on one, two and
-  four nodes with every save verified and 1000 stress saves without
-  damage. Left open, as later work rather than as part of the
-  milestone: the items under "Performance work left for later" in
-  [Distributed meshes](#distributed-meshes) — the H200 re-measurement
-  of the staged regrid with the buffer pool, `interpolate!` at 32 ranks
-  under Open MPI, compression at the members under `io = :node`, the
-  pool's own rules, and what only many more ranks will show.)* Curve partitioning, distributed ghost exchange (for
-  every centering, and the interface restriction with it, since both are
-  transfers over the same schedule machinery), distributed regridding,
-  and the `Allreduce` inside `mesh_mapreduce` (the planned global
-  reduction under [Parallelism](#parallelism)), the one place a
-  communicator appears in a reduction. *(Amended 2026-10-01: the
-  reduction is an `allgather` of per-rank partials folded in rank
-  order, not an `Allreduce`, and parallel checkpoints are part of M7;
-  both are under [Distributed meshes](#distributed-meshes), which
-  specifies the milestone. Interpolation routing is added with them.)*
-  *Accept:* results match serial to roundoff — bit-identical for
-  everything but floating-point sums, as [Parallelism](#parallelism)
-  states; weak-scaling smoke test; then MPI+GPU with CUDA-aware MPI. In
-  steps, each ending green and committed, with what it measured recorded
-  here and in the commit body. Every step runs the full suite at one
-  thread and at eight, with the thread-independence digests byte for
-  byte, and from step 3 on the MPI tests with it:
-  - **Step 0 — specification.** *(Done, 2026-10-01.)*
-    [Distributed meshes](#distributed-meshes), after two feasibility
-    checks recorded there: the stock HDF5_jll is a parallel build and
-    works under `mpiexec` with MPICH_jll on Julia 1.11 and MPIABI_jll
-    on 1.13, and an `mpiexec -n 3` subprocess costs about a serial
-    workload and a quarter.
-  - **Step 1 — local blocks, no messages.** `communicator.jl`, the
-    forest's `comm` field and keyword, the split helper shared with
-    `threadchunks`, and `blockrange`. Every block-index site becomes
-    local: allocation, `blockkey` and the coordinate and fill origins in
-    `storage.jl`; `block_origins` and `block_spacings`; the schedule's
-    block count and `BoundaryPlan`; the block-count checks in
-    `ghosts.jl` and `interfaces.jl`; `combine_blocks` and the volume
-    loop in `state.jl`; `flag_blocks`, `regrid!`, the scratch forest and
-    `firing_boxes` in `regrid.jl`; and `interpolate.jl`. *Accept:* the
-    whole suite passes unchanged. New in-process tests, through a
-    test-only `PartitionCommunicator(rank, size)` that answers rank and
-    size and sends nothing, check the partition: the ranges tile
-    `1:nleaves` in order and differ in length by at most one, ranks
-    beyond `nleaves` are empty, and `blockkey` on every rank names the
-    leaf that rank owns. *(Done, 2026-10-01.)* What it settled, and
-    where it went beyond the plan:
-    - *The split.* `equalsplit(n, p, i)` in `threading.jl`, the closed
-      form of `threadchunks`' old loop, is the one helper:
-      `threadchunks` returns its parts, and `blockrange(forest)` is part
-      `commrank + 1` of `commsize`. The test compares it against the old
-      loop for every `n ≤ 40` and `p ≤ 9`, and `threadchunks` against it
-      at the suite's thread count.
-    - *The keyword.* `Forest(…; comm = nothing)`, and
-      `communicator(nothing)` is the `SerialCommunicator`, so the default
-      is spelled the same way the MPI case will be. A `Communicator`
-      subtype lacking a verb is refused at that verb by name, through a
-      fallback method on the abstract type, rather than with a
-      `MethodError` inside a reduction; that is what lets the test-only
-      communicator answer rank and size alone. The serial `isend` and
-      `irecv` refuse any peer, since a serial rank has none, and the
-      serial `waitall` accepts only an empty list.
-    - *The geometry per local block.* `block_origins(forest)` and
-      `block_spacings(forest)` take the forest, not a field set, and are
-      per local block through `blockrange`, so every kernel that reads
-      them is unchanged. Tree queries — `nleaves`, `find_leaf`,
-      `neighbor_keys`, `locate_point` — stay global, and `flag_blocks`
-      walks the local range and passes the local index.
-    - *The schedules build their local part* (amended: the plan had them
-      untouched until step 2). `GhostSchedule` and `InterfaceSchedule`
-      walk the rank's own targets in global leaf indices and then keep
-      the transfers with both ends on the rank, shifted to local
-      indices, together with the boundary regions of the rank's blocks.
-      That is step 2's *local* class already; the test checks it against
-      the serial schedule restricted to each rank's range, mirrored
-      transfers and three levels included, over 2 and 3 fake ranks.
-    - *What refuses a distributed forest until its step*: `fill_ghosts!`
-      and `restrict_interfaces!` (step 3), `regrid!` (step 4),
-      `interpolate` (step 5) and `save_checkpoint` (step 6), each with an
-      `ArgumentError` naming the step; a reduction is refused by the
-      missing `allgather` of a communicator that lacks one.
-    - *The reduction is already written* (amended: the plan put it in
-      step 3). `combine_blocks` gathers `(hasvalue, partial)` per rank
-      and folds the ranks that have a value, in rank order, as
-      "Reductions" above specifies — but at one rank it returns its own
-      fold without calling `allgather`, so the serial value is unchanged
-      by construction and a serial reduction keeps accepting a
-      non-`isbits` partial, which `allgather` refuses. The multi-rank
-      fold is first exercised by step 3's workload.
-    - *Empty ranks.* `launch_by_owner!` skips an empty `ndrange` on a
-      device too, `firing_boxes` returns an empty vector, and the
-      `AllVariables` fill returns before checking its callback at a
-      block that does not exist.
-    - *Docs.* The `docs/src/api/distributed.md` page that step 9 was to
-      add exists now, with `communicator`, `blockrange` and the internal
-      verbs, since Documenter refuses a docstring that is on no page.
-    - *Suite cost.* 98818 tests in 4m44 at one thread and 98870 in 4m51
-      at eight; the difference from M9a's 93686 and 93738 is exactly
-      `partition_tests.jl`'s 5132, so no existing test moved. The docs
-      build.
-  - **Step 2 — the distributed schedule.** The candidate remote targets,
-    the three classes, the sorted layouts, the stages, and the
-    packed-buffer accessors. *Accept,* in process, over 1–5 fake ranks,
-    in `D = 1, 2, 3`, with periodic, reflecting and outer faces, every
-    centering, three levels and the interface schedule:
-    - the union over ranks of the local, send and recv transfers
-      equals the serial schedule's transfer set exactly;
-    - rank `r`'s send layout to `s` equals `s`'s receive layout from
-      `r`;
-    - every target is written exactly once;
-    - a pack-then-unpack round trip, with every rank's buffers wired
-      directly in one process, reproduces the serial `fill_ghosts!`
-      bitwise, in `Float64`, `Float32` and `Float32x2`, including an
-      odd variable that is zero at a reflecting wall (the `−0` case).
-
-    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
-    plan:
-    - *The data structures.* `GhostSchedule` keeps `phase1`, `phase2`
-      and `levels`, which now hold the transfers *local* to the rank,
-      and gains `stages`, a vector of `ExchangeStage`s in tag order:
-      phase 1, then one per phase-2 target level. A stage holds its
-      `tag`, its local groups and a `remote` part, which is `nothing`
-      when the stage has no messages on this rank. Serially every stage
-      is `nothing`-remote and its local groups *are* the phase (the same
-      vector). `InterfaceSchedule` gains `stages` the same way, one per
-      face dimension. A `RemoteStage` holds, per direction, the peers
-      ascending with their segment lengths in points; one `LayoutEntry`
-      per buffer slot (peer, `GroupKey`, global target and source,
-      offset and size in points), kept on the host; the pack and unpack
-      groups; the slot offsets on the backend; and the buffers. A
-      `GroupKey` has an explicit total order (`keyorder`: kind ranked,
-      then direction, offset, level, mirror state), so a layout never
-      depends on `Dict` order.
-    - *The tags*: phase 1 is 1, the level-`ℓ` stage `2 + ℓ`, interface
-      dimension `d` is `40 + d`, and 50 is reserved for the regrid.
-      They ascend in the order the stages run.
-    - *The classification.* `split_received!` splits the transfers
-      found for the rank's own targets into local ones, which are
-      shifted to local indices, and received ones, kept global.
-      `sent_transfers` runs the builder's own search (`block_sources!`
-      or `interface_sources!`) for every candidate remote target,
-      `remote_neighbors` in `forest.jl`, and keeps those with a local
-      source. `leafowner` inverts the split in `O(1)`, through
-      `equalsplit_part` beside `equalsplit`. `remote_stage` builds one
-      stage's messages. It takes the target and source owners and
-      ranges separately, so that step 4's regrid stage — targets in the
-      new partition, sources in the old — is a call of it, and is not
-      built here.
-    - *Packs and unpacks.* A pack is the serial group's stencils with
-      every target range moved to start at 1, `targetblocks` the slots,
-      `sourceblocks` the local sources, sorted by (source, slot), and
-      no parity column. An unpack is a width-1, weight-1 group from the
-      slot into the serial target box, sorted by (target, slot), with
-      the parity column. On the CPU, `run_phase!` bisects
-      `sourceblocks` when the destination is a packed buffer, through
-      `ownerblocks` and `ownercount`; the device path is the per-group
-      one, unchanged.
-    - *The driver.* `run_stage!` runs the five steps through the
-      communicator verbs. `exchange_ghosts!` and `exchange_interfaces!`
-      are the bodies of `fill_ghosts!` and `restrict_interfaces!` after
-      their checks, and a serial fill now goes through them. The two
-      public functions still refuse a distributed forest, so step 3
-      removes the refusal and adds the MPI methods of the verbs.
-      `run_stage!` takes the forest rather than its communicator: the
-      `comm` field is abstractly typed, and passing it made every stage
-      of a serial fill a run-time dispatch of 48 bytes (measured, then
-      removed).
-    - *Tests*, in `test/exchange_tests.jl`. They cover 1–5 simulated
-      ranks (and `nleaves + 1` in 1D, which leaves a rank empty), `D =
-      1, 2, 3`, periodic, outer and reflecting faces, `faces_forest`'s
-      three levels, every centering, both operator families, and the
-      interface schedule over every centering with a face dimension.
-      They check the candidates against the serial schedule's readers.
-      They check the union of the local transfers and the matched
-      sent and received halves against the serial set, per stage, with
-      every slot consistent with its layout entry. They check both
-      ends' layouts entry by entry and the per-stage write counts
-      against the serial ones, at most one write per point. They run
-      the bitwise lockstep round trip, the boundary hook between the
-      stages included: `Float64` over every centering, `Float32` and
-      `Float32x2` over a subset, and the interface restriction in
-      `Float64` and `Float32x2`. Finally the staged driver itself runs
-      over an in-process mailbox communicator, one task per rank, in
-      `D = 2, 3` at 3 and 5 ranks, for the ghosts and the interfaces,
-      bitwise against serial. `gpu_tests.jl` runs the lockstep round
-      trip on every backend; on Metal (Float32) it passes, with the
-      rest of that file.
-    - *Serial cost* (`bench/ghosts.jl` at its defaults: `D = 3`,
-      `N = 8`, 4³ roots, 10 variables, order 4; best of 400 fills and 40
-      builds, HEAD before and after, alternated). The fill is unchanged
-      at one thread: 2.71–2.78 ms against 2.71–2.73 ms on the uniform
-      mesh, 11.8–14.5 ms against 12.0–15.0 ms on the two-level one, with
-      identical allocations (10912 and 97536 bytes). At four threads
-      the uniform fill measured 0.51–0.52 ms against 0.64–0.65 ms; the
-      cause was not traced. The schedule build is within noise,
-      0.40–0.43 ms against 0.41 ms and 3.0–3.3 ms against 3.0–3.2 ms.
-      It allocates 2.8 % more on the uniform mesh (389 KB against 379 KB)
-      and 3.1 % more on the two-level one (4.65 MB against 4.51 MB),
-      nearly all of it the per-key stencil memo below.
-    - *Distributed build cost* (one thread, `D = 3`, `N = 8`, `G = 2`,
-      order 4, the bench's two-level periodic mesh, slowest rank of `P`
-      fake ranks). At 120 leaves the serial build is 3.4 ms and a rank's
-      is 3.6, 3.1 and 2.6 ms at `P = 2`, 4 and 8. At 960 leaves (8³
-      roots) the serial build is 9.7 ms and a rank's 11.0, 9.2 and
-      7.3 ms. So at these sizes a rank's build costs about the serial
-      one, not `1/P` of it. A profile of one of the eight ranks at 960
-      leaves puts a third of the time in the search for the sent
-      transfers and another third in building the remote stages. At
-      120 blocks a rank, a 3D halo is about as many blocks as the
-      rank's own, so that is the `O(local + halo)` the spec predicts,
-      not a defect. It is a regrid-frequency cost, about 1,300–2,100
-      sent transfers a rank here. The host stencils are memoized per
-      group key, which the stage builder asks for again (10 % of the
-      rank build).
-    - *What was not done.* The regrid's stage, which is step 4, has
-      only its builder's interface, as above.
-    - *Suite cost.* 108338 tests at one thread, in 5m29 and 5m51 over
-      two runs, and 108390 at eight, in 5m35 and 5m54. The increase over
-      step 1's 98818 and 98870 is exactly the 9506 tests of
-      `exchange_tests.jl` and the 14 of the CPU entry of the new
-      `gpu_tests.jl` testset (7380 of the 9506 check the owner inverse),
-      so no existing test moved. The thread-independence digests are
-      unchanged. The new file takes about 50 s standalone, almost all of
-      it compilation of the `Float32` and `Float32x2` kernels and of the
-      3D centerings; that is most of the 45–65 s the suite grew by, and
-      what to trim first if the suite has to shrink. The docs build.
-  - **Step 3 — the MPI extension and the exchange.** `TreeAMRMPIExt`,
-    the staged `fill_ghosts!` and `restrict_interfaces!`, the
-    `combine_blocks` allgather, and the forest digest check; MPI in
-    `[weakdeps]` and `[extensions]`, and in `test/Project.toml`. A new
-    `test/mpi_workload.jl`, a standalone script like
-    `thread_workload.jl`, prints on rank 0 digests of the leaves and of
-    the state gathered in curve order, the integer and max reductions
-    exactly, and the sums to `%.17g`. A new `test/mpi_tests.jl` runs it
-    under `MPI.mpiexec()` at `-n 2` and `-n 3`. *Accept:* against a
-    serial run, every line byte-identical except the sum lines, which
-    agree to roundoff, over the vertex and cell waves, Burgers with the
-    fixup, a reflecting box, three levels, and a rank with no blocks;
-    the digest check refuses a forest mutated on one rank only, on
-    every rank; and what the subprocesses add to the suite is measured,
-    with the rank counts trimmed if it is large.
-
-    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
-    plan:
-    - *The extension.* `ext/TreeAMRMPIExt.jl` defines `MPICommunicator`
-      (the duplicate, with its rank and size read once) and one method
-      per verb, each a single MPI.jl call: `MPI.Allgather` of the
-      `isbits` value, `Allgatherv!` after a gather of the lengths,
-      `Alltoallv!` after an `Alltoall` of the counts, `Isend`, `Irecv!`
-      and `Waitall`. `communicator(::MPI.Comm)` refuses MPI not
-      initialized (or finalized), `COMM_NULL` and a thread level below
-      `THREAD_SERIALIZED`, each saying what to do; the duplicate and its
-      cache are as amended under "The communicator layer". A message
-      buffer must be an `Array` or a `UnitRange` view of one, which
-      MPI.jl passes as a pointer and a count: the exchange's per-peer
-      segments are exactly such views, and anything else is refused
-      rather than sent as a derived datatype. The fill and the
-      interface restriction lose their refusals and run through
-      `run_stage!` unchanged from step 2; the reduction needed nothing,
-      since step 1 had written it.
-    - *The digest*, in `forest.jl` (`ForestDigest`, `agree_on_forest`,
-      `digest_verdict`, `collective_checks`), as amended under "Every
-      forest mutation is collective": a fold over every leaf, the brick,
-      the layout, and a refusal flag, so that a refusal on some ranks is
-      raised on all. `GhostSchedule` and `InterfaceSchedule` run their
-      argument checks through `collective_checks`; `regrid!` will in
-      step 4. The in-process fakes of steps 1 and 2 answer the digest
-      gather alone, by replication — their ranks are copies of one
-      forest — so they still refuse every other verb they lack.
-    - *The workload.* `test/mpi_workload.jl` prints, on rank 0, lines
-      that do not depend on the rank count: per case the leaf count, the
-      maximum level and a digest of the leaves; the serial transfer
-      count, as the sum over ranks of local and received transfers, and
-      whether the totals sent and received agree; digests, gathered to
-      every rank in block order, of the working arrays *with their
-      ghosts* after a fill, of the state after the steps, and of the
-      working arrays after a last fill; and the reductions — a count,
-      `linf`, `min`, a `max` of negative data and a weighted `max` from a
-      non-neutral `init` exactly, the norm and the mass on `sum` lines.
-      The cases: the cell-centered wave in 1D on two periodic leaves,
-      which leaves a rank empty at `-n 3`, and on three levels against
-      outer faces; the vertex-centered wave in 2D on three levels with
-      the hook; the cell-centered wave in 3D, periodic, three levels; a
-      reflecting box in 2D, vertex-centered with walls at both ends
-      (the derived wall plane) and cell-centered with low walls, the
-      first variable odd across x₁; Burgers in 2D on three levels with
-      the fixup, the fluxes digested after it and mass conservation
-      asserted; and every centering through one fill and, where a
-      dimension is vertex-like, one interface restriction — cell,
-      vertex and both faces in 2D, vertex, a face and an edge in 3D —
-      over pseudo-random data that is a function of the global leaf and
-      the stored index, so that no stencil reproduces it by accident
-      and the injection at a vertex-like face is not a no-op. Lines
-      starting with `#` depend on the rank count and are checked on
-      their own: the refusals, the duplicate cache, `alltoallv` and
-      `allgatherv` with empty contributions, and the negative control.
-      Without the argument `mpi` the forests are serial.
-    - *The test.* `test/mpi_tests.jl` runs the serial reference in
-      process (the script in a module of its own, printing into a
-      buffer), then `MPI.mpiexec()` at `-n 2` and `-n 3`, one thread a
-      rank, with `Base.julia_cmd()` and the active project, under a
-      deadline, and compares: every line byte for byte except the `sum`
-      lines, within `rtol = 1e-12`. It checks the comparison itself on
-      the serial output (a flipped digest character is caught, a sum
-      moved by `10⁻⁹` is caught, one moved by three ulps is not). The
-      negative control rewrites one rank's received ghosts from its last
-      receive buffer with one value moved by an ulp, and asserts that
-      the gathered digest changes. The refusals are a `refine!` on rank
-      1 only (`GhostSchedule`) and on rank 0 only
-      (`InterfaceSchedule`), other operators on rank 1, and an argument
-      only rank 1's checks refuse; each is raised on every rank, and the
-      test asserts the reasons. In process, the verdict is tested on
-      digests of real forests, and a forest over `COMM_WORLD` in a
-      process without `MPI.Init` is refused.
-    - *The launcher's environment.* `MPI.mpiexec()` returns a `Cmd`
-      carrying an environment — the library paths of the MPI binary —
-      which interpolating it into a larger command drops. The test
-      launches `setenv(cmd, mpiexec().env)`.
-    - *What was measured.* At `-n 2`, `-n 3` and `-n 4` with one thread
-      a rank, and at `-n 3` with two, every line agrees with the serial
-      run byte for byte except the `sum` lines, which differ in the last
-      one or two digits of 17 where they differ at all (`l2`, `mass`;
-      Burgers' mass 16 against 15.999999999999998); at `-n 1` the output
-      is the serial output exactly. Each `mpiexec` run of the workload
-      takes 27–29 s of wall clock at any of these rank counts, and the
-      serial run 25 s, nearly all of it compilation. Inside the suite
-      `mpi_tests.jl` takes 58.4 s at one thread and 58.9 s at eight
-      (timed around its `include`): the serial reference in process,
-      which reuses the suite's compiled kernels, and the two `mpiexec`
-      runs. That is the minute "What an MPI test costs" predicted, so the
-      rank counts were not trimmed.
-    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 resolves
-      MPI.jl 0.20.27 with MPICH_jll (its global environment's preference),
-      against MPIABI_jll on 1.13.1 here, where the global v1.13
-      `LocalPreferences.toml` selects it; `Pkg.test` copies the merged
-      preferences of the load path into its sandbox (Pkg's
-      `Operations.jl`, read, not measured), so the suite's ranks run the
-      same binary as its `MPI.mpiexec()` either way. `mpi_tests.jl` alone
-      passes there (32 tests, 1m04), and so does the whole suite, 108376
-      tests in 5m08.
-    - *Suite cost.* 108376 tests at one thread, in 6m10 and 6m00 over
-      two runs, and 108428 at eight, in 6m01. The increase over step 2's
-      108338 and 108390 is 38: the 32 of `mpi_tests.jl` and the 16 of the
-      in-process verdict test, less a net 10 in the refusal assertions
-      steps 1 and 2 made of `fill_ghosts!` and `restrict_interfaces!`
-      over a distributed forest (11 removed, and one added: a fill over
-      a communicator that answers rank and size alone now stops at
-      `irecv`, by name). The thread-independence digests are
-      unchanged. The docs build.
-  - **Step 4 — the distributed regrid.** The flag gather, the transfer
-    stage with the repartitioning, and `adapt_to_initial_data!`.
-    *Accept:* the tracked pulse and the Burgers shock through regrid
-    cycles in the workload, with leaves and state byte-identical to
-    serial and mass conserved to roundoff across ranks; a regrid that
-    migrates blocks between ranks, and one that coarsens a block whose
-    children had different owners.
-
-    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
-    plan (the design decisions are recorded under "Regridding" in
-    [Distributed meshes](#distributed-meshes)):
-    - *The driver.* `regrid!` runs its checks through
-      `collective_checks`, gathers the canonical marks with one
-      `allgatherv`, completes them replicated, and per field set fills
-      the old mesh's ghosts (the distributed fill), zero-fills the new
-      local array and runs the regrid stage through `run_stage!` from
-      the old array into the new one, waiting for its sends before the
-      next field set; then `rebuild_leaves!`. `fs => nothing`
-      reallocates to the new local count, `transfer = false` moves
-      nothing, and "nothing changed" returns `false` on every rank,
-      since every rank decides it from the same gathered marks. The
-      step-1 refusal is gone; `adapt_to_initial_data!`, `firing_boxes`
-      and `total_mass` needed no change.
-    - *The workload.* `test/mpi_workload.jl` gains the tracked pulse (a
-      right-moving Gaussian, vertex-centered, outer faces with the hook,
-      flagged through `firing_boxes` with a buffer, three regrids with
-      RK4 steps between), Burgers' shock through three regrids with the
-      fixup (conservative operators, the fluxes `=> nothing`; mass
-      conserved across each regrid and the run, and on `sum` lines),
-      `adapt_to_initial_data!` from a single leaf with the host callback
-      and with a `firing_boxes` flag vector (two of three ranks start
-      empty at `-n 3`), and a case that refines the first blocks of a
-      uniform mesh and coarsens them back, and refines three of four
-      roots and coarsens them back, over three field sets at once (cell,
-      `nvars = 2`, `G = 2`, order 4; vertex, `nvars = 1`, `G = 1`,
-      order 2; a face, `nvars = 3`, `G = 2`, order 4), then a regrid
-      that changes nothing. The second half runs again in `Float32` and
-      `Float32x2` over the cell-centered set, so both types cross MPI in
-      the regrid stage and the exchange. After each regrid the leaves
-      and every moved field set's array, ghosts zero, are digested
-      before any fill, so the transfer itself is compared bit for bit.
-      `#` lines count the blocks that moved up and down the ranks and
-      the coarsened blocks whose children had more than one owner, and
-      the test asserts at each rank count that both directions and the
-      straddling case occur. Four more refusals: a bad flag box on rank
-      1, a flag vector of the wrong length on rank 0, another `buffer`
-      on rank 1, and a forest refined on rank 1, each refused on every
-      rank, the forest untouched by the first three.
-    - *In process*, `test/regrid_exchange_tests.jl`. The lockstep test
-      builds the regrid stage of every simulated rank, packs from its
-      slice of the old array, delivers every segment, runs the local
-      groups and unpacks, and requires the result bit for bit equal to
-      the serial `regrid!` on every rank's new blocks; the union of the
-      local and received transfers equal to the serial transfer set;
-      both ends' layouts entry for entry; and every sent transfer naming
-      its source's old owner and its target's new one. It covers `D =
-      1, 2, 3`, every centering, the periodic, outer and reflecting
-      faces of `exchange_tests.jl`, PointValue and Conservative, 1–5
-      ranks and one more than the leaves in 1D (empty ranks), and, in
-      3D, 7 ranks, which is the first count at which a coarsened group
-      of that mesh straddles a rank boundary; `Float32` and `Float32x2`
-      over a 2D subset. Then `regrid!` and `adapt_to_initial_data!`
-      themselves run with one task per rank over a communicator whose
-      collectives are rendezvous between the tasks and whose messages
-      go through step 2's mailbox: two field sets and a flux `=> nothing`
-      with mixed bare and boxed flags and a buffer, in 2D and 3D at 3
-      and 5 ranks, bitwise against serial, and `transfer = false`; both
-      criterion forms from a single leaf at 3 ranks, with the serial
-      passes and data; and the refusals.
-    - *Measured.* The workload at `-n 2`, `3` and `4` with one thread a
-      rank, and at `-n 3` with two, prints the serial lines byte for
-      byte except the `sum` lines, which differ in the last one or two
-      of 17 digits where they differ (`l2`; Burgers' mass 16 against
-      15.999999999999998 and 16.000000000000004); 39–42 s of wall clock
-      per run, against 27–29 s in step 3. Blocks moved up and down at
-      every rank count (the uniform mesh: 3, 6 and 5 up on the refine,
-      as many down on the coarsen, at 2, 3 and 4 ranks), and 1, 2 and
-      2 coarsened blocks had children of more than one owner.
-    - *Serial cost* (a scratch script, best of 15: `D = 3`, `N = 16`,
-      the 4³-root mesh of `bench/threads.jl` with its middle refined, a
-      field set of 2 variables, `G = 2`, order 4, and a face-centered
-      flux `=> nothing`, refining a slab of 128 blocks and coarsening it
-      back; HEAD before and after, alternated). At one thread the
-      refine took 37.1–38.4 ms before and 37.2–38.3 ms after, the
-      coarsening 23.2–23.7 against 23.4–23.7; at four threads the
-      refine 12.6–13.2 ms against 12.7–14.3 and the coarsening 7.4–7.9
-      against 7.5–7.9. On a host-heavier mesh (`N = 6`, 8³ roots, 1856
-      leaves after the refine) 26.3–27.0 ms against 26.4–27.2 and
-      28.2–28.3 against 28.0–30.7. A regrid allocates 0.1–0.8 % more
-      (38.55 MB against 38.50, 34.86 against 34.57): the marks and the
-      layout hash. `bench/ghosts.jl`'s fill is unchanged, 2.57–2.59 ms
-      against 2.57–2.58 and 11.45–11.46 against 11.48, with 16 and 32
-      bytes less allocated per fill.
-    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
-      `partition_tests.jl`, `exchange_tests.jl`,
-      `regrid_exchange_tests.jl`, `regrid_tests.jl` and `mpi_tests.jl`
-      (2m38 together); the whole suite was not run there.
-    - *Suite cost.* 108827 tests at one thread in 6m57 (7m02 in a
-      second run, timed by file) and 108879 at eight in 6m57: 451 more
-      than step 3 at each — the 430 of `regrid_exchange_tests.jl`, 22
-      more in `mpi_tests.jl`, and one fewer in `partition_tests.jl`,
-      whose two regrid refusals became one. `mpi_tests.jl` now takes
-      96.6 s inside the suite, against step 3's 58.4 s, and
-      `regrid_exchange_tests.jl` 12.4 s: about 50 s more in all. The
-      `Float32x2` and `Float32` workload cases cost about 2 s each per
-      run and the three-field-set case the most compilation; those are
-      what to trim first. The thread-independence digests are
-      unchanged. The docs build.
-  - **Step 5 — interpolation routing.** *Accept:* an interpolation line
-    in the workload, bit-identical to serial; a rank that passes no
-    points; and an outside point refused on every rank with the same
-    reason. *(Amended in step 5: every rank refuses together, but a rank
-    that passed an outside point names its own, and the others name the
-    first rank's; see "Point interpolation" in
-    [Distributed meshes](#distributed-meshes).)*
-
-    *(Done, 2026-10-01.)* What it settled, and where it went beyond the
-    plan (the design decisions are recorded under "Point interpolation"
-    in [Distributed meshes](#distributed-meshes)):
-    - *The driver.* `interpolate!` over a distributed forest goes to
-      `interpolate_distributed!` in `interpolate.jl`: the serial
-      argument checks, factored into `check_interpolation`, run inside
-      one agreed gather together with the cheap forest check, a hash of
-      the arguments that must agree and the rank's first outside point;
-      then the host location, the route by a stable counting sort and
-      `alltoallv`, the kernel over the received points through
-      `launch_interpolation!` — the serial launch, factored out, with
-      the block offset — and the return of the values, and of the flags
-      when there is a region, into the caller's order. `interpolate`
-      itself defers a refusal of `derivs` to `interpolate!` over a
-      distributed forest, so that it too is agreed. The step-1 refusal
-      is gone; `refuse_distributed` now serves only the checkpoint.
-    - *In process*, `test/interpolate_exchange_tests.jl`, over
-      `regrid_exchange_tests.jl`'s rendezvous communicator, which gains
-      an `alltoallv`. Every simulated rank queries an uneven slice of
-      one point list — rank 1 none — and must reproduce its part of the
-      serial `interpolate` bit for bit: value and gradient of two
-      variables in reverse order with an excluded ball, the value alone
-      of every variable without a region, and `interpolate!` into
-      caller-supplied outputs from points given as vectors. The points
-      run beyond periodic dimensions and reflecting walls, sit on every
-      leaf's lower corner (so on every rank boundary) and on the
-      domain's corners, over random data in every stored point. The
-      cases are `D = 1` with a reflecting wall at 2 and 3 ranks and
-      periodic at `nleaves + 2` ranks (two of them without blocks);
-      `D = 2` reflecting at both ends and periodic, vertex-centered, at
-      3 ranks, outer and cell-centered at 5, and a face-centered
-      `Float32` set at 3; `D = 3` with a reflecting, an outer and a
-      periodic dimension at 4. The refusals at 3 ranks: an outside
-      point on rank 1 (its message and the others'), outside points on
-      ranks 0 and 2 with rank 1 passing none, `derivs` only rank 0's
-      checks refuse, `vars` and `exclude` that differ on one rank, and
-      a forest refined on one rank.
-    - *The workload.* `test/mpi_workload.jl` gains a 2D case, periodic
-      in x₁, reflecting below in x₂ and outer above, three levels and an
-      odd variable, over pseudo-random data with the ghosts filled:
-      every rank asks for its own uneven slice (rank 1 none) of 301
-      points running half a period and half a domain beyond the faces,
-      and rank 0 digests the gathered answers, which are then in
-      global order — value and gradient of two variables with an
-      excluded ellipse and its flags in `Float64`, the value alone in
-      `Float64` and `Float32x2`. A `#` line refuses an outside point on
-      rank 1, and `mpi_tests.jl` asserts it is refused on every rank
-      with rank 0 naming rank 1's point.
-    - *Measured.* The workload at `-n 2`, `3` and `4`, one thread a
-      rank, prints the serial lines byte for byte except the `sum`
-      lines, which differ in the last one or two of 17 digits where they
-      differ, as in step 4; the five interpolation lines are
-      byte-identical at every rank count. 44–47 s of wall clock per
-      run, against 39–42 s in step 4, the serial run 38 s. On Metal, a
-      scratch script found the device path bitwise equal to the serial
-      Metal call (the device bullet under "Point interpolation" in
-      [Distributed meshes](#distributed-meshes)); it is not in the suite.
-    - *Serial cost* (`bench/interpolate.jl` with `N = 8`, 4³ roots and
-      176 leaves, 20 variables, value and gradient with an excluded
-      ball, best of 200 calls; HEAD before and after, alternated, four
-      runs each). At one thread the 496-point batch took 0.353–0.368 ms
-      before and 0.363–0.370 ms after, 4960 points 3.61–3.66 ms against
-      3.64–3.71 ms; at four threads 0.109–0.114 ms against
-      0.110–0.114 ms and 0.981–0.998 ms against 0.979–0.992 ms. That is
-      within the run-to-run spread. A call allocates 32 bytes more at
-      one thread (10320 against 10288) and 96 more at four (13232
-      against 13136), the block offset in the kernel's arguments.
-    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes `interpolate_tests.jl`, `partition_tests.jl`,
-      `exchange_tests.jl`, `regrid_exchange_tests.jl`,
-      `interpolate_exchange_tests.jl` and `mpi_tests.jl` (3m06
-      together); the whole suite was not run there.
-    - *Suite cost.* 109038 tests at one thread in 7m49 and 109090 at
-      eight in 8m09: 211 more than step 4 at each — the 204 of
-      `interpolate_exchange_tests.jl` and 7 more in `mpi_tests.jl`;
-      `partition_tests.jl`'s interpolation refusal became a refusal by
-      verb, one test for one. The thread-independence digests are
-      unchanged. The docs build. The step-4 tree, run the same day on
-      the same machine, took 7m02 at one thread, so the suite grew by
-      about 47 s; of that the new tests account for about 24 s when run
-      standalone — `interpolate_exchange_tests.jl` 13.5 s, nearly all of
-      it compilation, and `mpi_tests.jl` 125 s against the step-4 tree's
-      114 s — and the rest was not separated from the run-to-run spread.
-      The `Float32` and 3D cases of the new file are what to trim first.
-  - **Step 6 — parallel checkpoints.** `TreeAMRHDF5MPIExt` and the hooks
-    in `TreeAMRHDF5Ext`. *Accept:* save at `-n 3`, then load at `-n 2`,
-    at `-n 1` and serially, each continuation byte-identical to the
-    uninterrupted run; a serial file loaded at `-n 3`; a rank with no
-    blocks; plain data that differ between ranks refused on every rank;
-    `MPI_File_sync` confirmed under the collective flush; and
-    `bench/checkpoint.jl` run under MPI on Symmetry, with the shared
-    file's throughput recorded on its parallel file system — the
-    benchmark "Parallel I/O and M7" asked for. The per-process files
-    are revisited only if the shared file does not hold up.
-
-    *(Done, 2026-10-01; measured on Symmetry on 2026-10-02, on one node
-    and then on two and four, where the shared file lost data until
-    ROMIO's read-modify-write was turned off, which with its rate led to
-    the decision to replace it; see the last items.)*
-    What it settled, and where it went beyond the
-    plan (the design decisions are recorded under "Parallel checkpoints"
-    in [Distributed meshes](#distributed-meshes)):
-    - *The code.* `ext/TreeAMRHDF5MPIExt.jl` (`[extensions]`
-      `TreeAMRHDF5MPIExt = ["HDF5", "MPI"]`) opens the shared file;
-      `TreeAMRHDF5Ext` gains the `Access` hooks (`open_file`,
-      `write_whole`, `write_slab` / `read_slab`, `put_value`,
-      `agree_values`, `flush_ranks`, `publish`), the agreement
-      (`agreed`), the plain-data walk (`plain_hash`) and the
-      fixed-length string arrays; `src/` gains the stubs `librarycomm`
-      and `open_parallel_file`, `load_checkpoint`'s `comm` keyword, and
-      the docstrings' collective contract. `refuse_distributed` is gone,
-      its last caller with it.
-    - *The serial file is unchanged but for `nranks`.* A scratch script
-      wrote the same checkpoint — two field sets, `Float64` with parity
-      and a `Float32x2` vertex set, a reflecting face, every kind of
-      plain data and a do-block `write_plain` — with HEAD before the step
-      and after it, unfiltered and with `Shuffle` + `Deflate(1)`; `h5dump`
-      of the two files differs in `created` and the new `nranks = 1`
-      only, and `h5dump -p` also in the storage offsets, which the 8-byte
-      dataset shifts.
-    - *The workload.* `test/mpi_workload.jl` gains `checkpoint_case`:
-      the tracked pulse as a chunked driver (RK4 steps, the flags and a
-      regrid per chunk), run uninterrupted for three chunks, then saved
-      after the first — the bare `name => fs` form, plain data with a
-      Rational and an array of strings including an empty one —
-      unfiltered and with `Shuffle` + `Deflate(1)`, dropped, loaded at
-      the same rank count and continued; the mesh refines again after
-      the save (39 leaves, then 87). Its lines must be the serial
-      run's, and the continued digests the uninterrupted run's. A 1D
-      forest of two leaves is saved and loaded too, which at three ranks
-      leaves one rank without blocks both times. `checkpoint_cross` then
-      loads every file the earlier runs wrote at another rank count, at
-      this one and, under MPI, a second time over `MPI.COMM_SELF`, on
-      `#` lines. `mpi_tests.jl` runs the serial reference, `-n 3` and
-      `-n 2` (in that order now) over one `TREEAMR_CHECKPOINT_DIR`, then
-      the serial loads in process: so the serial file loads at 3 ranks
-      and at one; the 3-rank files at 2, at one inside the 2-rank job
-      (a one-rank MPI communicator — what a separate `mpiexec -n 1`
-      would test, without a third launch) and serially; the 2-rank files
-      serially. Every load reproduces the saved digests and every
-      continuation the uninterrupted ones. The refusals, at every rank
-      count: plain data that differ between ranks; an `application` only
-      rank 1 refuses; filters that differ on rank 1; a `write_plain` in
-      the do-block of a value that differs, after which the earlier file
-      is intact and no partial file is left; a load whose `fieldsets`
-      differ on rank 1; a load of a missing file, which rank 0 alone
-      looks for. Each is raised on every rank.
-    - *In process*: `checkpoint_tests.jl` passes unchanged but for two
-      deliberate assertions, `nranks == 1` and a file without `nranks`
-      reading as 1; `partition_tests.jl`'s save over the test-only
-      communicator now stops at its missing `allgather`, by name, like
-      the interpolation.
-    - *Measured by hand.* The workload at `-n 2`, `3` and `4`, one thread
-      a rank, prints the serial lines byte for byte except the `sum`
-      lines, which agree to roundoff, as in step 5; every cross load at
-      every count reproduces the digests. 53–57 s of wall clock per run,
-      against 44–47 s in step 5, and the serial run 44 s, against 38;
-      most of the difference is compiling HDF5.jl's paths in each rank.
-      `mpi_tests.jl` alone takes 2m34, against step 5's 125 s.
-    - *Throughput, locally only* (`bench/checkpoint.jl`, now runnable
-      under `mpiexec` with the argument `mpi`; the development laptop of
-      "Throughput and filters", its internal SSD, one thread a rank,
-      MPICH_jll 5.0.2, the same day and the same in-use conditions).
-      GB/s of state, aggregate over the ranks, the slowest rank's time;
-      `-n 1` is the serial path over a one-rank communicator:
-
-      | data | filter | serial | `-n 1` | `-n 2` | `-n 4` |
-      |---|---|---|---|---|---|
-      | blast, save | none | 7.49 | 7.50 | 6.66 | 6.90 |
-      | blast, sync | none | 4.58 | 4.66 | 4.52 | 4.47 |
-      | blast, load | none | 1.24 | 1.28 | 2.28 | 3.89 |
-      | blast, save | `Shuffle` + `Deflate(1)` | 0.34 | 0.34 | 0.67 | 0.92 |
-      | blast, load | `Shuffle` + `Deflate(1)` | 0.51 | 0.51 | 0.96 | 1.57 |
-      | pulse, save | none | 5.66 | 7.46 | 6.51 | 4.55 |
-      | pulse, load | none | 1.20 | 1.21 | 2.03 | 3.09 |
-      | pulse, save | `Shuffle` + `Deflate(1)` | 0.11 | 0.11 | 0.21 | 0.38 |
-      | pulse, save | bitshuffle + LZ4 | 0.62 | 0.62 | 1.12 | 1.80 |
-
-      So on one SSD the unfiltered save stays at the page cache's rate
-      and the flush at the drive's whatever the rank count, while what
-      is per rank — compression, the load's allocation, first touch and
-      `scatter!` — divides among the ranks: the filtered save 2.7 times
-      faster at 4 ranks, the unfiltered load 3.1 times. This is the
-      point "Compression is serial" made, that under M7 a filter
-      parallelizes. File sizes are the serial ones (90.0 MB for blast
-      with Deflate). H5Zzstd and H5Zlz4 were not in the environment, so
-      their rows are missing; H5Zbitshuffle was, from the default
-      environment. One run each; the M9a table varied by 15–60 % run to
-      run on this machine. These are not the parallel file system's
-      numbers, which are the point of the measurement.
-    - *`MPI_File_sync`* is confirmed by reading libhdf5 2.2.0's and
-      MPICH 5.0's sources (the chain is under "Parallel checkpoints"),
-      not by tracing a run: the call is made, but no test here can see
-      a write reach stable storage, and macOS's `fsync` does not.
-    - *Symmetry, one node only* (measured 2026-10-02, job 567854 on
-      cn106, AMD EPYC 7543, 64 cores, 8 NUMA domains; Julia 1.13.1,
-      MPICH_jll 5.0.2 through `srun --mpi=pmi2`, HDF5_jll's MPICH build
-      of libhdf5 2.2.0 with `HDF5.has_parallel()`; the files on BeeGFS
-      under `/mnt/beegfs/eschnetter/claude`; `bench/symmetry_checkpoint_mpi.sh`
-      as amended in the step's script commit, `TREEAMR_BENCH_REPS = 3`,
-      `64 / P` threads a rank, ranks in blocks so that 8 are one per
-      domain). GB/s of state, aggregate, the slowest rank's time, save
-      (`sync = false`) / sync / load; the default mesh, 3296 blocks,
-      216 MB of `pulse` and 540 MB of `blast`; `-n 1` is the serial
-      path over a one-rank communicator:
-
-      | data | filter | `-n 1` | `-n 2` | `-n 4` | `-n 8` |
-      |---|---|---|---|---|---|
-      | blast | none | 1.53 / 1.60 / 1.52 | 1.56 / 1.26 / 2.82 | 1.44 / 0.96 / 4.03 | 1.37 / 0.84 / 4.56 |
-      | blast | `Shuffle` + `Deflate(1)` | 0.22 / 0.22 / 0.42 | 0.40 / 0.38 / 0.70 | 0.52 / 0.52 / 1.40 | 0.81 / 0.77 / 2.51 |
-      | blast | shuffle + zstd(1) | 0.64 / 0.64 / 0.70 | 0.89 / 0.85 / 1.02 | 1.18 / 1.01 / 2.50 | 1.46 / 1.28 / 3.83 |
-      | blast | bitshuffle + zstd(1) | 0.51 / 0.51 / 0.68 | 0.77 / 0.74 / 1.28 | 1.01 / 0.96 / 2.41 | 1.15 / 1.06 / 3.65 |
-      | pulse | none | 1.26 / 1.34 / 1.20 | 1.35 / 1.11 / 2.31 | 1.34 / 0.90 / 2.36 | 1.15 / 0.77 / 3.27 |
-      | pulse | `Shuffle` + `Deflate(1)` | 0.07 / 0.07 / 0.19 | 0.12 / 0.12 / 0.45 | 0.19 / 0.18 / 0.74 | 0.25 / 0.23 / 1.33 |
-      | pulse | shuffle + zstd(1) | 0.30 / 0.30 / 0.42 | 0.35 / 0.34 / 1.05 | 0.42 / 0.36 / 1.79 | 0.42 / 0.34 / 2.43 |
-
-      File sizes are the serial ones (blast 89.9 MB with Deflate, 87.9
-      with zstd(1); pulse 161–164 MB). The mesh with 6³ → 12³ roots has
-      12648 blocks (the refinement follows a surface, so 3.8 times the
-      blocks, not 8; 829 MB of pulse and 2.07 GB of blast): at `-n 1`
-      pulse unfiltered 1.25 / 1.48 / 1.35, blast zstd(1) 0.62 / 0.63 /
-      0.69; at `-n 2` pulse unfiltered 1.48 / 1.32 / 2.55, blast
-      unfiltered 1.48 / 1.13 / 2.96 — the default mesh's rates, so the
-      table is not a small-file effect. What it shows:
-      1. **An unfiltered save from one node is 1.2–1.6 GB/s at every
-         rank count**, and the flush costs more with more ranks (blast
-         sync 1.60 → 0.84 GB/s from 1 to 8), every rank's
-         `MPI_File_sync` being a BeeGFS client round trip. One node's
-         client, or the servers, set that rate; which, only the
-         multi-node run can say.
-      2. **A filter parallelizes**, as "Compression is serial"
-         predicted: blast with zstd(1) saves at 1.46 GB/s at 8 ranks,
-         2.3 times its one-rank rate and about the unfiltered rate,
-         for a file 6.1 times smaller; Deflate 3.7 times faster. Pulse,
-         whose data compress to 1.3 only, gains less (zstd(1) 1.4
-         times).
-      3. **The load scales** (blast unfiltered 1.52 → 4.56 GB/s), but it
-         reads a file the node just wrote, so this is the client's
-         cache and the per-rank allocation and `scatter!`, not BeeGFS's
-         read rate.
-      4. Collective metadata reads were not needed at these counts.
-
-      The log of 567854 was copied later and is complete; the larger
-      mesh at `-n 4` and `-n 8`, which the table above lacked, is pulse
-      unfiltered 1.28 / 0.94 / 3.41 and 1.43 / 0.89 / 4.24, blast
-      unfiltered 1.57 / 1.08 / 4.82 and 1.63 / 0.90 / 5.64.
-    - **The multi-node run lost data** (job 567855, 2026-10-02: cn092–095,
-      8 ranks a node, `TREEAMR_CKPT_ONENODE = 0`). Every setting at 2
-      nodes on both meshes and at 4 nodes on the default one, and at 4
-      nodes on the larger mesh through shuffle + zstd(3), loaded back; then a load of blast with
-      shuffle + LZ4 on the larger mesh was refused on every rank by the
-      forest: leaves 5538 and 5539 "out of curve order", the second a
-      key with coordinates `(0, 0, 0)`. The last file was still on
-      BeeGFS and was read serially on another node (job 567907,
-      `bench/checkpoint_inspect.jl`): `root`, `level` and all 63240
-      chunks of `data` were intact, and in `coords` exactly the 395
-      rows of rank 14 (on cn093) were zero, bytes [160993, 165733) of
-      the file. Every reader agreeing, the damage was in the file, not
-      in a read. `bench/checkpoint_layout.jl` showed the trigger: HDF5
-      had put the first 9 chunks of `data` (rank 0's first two blocks)
-      at [6672, 8110), in free space before the leaf columns at
-      [31309, 246325), and the rest from 250501 on, so rank 0's file
-      view for its chunks spanned the columns. ROMIO reported its
-      generic driver (`romio_filesystem_type` "UFS"), `romio_cb_write`
-      and `romio_ds_write` "automatic", and the BeeGFS client
-      `tuneFileCacheType = buffered` (512 KiB a file),
-      `tuneUseGlobalFileLocks = false`, `tuneRemoteFSync = true`; the
-      file was striped over 4 targets on 2 servers in 512 KiB chunks.
-      The mechanism this points to is under "Parallel checkpoints" in
-      [Distributed meshes](#distributed-meshes); here is what tested it.
-    - *The reproducers* (`bench/checkpoint_stress.jl`, run by
-      `bench/symmetry_checkpoint_stress.sh`; four nodes, 32 ranks,
-      MPICH_jll 5.0.2, files on BeeGFS unless marked; a save is damaged
-      when either of two serial readers on different nodes finds a row
-      that is not what was written). The 12648-leaf partition of the
-      failing run, at 4³ cells a block:
-
-      | layer | case | damaged | jobs |
-      |---|---|---|---|
-      | `save_checkpoint`, Shuffle + Deflate(1) | as in 0e71c75 | 12 / 200; 13 / 200 with `sync` | 567917 (and 567915) |
-      | | `romio_ds_write` off (hint file) | 0 / 200 | 567917 |
-      | | `romio_ds_write` and `romio_cb_write` off | 0 / 200 | 567917 |
-      | | with the fix (the hints in the code) | 0 / 1000 | 567930 |
-      | `save_checkpoint`, unfiltered | as in 0e71c75 | 0 / 200; 0 / 200 with `sync` | 567915 |
-      | | with the fix | 0 / 300 | 567930 |
-      | HDF5 alone, contiguous hyperslabs | defaults | 0 / 200 | 567915 |
-      | MPI-IO, the checkpoint's pattern, independent | defaults | 1 / 200; 3 / 2000 | 567917, 567930 |
-      | | data sieving off | 0 / 200; 0 / 2000 | 567917, 567930 |
-      | MPI-IO, the same, collective | defaults (falls back to independent) | 0 / 200; 0 / 200 with sync-barrier-sync | 567917 |
-      | | collective buffering forced on | 151 / 200; 176 / 200 | 567917, 567930 |
-      | | the same, data sieving off | 147 / 200 | 567917 |
-      | | both off | 0 / 200 | 567930 |
-      | MPI-IO, adjacent unaligned ranges | `write_at_all`; `write_at` | 0 / 200; 0 / 200 | 567915, 567917 |
-      | POSIX `pwrite`, adjacent unaligned ranges | — | 0 / 200 | 567915 |
-      | POSIX, a rank's write read by the next rank after a barrier | — | unseen 5 / 300, always across nodes; file after close intact | 567958 |
-      | NFS `/home`: MPI-IO pattern, independent; collective buffering on | defaults | 0 / 1000; 0 / 200 | 567959 |
-      | NFS: MPI-IO adjacent ranges; POSIX `pwrite`s | — | 0 / 200; 98 / 200, whole pages | 567959 |
-
-      Under data sieving the loss was always one or more whole slabs
-      of ranks on cn093–cn095 (31 damaged saves, ranks 9 to 30), never
-      of ranks 1–7, which share rank 0's node; under collective buffering,
-      whole aggregator file domains. Under the old rate, 0 damaged in
-      1000 has a probability of about e⁻⁶⁰. The collective MPI-IO case
-      with defaults saw no damage either way, so it says nothing about
-      sync-barrier-sync. What was not done: a trace of individual
-      writes, a cross-node `fcntl` lock test, a run with
-      `tuneUseGlobalFileLocks = true` (root only), and any Open MPI run
-      — HDF5_jll's Open MPI build failed to load HPC-X's library (job
-      567937), and the pure MPI-IO runs under OMPIO were cancelled when
-      the shared file was dropped.
-    - *Measured with the fix* (job 567938, cn092–095, the same day,
-      `TREEAMR_BENCH_REPS = 3`; every save now checked by a load, 8 a
-      setting, all of which passed): GB/s save / sync / load, as above.
-
-      | data | filter | 2 nodes, 16 ranks | 4 nodes, 32 ranks |
-      |---|---|---|---|
-      | blast | none | 1.69 / 0.92 / 5.45 | 1.72 / 0.93 / 6.10 |
-      | blast | `Shuffle` + `Deflate(1)` | 0.76 / 0.74 / 2.94 | 1.18 / 1.05 / 3.94 |
-      | blast | shuffle + zstd(1) | 1.29 / 1.16 / 4.27 | 1.79 / 1.57 / 4.76 |
-      | blast | bitshuffle + zstd(1) | 1.22 / 1.03 / 4.28 | 1.68 / 1.34 / 4.68 |
-      | pulse | none | 1.33 / 0.81 / 2.84 | 1.38 / 0.81 / 3.00 |
-      | pulse | `Shuffle` + `Deflate(1)` | 0.38 / 0.35 / 1.62 | 0.56 / 0.48 / 1.85 |
-      | pulse | shuffle + zstd(1) | 0.64 / 0.49 / 2.56 | 0.89 / 0.62 / 2.43 |
-
-      The larger mesh: at 2 nodes pulse unfiltered 2.00 / 0.88 / 5.13,
-      blast unfiltered 1.85 / 1.13 / 7.90, blast zstd(1) 1.26 / 1.06 /
-      5.21; at 4 nodes 1.72 / 1.05 / 5.49, 1.98 / 0.95 / 9.18 and 1.95 /
-      1.58 / 8.23. One node with the fix (job 567939, which overlapped
-      the cost measurement below on the same file system, on cn112): at `-n 8` blast unfiltered
-      1.47 / 0.94 / 3.82 and zstd(1) 0.80 / 0.72 / 2.96, against 1.37 /
-      0.84 / 4.56 and 1.46 / 1.28 / 3.83 without (567854); `-n 1`, the
-      serial path, which the hints do not touch, unchanged (blast
-      zstd(1) 0.64).
-    - *The hints' cost* (job 567964, 2 nodes, 16 ranks, alternating with
-      and without them in a scratch copy, two rounds, at the same time
-      as 567939): blast zstd(1) 1.40 and 1.40 GB/s with, 1.88 without;
-      shuffle + LZ4 1.37 and 1.40 against 2.08; Deflate(1) 0.95 and 0.91
-      against 1.16 and 1.15; blast unfiltered 1.73 and 1.79 against 1.68
-      and 1.84; pulse unchanged, unfiltered and filtered. With the
-      hints data sieving is replaced by one write a chunk (ROMIO's
-      "naive" strided path, `ad_write_str_naive.c`), and blast's chunks
-      compress to about 5 KB. Without the hints both rounds were
-      refused by the checksums, on every rank — round 1 at
-      bitshuffle + LZ4, round 2 at shuffle + zstd(1) — which is the
-      checksums catching the original loss in the benchmark itself.
-    - *What it says about the shared file.* An unfiltered save is 1.3–2.0
-      GB/s at one, two and four nodes alike, so its rate is that of one
-      file, presumably its four storage targets, and not of the
-      clients; a filter parallelizes up to that rate (blast zstd(1)
-      1.95 GB/s at 32 ranks on the larger mesh); a load of a file just
-      written reaches 9 GB/s at 32 ranks. Whether the shared file's
-      rate grows with nodes past one node's was the question; it does
-      not, and with the losses that settles it: **the shared file is to be replaced** by files per I/O
-      process (decided 2026-10-02 with Erik; see "Parallel
-      checkpoints"). The checksums, the self-checking benchmark and the
-      reproducers carry over to the replacement.
-    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
-      `partition_tests.jl`, `checkpoint_tests.jl` and `mpi_tests.jl`
-      (2m53 together), the parallel checkpoints and every cross load
-      included; the whole suite was not run there.
-    - *Suite cost.* 109107 tests at one thread in 8m10 and 109159 at
-      eight in 8m02, against step 5's 109038 in 7m49 and 109090 in 8m09:
-      69 more at each — 67 in `mpi_tests.jl` (the checkpoint lines, the
-      cross loads at each rank count and in process, the refusals, and
-      the extension's presence) and the two `nranks` assertions of
-      `checkpoint_tests.jl`. `mpi_tests.jl` takes about 28 s more than in
-      step 5 standalone (2m34 against 125 s), which is the HDF5 code
-      compiled in each `mpiexec` run and the in-process loads; at one
-      thread the suite grew by about 20 s. The thread-independence
-      digests are unchanged. The docs build.
-  - **Step 6b — checkpoints without parallel I/O.** The design under
-    "Checkpoints without parallel I/O" in
-    [Distributed meshes](#distributed-meshes), decided 2026-10-02 with
-    Erik, replacing step 6's shared file: I/O groups and the `io`
-    keyword, part files and an index (format version 2, the reader
-    reading 1 and 2), the verbs `commnodes` and `bcast`, and the removal
-    of `TreeAMRHDF5MPIExt`. *Accept:* serially, the single file with its
-    inline part round-trips as before, and version-1 files written by
-    the old writer (fixtures committed under `test/fixtures/`) still
-    load; under MPI, saves at `-n 3` with `io = :all`, `io = 1` (or
-    `:node` on one node) and an `io` between, loaded at `-n 2`, at one
-    rank and serially, each continuation byte-identical, and the
-    version-1 fixtures loaded at every rank count; refused on every
-    rank: a part from another save, a block damaged in a part, a missing
-    part; orphans removed and nothing else; an I/O process failing
-    mid-save, after which the previous checkpoint loads and no new part
-    is left; and no file opened by more than one process, by a test hook
-    that records every open. Then `bench/checkpoint.jl` under MPI with
-    `io = :node` and `io = :all` on one, two and four nodes of Symmetry,
-    on BeeGFS, every save verified, compared with step 6's shared file;
-    and the stress reproducer's `save_checkpoint` modes on four nodes,
-    hundreds of verified saves, with no damage.
-
-    *(Done, 2026-10-02.)* What it settled (the design decisions made
-    while implementing are under "Checkpoints without parallel I/O" in
-    [Distributed meshes](#distributed-meshes)):
-    - *The code.* `ext/TreeAMRHDF5MPIExt.jl` and its `[extensions]` entry
-      are gone, with `open_parallel_file`, `librarycomm` and the hints;
-      `src/communicator.jl` gains `bcast` and `commnodes`, each with a
-      serial method and an MPI one; `TreeAMRHDF5Ext` replaces the
-      `Access` hooks with the I/O plan (`io_plan`, `groupblocks`), the
-      gathering (`send_blocks`, `write_blocks!`), the index
-      (`write_index!`), the cleanup (`previous_parts`, `remove_stale`),
-      the image (`share_index`, `index_image`) and the scattering
-      (`part_readers`, `open_part`, `read_blocks!`), with `agree_errors`
-      after every step that runs on some ranks only.
-    - *The tests.* `checkpoint_tests.jl` checks the single version-2
-      file (its part inside the index, the part table, the save id), a
-      damaged block, a block whose checksum was recomputed with it
-      (refused by the index's checksum of the part's checksums), the
-      required checksums, an I/O process failing after its first write
-      (a test hook, `FAIL_PART`), the NUL refusal, and two version-1
-      fixtures written by the step-6 writer (`test/fixtures/`, 42 KB
-      together; generated without an active project, so that they hold
-      no environment texts). `mpi_workload.jl` saves the chunked pulse
-      run with `io = :all`, `io = 2` and `:node` (one part on one node),
-      with messages cut at 4 KiB by the hook `MAX_MESSAGE`, so that a
-      rank's blocks travel in several; continues from each at the same
-      rank count; loads the version-1 fixtures, on lines that must be
-      the serial run's; and refuses on every rank a block damaged in
-      the last part, a part from another save copied over one of this
-      save's, and a missing part. It checks that a save removes an
-      orphan and the previous save's parts and nothing else, that an
-      I/O process failing mid-save fails the save on every rank and
-      leaves the previous checkpoint loadable with no new part and no
-      partial index, and that no file is opened by two processes in a
-      save with two I/O groups or in a load (a hook, `OPEN_LOG`,
-      records every open on every rank). `mpi_tests.jl` loads every
-      file at the other rank counts, at one rank and serially, as
-      before, now for the three files, and follows the external links
-      of the three-rank `io = :all` index into its parts with HDF5.jl,
-      as a tool would.
-    - *Checked by hand.* TreeAMR 0.1.4, from the registry, refuses a
-      version-2 file with its format-version refusal, saying it was
-      written by a newer TreeAMR. Julia 1.11.9, in the manifest-free
-      copy, passes `partition_tests.jl`, `checkpoint_tests.jl` and
-      `mpi_tests.jl`, 5899 tests in 2m48.
-    - *Suite cost.* 110606 tests at one thread in 6m32 and 110658 at
-      eight in 6m28, against 110525 in 7m16 at one thread at 67c9153 the
-      same day: 81 more, in `checkpoint_tests.jl` (593 tests, 1m08 on
-      its own), `mpi_tests.jl` (173, 1m07 on its own) and
-      `partition_tests.jl`. The thread-independence digests are
-      unchanged. The docs build.
-    - *Measured on Symmetry* (2026-10-02: AMD EPYC 7543 nodes, 8 ranks a
-      node at 8 threads, one per NUMA domain; Julia 1.13.1, MPICH_jll
-      5.0.2 through `srun --mpi=pmi2`, libhdf5 2.2.0 used serially; files
-      on BeeGFS, then 91 % full; `bench/symmetry_checkpoint_mpi.sh`,
-      `TREEAMR_BENCH_REPS = 3`, every save verified by a load). GB/s of
-      state, save (`sync = false`) / sync / load, aggregate, the slowest
-      rank's time; the default mesh, 3296 blocks, 216 MB of `pulse` and
-      540 MB of `blast`; the parts in parentheses. `:all` is from jobs
-      568075 (two and four nodes, cn095 and cn102–104) and 568077 (one
-      node, cn084), `:node` from their repetition after the amendment
-      to the gathering, 568119 (cn107) and 568120 (cn093–096); the last
-      column is step 6's shared file on four nodes, with the hints
-      (567938):
-
-      | data | filter | 1 node, `:node` (1) | 1 node, `:all` (8) | 2 nodes, `:node` (2) | 2 nodes, `:all` (16) | 4 nodes, `:node` (4) | 4 nodes, `:all` (32) | shared, 4 nodes |
-      |---|---|---|---|---|---|---|---|---|
-      | blast | none | 0.77 / 0.71 / 0.99 | 2.45 / 4.16 / 4.64 | 1.28 / 1.34 / 1.58 | 2.55 / 2.59 / 6.78 | 2.22 / 2.17 / 3.18 | 2.70 / 2.37 / 8.24 | 1.72 / 0.93 / 6.10 |
-      | blast | `Shuffle` + `Deflate(1)` | 0.20 / 0.20 / 0.39 | 0.94 / 0.94 / 1.94 | 0.32 / 0.32 / 0.73 | 1.45 / 1.46 / 3.66 | 0.57 / 0.57 / 1.26 | 1.94 / 1.92 / 4.99 | 1.18 / 1.05 / 3.94 |
-      | blast | shuffle + zstd(1) | 0.49 / 0.48 / 0.59 | 2.96 / 2.88 / 2.77 | 0.72 / 0.73 / 1.07 | 3.49 / 3.60 / 5.36 | 1.45 / 1.46 / 2.00 | 4.50 / 4.32 / 7.46 | 1.79 / 1.57 / 4.76 |
-      | blast | bitshuffle + zstd(1) | 0.39 / 0.39 / 0.53 | 2.40 / 2.42 / 2.65 | 0.60 / 0.60 / 1.00 | 2.92 / 2.92 / 5.15 | 1.23 / 1.21 / 1.81 | 3.93 / 3.80 / 6.95 | 1.68 / 1.34 / 4.68 |
-      | pulse | none | 0.71 / 0.67 / 0.78 | 1.72 / 2.13 / 3.11 | 1.18 / 1.16 / 1.08 | 2.07 / 1.63 / 4.33 | 1.76 / 1.76 / 2.29 | 1.62 / 2.08 / 4.33 | 1.38 / 0.81 / 3.00 |
-      | pulse | `Shuffle` + `Deflate(1)` | 0.06 / 0.06 / 0.19 | 0.38 / 0.38 / 0.99 | 0.12 / 0.12 / 0.36 | 0.46 / 0.45 / 1.98 | 0.24 / 0.24 / 0.63 | 0.55 / 0.55 / 2.94 | 0.56 / 0.48 / 1.85 |
-      | pulse | shuffle + zstd(1) | 0.25 / 0.25 / 0.35 | 1.53 / 1.57 / 1.80 | 0.45 / 0.46 / 0.66 | 1.40 / 1.45 / 3.14 | 0.83 / 0.85 / 1.07 | 1.51 / 1.44 / 3.95 | 0.89 / 0.62 / 2.43 |
-
-      The larger mesh (12648 blocks, 829 MB of pulse and 2.07 GB of
-      blast), blast unfiltered: 1.37 / 1.35 / 1.69 and 3.47 / 3.06 /
-      9.07 at two nodes with `:node` and `:all`, 2.01 / 2.02 / 3.66 and
-      2.92 / 2.99 / 12.46 at four, against the shared file's 1.85 / 1.13
-      / 7.90 and 1.98 / 0.95 / 9.18; blast with zstd(1) 0.76 / 0.75 /
-      0.99 and 4.20 / 4.14 / 5.88 at two, 1.19 / 1.19 / 1.82 and 5.60 /
-      5.25 / 10.60 at four, against 1.26 / 1.06 / 5.21 and 1.95 / 1.58 /
-      8.23; pulse unfiltered 1.13 / 1.15 / 1.63 and 3.17 / 3.02 / 6.35 at
-      two, 2.24 / 2.38 / 3.11 and 2.70 / 2.57 / 8.02 at four. On one
-      node the shared file had saved blast at 1.47 / 0.94 / 3.82 and
-      with zstd(1) at 0.80 / 0.72 / 2.96 (567939, 8 ranks). What it
-      shows:
-      1. **A part per rank (`io = :all`) is the fastest setting
-         measured, everywhere.** Unfiltered it saves at 1.2–1.9 times
-         the shared file's rate, and its flush to stable storage costs
-         nothing measurable (sync ≈ save, where the shared file's
-         per-rank `MPI_File_sync` cost 40–55 % of the rate); a filter
-         parallelizes over the ranks (blast with zstd(1) at 4.50 GB/s on
-         four nodes, 5.60 on the larger mesh, 2.5 and 2.9 times the
-         shared file); and the load reaches 4–12 GB/s. The unfiltered
-         save does not grow from two nodes to four (2.55 → 2.70 GB/s,
-         3.47 → 2.92 on the larger mesh), so at about 3 GB/s it is the
-         file system's rate for these writes, not the clients'.
-      2. **A part per node (`io = :node`, the default) grows with the
-         nodes** — blast unfiltered 0.77, 1.28 and 2.22 GB/s on one, two
-         and four nodes — at 0.5–0.8 GB/s per I/O process. On one node
-         that is half the shared file's rate; on four, it is above it
-         unfiltered (2.22 against 1.72, and 2.17 against 0.93 synced)
-         and below it filtered (1.45 against 1.79 with zstd(1)), since
-         one process per node runs the node's compression, serially (see
-         "Compression where the data are" under "Performance work left
-         for later"). A load with one part per node is read by one rank
-         per node, 0.8–3.7 GB/s.
-      3. **The amendment to the gathering made no measurable
-         difference** (568119/568120 against 568075/568077, the `:node`
-         runs of the same jobs: blast unfiltered 0.77 against 0.80 on
-         one node, 1.28 against 1.36 on two, 2.22 against 2.76 on four,
-         inside this file system's run-to-run spread). It is kept for the
-         memory it bounds — two 64 MiB buffers on an I/O process instead
-         of two the size of a member's share — but the guess that
-         motivated it was wrong. What is consistent with the numbers,
-         and not traced: MPICH makes no progress on a posted receive
-         while the process is inside HDF5 (it has no asynchronous
-         progress by default), so the transfer from the members —
-         2.7–2.8 GB/s for 1–64 MiB between two ranks of one node,
-         `pingpong` job 568132 — and the write add up rather than
-         overlap. A write task on another thread while the calling task
-         waits in MPI, or MPICH's asynchronous progress, would test it.
-      4. **Every save was verified**, by a load that compared the leaves
-         and the state bit for bit on every rank and verified every
-         checksum: none failed, against both rounds of step 6's
-         measurement without the hints.
-    - *The stress reproducer on four nodes* (job 568076, cn093–096, 32
-      ranks, the 12648-leaf partition of step 6's failure at `4³` cells
-      a block, every save loaded serially and compared by a reader on
-      cn093 and then one on cn096): shuffle + `Deflate(1)` with `io =
-      :node`, 400 saves; the same with `io = :all` and `sync = true`, 300
-      saves; unfiltered with `:node`, 300 saves: **0 damaged in 1000**,
-      in 10m30. Step 6's shared file lost 12 of 200 filtered saves of
-      this mesh (567917); at that rate 0 in the 700 filtered saves here
-      has a probability of about e⁻⁴³.
-    - *What was not done.* An Open MPI run (nothing in the package needs
-      MPI-IO any more, so its OMPIO question is moot for checkpoints);
-      a cold-cache load; more than four nodes, where the metadata cost
-      of `:all`'s file per rank is the open question; and a trace of
-      where an I/O process's time goes.
-  - **Step 7 — weak-scaling smoke test.** `bench/mpi.jl` holds the
-    blocks per rank fixed and times the RHS, the ghost fill, a regrid
-    and the norm; `bench/symmetry_mpi.sh` runs one rank per NUMA domain
-    at eight threads, on one, two and four nodes, with the system MPI
-    through MPIPreferences. *Accept:* the table recorded here, with
-    what limits it named, the replicated regrid bookkeeping and the
-    overlap of the exchange with the local groups among them.
-
-    *(Done, 2026-10-02: built and run locally, then on Symmetry at up to
-    four nodes, 32 ranks; the table and what limits it are the
-    "Symmetry" items below.)* What it settled:
-    - *The benchmark.* `bench/mpi.jl` (under `mpiexec` with the
-      argument `mpi`, in the test environment) builds a mesh of `TILES`
-      identical tiles of `ROOTS^D` roots stacked along `x_D`, periodic,
-      `TILES` the rank count unless set. The roots are numbered with
-      `x_D` slowest and every tile has the same leaves, so the
-      equal-count split gives rank `r` exactly tile `r`: the blocks per
-      rank are fixed by construction, and the halo per rank is constant
-      from three ranks on. Two tiles: *two-level*, the leaves with `x₁`
-      in the lower half and `x_D` in the upper half of the tile refined
-      once (176 blocks at `ROOTS = 4` in 3D), so a coarse-fine face
-      crosses every rank boundary and phase 1, the prolongation stage
-      and the interface restriction all carry messages; and *uniform*
-      (64 blocks), copies only. Timed in synchronized windows — an
-      `MPI.Barrier`, the call, the slowest rank's time by `allgather` —
-      as the minimum and the median over the repetitions: the wave RHS
-      (`scatter!` → `fill_ghosts!` → `map_blocks!`), the fill alone and
-      its three parts run separately through the internals (the stages'
-      local groups, the packs, the unpacks), `scatter!`, the norm, a
-      `mesh_mapreduce` max, `restrict_interfaces!` on a set
-      face-centered along `x_D`, `interpolate!` of 1000 points a rank
-      spread over the whole domain, the two schedule builds, a regrid
-      that refines the lowest layer of roots of tile 0 — the start of
-      the curve, so every later rank's range shifts and blocks migrate
-      — and one that coarsens it back, and the triad. `#` lines give per
-      rank, as min/mean/max, the messages, bytes, transfers and peers of
-      a fill and of an interface restriction (read from the stages),
-      the blocks a regrid made a rank take from another, and ns per cell
-      of the whole job. `TREEAMR_BENCH_BACKEND` and
-      `TREEAMR_BENCH_DEVICEAWARE` choose a device and its message path,
-      `TREEAMR_BENCH_TILES` the mesh of a `P`-rank run for a serial
-      control, `TREEAMR_BENCH_LABEL` the column name. The tab-separated
-      lines carry the minimum *and* the median, so `bench/scan.sh`'s
-      awk does not read them; `bench/mpitable.awk` is the matching
-      parser (efficiency against the first run, then both times) and
-      `bench/mpiscan.sh P…` launches each count through
-      `MPI.mpiexec()` and prints the table.
-    - *Laptop smoke run, not a scaling result* (Apple M3 Pro, 6
-      performance and 6 efficiency cores, one memory system; MPIABI_jll
-      through the global preference; `D = 3`, `N = 16`, `ROOTS = 4`, 2
-      variables, `G = 2`, order 4, Float64, 10 windows; `bench/mpiscan.sh
-      1 2 4`, one thread a rank). Minimum ms, two-level mesh, with the
-      weak-scaling efficiency `t(1)/t(P)`:
-
-      | phase | 1 rank | 2 ranks | 4 ranks | eff. 2 | eff. 4 |
-      |---|---|---|---|---|---|
-      | rhs | 16.65 | 20.12 | 22.56 | 0.83 | 0.74 |
-      | fill_ghosts | 10.22 | 14.00 | 16.38 | 0.73 | 0.62 |
-      | — its local groups | 9.91 | 11.43 | 14.16 | | |
-      | — its packs | – | 1.63 | 1.68 | | |
-      | — its unpacks | – | 0.29 | 0.30 | | |
-      | scatter | 2.56 | 2.61 | 2.69 | 0.98 | 0.95 |
-      | norm | 6.15 | 6.25 | 6.46 | 0.98 | 0.95 |
-      | interfaces | 0.025 | 0.046 | 0.073 | | |
-      | interpolate (1000 pts/rank) | 0.148 | 0.272 | 0.396 | 0.54 | 0.37 |
-      | ghost_schedule | 3.82 | 6.30 | 6.57 | 0.61 | 0.58 |
-      | interface_schedule | 0.13 | 1.23 | 1.35 | | |
-      | regrid, refine | 46.0 | 57.4 | 65.5 | 0.80 | 0.70 |
-      | regrid, coarsen | 30.4 | 45.5 | 44.7 | 0.67 | 0.68 |
-      | triad reference | 0.61 | 1.22 | 2.20 | 0.50 | 0.28 |
-
-      A fill sends, per rank, 2 messages at 2 ranks and 3 at 4 (phase 1
-      to both neighbours, the prolongation stage to one), 717 KB each way
-      in both cases, 560 transfers sent and 560 received against 4224
-      local (4784 serially); the interface restriction one message of
-      32 KB, 32 transfers. The uniform mesh: one stage, 410 KB, 288
-      transfers; its rhs 3.26 / 4.25 / 4.56 ms, fill 1.19 / 1.70 / 2.51,
-      build 0.40 / 1.20 / 1.26, refine 32.2 / 39.1 / 46.1. The refine
-      makes ranks take 0/28/56 blocks from another (min/mean/max) at 2
-      ranks and 0/42/84 at 4, the coarsening as many. At two threads a
-      rank the two-level rhs is 8.72 / 11.53 / 22.47 ms (efficiency 0.76
-      and 0.39) — eight threads on this machine reach its efficiency
-      cores, and the window is the slowest rank's.
-    - *What limits it here, named.* (1) **Memory bandwidth is shared**:
-      the triad's aggregate is about 120 GB/s at any rank count, one
-      core nearly saturates it, and so the per-rank triad halves with
-      each doubling. Whatever streams memory cannot weak-scale on this
-      machine, and the local groups of the fill do not (9.9 → 14.2 ms
-      for *fewer* transfers); only the phases bound by one core's
-      arithmetic do (`scatter`, the norm, 0.95). That is the reason the
-      numbers are not a scaling result. (2) **The sender computes**: the
-      packs are 1.6–1.7 ms, about a tenth of the fill. They are the
-      halo's copies, restrictions and prolongations, evaluated into the
-      send buffer rather than into ghosts, and the unpacks (0.3 ms) are
-      the extra pass that copies them into place. (3) **The overlap**: the fill less its local groups, packs
-      and unpacks is 0.7 ms at 2 ranks and 0.2 ms at 4, so over shared
-      memory almost nothing of the messages is left unhidden behind the
-      local groups; between nodes is what Symmetry will show. (4)
-      **Per-call collectives on small work**: an interpolation of 1000
-      points a rank costs an `allgather` and four `alltoallv`, 0.40 ms
-      at 4 ranks against 0.06 ms in one 4-thread process over the same
-      4-tile mesh (`TREEAMR_BENCH_TILES=4`); there the rhs and fill were
-      within 5 % of the 4-rank run (22.1 against 22.7 ms, 15.9 against
-      16.8), the schedule build 3.9 against 6.7 ms, the interface
-      schedule 0.14 against 1.35 ms and the refine 48.8 against 65.4 ms.
-      The interface schedule's growth is `remote_neighbors`, which
-      searches all `3^D − 1` directions of every local leaf (about 1 ms
-      here) for a builder that needs only faces, and which each
-      schedule build repeats.
-    - *Does the schedule build stay flat with `P`?* Yes. Step 2's
-      finding — a rank's build costs about the serial one at 120 blocks
-      a rank — was strong scaling: the halo is as large as the local
-      part, so the build does not shrink with `P`. At a *fixed* number
-      of blocks per rank it does not grow either. `bench/replicated.jl`
-      simulates rank `P÷2` of `P` in one process, over a communicator
-      that answers the digest gather by replication, hands `regrid!` the
-      global marks and makes every message a no-op, over this tile mesh
-      (176 blocks a rank, `N = 16`); best of 3–5, ms, at one thread and
-      at four:
-
-      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
-      |---|---|---|---|---|
-      | digest, fold over every leaf | 0.024 | 0.15 | 1.14 | 2.27 |
-      | `GhostSchedule` on the rank, 1 thread | 6.3 | 6.7 | 8.1 | 9.1 |
-      | the same, 4 threads | 4.3 | 4.4 | 5.6 | 6.8 |
-      | `remote_neighbors`, 1 thread | 1.04 | 1.19 | 1.29 | 1.34 |
-      | `complete_marks`, the slab, no buffer | 0.025 | 0.13 | 1.01 | 1.90 |
-      | `balance!` alone | 0.005 | 0.033 | 0.26 | 0.52 |
-      | `regrid_sources`, 1 thread | 0.17 | 1.27 | 12.1 | 29.0 |
-      | the same, 4 threads | 0.17 | 1.01 | 8.7 | 19.4 |
-      | `split_regrid` | 0.015 | 0.026 | 0.11 | 0.21 |
-      | `complete_marks`, every block a `(Keep, box)` source, buffer 4, 1 thread | 8.2 | 74 | 672 | 1407 |
-      | the same, 4 threads | 2.3 | 21 | 204 | 436 |
-      | `regrid!` on the rank, refine, 1 thread | 21.7 | 21.9 | 51.7 | 67.2 |
-      | `regrid!` on the rank, refine, 4 threads | 11.4 | 12.7 | 17.7 | 44.0 |
-      | marks gathered per rank and regrid | 0.05 MB | 0.36 MB | 2.9 MB | 5.8 MB |
-
-      Over 128 times the leaves the rank's build grows by 2.8 ms at one
-      thread, 2.2 ms of it the digest, the rest the `log n` of the
-      searches; so it is weak-scaling-flat, and the digest is the only
-      `O(nleaves)` part of it (13 ns a leaf, single-threaded, folded up
-      to three times per generation: `regrid!`, each `GhostSchedule`,
-      each `InterfaceSchedule`). The `regrid!` times are noisy, the
-      garbage collector's share included; a profile of one rank at 90112
-      leaves (one thread, 20 regrids, 29 ms each) put 38 % in
-      `regrid_sources`, 25 % in the fill before the transfer, 22 % in
-      allocating and zeroing the new array (local, first touch), 7 % in
-      `complete_marks` and
-      7 % in the transfer stage.
-    - *The replicated regrid bookkeeping, and what to do about it*
-      (proposed here, and the first two implemented the same day; what
-      was done, and measured, is the next item). Two passes become the
-      regrid's cost long before the forest's memory does:
-      1. **The buffer's recruit search** in `buffered_flags`, about
-         5.8–7.8 µs per source leaf at one thread and 1.6–2.4 at four,
-         over every source of the whole forest on every rank. With
-         every block a source it overtakes the whole local regrid
-         between 1408 and 11264 leaves (8.2 and 74 ms against 22) and
-         is 13 times it at 90112 (672 against 52); at 32 ranks
-         of 176 blocks (four Symmetry nodes) it would be some 35–40 ms
-         at one thread, by the 1408- and 11264-leaf points, against a
-         local regrid of 11–22 ms — an extrapolation, not measured
-         there. The share of sources is the share of blocks whose
-         criterion fired (`firing_boxes`), so a run with a wide feature
-         pays it. *Remedy:* the recruits of a source are found from the
-         tree alone, so each rank can search for its own sources only
-         and gather the `(leaf, level)` pairs beside the marks; applying
-         them only raises a mark to `Refine` below a level or lifts a
-         `Coarsen` at or below one, which does not depend on their
-         order, so the result is bit for bit the replicated one, at
-         `O(local sources)` per rank and one `allgatherv` of the pairs.
-      2. **`regrid_sources`** classifies every new leaf on every rank,
-         with a `Dict` of every old leaf and a vector per new one: 12 ms
-         at 90112 leaves, 29 ms at 180224, 38 % of a rank's regrid at
-         512 ranks. *Remedy:* a rank needs only the new leaves it will
-         own and those whose sources it owns now. Refinement and
-         coarsening keep the curve order, so the second set is one
-         contiguous range of new indices, found by two binary searches
-         over the new leaves at the keys of the rank's first and last
-         old leaf, and an old leaf is found by `searchsortedfirst`
-         instead of the `Dict`: `O(local · log n)`. The layouts are
-         sorted explicitly (`stage_layout`), so restricting the list
-         changes no message.
-      3. Smaller and left as they are: the digest (cache its leaf fold
-         per generation if it ever shows; 1.1 ms at 90112 leaves is
-         14 % of a build), `complete_marks`' own passes and `balance!`
-         (1–2 ms at 10⁵ leaves, replicated in AMReX and Parthenon too),
-         and the marks' `allgatherv`, 32 bytes a leaf to every rank,
-         which a gather of the marks that are not a bare `Keep` would
-         shrink when it matters.
-    - *What was done about it* (2026-10-02, after the measurement; the
-      results are unchanged, bit for bit):
-      1. **The recruits.** `buffered_flags` is now two passes, both
-         internal: `buffer_recruits`, the neighbour search over a run of
-         sources, which returns `Recruit(leaf, level)` pairs in source
-         order, and `apply_recruits!`, the serial rewrite of the marks.
-         The public function runs both over every leaf, as before.
-         `regrid!` runs `regrid_marks` instead: each rank searches from
-         its own sources, reduces its recruits with
-         `strongest_recruits`, gathers them in a second `allgatherv`,
-         and applies the union to the gathered marks; then the
-         completion, which is `complete_marks` after the buffer
-         (`completed_leaves`). Serially nothing is gathered and the
-         recruits are applied as found, which is `buffered_flags`.
-         *Why the order does not matter*, checked against the code
-         rather than assumed: the rewrite is two statements per recruit
-         `(j, L)` at a leaf of level `l` — a `Coarsen` with `l ≤ L`
-         becomes `Keep`, then anything with `l < L` becomes `Refine`.
-         `Refine` is never undone, and a `Keep` made from `Coarsen` is
-         only ever raised to `Refine`. So a leaf ends as `Refine` if any
-         recruit asks it for more than its level, as `Keep` if it was
-         `Coarsen` and some recruit asks for its level exactly, and as
-         it was otherwise: a function of its own reported mark and of
-         the largest level asked of it, whatever the order of the
-         recruits and however often one repeats. Recruitment reads the
-         *reported* marks, never the rewritten ones, so the search
-         itself does not depend on the order either. That is also what
-         lets a rank keep, per leaf, only its largest request, and drop
-         a request at a leaf already finer, which changes no mark; so
-         gathering in global source order, the fallback had the rewrite
-         been order-dependent, was not needed. *Why a second gather and
-         not the marks' own*: merging the two would need a
-         byte-level encoding of a vector of padded structs with its
-         per-rank counts, to save one collective whose cost is below
-         the marks' gather. Measured over MPI on this laptop (one tile
-         a rank, one thread, every block a `(Keep, box)` source, buffer
-         4), at 2, 4 and 8 ranks: the recruits' `allgatherv` 0.015,
-         0.034 and 0.078 ms with 1600 bytes from a rank, the marks'
-         0.021, 0.074 and 0.188 ms with 5632; the whole `regrid_marks`
-         0.97, 1.12 and 1.93 ms against the replicated `buffered_flags`
-         1.88, 4.11 and 11.8 ms, with the same leaves at every count.
-      2. **`regrid_sources`** takes `oldrange` and `newrange` and
-         classifies `newrange` and `overlapping_leaves(oldrange)`: the
-         new leaves from the one that covers the start of the rank's
-         first old leaf (that leaf or an ancestor, at or before it in the
-         curve's pre-order, else its first descendant, directly after
-         it) through the last one at or before the deepest last
-         descendant of its last old leaf. Without the ranges it
-         classifies every leaf, as before, which is what the serial
-         `regrid!`, `transfer_groups` and the tests use. A plain
-         `searchsortedfirst` in place of the `Dict` was *slower* for the
-         full classification — 14.1 against 11.6 ms at 90112 leaves,
-         30.9 against 29.6 at 180224 — so the serial regrid would have
-         paid for the distributed one. The search therefore starts at the
-         previous target's sources (`findfrom`: four steps along the
-         curve, then a binary search over the rest), since the sources
-         of ascending new leaves are non-decreasing old leaves; that
-         made the full classification faster than the `Dict`. The
-         in-process lockstep test now builds every rank's stage from its
-         own classification and checks that `split_regrid` keeps the
-         same transfers from it as from the full one.
-      3. **The digest's fold is not cached.** A cache per forest and
-         generation goes stale whenever the leaves change without
-         `rebuild_leaves!`, and nothing prevents that: `forest.leaves`
-         is a public `Vector`, and `test/regrid_tests.jl` itself
-         empties and refills one at generation 0. The digest exists to
-         catch a forest that changed outside the collective contract,
-         so it should not trust the generation to say the leaves are
-         unchanged. Where to keep the cache is a second problem:
-         `Forest` is immutable, and its positional constructor is called
-         from `complete_marks`. The saving would be at most 1.1 ms a
-         build at 90112 leaves.
-
-      `bench/replicated.jl` (rank `P÷2`, 176 blocks a rank, ms, best of
-      3–5) now also times the rank's own buffer and classification.
-      Before and after on the same machine, run back to back, a stale
-      copy of the tree for the "before":
-
-      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
-      |---|---|---|---|---|
-      | every block a source, buffer 4: replicated `complete_marks`, 1 thread | 7.6 | 71 | 650 | 1365 |
-      | on the rank: `regrid_marks` / with the completion, 1 thread | 1.0 / 1.1 | 1.1 / 1.6 | 1.4 / 5.4 | 1.6 / 9.6 |
-      | replicated, 4 threads | 2.3 | 21.7 | 212 | 422 |
-      | on the rank, 4 threads | 0.45 / 0.52 | 0.53 / 0.93 | 0.64 / 3.8 | 0.78 / 7.5 |
-      | `regrid_sources`, every leaf, `Dict` (before), 1 thread | 0.165 | 1.26 | 11.6 | 29.6 |
-      | the same by `findfrom` | 0.134 | 0.99 | 8.1 | 18.1 |
-      | the rank's own (what `regrid!` runs) | 0.021 | 0.019 | 0.017 | 0.016 |
-      | `regrid!` on the rank, refine / coarsen, 1 thread, before | 21.6 / 22.7 | 22.4 / 23.0 | 33.6 / 42.6 | 73.1 / 68.1 |
-      | after | 21.9 / 22.9 | 22.7 / 22.8 | 20.7 / 21.0 | 23.2 / 23.6 |
-      | the same, 4 threads, before | 11.1 / 11.0 | 11.4 / 11.7 | 22.5 / 17.4 | 35.7 / 41.4 |
-      | after | 11.3 / 9.9 | 9.8 / 11.4 | 17.0 / 9.4 | 15.4 / 11.4 |
-
-      So a rank's regrid no longer grows with the forest here: at
-      180224 leaves it costs what it costs at 1408, within the noise
-      the four-thread column shows. What remains replicated is the
-      completion. It is the 4–8 ms above at 90112–180224 leaves when
-      every block is a source, since these marks then refine every
-      coarse leaf beside a fine one and `balance!` has a level 2 to
-      check; with the slab's marks it is the 0.9–2.0 ms of item 3. A
-      recruit gathers as 8 bytes, 0.82 MB a rank at 90112 leaves in
-      that case, against 2.9 MB of marks.
-
-      *Tests.* A new in-process testset in
-      `test/regrid_exchange_tests.jl` runs `regrid_marks`, the
-      completion and `regrid!` itself (one task per simulated rank, over
-      the rendezvous communicator) on random forests with random bare and
-      boxed flags, `D = 1, 2, 3`, buffer 0–4 and 1–7 ranks, a roots-only
-      forest among them so that most ranks are empty, and requires every
-      rank's marks and leaves to be the serial `buffered_flags` and
-      `complete_marks` ones. Each of four deliberate breakages fails it
-      or the lockstep test: skipping the gather, dropping a recruit at a
-      leaf of the requested level, and moving either end of
-      `overlapping_leaves`. The suite passes at one thread (110511
-      tests, 8m08) and at eight (110563, 7m57), and the MPI workload at
-      2, 3 and 4 ranks prints the serial lines byte for byte, apart from
-      the 20 `sum` lines, which agree to roundoff (11, 11 and 9 of them
-      byte for byte).
-    - *A device.* `TREEAMR_BENCH_BACKEND=metal TREEAMR_BENCH_N=8
-      TREEAMR_BENCH_REPS=3 TREEAMR_BENCH_PROJECT=<env> bench/mpiscan.sh
-      1 2` (a scratch environment that develops this checkout and adds
-      Metal, MPI and KernelAbstractions) runs in Float32 through the
-      staging path at 2 ranks, every phase included; its numbers, two
-      ranks sharing one GPU, say only that the path works.
-    - *Symmetry* (measured 2026-10-02, job 567847 on cn092–cn095: AMD
-      EPYC 7532, the Rome nodes of `amdq`, 64 cores and 8 NUMA domains
-      each, ConnectX-6 HDR100 InfiniBand; Julia 1.13.1; HPC-X 2.20's Open
-      MPI 4.1.7 over UCX 1.17, `nvhpc-hpcx-cuda12/24.9`, through
-      MPIPreferences' system binary). `bench/symmetry_mpi.sh` as amended
-      in the same step's script commit: one rank per NUMA domain bound by
-      `numactl`, 8 threads, `D = 3`, `ROOTS = 4`, 2 variables, Float64,
-      10 windows, the minimum over them. Launching took four fixes to
-      the script and none to the package: `amddebugq` takes one node a
-      job, so the job ran on `amdq`; SLURM 21.08 ignores
-      `--ntasks-per-node` in a step unless `--ntasks` is given;
-      MPICH_jll starts under `srun --mpi=pmi2` but runs TCP over IPoIB,
-      2.1 GB/s and 40 µs ping-pong between nodes (job 567845), while
-      HPC-X runs 12.0 GB/s and 2.2 µs (job 567846) and is not built with
-      SLURM's PMI, so it is launched by its own `mpiexec`; and Open MPI
-      hands each rank a pseudo-terminal, into which the juliaup launcher
-      writes a terminal title, so the ranks run the julia binary itself.
-      Minimum ms, two-level mesh (176 blocks a rank), one node at 1–8
-      ranks, then 2 and 4 nodes at 8 a node; efficiency `t(1)/t(P)`:
-
-      | `N = 16` | 1 | 2 | 4 | 8 | 16 | 32 | eff. 32 |
-      |---|---|---|---|---|---|---|---|
-      | rhs | 7.75 | 11.98 | 12.99 | 12.78 | 13.59 | 14.41 | 0.54 |
-      | fill_ghosts | 4.37 | 8.40 | 8.86 | 8.87 | 8.93 | 9.64 | 0.45 |
-      | — its local groups | 4.33 | 5.18 | 3.90 | 5.29 | 5.31 | 5.55 | |
-      | — its packs | – | 2.73 | 2.97 | 2.98 | 2.95 | 2.93 | |
-      | — its unpacks | – | 0.51 | 0.78 | 0.80 | 0.79 | 0.80 | |
-      | scatter | 1.84 | 1.84 | 1.84 | 1.95 | 1.91 | 1.91 | 0.97 |
-      | norm | 2.96 | 2.09 | 2.09 | 2.08 | 3.34 | 3.00 | 0.99 |
-      | interfaces | 0.13 | 0.70 | 0.62 | 0.74 | 0.72 | 0.52 | |
-      | interpolate (1000 pts/rank) | 0.24 | 0.77 | 0.83 | 0.61 | 0.69 | 10.24 | 0.02 |
-      | ghost_schedule | 8.38 | 11.79 | 11.65 | 12.10 | 11.70 | 11.73 | 0.71 |
-      | interface_schedule | 0.33 | 1.54 | 1.23 | 1.63 | 1.36 | 1.36 | |
-      | regrid, refine | 25.6 | 28.9 | 26.4 | 27.0 | 24.9 | 32.5 | 0.79 |
-      | regrid, coarsen | 21.9 | 28.9 | 33.9 | 30.5 | 33.7 | 38.8 | 0.56 |
-      | triad reference | 1.70 | 1.74 | 2.13 | 2.18 | 2.26 | 2.15 | 0.79 |
-
-      | `N = 32` | 1 | 2 | 4 | 8 | 16 | 32 | eff. 32 |
-      |---|---|---|---|---|---|---|---|
-      | rhs | 37.9 | 47.7 | 49.4 | 58.2 | 55.0 | 55.9 | 0.68 |
-      | fill_ghosts | 18.7 | 29.2 | 28.6 | 27.7 | 29.8 | 30.1 | 0.62 |
-      | — its local groups | 18.7 | 17.0 | 17.0 | 17.0 | 16.9 | 17.1 | |
-      | — its packs | – | 8.58 | 8.58 | 8.55 | 8.96 | 9.07 | |
-      | — its unpacks | – | 2.04 | 1.73 | 1.77 | 1.99 | 2.09 | |
-      | scatter | 8.02 | 8.69 | 8.71 | 9.38 | 9.96 | 11.98 | 0.67 |
-      | norm | 15.5 | 15.2 | 15.9 | 16.2 | 16.0 | 16.9 | 0.92 |
-      | interpolate | 0.19 | 0.78 | 0.94 | 0.63 | 0.86 | 8.28 | 0.02 |
-      | ghost_schedule | 13.2 | 16.0 | 16.4 | 16.2 | 16.2 | 16.3 | 0.81 |
-      | regrid, refine | 162 | 174 | 192 | 163 | 154 | 162 | 1.00 |
-      | regrid, coarsen | 134 | 172 | 224 | 225 | 217 | 217 | 0.62 |
-      | triad reference | 13.3 | 13.6 | 13.8 | 14.5 | 14.4 | 13.8 | 0.96 |
-
-      A fill sends, per rank, 2 messages at 2 ranks and 3 from 4 on
-      (716800 bytes each way at `N = 16`, 2.3 MB at 32; 560 transfers
-      sent and 560 received against 4224 local); the regrid makes ranks
-      take 0/50/108 blocks from another (min/mean/max) at 32 ranks. The
-      uniform mesh (64 blocks a rank, one stage): rhs 2.05 / 3.75 / 2.62 /
-      3.92 / 3.85 / 3.83 ms at `N = 16` (efficiency 0.53 at 32) and 9.84
-      / 13.4 / 15.3 / 16.3 / 16.2 / 16.9 at 32 (0.58). What it shows:
-      1. **The step from one rank to two is the whole loss, and the
-         network is not in it.** From 2 to 32 ranks, across one, two and
-         four nodes, the two-level rhs grows by 20 % at `N = 16` (12.0 →
-         14.4 ms) and 17 % at 32 (47.7 → 55.9): efficiency 0.83 and 0.85
-         against 2 ranks. The fill less its local groups, packs and
-         unpacks — what the messages left unhidden — is −0.2 to 0.4 ms
-         at `N = 16` and 0.4 to 2.0 ms at 32 at every count, inside the
-         error of subtracting separately measured minima; 2.3 MB over
-         UCX at 12 GB/s is 0.2 ms. The overlap does its job, and
-         between nodes too.
-      2. **The packs are the cost**: 2.7–3.0 ms of an 8.9 ms fill at
-         `N = 16`, 8.6–9.1 of 30 at 32, against local groups of 5.3 and
-         17.0 ms for 7.5 times as many transfers. So a packed transfer
-         costs about 4 times a local one. The likely reason, not
-         measured: pack groups run by the owner of the *source* block
-         ("Ownership" under "Pack and unpack are transfers"), and the
-         sources of a rank's halo are the bottom and top layers of its
-         tile, which sit at the two ends of its curve range and so in
-         the first and last thread chunks: at 8 threads the packs for
-         the rank below run on one thread, those for the rank above on
-         about four. The sender-computes rule moves the halo's
-         arithmetic to the sender, as designed; what costs is that the
-         block-ownership partition then gives it to a few threads. A
-         pack split over all threads by transfer, not by owner, would
-         trade affinity for balance, which is a design question.
-      3. **The schedule build and the regrid are flat from 2 ranks on**,
-         as `bench/replicated.jl` predicted: the build 11.7–12.1 ms at
-         `N = 16` and 16.0–16.4 at 32 at every count from 2 to 32; the
-         refining regrid 25–33 ms and 154–192 ms. The coarsening regrid
-         rises from 1 to 4 ranks, by 55 % at `N = 16` and 67 % at 32,
-         and is flat after at `N = 32`; at 16 it rises again at 32 ranks
-         (not traced).
-      4. **`interpolate!` at 32 ranks jumps to 8–10 ms**, from 0.6–0.9
-         ms at 2–16 ranks; at 16 ranks (two nodes) its *median* is
-         already 9.9 ms. Nothing else in the table does this, and
-         MPICH_jll over TCP at 16 ranks takes 2.0 ms (below), so it is
-         the collectives — an `allgather` and four `alltoallv` — inside
-         this Open MPI at that scale, not the work. A job that repeats
-         the 16- and 32-rank runs with HPC-X's HCOLL collectives on and
-         off (567858) was queued and its result not collected; the cause
-         is open.
-      5. **Phases without messages slow by the slowest of 32 ranks**:
-         `scatter` 8.0 → 12.0 ms at `N = 32` and the uniform mesh's
-         local groups 2.5 → 4.3, while the triad stays at 0.96. The
-         window is the slowest rank's.
-    - *One node, the same mesh: 8 ranks against one process* (the same
-      job; the control is 64 threads over the 8-tile mesh in one
-      process). The one process wins the per-evaluation phases. Minimum
-      ms, two-level, 8 ranks / one process pinned with first touch
-      (`JULIA_EXCLUSIVE=1`) / one process interleaved:
-
-      | | `N = 16` | `N = 32` |
-      |---|---|---|
-      | rhs | 12.78 / 7.98 / 11.97 | 58.2 / 39.4 / 50.5 |
-      | fill_ghosts | 8.87 / 4.78 / 7.82 | 27.7 / 19.8 / 28.2 |
-      | ghost_schedule | 12.1 / 16.7 / 17.1 | 16.2 / 23.0 / 19.9 |
-      | regrid, refine | 27.0 / 48.1 / 44.3 | 163 / 233 / 245 |
-      | regrid, coarsen | 30.5 / 48.9 / 41.4 | 225 / 221 / 218 |
-
-      One pinned process runs the rhs 1.6 times as fast at `N = 16` and
-      1.5 times at 32 (the uniform mesh 1.3 and 1.6), because the 8-rank
-      run pays the packs and unpacks of item 2 and the one process pays
-      nothing for the same halo: its local groups are the 8 ranks' local
-      groups plus the halo, at about the same time (4.95 against 5.29
-      ms at `N = 16`). That settles what "What one process loses" left
-      for this step: the ownership policy recovers inside one process
-      everything one rank per domain was expected to, and on one node
-      ranks are a loss for the rhs. The replicated host passes go the
-      other way — the schedule build and the refining regrid are
-      1.4–1.8 times faster over 8 ranks, being per rank `O(local)` work
-      on fewer threads — but they run at regrid frequency. So the
-      layout to recommend is one process per node, its threads pinned,
-      and ranks between nodes.
-    - *The default binary between nodes* (job 567857, cn109–cn110, the
-      Milan EPYC 7543 nodes, MPICH_jll 5.0.2 through `srun --mpi=pmi2`,
-      `N = 16`; compare within the job only). On one node it matches
-      HPC-X's shape (two-level rhs 6.32 / 11.83 / 12.31 / 13.66 ms at
-      1–8 ranks); on two nodes the rhs is 18.52 ms and the fill 13.42,
-      against 13.66 and 9.48 at 8 ranks, so TCP over IPoIB adds 4 ms a
-      fill that UCX does not (efficiency 0.34 at 16 ranks, against 0.57
-      for HPC-X at 16 in job 567847). Between nodes the system MPI is
-      not optional.
-    - *The replicated costs on a rank's domain* (`bench/replicated.jl`
-      in job 567847, one domain of cn092, 8 threads, 176 blocks a rank;
-      ms):
-
-      | leaves (`P`) | 1408 (8) | 11264 (64) | 90112 (512) | 180224 (1024) |
-      |---|---|---|---|---|
-      | digest | 0.036 | 0.19 | 1.40 | 2.79 |
-      | `GhostSchedule` on the rank | 11.9 | 11.7 | 13.0 | 14.3 |
-      | `regrid_sources`, every leaf / the rank's own | 0.40 / 0.17 | 1.94 / 0.18 | 15.8 / 0.16 | 32.3 / 0.17 |
-      | every block a source: replicated `complete_marks` | 3.6 | 33 | 290 | 596 |
-      | on the rank: `regrid_marks` / the completion | 0.78 / 1.04 | 0.84 / 2.15 | 0.89 / 12.2 | 1.26 / 20.4 |
-      | `regrid!` on the rank, refine / coarsen | 23.1 / 18.5 | 19.2 / 22.8 | 19.5 / 19.4 | 22.4 / 23.9 |
-
-      So the laptop's finding holds on the cluster: a rank's regrid
-      costs at 180224 leaves what it costs at 1408. What remains
-      replicated and grows is the completion after the buffer, 20 ms at
-      180224 leaves when every block is a source, about a regrid's
-      worth; the build grows by 2.4 ms over 128 times the leaves, the
-      digest most of it.
-    - *What was not done.* The benchmark itself changed nothing in
-      `src/`, so the suite was not rerun for it; the follow-up above
-      did, and it was.
-      The fill's overlap is read from the difference of its parts, not
-      traced inside `run_stage!`. The benchmark's mesh is periodic, so
-      the boundary hook is not timed.
-  - **Step 8 — MPI+GPU.** Device-resident buffers, the device-aware
-    check and host staging. *Accept:* the workload on Metal through the
-    staging path, and on an H200 on Symmetry, agreeing with the serial
-    device run as [Parallelism](#parallelism) states for a device.
-
-    *(Done locally, 2026-10-01, and on Symmetry's H200s, both paths, on
-    2026-10-02.)*
-    What it settled, and where it went beyond the plan (the design
-    decisions are recorded under "MPI+GPU" in
-    [Distributed meshes](#distributed-meshes)):
-    - *The code.* `run_stage!` in `ghosts.jl` is the one place every
-      stage runs — the ghost fill, the interface restriction and the
-      regrid transfer — so it is the one place that stages: it asks the
-      new verb `hoststaging(comm, buffer)`, and when the answer is yes it
-      posts the receives into host mirrors, downloads the packed buffer
-      after the pack's synchronization, sends from the mirror, and
-      uploads the receive mirror before the unpack. `stagemirrors`
-      allocates the mirrors once per stage and variable count, kept in
-      `RemoteStage`'s new `mirrors` field, and page-locks them with
-      `KernelAbstractions.pagelock!`. The MPI extension gains the
-      `deviceaware` keyword of `communicator` and a field of
-      `MPICommunicator` for it, answers `hoststaging`, and checks a
-      message buffer against the setting. No new dependency, weak or
-      otherwise.
-    - *An inference fix found by the new test.* The in-process staging
-      test defines a fourth test `Communicator` with an `allgather`
-      method, and with it `type_tests.jl`'s `@inferred total_mass` and
-      `@inferred volume_weighted_norm` failed: `combine_blocks` calls
-      `allgather` on the abstractly typed `comm` field, and with that
-      many methods inference returns `Any` for the call, and the fold
-      over its result with it. Nothing about a reduction's type should
-      depend on how many communicator types a process has loaded — an
-      application with its own would have hit it too — so the gather is
-      now asserted, `allgather(comm, partial)::Vector{typeof(partial)}`,
-      which every `allgather` returns.
-    - *The device workload.* `test/mpi_device_workload.jl`, standalone and
-      not in `Pkg.test`, since the test environment has no device package
-      and must not gain one: the vertex-centered wave on three levels with
-      the hook, a reflecting box with an odd variable, a periodic 3D
-      mesh, each filled and stepped with RK4; Burgers with the interface
-      fixup and its conservation; the tracked pulse through two regrids
-      flagged by `firing_boxes` on the device; and refinements of the
-      first blocks and their coarsening, which move blocks up and down
-      the ranks and coarsen siblings with different owners, over a
-      conservative cell-centered set and a vertex-centered one. Rank 0
-      prints digests of the arrays downloaded and gathered in block
-      order, ghosts included, the exact reductions, the sums, and `#`
-      lines with how many of each schedule's stages had messages and how
-      many were staged, and how blocks migrated. Every callback computes
-      in the coordinates' type (the forests' extents are in `T`), since
-      Metal has no Float64. `TREEAMR_TEST_BACKEND` chooses `cpu`, `metal`
-      or `cuda`, `TREEAMR_TEST_T` the type, and
-      `TREEAMR_TEST_DEVICEAWARE=1` the direct path; on a node with several
-      devices each rank takes device `local rank mod devices`.
-      `test/mpi_device_tests.jl` runs it serially and under `mpiexec` at
-      `TREEAMR_TEST_RANKS` (default `2 3`), one thread a rank, and
-      requires every line to be the serial device run's, the `sum` lines
-      to `rtol = 10⁻⁵` in Float32 and `10⁻¹²` in Float64; every stage with
-      messages to have been staged on a device that is not device-aware,
-      and none otherwise; and the migrations to have happened.
-    - *Measured on Metal* (Apple M3 Pro, Metal.jl in a scratch environment
-      that develops this checkout and adds Metal, MPI, KernelAbstractions,
-      SHA and Test; MPICH_jll 5.0.2; two and three ranks sharing the one
-      GPU). `TREEAMR_TEST_BACKEND=metal julia --project=<env>
-      test/mpi_device_tests.jl` passes, 36 tests in 1m45: the serial run
-      31 s, `-n 2` 36 s and `-n 3` 38 s of wall clock, nearly all of it
-      compilation. In Float32 every line but the sums is the serial Metal
-      run's byte for byte, at both counts; at `-n 3` the sums move in the
-      seventh or eighth of 9 digits (Burgers' mass 15.999999 against 16,
-      `l2` by 1–2 × 10⁻⁷ relative). At `-n 3` 9, 8, 6, 9 and 5 stages of
-      the five schedules had messages, and all of them were staged;
-      6 blocks moved up the ranks on the refinement, 6 back down on the
-      coarsening, and 2 coarsened blocks had children of two owners. As a
-      negative control, with the upload of the receive mirror removed the
-      `-n 2` run differs from the serial one in 53 lines. The same driver
-      on the CPU (the direct path, nothing staged) passes in 59 s.
-    - *In process*, the staging path on the CPU: a communicator in
-      `regrid_exchange_tests.jl` that answers `hoststaging` with `true`
-      for every buffer, over the rendezvous communicator, and records the
-      arrays every message is handed out of. At 3 ranks in 2D, vertex-
-      centered, outer and reflecting faces with the hook, the staged ghost
-      fill, the interface restriction and `regrid!` reproduce the serial
-      results bit for bit; every buffer handed to the communicator is one
-      of the stages' mirrors and none is a stage buffer; a second fill
-      reuses the mirrors and gives the same bits. With the upload removed
-      it fails, 7 of its 31 tests. `mpi_workload.jl` gains a `#` line that
-      checks, under MPI, that a device-aware communicator shares the
-      duplicate, and that a buffer which is not contiguous host memory is
-      refused before anything is sent, naming the setting.
-    - *The CPU path is unchanged.* `bench/ghosts.jl` at its defaults, one
-      thread, best of 200, HEAD before and after, alternated twice: the
-      serial fill allocates exactly what it did, 10896 bytes on the
-      uniform mesh and 97504 on the two-level one, and the schedule build
-      392832 and 4656880; the fill took 2.660–2.719 ms against
-      2.667–2.670 ms and 12.09–12.22 ms against 11.87–11.92 ms, the second
-      1.5–3 % slower in both rounds, though the serial path runs no
-      changed line (the stage without messages returns before the new
-      code); not traced further. A distributed CPU fill (the same
-      two-level mesh, 10 variables, `mpiexec` with one thread a rank,
-      best of 50) allocates exactly what it did, 130320 bytes on each rank
-      at `-n 2` and 151856 / 189168 / 151856 at `-n 3`, in 7.0 ms and
-      6.1–6.9 ms both before and after.
-    - *The CPU workload by hand*, `test/mpi_workload.jl` at `-n 3` against
-      the serial run (before the inference fix above, which changes no
-      value): every line but the `sum` lines and the `#` lines identical,
-      the sums agreeing to the last one or two of 17 digits, as in step 6.
-    - *Symmetry* (measured 2026-10-02 on cn111, one node of 8 H200s
-      with 4 of them allocated, NVLink between every pair; Julia 1.13.1,
-      CUDA.jl's CUDACore 6.4.1; `bench/symmetry_mpi_gpu.sh` as amended
-      in the step's script commit, on `h200q`, since `h200debugq`'s QOS
-      allows a group 2 GPUs and 24 CPUs). One rank per GPU, one thread a
-      rank, `TREEAMR_TEST_RANKS = "2 3 4"`:
-      - **Host staging, MPICH_jll 5.0.2** (job 567852):
-        `test/mpi_device_tests.jl` passes in Float64 and in Float32, 52
-        tests each, every line of every distributed run the serial CUDA
-        run's but the sums, every stage with messages staged. The first
-        job (567850) had failed at `-n 2`: CUDA refuses to page-lock an
-        empty range, and a stage this rank only sends in, or only
-        receives in, has an empty mirror, which Metal and the CPU never
-        refused. `pagelock_mirror!` now skips an empty mirror (the
-        step's fix commit), and nothing else changed between the jobs.
-      - **Symmetry has a CUDA-aware MPI**: HPC-X 2.20's Open MPI 4.1.7
-        (`nvhpc-hpcx-cuda12/24.9`, through MPIPreferences' system
-        binary), whose `ompi_info` says `opal_built_with_cuda_support`
-        and for which `MPI.has_cuda()` is `true`. Over it (job 567856)
-        the test passes through host staging and through the direct
-        path, `communicator(COMM_WORLD; deviceaware = true)`, in
-        Float64 and in Float32: four times 52 tests, the direct runs
-        with no stage staged. So the direct path, which no device here
-        could run, is checked — MPI.jl hands the `CuArray` views to the
-        library by device pointer, and UCX moves them. The probe of
-        `MPI.has_cuda()` has to run under `mpiexec -n 1`: a singleton
-        `MPI.Init()` of this Open MPI inside a SLURM job waits forever
-        for the daemon it spawns (job 567853, cancelled).
-      - **What the two paths cost** (`bench/mpi.jl` on CUDA through
-        `bench/mpiscan.sh 1 2 4`, `N = 32`, `ROOTS = 4`, Float64, 5.8 M
-        cells a rank, the four GPUs of one node, HPC-X; minimum ms,
-        staged / direct):
-
-        | phase | 1 rank | 2 ranks | 4 ranks |
-        |---|---|---|---|
-        | two-level rhs | 2.07 / 2.06 | 2.89 / 2.72 | 2.92 / 2.76 |
-        | two-level fill_ghosts | 1.71 / 1.70 | 2.49 / 2.29 | 2.52 / 2.35 |
-        | — its local groups | 1.69 / 1.67 | 1.44 / 1.41 | 1.44 / 1.43 |
-        | — its packs | – | 0.52 / 0.51 | 0.51 / 0.50 |
-        | — its unpacks | – | 0.44 / 0.44 | 0.44 / 0.44 |
-        | uniform rhs | 0.31 / 0.31 | 0.63 / 0.61 | 0.71 / 0.63 |
-        | two-level regrid, refine | 5.2 / 5.2 | 25.4 / 7.1 | 48.0 / 8.7 |
-        | two-level regrid, coarsen | 3.6 / 3.6 | 26.1 / 7.3 | 52.6 / 8.2 |
-        | interpolate (1000 pts/rank) | 0.11 / 0.11 | 0.55 / 0.55 | 0.47 / 0.50 |
-
-        The rhs weak-scales at 0.71 staged and 0.74 direct to 4 GPUs.
-        As on the CPU, the messages are not the cost: the fill less its
-        parts is under 0.2 ms either way. The packs and unpacks are,
-        0.95 ms of a 2.5 ms fill, and on a device that is launches —
-        one per group, for groups of a few thousand points (the
-        uniform mesh's single stage has 0.12 + 0.12 ms of them for a
-        fill of 0.16 ms serially). The direct path saves 0.16–0.2 ms a
-        fill, the two copies. **The staged regrid is the surprise**: 48
-        ms at 4 ranks against 8.7 direct and 5.2 serially. A regrid
-        stage is built per regrid, so its host mirrors are allocated,
-        zero-filled and page-locked afresh each time, for up to 84
-        blocks of `32³ × 2` values; that is the likely cost (not
-        traced), and MPICH_jll's staging (job 567852) shows the same
-        48.4 ms. A regrid that staged through pageable memory, or kept
-        its mirrors, would not pay it; left open, since a regrid runs at
-        regrid frequency and the direct path exists. *(Followed up the
-        same day with the buffer pool, the next bullet; the H200
-        re-measurement is pending.)*
-    - *The buffer pool* (the follow-up, 2026-10-02; the design is "The
-      buffer pool" under "MPI+GPU" in
-      [Distributed meshes](#distributed-meshes)). Stage buffers and host
-      mirrors are leased from the forest's pool, the regrid stage's
-      returned at the end of its transfer and a stale schedule's
-      reclaimed at the next lease, so that a regrid reuses what the
-      earlier ones allocated and, on CUDA, page-locked. Measured locally
-      only (Apple M3 Pro, MPICH_jll 5.0.2, one thread a rank, Symmetry
-      being in use by another job):
-      - *Reuse.* In process, `regrid_exchange_tests.jl`'s new test runs
-        a refine-and-coarsen cycle three times at 3 ranks with every
-        message staged on the CPU, schedules rebuilt after each regrid
-        and filled, with the serial bits throughout and no buffer
-        allocated in the third cycle. A script running five cycles of
-        the same setup shows the three ranks' pools allocating 8, 10
-        and 8 buffers in the first cycle (half of them mirrors) and none
-        in the four after it. `mpi_device_workload.jl` runs its
-        moving-blocks cycle twice and prints the ranks' pool counts after
-        each: on Metal at `-n 3`, 42 buffers (21 mirrors) and 48 (24)
-        after the first cycles of its two meshes, the same after the
-        second, and `mpi_device_tests.jl` now asserts that, 52 tests
-        passing on Metal (staged) and on the CPU (direct, no mirrors).
-        `bench/mpi.jl` over its six regrid cycles at `N = 16`: rank 0's
-        pool allocates 20 buffers at 2 ranks and 18 at 4 in the first
-        cycle, staged on Metal or forced-staged on the CPU, 10 and 9
-        direct on the CPU, and nothing after.
-      - *Negative controls.* With reclaiming disabled, the pool's unit
-        test fails 4 of its 9 tests; with a leased buffer left on the
-        free list, the unit test fails 2 and the cycle test's overlap
-        check fails on all 3 ranks — while its bits stayed serial,
-        since the in-process mailbox copies a message when it is sent,
-        which is why the overlap is checked directly.
-      - *Host allocation per regrid*, rank 0, `bench/mpi.jl`'s last
-        refine / coarsen (`@allocated`, `N = 16`, `ROOTS = 4`, 2 / 4
-        ranks), before and after: forced staging on the CPU 57.0 / 48.4
-        and 55.2 / 52.2 MB to 46.8 / 35.5 and 41.4 / 35.6; direct on the
-        CPU 51.9 / 42.0 and 48.3 / 43.9 to 46.8 / 35.5 and 41.3 / 35.6;
-        staged on Metal (Float32) 5.3 / 6.5 and 6.3 / 7.4 to 2.7 / 3.2
-        and 2.8 / 3.2. What remains on the CPU is mostly the new
-        working arrays, which a regrid allocates by design.
-      - *Time: no change that the noise lets one see* — the cost the
-        pool removes is not one this machine has. Two runs each,
-        alternated, minimum ms, refine / coarsen at 2 and 4 ranks:
-        forced staging on the CPU 61.2–62.8 / 50.2–50.9 and
-        69.1–72.6 / 48.4–48.7 before, 61.5–63.8 / 49.6–54.5 and
-        71.3–71.6 / 44.0–44.5 after; Metal 40.2–51.1 / 40.0–42.4 and
-        51.4–56.0 / 50.5–50.8 before, 47.9–50.3 / 40.7 and 51.2–52.8 /
-        48.2–49.9 after (the ranks share one GPU, so the Metal
-        distributed numbers are not weak scaling). Neither backend
-        page-locks, and the allocation and zero-filling the pool does
-        save here are evidently lost in a 40–70 ms regrid.
-        So the local runs show that the pool works and is safe, not
-        what it buys on CUDA: whether step 8's 40 ms were the pinning
-        is still to be measured on Symmetry (pending; see "Performance
-        work left for later" under
-        [Distributed meshes](#distributed-meshes)).
-      - *Unchanged elsewhere.* `bench/ghosts.jl` at one thread: the
-        serial fill allocates 10896 and 97504 bytes and the schedule
-        build 392832 and 4656880, as in step 8; the distributed CPU
-        fill of step 8 allocates 130320 bytes a rank at `-n 2` and
-        151856 / 189168 / 151856 at `-n 3`, as before.
-    - *What was not checked* (before the Symmetry run, which checked the
-      direct path on CUDA). The direct path on any device: Metal has no
-      device-aware MPI, and the CPU's direct path is not the device's
-      code path for MPI.jl, which hands a `CuArray` over through its
-      own CUDA extension. A checkpoint or an interpolation from a device
-      field set under MPI was not run (both go through the host, as steps
-      5 and 6 recorded).
-    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes
-      `partition_tests.jl`, `exchange_tests.jl`,
-      `regrid_exchange_tests.jl` (the staging test included),
-      `type_tests.jl` after them (the inference fix) and `mpi_tests.jl`
-      (3m21 together); the whole suite was not run there.
-    - *Suite cost.* 109140 tests at one thread in 7m55 and 109192 at eight
-      in 7m51, against step 6's 109107 in 8m10 and 109159 in 8m02: 33
-      more at each, the 31 of the staging test and the device-aware line
-      at two rank counts. The thread-independence digests are unchanged.
-      The docs build.
-  - **Step 9 — wrap-up.** A `docs/src/api/distributed.md` page
-    (`communicator`, `blockrange`), a guide section in `index.md`, the
-    status there and in `README.md`, and CLAUDE.md's architecture row,
-    MPI test commands and suite cost. *Accept:* the docs build; TreeWave
-    and TreeHydro green in scratch copies against the checkout, with
-    the audit for `nleaves`-sized per-block arrays done in all three
-    downstreams; M7 marked *(Done.)*. Tagging the release is left to
-    Erik. *(Amended in step 9: M7 is marked implemented rather than
-    done, since the acceptance's weak-scaling table and the H200 run
-    are scripted and not run; see the milestone's heading.)*
-
-    *(Done, 2026-10-02.)* What it settled:
-    - *Suite cost, and what was trimmed.* After step 8 the suite took
-      about 8 minutes at one thread, against M9a's 4m16, and
-      `mpi_tests.jl` was the largest file: 123–128 s, the serial
-      reference in process and then `mpiexec -n 3` and `-n 2` one after
-      the other, each launch about 55 s of wall clock and, by a timed
-      copy of the workload, almost all of it compilation (a fresh serial
-      process spends about 20 s compiling `main`'s call tree before its
-      first case runs, and the cases' own time is about 19 s). Nothing
-      orders the launches but the checkpoint cross loads, so they now
-      overlap. Each run leaves an empty marker beside its checkpoints
-      once they are written, and `TREEAMR_CHECKPOINT_FROM` names the
-      rank counts whose files a run waits for and loads; every rank
-      waits on its own, sleeping, so none spins in MPI meanwhile, and a
-      run by hand without the variable loads whatever it finds, as
-      before. A new helper, `test/mpi_jobs.jl`, starts both jobs at the
-      start of the suite where the machine has room for five ranks
-      beside it — eight threads and 24 GB, since a rank measured about
-      2 GB resident — and `mpi_tests.jl` collects them; elsewhere, a CI
-      runner among them, the three-rank job runs beside the serial
-      reference and the two-rank job after it. *(Amended 2026-10-06:
-      there the three ranks now start after the reference. Beside it,
-      on CI's macOS runners — 3 cores, 7 GB, Julia 1.13 — three ranks
-      of about 2.4 GB each compiling beside the reference and the
-      suite's process missed the job's 900 s deadline: once on `main`
-      on 2026-10-04, and in two cells of the copy-kernel change, whose
-      first version had also slowed the workload's compilation (see
-      [The copy kernels on a device](#the-copy-kernels-on-a-device)).
-      On a laptop the MPI test alone takes 3m46 that way, against 1m47
-      with both jobs beside the reference.)*
-      `TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice. Two
-      type repeats went, each of a path covered elsewhere: the
-      workload's `Float32` regrid case (`Float32` crosses MPI as a
-      native type, its regrid stage is checked bitwise in process by
-      `regrid_exchange_tests.jl`, and `Float32x2`, which MPI sends
-      through a derived datatype, stays), and `exchange_tests.jl`'s
-      pack/unpack round trip in `Float32` in 1D and 3D and in `Float32x2`
-      in 1D, 29 tests (`Float32` stays in 2D, `Float32x2` in 2D and 3D,
-      where remote mirrored transfers exist). No claim of an acceptance
-      list went with them: every case the step-3 to step-6 acceptances
-      name is still in the workload, at both rank counts, and every type
-      the step-2 round trip names is still in it. The thread-independence
-      test was not touched.
-
-      Per file, one thread, timed around each `include` in a scratch
-      copy of `runtests.jl` (s; before and after on the same machine,
-      the same day):
-
-      | file | before | after |
-      |---|---|---|
-      | inline M1 tests | 10.7 | 14.7 |
-      | `ghost_tests.jl` | 14.2 | 18.0 |
-      | `centering_tests.jl` | 25.7 | 30.5 |
-      | `reflect_tests.jl` | 28.7 | 29.5 |
-      | `interpolate_tests.jl` | 18.0 | 23.4 |
-      | `interface_tests.jl` | 5.2 | 5.1 |
-      | `partition_tests.jl` | 8.8 | 8.2 |
-      | `exchange_tests.jl` | 40.1 | 32.8 |
-      | `regrid_exchange_tests.jl` | 20.3 | 19.0 |
-      | `interpolate_exchange_tests.jl` | 13.2 | 12.9 |
-      | `allvariables_tests.jl` | 8.3 | 8.1 |
-      | `state_tests.jl` | 7.6 | 7.5 |
-      | `regrid_tests.jl` | 10.4 | 10.8 |
-      | `wave_tests.jl` | 4.2 | 4.2 |
-      | `wave_cell_tests.jl` | 2.3 | 2.3 |
-      | `burgers_tests.jl` | 16.6 | 17.2 |
-      | `imex_tests.jl` | 5.6 | 5.3 |
-      | `type_tests.jl` | 12.8 | 13.4 |
-      | `checkpoint_tests.jl` | 26.6 | 28.6 |
-      | `thread_tests.jl` | 50.2 | 50.3 |
-      | `mpi_tests.jl` | 127.8 | 15.0 |
-      | `gpu_tests.jl` | 27.5 | 27.0 |
-      | whole run | 489.6 | 386.5 |
-
-      The files that run while the jobs compile lose 4–6 s each, about
-      20 s in all, to the five ranks on the other cores (an M3 Pro, six
-      performance and six efficiency cores); the net is 103 s. On the
-      sequential path, which is CI's, `mpi_tests.jl` alone takes 1m47
-      (130 tests), against step 6's 2m34 for three launches in a row,
-      and the whole suite, forced onto that path here with
-      `TREEAMR_TEST_MPI_CONCURRENT=0`, 7m52 (110484 tests), within the
-      run-to-run spread of the 7m55 before (steps 5–8 measured 7m49 to
-      8m10). So the trim is a local saving: a CI cell, whose runner has
-      no room for the jobs beside the suite, is not expected to get
-      faster, and launching them there anyway was not tried, since a
-      `macos-latest` runner has 7 GB for the main process and five ranks
-      of about 2 GB.
-    - *CI.* `.github/workflows/CI.yml` needed no change for MPI: MPI.jl's
-      default binary is MPICH_jll, an artifact on both runners'
-      platforms, and the parallel HDF5_jll build matching it is chosen
-      by MPIPreferences with nothing configured ("What the feasibility
-      check found"); the ranks run at one thread whatever
-      `JULIA_NUM_THREADS` says, and inherit `--check-bounds=yes` and,
-      on the single-threaded cells, `--code-coverage` through
-      `Base.julia_cmd()`, so their `.cov` files are merged with the
-      rest. The job gained a `timeout-minutes` of 120, since a process
-      stuck outside the test's own deadlines would hold a runner for
-      GitHub's default six hours. **None of it has run on GitHub**: the
-      branch is not pushed. What is unverified there: that MPICH's
-      launcher starts on the hosted macOS runner; the memory of a
-      `macos-latest` runner (7 GB) against the main process and three
-      ranks of about 2 GB each, which may swap; and the time of the
-      coverage cells, whose ranks are instrumented too (the deadline is
-      900 s a launch, against about 55 s uninstrumented here).
-      *(Linux, 2026-10-02: in a fresh clone of the branch at 12a6cd6 on
-      one Symmetry node each — jobs 567843 on cn106 and 567844 on cn109,
-      AMD EPYC 7543 — `Pkg.test()` at one thread passes on Julia 1.11.9,
-      110484 tests in 13m34 (`--check-bounds=yes`, which 1.11's
-      `Pkg.test` sets), and on 1.13.1, 110484 in 11m18, the MPI jobs
-      started early on both, with MPICH_jll 5.0.2 resolved by default.
-      `HYDRA_LAUNCHER=fork` was set, so that MPICH's launcher forked its
-      ranks as on a runner without SLURM, rather than starting them
-      through `srun`. So the MPI tests work on Linux; GitHub's runners
-      are what CI is for.)*
-    - *Docs.* A guide section, "Running distributed", in
-      `docs/src/index.md`; the status there and in `README.md`; the
-      distributed API page pointing at the guide. Two examples that
-      were right only serially were fixed: `firing_boxes`' verdict used
-      `level(forest.leaves[b])`, and the regridding section named
-      `forest.leaves[b]` as the way to tell blocks apart; both are
-      `blockkey(fs, b)`. The docs build.
-    - *Fixed upstream from the audit.* `buffered_flags` now refuses a
-      flag vector that is not one per leaf, as `complete_marks` already
-      did: TreeGeneralizedHarmonic calls it with `flag_blocks`' flags,
-      which over a distributed forest are a rank's local blocks, and
-      without the check it buffered around leaves `1:nblocks` and wrote
-      global recruit indices into the local vector — silently. The
-      `DimensionMismatch` says to pass the local flags to `regrid!` with
-      `buffer` instead. And `block_mapreduce`'s docstring had shown
-      `maximum(block_mapreduce(…))` as a refinement scale, the
-      rank-local pattern two downstreams copied; it shows
-      `mesh_mapreduce` now and says why.
-    - *The downstreams*, each copied to scratch with this checkout
-      developed into the copy, at one thread: TreeWave 310 tests in 1m22
-      (`Pkg.test`'s summary; 310 in 1m12 against the M9a checkout);
-      TreeHydro 12447 in 5m00 (11893 in 4m16 then; it has grown since);
-      TreeGeneralizedHarmonic, whose whole suite takes about 19 minutes,
-      a subset of 1760 tests in 7m04 — `precision_`, `prerequisite_`,
-      `stencils_`, `stepping_`, `interface_`, `refinement_`, `horizon_`,
-      `checkpoint_` and `type_tests.jl`, the files that reach TreeAMR
-      most directly (its names, the partition, the exchange, the
-      buffer, `interpolate`, checkpoints, the element types). All pass,
-      so the local block indices, the new check in `buffered_flags` and
-      the rest of M7 change nothing serially for them.
-    - *The audit* (read-only, of each downstream's `src/` and `bin/`
-      against the list under "What an application must make global
-      itself"). None of the three passes `comm` to a `Forest` yet, so
-      today an `mpiexec` launch runs a full serial copy per rank, and
-      nothing below is wrong until one does. None indexes
-      `forest.leaves` by a block index or sizes a per-block array by
-      `nleaves`, with the exceptions named. What would go wrong once it
-      is distributed:
-      - *TreeWave.* `field_scales` (`src/refinement.jl:112`) is
-        `maximum(block_mapreduce(…))`, so the Löhner reference amplitude
-        becomes per rank: the mesh would depend on the rank count, and an
-        empty rank would throw on `maximum` of nothing and leave the
-        others in the next collective. `blast_coverage`
-        (`src/blast.jl:281–295`) and `track_pulse`'s tracking measure
-        (`src/supergaussian.jl:188–195`) are rank-local diagnostics.
-        Its integrators are fixed-step, so no adaptive norm. The viewers
-        in `bin/` would plot one rank's blocks.
-      - *TreeHydro.* Five functions combine `block_mapreduce` on the host
-        — `max_signal_speed` (`src/evolution.jl:477`), `floor_hits`
-        (`:505`), `ghost_floor_hits` (`:578–585`), `indicator_scales`
-        (`src/refinement.jl:189–190`), `peak_compression`
-        (`src/sedov.jl:512`) — and the first is the CFL speed: `evolve!`
-        derives each chunk's step count from it (`src/driver.jl:857–860`),
-        so the ranks would take different numbers of steps and hang in
-        the exchange; `entropywave_errors`, `sedov_static` and the
-        `check_cfl` calls do the same. Its time-based checkpoint triggers
-        read each rank's own clock (`src/driver.jl:910–917`), so some
-        ranks would enter the collective `save_checkpoint` and others
-        not. The run state it checkpoints holds the rank-local counts and
-        speeds, which `write_plain`'s agreement would refuse on every
-        rank. `tracked_share`, `reduce_to_grid`, `mode_amplitude`,
-        `max_y_kinetic_energy`, `shock_radius` are rank-local
-        diagnostics, and `src/kelvinhelmholtz.jl:544` records
-        `nblocks` where the mesh's block count is meant.
-      - *TreeGeneralizedHarmonic.* Its reductions are already
-        `mesh_mapreduce` (the speed, the bounds, the constraint norms),
-        and its integrator is fixed-step. But `indicator_flags` passes
-        local flags to the public `buffered_flags`
-        (`src/refinement.jl:739`) — now refused, above — and
-        `clamp_marks` (`:762`) and `refinement_centroid` (`:816`) index
-        `forest.leaves[b]` by a local block, the centroid's sums staying
-        per rank too; `nfiring` (`:743`) is a local count. Its
-        time-based checkpoint triggers read each rank's clock
-        (`src/driver.jl:1287–1293`), its run state holds wall-clock fit
-        costs and the rank-local centroids (`:1312`), which the agreement
-        would refuse, and its non-finite check (`:741`) reads the local
-        state only, so one rank would throw alone. Its horizon finder
-        passes every point on every rank, which is correct under M7's
-        collective `interpolate` and only redundant.
-      None of these is fixed here: they are the downstreams' to fix
-      when they distribute.
-    - *Julia 1.11.* In the manifest-free copy, Julia 1.11.9 passes the
-      whole suite, 110484 tests in 6m46 at one thread, with the MPI jobs
-      started early as on 1.13. It resolves MPICH_jll there, the binary
-      CI's runners get, against MPIABI_jll on 1.13.1 here (the global
-      preference), and IMEXRungeKutta 1.3.0 from `main`, against the 1.1.0
-      the 1.13 test manifest holds.
-    - *Suite cost.* 110484 tests at one thread in 6m25 and 110536 at
-      eight in 6m21 (`Pkg.test`), against 7m55 and 7m51 after step 8.
-      The differences from the step-7 follow-up's 110511 and 110563 are the
-      29 tests of the round trip and two new `buffered_flags`
-      assertions. The thread-independence digests are unchanged. The
-      docs build.
-- **M12 — Rotating symmetry.** *(Specified 2026-10-03. Done 2026-10-03.)*
-  A 90° rotating symmetry about the axis where the low faces of two
-  dimensions meet: one quadrant of the plane is simulated, as Cactus's
-  RotatingSymmetry90 does, for a spinning black hole, which no
-  reflection in `x` or `y` maps onto itself; with M10's reflection at
-  `z = 0` it gives an octant. `rotating = (d1, d2)` on the forest,
-  `rotation` on the field set, the oriented neighbor search with
-  conformity at the seam, the virtual-frame transfers with the axis map
-  and the signed variable map, and `RotationPair` for the field sets
-  whose layout is not symmetric in the plane, all as specified under
-  [Domain and boundaries](#domain-and-boundaries) and "Rotating seams"
-  in [Ghost filling](#ghost-filling), with the additions under
-  [Conservation](#conservation-at-coarse-fine-faces),
-  [Point interpolation](#point-interpolation) and
-  [Checkpoint and restart](#checkpoint-and-restart). It comes after
-  M7, so unlike M10's mirrored transfers, which M7 distributed as the
-  ordinary transfers they are, the rotated ones are distributed by M12
-  itself; the MPI path needs the pack to permute and the unpack to
-  sign, and nothing else. The change is additive — new
-  keywords and one new export — so it is a `0.1.x` release, 0.1.7.
-  *Accept:*
-  - **refusals**, each with its reason: every case listed for the
-    forest and the field set under
-    [Domain and boundaries](#domain-and-boundaries), a leaf list that
-    is not conforming at the seam, an asymmetric set filled alone where
-    it has seam ghosts, and a `RotationPair` that is mismatched or
-    whose maps compose to anything but the identity;
-  - **the neighbor oracle**: the quadrant's oriented neighbors equal the
-    images of the neighbors in an independently built *unfolded* forest
-    of `2M × 2M` roots over `[−L, L]²`, made by rotating the quadrant's
-    leaves with exact `Rational` boxes rather than with the package's
-    arithmetic, on random refinements and then after `balance!`; the
-    unfolded forest is 2:1 balanced by the oracle, and the seam is
-    conforming;
-  - **no ghost undefined, and none read before it is defined**:
-    `NaN`-prefilled storage with finite owned data has no `NaN` after
-    one fill, in `D = 2` and in `D = 3` with `z` periodic, outer or
-    reflecting at its low face, for every centering symmetric under the
-    swap;
-  - **`rotating_vs_quadrupled`**, the definitional test after
-    `reflecting_vs_doubled`: data covariant under the quarter turn and
-    not polynomial — a scalar built from invariants such as
-    `x⁴ − 6x²y² + y⁴`, and a vector field — on a refinement symmetric
-    under the rotation that reaches the seam and the axis, where every
-    stored point, ghosts included, equals the full domain's within
-    `1e-13`, compared with `==` semantics so that `−0` counts; cell and
-    vertex centering, `D = 2` and `3`; and the same for a paired
-    face-centered `(B_x, B_y)` with `G > 0`, against the full domain
-    filled set by set;
-  - **write counts**: the schedule partitions the stored points, zero
-    writes at owned points and one everywhere else, and every hook
-    region's virtual position leaves through an outer face;
-  - **the wave equation on a quadrant against the full box**, a scalar
-    and a two-component vector wave that exercises the mixing: the same
-    number of steps, `linf` equal to the full box's to `rtol = 1e-8`,
-    the vertex-centered seam planes at `x = 0` and `y = 0` equal to each
-    other — asserted as measured, bitwise if it holds — and the rate 2;
-  - **a regrid across the seam**: conformity kept, no block moved by
-    more than one level, and the ghosts afterwards equal to the
-    oracle's;
-  - **conservation through the seam**: advection by the rigid rotation
-    `v = (−y, x)`, with face flux sets (`G = 0`, asymmetric, filled
-    alone) and the fixup, conserves mass to roundoff while the field
-    crosses the seam;
-  - **interpolation beyond the seam**: the value and first derivatives
-    of the covariant vector field at `r = 1, 2, 3`;
-  - **checkpoints**: a round trip, a restart that continues byte for
-    byte, and the old fixtures still loading;
-  - **MPI in process**: a lockstep rotated pack and unpack in
-    `exchange_tests.jl`, bitwise, with a rotated `−0`, and rotating
-    cases in `regrid_exchange_tests.jl` and
-    `interpolate_exchange_tests.jl`;
-  - **the MPI workload**: a rotating case and a pair case in
-    `mpi_workload.jl` at `-n 2` and `-n 3`, with seam transfers that
-    cross ranks and a rank without blocks;
-  - a rotating cycle in `thread_workload.jl`, and a rotating fill in
-    `gpu_tests.jl`; `mpi_device_tests.jl` run by hand on Metal.
-
-  Measured, as for every milestone: ordinary fills unchanged in time and
-  allocation in `bench/ghosts.jl`, the quadrant against the full domain,
-  the suite's cost, and TreeWave and TreeHydro against a scratch copy
-  that develops this checkout. In steps, each ending green and
-  committed, with what it measured in the commit body:
-  - **Step 0 — specification.** *(Done, 2026-10-03.)* The sections
-    above, before any code.
-  - **Step 1 — forest.** *(Done, 2026-10-03.)* The keyword and its
-    refusals, the oriented neighbor search, conformity in `balance!`,
-    the checked `leaves` path and `isbalanced`, and the forest digest.
-    The field, with `bench/ghosts.jl`'s allocation before and after, and
-    the fold into one field with `reflecting` if a ninth field costs
-    again (see "The buffer pool" under
-    [Distributed meshes](#distributed-meshes)); the outcome is recorded
-    here either way.
-    - *What was built.* `Forest(…; rotating = (d1, d2))` with every
-      refusal listed under [Domain and boundaries](#domain-and-boundaries);
-      `neighbor_anchor` as the one place the seam's arithmetic lives, in
-      global level coordinates, returning the orientation; the internal
-      `oriented_neighbors(forest, k, δ) -> (r, keys)`, of which
-      `neighbor_keys` returns the keys, so `remote_neighbors`,
-      `buffer_recruits`, `balance!` and `isbalanced` see the seam
-      through it; `real_direction` and `virtual_offset` (the table under
-      "Rotating seams"); the seam rule in `balance!`, whose `level ≥ 2`
-      shortcut now lets a level-1 leaf of a rotating forest through;
-      the conformity refusal in the checked `leaves` path; `rotating` in
-      the digest's brick. Until step 3, `GhostSchedule`,
-      `InterfaceSchedule`, `interpolate` and `save_checkpoint` refuse a
-      rotating forest ("not implemented yet in this step of M12"), so
-      that no commit builds unrotated transfers across the seam or
-      writes a checkpoint that would load without it; the later steps
-      remove each refusal as they teach its reader the orientation.
-    - *The field* (measured on the laptop, Julia 1.13.1, `-t 4`,
-      defaults `D = 3`, `N = 8`, 4 roots, 10 variables, `p = 4`; bytes
-      allocated per call, the median time of two runs). Before:
-      uniform `fill_ghosts` 50208 B in 0.52 ms and `ghost_schedule`
-      441888 B in 0.24–0.27 ms; two-level 310144 B in 4.03–4.06 ms and
-      4976688 B in 2.65 ms. With `rotating::NTuple{2,Int}` the builds
-      allocated 442048 and 4981584 B (+160, +4896). With
-      `NTuple{2,Int8}`, and with the whole of step 1, every number is
-      the baseline's: 50208, 441888, 310144 and 4976688 B, in 0.52,
-      0.24–0.30, 4.1–4.3 and 2.63–2.65 ms, inside the run-to-run noise.
-      The forest keeps its nine fields; no fold.
-    - *Tests.* `test/rotate_tests.jl`, after `reflect_tests.jl`, with
-      the unfolded-forest oracle at the end of `ghost_oracles.jl`
-      (`unfolded_forest`, `seam_neighbor_mismatches`,
-      `seam_conforming`): the refusals; the direction and offset maps
-      against turned boxes; the oriented neighbors against the unfolded
-      forest's, every leaf and every direction, on random quadrants
-      before and after `balance!` in `D = 2` and in `D = 3` with the
-      third dimension outer, periodic or reflecting below, over four
-      orderings of the pair, every `(r, kind)` met; the unfolded forest
-      balanced and the seam conforming; the conformity refusal and its
-      acceptance after `balance!`; `complete_marks` moving no leaf by
-      more than one level across the seam, with a buffer of 0 and 1;
-      and mutual adjacency with `remote_neighbors` over cuts of the
-      leaves. Deliberately breaking `virtual_offset` or
-      `real_direction` (exchanging `r = 1` and `3`) makes the oracle
-      report 58 mismatches on six balanced quadrants. The file holds
-      885 tests and runs in about 10 s, nearly all compilation. The
-      suite: 111503 tests at one thread in 8m12 (`Pkg.test`), every one
-      passing; the docs build, doctests included.
-  - **Step 2 — field sets.** *(Done, 2026-10-03, with step 3.)*
-    `rotation`, the factor and `rotvars` tables, `RotationPair`.
-    - *What was built.* `FieldSet(…; rotation)`, required on a rotating
-      forest and checked as recorded under
-      [Domain and boundaries](#domain-and-boundaries) (step 2's note
-      there says where each check lives). Two fields, `rotation` (the
-      checked map) and `rotvars` (`nvars × 4` `Int32`, the composed
-      variable `σ_r(v)` in column `r + 1`, on the backend), and
-      `factors` grown on a rotating forest to `nvars × 3^D·4`, column
-      `mirror column + 3^D·r`, each entry the target variable's parity
-      factor times the sign of `Q^r`, formed in integers so that a zero
-      is `+0`; `r = 0` is M10's table unchanged (`seamtables`). A
-      symmetric set composes its own map three times; an asymmetric
-      set alone holds zero factors and the identity for `r ≥ 1`, which
-      no fill reads, since a plain fill refuses it. `RotationPair(a, b)`,
-      exported, with every refusal of the design and one more (two
-      symmetric sets: each turns into itself), builds both members'
-      tables by alternating the maps, `(Q_a, Q_b, Q_a)` for `a`'s
-      targets.
-  - **Step 3 — schedule and kernel.** *(Done, 2026-10-03.)* The
-    orientation in the group key and the axis map in the group, the
-    rotated source accessor, the oriented source search, the single and
-    paired fills, and `show`.
-    - *What was built.* `GroupKey` gained `orientation::Int8`, last in
-      `keyorder` (the old constructors give 0), and `TransferGroup`
-      gained `orientation` and `plane` (see the amendment under "Ghost
-      filling"). `block_sources!` and `mirror_sources!` search with
-      `oriented_neighbors`, take a finer source's offset into the
-      virtual frame (`seam_offset`), filter the wall side on it, and
-      record `r`; a region with no source is the hook's whatever its
-      `r`. `factorcol` is `mirror column + 3^D·r` whenever either is
-      nonzero. In the kernel the source accessor
-      `RotatedSource = (src, perm, flip, len, vars, col)` maps a
-      virtual stored index to the real one (a run-time `perm` is read
-      through a chain of selects, `tuplepick`, not a run-time tuple
-      index) and reads `vars[v, col]`; `run_group!` builds it only for
-      `orientation ≠ 0`, in a branch of its own, so an ordinary launch
-      is the code it was. `altsrc` (the array odd orientations read:
-      the partner's in a pair, the set's own otherwise) and `rotvars`
-      are threaded through `run_group!`, `run_phase!`, `pack_stage!`
-      and `run_stage!` beside `factors`. A rotated pack carries the
-      orientation and the plane and computes the unscaled sum through
-      the accessor; its unpack is the plain width-1 copy with the
-      factor column, now holding the sign, so the serial `−0` stays
-      bitwise. The step-1 refusal is gone from `GhostSchedule`; the
-      plain fill refuses an asymmetric set with ghosts in the plane,
-      naming the pair; `fill_ghosts!(pair, (sa, sb); boundary)` runs
-      the merged stages (`exchange_pair!`), with one hook or two;
-      `show` says "N rotated transfers" when there are any (and counts
-      as mirrored only the groups whose mirror state is nonzero).
-    - *Deviations*, each amended where the design states it: the
-      odd-orientation refusal is decided from the layout, not recorded
-      on the schedule; the group holds the orientation and the plane,
-      not an `AxisMap`; the `G = 0` asymmetric case has no ghost
-      schedule at all; and in 2D a half turn is only ever a copy (a
-      region beyond both low faces belongs to the block at the axis,
-      whose image there is itself), so rotated restrictions and
-      prolongations at `r = 2` occur in 3D only, across the third
-      dimension.
-    - *The schedule build.* Building the groups inline, with the
-      element type a run-time value there, made the new small fields
-      a dynamic call's boxed arguments, 448 bytes more per build in
-      `bench/ghosts.jl`. The groups are now built behind a function
-      barrier (`local_groups`), where the type is static, which also
-      removes the run-time type construction the build always did per
-      group.
-    - *Measured* (laptop, Julia 1.13.1, `-t 4`, `bench/ghosts.jl`
-      defaults, bytes per call, two runs). Fills: uniform 50208 B in
-      0.52–0.53 ms, two-level 310144 B in 3.8–4.2 ms, against 50208 B
-      in 0.51 ms and 310144 B in 3.9 ms before, so unchanged. Schedule
-      builds: 406592 B in 0.18–0.25 ms and 4653648 B in 2.08 ms,
-      against 441888 B in 0.22 ms and 4976688 B in 2.63 ms: 8 % and
-      6 % fewer bytes, and the two-level build 21 % faster, from the
-      barrier. The quadrant against the full plane, every stored point:
-      worst 2.2e-16 in 2D and 8.9e-16 in 3D (cell and vertex, both
-      orders of the pair, the third dimension periodic, reflecting or
-      outer), and 4.4e-16 for the pairs (face-centered `(B, F)` with the
-      variables in swapped orders, `F` odd about a reflecting wall, and
-      a cell-centered pair whose ghost widths alone are swapped) — not
-      zero, since the formula's covariance is itself only to roundoff.
-      The polynomial data of the `NaN` test is reproduced to 1e-10 or
-      better in every case, with no `NaN` left. By hand (not yet in the
-      suite; step 7), the lockstep driver of `exchange_tests.jl` over
-      2, 3 and 5 simulated ranks reproduces the serial fill bit for
-      bit, a symmetric set and a pair, in 2D and 3D, with 40 to 3184
-      rotated `−0`s per case.
-    - *Tests.* In `test/rotate_tests.jl`, with the oracles at the end of
-      `ghost_oracles.jl` (`rotating_data`, `rotating_forest`,
-      `undefined_rotated_ghosts`, `rotating_vs_quadrupled`,
-      `rotating_pair_vs_quadrupled`, `hook_regions_leave`): the
-      refusals of `rotation` and of `RotationPair`; the tables against
-      hand-composed turns, and their `r = 0` block against M10's; the
-      `NaN` test over every symmetric centering, `p = 2` and 4, `D = 2`
-      and 3 with the third dimension periodic, outer and reflecting,
-      every `(kind, r)` met; the quadrant and the pair against the full
-      plane; the write counts and the hook regions, pairs included; and
-      the plain fill's refusal and `show`.The file
-      holds 1092 tests (885 after step 1) and runs in about 30 s at one
-      thread and at four, nearly all compilation (the `NaN` test's 3D
-      cases alone compile 12 s and compute 1.2 s, which is why the
-      other orders of the pair there run cell and vertex only). The
-      suite: 111710 tests at one thread in 6m51 (`Pkg.test`), every one
-      passing; the docs build, doctests included.
-  - **Step 4 — regrid, initial data and the interface schedule.**
-    *(Done, 2026-10-03.)*
-    - *What was built.* `regrid!` takes `pair => (sa, sb)` and fills the
-      pair before its two transfers (`regrid_steps`); `check_regrid`
-      checks both members as it checks a set (`check_regrid_set!`), adds
-      the pair to the agreed layout, and refuses a plain asymmetric set
-      with ghosts in the plane, with the pair named.
-      `adapt_to_initial_data!` gained a pair form (amended under "Rotating
-      seams"); both forms share `adapt_criterion`. The interface
-      schedule's step-1 refusal is gone, its search is oriented, and a
-      seam restriction is a bug check (amended under
-      [Conservation](#conservation-at-coarse-fine-faces)).
-    - *Measured.* A regrid of the quadrant against a regrid of the full
-      plane to the turned image of the quadrant's new leaves, the full
-      plane's flags derived from the quadrant's moves in `Rational` boxes
-      (`rotating_regrid_vs_quadrupled`): three passes — refine along the
-      low face of `d1` near the axis, which conformity carries to the
-      low face of `d2`; coarsen everything at level 2; refine along the
-      low face of `d2` — take the 2D quadrant through 31, 16 and 34
-      leaves and the 3D ones through 134 (or 176), 57 and 246. After
-      every pass every leaf moved by at most one level, the quadrant is
-      balanced and conforming, the full plane's leaves are exactly the
-      four turns of the quadrant's, and every stored point after a fill
-      equals the full plane's: worst 1.1e-15 in 2D and 3.6e-15 in 3D,
-      cell, vertex and the face-centered pair, with the third dimension
-      reflecting below or periodic. Without the pair's fill before the
-      transfer the same comparison is off by 1.5. The interface
-      schedule and the conservation test are recorded under
-      [Conservation](#conservation-at-coarse-fine-faces).
-    - *Tests*, in `test/rotate_tests.jl` with the regrid oracle at the
-      end of `ghost_oracles.jl` (`quadrant_preimage`, `regrid_move`,
-      `formula_hook`, `rotating_regrid_vs_quadrupled`): the regrid
-      against the full plane in `D = 2` and 3; the refusals and a pair's
-      regrid, after which the pair fills again; the initial-data cycle
-      on a quadrant, alone (3 passes to level 2) and as a pair, each
-      reproducing polynomial data to 1e-10 after a fill; the interface
-      schedule against the seamless leaves and its bug check; and the
-      rigid-rotation advection, both orders of the pair. The file holds
-      1334 tests (1092 after step 3) and runs in 50 s at one thread and
-      42 s at four.
-  - **Step 5 — interpolation.** *(Done, 2026-10-03.)*
-    - *What was built.* The step-1 refusal is gone. `PointGeometry`
-      carries the seam's pair; `fold_point` folds periodic and
-      reflecting coordinates and then turns a point beyond the seam
-      back, returning the orientation (amended under
-      [Point interpolation](#point-interpolation)); `locate_point`,
-      the kernel and M7's host routing share it. The kernel reads
-      variable `rotvars[v, r + 1]` and the factor column
-      `mirror + 3^D·r`, and contracts with the exchanged multi-indices
-      for an odd `r` (`contract_point!`, split out of
-      `interpolate_point!` so that both calls see constant indices). A
-      set with an asymmetric layout is handed no variable table and
-      refuses a point beyond the seam after the launch, with the reason
-      and the partner named. `inside`, `stencil_hits` and
-      `stencil_position` are unchanged.
-    - *Measured.* Polynomial data of degree 3 per dimension, which every
-      operator and `Lagrange(4)` reproduce, at the images of 60 points
-      under every turn (and the mirror below `z = 0` where `z` reflects),
-      values and all first derivatives against the formula and its
-      complex-step derivatives: within 1.6e-14 in 2D and 2.4e-14 in 3D,
-      cell and vertex, both orders of the pair, the third dimension
-      reflecting below or periodic. The value at a turned point is the
-      preimage's, turned, **bit for bit**, every variable and derivative.
-      Smooth data at 400 random points of the whole plane: within
-      1.3e-16 of the full plane's value at the preimage, turned; at the
-      point itself within 3.4e-14 for cell centering and 4.2e-3 (2D) and
-      5.5e-3 (3D) for vertex centering, values and gradients, about 6e-5 for
-      the values alone, which is the full plane's own lack of covariance
-      (amended under [Point interpolation](#point-interpolation)).
-      `vars = [3, 2]` returns the same numbers bit for bit. Float32: the
-      turned identity holds bit for bit there too, an `exclude` region
-      flags a turned point as its preimage, and the values are within
-      7.9e-6 of Float64's. Deliberately contracting an odd turn with the
-      unexchanged derivatives puts the polynomial comparison off by 3.4.
-    - *The ordinary path* (`bench/interpolate.jl`, laptop, Julia 1.13.1,
-      defaults, two runs each against the 0.1.6 release): unchanged
-      within the noise — at one thread 783–859 ns per point against
-      799–919, at four 217–306 against 226–465, `locate_point` 96 ns
-      against 93–97 — with 64 bytes more per batch (128 at four
-      threads), the two new kernel arguments. The first version of the
-      fold reassigned two tuples that its closures captured, which boxed
-      them: 930 bytes allocated per point and 1.6x the time, on every
-      forest. On a rotating quadrant (2D and 3D, `N = 16`, vertex,
-      value and gradient, 49600 points) a batch allocates what an
-      ordinary one does, and points spread over the whole plane, three
-      quarters of them turned, cost 94 ns per point in 2D and 559 in 3D
-      at one thread, against 75 and 455 for points inside the quadrant.
-    - *Tests*, in `test/rotate_tests.jl`: the turned field in `D = 2` and
-      3 (`turn_matrix`, `turned_values`, `complex_step`), Float32 with a
-      region, and the asymmetric set's refusal, the outside points with
-      the seam named, and `locate_point` beyond the seam. The file holds
-      1388 tests (1334 after step 4) and runs in 60–84 s at one thread
-      and 53–60 s at four. The suite, run once for steps 4 and 5
-      together: 112006 tests at one thread in 8m27 (`Pkg.test`; 111710
-      in 6m51 after step 3, on a machine less loaded), every one
-      passing; the docs build, doctests included.
-  - **Step 6 — checkpoint.** *(Done, 2026-10-03.)*
-    - *What was built.* The step-1 refusal in `save_checkpoint` is gone,
-      and with it the last caller of `refuse_rotating`, which went too.
-      A forest with a seam writes `rotating`, `Int64[d1, d2]`, in
-      `forest/`, and the file lists `features = ["brick", "rotating"]`;
-      one without writes neither and lists `["brick"]`, as before M12,
-      so that every file an unrotated run writes is still readable by
-      0.1.6. The reader knows both features (`FEATURES`) and builds the
-      forest with `rotating` through the checked `leaves` path. A field
-      set with a map writes `rotation`, `Int64[nvars]`, in its group,
-      read back into the constructor; the map is part of the save's
-      agreed layout (`set_layout`). Both attributes are read only where
-      present, so the version-1 fixtures and every version-2 file of
-      0.1.6 load as before (amended under
-      [Checkpoint and restart](#checkpoint-and-restart)).
-    - *Measured.* A quadrant with a symmetric vertex-centered set and
-      a face-centered `RotationPair`, in 2D in `Float32x2` (polynomial
-      data, which has no `sin`) and in 3D in `Float64` with a reflecting
-      low face, round-trips bit for bit: the forest's pair, every set's
-      map, `rotvars` and factor table, the state, and the working arrays
-      after the same fill, the pair's through a pair rebuilt from the
-      loaded sets. A quadrant wave — a ring about the axis, vertex-
-      centered, refined where it is large, with a pair riding through
-      every regrid as a pair — runs four chunks through 136, 142, 148,
-      160 and 178 leaves, 25 to 29 refined blocks on the seam faces, and
-      a restart after the second continues byte for byte, the wave and
-      both members of the pair. The file without its feature, without
-      its seam, with an unknown feature, with a pair out of range or not
-      a pair, with a map that is not a signed permutation, of the wrong
-      length, or missing, is refused with the reason each time.
-    - *Tests*, in `test/checkpoint_tests.jl`, after the restarts: the
-      round trip (`rotating_checkpoint_sets`), the restart
-      (`quadrant_start`, `quadrant_chunk`, `quadrant_restore`, through
-      `interrupted`), and the refusals; the step-1 refusal's test in
-      `rotate_tests.jl` is gone. The file holds 658 tests (593 before)
-      and runs in 77 s alone, the four new testsets about 10 s of it.
-  - **Step 7 — MPI.** *(Done, 2026-10-03.)* The pack and unpack, and
-    the workloads.
-    - *What was built.* Nothing in `src/`: the rotated pack and unpack,
-      the merged stages of a pair and the agreed refusals came with
-      steps 3–5, and step 7 is their tests in process and over MPI. The
-      transfer oracles of `exchange_tests.jl` carry the orientation
-      (the pack supplies it, the unpack must be a plain copy with
-      orientation 0), and `lockstep_pair!` runs a pair's stages merged
-      as `fill_ghosts!(pair, …)` merges them. The paired fill's shared
-      tags are safe as specified (amended under "Rotating seams" in
-      [Ghost filling](#ghost-filling)).
-    - *In process.* On the quadrants of `rotating_forest` — 10 leaves in
-      2D, 22 in 3D with the third dimension reflecting below and 29 with
-      it periodic, 21 of 73, 155 of 517 and 217 of 737 transfers
-      rotated — over 2, 3 and 5 simulated ranks, for a scalar and
-      vector, cell- and vertex-centered, and for both members of a
-      face-centered pair: the local and the sent-and-received transfers
-      are the serial ones with their orientations and factor columns,
-      both ends of every message derive one layout, and every point is
-      written once per stage; 6, 8 and 14 rotated transfers cross
-      ranks in 2D at 2, 3 and 5 ranks, 45–125 in 3D. In lockstep, and
-      through `MailboxCommunicator` at 3 and 5 ranks, every rank's
-      array, ghosts included, is the serial fill's bit for bit, the
-      single set's and the pair's, with the turned `−0` of a zero
-      component kept (38 to 609 per serial fill of a single set, 84 to
-      996 of a pair). Over
-      `GatherCommunicator`, `regrid!` of a single set and a pair
-      together at 3 and 5 ranks, and `adapt_to_initial_data!` from one
-      leaf at the axis at 3 ranks (two empty), alone and as a pair, give
-      the serial leaves, passes and arrays bit for bit; routed
-      `interpolate` over the whole plane (three quarters of the points
-      turned back) is the serial one bit for bit at 3 ranks and at more
-      ranks than leaves, and a point beyond the seam of a pair's member
-      on one rank is refused on all three, that rank with its reason.
-    - *Over MPI.* `mpi_workload.jl` gained a rotating quadrant: the
-      wave, vertex-centered in 2D (`Q2v`, 27 leaves) and cell-centered
-      in 3D over a reflecting low face (`Q3c`, an octant, 57 leaves); a
-      single set with a zero `v_2` and a pair with zero second variables
-      through a fill, a regrid that refines along the seam and coarsens
-      off it, interpolation of 257 points of which 193 are turned back,
-      and a checkpoint saved and loaded at this rank count and at the
-      others (`rotating_cross`, `QC`), the pair rebuilt and refilled to
-      the bytes it had (`Q2`); a single leaf at the axis (`QE2`), which
-      leaves every rank but one empty, through the fill, the wave, a
-      pair's fill, interpolation from rank 0 alone, a refinement that
-      gives every rank blocks, the coarsening back and a checkpoint;
-      and two refusals on rank 1 only, a point beyond the seam of a
-      pair's member and such a member regridded alone where the others
-      regrid the pair, each refused on every rank. Run by hand,
-      serially in 53 s and at `-n 3` and `-n 2` (one thread a rank)
-      in 66 s and 63 s against about 55 s before, every line agrees but
-      the `#` lines, and the sums to `rtol = 1e-12`; 66 rotated
-      transfers cross ranks at `-n 3`, 18 at `-n 2`. `mpi_tests.jl`
-      asserts the new lines: 206 tests (179 before), in 1m11 alone on
-      the concurrent path.
-    - *Collective refusals.* Every refusal M12 added was checked for
-      one rank refusing alone. The forest's are local and see the same
-      arguments and the same replicated leaves on every rank. The field
-      set's `rotation` and `RotationPair`'s checks are local, as every
-      field-set check is, and depend only on the arguments; the plain
-      fill's refusal of an asymmetric set depends on the layout alone
-      (amended in step 3), so `fill_ghosts!`'s checks stay rank-local
-      on purpose. `regrid!`'s pair checks and its refusal of an
-      asymmetric set alone run inside `collective_checks`, and
-      `interpolate`'s refusal beyond the seam is decided on the host
-      before the routing and agreed with the outside points; the
-      workload shows both refused on every rank. The checkpoint's map
-      is in the agreed layout (step 6). As with `parity`, a `rotation`
-      that differs between ranks is not caught: the schedule is built
-      from the forest and the layout, not from the map, so it would
-      fill wrong data without a hang; recorded, not changed.
-    - *Tests.* `exchange_tests.jl` 9840 tests (9491 before) in 49 s
-      alone (38 s), `regrid_exchange_tests.jl` 1951 (1857) in 31 s
-      (24 s), `interpolate_exchange_tests.jl` 298 (204) in 16 s (14 s),
-      `mpi_tests.jl` 206 (179). The suite, run once for steps 6 and 7:
-      112635 tests at one thread in 7m27 (`Pkg.test`; 112006 in 8m27
-      after step 5), every one passing; the docs build, doctests
-      included.
-  - **Step 8 — threads and device, and the wave.** *(Done, 2026-10-03.)*
-    - *The wave on a quadrant against the full plane*, the acceptance
-      test left from the list above (`test/rotate_tests.jl`,
-      `rotating_wave`): the scalar wave and a two-component vector wave,
-      state `(v_x, v_y, ∂ₜv_x, ∂ₜv_y)` with `rotation = (−2, 1, −4, 3)`,
-      on the quadrant of `quadrant_and_full` (refinement to level 2 along
-      both seam faces and at the axis) and on the full plane, order 4,
-      RK4 to a quarter period, the exact solution in the hook on the
-      outer faces of both. The exact solution is the sum of the four
-      turns of one standing mode with no symmetry of its own, summed as
-      `(t₀ + t₂) + (t₁ + t₃)`: at the turned point the terms come round
-      as `(t₁ + t₃) + (t₂ + t₀)`, the same bits, since floating-point
-      addition commutes; so the data is covariant bit for bit, and so is
-      its gradient, the vector. The Laplacian adds the two neighbours
-      before subtracting `2u₀`, which makes a point and its image compute
-      the same bits too. *Measured* (`N = 16`, 143 steps on both):
-      cell-centered, `linf` 0.0046035106829825 on the quadrant against
-      0.0046035106829834 on the plane, and every stored point, ghosts
-      included, within 1.9e-13 of the plane's (4.2e-13 for the vector).
-      Vertex-centered, `linf` agrees to the last bit, but the stored
-      points differ by 1.9e-4 (vector 3.2e-4), and that is the *full
-      plane's* fault: its solution is not covariant itself, by 2.0e-3
-      (3.7e-3) under a turn, because which block owns the shared plane
-      of a coarse-fine face — the one above it — does not turn with the
-      mesh, so a plane the coarse block evolves becomes, a half turn
-      away, one the fine block evolves. The quadrant is covariant by
-      construction; the test asserts it within the plane's own defect.
-      The vertex-centered quadrant owns both seam planes, `x = 0` and
-      `y = 0`, which are the same 63 points under the turn: after the
-      evolution they are equal **bit for bit**, scalar and vector. Rates
-      on the quadrant over `N = 8, 16, 32`, `l2` and `linf`: cell 2.04
-      and 2.01 (scalar), 2.02 and 2.00 (vector); vertex 2.04 and 2.00,
-      2.02 and 2.00. The two testsets take about 12 s, mostly
-      compilation.
-    - *Threads.* `thread_workload.jl` gained two rotating quadrants,
-      cell-centered with `G = 2` (`D2ocq`) and vertex-centered with
-      `G = 1` (`D2ovq`): a ring about the axis, so that the refinement
-      reaches both seam faces and the axis, through the adapt, evolve,
-      regrid, evolve cycle, interpolation over the whole plane, and a
-      face-centered `RotationPair` filled as a pair (39 rotated
-      transfers in the final schedule). Its output is the same at one
-      thread and at four; the script takes 26.7 and 25.4 s.
-    - *Device.* `gpu_tests.jl` gained a rotating fill — the `NaN` test
-      of `undefined_rotated_ghosts`, cell and vertex, in 2D and in 3D
-      over a reflecting low face, and a face-centered pair against the
-      CPU — and interpolation through the seam against the host. The
-      oracles' formulas had to be made device-clean: their constants are
-      now converted to the argument's real type (`literal`), the data
-      closure carries the third dimension's kind as a `Val` (a `Symbol`
-      is not plain data), and `outofplane` no longer builds a `Set`;
-      `Float64` results are unchanged bit for bit. On this laptop's
-      Metal GPU (`Float32`, a scratch environment that develops this
-      checkout and adds Metal): the rotating testsets pass, 23 tests on
-      Metal and 46 on the CPU in 43 s, compilation included, and the
-      `NaN` fill reproduces the polynomial data to 3.6e-7 in 2D and
-      8.3e-7 in 3D on Metal, as on the CPU in `Float32`.
-      `mpi_device_workload.jl` gained a rotating quadrant (`Q2v`, 15
-      leaves, the vertex-centered wave) and a face-centered pair
-      (`QP2`); `mpi_device_tests.jl` passes on Metal, 60 tests in 1m59
-      (serial 35 s, `-n 2` 41 s, `-n 3` 42 s; 1m45 before M12), with 8
-      staged messages for `Q2v` and 16 for `QP2` at `-n 3`.
-  - **Step 9 — measurements**, as listed above. *(Done, 2026-10-03.)*
-    All on the laptop (Apple silicon, 12 cores), Julia 1.13.1 unless
-    stated.
-    - *The ordinary fill.* `bench/ghosts.jl` at `-t 4` with its defaults
-      (`D = 3`, `N = 8`, 4 roots, 10 variables, `p = 4`), this checkout
-      against a pristine copy of 0.1.6 with the same manifest, run
-      alternately twice each; seconds and bytes per call:
-
-      | | 0.1.6 | M12 |
-      |---|---|---|
-      | uniform `fill_ghosts` | 0.641, 0.635 ms; 50208 B | 0.516, 0.517 ms; 50208 B |
-      | uniform `ghost_schedule` | 0.217, 0.219 ms; 441888 B | 0.143, 0.141 ms; 406592 B |
-      | two-level `fill_ghosts` | 3.81, 3.77 ms; 310144 B | 3.53, 3.53 ms; 310144 B |
-      | two-level `ghost_schedule` | 2.52, 2.50 ms; 4976688 B | 1.86, 1.87 ms; 4653648 B |
-
-      A fill allocates exactly what it did, and it is not slower: 19 %
-      and 7 % faster in these runs, a difference not investigated (step
-      3 measured the fills equal, 0.52 against 0.51 ms, on a quieter
-      machine). The schedule builds are 8 % and 6 % smaller and 35 % and
-      26 % faster, from step 3's function barrier (`local_groups`).
-    - *The quadrant against the full plane*: step 8, and the single
-      fills of steps 3–5.
-    - *The suite.* 112715 tests at one thread in 7m52 (`Pkg.test`, 8m01
-      wall clock) and 112767 at eight threads in 7m33 (7m43), every one
-      passing, against 110606 in 6m32 and 110658 in 6m28 after M7. On
-      Julia 1.11.9, on a copy without manifests (the procedure in
-      `CLAUDE.md`): 112715 tests in 8m09, every one passing. M12 added
-      about 2100 tests; `rotate_tests.jl` holds 1421 of them and takes
-      about 56 s alone at four threads, nearly all compilation.
-    - *Downstream*, each in a scratch copy whose `Project.toml` and
-      `test/Project.toml` name this checkout under `[sources]`, the real
-      repositories untouched: TreeWave 310 tests in 1m17 (1m22 against
-      M7), TreeHydro 12447 tests in 5m08 (5m00), both at one thread and
-      all passing; neither uses the seam. TreeGeneralizedHarmonic's
-      suite takes about 19 minutes, so only its `prerequisite_tests.jl`,
-      which names the unexported TreeAMR functions it relies on, was run:
-      52 tests, passing.
-  - **Step 10 — documentation and status.** *(Done, 2026-10-03.)* The
-    `rotating` keyword is documented in `Forest`'s docstring and
-    `rotation` in `FieldSet`'s, both already on their pages, and
-    `RotationPair` is on the storage page; the guide gained a section,
-    "Rotating symmetry", with a doctest of a quadrant, a velocity's map
-    and a face-centered pair; README and the guide's status say M12;
-    `CLAUDE.md` gained the architecture bullet "Rotating seams are
-    oriented transfers", the oracles and the workloads in its tests
-    paragraph, and the new timings. The docs build, doctests included.
-    The repository keeps no changelog; the release commit says what
-    changed. M12 is additive — the keywords `rotating` and
-    `rotation`, the export `RotationPair`, the pair forms of
-    `fill_ghosts!`, `regrid!` and `adapt_to_initial_data!`, and a
-    checkpoint feature that only a rotating forest writes — so it is a
-    `0.1.x` release: *released as 0.1.7 (2026-10-04)*, together with the
-    interpolator's second derivatives from `main`.
-- **M9b — Visualization export.** *(Split from M9, "I/O and
-  visualization", on 2026-09-29, when its checkpoint half became M9a;
-  not designed.)* After M7. The candidates:
-  - an XDMF sidecar that describes the checkpoint's own datasets as
-    hyperslabs, for ParaView and VisIt (it grows by one grid per block);
-  - VTKHDF `OverlappingAMR` with restricted parents added, which turns
-    leaf-only data into a real overlapping hierarchy and gives level of
-    detail for about 1/7 more storage in 3D (ParaView only);
-  - Conduit Blueprint through Conduit.jl, for VisIt;
-  - a Parthenon-compatible export, which yt reads directly;
-  - sampling onto output grids (slices, a uniform box) through M11's
-    `interpolate`.
-
-  An in-file view goes in a top-level group of its own and points at
-  the checkpoint's datasets without copying them, through links or
-  virtual datasets, as the layout under
-  [Checkpoint and restart](#checkpoint-and-restart) leaves room for.

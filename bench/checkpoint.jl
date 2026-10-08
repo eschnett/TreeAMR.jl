@@ -57,7 +57,7 @@
 # Every save is checked, untimed, by a load that must return the saved
 # leaves and state bit for bit on every rank, so a file damaged while it
 # was written cannot pass (on a cluster file system one did: "Parallel
-# checkpoints" under "Distributed meshes" in CODE.md, M7 step 6). The
+# checkpoints" in HISTORY.md, M7 step 6). The
 # load verifies the file's checksums too, and refuses damage with its
 # reason.
 #

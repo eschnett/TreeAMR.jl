@@ -7,8 +7,9 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://eschnett.github.io/TreeAMR.jl/dev)
 [![codecov](https://codecov.io/gh/eschnett/TreeAMR.jl/graph/badge.svg?token=IHXP23WQ1H)](https://codecov.io/gh/eschnett/TreeAMR.jl)
 
-See [CODE.md](CODE.md) for the full design document and the milestone
-roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
+See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
+for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
+package got here, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
 The package is currently at milestone **M12** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
@@ -28,6 +29,12 @@ reflecting face below `z = 0` it stores an octant.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
+
+**Contents**
+
+- [Overview](#overview)
+- [Installing](#installing)
+- [Testing](#testing)
 
 ## Overview
 

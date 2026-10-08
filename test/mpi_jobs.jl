@@ -4,7 +4,7 @@
 #
 # Each job runs `mpi_workload.jl` under `mpiexec` — three ranks, then two —
 # and is compilation-bound: some 55 s of wall clock a job, against a few
-# seconds of arithmetic (measured in step 9, "Suite cost" in CODE.md).
+# seconds of arithmetic (measured in M7 step 9, "Suite cost" in HISTORY.md).
 # Where the machine has room for both jobs beside the suite, they start
 # here, at the start of the suite, and compile on otherwise idle cores
 # while the rest of it runs; each then waits at its checkpoint loads for
