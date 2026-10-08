@@ -5,7 +5,8 @@ Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
 See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.md)
-for the full design and the milestone roadmap.
+for the full design, and [PLAN.md](https://github.com/eschnett/TreeAMR.jl/blob/main/PLAN.md)
+for the milestone roadmap.
 
 The package has completed milestone **M12**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
@@ -36,12 +37,13 @@ points, for a horizon finder or any other analysis that asks for values
 where the mesh has none (see [Interpolating to points](@ref)).
 
 M9a added checkpoint and restart, ahead of MPI because long runs need to
-resume before they need more nodes: [`save_checkpoint`](@ref) writes the
+resume before they need more nodes: `save_checkpoint` writes the
 forest, the evolved field sets and the application's own plain data to
-one HDF5 file, and [`load_checkpoint`](@ref) reads them into a fresh
-process, which continues bit for bit at any thread count. HDF5 is a
-weak dependency, loaded with `using HDF5` (see
-[Checkpoints and restarts](@ref)).
+one HDF5 file, and `load_checkpoint` reads them into a fresh
+process, which continues bit for bit at any thread count. Since TreeAMR
+0.2 they are the companion package
+[TreeIOHDF5](https://github.com/eschnett/TreeIOHDF5.jl), loaded with
+`using TreeIOHDF5`.
 
 M7 added MPI: one forest runs over many processes,
 `Forest(…; comm = MPI.COMM_WORLD)`, with the forest replicated on every
@@ -72,7 +74,7 @@ reference, one page per layer — [Tree and geometry](api/tree.md),
 [Storage](api/storage.md), [Ghost exchange and conservation](api/exchange.md),
 [ODE coupling](api/ode.md), [Regridding](api/regrid.md),
 [Point interpolation](api/interpolate.md),
-[Checkpoint and restart](api/io.md), [Distributed meshes](api/distributed.md)
+[Distributed meshes](api/distributed.md)
 and [Internals](api/internals.md) — with an
 [Index](api/genindex.md) of every documented name.
 
@@ -508,89 +510,6 @@ julia> interpolate(fs, [(0.3, 0.7), (0.6, 0.6)], Lagrange(4);
  1
 ```
 
-## Checkpoints and restarts
-
-A long run stops and resumes through a checkpoint: [`save_checkpoint`](@ref)
-writes the forest, the field sets the application evolves and its own
-run state to one HDF5 file, and [`load_checkpoint`](@ref) reads them into
-fresh objects in a new process — on any thread count and any backend —
-exactly. HDF5 is a weak dependency, so the two come with `using HDF5`.
-
-What is stored is what cannot be recomputed: the forest's parameters and
-leaf list, and each field set's layout and **owned** points. The ghosts
-are not stored, since they follow from the owned points, the operators
-and the boundary hook, and the last two are the application's own; after
-a load it fills them as it would at any right-hand side. The run state —
-the time, the chunk index, histories — goes in `data`, as plain data
-(see [`write_plain`](@ref)), and comes back as it went in:
-
-```jldoctest checkpoint
-julia> using TreeAMR, HDF5
-
-julia> forest = Forest((2, 2); N = 8, periodic = (true, true));
-
-julia> refine!(forest, forest.leaves[1]); balance!(forest);
-
-julia> fs = FieldSet(forest, 1; G = 2);
-
-julia> fill_by_coordinates!((x, v) -> sinpi(x[1]) * cospi(x[2]), fs);
-
-julia> u = statevector(fs); gather!(u, fs);
-
-julia> path = joinpath(mktempdir(), "run.h5");
-
-julia> save_checkpoint(path, forest; fieldsets = ("u" => (fs, u),),
-                       application = "MyApp" => 1, data = (; t = 0.25, chunk = 3));
-
-julia> ck = load_checkpoint(path);
-
-julia> ck.forest.leaves == forest.leaves
-true
-
-julia> ck.application, ck.data
-("MyApp" => 1, (t = 0.25, chunk = 3))
-
-julia> restored = ck.fieldsets["u"].fieldset;
-
-julia> ck.fieldsets["u"].state == u
-true
-
-julia> ops = Operators(prolongation = 4, restriction = 4);
-
-julia> fill_ghosts!(restored, GhostSchedule(restored, ops));
-
-julia> fill_ghosts!(fs, GhostSchedule(fs, ops));
-
-julia> restored.work == fs.work
-true
-```
-
-A checkpoint belongs at a chunk boundary, *after* the regrid, where a
-fixed-step integrator holds nothing but `(t, u)`: a restart then begins
-the next chunk with exactly what the uninterrupted run began it with.
-Pass `name => (fs, u)` for an evolved set — after `solve` its working
-array holds a stage, not the solution — and leave scratch sets such as
-fluxes out. The file is written beside `path` and renamed over it only
-when complete, so a failed write never destroys the previous checkpoint.
-A serial checkpoint is one file; a distributed one adds a part file per
-I/O process beside it (see [Running distributed](@ref)).
-
-Compression is HDF5's, through `filters`. None is the default and, by
-the measurements in the design document, the recommendation: smooth
-data compress only about 1.3-fold, at many times the cost. When size
-matters, `filters = (HDF5.Filters.Shuffle(), H5Zzstd.ZstdFilter(1))`,
-after `using H5Zzstd`, shrinks a state that is mostly uniform
-atmosphere about six-fold. A filtered file can be read only where its
-filter is loaded too.
-
-A software element type such as MultiFloats' `Float32x2` is stored as
-its limbs, and a load names it through `types = (Float32x2,)`. A file
-this version cannot interpret — a newer format version, an unknown
-feature — is refused with the reason and the TreeAMR version that wrote
-it, and [`checkpoint_environment`](@ref) writes out that version's
-`Project.toml` and `Manifest.toml`, so that `julia --project=dir` can
-read it.
-
 ## Threading
 
 Start Julia with threads and everything in the package uses them:
@@ -743,7 +662,7 @@ fs     = FieldSet(forest, 2; G = 2)
 ```
 
 Everything else is the code you would write for one process. MPI is a
-weak dependency, like HDF5: an application that never runs distributed
+weak dependency: an application that never runs distributed
 never loads it.
 
 **What is distributed.** Every rank holds the whole forest —
@@ -797,7 +716,7 @@ at a time:
   [`volume_weighted_norm`](@ref) and [`total_mass`](@ref);
 - [`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref);
 - [`interpolate`](@ref) and [`interpolate!`](@ref);
-- [`save_checkpoint`](@ref), [`write_plain`](@ref) in its do-block, and
+- TreeIOHDF5's `save_checkpoint`, `write_plain` in its do-block, and
   `load_checkpoint(path; comm)`.
 
 What touches only this rank's blocks is local: [`fill_by_coordinates!`](@ref),
@@ -851,32 +770,13 @@ curve rebalances the whole run. [`buffered_flags`](@ref) and
 over MPI let `regrid!` buffer the flags (its `buffer` keyword) rather
 than calling them yourself.
 
-**Interpolation and checkpoints.** [`interpolate`](@ref) routes each
+**Interpolation.** [`interpolate`](@ref) routes each
 rank's points to the ranks that own them and the values back: every
 rank passes the same field set and arguments and its own points, any
 number of them or none, and gets the values of its own points in its
-own order. A checkpoint never has two processes write or open one file,
-so it depends on no parallel I/O: the ranks form groups of consecutive
-ranks, one per node by default (`io = :node`; `io = :all` gives every
-rank its own, or pass a number), and each group's first rank receives
-the group's blocks and writes them into a part file of its own,
-`path.<saveid>.<j>.h5`, beside the index that rank 0 writes at `path`
-last. Loading, rank 0 alone opens the index and shares it, and each part
-is read by one rank, which sends the blocks to their owners. A
-checkpoint written at any rank count loads at any other, or serially,
-and continues bit for bit. The plain data must be the same on every
-rank; data that differ are refused on every rank before anything is
-written. Keep the index and its parts together: the next save to the
-same path removes the parts of the one it replaces, and any other file
-named like one of its parts. One part per node keeps the number of
-files small; one per rank was faster on the cluster measured, most of
-all with a filter, which each I/O process runs for its group alone.
+own order. Checkpoints over MPI are TreeIOHDF5's; its documentation says how
+they are distributed.
 
-```julia
-save_checkpoint("run.h5", forest; fieldsets = ("u" => (fs, u),),
-                application = "MyApp" => 1, data = (; t, chunk))   # io = :node
-# run.h5, run.h5.<saveid>.0.h5, run.h5.<saveid>.1.h5, … one part per node
-```
 
 **Devices.** Field sets on a device work the same way. Their message
 buffers live on the device and are staged through page-locked host

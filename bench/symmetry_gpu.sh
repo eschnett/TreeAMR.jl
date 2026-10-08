@@ -2,7 +2,7 @@
 # The M6 acceptance run on Symmetry: the test suite against CUDA, in
 # Float64 and Float32, followed by the kernel benchmarks.
 #
-# `CODE.md` asks M6 for "M3 convergence results reproduced on GPU;
+# `HISTORY.md`'s M6 entry asks for "M3 convergence results reproduced on GPU;
 # kernel benchmarks", and it names CUDA. A Mac's Metal backend answers
 # the Float32 half of that locally and quickly, which is what makes it
 # the development target — but it has no hardware fp64 at all, so the

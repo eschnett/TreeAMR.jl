@@ -397,7 +397,7 @@ end
 # leaf below `L` to `Refine` and lifts its `Coarsen` to `Keep` at or
 # below `L`. The result does not depend on the order of the recruits, nor
 # on how often one appears (M7; "What was done about it" under step 7 in
-# CODE.md): `Refine` is never undone, a `Keep` made from `Coarsen` is only
+# HISTORY.md): `Refine` is never undone, a `Keep` made from `Coarsen` is only
 # ever raised to `Refine`, and so a leaf of level `l` ends as `Refine` if
 # any recruit asks it for more than `l`, as `Keep` if it was `Coarsen`
 # and some recruit asks for `l` exactly, and as it was otherwise — a

@@ -8,7 +8,8 @@ to writing a distributed application is
 [Running distributed](@ref) on the home page. Everything a serial run
 does works across ranks: the ghost exchange for every centering, the
 interface restriction, the reductions, the regrid with the
-repartitioning it implies, point interpolation and checkpoints.
+repartitioning it implies, and point interpolation; checkpoints too,
+through the companion package TreeIOHDF5.
 
 A distributed run loads MPI.jl beside TreeAMR, which loads the package's
 MPI extension, and passes its communicator to the forest:
@@ -28,12 +29,7 @@ that differ between ranks — a `refine!` made on one rank only, say — is
 refused on every rank together, with the reason, as is one built for a
 different layout on some rank. [`interpolate`](@ref) is collective too:
 every rank passes the same field set and arguments and its own points,
-any number of them, and gets their values back in its own order. So are
-[`save_checkpoint`](@ref) and `load_checkpoint(path; comm)`: the ranks'
-blocks go to one I/O process per node (by default), each of which writes
-a part file of its own beside an index that rank 0 writes, so no file is
-ever written or opened by two processes; and a checkpoint written on any
-number of ranks loads on any other, or serially.
+any number of them, and gets their values back in its own order.
 
 Field sets on a device backend work the same way. Their message buffers
 live on the device, and by default every message is staged through

@@ -4,14 +4,13 @@
 #
 # Each job runs `mpi_workload.jl` under `mpiexec` — three ranks, then two —
 # and is compilation-bound: some 55 s of wall clock a job, against a few
-# seconds of arithmetic (measured in step 9, "Suite cost" in CODE.md).
+# seconds of arithmetic (measured in M7 step 9, "Suite cost" in HISTORY.md).
 # Where the machine has room for both jobs beside the suite, they start
 # here, at the start of the suite, and compile on otherwise idle cores
-# while the rest of it runs; each then waits at its checkpoint loads for
-# the serial reference that `mpi_tests.jl` writes (`TREEAMR_CHECKPOINT_FROM`
-# in the workload), sleeping, not spinning in MPI. Elsewhere — a CI runner
-# — nothing starts here, and `mpi_tests.jl` runs the serial reference, the
-# three-rank job and the two-rank job one after the other.
+# while the rest of it runs. The jobs are independent of each other and
+# of the serial reference. Elsewhere — a CI runner — nothing starts here,
+# and `mpi_tests.jl` runs the serial reference, the three-rank job and
+# the two-rank job one after the other, for the memory.
 
 using MPI: MPI
 
@@ -30,17 +29,14 @@ function concurrent_launches()
     return Sys.CPU_THREADS >= 8 && Sys.total_memory() >= 24 * 2^30
 end
 
-# The workload under `mpiexec -n $n`, started and not waited for, loading
-# the files of the runs at the rank counts `from` once they are there,
-# and failing if `timeout` seconds pass first.
-function launch_workload(n, dir; from, threads=1, timeout=900)
+# The workload under `mpiexec -n $n`, started and not waited for, and
+# failing if `timeout` seconds pass first.
+function launch_workload(n; threads=1, timeout=900)
     mpi = MPI.mpiexec()
     project = Base.active_project()
     cmd = `$mpi -n $n $(Base.julia_cmd()) --threads=$threads --project=$project
            $MPI_WORKLOAD mpi`
-    cmd = addenv(setenv(cmd, mpi.env), "TREEAMR_CHECKPOINT_DIR" => dir,
-                 "TREEAMR_CHECKPOINT_FROM" => join(from, " "),
-                 "TREEAMR_CHECKPOINT_WAIT" => string(timeout))
+    cmd = setenv(cmd, mpi.env)
     out, err = IOBuffer(), IOBuffer()
     proc = run(pipeline(cmd; stdout=out, stderr=err); wait=false)
     return (; n, proc, out, err, start=time(), timeout)
@@ -48,8 +44,7 @@ end
 
 # Its output, with the deadline from its start: a rank that waited for a
 # message never sent would otherwise hang the suite. A failed job takes
-# the jobs in `others` down with it, since they may be waiting for its
-# files.
+# the jobs in `others` down with it, since the test fails anyway.
 function finish_workload(job; others=())
     (; n, proc, out, err, start, timeout) = job
     left = max(1.0, timeout - (time() - start))
@@ -73,10 +68,9 @@ const MPI_JOBS = Ref{Any}(nothing)
 
 function start_mpi_jobs!()
     concurrent_launches() || return nothing
-    dir = mktempdir()
-    three = launch_workload(3, dir; from=(1,), timeout=3600)
-    two = launch_workload(2, dir; from=(1, 3), timeout=3600)
-    MPI_JOBS[] = (; dir, three, two)
+    three = launch_workload(3; timeout=3600)
+    two = launch_workload(2; timeout=3600)
+    MPI_JOBS[] = (; three, two)
     atexit() do
         for job in (three, two)
             process_running(job.proc) && kill(job.proc)

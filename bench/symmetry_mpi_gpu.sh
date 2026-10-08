@@ -30,7 +30,7 @@
 #   the default binary, MPICH_jll, which is not built with CUDA, only the
 #   staging path runs, and the direct one needs a CUDA-aware system MPI
 #   selected with `TREEAMR_MPI=system TREEAMR_MPI_MODULE=<module>`, as in
-#   `symmetry_checkpoint_mpi.sh`. On Symmetry that is HPC-X's Open MPI
+#   TreeIOHDF5's `bench/symmetry_checkpoint_mpi.sh`. On Symmetry that is HPC-X's Open MPI
 #   4.1.7 (`nvhpc-hpcx-cuda12/24.9`; `ompi_info --parsable --all | grep
 #   cuda_support` says it is built with CUDA), launched by its own
 #   `mpiexec`, which `MPI.mpiexec()` names under the system binary.

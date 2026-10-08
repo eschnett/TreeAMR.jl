@@ -7,8 +7,9 @@ for Julia. It provides mesh, storage, and inter-grid operations.
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://eschnett.github.io/TreeAMR.jl/dev)
 [![codecov](https://codecov.io/gh/eschnett/TreeAMR.jl/graph/badge.svg?token=IHXP23WQ1H)](https://codecov.io/gh/eschnett/TreeAMR.jl)
 
-See [CODE.md](CODE.md) for the full design document and the milestone
-roadmap, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
+See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
+for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
+package got here, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
 The package is currently at milestone **M12** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
@@ -28,6 +29,12 @@ reflecting face below `z = 0` it stores an octant.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
+
+**Contents**
+
+- [Overview](#overview)
+- [Installing](#installing)
+- [Testing](#testing)
 
 ## Overview
 
@@ -129,9 +136,10 @@ writes the mesh, the evolved fields and the application's own run state
 to one HDF5 file, and `load_checkpoint` reads them back exactly in a
 new process, on any thread count or backend; at any thread count the
 run then continues bit for bit. Only what cannot be recomputed is
-stored: the leaves, and the fields without their ghost zones. HDF5 is
-an optional dependency, so these functions become available with
-`using HDF5`.
+stored: the leaves, and the fields without their ghost zones. Since
+TreeAMR 0.2 these functions are the companion package
+[TreeIOHDF5](https://github.com/eschnett/TreeIOHDF5.jl): `using
+TreeIOHDF5`.
 
 **MPI.** One forest runs over many processes when it is built with
 `comm = MPI.COMM_WORLD`. Every rank holds the whole tree, which keeps
@@ -142,10 +150,10 @@ blocks between ranks), point interpolation and checkpoints all work
 across ranks, on the CPU or on GPUs. The results are bit-identical to a
 serial run at any rank count, except floating-point sums, which agree
 to roundoff. MPI is an optional dependency too: the distributed
-methods load with `using MPI`. A distributed checkpoint is an index file
-and one part file per node (or per rank, or per any number of I/O
-processes), each written and read by a single process, so it needs no
-parallel I/O; it loads at any rank count or serially.
+methods load with `using MPI`. A distributed checkpoint (TreeIOHDF5's)
+is an index file and one part file per node (or per rank, or per any
+number of I/O processes), each written and read by a single process, so
+it needs no parallel I/O; it loads at any rank count or serially.
 
 **Still missing.** There is no visualization output yet; that is the
 next milestone. The leaf-only storage also rules out multigrid

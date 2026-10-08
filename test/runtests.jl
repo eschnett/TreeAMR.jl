@@ -1,7 +1,6 @@
 using Test
 using Random
 using TreeAMR
-using HDF5
 
 include("oracles.jl")
 include("ghost_oracles.jl")
@@ -329,7 +328,7 @@ end
 end
 
 @testset "A forest rebuilt from its own leaves is the same forest: D=$D" for D in (1, 2, 3)
-    # Guards the restore path (a checkpoint now, M7's ranks later): a
+    # Guards the restore path (a TreeIOHDF5 checkpoint, MPI ranks): a
     # valid list refused or altered, a forest aliasing the caller's
     # vector, a check that accepts a list the geometric oracle says does
     # not tile the brick, and a balance verdict that disagrees with the
@@ -596,7 +595,6 @@ include("wave_cell_tests.jl")
 include("burgers_tests.jl")
 include("imex_tests.jl")
 include("type_tests.jl")
-include("checkpoint_tests.jl")
 include("thread_tests.jl")
 include("mpi_tests.jl")
 include("gpu_tests.jl")

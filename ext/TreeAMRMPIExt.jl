@@ -5,8 +5,8 @@
 # `CODE.md`): its rank and size, three collectives — an allgather of one
 # `isbits` value, which every reduction and the forest digest are built
 # from, an allgatherv and an alltoallv — and nonblocking point-to-point
-# messages over flat buffers, and (M7 step 6b) a broadcast and a count of
-# the shared-memory nodes for checkpoints. Each verb below is one MPI.jl
+# messages over flat buffers, and a broadcast and a count of the
+# shared-memory nodes for TreeIOHDF5's checkpoints. Each verb below is one MPI.jl
 # call, or two, over a *duplicate* of the application's communicator, so
 # that the package's messages, whose tags are its own, can never match
 # the application's.
@@ -118,7 +118,7 @@ function allgatherv(c::MPICommunicator, v::AbstractVector)
 end
 
 # Rank `root`'s vector on every rank: its length, then its elements. A
-# checkpoint load broadcasts the index's image this way (M7 step 6b).
+# TreeIOHDF5 checkpoint load broadcasts the index's image this way.
 function bcast(c::MPICommunicator, v::AbstractVector, root::Integer)
     0 <= root < c.size || throw(ArgumentError(
         "there is no rank $root among the $(c.size) to broadcast from"))

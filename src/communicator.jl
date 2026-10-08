@@ -11,8 +11,7 @@
 # distributed code path with every message empty.
 #
 # The MPI methods live in a package extension, `ext/TreeAMRMPIExt.jl`,
-# for the reason HDF5's do: an application that never runs distributed
-# should not load MPI.
+# so that an application that never runs distributed does not load MPI.
 
 """
     Communicator
@@ -174,9 +173,10 @@ alltoallv(comm::Communicator, sendbuf::AbstractVector, sendcounts) =
 
 Rank `root`'s vector `v`, on every rank: collective. The other ranks pass
 a vector of the same element type, whose contents are ignored (an empty
-one will do); the length is sent first. A checkpoint load broadcasts the
-index file's image this way, so that only one process opens the file
-(M7 step 6b, "Checkpoints without parallel I/O" in `CODE.md`).
+one will do); the length is sent first. A checkpoint load of
+TreeIOHDF5 broadcasts the index file's image this way, so that only one
+process opens the file ("Checkpoints without parallel I/O" in its
+`CODE.md`).
 """
 function bcast(::SerialCommunicator, v::AbstractVector, root::Integer)
     root == 0 || no_peer(root)
@@ -188,8 +188,8 @@ bcast(comm::Communicator, v::AbstractVector, root::Integer) = missing_verb(comm,
     commnodes(comm) -> Int
 
 The number of shared-memory nodes the ranks of `comm` run on:
-collective. A checkpoint saved with `io = :node` has one I/O process per
-node (M7 step 6b). Over MPI it is the number of groups that
+collective. A TreeIOHDF5 checkpoint saved with `io = :node` has one I/O
+process per node. Over MPI it is the number of groups that
 `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)` forms; serially 1.
 """
 commnodes(::SerialCommunicator) = 1
