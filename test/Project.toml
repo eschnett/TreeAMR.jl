@@ -1,5 +1,4 @@
 [deps]
-HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 IMEXRungeKutta = "6f46d5f7-e15e-41aa-a098-eed9d1a63ad8"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
@@ -14,7 +13,6 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TreeAMR = "91bc416d-811c-44c1-9bc4-b9c8bbdbbd08"
 
 [compat]
-HDF5 = "0.17"
 IMEXRungeKutta = "1.1"
 MPI = "0.20"
 MultiFloats = "3"

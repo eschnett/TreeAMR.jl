@@ -136,9 +136,10 @@ writes the mesh, the evolved fields and the application's own run state
 to one HDF5 file, and `load_checkpoint` reads them back exactly in a
 new process, on any thread count or backend; at any thread count the
 run then continues bit for bit. Only what cannot be recomputed is
-stored: the leaves, and the fields without their ghost zones. HDF5 is
-an optional dependency, so these functions become available with
-`using HDF5`.
+stored: the leaves, and the fields without their ghost zones. Since
+TreeAMR 0.2 these functions are the companion package
+[TreeIOHDF5](https://github.com/eschnett/TreeIOHDF5.jl): `using
+TreeIOHDF5`.
 
 **MPI.** One forest runs over many processes when it is built with
 `comm = MPI.COMM_WORLD`. Every rank holds the whole tree, which keeps
@@ -149,10 +150,10 @@ blocks between ranks), point interpolation and checkpoints all work
 across ranks, on the CPU or on GPUs. The results are bit-identical to a
 serial run at any rank count, except floating-point sums, which agree
 to roundoff. MPI is an optional dependency too: the distributed
-methods load with `using MPI`. A distributed checkpoint is an index file
-and one part file per node (or per rank, or per any number of I/O
-processes), each written and read by a single process, so it needs no
-parallel I/O; it loads at any rank count or serially.
+methods load with `using MPI`. A distributed checkpoint (TreeIOHDF5's)
+is an index file and one part file per node (or per rank, or per any
+number of I/O processes), each written and read by a single process, so
+it needs no parallel I/O; it loads at any rank count or serially.
 
 **Still missing.** There is no visualization output yet; that is the
 next milestone. The leaf-only storage also rules out multigrid

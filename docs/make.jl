@@ -1,5 +1,4 @@
 using Documenter
-using HDF5              # loads TreeAMRHDF5Ext, for the checkpoint doctest
 using KernelAbstractions
 using TreeAMR
 
@@ -20,7 +19,6 @@ makedocs(;
             "ODE coupling" => "api/ode.md",
             "Regridding" => "api/regrid.md",
             "Point interpolation" => "api/interpolate.md",
-            "Checkpoint and restart" => "api/io.md",
             "Distributed meshes" => "api/distributed.md",
             "Internals" => "api/internals.md",
             "Index" => "api/genindex.md",

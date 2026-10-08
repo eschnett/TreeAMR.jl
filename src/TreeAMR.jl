@@ -55,9 +55,6 @@ export RotationPair
 export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
        Region, Ellipsoid
 
-# Checkpoint and restart (M9a)
-export save_checkpoint, load_checkpoint, write_plain, read_plain, checkpoint_environment
-
 # Distributed meshes (M7)
 export communicator, blockrange
 
@@ -75,6 +72,5 @@ include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
 include("interpolate.jl")
-include("checkpoint.jl")
 
 end

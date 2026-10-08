@@ -21,6 +21,7 @@ milestones were planned in, and the list below is in execution order.
   - [M7 — MPI](#m7--mpi)
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
   - [M9b — Visualization export](#m9b--visualization-export)
+  - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
 
 ## Milestones
 
@@ -66,7 +67,7 @@ Done. The design is under "Point interpolation" in [CODE.md](CODE.md#point-inter
 
 ### M9a — Checkpoint and restart
 
-Done. The design is under "Checkpoint and restart" in [CODE.md](CODE.md#checkpoint-and-restart); the record is in [HISTORY.md](HISTORY.md#m9a--checkpoint-and-restart).
+Done. Since TreeAMR 0.2 the checkpoints are the companion package [TreeIOHDF5](https://github.com/eschnett/TreeIOHDF5.jl), whose `CODE.md` has the design; the record is in [HISTORY.md](HISTORY.md#m9a--checkpoint-and-restart).
 
 ### M7 — MPI
 
@@ -93,3 +94,19 @@ An in-file view goes in a top-level group of its own and points at
 the checkpoint's datasets without copying them, through links or
 virtual datasets, as the layout under
 [Checkpoint and restart](CODE.md#checkpoint-and-restart) leaves room for.
+
+### Release 0.2.0 with TreeIOHDF5
+
+The checkpoints moved to the companion package TreeIOHDF5, which removes
+exported functions, so the next release is 0.2.0 (`Project.toml` says so
+already). In order, each step Erik's to take:
+
+1. Tag and register TreeAMR 0.2.0, after TreeIOHDF5's suite, TreeWave's
+   and TreeHydro's (checkpoint tests included) have passed against the
+   checkout.
+2. Release TreeIOHDF5 0.1.0, and make the downstream changes, as
+   TreeIOHDF5's `PLAN.md` lists them.
+
+*Done when* TreeAMR 0.2.0 and TreeIOHDF5 0.1.0 are registered and the
+three downstreams resolve them.
+

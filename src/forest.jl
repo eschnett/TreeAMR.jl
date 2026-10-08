@@ -72,7 +72,7 @@ Without `leaves` the forest starts as its unrefined roots. With it, it
 starts from that leaf list instead — keys in curve order, as
 `forest.leaves` holds them — which is copied rather than aliased, and
 the new forest is at [`generation`](@ref) 0. That is how a checkpoint
-is restored, and how M7's ranks will build their forests. Everything
+package such as TreeIOHDF5 restores a forest. Everything
 built over a forest trusts its leaves, so the list is refused unless
 every key lies in the brick, the keys strictly increase, they tile the
 brick exactly — no gap, no overlap — and they are 2:1 balanced and, on a
@@ -581,7 +581,8 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "the ghost widths, the centering, the operators and the element type must " *
         "be the same everywhere (for regrid!, so must the field sets passed, their " *
         "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
-        "`derivs`, `vars` and `exclude`; for save_checkpoint and load_checkpoint, " *
+        "`derivs`, `vars` and `exclude`; for TreeIOHDF5's save_checkpoint and " *
+        "load_checkpoint, " *
         "the path and every keyword but `data`, and for write_plain the item's " *
         "name), since a rank computes the data it sends with its own stencils and " *
         "lays out what it receives by its own, and the ranks of a checkpoint send " *

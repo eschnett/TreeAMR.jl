@@ -74,7 +74,9 @@ TreeAMR.jl is a Julia package: a tree-based (octree-style) block-structured
 AMR mesh — storage, ghost exchange, inter-grid operators, regridding — with
 **no physics**. `CODE.md` is the authoritative design document; the status
 is at its top, in `README.md` and in `docs/src/index.md`, and the next
-milestone in `PLAN.md`.
+milestone in `PLAN.md`. Checkpoints are the companion package
+TreeIOHDF5 (`~/src/jl/TreeIOHDF5`), which uses TreeAMR's internals and
+pins exact TreeAMR versions (`CODE.md`, "Companion interface").
 
 ## Commands
 
@@ -124,7 +126,7 @@ file; about 2 min here, where both jobs start beside the serial
 reference, and about 4 on CI's one-after-the-other path):
 
 ```bash
-julia --project=test -e 'using Test, TreeAMR, HDF5; @testset "mpi" begin include("test/mpi_tests.jl") end'
+julia --project=test -e 'using Test, TreeAMR; @testset "mpi" begin include("test/mpi_tests.jl") end'
 ```
 
 The workload by hand, serially and at three ranks; every line but the
@@ -208,6 +210,13 @@ rather than by Burgers in `test/`. The same scratch-copy rule holds for
 it. What each downstream calls is under "Downstream applications" in
 `CODE.md`.
 
+Companion checks. Before tagging any release, run TreeIOHDF5's suite
+(`~/src/jl/TreeIOHDF5`, about 3 min) against this checkout: its
+`Project.toml` and `test/Project.toml` locate TreeAMR through `[sources]`
+until the version is registered, and its `[compat]` lists the exact
+TreeAMR versions it accepts, so it needs a release of its own with the
+new version appended ("Companion interface" in `CODE.md`).
+
 Thread scaling (`bench/threads.jl`, driven by `bench/scan.sh`, which
 takes a list of thread counts and prints a speedup table). Sizes come
 from `TREEAMR_BENCH_{D,N,ROOTS,REPS}`. On a NUMA node, pin the threads
@@ -272,23 +281,14 @@ TREEAMR_BENCH_N=8 bench/mpiscan.sh 1 2 4
 julia -t 4 --project=test bench/replicated.jl 8 64 512
 ```
 
-Three SLURM jobs hold the M7 measurements, all run on 2026-10-02:
+Two SLURM jobs hold the M7 measurements, both run on 2026-10-02:
 `bench/symmetry_mpi.sh` (weak scaling, one rank per NUMA domain at 8
-threads, 1–4 nodes, plus single-process controls),
-`bench/symmetry_checkpoint_mpi.sh` (checkpoint throughput on BeeGFS: the
-shared file of step 6, then the part files of step 6b, once per `io` in
-`TREEAMR_CKPT_IO`) and `bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
+threads, 1–4 nodes, plus single-process controls) and
+`bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
 staged and, with a CUDA-aware system MPI, direct). Each launches
 MPICH_jll through `srun --mpi=pmi2` by default or a system MPI through
-MPIPreferences (`TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`).
-`bench/symmetry_checkpoint_stress.sh` runs `bench/checkpoint_stress.jl`,
-the reproducers of the multi-node checkpoint loss, from
-`save_checkpoint` (now the part-file writer, verified by serial loads on
-two nodes; `STRESS_IO`) down to plain `pwrite`;
-`bench/checkpoint_inspect.jl` and `bench/checkpoint_layout.jl` read a
-damaged shared file of step 6. Nothing in the package writes one file
-from several processes any more; anything that would must be checked
-with them first.
+MPIPreferences (`TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`). The
+checkpoint jobs and benchmarks moved to TreeIOHDF5's `bench/`.
 
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
@@ -296,25 +296,6 @@ runs in the test environment, which has both:
 
 ```bash
 TREEAMR_BENCH_ROOTS=8 TREEAMR_BENCH_SCRIPT=bench/stepping.jl TREEAMR_BENCH_PROJECT=test bench/scan.sh 1 8
-```
-
-`bench/checkpoint.jl` times `save_checkpoint` and `load_checkpoint` (M9a)
-for each HDF5 filter setting, on a smooth wave pulse and a blast wave
-with a uniform atmosphere, and prints the file size, the ratio and GB/s
-for a save with `sync = false`, one with the default `sync = true`
-(which adds the flush to stable storage: `fsync`, or `F_FULLFSYNC` on
-macOS, where `fsync` does not wait), and a load. It
-runs in the test environment with the built-in filters only; the
-filter packages (H5Zzstd, H5Zlz4, H5Zbitshuffle) are used
-where the environment has them, which means a scratch environment that
-develops this checkout — never add them to `test/Project.toml`.
-`TREEAMR_BENCH_DIR` puts the files on the file system under test. A
-load right after a save reads the page cache; `CODE.md`'s "Throughput and
-filters" under "Checkpoint and restart" has the numbers and that
-caveat:
-
-```bash
-julia --project=test bench/checkpoint.jl
 ```
 
 There is no formatter or linter configured.
@@ -366,12 +347,11 @@ the one that says why.
   block-shaped CPU launch in `src/` goes through `launch_by_owner!`, and
   a new host loop over blocks through `threaded_chunks` ("What one
   process loses").
-- **A checkpoint stores what cannot be recomputed**; do not add JLD2 or
-  `Serialization`, and rename with `Base.Filesystem.rename`, not
-  `mv(…; force = true)` ("Checkpoint and restart").
-- **No file of a checkpoint has two writers or two openers.** Do not
-  reintroduce parallel HDF5 or MPI-IO ("Checkpoints without parallel
-  I/O").
+- **Physics packages use the exports only; companion packages pin
+  exact TreeAMR versions.** A name or field of the companion interface
+  that changes is a change for TreeIOHDF5: run its suite before a
+  release, and release it with the new version appended to its
+  `[compat]` list ("Companion interface").
 - **Every forest mutation is collective.** Any new check that can fire
   on some ranks only goes through `collective_checks`. Do not add a
   field to `Forest`: put mutable state in `ForestState` ("Distributed
@@ -381,9 +361,9 @@ the one that says why.
 - **Reductions are an allgather of per-rank partials**, folded in
   `combine_blocks` (the only site); a number combined from
   `block_mapreduce` is rank-local.
-- **HDF5 and MPI are weak dependencies.** Do not make either a hard
-  dependency, do not call MPI from `src/`, and do not use `MPI.Comm_dup`
-  ("Distributed meshes").
+- **MPI is a weak dependency.** Do not make it a hard dependency, do not
+  call MPI from `src/`, and do not use `MPI.Comm_dup` ("Distributed
+  meshes"). Checkpoints are TreeIOHDF5's; do not bring HDF5 back.
 - **Index conventions**: `coordinates` takes *stored* indices, and a
   `map_blocks!` kernel written for the owned form is wrong under
   `stored = true`, and still in bounds ("Index conventions").

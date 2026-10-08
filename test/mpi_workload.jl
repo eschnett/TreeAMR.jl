@@ -29,18 +29,10 @@
 # before any ghost fill, so the transfer itself is checked bit for bit.
 # From step 5 on it interpolates: every rank queries its own slice of one
 # global point list, and the answers gathered in rank order are the
-# serial answers in global order. From step 6 on it checkpoints: a run
-# saved after a regrid, with one part file per rank, per two groups and
-# per node (step 6b), and continued from each file at the same rank count
-# must print what the uninterrupted run prints; the files of other runs,
-# written at other rank counts, are loaded at this one on `#` lines
-# (`TREEAMR_CHECKPOINT_DIR`, and `TREEAMR_CHECKPOINT_FROM` for the rank
-# counts whose files to wait for and load, which lets `mpi_tests.jl` run
-# the launches at once); and the version-1 fixtures, written by the
-# shared-file writer's version, load at every rank count. From M12 on it
-# runs a rotating quadrant too: the wave, a set that turns into itself
-# and a `RotationPair` through a fill, a regrid, interpolation beyond the
-# seam and a checkpoint, loaded at the other rank counts as well.
+# serial answers in global order. From M12 on it runs a rotating
+# quadrant too: the wave, a set that turns into itself and a
+# `RotationPair` through a fill, a regrid and interpolation beyond the
+# seam. The checkpoints moved to TreeIOHDF5, whose own workload runs them.
 
 using TreeAMR
 using MPI: MPI
@@ -48,8 +40,6 @@ using KernelAbstractions: @kernel, @index, @Const
 using Printf: @sprintf
 using SHA: sha256
 using MultiFloats: Float32x2
-using HDF5: HDF5
-using HDF5.Filters: Shuffle, Deflate
 
 const USE_MPI = "mpi" in ARGS
 USE_MPI && MPI.Init()
@@ -57,11 +47,6 @@ const COMM = USE_MPI ? MPI.COMM_WORLD : nothing
 const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 const OUT = isdefined(@__MODULE__, :WORKLOAD_IO) ? WORKLOAD_IO : stdout
-# Under MPI the checkpoints' messages are cut at 4 KiB (a test hook of
-# the HDF5 extension; 64 MiB otherwise), so that a rank's blocks travel to
-# its I/O process, and a part's from its reader, in several messages.
-const CKPT = Base.get_extension(TreeAMR, :TreeAMRHDF5Ext)
-USE_MPI && (CKPT.MAX_MESSAGE[] = 4096)
 
 emit(words...) = (RANK == 0 && println(OUT, join(words, " ")); nothing)
 
@@ -651,7 +636,7 @@ end
 # every operation an application makes on it: the all-variables forms of
 # the fill and the boundary hook, the wave equation, the interface
 # restriction, interpolation, regrids that give the empty rank blocks
-# and take them away again, the initial-data cycle and a checkpoint. A
+# and take them away again, and the initial-data cycle. A
 # step that assumed a rank has a block 1 throws there while the others
 # wait, which `main` turns into an abort: the all-variables hook's length
 # check did, until it was guarded in 0.1.6.
@@ -703,15 +688,6 @@ function empty_rank_case(tag)
     emit(tag, "coarsened", digest(gathered(forest, fs.work)))
     emit("#", tag, "empty ranks after the regrids", empties())
 
-    path = joinpath(checkpoint_dir(), "$tag-n$NRANKS.h5")
-    save_checkpoint(path, forest; fieldsets=("u" => fs,), application="Empty" => 1)
-    ck = load_checkpoint(path; comm=COMM)
-    back = ck.fieldsets["u"].fieldset
-    v = statevector(back)
-    gather!(v, back)
-    gather!(u, fs)
-    emit(tag, "checkpoint", nleaves(ck.forest), gathered(forest, u) == gathered(forest, v))
-
     # The initial-data cycle from the two leaves, in both callback forms.
     for (name, initial) in (("all", EMPTY_DATA), ("each", (x, v) -> EMPTY_DATA.f(x)[v]))
         forest = forest_of((2, 1), 8; reflecting=((true, false), (false, false)))
@@ -734,8 +710,7 @@ end
 # face-centered sets, `(B_1, F_1)` and `(F_2, B_2)`, whose stages are
 # merged and share their tags; a regrid of both, the pair filled as a pair
 # before its transfer; interpolation over the whole plane, three quarters
-# of the points turned back across the seam; and a checkpoint, saved and
-# loaded at this rank count and at the others (`rotating_cross`). Each
+# of the points turned back across the seam. Each
 # set has a variable that is zero everywhere, the vector's `v_2` and each
 # member's second, so the turned ghosts hold `−0`, which a pack that
 # applied the sign would turn into `+0`; the digests are of the bytes.
@@ -782,14 +757,6 @@ end
 quad_digests(forest, fs, pair) =
     (digest(gathered(forest, fs.work)), digest(gathered(forest, pair.a.work)),
      digest(gathered(forest, pair.b.work)))
-
-function quad_states(forest, sets...)
-    return map(sets) do fs
-        u = statevector(fs)
-        gather!(u, fs)
-        digest(gathered(forest, u))
-    end
-end
 
 # A global list of points over `[-2.9, 2.9]^2`, three quarters of them
 # beyond the seam, of which rank `r` queries its slice as in
@@ -840,48 +807,6 @@ function rotating_case(tag)
     emit(tag, "interpolated", length(gathered(forest, r.excluded)),
          count(x -> x[1] < 0 || x[2] < 0, seam_points_all(257)),
          digest(gathered(forest, r.values)))
-
-    # The checkpoint: the bare form, after the fill; loaded at this rank
-    # count, the pair rebuilt from its two sets and filled again.
-    dir = checkpoint_dir()
-    path = joinpath(dir, "QC-n$NRANKS.h5")
-    emit("QC", "saved", quad_states(forest, fs, pair.a, pair.b)...)
-    save_checkpoint(path, forest; fieldsets=("u" => fs, "a" => pair.a, "b" => pair.b),
-                    application="Quadrant" => 1, io=:all)
-    loaded = quad_load(path, COMM)
-    emit("QC", "loaded", quad_states(loaded...)...)
-    lforest, lfs, lpair = loaded[1], loaded[2], RotationPair(loaded[3], loaded[4])
-    quad_fill!(lforest, lfs, lpair)
-    emit("QC", "refilled", quad_digests(lforest, lfs, lpair)...)
-    RANK == 0 && touch(joinpath(dir, "QC-n$NRANKS.done"))
-    rotating_cross("QC")
-    return nothing
-end
-
-function quad_load(path, comm)
-    ck = load_checkpoint(path; comm=comm)
-    sets = ck.fieldsets
-    return (ck.forest, sets["u"].fieldset, sets["a"].fieldset, sets["b"].fieldset)
-end
-
-# The rotating checkpoints of the runs at other rank counts, loaded at
-# this one and, under MPI, at one rank over `MPI.COMM_SELF`: their states
-# must be the saved ones. `#` lines, as in `checkpoint_cross`.
-function rotating_cross(tag)
-    dir = checkpoint_dir()
-    counts = checkpoint_sources(dir, tag)
-    names = filter(readdir(dir)) do name
-        m = match(r"^(.*)-n(\d+)\.h5$", name)
-        m === nothing && return false
-        n = parse(Int, m[2])
-        m[1] == tag && n != NRANKS && (counts === nothing || n in counts)
-    end
-    comms = USE_MPI ? ((NRANKS, COMM), (1, MPI.COMM_SELF)) : ((1, nothing),)
-    for name in sort(names), (n, comm) in comms
-        loaded = quad_load(joinpath(dir, name), comm)
-        emit("#", replace(name, ".h5" => ""), "at", n, "loaded",
-             quad_states(loaded...)...)
-    end
     return nothing
 end
 
@@ -889,7 +814,7 @@ end
 # — its own neighbor across the seam three times over — so that at two
 # and three ranks only one rank has a block: the fill, the wave, a pair's
 # fill, interpolation beyond the seam from rank 0 alone, regrids that
-# give every rank blocks and take them away again, and a checkpoint.
+# give every rank blocks and take them away again.
 function rotating_empty_case(tag)
     forest = Forest((1, 1); N=8, rotating=(1, 2), comm=COMM)
     empties() = count(iszero, TreeAMR.allgather(forest.comm, length(blockrange(forest))))
@@ -926,12 +851,6 @@ function rotating_empty_case(tag)
     regridded("$tag.coarsen", forest, (fs => sched, pair => pscheds);
               flags=fill(Coarsen, length(blockrange(forest))), boundary=QUAD_HOOK)
     emit("#", tag, "empty ranks after coarsening", empties())
-    path = joinpath(checkpoint_dir(), "$tag-n$NRANKS.h5")
-    save_checkpoint(path, forest; fieldsets=("u" => fs, "a" => pair.a, "b" => pair.b),
-                    application="QuadrantEmpty" => 1)
-    loaded = quad_load(path, COMM)
-    emit(tag, "checkpoint", nleaves(loaded[1]),
-         quad_states(forest, fs, pair.a, pair.b) == quad_states(loaded...))
     return nothing
 end
 
@@ -1078,369 +997,6 @@ function verbs()
     return nothing
 end
 
-# --- checkpoints (step 6 of M7) --------------------------------------------
-
-# Where the checkpoints go: `TREEAMR_CHECKPOINT_DIR`, which `mpi_tests.jl`
-# sets to one directory for the serial run and every `mpiexec` run, so
-# that each run can load what the runs before it wrote, at another rank
-# count; otherwise a fresh directory, rank 0's, named to every rank.
-function checkpoint_dir()
-    dir = get(ENV, "TREEAMR_CHECKPOINT_DIR", "")
-    isempty(dir) || return dir
-    USE_MPI || return mktempdir()
-    name = RANK == 0 ? collect(codeunits(mktempdir())) : UInt8[]
-    return String(TreeAMR.allgatherv(TreeAMR.communicator(COMM), name))
-end
-
-# The tracked pulse as a chunked driver, as in `checkpoint_tests.jl`: a
-# chunk is a few RK4 steps, the flags and a regrid, and the checkpoint
-# goes at a chunk boundary, after the regrid, where the run holds nothing
-# but the mesh, the owned points and `(t, chunk)`.
-const CK_PULSE = moving_pulse((1.3, 1.4), 0.35)
-const CK_HOOK = boundary_by_coordinates(CK_PULSE)
-
-function ck_start(comm)
-    forest = Forest((4, 3); N=8, comm=comm)
-    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(2))
-    fill_by_coordinates!(CK_PULSE, fs)
-    return (; forest, fs, t=0.0, chunk=0)
-end
-
-function ck_chunk(run; steps=3)
-    (; forest, fs, t, chunk) = run
-    sched = GhostSchedule(fs, OPS4)
-    u = statevector(fs)
-    gather!(u, fs)
-    dt = 0.2 * minimum_spacing(forest)
-    rk4!(u, fs, sched, dt, steps, Val(2), Val(fs.G), CK_HOOK)
-    scatter!(fs, u)
-    fill_ghosts!(fs, sched; boundary=CK_HOOK)
-    regrid!(forest, fs => sched; flags=pulse_flags(fs, 2), buffer=2, boundary=CK_HOOK)
-    return (; forest, fs, t=t + steps * dt, chunk=chunk + 1)
-end
-
-function ck_digests(run)
-    u = statevector(run.fs)
-    gather!(u, run.fs)
-    return (digest(string(run.forest.leaves)), digest(gathered(run.forest, u)))
-end
-
-# The bare form, `name => fs`: `regrid!` has just filled the working
-# array's owned points. The plain data carry the run state and an array
-# of strings.
-function ck_save(path, run; filters=(), io=:node)
-    return save_checkpoint(path, run.forest; fieldsets=("pulse" => run.fs,),
-                           application="PulseRestart" => 1, filters=filters, io=io,
-                           data=(; t=run.t, chunk=run.chunk, σ=7 // 20,
-                                 tags=["pulse", "", "vertex-centered"]))
-end
-
-function ck_restore(path, comm)
-    ck = load_checkpoint(path; comm=comm)
-    ck.data.tags == ["pulse", "", "vertex-centered"] && ck.data.σ === 7 // 20 ||
-        error("the plain data did not come back exactly: $(ck.data)")
-    return (; forest=ck.forest, fs=ck.fieldsets["pulse"].fieldset, t=ck.data.t,
-            chunk=ck.data.chunk), ck.provenance
-end
-
-function ck_finish(run; chunks)
-    while run.chunk < chunks
-        run = ck_chunk(run)
-    end
-    return run
-end
-
-# One leaf per rank or fewer: a 1D cell-centered state on two leaves, so
-# that at three ranks one rank holds no blocks when the file is written
-# and when it is read.
-function ck_small(comm)
-    forest = Forest((2,); N=8, periodic=(true,), comm=comm)
-    fs = FieldSet(forest, 1; G=2)
-    fill_by_coordinates!((x, v) -> sin(π * x[1]) + x[1]^2 / 7, fs)
-    return forest, fs
-end
-
-# The mesh refines in the first chunk and again in the second, so a
-# checkpoint after the first is followed by a regrid that changes the
-# mesh: a regrid that depended on something the file does not hold would
-# show.
-function checkpoint_case(tag; chunks=3, k=1)
-    dir = checkpoint_dir()
-    run = ck_finish(ck_start(COMM); chunks=chunks)
-    emit(tag, "uninterrupted", ck_digests(run)...)
-    final = nleaves(run.forest)
-    # Saved after chunk `k`, everything dropped, and continued from each
-    # file at this rank count: unfiltered with a part per rank, filtered
-    # with two I/O groups (at three ranks, one of two ranks and one of
-    # one), and with the default, a part per node, which on one node is
-    # the one part inside the index.
-    run = ck_finish(ck_start(COMM); chunks=k)
-    emit(tag, "mesh", nleaves(run.forest), "then", final)
-    emit(tag, "saved", ck_digests(run)...)
-    plain = joinpath(dir, "$tag-n$NRANKS.h5")
-    filtered = joinpath(dir, "$tag-n$NRANKS-filtered.h5")
-    node = joinpath(dir, "$tag-n$NRANKS-node.h5")
-    ck_save(plain, run; io=:all)
-    ck_save(filtered, run; filters=(Shuffle(), Deflate(1)), io=2)
-    ck_save(node, run)
-    run = nothing
-    for (name, path) in (("restarted", plain), ("restarted-filtered", filtered),
-                         ("restarted-node", node))
-        resumed, provenance = ck_restore(path, COMM)
-        emit(tag, name, "loaded", ck_digests(resumed)...)
-        emit(tag, name, "continued", ck_digests(ck_finish(resumed; chunks=chunks))...)
-        emit("#", tag, name, "nranks", provenance.nranks, "nparts", provenance.nparts)
-    end
-    # The version-1 fixtures (`checkpoint_tests.jl`), loaded at this rank
-    # count: their digests must be the serial run's.
-    for name in ("plain", "filtered")
-        ck = load_checkpoint(joinpath(@__DIR__, "fixtures", "checkpoint-v1-$name.h5");
-                             comm=COMM, types=(Float32x2,))
-        emit("V1", name, "loaded", digest(string(ck.forest.leaves)),
-             digest(gathered(ck.forest, ck.fieldsets["u"].state)),
-             digest(reinterpret(UInt8, gathered(ck.forest, ck.fieldsets["w"].state))),
-             digest(string(ck.data)))
-    end
-    forest, fs = ck_small(COMM)
-    u = statevector(fs)
-    gather!(u, fs)
-    emit(tag * "1", "saved", digest(gathered(forest, u)))
-    save_checkpoint(joinpath(dir, "$(tag)1-n$NRANKS.h5"), forest;
-                    fieldsets=("u" => (fs, u),), application="Small" => 1)
-    ck = load_checkpoint(joinpath(dir, "$(tag)1-n$NRANKS.h5"); comm=COMM)
-    emit(tag * "1", "loaded", digest(gathered(ck.forest, ck.fieldsets["u"].state)))
-    emit("#", tag * "1", "empty ranks", count(TreeAMR.allgather(forest.comm,
-                                                               nblocks(fs) == 0)))
-    # Every file of this run is in place (each save returns on every rank
-    # after the rename), which a run waiting to load them is told by an
-    # empty marker file.
-    RANK == 0 && touch(joinpath(dir, "$tag-n$NRANKS.done"))
-    checkpoint_cross(tag; chunks=chunks)
-    return nothing
-end
-
-# The rank counts whose files `checkpoint_cross` loads: those that
-# `TREEAMR_CHECKPOINT_FROM` lists, once each run's marker is there, every
-# rank waiting on its own so that none spins in a collective meanwhile;
-# without the variable, every other rank count whose files are there.
-function checkpoint_sources(dir, tag)
-    from = get(ENV, "TREEAMR_CHECKPOINT_FROM", nothing)
-    from === nothing && return nothing
-    counts = parse.(Int, split(from))
-    deadline = time() + parse(Float64, get(ENV, "TREEAMR_CHECKPOINT_WAIT", "900"))
-    for n in counts
-        marker = joinpath(dir, "$tag-n$n.done")
-        while !isfile(marker)
-            time() < deadline ||
-                error("the checkpoints of the run at $n rank(s) did not appear: no $marker")
-            sleep(0.2)
-        end
-    end
-    return counts
-end
-
-# The files the other runs wrote, at other rank counts, loaded at this
-# one and continued: a `#` line each, since which files exist depends on
-# the order of the runs. Under MPI each is loaded a second time over
-# `MPI.COMM_SELF`, every rank on its own, which is a load at one rank of
-# MPI. Collective.
-function checkpoint_cross(tag; chunks=3)
-    dir = checkpoint_dir()
-    counts = checkpoint_sources(dir, tag)
-    names = filter(readdir(dir)) do name
-        m = match(r"^(.*)-n(\d+)(-filtered|-node)?\.h5$", name)
-        m === nothing && return false
-        n = parse(Int, m[2])
-        m[1] in (tag, tag * "1") && n != NRANKS && (counts === nothing || n in counts)
-    end
-    comms = USE_MPI ? ((NRANKS, COMM), (1, MPI.COMM_SELF)) : ((1, nothing),)
-    for name in sort(names), (n, comm) in comms
-        path = joinpath(dir, name)
-        what = replace(name, ".h5" => "")
-        if startswith(name, tag * "1")
-            ck = load_checkpoint(path; comm=comm)
-            emit("#", what, "at", n, "loaded",
-                 digest(gathered(ck.forest, ck.fieldsets["u"].state)))
-        else
-            resumed, _ = ck_restore(path, comm)
-            emit("#", what, "at", n, "loaded", ck_digests(resumed)...)
-            emit("#", what, "at", n, "continued",
-                 ck_digests(ck_finish(resumed; chunks=chunks))...)
-        end
-    end
-    return nothing
-end
-
-# The files of the directory that belong to the checkpoint `path`: the
-# index and every file named after it.
-ck_files(path) = sort(filter(n -> n == basename(path) || startswith(n, basename(path) * "."),
-                             readdir(dirname(path))))
-
-# Whether no file was opened by more than one process during `f()`: every
-# rank records the files it opens (a test hook of the HDF5 extension),
-# and the records are gathered.
-function opened_once(f)
-    CKPT.OPEN_LOG[] = String[]
-    try
-        f()
-    finally
-        mine = unique(CKPT.OPEN_LOG[])
-        CKPT.OPEN_LOG[] = nothing
-        world = TreeAMR.communicator(COMM)
-        all_ = split(String(TreeAMR.allgatherv(world, collect(codeunits(join(mine, "\n") *
-                                                                       "\n")))), '\n';
-                     keepempty=false)
-        return allunique(all_) && !isempty(all_)
-    end
-end
-
-# A refusal on some ranks, or arguments that differ between them, must be
-# refused on every rank before the file is created, and leave the
-# previous checkpoint at the path as it was.
-function checkpoint_refusals()
-    NRANKS > 1 || return nothing
-    world = TreeAMR.communicator(COMM)
-    function attempt(f)
-        msg = try
-            f()
-            ""
-        catch err
-            err isa ArgumentError || rethrow()
-            err.msg
-        end
-        return count(TreeAMR.allgather(world, !isempty(msg))), msg
-    end
-    dir = checkpoint_dir()
-    path = joinpath(dir, "refused-n$NRANKS.h5")
-    forest = Forest((4, 4); N=8, comm=COMM)
-    fs = FieldSet(forest, 1; G=1)
-    fill_by_coordinates!((x, v) -> x[1] - x[2], fs)
-    save(; kwargs...) = save_checkpoint(path, forest; fieldsets=("u" => fs,),
-                                        application="Refused" => 1, io=1, kwargs...)
-    save(; data=(; t=1.0))
-    n, msg = attempt(() -> save(; data=(; t=1.0, rank=RANK)))
-    emit("# checkpoint data refused on", n, "of", NRANKS, "ranks:", msg)
-    n, msg = attempt(() -> save_checkpoint(path, forest; fieldsets=("u" => fs,),
-                                           application=(RANK == 1 ? "TreeAMR.jl" :
-                                                        "Refused") => 1))
-    emit("# checkpoint partial refused on", n, "of", NRANKS, "ranks:", msg)
-    n, msg = attempt(() -> save(; filters=RANK == 1 ? (Deflate(1),) : ()))
-    emit("# checkpoint layout refused on", n, "of", NRANKS, "ranks:", msg)
-    # In the do-block, after the file is created: refused on every rank
-    # before the item is written, the file closed and the partial removed.
-    n, msg = attempt(() -> save_checkpoint(path, forest; fieldsets=("u" => fs,),
-                                           application="Refused" => 1) do app
-                         write_plain(app, "mine", RANK)
-                     end)
-    emit("# checkpoint write_plain refused on", n, "of", NRANKS, "ranks:", msg)
-    intact = load_checkpoint(path; comm=COMM).data == (; t=1.0) &&
-             !ispath(path * ".partial")
-    emit("# checkpoint refusals left the file alone",
-         all(TreeAMR.allgather(world, intact)))
-    n, msg = attempt(() -> load_checkpoint(path; comm=COMM,
-                                           fieldsets=RANK == 1 ? ("v",) : ("u",)))
-    emit("# load layout refused on", n, "of", NRANKS, "ranks:", msg)
-    n, msg = attempt(() -> load_checkpoint(joinpath(dir, "missing.h5"); comm=COMM))
-    emit("# load missing refused on", n, "of", NRANKS, "ranks:", msg)
-    # Damage only the last part's reader can see — one value of the last
-    # block, changed by rank 0 alone in the last part file between the save
-    # and the load — is refused by the checksums on every rank, which is
-    # the agreement: the other parts are intact. This is the multi-node
-    # corruption of step 6 made by hand; no file is shared any more, so
-    # none can happen on its own.
-    damaged = joinpath(dir, "damaged-n$NRANKS.h5")
-    save_checkpoint(damaged, forest; fieldsets=("u" => fs,), application="Refused" => 1,
-                    io=:all)
-    world_barrier() = TreeAMR.allgather(world, true)
-    parts = filter(n -> n != basename(damaged), ck_files(damaged))
-    if RANK == 0
-        lastpart = last(sort(parts; by=n -> parse(Int, split(n, '.')[end - 1])))
-        HDF5.h5open(joinpath(dir, lastpart), "r+") do file
-            data = file["TreeAMR.jl/fieldsets/u/data"]
-            d = read(data)
-            d[2, 3, 1, end] += 1
-            data[:, :, :, :] = d
-        end
-    end
-    world_barrier()
-    n, msg = attempt(() -> load_checkpoint(damaged; comm=COMM))
-    emit("# checkpoint damage refused on", n, "of", NRANKS, "ranks:", msg)
-    # A part of another save in place of one of this save's, and a part
-    # missing: both refused on every rank, before any data move.
-    other = joinpath(dir, "other-n$NRANKS.h5")
-    save_checkpoint(other, forest; fieldsets=("u" => fs,), application="Refused" => 1,
-                    io=:all)
-    save_checkpoint(damaged, forest; fieldsets=("u" => fs,), application="Refused" => 1,
-                    io=:all)
-    partof(path, j) = only(filter(n -> endswith(n, ".$j.h5"), ck_files(path)))
-    if RANK == 0
-        cp(joinpath(dir, partof(other, 1)), joinpath(dir, partof(damaged, 1)); force=true)
-    end
-    world_barrier()
-    n, msg = attempt(() -> load_checkpoint(damaged; comm=COMM))
-    emit("# checkpoint foreign part refused on", n, "of", NRANKS, "ranks:", msg)
-    RANK == 0 && rm(joinpath(dir, partof(other, NRANKS - 1)))
-    world_barrier()
-    n, msg = attempt(() -> load_checkpoint(other; comm=COMM))
-    emit("# checkpoint missing part refused on", n, "of", NRANKS, "ranks:", msg)
-    # Orphans: a file of the part form for the index, from a save no index
-    # names, is removed by the next save, and so are the previous save's
-    # parts; files of other forms are left alone.
-    orphans = joinpath(dir, "orphans-n$NRANKS.h5")
-    keep = [basename(orphans) * ".notapart.h5", basename(orphans) * "." * "a"^31 * ".0.h5",
-            basename(orphans) * "x." * "a"^32 * ".0.h5"]
-    if RANK == 0
-        touch(joinpath(dir, basename(orphans) * "." * "b"^32 * ".7.h5"))
-        foreach(name -> touch(joinpath(dir, name)), keep)
-    end
-    world_barrier()
-    save_checkpoint(orphans, forest; fieldsets=("u" => fs,), application="Refused" => 1,
-                    io=:all)
-    # Rank 0 removes the stale files after the commit, when the other ranks
-    # have returned: they wait for it here before they look.
-    world_barrier()
-    first_parts = ck_files(orphans)
-    save_checkpoint(orphans, forest; fieldsets=("u" => fs,), application="Refused" => 1,
-                    io=:all)
-    world_barrier()
-    after = ck_files(orphans)
-    # The index, its parts, and the two of `keep` named after the index.
-    cleaned = length(after) == NRANKS + 3 &&
-              !(basename(orphans) * "." * "b"^32 * ".7.h5" in after) &&
-              isempty(intersect(setdiff(first_parts, [basename(orphans)], keep), after)) &&
-              all(name -> isfile(joinpath(dir, name)), keep)
-    emit("# checkpoint orphans removed", all(TreeAMR.allgather(world, cleaned)))
-    # An I/O process that fails after its first write (a test hook): the
-    # save is refused on every rank, the previous checkpoint still loads,
-    # and none of the new parts, nor the partial index, is left.
-    world_barrier()
-    before = ck_files(orphans)
-    CKPT.FAIL_PART[] = NRANKS - 1
-    n, msg = try
-        attempt(() -> save_checkpoint(orphans, forest; fieldsets=("u" => fs,),
-                                      application="Refused" => 1, io=:all,
-                                      data=(; t=2.0)))
-    catch err
-        # Not an ArgumentError: an I/O error, which `attempt` rethrows.
-        count(TreeAMR.allgather(world, true)), sprint(showerror, err)
-    finally
-        CKPT.FAIL_PART[] = -1
-    end
-    emit("# checkpoint failed part on", n, "of", NRANKS, "ranks:", first(split(msg, '\n')))
-    intact = ck_files(orphans) == before &&
-             load_checkpoint(orphans; comm=COMM).data == (;)
-    emit("# checkpoint failed part left the previous one", all(TreeAMR.allgather(world,
-                                                                                  intact)))
-    # No file opened by more than one process, saving with two I/O groups
-    # and loading.
-    once = joinpath(dir, "once-n$NRANKS.h5")
-    saved = opened_once(() -> save_checkpoint(once, forest; fieldsets=("u" => fs,),
-                                              application="Refused" => 1, io=2))
-    loaded = opened_once(() -> load_checkpoint(once; comm=COMM))
-    emit("# checkpoint each file opened by one process", saved, loaded)
-    return nothing
-end
-
 # --- the cases --------------------------------------------------------------
 
 const OPS4 = Operators(prolongation=4, restriction=4)
@@ -1509,8 +1065,8 @@ function main()
     empty_rank_case("E2")
     # A rotating quadrant (M12): the vertex-centered wave in 2D, and in 3D
     # cell-centered over a reflecting low face below the plane, an octant;
-    # a set that turns into itself and a pair through a fill, a regrid,
-    # interpolation and a checkpoint; and a single leaf at the axis, which
+    # a set that turns into itself and a pair through a fill, a regrid and
+    # interpolation; and a single leaf at the axis, which
     # leaves every rank but one without blocks.
     wave_case("Q2v", forest_of((3, 3), 8; rotating=(1, 2), centre=(0.4, 0.5)); G=1,
               centering=vertexcentered(2), ops=OPS4, steps=6, rotation=(1, 2))
@@ -1521,11 +1077,7 @@ function main()
               parity=[ntuple(_ -> EvenParity, 3), ntuple(_ -> EvenParity, 3)])
     rotating_case("Q2")
     rotating_empty_case("QE2")
-    # Checkpoints: saved and loaded at this rank count, and the files of
-    # the runs before this one loaded at it.
-    checkpoint_case("C")
     refusals()
-    checkpoint_refusals()
     verbs()
     return nothing
 end

@@ -11,13 +11,10 @@
 # that had different owners, in three element types; then (step 5) point
 # interpolation, each rank asking for its own slice of a global point
 # list, and an outside point on one rank refused on all; a rank without
-# blocks through every operation (added in 0.1.6); then (steps 6
-# and 6b) a run checkpointed after a regrid, with a part file per rank,
-# per I/O group and per node, and continued from each, and the files of
-# the earlier runs, written at other rank counts, loaded and continued;
-# and (M12) a rotating quadrant: the wave in 2D and over a reflecting low
-# face in 3D, a set that turns into itself and a `RotationPair` filled,
-# regridded, interpolated beyond the seam and checkpointed, the pair's
+# blocks through every operation (added in 0.1.6); and (M12) a rotating
+# quadrant: the wave in 2D and over a reflecting low face in 3D, a set
+# that turns into itself and a `RotationPair` filled, regridded and
+# interpolated beyond the seam, the pair's
 # merged stages sharing their tags, and a single leaf at the axis that
 # leaves every rank but one empty — and prints
 # digests of the leaves, of the state and of the working arrays *with
@@ -38,13 +35,9 @@
 # says so — and the project is the *active* one, as in `thread_tests.jl`,
 # since under `Pkg.test` the tests run in a sandbox.
 #
-# The checkpoints go to one directory for every run: a file saved at
-# three ranks is loaded at two, at one (over `MPI.COMM_SELF` inside the
-# two-rank run) and serially, and the serial file at three; each
-# continuation must print the uninterrupted run's digests. A run that
-# loads another's files waits for that run's marker
-# (`TREEAMR_CHECKPOINT_FROM`), so the runs need not follow one another.
-# Where they start is `mpi_jobs.jl`'s: at the start of the suite where
+# The checkpoints, with their cross loads between rank counts, are
+# TreeIOHDF5's, and its own MPI test runs them. Where the jobs start is
+# `mpi_jobs.jl`'s: at the start of the suite where
 # the machine has room for both jobs beside it. Otherwise both start
 # here, beside the serial reference, where there is room for them (this
 # file run on its own on a large machine), or one after the other, each
@@ -84,42 +77,31 @@ function workload_mismatches(ref, out; rtol=1e-12)
 end
 
 # The serial reference, in this process: the script in a module of its
-# own, printing into a buffer it finds there. It loads no other run's
-# files.
-function serial_workload(dir)
+# own, printing into a buffer it finds there.
+function serial_workload()
     m = Module(:MPIWorkloadSerial)
     io = IOBuffer()
     Core.eval(m, :(const WORKLOAD_IO = $io))
-    withenv("TREEAMR_CHECKPOINT_DIR" => dir, "TREEAMR_CHECKPOINT_FROM" => "") do
-        Base.include(m, MPI_WORKLOAD)
-    end
-    return String(take!(io)), m, io
-end
-
-# The two digests at the end of the `#` line that starts with `prefix`.
-function digests_of(lines, prefix)
-    hits = filter(startswith(prefix * " "), lines)
-    length(hits) == 1 || return nothing
-    return split(only(hits))[(end - 1):end]
+    Base.include(m, MPI_WORKLOAD)
+    return String(take!(io))
 end
 
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
     early = take_mpi_jobs!()
-    dir = early === nothing ? mktempdir() : early.dir
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
     room = early !== nothing || concurrent_launches()
     three = early !== nothing ? early.three :
-            room ? launch_workload(3, dir; from=(1,)) : nothing
+            room ? launch_workload(3) : nothing
     two = early !== nothing ? early.two :
-          room ? launch_workload(2, dir; from=(1, 3)) : nothing
-    serial, workload, io = try
-        serial_workload(dir)
+          room ? launch_workload(2) : nothing
+    serial = try
+        serial_workload()
     catch
         foreach(j -> j === nothing || kill(j.proc), (three, two))
         rethrow()
     end
-    three === nothing && (three = launch_workload(3, dir; from=(1,)))
+    three === nothing && (three = launch_workload(3))
     lines = workload_lines(serial)
     @test first(lines) == "# ranks 1"
     @test count(l -> occursin(" state ", l), lines) >= 7
@@ -136,40 +118,20 @@ end
     @test all(l -> split(l)[3] == "301", filter(l -> occursin(" values ", l) &&
                                                      startswith(l, "I2"), lines))
     @test 0 < parse(Int, split(only(filter(startswith("I2.F64 excluded"), lines)))[3]) < 301
-    # Checkpoints (steps 6 and 6b): the restarted runs, from each of the
-    # three files, load what was saved and end where the uninterrupted run
-    # ends, on a mesh that changed after the save; and the version-1
-    # fixtures load (their lines are compared with the distributed runs'
-    # below, as every line is).
     words(prefix) = split(only(filter(startswith(prefix * " "), lines)))
-    uninterrupted, saved = words("C uninterrupted")[3:4], words("C saved")[3:4]
-    @test count(startswith("V1 "), lines) == 2
-    for name in ("restarted", "restarted-filtered", "restarted-node")
-        @test words("C $name loaded")[4:5] == saved
-        @test words("C $name continued")[4:5] == uninterrupted
-    end
-    leaves = words("C mesh")
-    @test leaves[3] != leaves[5]
-    @test words("C1 loaded")[3] == words("C1 saved")[3]
     # Three levels wherever they were asked for.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p") &&
                                                     !startswith(l, "E2"), lines))
-    # The ranks without blocks (E2): everything ran, the checkpoint came
-    # back as saved, and both initial-data cycles refined and converged.
-    @test words("E2 checkpoint")[3:4] == ["2", "true"]
+    # The ranks without blocks (E2): everything ran, and both initial-data
+    # cycles refined and converged.
     @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
               filter(startswith("E2 adapted "), lines))
     # The rotating quadrant (M12): the turned ghosts hold `−0` in all
-    # three sets, three quarters of the points were turned back across
-    # the seam, the checkpoint loads what was saved and fills to what was
-    # filled, and so does the single leaf's.
+    # three sets, and three quarters of the points were turned back
+    # across the seam.
     @test all(w -> parse(Int, w) > 0, words("Q2 negzero")[3:5])
     @test words("Q2 interpolated")[3:4] == ["257", "193"]
-    qsaved = words("QC saved")[3:5]
-    @test words("QC loaded")[3:5] == qsaved
-    @test words("QC refilled")[3:5] == words("Q2 refilled")[3:5]
-    @test words("QE2 checkpoint")[3:4] == ["1", "true"]
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.
@@ -184,23 +146,9 @@ end
     @test isempty(workload_mismatches(serial, moved(nextfloat(value, 3))))
     @test length(workload_mismatches(serial, moved(value * (1 + 1e-9)))) == 1
 
-    # A file another run wrote, at another rank count, loaded at `at` and
-    # continued: it must load what was saved and end where the
-    # uninterrupted run ends.
-    function crossed(hashes, from, at)
-        for suffix in ("", "-filtered", "-node")
-            @test digests_of(hashes, "# C-n$from$suffix at $at loaded") == saved
-            @test digests_of(hashes, "# C-n$from$suffix at $at continued") == uninterrupted
-        end
-        c1 = filter(startswith("# C1-n$from at $at loaded "), hashes)
-        @test length(c1) == 1 && split(only(c1))[end] == words("C1 saved")[3]
-        qc = filter(startswith("# QC-n$from at $at loaded "), hashes)
-        @test length(qc) == 1 && split(only(qc))[(end - 2):end] == qsaved
-    end
-
     outs = Dict{Int,String}()
     outs[3] = finish_workload(three; others=two === nothing ? () : (two,))
-    two === nothing && (two = launch_workload(2, dir; from=(1, 3)))
+    two === nothing && (two = launch_workload(2))
     outs[2] = finish_workload(two)
     for n in (3, 2)
         out = outs[n]
@@ -210,15 +158,6 @@ end
         @test isempty(bad)
         hashes = filter(startswith("#"), workload_lines(out))
         refused(what) = only(filter(startswith("# $what refused on"), hashes))
-        # The distributed checkpoints (steps 6 and 6b): the files record
-        # the rank count and the number of parts — one a rank, two groups,
-        # one node; at three ranks one rank holds none of the small
-        # forest's two blocks, when saving and loading; the serial file
-        # loads at three ranks, and the three-rank files at two and at one.
-        @test "# C restarted nranks $n nparts $n" in hashes
-        @test "# C restarted-filtered nranks $n nparts 2" in hashes
-        @test "# C restarted-node nranks $n nparts 1" in hashes
-        @test "# C1 empty ranks $(n == 3 ? 1 : 0)" in hashes
         # E2's two leaves leave one of three ranks without a block, before
         # its regrids and after them.
         @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
@@ -231,57 +170,6 @@ end
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes
         @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
-        for from in (n == 3 ? (1,) : (1, 3)), at in (n, 1)
-            crossed(hashes, from, at)
-        end
-        # Refused on every rank before the file is created: plain data
-        # that differ between ranks, an argument only rank 1's checks
-        # refuse, filters that differ on rank 1, and in the do-block a
-        # write_plain of a value that differs; then a load whose
-        # arguments differ on rank 1, and one of a file that is not
-        # there, which rank 0 alone looks for.
-        @test startswith(refused("checkpoint data"),
-                         "# checkpoint data refused on $n of $n ranks: the plain data " *
-                         "of save_checkpoint differ between ranks: rank(s) 1")
-        @test startswith(refused("checkpoint partial"),
-                         "# checkpoint partial refused on $n of $n ranks: " *
-                         "save_checkpoint was refused on rank(s) 1")
-        @test startswith(refused("checkpoint layout"),
-                         "# checkpoint layout refused on $n of $n ranks: " *
-                         "save_checkpoint was called for a different layout on rank(s) 1")
-        @test startswith(refused("checkpoint write_plain"),
-                         "# checkpoint write_plain refused on $n of $n ranks: the plain " *
-                         "data of write_plain of /Refused/mine differ between ranks")
-        @test "# checkpoint refusals left the file alone true" in hashes
-        @test startswith(refused("load layout"),
-                         "# load layout refused on $n of $n ranks: load_checkpoint was " *
-                         "called for a different layout on rank(s) 1")
-        @test startswith(refused("load missing"), "# load missing refused on $n of $n " *
-                                                  "ranks: there is no checkpoint at")
-        # Damage in the last part alone, refused by the checksums on every
-        # rank; a part of another save, and a missing part, refused on
-        # every rank before any data move (step 6b).
-        @test startswith(refused("checkpoint damage"),
-                         "# checkpoint damage refused on $n of $n ranks: the data of " *
-                         "field set \"u\" do not match the checksums stored with them " *
-                         "in 1 of its 16 blocks, the first being block 16")
-        @test startswith(refused("checkpoint foreign part"),
-                         "# checkpoint foreign part refused on $n of $n ranks:")
-        @test occursin("belongs to another save", refused("checkpoint foreign part"))
-        @test startswith(refused("checkpoint missing part"),
-                         "# checkpoint missing part refused on $n of $n ranks:")
-        @test occursin("is missing, so the checkpoint is refused",
-                       refused("checkpoint missing part"))
-        # Orphans removed, and nothing else; an I/O process that fails
-        # mid-save takes the save down on every rank and leaves the
-        # previous checkpoint as it was; and no file opened by two
-        # processes, saving or loading.
-        @test "# checkpoint orphans removed true" in hashes
-        failed = only(filter(startswith("# checkpoint failed part on"), hashes))
-        @test startswith(failed, "# checkpoint failed part on $n of $n ranks:")
-        @test occursin("writing the parts", failed) || occursin("failed on purpose", failed)
-        @test "# checkpoint failed part left the previous one true" in hashes
-        @test "# checkpoint each file opened by one process true true" in hashes
         # The negative control: one received ghost rewritten from a
         # corrupted message buffer changes the gathered digest.
         @test "# W2v perturbed-ghost-changes-digest true" in hashes
@@ -348,24 +236,6 @@ end
         @test migrated("M4.coarsen")[2] > 0
         @test all(t -> migrated("$t.coarsen")[3] > 0, ("M2", "M32x2-2"))
     end
-    # The files of both distributed runs, loaded serially in this process.
-    withenv("TREEAMR_CHECKPOINT_DIR" => dir, "TREEAMR_CHECKPOINT_FROM" => "2 3") do
-        Base.invokelatest(workload.checkpoint_cross, "C")
-        Base.invokelatest(workload.rotating_cross, "QC")
-    end
-    hashes = workload_lines(String(take!(io)))
-    for from in (2, 3)
-        crossed(hashes, from, 1)
-    end
-    # The index's external links lead tools into the parts (step 6b).
-    index = joinpath(dir, "C-n3.h5")
-    @test HDF5.h5open(index) do file
-        id = HDF5.read_attribute(file["TreeAMR.jl"], "save_id")
-        all(0:2) do j
-            HDF5.read_attribute(file["TreeAMR.jl/parts/$(lpad(j, 4, '0'))"], "save_id") ==
-            id
-        end
-    end
 end
 
 @testset "An MPI communicator needs MPI initialized, and says so" begin
@@ -373,10 +243,6 @@ end
     # so a forest over `COMM_WORLD` here would duplicate a communicator
     # of a library that is not running.
     @test !MPI.Initialized()
-    # The parallel-HDF5 extension of step 6 is gone (step 6b): with HDF5
-    # and MPI both loaded, only their own extensions are.
-    @test Base.get_extension(TreeAMR, :TreeAMRHDF5MPIExt) === nothing
-    @test Base.get_extension(TreeAMR, :TreeAMRHDF5Ext) !== nothing
     @test_throws "Call `MPI.Init()` before building the forest" Forest((2,); N=4,
                                                                        comm=MPI.COMM_WORLD)
 end

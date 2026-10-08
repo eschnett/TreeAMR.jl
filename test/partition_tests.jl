@@ -212,9 +212,8 @@ end
     # its communicator lacks, by name, rather than act on this rank's
     # blocks as if they were the whole mesh. A ghost fill gets as far as
     # its first message, a regrid as far as the gather of the flags, and
-    # an interpolation and a checkpoint (step 6) as far as their agreed
-    # checks, which a communicator answering only rank and size (and the
-    # digest) refuses by verb.
+    # an interpolation as far as its agreed checks, which a communicator
+    # answering only rank and size (and the digest) refuses by verb.
     serial = nested_forest(Val(2); N=8)
     forest = rank_forest(serial, 1, 3)
     fs = FieldSet(forest, 1; G=2)
@@ -229,8 +228,6 @@ end
     # forest digest.
     @test_throws "does not implement `allgather`" interpolate(fs, [(0.5, 0.5)],
                                                               Lagrange(4))
-    @test_throws "does not implement `allgather`" save_checkpoint(
-        tempname(), forest; fieldsets=("u" => fs,), application="A" => 1)
     # A reduction needs `allgather`, which this communicator lacks; the
     # refusal names the verb rather than failing inside the fold.
     @test_throws "does not implement `allgather`" mesh_mapreduce(abs, max, 0.0, fs)
@@ -256,7 +253,7 @@ end
     @test_throws "no peer 1" isend(comm, [1.0], 1, 0)
     @test_throws "no peer 0" irecv(comm, [1.0], 0, 0)
     @test waitall(comm, []) === nothing
-    # The two verbs of the checkpoints without parallel I/O (M7 step 6b).
+    # The two verbs only TreeIOHDF5's checkpoints use (companion interface).
     @test bcast(comm, UInt8[1, 2], 0) == UInt8[1, 2]
     @test_throws "no peer 1" bcast(comm, UInt8[], 1)
     @test commnodes(comm) == 1

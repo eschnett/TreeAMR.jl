@@ -689,49 +689,6 @@ end
     @test total_mass(dev) ≈ total_mass(host) rtol = gputol(T, 65536)
 end
 
-@testset "$bname: a checkpoint round-trips through the device: T=$T" for
-        (bname, backend, types) in BACKENDS, T in types
-    # M9a on a device. A save copies the state vector to the host, and a
-    # load reads into a host buffer and uploads it; neither may change a
-    # bit, and a file written from a device loads on the CPU as well as
-    # on the device, since nothing in it depends on the backend. Both
-    # forms of a field set are saved: `(fs, u)`, and the bare set, which
-    # gathers on the device first. The comparison is of bytes on the host.
-    forest = Forest((2, 2); N=8, periodic=(true, true),
-                    extents=ntuple(_ -> (zero(T), one(T)), 2))
-    refine!(forest, forest.leaves[1])
-    balance!(forest)
-    four = T(4)
-    f = (x, v) -> sin(four * x[1]) * cos(four * x[2]) + oftype(x[1], v)
-    fs = FieldSet{T}(forest, 2; G=2, backend=backend)
-    fill_by_coordinates!(f, fs)
-    u = statevector(fs)
-    gather!(u, fs)
-    path = joinpath(mktempdir(), "device.h5")
-    save_checkpoint(path, forest; fieldsets=("u" => (fs, u), "w" => fs),
-                    application="Device" => 1)
-    ops = Operators(prolongation=4, restriction=4)
-    fill_ghosts!(fs, GhostSchedule(fs, ops))
-    want = reinterpret(UInt8, Array(u))
-    for bk in (CPU(), backend)
-        ck = load_checkpoint(path; backend=bk)
-        @test ck.forest.leaves == forest.leaves
-        for name in ("u", "w")
-            loaded, v = ck.fieldsets[name].fieldset, ck.fieldsets[name].state
-            @test typeof(get_backend(v)) === typeof(bk)
-            @test typeof(get_backend(loaded.work)) === typeof(bk)
-            @test reinterpret(UInt8, Array(v)) == want
-            # The ghost fill on the loaded set, on the backend it was
-            # loaded to, reproduces the original's on the same backend.
-            if typeof(bk) === typeof(backend)
-                fill_ghosts!(loaded, GhostSchedule(loaded, ops))
-                @test reinterpret(UInt8, vec(Array(loaded.work))) ==
-                      reinterpret(UInt8, vec(Array(fs.work)))
-            end
-        end
-    end
-end
-
 # --- the acceptance test -------------------------------------------------
 
 @testset "$bname: M3 convergence reproduced: T=$T, D=$D" for
