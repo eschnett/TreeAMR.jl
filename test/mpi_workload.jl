@@ -1003,6 +1003,8 @@ end
 const OPS4 = Operators(prolongation=4, restriction=4)
 const OPS2 = Operators(prolongation=2, restriction=2)
 const OPSC = Operators(family=Conservative, prolongation=3, restriction=2)
+const OPSCB = Operators(family=Conservative, prolongation=3, restriction=2,
+                        bounded=true)
 
 function main()
     emit("# ranks", NRANKS)
@@ -1049,6 +1051,12 @@ function main()
               ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
                "edge1" => edgecentered(3, 1));
               G=1, ops=OPS2)
+    # The bounded prolongation across ranks, mirrored and clamped
+    # rows included: computed by the sender, read through the same columns.
+    fill_case("B2", forest_of((3, 3), 8; reflecting=((true, false), (false, false)),
+                              outflow=((false, true), (true, false)),
+                              centre=(0.4, 0.5)),
+              ("cell" => cellcentered(2),); G=1, ops=OPSCB)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,
     # the initial-data cycle from one leaf, and blocks moving between
     # ranks over several field sets, in Float64 and Float32x2. Float32 is

@@ -613,11 +613,11 @@ one.
 """
 function undefined_ghosts(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
                           T::Type=Float64, p::Int=4, N::Int=8,
-                          family=PointValue, backend=CPU()) where {D}
+                          family=PointValue, backend=CPU(), bounded=false) where {D}
     forest = faces_forest(kinds; T=T, N=N)
     f, parity = parity_data(T, kinds, p)
     ops = family === Conservative ?
-          Operators(prolongation=p, restriction=2, family=Conservative) :
+          Operators(prolongation=p, restriction=2, family=Conservative, bounded=bounded) :
           Operators(prolongation=p, restriction=p)
     fs = FieldSet{T}(forest, 2; G=ghosts_for(C, p), centering=C, parity=parity,
                      backend=backend)
@@ -662,11 +662,12 @@ occur. The remaining dimensions are periodic on both domains.
 `:hi` on `[-2, 0]` with its wall above.
 
 Returns `(maxdiff, ncells)`, or `nothing` if the two refinement patterns
-failed to correspond.
+failed to correspond. `ops` replaces the order-`p` point-value operators,
+for the conservative family and its bounded prolongation.
 """
 function reflecting_vs_doubled(::Val{D}; side::Symbol, centering::NTuple{D,Symbol},
-                               N=8, p=4) where {D}
-    ops = Operators(prolongation=p, restriction=p)
+                               N=8, p=4,
+                               ops=Operators(prolongation=p, restriction=p)) where {D}
     G = ghosts_for(centering, p)
     others = ntuple(d -> d == 1 ? false : true, D)
     xext = side === :lo ? (0.0, 2.0) : (-2.0, 0.0)
@@ -1186,9 +1187,9 @@ Returns [`compare_matching_blocks`](@ref)'s `(worst, npoints)`, or
 `nothing` if the refinements failed to correspond.
 """
 function rotating_vs_quadrupled(::Val{D}; rotating, centering::NTuple{D,Symbol},
-                                other=:periodic, N=8, p=4) where {D}
+                                other=:periodic, N=8, p=4,
+                                ops=Operators(prolongation=p, restriction=p)) where {D}
     quad, full = quadrant_and_full(Val(D); rotating=rotating, other=other, N=N)
-    ops = Operators(prolongation=p, restriction=p)
     G = ghosts_for(centering, p)
     f = rotating_data(D, rotating, other)
     parity = vector_parity(D, rotating, other)

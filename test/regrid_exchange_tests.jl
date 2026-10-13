@@ -41,8 +41,9 @@ end
 # received; the number of mismatched layout entries and segments, and of
 # ranks whose own classification kept other transfers than the whole
 # one; and the number of transfers that crossed a rank boundary.
-function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
-    ops = exchange_operators(C, family)
+function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
+                         bounded=false) where {D,T}
+    ops = exchange_operators(C, family; bounded=bounded)
     G = exchange_ghosts(C, family)
     nvars = length(EXCHANGE_PARITY)
     forest = Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
@@ -175,6 +176,9 @@ end
         end
         same, _, bad, _, _, _ = lockstep_regrid(serial, 3, cellcentered(D), Conservative,
                                                 Float64)
+        @test same && bad == 0
+        same, _, bad, _, _, _ = lockstep_regrid(serial, 3, cellcentered(D), Conservative,
+                                                Float64; bounded=true)
         @test same && bad == 0
     end
     @test ncross > 0

@@ -730,14 +730,17 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     local_, sent, received = serial ? (pairs, nothing, nothing) :
                              split_regrid(pairs, oldrange, newrange)
     GRP = grouptype(backend, T, Val(D))
+    # A bounded prolongation bounds the new children too.
+    bounded = boundedkernel(operators)
     locals = GRP[todevice(backend, TransferGroup{T,D}(key.kind, stencils(key), targets,
-                                                      sources))
+                                                      sources, 0, 0, (0, 0),
+                                                      key.kind === :prolong && bounded))
                  for (key, (targets, sources)) in local_]
     ST = stagetype(backend, T, Val(D))
     remote = serial ? nothing :
              remote_stage(remotetype(ST), T, backend, sent, received, stencils, key -> 0;
                           targetowner=newowner, sourceowner=oldowner,
-                          targetrange=newrange, sourcerange=oldrange)
+                          targetrange=newrange, sourcerange=oldrange, bounded=bounded)
     return ST(REGRID_TAG, locals, remote)
 end
 
@@ -868,7 +871,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "built for $(nameof(typeof(sched.backend))); pair each field set with its " *
         "own schedule"))
     ops = sched.operators
-    push!(layout, (Int(ops.family), ops.prolongation, ops.restriction))
+    push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded))
     return nothing
 end
 

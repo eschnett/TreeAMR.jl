@@ -491,6 +491,23 @@ not locally conservative. Coarsening alone conserves either way.
 ops = Operators(prolongation = 3, restriction = 2, family = Conservative)
 ```
 
+Where the data have jumps — a shock, a stellar surface — the order-3
+reconstruction overshoots by an eighth of the jump, which can make a
+positive quantity negative in a fresh child or a fine ghost. A bounded
+prolongation keeps every prolongated value between the extremes of its
+parent and the parent's face neighbours, still conservative and still
+exact for linear data:
+
+```julia
+ops = Operators(prolongation = 3, restriction = 2, family = Conservative,
+                bounded = true)
+```
+
+The bound is all the mesh promises: whether a state is physically
+admissible — a positive pressure, say — is a condition on all of a cell's
+variables together, and the application checks it after the fill or the
+regrid.
+
 ## Interpolating to points
 
 [`interpolate`](@ref) answers "what is the field *here*" for a batch of

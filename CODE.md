@@ -1380,15 +1380,139 @@ two operator families:
   [Blocks](#blocks). How the interface-order rule below transfers to
   this family is predicted and measured below.
 
+**Bounded prolongation.** The order-3 conservative prolongation
+overshoots a discontinuity by an eighth of the jump, so across a shock,
+or a stellar surface where the density drops by orders of magnitude, a
+fine ghost or a child the regrid makes can leave the range of the data
+around it — a density below the atmosphere, or negative. Order 1 does
+not, but costs the interface its order. `Operators(…; bounded = true)`,
+allowed only with `Conservative` at `prolongation = 3` or `1`, bounds it.
+At order 1 there is nothing to do — a child is a copy of its parent — and
+the flag is accepted only so that an application can switch between the
+two orders without touching it; the schedule then builds the ordinary
+order-1 groups, bit for bit the unbounded ones. At order 3, per
+variable, for a parent cell with average `ū`, one-sided differences
+`a = ū₊ − ū`, `b = ū − ū₋` along each dimension, the monotonized central
+slope `s_d = minmod(2a, 2b, (a + b)/2)`, and a child on sides
+`σ_d = ±1`:
+
+    child = ū + φ Σ_d σ_d s_d / 4,   φ = min(1, (M − ū)/S, (ū − m)/S),
+    S = Σ_d |s_d| / 4,
+
+with `M`, `m` the extremes of `ū` and its `2D` face neighbours (`φ = 1`
+where every slope is zero). So every child lies in `[m, M]`: no new
+extrema. The bound comes from `φ`, whatever the slope, so the slope is a
+matter of accuracy alone, and there is no choice of it to offer: the MC
+slope is the central one wherever the data are monotone, and it kept the
+interface order where minmod did not (the tables below; the minmod
+measurements are in [HISTORY.md](HISTORY.md#operators)). The children of
+a cell still average to it, to roundoff — opposite children's sums are
+exact negatives — so the transfer stays conservative, and linear data
+are reproduced (`φ = 1` for them when `D ≤ 3`). It is not a tensor
+product: it drops the mixed terms of the unbounded `3^D` stencil, so on
+smooth data it differs from the unbounded operator by `O(h²)` in
+`D ≥ 2`, still second order; in 1D, on smooth monotone data, it is the
+order-3 operator itself. `bounded = false`, the default, is the
+tensor-product operator, bit for bit as before. The bound holds
+everywhere the prolongation runs — the ghost fill, the regrid transfer
+and the fill the regrid does first.
+
+*Where the mesh stops.* The bound is a property of the interpolation, as
+conservation is, and needs nothing but the values. Whether a state is
+physically *admissible* — a positive pressure, an entropy inside the
+equation of state's window, a con2prim that succeeds — is not: it is a
+joint condition on all of a cell's variables, which no per-variable
+bound on conserved variables implies. That is the application's, applied
+cell by cell after the mesh has done its part: over the ghosts after the
+fill (`map_blocks!(…; stored = true)`), and over the new children after
+a regrid. The use this is built for, TreeGRRMHD with EntropyEOS for
+con2prim and admissibility, prolongates the *primitive* variables in the
+ghost fill, bounded, and the conserved ones only in the regrid. For
+primitives the per-variable bound has the right shape: the density and
+the electron fraction stay within their neighbours' range and so within
+the table's, rapidity components need no bound, and only the entropy
+window, which depends on the other two, can still be missed — which the
+application's projection after the fill catches. The projection is no
+substitute for the bound: at a surface with coarse densities `10⁻²`,
+`10⁻³` and `10⁻¹³`, the unbounded child next to the atmosphere is about
+`−2.5·10⁻⁴`, which a projection resets to the atmosphere, ten orders
+below the cell beside it; the bounded children are `5·10⁻⁴` and
+`1.5·10⁻³`. A primitive set needs no conservation from its ghosts —
+the flux fixup conserves at coarse-fine faces whatever they hold — but
+the conservative family is still the one for it: its restriction is the
+plain average, a convex combination, so the coarse ghosts stay bounded
+too, where an order-4 point-value restriction has negative weights.
+
+It enters the one transfer kernel rather than a kernel of its own. A
+`TransferGroup` carries a `bounded` flag, set only on a prolongation
+built from bounded order-3 operators (`boundedkernel`): the schedule's
+local groups, its packs —
+the sender computes, so the pack bounds and the unpack stays a copy —
+and the regrid's groups. The flag reaches `transfer_kernel!` as a `Val`,
+in the same run-time dispatch the stencil orders already go through, so
+a bounded kernel is compiled only where one runs, and the unbounded path
+is the code it was. The bounded sum reads the parent at the centre of
+the order-3 window and its face neighbours through `transfer_load`, and
+the child's side off its stencil column — `(1/8, 1, −1/8)` is the low
+child, `(−1/8, 1, 1/8)` the high one — not off the target position; so a
+mirrored, clamped or rotated row, whose column is its image's, and a
+pack, which keeps the serial columns, need nothing of their own. The
+parity or rotation sign comes afterwards, as for every transfer, and
+commutes with the bounded sum, which is odd. A `NaN` neighbour would
+vanish into a zero slope through `minmod`'s comparisons, so the result
+carries `0 · (M − m)`, keeping an undefined source as visible as the
+stencil sum keeps it. The operators' `bounded` joins what the ranks
+agree on, for the schedule and for the regrid. How it came to be a
+property rather than a choice of limiters is in
+[HISTORY.md](HISTORY.md#operators).
+
+**Measured** with TreeHydro (2026-10-13, its `main` against this
+checkout, prolongating the *conserved* variables, which is what
+TreeHydro does; deterministic counts and errors, not timings). The
+static Sedov blast whose shock crosses a coarse-fine face
+(`sedov_static`, `refined = :center`, the same step count for every row,
+L1 against the uniformly fine run by TreeHydro's `l1_difference`, energy
+drift relative to its scale):
+
+| prolongation | `D` | floor / reset / ghost hits | L1 | energy drift |
+|---|---|---|---|---|
+| 3 | 2 | 0 / 4136 / 40 | 4.4066e-2 | 1.2e-5 |
+| 3, bounded | 2 | 0 / 0 / 0 | 4.4117e-2 | 1.1e-15 |
+| 1 | 2 | 0 / 0 / 0 | 4.4272e-2 | 1.9e-15 |
+| 3 | 3 | 89 / 24576 / 4786 | 2.313e-3 | 4.3e-5 |
+| 3, bounded | 3 | 0 / 0 / 0 | 1.717e-3 | 1.9e-15 |
+| 1 | 3 | 0 / 0 / 0 | 1.808e-3 | 1.7e-15 |
+
+So the bound buys order 1's freedom from floors and resets — energy
+conserved to roundoff — at almost all of order 3's accuracy in 2D, and
+better accuracy than either in 3D, where the unbounded prolongation's
+floors and resets cost more than its order gains. TreeHydro's
+interface-order study (smooth entropy wave across a static coarse-fine
+face, reconstruction unlimited) measures the price on smooth data:
+
+| prolongation | L∞ rate `D = 1` | L∞ rate `D = 2` | L1 rate `D = 1` | L1 rate `D = 2` |
+|---|---|---|---|---|
+| 3 | 2.034 | 2.041 | 1.971 | 2.009 |
+| 3, bounded | 2.034 | 2.027 | 1.987 | 2.013 |
+| 1 | 0.963 | 0.925 | 1.966 | 1.900 |
+| *unrefined control* | 2.024 | 2.029 | 2.015 | 2.021 |
+
+The bounded prolongation keeps the interface order: its finest 2D L∞
+error is within 3 % of the unbounded one's. These are conserved
+variables; prolongating primitives, as TreeGRRMHD will, has yet to be
+measured.
+
 There is **no default order**: the
 right order depends on the application's differencing order via the
 interface-order rule below, which the mesh library cannot know, so
 `Operators` requires both orders explicitly. The application chooses
 `G`; the package verifies at construction that `N`, `G`, and the
 requested operator orders satisfy the invariants listed under
-[Blocks](#blocks). Physics-specific operators —
-hydro-aware limited interpolation, primitive-variable-based prolongation
-— live in application packages and plug into the same interface.
+[Blocks](#blocks). Physics stays out of the operators: the bounded
+prolongation above keeps values within their neighbours' range, which
+needs nothing but the values, while admissibility — and the choice of
+which variables to prolongate — is the application's (see "Where the
+mesh stops" above).
 
 Operators are configured per field set, not per variable — and that
 *is* per-variable selection: a field set is the unit of
@@ -4325,11 +4449,12 @@ which companion releases go with it.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`rotate_tests.jl` (M12),
+`outflow_tests.jl`, `rotate_tests.jl` (M12),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
-`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
+`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`,
+`bounded_tests.jl` (the bounded prolongation), `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `mpi_tests.jl` (M7) and
 `gpu_tests.jl` (M2–M8).
@@ -4621,23 +4746,6 @@ Remaining, none blocking before their milestone:
   extrapolation would be a stencil of its own along the wall dimension,
   in place of `clamp_rows`'s copy, reading owned rows only; it needs an
   application that asks for it.
-- **(proposed) Limited conservative prolongation**, asked for by
-  TreeGRRMHD (its AMR-4) so that the regrid and the ghost fill create
-  no new extrema at a stellar surface: `Operators(…; limiter = :minmod |
-  :mc | :none)`, only with `Conservative` and `prolongation = 3`, `:none`
-  bit-identical to today. Per variable, slopes `s_d` from the coarse
-  cell's face neighbours, children `ū_c + φ Σ_d σ_d s_d / 4`, with `φ`
-  the largest scaling that keeps every child within the min and max of
-  the cell and its `2D` face neighbours. It conserves exactly and
-  reproduces linear data, and reads only cells inside the `p = 3`
-  window, so `G ≥ 1` still holds. It is not a tensor product, which is
-  the cost: it has to enter the one transfer kernel without breaking
-  "one kernel for every transfer" — a compile-time limiter parameter on
-  `transfer_kernel!`, chosen for `:prolong` groups only, so that
-  `:none` compiles to today's code, and checked against the MPI
-  workload's compile time — and the child side `σ_d` has to come from
-  the stencil rows, so that mirrored, clamped, rotated and packed
-  transfers need no special case. Deferred.
 - **What M12 leaves open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
   - *A 180° rotation, the π-symmetry* (deferred).

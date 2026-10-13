@@ -392,6 +392,12 @@ end
     @test isfinite(r.l1)
     @test r.drift <= 64 * eps(T) * r.scale
     @test control.drift > 100 * eps(T) * control.scale
+    # The bounded prolongation conserves too, on the same backend.
+    bounded = burgers_errors(Val(D); common...,
+                             ops=Operators(family=Conservative, prolongation=3,
+                                           restriction=2, bounded=true))
+    @test isfinite(bounded.l1)
+    @test bounded.drift <= 64 * eps(T) * bounded.scale
 end
 
 @testset "$bname: the cell hook reproduces the host hook exactly: T=$T, D=$D" for

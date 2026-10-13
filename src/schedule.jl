@@ -94,6 +94,11 @@ reads the real source through the axis map of `r` (see `axismap`) and the
 field set's variable table. Zero means an ordinary source, read as it
 is. The three small fields share the eight bytes `factorcol` had alone,
 so a group is no larger than before M12.
+
+`bounded` is false for every group but a prolongation built from bounded
+operators, whose kernel then bounds the reconstruction instead of summing
+the stencil (see "Bounded prolongation" in `CODE.md`). It is the fourth
+small field in those eight bytes.
 """
 struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     kind::Symbol                      # :copy, :restrict, or :prolong
@@ -103,14 +108,16 @@ struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     factorcol::Int32                  # 0, or the factor-table column
     orientation::Int8                 # 0, or the quarter turns of the source
     plane::NTuple{2,Int8}             # the seam's (d1, d2), or (0, 0)
+    bounded::Bool                     # a bounded prolongation
 end
 
 TransferGroup{T,D}(kind::Symbol, stencils::NTuple{D,S},
                    targetblocks::VB, sourceblocks::VB, factorcol::Integer=0,
                    orientation::Integer=0,
-                   plane::NTuple{2,Integer}=(0, 0)) where {T,D,S,VB} =
+                   plane::NTuple{2,Integer}=(0, 0),
+                   bounded::Bool=false) where {T,D,S,VB} =
     TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks,
-                            Int32(factorcol), Int8(orientation), Int8.(plane))
+                            Int32(factorcol), Int8(orientation), Int8.(plane), bounded)
 
 boxsize(g::TransferGroup{T,D}) where {T,D} = ntuple(d -> ntarget(g.stencils[d]), D)
 ntransfers(g::TransferGroup) = length(g.targetblocks)
@@ -123,7 +130,7 @@ todevice(backend::Backend, g::TransferGroup{T,D}) where {T,D} =
     TransferGroup{T,D}(g.kind, ntuple(d -> todevice(backend, g.stencils[d]), D),
                        todevice(backend, g.targetblocks),
                        todevice(backend, g.sourceblocks), g.factorcol, g.orientation,
-                       g.plane)
+                       g.plane, g.bounded)
 # The concrete group type on a given backend, so that a schedule's
 # `phase1`/`phase2` are concretely typed even when they are empty (a
 # uniform single-root forest has no restrictions and no prolongations).
@@ -1163,12 +1170,16 @@ end
 # the targets and the sources are local to. For the ghost and interface
 # exchanges both are `blockrange(forest)`; the regrid transfer (`regrid_stage`)
 # has its targets in the new partition and its sources in the old.
+# `bounded` is whether the prolongations among the packs are bounded:
+# the sender computes, so it is the pack that bounds, and the unpack
+# stays a copy.
 # Returns `nothing` when the stage has no messages here.
 function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
                       sent::TransferPairs{D}, received::TransferPairs{D}, stencils,
                       factorcol; targetowner, sourceowner, targetrange::UnitRange{Int},
                       sourcerange::UnitRange{Int},
-                      plane::NTuple{2,Int8}=(Int8(0), Int8(0))) where {RS<:RemoteStage,T,D}
+                      plane::NTuple{2,Int8}=(Int8(0), Int8(0)),
+                      bounded::Bool=false) where {RS<:RemoteStage,T,D}
     isempty(sent) && isempty(received) && return nothing
     built = Dict{GroupKey{D},Any}()
     host(key) = get!(() -> stencils(key), built, key)
@@ -1192,7 +1203,7 @@ function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
         st = map(s -> Stencil1D{T}(1, s.srcstart, s.weights), host(key))
         push!(packs, todevice(backend, TransferGroup{T,D}(
             key.kind, st, Int32[o[2] for o in order], Int32[o[1] for o in order], 0,
-            key.orientation, plane)))
+            key.orientation, plane, key.kind === :prolong && bounded)))
     end
     # An unpack is a width-1, weight-1 transfer from a slot into the
     # target box the serial group writes, carrying its parity column.
@@ -1228,7 +1239,8 @@ function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, locals
                       sentby::Dict{Int,TransferPairs{D}},
                       receivedby::Dict{Int,TransferPairs{D}}, stencils, factorcol,
                       forest::Forest{D}; required=Int[],
-                      plane::NTuple{2,Int8}=(Int8(0), Int8(0))) where {ST,T,D}
+                      plane::NTuple{2,Int8}=(Int8(0), Int8(0)),
+                      bounded::Bool=false) where {ST,T,D}
     owned = blockrange(forest)
     owner(i) = leafowner(forest, i)
     tags = sort!(unique!([required; localtags; collect(keys(sentby));
@@ -1238,7 +1250,7 @@ function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, locals
                  remote_stage(remotetype(ST), T, backend, get(sentby, tag, nopairs),
                               get(receivedby, tag, nopairs), stencils, factorcol;
                               targetowner=owner, sourceowner=owner, targetrange=owned,
-                              sourcerange=owned, plane=plane))
+                              sourcerange=owned, plane=plane, bounded=bounded))
               for tag in tags]
 end
 
@@ -1254,9 +1266,10 @@ end
 # builder takes its element type as a run-time value: here `T` is static,
 # so each group is built by a static call. (Built inline, M12's small
 # fields made the call box them once per group, which `bench/ghosts.jl`
-# showed as 448 bytes more per build.)
+# showed as 448 bytes more per build.) `bounded` is whether the
+# prolongation groups are bounded.
 function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::TransferPairs{D},
-                      build, factorcol, plane) where {GRP,T,D}
+                      build, factorcol, plane, bounded::Bool) where {GRP,T,D}
     phase1 = GRP[]
     bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
@@ -1264,7 +1277,8 @@ function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::Transfer
         stencils = build(key)::NTuple{D,Stencil1D{T,Vector{Int32},Matrix{T}}}
         group = todevice(backend, TransferGroup{T,D}(key.kind, stencils, targets, sources,
                                                      factorcol(key), key.orientation,
-                                                     plane))
+                                                     plane,
+                                                     key.kind === :prolong && bounded))
         if key.kind === :prolong
             push!(get!(bylevel, key.level, GRP[]), group)
         else
@@ -1294,7 +1308,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         check_operators(N, gs, ss, operators)
         check_floattype(T, backend)
         layout = layouthash(gs, cs, Int(operators.family), operators.prolongation,
-                            operators.restriction, T, nameof(typeof(backend)))
+                            operators.restriction, operators.bounded, T,
+                            nameof(typeof(backend)))
         return (gs, cs, ss), layout
     end
     ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int} = checked
@@ -1373,7 +1388,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     plane = forest.rotating
 
     GRP = grouptype(backend, T, Val(D))
-    phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, plane)
+    phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, plane,
+                                   boundedkernel(operators))
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
@@ -1388,7 +1404,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     ST = stagetype(backend, T, Val(D))
     stages = build_stages(ST, T, backend, leveltags, localsof, bystage(stageof, sent),
                           bystage(stageof, received), build, factorcol, forest;
-                          required=[PHASE1_TAG], plane=plane)
+                          required=[PHASE1_TAG], plane=plane,
+                          bounded=boundedkernel(operators))
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, operators, backend, phase1,
         phase2, levels, boundaries, bplan, stages)

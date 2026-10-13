@@ -49,7 +49,7 @@ See [`Operators`](@ref).
 @enum OperatorFamily PointValue Conservative
 
 """
-    Operators(; prolongation, restriction, family=PointValue)
+    Operators(; prolongation, restriction, family=PointValue, bounded=false)
 
 The operator family and orders a [`GhostSchedule`](@ref) is built with.
 Both orders are required — there is deliberately **no default**. The
@@ -150,6 +150,41 @@ forest, each with its own schedule.
     for a second-order-in-space application — which is what a default of
     2 used to hide.
 
+**Bounded prolongation.** `bounded = true`, allowed only with the
+conservative family at `prolongation = 3` or `1`, makes the prolongation
+create no new extrema: a ghost filled across a coarse-fine face, or a child made
+by [`regrid!`](@ref), lies between the smallest and the largest of its
+parent cell and the parent's `2D` face neighbours. That is a property of
+the interpolation, as conservation is, and it is what keeps a fine ghost
+from leaving the range of the data around it where the unlimited order-3
+slope overshoots — across a shock, or a stellar surface where the
+density drops by orders of magnitude. Whether a state is *physically*
+admissible is the application's question, answered after the fill. At
+order 1 a child is a copy of its parent, so the bound holds already and
+`bounded = true` changes nothing; it is accepted so that an application
+can switch between the two orders without touching it. At order 3, per
+variable, with `ū` the parent's average, `a = ū₊ − ū` and `b = ū − ū₋`
+its one-sided differences along dimension `d`,
+
+- the slope is the monotonized central `s_d = minmod(2a, 2b, (a + b)/2)`,
+  which is the unlimited `(a + b)/2` wherever the data are smooth and
+  monotone;
+- a child on side `σ_d = ±1` gets `ū + φ Σ_d σ_d s_d / 4`;
+- `φ = min(1, (M − ū)/S, (ū − m)/S)` with `S = Σ_d |s_d|/4` and `M`, `m`
+  the largest and smallest of `ū` and its face neighbours (`φ = 1` where
+  every slope is zero) — the largest scaling that keeps every child in
+  `[m, M]`.
+
+The bound comes from `φ`, not from the slope, so the slope is a matter
+of accuracy only, and there is no choice of slope to make. The `2^D`
+children of a cell still average to it, so the transfer stays
+conservative, and linear data are still reproduced exactly. Unlike the
+unbounded operator it is not a tensor product: it drops the mixed terms
+of the tensor-product stencil, so on smooth data it differs from the
+unbounded operator by `O(h²)` in `D ≥ 2`, and it stays second order.
+`bounded = false`, the default, is the tensor-product operator,
+unchanged. See "Bounded prolongation" under "Operators" in `CODE.md`.
+
 The two operators behave differently at a coarse-fine interface.
 
 **Prolongation stays symmetric.** Its window may reach into the coarse
@@ -189,13 +224,14 @@ struct Operators
     family::OperatorFamily
     prolongation::Int
     restriction::Int
+    bounded::Bool                      # the prolongation creates no new extrema
 
     # Sentinel defaults rather than required keywords, so that omitting
     # one reports *why* there is no default instead of a bare
     # UndefKeywordError.
     function Operators(; prolongation::Union{Integer,Nothing}=nothing,
                        restriction::Union{Integer,Nothing}=nothing,
-                       family::OperatorFamily=PointValue)
+                       family::OperatorFamily=PointValue, bounded::Bool=false)
         for (name, p) in (("prolongation", prolongation), ("restriction", restriction))
             p === nothing && throw(ArgumentError(
                 "Operators has no default order: pass $name explicitly. The order " *
@@ -225,13 +261,25 @@ struct Operators
                 "$restriction. It is exact for any field, so there is no higher order " *
                 "to ask for."))
         end
-        return new(family, Int(prolongation), Int(restriction))
+        !bounded || (family === Conservative && prolongation in (1, 3)) ||
+            throw(ArgumentError(
+                "bounded = true needs family = Conservative and prolongation = 3 or 1, " *
+                "got family = $family and prolongation = $prolongation: the bound limits " *
+                "the slope of the order-3 conservative reconstruction, the one operator " *
+                "that has a slope to limit and cell averages whose range it can keep, " *
+                "and order 1, which copies the parent, is bounded already"))
+        return new(family, Int(prolongation), Int(restriction), bounded)
     end
 end
 
+# Whether the prolongation groups take the bounded kernel: at order 1 a
+# child is a copy of its parent, bounded already, so only order 3 does.
+boundedkernel(ops::Operators) = ops.bounded && ops.prolongation == 3
+
 Base.show(io::IO, ops::Operators) =
     print(io, "Operators(prolongation=", ops.prolongation,
-          ", restriction=", ops.restriction, ", family=", ops.family, ")")
+          ", restriction=", ops.restriction, ", family=", ops.family,
+          ops.bounded ? ", bounded=true" : "", ")")
 
 """
     ghost_layers_read(ops::Operators)

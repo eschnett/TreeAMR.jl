@@ -87,7 +87,9 @@ the discretization scheme you are using. For example, to stay second
 order across a refinement boundary, a second-derivative stencil needs
 order-4 interpolation, and a flux divergence needs order-3
 conservative prolongation, two orders above the differencing in either
-family.
+family. The order-3 conservative prolongation can also be *bounded*
+(`bounded = true`), so that refining across a shock or a stellar surface
+creates no new extrema and a positive quantity stays positive.
 
 Fields (variables) can live at cell centers (cell averages), vertices,
 faces, or edges, per dimension, and different field sets with
