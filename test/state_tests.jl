@@ -412,3 +412,20 @@ end
     refine!(forest, forest.leaves[1])
     @test_throws "was not resized" statevector((a, b))
 end
+
+@testset "map_blocks! accepts a workgroup size and the CPU keeps its own: D=$D" for
+        D in (1, 2, 3)
+    # Backend-agnostic code passes the workgroup size a device kernel
+    # wants unconditionally. On the CPU the workgroup is the block, which
+    # keeps every block on its owner's thread, so the size changes
+    # nothing there.
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
+    fs = FieldSet(forest, 1; G=1)
+    fill_by_coordinates!((x, v) -> sum(x), fs)
+    du = statevector(fs)
+    map_blocks!(double_interior!, fs, statearray(du, fs), fs.work, Val(D), Val(fs.G))
+    dv = statevector(fs)
+    map_blocks!(double_interior!, fs, statearray(dv, fs), fs.work, Val(D), Val(fs.G);
+                workgroupsize=(ntuple(_ -> 2, D)..., 1))
+    @test dv == du
+end

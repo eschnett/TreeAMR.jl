@@ -332,6 +332,13 @@ depend on the workgroup size. The same launch runs on a device; every
 work item writes its own output cell, so the result does not depend on
 how the loop was split.
 
+`workgroupsize` is handed to the KernelAbstractions launch on a device,
+where a kernel heavy in registers may want smaller workgroups than the
+backend picks; `nothing` leaves the choice to the backend. The CPU
+ignores it, since there the workgroup is the block, which is what keeps
+every block on its owner's thread — so code written once for every
+backend may pass it unconditionally.
+
 ```julia
 @kernel function rhs!(du, @Const(work), @Const(h), ::Val{D}, ::Val{G}) where {D,G}
     I = @index(Global, NTuple)
@@ -354,7 +361,8 @@ end
 ```
 """
 function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
-                     closed::Bool=false, stored::Bool=false) where {T,D}
+                     closed::Bool=false, stored::Bool=false,
+                     workgroupsize=nothing) where {T,D}
     stored && closed && throw(ArgumentError(
         "map_blocks! takes `closed = true` or `stored = true`, not both: the " *
         "closed range G+1 … G+N+c is a sub-range of the stored one 1 … N+2G+c, " *
@@ -365,7 +373,8 @@ function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
     c = staggers(fs)
     extent = stored ? ntuple(d -> size(fs.work, d), D) :
              ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
-    launch_by_owner!(kernel!, backend, args...; ndrange=(extent..., nblocks(fs)))
+    launch_by_owner!(kernel!, backend, args...; ndrange=(extent..., nblocks(fs)),
+                     workgroupsize=workgroupsize)
     synchronize(backend)
     return nothing
 end

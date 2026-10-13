@@ -2533,6 +2533,11 @@ entries per volume.
      package must substitute `CPU(; static = true)` itself, because
      `get_backend(::Array)` returns the default `CPU()` and the flag
      cannot travel on the storage. A device backend is untouched.
+     `map_blocks!(…; workgroupsize)` hands an application's workgroup
+     size (a register-heavy kernel may want a small one) to a device
+     launch only: on the CPU the workgroup *is* the block, so the
+     keyword is ignored there rather than refused, and code written
+     once for every backend may pass it unconditionally.
      Nothing upstream is required. KernelAbstractions' default is
      reasonable for a kernel run once and wrong for one run every step
      over the same data, which is worth an issue there, not a

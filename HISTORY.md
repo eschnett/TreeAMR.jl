@@ -274,6 +274,8 @@ The volume-weighted norm for adaptive integrators was documented in the design a
 
 Bit-identical results were decided in M5 and narrowed after M8 to promise floating-point sums to roundoff only.
 
+`map_blocks!`'s `workgroupsize` came on 2026-10-13, as TreeGRRMHD's AMR-5 (also on TreeGeneralizedHarmonic's list). It reaches a device launch only; the CPU ignores it rather than refusing it, since overriding the block-per-workgroup launch would move blocks off their owners' threads, and backend-agnostic code should not have to branch on the backend to pass it.
+
 The phase as one parallel loop was amended in M5: each phase was flattened into slices of roughly equal cell count, never crossing a batch, dealt out largest first, one task per thread, each slice launching as a single inline workgroup. It was amended again on 2026-09-23: still one parallel loop with every batch split across all threads, but by owner rather than by size.
 
 Pinning KernelAbstractions to its *static* schedule,
