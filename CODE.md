@@ -4621,6 +4621,23 @@ Remaining, none blocking before their milestone:
   extrapolation would be a stencil of its own along the wall dimension,
   in place of `clamp_rows`'s copy, reading owned rows only; it needs an
   application that asks for it.
+- **(proposed) Limited conservative prolongation**, asked for by
+  TreeGRRMHD (its AMR-4) so that the regrid and the ghost fill create
+  no new extrema at a stellar surface: `Operators(…; limiter = :minmod |
+  :mc | :none)`, only with `Conservative` and `prolongation = 3`, `:none`
+  bit-identical to today. Per variable, slopes `s_d` from the coarse
+  cell's face neighbours, children `ū_c + φ Σ_d σ_d s_d / 4`, with `φ`
+  the largest scaling that keeps every child within the min and max of
+  the cell and its `2D` face neighbours. It conserves exactly and
+  reproduces linear data, and reads only cells inside the `p = 3`
+  window, so `G ≥ 1` still holds. It is not a tensor product, which is
+  the cost: it has to enter the one transfer kernel without breaking
+  "one kernel for every transfer" — a compile-time limiter parameter on
+  `transfer_kernel!`, chosen for `:prolong` groups only, so that
+  `:none` compiles to today's code, and checked against the MPI
+  workload's compile time — and the child side `σ_d` has to come from
+  the stencil rows, so that mirrored, clamped, rotated and packed
+  transfers need no special case. Deferred.
 - **What M12 leaves open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
   - *A 180° rotation, the π-symmetry* (deferred).
