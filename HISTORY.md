@@ -235,7 +235,7 @@ Buffering was added post-M4, and amended to *box-as-source* after the first impl
 
 The conservation of the transfer was measured in M4. The conservative operator family landed early (pre-M5).
 
-Per-set boundary hooks in `regrid!` (`fs => (schedule, hook)`) came on 2026-10-13, as TreeGRRMHD's AMR-2. AMR-2 offered an alternative — document that with `boundary = nothing` the outward ghosts keep what the caller put there, so a caller may fill each set with its own hook just before `regrid!` — which holds, but costs a fill per set per regrid; the API form was taken.
+Per-set boundary hooks in `regrid!` (`fs => (schedule, hook)`) and the several-set initial-data cycle came on 2026-10-13, as TreeGRRMHD's AMR-2 and AMR-3. AMR-2 offered an alternative — document that with `boundary = nothing` the outward ghosts keep what the caller put there, so a caller may fill each set with its own hook just before `regrid!` — which holds, but costs a fill per set per regrid; the API form was taken. In AMR-3 a set paired with `nothing`, only resized, was added for TreeGRRMHD's ghost-free flux set, which has no initial data.
 
 ### Point interpolation
 

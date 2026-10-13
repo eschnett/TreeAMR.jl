@@ -1075,6 +1075,7 @@ regrid!(::Forest, ::Any, ::GhostSchedule; kwargs...) = throw(ArgumentError(
     adapt_to_initial_data!(fs, operators; initial, flag, buffer=0, maxpasses=10,
                            boundary=nothing)
     adapt_to_initial_data!(pair::RotationPair, operators; initial, flag, …)
+    adapt_to_initial_data!(pairs::Tuple; initial::Tuple, flag, …)
 
 Run the initialization cycle from `CODE.md`: fill the initial data, flag,
 regrid, then **re-evaluate** the initial data on the new mesh rather than
@@ -1113,6 +1114,28 @@ callback for both sets or a tuple of two, `flags` receives the pair, and
 `boundary` is one hook or a tuple of two, as for
 [`fill_ghosts!`](@ref). It returns `((schedule_a, schedule_b), passes,
 converged)`.
+
+Several field sets over one forest adapt together through the third
+form, so that the criterion may read all of them and every set is
+re-evaluated on the final mesh:
+
+```julia
+(schedules, passes, converged) = adapt_to_initial_data!(
+    (matter => ops, metric => (ops, metric_hook), flux => nothing);
+    initial = (matter_data, metric_data, nothing),
+    flags = sets -> my_flags(sets...))
+```
+
+Each element of `pairs` is `fs => operators`, `fs => (operators, hook)`
+with a boundary hook of the set's own that replaces `boundary` — sets
+with different `nvars` cannot share one [`AllVariables`](@ref) hook — or
+`fs => nothing` for a set that is only resized, as in
+[`regrid!`](@ref). `initial` has one entry per element: a callback as
+above, or `nothing` exactly for the sets that are only resized. Every
+set with data is refilled after every pass, and its ghosts are filled
+before the criterion runs; `flags` receives the tuple of field sets, in
+the order of `pairs`. It returns `(schedules, passes, converged)` with
+one schedule per element, `nothing` for a set only resized.
 
 Over a distributed forest (M7) the cycle is collective, as every
 [`regrid!`](@ref) in it is: `flag` is called for this rank's blocks,
@@ -1170,6 +1193,80 @@ function adapt_to_initial_data!(pair::RotationPair, operators::Operators;
     return (schedules, Int(maxpasses), false)
 end
 
+# The several-set form (for TreeGRRMHD): the same cycle over every set of
+# the tuple, each filled with its own initial data and its own hook, and
+# the forest regridded once per pass for all of them.
+function adapt_to_initial_data!(pairs::Tuple{Vararg{Pair}}; initial::Tuple,
+                                flag=nothing, flags=nothing, buffer::Integer=0,
+                                maxpasses::Integer=10, boundary=nothing)
+    criterion = adapt_criterion(flag, flags)
+    entries = adapt_entries(pairs, initial)
+    sets = map(e -> e.fs, entries)
+    forest = first(sets).forest
+    build() = map(e -> e.ops === nothing ? nothing : GhostSchedule(e.fs, e.ops), entries)
+    refill() = foreach(e -> e.init === nothing || fill_by_coordinates!(e.init, e.fs),
+                       entries)
+    schedules = build()
+    refill()
+
+    for pass in 1:maxpasses
+        for (e, sched) in zip(entries, schedules)
+            sched === nothing && continue
+            fill_ghosts!(e.fs, sched; boundary=(e.hook === nothing ? boundary : e.hook))
+        end
+        changed = regrid!(forest, map((e, sched) -> e.fs => sched, entries, schedules);
+                          flags=criterion(sets), buffer=buffer, transfer=false)
+        schedules = build()
+        refill()
+        changed || return (schedules, pass, true)
+    end
+    return (schedules, Int(maxpasses), false)
+end
+
+# The elements of the several-set form, checked and taken apart: each
+# set with its operators (or `nothing`), its own hook, and its initial
+# data.
+function adapt_entries(pairs::Tuple, initial::Tuple)
+    isempty(pairs) && throw(ArgumentError(
+        "adapt_to_initial_data! needs at least one `fs => operators` element"))
+    length(initial) == length(pairs) || throw(ArgumentError(
+        "initial has $(length(initial)) entries for $(length(pairs)) field sets: give " *
+        "one callback per set, in the order of the pairs, and `nothing` for a set " *
+        "that is only resized"))
+    forest = nothing
+    return ntuple(length(pairs)) do i
+        p = pairs[i]
+        p.first isa FieldSet || throw(ArgumentError(
+            "element $i is a `$(typeof(p.first)) => …`; the several-set form takes " *
+            "`fs => operators` with a FieldSet. A RotationPair adapts through its own " *
+            "form, `adapt_to_initial_data!(pair, operators; …)`"))
+        fs = p.first
+        forest === nothing && (forest = fs.forest)
+        fs.forest === forest || throw(ArgumentError(
+            "field set $i is over a different forest from field set 1: the sets adapt " *
+            "together, so they must share the forest"))
+        x = p.second
+        ops, hook = x isa Operators ? (x, nothing) :
+                    x === nothing ? (nothing, nothing) :
+                    x isa Tuple{Operators,Any} ? (x[1], x[2]) :
+                    throw(ArgumentError(
+                        "element $i is `fs => ` a $(typeof(x)); write " *
+                        "`fs => operators`, `fs => (operators, hook)` with a boundary " *
+                        "hook of the set's own, or `fs => nothing` for a set that is " *
+                        "only resized"))
+        init = initial[i]
+        (ops === nothing) == (init === nothing) || throw(ArgumentError(
+            ops === nothing ?
+            "field set $i is only resized (`fs => nothing`) but has initial data: a " *
+            "set without operators has no schedule to fill ghosts with, so give it " *
+            "operators, or `nothing` as its initial data" :
+            "field set $i has operators but `nothing` as its initial data: the cycle " *
+            "re-evaluates every set with operators on each new mesh, so give it a " *
+            "callback, or write `fs => nothing` to resize it only"))
+        return (fs=fs, ops=ops, hook=hook, init=init)
+    end
+end
+
 # The criterion of `adapt_to_initial_data!` as a callable of what is
 # adapted, a field set or a pair, from exactly one of its two forms.
 function adapt_criterion(flag, flags)
@@ -1182,6 +1279,7 @@ end
 
 adapted_forest(fs::FieldSet) = fs.forest
 adapted_forest(pair::RotationPair) = pair.a.forest
+adapted_forest(sets::Tuple) = first(sets).forest
 
 """
     total_mass(fs::FieldSet, var=1)

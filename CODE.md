@@ -1807,6 +1807,16 @@ family drifts at the percent level.
 **Initialization** iterates the same machinery: fill initial data →
 flag → regrid → *re-evaluate* the initial data on the new mesh (rather
 than prolongating it) → repeat until the hierarchy stops changing.
+Several field sets over one forest adapt together through the tuple
+form, `adapt_to_initial_data!((fs₁ => ops₁, fs₂ => (ops₂, hook₂), fs₃ =>
+nothing); initial = (init₁, init₂, nothing), flag | flags, …)`: every set
+with operators is refilled and has its ghosts filled (with its own hook,
+if it has one) in every pass, the criterion `flags` receives the tuple
+of sets, so it may read any of them, and a set paired with `nothing` —
+a flux — is only resized, its `initial` entry `nothing`. One schedule
+comes back per element, `nothing` for a set only resized. Adapting one
+set and filling the others on the final mesh afterwards gives the same
+mesh only while the criterion reads that set alone.
 
 When driven by an ODE integrator, regridding changes both the size and
 the meaning of the state vector. DiffEq callbacks support `resize!`, but
