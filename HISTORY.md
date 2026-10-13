@@ -235,6 +235,8 @@ Buffering was added post-M4, and amended to *box-as-source* after the first impl
 
 The conservation of the transfer was measured in M4. The conservative operator family landed early (pre-M5).
 
+Per-set boundary hooks in `regrid!` (`fs => (schedule, hook)`) came on 2026-10-13, as TreeGRRMHD's AMR-2. AMR-2 offered an alternative — document that with `boundary = nothing` the outward ghosts keep what the caller put there, so a caller may fill each set with its own hook just before `regrid!` — which holds, but costs a fill per set per regrid; the API form was taken.
+
 ### Point interpolation
 
 Point interpolation was added in M11, for the horizon finder of TreeGeneralizedHarmonic, which carried a stopgap of its own; the points below were decided in its design. Compared with the stopgap: the stopgap searched each ancestor in turn, `maxlevel` searches per point; it wrapped a periodic point for location only, not for the stencil, a latent bug no Dirichlet case could see; its excluded-region guard threw, because a horizon inside the damping layer is a bug there; and it moved to `threaded_foreach` precisely so that its refusal reached the caller readable. Mirroring a point beyond a reflecting face was decided with Erik.

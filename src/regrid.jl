@@ -788,7 +788,13 @@ function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer:
             check_regrid_set!(layout, forest, p.first.a, scheds[1])
             check_regrid_set!(layout, forest, p.first.b, scheds[2])
         else
-            fs, sched = p
+            fs = p.first
+            sched, hook = set_schedule_hook(p.second)
+            sched === nothing && hook !== nothing && throw(ArgumentError(
+                "`fs => (nothing, hook)` names a boundary hook for a field set that is " *
+                "only resized: such a set is not filled before the regrid, so the hook " *
+                "would never run. Write `fs => nothing`, or pass the set's schedule."))
+            push!(layout, hook === nothing)
             check_regrid_set!(layout, forest, fs, sched)
             # What `fill_ghosts!` would refuse before the transfer, refused
             # here, where the refusal is agreed between the ranks.
@@ -811,6 +817,23 @@ function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer:
     marks = RegridMark{D}[RegridMark{D}(m, forest.N) for m in flags]
     return marks, layouthash(layout...)
 end
+
+# The schedule and the set's own boundary hook of a `fs => …` element:
+# `fs => schedule`, `fs => nothing`, or `fs => (schedule, hook)` (for
+# TreeGRRMHD: sets with different `nvars` cannot share one all-variables
+# hook). A 2-tuple of schedules is a `RotationPair`'s and is refused here
+# with the form a field set takes.
+set_schedule_hook(x::Union{GhostSchedule,Nothing}) = (x, nothing)
+set_schedule_hook(x::Tuple{Union{GhostSchedule,Nothing},Any}) =
+    x[2] isa GhostSchedule ? throw(ArgumentError(
+        "a field set is regridded with one schedule, `fs => schedule`, or with a " *
+        "schedule and its own boundary hook, `fs => (schedule, hook)`; two " *
+        "schedules are a RotationPair's, `RotationPair(a, b) => (schedule_a, " *
+        "schedule_b)`")) : (x[1], x[2])
+set_schedule_hook(x) = throw(ArgumentError(
+    "a field set is regridded as `fs => schedule`, `fs => (schedule, hook)` with a " *
+    "boundary hook of its own, or `fs => nothing` to resize it only; got " *
+    "`fs => ` a $(typeof(x))"))
 
 # The checks of one field set and its schedule (or `nothing`), adding what
 # the ranks must agree on to `layout`.
@@ -898,7 +921,11 @@ first.
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
 if the domain has outer faces (neither periodic nor reflecting —
-reflecting faces are filled by the schedule itself). Write `fs => nothing` for a set
+reflecting faces are filled by the schedule itself). A set whose boundary
+condition differs from the others' — another `nvars`, which an
+[`AllVariables`](@ref) hook is checked against, or other data — brings
+its own hook as `fs => (schedule, hook)`, which replaces `boundary` for
+that set's fill. Write `fs => nothing` for a set
 that should only be **resized** — a computed quantity such as a flux,
 which the next right-hand side overwrites anyway, and whose ghost-free
 layout has no schedule to fill it from. Afterwards every schedule is
@@ -967,7 +994,7 @@ function regrid!(forest::Forest{D}, pairs;
     newowner(j) = equalsplit_part(nnew, P, Int(j)) - 1
     sources = nothing                            # classified once, on first use
 
-    for (fs, sched, fill) in regrid_steps(sets)
+    for (fs, sched, fill, hook) in regrid_steps(sets)
         # Per field set, not once from the first one: nothing says two
         # field sets over the same forest share a backend, a ghost width,
         # or an operator family.
@@ -979,7 +1006,8 @@ function regrid!(forest::Forest{D}, pairs;
             # Over a distributed forest this is the distributed fill, so a
             # parent's ghosts are current on its owner. A `RotationPair`
             # is filled as a pair before either of its sets moves (M12).
-            fill_ghosts!(fill.first, fill.second; boundary=boundary)
+            fill_ghosts!(fill.first, fill.second;
+                         boundary=(hook === nothing ? boundary : hook))
         end
         stored = storedsize(forest.N, fs.G, staggers(fs))
         fresh = similar(fs.work, stored..., fs.nvars, length(newrange))
@@ -1015,19 +1043,21 @@ function regrid!(forest::Forest{D}, pairs;
     return true
 end
 
-# The field sets `regrid!` moves, in order, each with its schedule and
-# what to fill before its transfer: itself with its schedule, or for the
-# first set of a `RotationPair` the pair with both schedules, which
-# fills the second set too, so that it moves without a fill of its own.
-# The transfers are δ = 0 and never cross the seam, so once both sets'
+# The field sets `regrid!` moves, in order, each with its schedule, what
+# to fill before its transfer, and its own boundary hook (`nothing` for
+# the call's `boundary`): itself with its schedule, or for the first set
+# of a `RotationPair` the pair with both schedules, which fills the
+# second set too, so that it moves without a fill of its own. The
+# transfers are δ = 0 and never cross the seam, so once both sets'
 # ghosts are current the two move independently.
 function regrid_steps(sets)
-    steps = Tuple{FieldSet,Any,Any}[]
-    for (x, sched) in sets
+    steps = Tuple{FieldSet,Any,Any,Any}[]
+    for (x, s) in sets
         if x isa RotationPair
-            push!(steps, (x.a, sched[1], x => sched), (x.b, sched[2], nothing))
+            push!(steps, (x.a, s[1], x => s, nothing), (x.b, s[2], nothing, nothing))
         else
-            push!(steps, (x, sched, x => sched))
+            sched, hook = set_schedule_hook(s)
+            push!(steps, (x, sched, x => sched, hook))
         end
     end
     return steps

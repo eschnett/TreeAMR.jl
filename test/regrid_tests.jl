@@ -709,3 +709,64 @@ end
         end
     end
 end
+
+@testset "Each field set may bring its own boundary hook to regrid!: D=$D" for D in (1, 2)
+    # An all-variables hook is checked against its set's `nvars`, so one
+    # shared hook cannot fill sets with different `nvars`; and sets of
+    # different physics have different boundary data. Regridding them in
+    # one call, each with its own hook, must move exactly what two
+    # single-set calls move — the prolongation onto a fresh child at an
+    # outer face reads the hook's ghosts.
+    function setup()
+        # `local`, or the assignments would rebind the testset's own names.
+        local forest = Forest(ntuple(_ -> 2, D); N=8,
+                              extents=ntuple(_ -> (0.0, 1.0), D))
+        local cell = FieldSet(forest, 2; G=1)
+        local vert = FieldSet(forest, 1; G=1, centering=vertexcentered(D))
+        fill_by_coordinates!((x, v) -> v + sum(x)^2, cell)
+        fill_by_coordinates!((x, v) -> 3 - prod(x), vert)
+        return forest, cell, vert
+    end
+    hcell = CellBoundary(AllVariables((x, δ) -> (1 + sum(x)^2, 2 + sum(x)^2)))
+    hvert = CellBoundary(AllVariables((x, δ) -> (3 - prod(x),)))
+    flags(forest) = flag_blocks((b, k) -> b == 1 ? Refine : Keep, forest)
+
+    forest, cell, vert = setup()
+    @test regrid!(forest, (cell => (GhostSchedule(cell, OPS2), hcell),
+                           vert => (GhostSchedule(vert, OPS2), hvert));
+                  flags=flags(forest))
+    f1, c1, _ = setup()
+    @test regrid!(f1, c1 => GhostSchedule(c1, OPS2); flags=flags(f1), boundary=hcell)
+    f2, _, v2 = setup()
+    @test regrid!(f2, v2 => GhostSchedule(v2, OPS2); flags=flags(f2), boundary=hvert)
+    @test forest.leaves == f1.leaves == f2.leaves
+    @test cell.work == c1.work
+    @test vert.work == v2.work
+
+    # One shared all-variables hook cannot serve both, which is why.
+    forest, cell, vert = setup()
+    @test_throws "one value per variable" regrid!(
+        forest, (cell => GhostSchedule(cell, OPS2), vert => GhostSchedule(vert, OPS2));
+        flags=flags(forest), boundary=hcell)
+    # A set's own hook replaces the shared one, which the other set uses.
+    forest, cell, vert = setup()
+    f2, _, v2 = setup()
+    @test regrid!(forest, (cell => GhostSchedule(cell, OPS2),
+                           vert => (GhostSchedule(vert, OPS2), hvert));
+                  flags=flags(forest), boundary=hcell)
+    @test regrid!(f2, v2 => GhostSchedule(v2, OPS2); flags=flags(f2), boundary=hvert)
+    @test vert.work == v2.work
+end
+
+@testset "A per-set hook is refused where it would never run" begin
+    # A set that is only resized is never filled, so a hook given for it
+    # would be silently ignored; two schedules are a RotationPair's form.
+    forest = Forest((2, 2); N=4)
+    fs = FieldSet(forest, 1; G=1)
+    hook = boundary_by_coordinates((x, v) -> 0.0)
+    flags = flag_blocks((b, k) -> Keep, forest)
+    @test_throws "would never run" regrid!(forest, fs => (nothing, hook); flags=flags)
+    s = GhostSchedule(fs, OPS2)
+    @test_throws "RotationPair" regrid!(forest, fs => (s, s); flags=flags)
+    @test_throws "fs => schedule" regrid!(forest, fs => 3; flags=flags)
+end

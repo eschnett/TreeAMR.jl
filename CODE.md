@@ -1772,6 +1772,13 @@ the strongest available statement that nothing in it is fp64-dependent.
    aux_schedule); flags, …)` — since operators are per field set; a set
    paired with `nothing` is **resized without transfer**, which is what
    flux sets want (fluxes are recomputed at the next RHS evaluation).
+   The pre-transfer fill uses the call's `boundary` hook unless a set
+   brings its own, `fs => (schedule, hook)`: an `AllVariables` hook is
+   checked against its set's `nvars`, so sets of different `nvars`
+   cannot share one, and sets of different physics have different
+   boundary data. Whether a set has its own hook is part of what the
+   ranks agree on. `fs => (nothing, hook)` is refused, since a set only
+   resized is never filled.
    For a staggered field the target of every transfer is the *owned*
    range: the shared plane and the ghosts of a fresh block are left to
    the next `fill_ghosts!`, as ghosts are today. Coarsening a vertex-like
