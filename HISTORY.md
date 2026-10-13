@@ -263,7 +263,7 @@ The interface sketch was updated for the M8 design; through M6 `G` was a forest 
 
 The interiors-only state vector was decided early. The alternative — handing the padded working array to the integrator, with `du = 0` in ghost cells — was rejected: it makes the RHS mutate `u` and spends integrator bandwidth on ghost memory.
 
-Several field sets in one state vector were specified in the M8 design, to be implemented with the first application that needs it.
+Several field sets in one state vector were specified in the M8 design, to be implemented with the first application that needs it. That was TreeGRRMHD (constrained-transport GRMHD), whose AMR-1 asked for it with the segment accessors `staterange` and `stateview`; it landed on 2026-10-13. The request's consistency check compared each set's block count with `nleaves`, which would have refused every rank but one of a distributed forest; the implementation compares with `length(blockrange(forest))`. The whole-vector `volume_weighted_norm` was added beside it, which the request did not ask for, since an adaptive integrator needs the norm of the vector it advances.
 
 Through M3 only fixed-`dt` integrators are exercised,
 with `dt` chosen by the application from a minimum-spacing query.

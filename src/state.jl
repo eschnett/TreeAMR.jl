@@ -123,8 +123,167 @@ function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
     return u
 end
 
+# Several field sets in one state vector.
+#
+# Constrained-transport MHD evolves cell-centered hydro variables and
+# face-centered `B` together, and the integrator sees one vector. The
+# sets' segments are concatenated in tuple order, each in exactly the
+# single-set layout, so every single-set function applied to a segment's
+# view behaves as on a vector of its own ("Time integration" in
+# CODE.md). The functions below are therefore loops over segments, and
+# the per-segment work is the single-set code unchanged.
+
 """
-    map_blocks!(kernel!, fs::FieldSet, args...; closed=false, stored=false)
+    statelength(sets::Tuple{Vararg{FieldSet}})
+
+Number of entries in the state vector of several field sets: the sum of
+their single-set lengths. See [`statevector`](@ref) for the layout.
+"""
+function statelength(sets::Tuple{Vararg{FieldSet}})
+    check_sets(sets)
+    return sum(statelength, sets)
+end
+
+"""
+    staterange(sets::Tuple{Vararg{FieldSet}}, i::Integer) -> UnitRange{Int}
+
+The entries of the `i`-th set's segment in the state vector of `sets`.
+Segments follow each other in tuple order, so the range starts after the
+lengths of the sets before it.
+"""
+function staterange(sets::Tuple{Vararg{FieldSet}}, i::Integer)
+    check_sets(sets)
+    1 <= i <= length(sets) || throw(ArgumentError(
+        "set index $i is outside 1:$(length(sets)): the state vector has one " *
+        "segment per field set in the tuple"))
+    start = sum(j -> statelength(sets[j]), 1:(i - 1); init=0)
+    return (start + 1):(start + statelength(sets[i]))
+end
+
+"""
+    statevector(sets::Tuple{Vararg{FieldSet}})
+
+A freshly allocated, zeroed state vector for several field sets over one
+forest: their segments concatenated in tuple order, each in exactly the
+layout `statevector(sets[i])` has. That is what makes every single-set
+function apply to a segment — [`scatter!`](@ref), [`gather!`](@ref),
+[`statearray`](@ref), [`block_mapreduce`](@ref), [`mesh_mapreduce`](@ref)
+and [`volume_weighted_norm`](@ref) on [`stateview`](@ref)`(u, sets, i)`
+and `sets[i]` behave as on a separate vector.
+
+The sets may mix centerings, `nvars` and ghost widths, but must share
+the forest, the backend and the element type, and each must hold this
+rank's blocks of the forest's current leaves.
+
+```julia
+u = statevector((hydro, Bx, By, Bz))
+gather!(u, (hydro, Bx, By, Bz))
+```
+"""
+function statevector(sets::Tuple{Vararg{FieldSet}})
+    check_sets(sets)
+    fs = first(sets)
+    backend = get_backend(fs.work)
+    u = allocate(backend, eltype(fs.work), (statelength(sets),))
+    # Segment by segment, each through its own set's blocks, so every
+    # block's entries are first touched by its owner as for one set.
+    for i in eachindex(sets)
+        zerofill!(statearray(u, sets, i), backend)
+    end
+    return u
+end
+
+"""
+    stateview(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
+
+The `i`-th set's segment of the state vector `u`, as a view sharing
+memory with it: `view(u, staterange(sets, i))`. Pass it with `sets[i]`
+to any single-set function.
+"""
+function stateview(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
+    check_statelength(u, sets)
+    return view(u, staterange(sets, i))
+end
+
+"""
+    statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
+
+The `i`-th set's segment of `u` as that set's `(N, ..., N, nvars,
+nblocks)` array, sharing memory: `statearray(stateview(u, sets, i),
+sets[i])`.
+"""
+statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer) =
+    statearray(stateview(u, sets, i), sets[i])
+
+"""
+    scatter!(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector)
+
+[`scatter!`](@ref) for each set from its own segment of `u`.
+"""
+function scatter!(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector)
+    check_statelength(u, sets)
+    for i in eachindex(sets)
+        scatter!(sets[i], stateview(u, sets, i))
+    end
+    return sets
+end
+
+"""
+    gather!(u::AbstractVector, sets::Tuple{Vararg{FieldSet}})
+
+[`gather!`](@ref) of each set into its own segment of `u`.
+"""
+function gather!(u::AbstractVector, sets::Tuple{Vararg{FieldSet}})
+    check_statelength(u, sets)
+    for i in eachindex(sets)
+        gather!(stateview(u, sets, i), sets[i])
+    end
+    return u
+end
+
+# What makes a tuple of field sets one state vector: one forest, one
+# backend, one element type, and every set holding this rank's blocks of
+# the forest's current leaves. The block count is compared with the
+# rank's own range, never with `nleaves`, which counts every rank's.
+function check_sets(sets::Tuple{Vararg{FieldSet}})
+    isempty(sets) && throw(ArgumentError(
+        "a state vector over several field sets needs at least one set; for one " *
+        "set, the single-set functions take the field set itself"))
+    fs = first(sets)
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    T = eltype(fs.work)
+    for (i, s) in enumerate(sets)
+        s.forest === forest || throw(ArgumentError(
+            "field set $i is over a different forest from field set 1: the sets of " *
+            "one state vector are regridded together, so they must share the forest"))
+        samebackend(get_backend(s.work), backend) || throw(ArgumentError(
+            "field set $i is on $(nameof(typeof(get_backend(s.work)))) and field set 1 " *
+            "on $(nameof(typeof(backend))): the state vector is one array, on one " *
+            "backend"))
+        eltype(s.work) === T || throw(ArgumentError(
+            "field set $i has element type $(eltype(s.work)) and field set 1 has $T: " *
+            "the state vector is one array, of one element type"))
+        nblocks(s) == length(blockrange(forest)) || throw(ArgumentError(
+            "field set $i has $(nblocks(s)) blocks but the forest has " *
+            "$(length(blockrange(forest))) on this rank: the set was not resized " *
+            "with the forest's last regrid (pass it to `regrid!`, as `fs => nothing` " *
+            "if it holds nothing worth moving)"))
+    end
+    return nothing
+end
+
+function check_statelength(u::AbstractVector, sets::Tuple{Vararg{FieldSet}})
+    n = statelength(sets)
+    length(u) == n || throw(DimensionMismatch(
+        "state vector has $(length(u)) entries but these $(length(sets)) field sets " *
+        "need $n"))
+    return nothing
+end
+
+"""
+    map_blocks!(kernel!, fs::FieldSet, args...; closed=false, stored=false,
+                workgroupsize=nothing)
 
 Launch a KernelAbstractions kernel over every **owned** point of every
 block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
@@ -541,10 +700,49 @@ CPU, where the partials are combined in block order, it is exact across
 thread counts as well.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
+    R = float(real(T))
+    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u)
+    total, volume = norm_parts(fs, u, p)
+    volume == 0 && return zero(R)
+    # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
+    # promotes the whole result to Float64 and made this function return a
+    # different type from the `isinf(p)` branch above.
+    return (total / volume)^inv(R(p))
+end
+
+"""
+    volume_weighted_norm(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector; p=2)
+
+The same norm over the state vector of several field sets (see
+[`statevector`](@ref)): every cell of every set weighted by its volume,
+normalized by the sum of the sets' domain volumes, each counted once per
+variable as for one set. For `p = Inf` it is the maximum over all
+segments. With one set it equals the single-set norm exactly. This is
+the `internalnorm` an adaptive integrator wants for such a vector.
+"""
+function volume_weighted_norm(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector;
+                              p::Real=2)
+    check_statelength(u, sets)
+    R = float(real(eltype(first(sets).work)))
+    if isinf(p)
+        return mapreduce(i -> volume_weighted_norm(sets[i], stateview(u, sets, i); p=p),
+                         max, eachindex(sets))
+    end
+    total, volume = zero(R), zero(R)
+    for i in eachindex(sets)
+        t, v = norm_parts(sets[i], stateview(u, sets, i), p)
+        total += t
+        volume += v
+    end
+    volume == 0 && return zero(R)
+    return (total / volume)^inv(R(p))
+end
+
+# The two sums of a finite `p`-norm over one field set: `Σ hᴰ |u|^p` over
+# its cells, and its domain volume times `nvars`.
+function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     forest = fs.forest
     R = float(real(T))
-
-    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u)
 
     # An integer exponent stays an integer: `abs(x)^2` is a squaring,
     # while `abs(x)^2.0` would drag a `Float64` operand into the
@@ -567,9 +765,5 @@ function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) w
         volumes[b] = cellvolume(blockkey(fs, b)) * cells
     end
     volume = combine_blocks(+, zero(R), fs, volumes, nothing)
-    volume == 0 && return zero(R)
-    # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
-    # promotes the whole result to Float64 and made this function return a
-    # different type from the `isinf(p)` branch above.
-    return (total / volume)^inv(R(p))
+    return (total, volume)
 end

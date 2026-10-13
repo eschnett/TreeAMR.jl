@@ -2134,10 +2134,22 @@ evolved set, but constrained-transport MHD evolves cell-centered hydro
 variables *and* face-centered `B`, and the integrator must see both as
 one vector. The state functions accept a tuple of field sets and lay them
 out contiguously in tuple order — `statevector((hydro, Bx, By, Bz))`,
-`scatter!(sets, u)`, `statearray(du, sets, i)` for the `i`-th set's view.
+`scatter!(sets, u)`, `gather!(u, sets)`, `staterange(sets, i)` for the
+`i`-th set's entries, `stateview(u, sets, i)` for its segment as a view
+and `statearray(du, sets, i)` for that segment in its set's array shape.
 Each set contributes `N^D · nvars · nblocks` entries whatever its
 centering; half-open ownership (see [Centerings](#centerings)) is what
-makes this a plain concatenation.
+makes this a plain concatenation. Each segment has exactly its set's
+single-set layout, so every single-set function applied to
+`stateview(u, sets, i)` and `sets[i]` — the reductions included —
+behaves as on a separate vector, and the tuple methods are loops over
+segments that call them. The sets may mix centerings, `nvars` and ghost
+widths but share the forest, the backend and the element type, and each
+must hold this rank's blocks of the current leaves (compared with
+`length(blockrange(forest))`, never with `nleaves`, which would refuse
+every rank but one of a distributed forest). `volume_weighted_norm(sets,
+u)` is the whole vector's norm, every set's domain counted once per
+variable, which is what an adaptive integrator's `internalnorm` wants.
 
 Because external integrators own the stages, ghosts are filled at
 *every* RHS evaluation; the classic wide-ghost/fewer-exchanges
@@ -4508,7 +4520,8 @@ collective `interpolate`, only redundant.
 All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
 
-- Wiring `volume_weighted_norm` into adaptive
+- Wiring `volume_weighted_norm` (of one set, or of the state vector of
+  several) into adaptive
   integrators as `internalnorm`. Its cost objection on a
   device — the norm at one work item per block cost three RHS
   evaluations — went with the two-launch reduction: the norm is 7 % of
@@ -4518,9 +4531,6 @@ Remaining, none blocking before their milestone:
   vertex-like dimension: refused until an application needs them, with
   order-`(p+1)` Lagrange as the recorded candidate (see
   [Operators](#operators)).
-- A state vector spanning several field sets: specified under
-  [Time integration](#time-integration), implemented with the first
-  application that needs it (constrained-transport MHD).
 - **What M12 leaves open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
   - *A 180° rotation, the π-symmetry* (deferred).

@@ -32,6 +32,9 @@ export Operators, OperatorFamily, PointValue, Conservative, check_operators,
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
        block_mapreduce, mesh_mapreduce, volume_weighted_norm
 
+# Several field sets in one state vector (for TreeGRRMHD)
+export staterange, stateview
+
 # Regridding (M4)
 export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_marks,
        regrid!, adapt_to_initial_data!, total_mass
