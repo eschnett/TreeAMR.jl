@@ -8,7 +8,7 @@
 # of definite parity, the doubled domain the half domain folds, a count
 # of writes, and `NaN` that no stencil can wash out.
 
-using TreeAMR: reflect_direction
+using TreeAMR: wall_direction, OuterFace, ReflectingFace
 
 const OPS4 = Operators(prolongation=4, restriction=4)
 
@@ -21,8 +21,8 @@ const OPS4 = Operators(prolongation=4, restriction=4)
                                                         reflecting=((true, false),
                                                                     (false, false)))
     forest = Forest((2, 2); N=8, reflecting=((true, false), (false, false)))
-    @test forest.reflecting == ((true, false), (false, false))
-    @test Forest((2, 2); N=8).reflecting == ((false, false), (false, false))
+    @test TreeAMR.reflecting_faces(forest) == ((true, false), (false, false))
+    @test TreeAMR.reflecting_faces(Forest((2, 2); N=8)) == ((false, false), (false, false))
 
     @test_throws "needs `parity`" FieldSet(forest, 2; G=1)
     @test_throws "one entry per variable" FieldSet(forest, 2; G=1,
@@ -51,19 +51,20 @@ end
     # The schedule looks for a mirrored ghost's source in direction δ′,
     # so a wrong split sends it to the wrong block. Only a step that
     # actually leaves through a reflecting face is masked.
+    R, O = ReflectingFace, OuterFace
     forest = Forest((2, 2); N=8, reflecting=((true, false), (false, false)))
     lowleft = forest.leaves[findfirst(k -> root_position(forest, k.root) == (0, 0),
                                       forest.leaves)]
     lowright = forest.leaves[findfirst(k -> root_position(forest, k.root) == (1, 0),
                                        forest.leaves)]
-    @test reflect_direction(forest, lowleft, (-1, 0)) == ((0, 0), (true, false))
-    @test reflect_direction(forest, lowleft, (-1, 1)) == ((0, 1), (true, false))
-    # The y faces are outer: not masked, even where they leave the domain.
-    @test reflect_direction(forest, lowleft, (-1, -1)) == ((0, -1), (true, false))
-    @test reflect_direction(forest, lowleft, (0, -1)) == ((0, -1), (false, false))
+    @test wall_direction(forest, lowleft, (-1, 0)) == ((0, 0), (R, O))
+    @test wall_direction(forest, lowleft, (-1, 1)) == ((0, 1), (R, O))
+    # The y faces are outer: not walls, even where they leave the domain.
+    @test wall_direction(forest, lowleft, (-1, -1)) == ((0, -1), (R, O))
+    @test wall_direction(forest, lowleft, (0, -1)) == ((0, -1), (O, O))
     # The high x face is outer, and an interior step crosses nothing.
-    @test reflect_direction(forest, lowright, (1, 0)) == ((1, 0), (false, false))
-    @test reflect_direction(forest, lowright, (-1, 0)) == ((-1, 0), (false, false))
+    @test wall_direction(forest, lowright, (1, 0)) == ((1, 0), (O, O))
+    @test wall_direction(forest, lowright, (-1, 0)) == ((-1, 0), (O, O))
 end
 
 @testset "Every ghost is defined and none is read undefined: D=$D" for D in (1, 2, 3)
@@ -200,7 +201,7 @@ end
             # The hook's regions leave the domain even after the mirror.
             @test all(schedule.boundaries) do r
                 k = forest.leaves[r.block]
-                δ′, _ = reflect_direction(forest, k, r.direction)
+                δ′, _ = wall_direction(forest, k, r.direction)
                 any(!iszero, δ′) && isempty(neighbor_keys(forest, k, δ′))
             end
         end
@@ -211,7 +212,8 @@ end
         _, parity = parity_data(Float64, (:reflect_lo, :outer), 4)
         schedule = GhostSchedule(FieldSet(forest, 2; G=2, parity=parity), OPS4)
         @test any(schedule.boundaries) do r
-            any(reflect_direction(forest, forest.leaves[r.block], r.direction)[2])
+            any(==(ReflectingFace),
+                wall_direction(forest, forest.leaves[r.block], r.direction)[2])
         end
     end
 end

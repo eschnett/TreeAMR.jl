@@ -138,10 +138,11 @@ end
     BoundaryRegion{D}
 
 A ghost region of a block that faces outside the domain through an
-outer face — neither periodic nor reflecting — and so is filled by the
-user's boundary hook rather than by an inter-block transfer. A corner
-or edge region crossing a reflecting face as well is one of these when
-its mirror image still lies outside through an outer face.
+outer face — neither periodic, reflecting nor outflow — and so is filled
+by the user's boundary hook rather than by an inter-block transfer. A
+corner or edge region crossing a reflecting or outflow face as well is
+one of these when its mirror (or clamped) image still lies outside
+through an outer face.
 """
 struct BoundaryRegion{D}
     block::Int32
@@ -247,11 +248,13 @@ end
 # batched across levels — one launch instead of one per level.
 #
 # `mirror` is the mirror state per dimension of a transfer across a
-# reflecting face (M10): 0 for an ordinary dimension, 1 for rows
-# mirrored across the wall, 2 for the derived upper wall row of a
-# vertex-like dimension. It changes the stencils, and — through the
-# parity factor — what the kernel does with their result, so it is part
-# of the key. Everything that is not a mirror transfer has all zeros.
+# reflecting or outflow face (M10): 0 for an ordinary dimension, 1 for
+# rows mirrored across a reflecting wall, 2 for the derived upper wall
+# row of a vertex-like dimension, 3 for rows clamped onto the nearest
+# owned row at an outflow face. It changes the stencils, and — through
+# the parity factor of states 1 and 2 — what the kernel does with their
+# result, so it is part of the key. Everything that is not a mirror
+# transfer has all zeros.
 #
 # `orientation` is the number of quarter turns that carry the source
 # across a rotating seam to where the target sees it (M12): it changes
@@ -443,8 +446,8 @@ The phasing follows `CODE.md`:
   may themselves have been prolongated from a still-coarser block —
   legal under 2:1 balance, where levels `l-2, l-1, l` can meet.
 - `boundaries` lists the ghost regions facing outside the domain through
-  an *outer* face — neither periodic nor reflecting — filled by the user
-  hook between the two phases;
+  an *outer* face — neither periodic, reflecting nor outflow — filled by
+  the user hook between the two phases;
   `boundaryplan` is the same information batched by region shape and
   resident on the backend, which is what the cell-wise hook form
   ([`CellBoundary`](@ref)) is launched over;
@@ -465,7 +468,9 @@ faces (M10) are ordinary transfers too, from mirrored sources: a copy,
 restriction or prolongation with its target rows remapped across the
 wall, whose result the kernel multiplies by each variable's parity
 sign. They sit in the same two phases as every other transfer, so the
-hook never sees them; see "Ghost filling" in `CODE.md`. So are the
+hook never sees them; see "Ghost filling" in `CODE.md`. Outflow faces
+are the same transfers with the target rows clamped onto the nearest
+owned row instead of mirrored, and no sign. So are the
 ghosts across a rotating seam (M12): each is a transfer from the real
 leaf across the seam, built as though that leaf sat where the block sees
 it and read through the quarter turns between the two, which `show`
@@ -790,6 +795,35 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
 # with `c = 1` along a vertex-like dimension, whose wall is a stored
 # point, and `0` along a cell-centered one, whose wall lies between two.
 
+# --- Clamped stencils (outflow faces) -------------------------------------
+#
+# A ghost row `j` beyond an outflow face holds the value at the nearest
+# owned row — zero-gradient extrapolation — which is what the ordinary
+# tangential transfer writes there. So, as for a mirror, the clamped
+# stencil is the tangential stencil with its target rows remapped:
+#
+#   low face   j* = G + 1
+#   high face  j* = G + N
+#
+# over the whole ghost slab, which on the high side of a vertex-like
+# dimension includes the wall row `G + N + 1` that no block owns: it is
+# a ghost like the rows beyond it, and clamped like them.
+clamp_range(N::Int, G::Int, c::Int, δd::Int) =
+    δd < 0 ? (1:G) : ((G + N + 1):(N + 2G + c))
+
+function clamp_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    rng = clamp_range(N, G, c, δd)
+    row = (δd < 0 ? G + 1 : G + N) - s.targetfirst + 1
+    # The nearest owned row is on the wall side of the owned range, so
+    # it lies inside whatever range the tangential stencil covers, halved
+    # or not, as a mirror point does. A failure is a bug in the schedule.
+    1 <= row <= ntarget(s) || error(
+        "clamped row $row falls outside the tangential stencil's $(ntarget(s)) " *
+        "targets (N=$N, G=$G, c=$c, δ=$δd)")
+    rows = fill(row, length(rng))
+    return Stencil1D{T}(first(rng), s.srcstart[rows], s.weights[:, rows])
+end
+
 # Target range of the mirrored rows: the whole ghost slab, less the wall
 # row itself on the high side of a vertex-like dimension (that row is
 # `wall_stencil`'s).
@@ -876,9 +910,9 @@ function block_sources!(pairs::TransferPairs{D},
         # cannot empty it, so testing the unhalved region covers every
         # kind.)
         isempty(region) && continue
-        δ′, mask = reflect_direction(forest, k, δ)
-        if any(mask)
-            mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, mask, region)
+        δ′, walls = wall_direction(forest, k, δ)
+        if any(!=(OuterFace), walls)
+            mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, walls, region)
             continue
         end
         r, nbrs = oriented_neighbors(forest, k, δ)
@@ -915,28 +949,32 @@ seam_offset(forest::Forest, nbr::MortonKey, r::Integer) =
     r == 0 ? childoffset(nbr) :
     virtual_offset(childoffset(nbr), r, forest.rotating[1], forest.rotating[2])
 
-# The sources of a ghost region that crosses a reflecting face (M10; see
-# "Ghost filling" in CODE.md). Mirrored along the masked dimensions, the
-# region lies inside the domain: in the block itself when `δ′` is zero,
-# and otherwise in the node adjacent to it in direction `δ′`, at the
-# block's own extent along every masked dimension. So the source is
-# whatever the ordinary search finds in `δ′`, and the transfer is
-# recorded under the original `δ`, which fixes the target range. A `δ′`
-# that leaves through an outer face makes the region the hook's.
+# The sources of a ghost region that crosses a reflecting or an outflow
+# face (M10; see "Ghost filling" in CODE.md). Mirrored (or clamped)
+# along the walls' dimensions, the region lies inside the domain: in the
+# block itself when `δ′` is zero, and otherwise in the node adjacent to
+# it in direction `δ′`, at the block's own extent along every wall
+# dimension. So the source is whatever the ordinary search finds in
+# `δ′`, and the transfer is recorded under the original `δ`, which fixes
+# the target range. A `δ′` that leaves through an outer face makes the
+# region the hook's.
 function mirror_sources!(pairs::TransferPairs{D},
                          boundaries::Vector{BoundaryRegion{D}},
                          forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
                          b::Int, δ::NTuple{D,Int}, δ′::NTuple{D,Int},
-                         mask::NTuple{D,Bool}, region) where {D}
+                         walls::NTuple{D,FaceKind}, region) where {D}
     k = forest.leaves[b]
     zerooffset = ntuple(_ -> 0, D)
-    # A masked vertex-like dimension on the high side splits its target
-    # into the derived wall row (state 2) and the mirrored rows beyond it
-    # (state 1), which are batched apart because their parity factors
-    # differ. Each part may be empty — at `G = 0` only the wall row is
-    # left — and an empty part records nothing.
+    mask = map(!=(OuterFace), walls)
+    # A reflecting vertex-like dimension on the high side splits its
+    # target into the derived wall row (state 2) and the mirrored rows
+    # beyond it (state 1), which are batched apart because their parity
+    # factors differ. Each part may be empty — at `G = 0` only the wall
+    # row is left — and an empty part records nothing. An outflow
+    # dimension clamps its whole slab, wall row included (state 3).
     choices = ntuple(D) do d
         !mask[d] && return (Int8(0),)
+        walls[d] == OutflowFace && return (Int8(3),)
         c[d] == 1 && δ[d] == 1 || return (Int8(1),)
         return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
     end
@@ -1302,9 +1340,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs)
     end
 
-    # One dimension of a group's stencils. Along a masked dimension of a
+    # One dimension of a group's stencils. Along a wall dimension of a
     # mirror transfer the stencil is the ordinary *tangential* one with
-    # its target rows remapped across the wall, or the derived wall row.
+    # its target rows remapped across the wall (or clamped onto the
+    # nearest owned row at an outflow face), or the derived wall row.
     function build1(key, d)
         δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
         state == 2 && return wall_stencil(T, N, ghosts[d], operators.prolongation)
@@ -1314,6 +1353,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
             restriction_stencil(T, N, ghosts[d], stags[d], δs, od, operators) :
             prolongation_stencil(T, N, ghosts[d], stags[d], δs, od, operators)
         state == 0 && return s
+        state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd)
         return mirror_rows(s, N, ghosts[d], stags[d], δd)
     end
     # Memoized per key: over a distributed forest the stage builder asks
@@ -1322,9 +1362,14 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     build(key) = get!(() -> ntuple(d -> build1(key, d), D), built, key)
     # The factor column covers the mirror state and the orientation
     # (M12): `mirror column + 3^D·r`, so an ordinary transfer keeps 0 and
-    # a mirrored one off the seam the column it had.
-    factorcol(key) = any(!iszero, key.mirror) || key.orientation != 0 ?
-                     mirrorcolumn(key.mirror) + 3^D * Int(key.orientation) : 0
+    # a mirrored one off the seam the column it had. A clamped dimension
+    # takes no sign, so it counts as unmirrored, and a transfer clamped
+    # only is an ordinary one to the kernel.
+    function factorcol(key)
+        parity = map(m -> m == 3 ? Int8(0) : m, key.mirror)
+        return any(!iszero, parity) || key.orientation != 0 ?
+               mirrorcolumn(parity) + 3^D * Int(key.orientation) : 0
+    end
     plane = forest.rotating
 
     GRP = grouptype(backend, T, Val(D))

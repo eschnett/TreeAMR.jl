@@ -452,6 +452,39 @@ declared up front:
   So reflection runs on every backend, in the same kernel and the same
   phases as every other transfer, and the boundary hook never sees a
   reflecting face.
+- **Outflow** (per face): zero-gradient extrapolation, the ghosts
+  beyond the face repeating the nearest owned cell or point. It is
+  declared as `outflow = ((lo, hi), …)`, shaped like `reflecting`; a
+  dimension cannot be both periodic and outflow, and a face cannot be
+  both reflecting and outflow. It is a reflecting face without the
+  mirror: the schedule fills it by the same transfers, with the target
+  rows **clamped** onto the nearest owned row rather than mirrored (see
+  [Ghost filling](#ghost-filling)), and with no sign, so it needs no
+  parity and runs on every backend and across ranks with nothing new
+  in the kernel. It was asked for as a device-capable boundary hook that
+  reads the interior (TreeGRRMHD's AMR-6), and is this instead because
+  the common case is linear and the precedent was there: the hook
+  stays a function of position, and a condition that is not a copy —
+  forbidding inflow, say — is the application's, applied to the outer
+  ghosts after the fill (a `map_blocks!(…; stored = true)` pass that
+  tests the position). How the request was weighed is in
+  [HISTORY.md](HISTORY.md#domain-and-boundaries).
+
+  The zero-gradient copy is first order at the face: on a refined
+  mesh a coarse block's clamped ghosts reach the tangential
+  prolongation of a fine neighbor next to the face, so data varying
+  along the outflow dimension are not reproduced there, as they are not
+  by the condition itself. Higher-order extrapolation would be a
+  stencil of its own in place of the clamped copy; it is an open
+  question.
+
+  The forest stores the kind of every face, `faces[d][side]`, an `Int8`
+  enum (`OuterFace`, `ReflectingFace`, `OutflowFace`), in the bytes the
+  `(lo, hi)` `Bool` pairs of `reflecting` took, so the struct did not
+  grow; `reflecting_faces(forest)` and `outflow_faces(forest)` give the
+  pairs back in the keywords' shape, and so do the properties
+  `forest.reflecting` and `forest.outflow`, through `getproperty`, since
+  physics packages read `forest.reflecting` as the field it was.
 - **Rotating** (a pair of dimensions): a quarter-plane symmetry. Only one quadrant of the
   `(d1, d2)` plane is simulated, and the other three are its images
   under rotations by 90° about the line where the low faces of `d1` and
@@ -473,10 +506,10 @@ declared up front:
     the low face of `d2` (once the root counts agree, the cube check
     makes the extents' lengths agree);
   - `d1` or `d2` periodic;
-  - a reflecting face on either side of `d1` or `d2`. The two low faces
-    are the seam, and the two high faces stay outer, the hook's;
-    reflecting high walls together with the rotation are an open
-    question (see [Open questions](#open-questions)).
+  - a reflecting or outflow face on either side of `d1` or `d2`. The
+    two low faces are the seam, and the two high faces stay outer, the
+    hook's; reflecting or outflow high faces together with the rotation
+    are an open question (see [Open questions](#open-questions)).
 
   Every field set over such a forest declares its **rotation**, a
   signed variable map with one entry per variable, required with no
@@ -531,9 +564,9 @@ declared up front:
   two `Int8`s, which fit in the struct's alignment padding (what a
   field of `Forest` costs is under "The buffer pool" in
   [Distributed meshes](#distributed-meshes)).
-- **Physical** (per face, neither periodic, reflecting nor a rotating
-  seam): ghost cells are filled by a user-supplied boundary condition
-  hook. For a vertex-like dimension the domain's upper boundary plane
+- **Physical** (per face, neither periodic, reflecting, outflow nor a
+  rotating seam): ghost cells are filled by a user-supplied boundary
+  condition hook. For a vertex-like dimension the domain's upper boundary plane
   is the first plane of an outward-facing region and is filled by the
   hook too (see [Centerings](#centerings)).
 
@@ -738,6 +771,28 @@ level and joins the sweep at that level. This is what the hook could not
 do. At a mixed edge or corner region whose tangential neighbor is
 coarser, the mirrored values are the block's *own* prolongated ghosts,
 and the hook, which runs before the sweep, would have read them stale.
+
+**Outflow faces** are the same transfers with the target rows
+**clamped** instead of mirrored: every ghost row beyond the face takes
+the tangential stencil's row at the nearest owned row,
+
+| | low face | high face |
+|---|---|---|
+| every centering | `j* = G + 1` | `j* = G + N` |
+
+over the whole ghost slab, which on the high side of a vertex-like
+dimension includes the unowned wall row `G + N + 1`: it is a ghost like
+the rows beyond it, and is clamped like them. The source search, the
+wall-side children of a restriction and the phasing are the
+reflecting face's, unchanged — `wall_direction` returns the kind of
+each wall a direction crosses, `mirror_sources!` records a clamped
+dimension as mirror state 3, and `clamp_rows` builds its stencil beside
+`mirror_rows`. A clamped dimension takes no sign, so it counts as
+unmirrored in the factor column: a transfer that is only clamped is an
+ordinary one to the kernel (`factorcol = 0`), and one that is also
+mirrored in another dimension carries that dimension's parity. A corner
+region crossing an outflow face and an outer one is the hook's, as for
+a reflecting face.
 
 **The upper wall point in a vertex-like dimension**. On a high reflecting face the wall plane `G + N + 1` belongs to
 nobody (see [Centerings](#centerings)), and the mirror maps it onto
@@ -1037,7 +1092,7 @@ is visible only through ghost cells.
 
 Transfers are **batched by stencil**: everything sharing a kind, a
 direction, a child offset, a mirror state per dimension — none,
-mirrored rows, or the vertex-like upper wall row — and an
+mirrored rows, the vertex-like upper wall row, or clamped rows — and an
 orientation shares one set of one-dimensional stencils and so one
 kernel launch. The orientation joins `keyorder` as well, so both ends
 of an MPI message still derive one layout. A group carries its
@@ -3169,7 +3224,7 @@ collective.
   unchanged (checked). So the digest folds `hash(key, h)` over every
   leaf.
 - *It carries the brick and the layout too.* The brick (roots, `N`,
-  the periodic and reflecting faces, the extents) is hashed through its
+  the kinds of the faces, the extents) is hashed through its
   printed form. Beside it goes a hash of the layout the schedule is
   built for — the ghost widths, the centering, the operator family and
   orders, the element type and the backend's name — since a rank that
@@ -3974,22 +4029,26 @@ The ideas that span several files and are easy to violate:
   sweep filled. The hook runs *between* the phases, not last: prolongation
   stencils at a domain edge reach tangentially into the source's outer
   ghosts.
-- **Reflecting faces are transfers, not hooks** (M10). `reflecting` is a
-  per-face `(lo, hi)` property of the `Forest`, `parity` a per-variable,
-  per-dimension property of the `FieldSet` (required when the forest has
-  a reflecting face; `NoParity` refused in a reflected dimension). The
-  tree does not see the walls — `neighbor_keys` finds nothing across
-  them — but `block_sources!` asks `reflect_direction` (in `forest.jl`,
-  since it is brick knowledge) for `δ′`, the direction with the masked
-  components zeroed, and takes the source that `δ′` finds. Along a
-  masked dimension the stencil is the *tangential* one with its target
-  rows remapped across the wall (`mirror_rows`), and the kernel
-  multiplies by a parity factor from `fs.factors` (column
-  `TransferGroup.factorcol`; 0 = an ordinary transfer, left unscaled).
-  So mirrored transfers sit in the ordinary phases and run on devices.
-  The unowned upper wall plane of a vertex-like dimension is derived by
-  `wall_stencil` (odd → 0, even → the folded order-`p` interpolant).
-  The boundary hook sees only *outer* faces.
+- **Reflecting and outflow faces are transfers, not hooks** (M10). The
+  kind of each face is a property of the `Forest` (`faces`, read
+  through `reflecting_faces`, `outflow_faces` and `facekind`), `parity` a
+  per-variable, per-dimension property of the `FieldSet` (required when
+  the forest has a reflecting face; `NoParity` refused in a reflected
+  dimension; never needed for an outflow face). The tree does not see
+  the walls — `neighbor_keys` finds nothing across them — but
+  `block_sources!` asks `wall_direction` (in `forest.jl`, since it is
+  brick knowledge) for `δ′`, the direction with the wall components
+  zeroed, and takes the source that `δ′` finds. Along a wall dimension
+  the stencil is the *tangential* one with its target rows remapped
+  across the wall (`mirror_rows`) or clamped onto the nearest owned row
+  (`clamp_rows`), and the kernel multiplies a mirrored transfer by a
+  parity factor from `fs.factors` (column `TransferGroup.factorcol`; 0 =
+  an ordinary or clamped-only transfer, left unscaled). So these
+  transfers sit in the ordinary phases and run on devices. The unowned
+  upper wall plane of a vertex-like dimension is derived by
+  `wall_stencil` at a reflecting face (odd → 0, even → the folded
+  order-`p` interpolant) and clamped at an outflow face. The boundary
+  hook sees only *outer* faces.
 - **Rotating seams are oriented transfers** (M12, see "Rotating
   seams" under "Ghost filling"). `rotating = (d1, d2)` is a property of
   the `Forest` (a ninth field, `NTuple{2,Int8}` because an `Int` pair
@@ -4249,8 +4308,11 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
+- the face kinds: `reflecting_faces`, `outflow_faces` (`forest.jl`),
+  each a `(lo, hi)` pair per dimension, in the shape of the `Forest`
+  keywords;
 - the fields it reads: of a `Forest`, `N`, `roots`, `periodic`,
-  `reflecting`, `extents`, `leaves` and `comm`; of a `FieldSet`,
+  `extents`, `leaves` and `comm`; of a `FieldSet`,
   `work`, `nvars`, `G`, `centering`, `parity`, `rotation` and `forest`;
   of a `MortonKey`, `root`, `level` and `coords`.
 
@@ -4553,6 +4615,12 @@ Remaining, none blocking before their milestone:
   vertex-like dimension: refused until an application needs them, with
   order-`(p+1)` Lagrange as the recorded candidate (see
   [Operators](#operators)).
+- **Higher-order outflow.** An outflow face repeats the nearest owned
+  row, which is first order at the face (see
+  [Domain and boundaries](#domain-and-boundaries)). Linear or quadratic
+  extrapolation would be a stencil of its own along the wall dimension,
+  in place of `clamp_rows`'s copy, reading owned rows only; it needs an
+  application that asks for it.
 - **What M12 leaves open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
   - *A 180° rotation, the π-symmetry* (deferred).
@@ -4563,12 +4631,15 @@ Remaining, none blocking before their milestone:
     more, a face that is its own neighbor across the seam, which a
     leaf's image on the same face can make coarse-fine unless
     conformity is extended to it.
-  - *Reflecting high walls together with the rotation*, a symmetric box
-    rather than a quadrant open at its high faces. `R` carries the high
+  - *Reflecting or outflow high faces together with the rotation*, a
+    symmetric box, or a quadrant whose outer boundary is outflow, rather
+    than a quadrant open at its high faces. `R` carries the high
     face of `d1` onto that of `d2`, so both would have to reflect, the
     parities along `d1` and `d2` would have to agree with the map (`vx`
     odd in `x` exactly when `vy` is odd in `y`), and a mirrored transfer
-    across one high wall can then also cross the seam. Refused for now.
+    across one high wall can then also cross the seam. An outflow high
+    face needs no parity, but its clamped transfers would cross the seam
+    the same way, in the virtual frame. Both are refused for now.
   - *Interpolation of a paired set beyond the seam.* The value there is
     the partner's, so the kernel would need both working arrays, or the
     host would route the folded point to the partner and swap the

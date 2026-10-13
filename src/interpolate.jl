@@ -280,7 +280,7 @@ end
 
 PointGeometry(::Type{T}, forest::Forest{D}) where {T,D} =
     PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]), T(forest.extents[d][2])), D),
-                       forest.roots, forest.periodic, forest.reflecting,
+                       forest.roots, forest.periodic, reflecting_faces(forest),
                        (Int(forest.rotating[1]), Int(forest.rotating[2])),
                        maxlevel(forest))
 
@@ -705,18 +705,20 @@ function outside_error(fs::FieldSet, x, j)
             "partner at the turned point instead, or ask for points inside the " *
             "quadrant.")
     end
+    facename(k) = k == ReflectingFace ? "reflecting" :
+                  k == OutflowFace ? "outflow" : "outer"
     kinds = ntuple(length(forest.extents)) do d
+        lo, hi = facename.(forest.faces[d])
         forest.periodic[d] ? "periodic" :
         seam !== nothing && d in seam ? "rotating seam below" :
-        forest.reflecting[d] == (true, true) ? "reflecting" :
-        forest.reflecting[d][1] ? "reflecting below" :
-        forest.reflecting[d][2] ? "reflecting above" : "outer"
+        lo == hi ? lo : "$lo below, $hi above"
     end
     return ArgumentError(
         "point $j, $(Tuple(x)), is outside the domain $(forest.extents) (faces " *
         "$(kinds)), so no block holds data there. A periodic dimension wraps, a " *
         "reflecting face mirrors a point once and a rotating seam turns it back by " *
-        "quarter turns; beyond an outer face there is nothing to interpolate from, " *
+        "quarter turns; beyond an outer or outflow face there is nothing to " *
+        "interpolate from, " *
         "and taking the nearest block would extrapolate without saying so.")
 end
 

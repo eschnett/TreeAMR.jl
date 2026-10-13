@@ -54,7 +54,8 @@ sorted vector of Morton keys, so neighbour finding is just arithmetic
 on keys rather than pointer chasing, and periodic directions are built
 into that arithmetic. Reflecting faces (symmetry planes, solid walls)
 are declared on the domain too, with an even or odd parity per
-variable, and the ghost exchange fills them itself; so is a rotating
+variable, and the ghost exchange fills them itself; so are outflow
+faces, whose ghosts repeat the nearest interior cell, and so is a rotating
 symmetry, a quadrant whose two low faces are glued to each other by a
 quarter turn, with a signed map per field set saying how a vector's
 components turn. Other physical

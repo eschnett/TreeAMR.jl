@@ -525,7 +525,7 @@ function completed_leaves(forest::Forest{D}, marks::Vector{RegridFlag}) where {D
     # holds the whole tree and arrives at the same leaves. Its state is
     # its own, so it has no buffer pool, and would make its own if it
     # exchanged anything.
-    scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
+    scratch = typeof(forest)(forest.roots, forest.periodic, forest.faces,
                              forest.rotating, forest.extents, forest.N, candidate,
                              ForestState(), forest.comm)
     balance!(scratch)
@@ -920,8 +920,8 @@ first.
 
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
-if the domain has outer faces (neither periodic nor reflecting —
-reflecting faces are filled by the schedule itself). A set whose boundary
+if the domain has outer faces (neither periodic, reflecting nor outflow —
+those faces are filled by the schedule itself). A set whose boundary
 condition differs from the others' — another `nvars`, which an
 [`AllVariables`](@ref) hook is checked against, or other data — brings
 its own hook as `fs => (schedule, hook)`, which replaces `boundary` for

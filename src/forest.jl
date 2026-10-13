@@ -15,6 +15,11 @@ function bufferpool(forest)
     return state.pool::BufferPool
 end
 
+# What fills the ghosts beyond a face of the brick: the boundary hook
+# (an outer face), a mirror (M10), or the nearest interior cell. A
+# periodic dimension's faces are `OuterFace` and never asked about.
+@enum FaceKind::Int8 OuterFace ReflectingFace OutflowFace
+
 """
     Forest{D,T}
 
@@ -36,9 +41,17 @@ leaf-only linear octree.
   on its [`FieldSet`](@ref). The tree does not see them — there is no
   neighbor across a reflecting face, as across any other non-periodic
   one — but the [`GhostSchedule`](@ref) does, and fills their ghosts by
-  mirrored transfers. The faces that are neither periodic nor reflecting
-  are *outer* faces, and belong to the boundary hook of
-  [`fill_ghosts!`](@ref).
+  mirrored transfers.
+- `outflow[d]` is a `(lo, hi)` pair selecting the **outflow** faces of a
+  non-periodic dimension: the solution beyond them repeats the nearest
+  interior cell (zero-gradient extrapolation). Like a reflecting face it
+  is the schedule's, filled by transfers with clamped rather than
+  mirrored target rows, so it needs no hook and no parity, and runs on
+  every backend and across ranks. A nonlinear condition, such as
+  forbidding inflow, is the application's, applied to the ghosts after
+  the fill. A face is reflecting or outflow, not both. The faces that
+  are neither periodic, reflecting nor outflow are *outer* faces, and
+  belong to the boundary hook of [`fill_ghosts!`](@ref).
 - `rotating = (d1, d2)` declares a **rotating seam** (M12): only one
   quadrant of the `(d1, d2)` plane is simulated, and the other three are
   its images under quarter turns about the line where the low faces of
@@ -48,8 +61,8 @@ leaf-only linear octree.
   glued to the low face of `d2`, [`neighbor_keys`](@ref) finds the real
   leaves across it, and [`balance!`](@ref) keeps the leaves on either
   side of it at one level (*conformity*). The two dimensions must have
-  as many roots as each other and be neither periodic nor reflecting;
-  their high faces stay outer. See "Rotating seams" in `CODE.md`.
+  as many roots as each other and be neither periodic, reflecting nor
+  outflow; their high faces stay outer. See "Rotating seams" in `CODE.md`.
 - `N` is the per-block interior size, and it is even: cells are the
   tree's geometry, so `N` belongs here. The ghost width `G` does **not**
   — it says how far a stencil reaches into a neighbor's data, which is a
@@ -64,8 +77,8 @@ leaf-only linear octree.
 Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
-    Forest(roots; N, periodic=all false, reflecting=all false, rotating=nothing,
-           extents=one unit per root, leaves=nothing, comm=nothing)
+    Forest(roots; N, periodic=all false, reflecting=all false, outflow=all false,
+           rotating=nothing, extents=one unit per root, leaves=nothing, comm=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
 
 Without `leaves` the forest starts as its unrefined roots. With it, it
@@ -98,12 +111,21 @@ julia> octant = Forest((1, 1, 1); N = 8, reflecting = ntuple(_ -> (true, false),
 
 julia> quadrant = Forest((2, 2, 1); N = 8, rotating = (1, 2),
                          reflecting = ((false, false), (false, false), (true, false)));
+
+julia> star = Forest((1, 1, 1); N = 8, reflecting = ntuple(_ -> (true, false), 3),
+                     outflow = ntuple(_ -> (false, true), 3));
 ```
 """
 struct Forest{D,T}
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
-    reflecting::NTuple{D,Tuple{Bool,Bool}}       # (lo, hi) per dimension
+    # The kind of each face, `(lo, hi)` per dimension; read it through
+    # `reflecting_faces`, `outflow_faces` and `facekind`, or as the
+    # properties `reflecting` and `outflow` (see `getproperty`). One byte a face,
+    # as the `(lo, hi)` `Bool` pair of the reflecting faces was before the
+    # outflow faces came, so the struct stays as large as it was (see
+    # `rotating` below).
+    faces::NTuple{D,NTuple{2,FaceKind}}
     # The rotating seam's pair of dimensions `(d1, d2)` (M12), `(0, 0)` for
     # none; read it through `hasrotating` and `rotating_dims`. `Int8`
     # because the cost of a ninth field was its size, not its count: two
@@ -154,6 +176,7 @@ function Forest{T}(roots::NTuple{D,Integer};
                    periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
                    reflecting::NTuple{D,Tuple{Bool,Bool}}=
                        ntuple(_ -> (false, false), D),
+                   outflow::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                    rotating::Union{Nothing,Tuple{Integer,Integer}}=nothing,
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
@@ -169,8 +192,21 @@ function Forest{T}(roots::NTuple{D,Integer};
             "$(reflecting[d]): a periodic dimension has no faces — its last block " *
             "is the first block's neighbor — so there is nothing for a reflection " *
             "to act on. Drop one of the two."))
+        periodic[d] && any(outflow[d]) && throw(ArgumentError(
+            "dimension $d is both periodic and outflow, got outflow[$d] = " *
+            "$(outflow[d]): a periodic dimension has no faces — its last block is " *
+            "the first block's neighbor — so nothing flows out of it. Drop one of " *
+            "the two."))
+        for s in 1:2
+            reflecting[d][s] && outflow[d][s] && throw(ArgumentError(
+                "the $(s == 1 ? "low" : "high") face of dimension $d is both " *
+                "reflecting and outflow: its ghosts are either the mirror image of " *
+                "the interior or a copy of the nearest interior cell, not both"))
+        end
     end
-    rot = check_rotating(rotating, roots, periodic, reflecting)
+    rot = check_rotating(rotating, roots, periodic, reflecting, outflow)
+    faces = ntuple(d -> ntuple(s -> reflecting[d][s] ? ReflectingFace :
+                                    outflow[d][s] ? OutflowFace : OuterFace, 2), D)
 
     ext = ntuple(d -> (T(extents[d][1]), T(extents[d][2])), D)
     all(d -> ext[d][2] > ext[d][1], 1:D) ||
@@ -196,7 +232,7 @@ function Forest{T}(roots::NTuple{D,Integer};
         # array in place, which must never reach the caller's vector.
         list = collect(MortonKey{D}, leaves)
     end
-    forest = Forest{D,T}(rootsI, periodic, reflecting, rot, ext, Int(N), list,
+    forest = Forest{D,T}(rootsI, periodic, faces, rot, ext, Int(N), list,
                          ForestState(), communicator(comm))
     leaves === nothing || check_leaves(forest)
     return forest
@@ -209,6 +245,7 @@ function Forest(roots::NTuple{D,Integer};
                 N::Integer,
                 periodic::NTuple{D,Bool}=ntuple(_ -> false, D),
                 reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
+                outflow::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 rotating::Union{Nothing,Tuple{Integer,Integer}}=nothing,
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
                 leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
@@ -216,19 +253,22 @@ function Forest(roots::NTuple{D,Integer};
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
         return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                               rotating=rotating, leaves=leaves, comm=comm)
+                               outflow=outflow, rotating=rotating, leaves=leaves,
+                               comm=comm)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
     return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                     rotating=rotating, extents=extents, leaves=leaves, comm=comm)
+                     outflow=outflow, rotating=rotating, extents=extents, leaves=leaves,
+                     comm=comm)
 end
 
 # The `rotating` keyword, checked, as the forest stores it: `(0, 0)` for
 # none. Each refusal says why the seam cannot be glued that way (CODE.md,
 # "Rotating" under "Domain and boundaries").
 function check_rotating(rotating, roots::NTuple{D,Integer}, periodic::NTuple{D,Bool},
-                        reflecting::NTuple{D,Tuple{Bool,Bool}}) where {D}
+                        reflecting::NTuple{D,Tuple{Bool,Bool}},
+                        outflow::NTuple{D,Tuple{Bool,Bool}}) where {D}
     rotating === nothing && return (Int8(0), Int8(0))
     d1, d2 = Int(rotating[1]), Int(rotating[2])
     D >= 2 || throw(ArgumentError(
@@ -260,6 +300,12 @@ function check_rotating(rotating, roots::NTuple{D,Integer}, periodic::NTuple{D,B
             "wall together with the rotation is an open question in CODE.md, not " *
             "implemented. Reflect along a dimension outside the plane of the " *
             "rotation instead, as an octant does."))
+        any(outflow[d]) && throw(ArgumentError(
+            "rotating = $rotating, but dimension $d has an outflow face, " *
+            "outflow[$d] = $(outflow[d]): its low face is the rotating seam, and its " *
+            "high face stays outer, the boundary hook's. An outflow high face " *
+            "together with the rotation is an open question in CODE.md, not " *
+            "implemented."))
     end
     return (Int8(d1), Int8(d2))
 end
@@ -517,7 +563,7 @@ function ForestDigest(forest::Forest, layout::UInt, refused::Bool)
     for k in forest.leaves
         h = hash(k, h)
     end
-    brick = hash(string((forest.roots, forest.N, forest.periodic, forest.reflecting,
+    brick = hash(string((forest.roots, forest.N, forest.periodic, forest.faces,
                          Int.(forest.rotating), forest.extents)))
     return ForestDigest(generation(forest), nleaves(forest), h, brick, layout, refused)
 end
@@ -788,36 +834,65 @@ function neighbor_anchor(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) 
     return (root_index(forest, rootpos), ntuple(d -> wrapped[d] & mask, D), r)
 end
 
-# Whether the forest has any reflecting face at all — what decides
-# whether a field set over it must declare a parity.
-hasreflecting(forest::Forest) = any(r -> r[1] || r[2], forest.reflecting)
+# The kind of face `side` (1 low, 2 high) of dimension `d`, and the
+# faces of each kind as `(lo, hi)` pairs per dimension, the form the
+# `reflecting` and `outflow` keywords take.
+# They read the field with `getfield`, since `getproperty` calls them,
+# and a recursion there would widen what `forest.reflecting` infers to.
+facekind(forest::Forest, d::Integer, side::Integer) =
+    getfield(forest, :faces)[d][side]
+reflecting_faces(forest::Forest{D}) where {D} =
+    map(f -> map(==(ReflectingFace), f),
+        getfield(forest, :faces))::NTuple{D,NTuple{2,Bool}}
+outflow_faces(forest::Forest{D}) where {D} =
+    map(f -> map(==(OutflowFace), f), getfield(forest, :faces))::NTuple{D,NTuple{2,Bool}}
 
-# Split a ghost direction of block `k` at the reflecting faces it crosses
-# (M10). Returns `(δ′, mask)`: `mask[d]` says that stepping from `k` by
-# `δ[d]` leaves the domain through a reflecting face, and `δ′` is `δ`
-# with those components zeroed — the direction whose region, mirrored
-# along the masked dimensions, is the ghost region `δ`. So the mirrored
-# source of region `δ` is the block itself when `δ′` is zero and
-# whatever lies in direction `δ′` otherwise.
+# `forest.reflecting` and `forest.outflow` read as the keywords' pairs,
+# derived from `faces`. The forest stored `reflecting` itself until the
+# outflow faces came, and physics packages read it as a field (TreeHydro,
+# TreeWaveGR, TreeGeneralizedHarmonic), so it stays readable; `outflow`
+# beside it, for symmetry. A constant name folds away, so a field read
+# costs what it did.
+@inline function Base.getproperty(forest::Forest, name::Symbol)
+    name === :reflecting && return reflecting_faces(forest)
+    name === :outflow && return outflow_faces(forest)
+    return getfield(forest, name)
+end
+Base.propertynames(forest::Forest, private::Bool=false) =
+    (fieldnames(typeof(forest))..., :reflecting, :outflow)
+
+# Whether the forest has any reflecting face at all — what decides
+# whether a field set over it must declare a parity. An outflow face
+# needs none.
+hasreflecting(forest::Forest) = any(f -> ReflectingFace in f, forest.faces)
+
+# Split a ghost direction of block `k` at the reflecting and outflow
+# faces it crosses (M10). Returns `(δ′, walls)`: `walls[d]` is the kind of
+# face that stepping from `k` by `δ[d]` leaves the domain through, when
+# that face is reflecting or outflow, and `OuterFace` otherwise; `δ′` is
+# `δ` with those components zeroed — the direction whose region, mirrored
+# (reflecting) or clamped (outflow) along those dimensions, is the ghost
+# region `δ`. So the source of region `δ` is the block itself when `δ′`
+# is zero and whatever lies in direction `δ′` otherwise.
 #
 # Lives here rather than in the schedule because it is brick knowledge:
-# which faces are the domain's, and which of them reflect. A rotating
-# seam (M12) is never masked: the constructor refuses a reflecting face
+# which faces are the domain's, and of what kind. A rotating seam (M12)
+# is never a wall: the constructor refuses a reflecting or outflow face
 # in either dimension of its plane, and the tree finds the leaves across
 # the seam, so a `δ` through it is ordinary here.
-function reflect_direction(forest::Forest{D}, k::MortonKey{D},
-                           δ::NTuple{D,Int}) where {D}
+function wall_direction(forest::Forest{D}, k::MortonKey{D},
+                        δ::NTuple{D,Int}) where {D}
     n = 1 << level(k)
     rootpos = root_position(forest, k.root)
-    mask = ntuple(D) do d
-        δ[d] == 0 && return false
-        forest.periodic[d] && return false
+    walls = ntuple(D) do d
+        δ[d] == 0 && return OuterFace
+        forest.periodic[d] && return OuterFace
         stepped = Int(k.coords[d]) + δ[d]
         exits = δ[d] < 0 ? (stepped < 0 && rootpos[d] == 0) :
                            (stepped >= n && rootpos[d] == forest.roots[d] - 1)
-        return exits && forest.reflecting[d][δ[d] < 0 ? 1 : 2]
+        return exits ? forest.faces[d][δ[d] < 0 ? 1 : 2] : OuterFace
     end
-    return ntuple(d -> mask[d] ? 0 : δ[d], D), mask
+    return ntuple(d -> walls[d] == OuterFace ? δ[d] : 0, D), walls
 end
 
 # The index of the leaf that covers the node (root, lvl, coords): either

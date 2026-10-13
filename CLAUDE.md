@@ -326,9 +326,13 @@ the one that says why.
   function.
 - **Phased ghost fill**: the boundary hook runs *between* the phases,
   not last.
-- **Reflecting faces are transfers, not hooks**, and **rotating seams
-  are oriented transfers**; the boundary hook sees only outer faces
-  ("Domain and boundaries", "Ghost filling").
+- **Reflecting and outflow faces are transfers, not hooks**, and
+  **rotating seams are oriented transfers**; the boundary hook sees only
+  outer faces ("Domain and boundaries", "Ghost filling"). The face kinds
+  live in `forest.faces`; inside the package read them through
+  `reflecting_faces`, `outflow_faces` and `facekind`. `forest.reflecting`
+  stays a property, through `getproperty`, because physics packages
+  read it.
 - **Neighbor finding is asymmetric across levels**: ghost filling is
   each block asking for its own sources, never a reversed neighbor
   lookup ("Tree structure").

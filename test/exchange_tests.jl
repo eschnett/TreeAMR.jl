@@ -639,7 +639,8 @@ end
         fill_ghosts!(sfs, GhostSchedule(sfs, XOPS4); boundary=hook)
         box = Mailbox()
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                          reflecting=serial.reflecting, extents=serial.extents,
+                          reflecting=TreeAMR.reflecting_faces(serial),
+                          outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                           rotating=TreeAMR.rotating_dims(serial),
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]
@@ -704,7 +705,8 @@ end
                                                        Val(nvars))))
     box = Mailbox()
     forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                      reflecting=serial.reflecting, extents=serial.extents,
+                      reflecting=TreeAMR.reflecting_faces(serial),
+                      outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                       rotating=TreeAMR.rotating_dims(serial),
                       leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                for r in 0:(P - 1)]
@@ -995,7 +997,8 @@ end
     for P in (3, 5)
         box = Mailbox()
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                          reflecting=serial.reflecting, extents=serial.extents,
+                          reflecting=TreeAMR.reflecting_faces(serial),
+                          outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                           rotating=TreeAMR.rotating_dims(serial),
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]

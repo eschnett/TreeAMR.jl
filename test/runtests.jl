@@ -362,9 +362,9 @@ end
         @test tiles_brick(rebuilt, rebuilt.leaves)
         @test balanced_by_geometry(rebuilt, rebuilt.leaves)
         @test generation(rebuilt) == 0
-        @test (rebuilt.roots, rebuilt.periodic, rebuilt.reflecting, rebuilt.rotating,
+        @test (rebuilt.roots, rebuilt.periodic, rebuilt.faces, rebuilt.rotating,
                rebuilt.extents, rebuilt.N) ==
-              (forest.roots, forest.periodic, forest.reflecting, forest.rotating,
+              (forest.roots, forest.periodic, forest.faces, forest.rotating,
                forest.extents, forest.N)
         @test floattype(rebuilt) == floattype(forest)
 
@@ -580,6 +580,7 @@ end
 include("ghost_tests.jl")
 include("centering_tests.jl")
 include("reflect_tests.jl")
+include("outflow_tests.jl")
 include("rotate_tests.jl")
 include("interpolate_tests.jl")
 include("interface_tests.jl")

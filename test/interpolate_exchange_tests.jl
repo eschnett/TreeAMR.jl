@@ -21,8 +21,9 @@ function routing_points(rng, forest::Forest{D}; nrandom=120) where {D}
     lo = ntuple(d -> Float64(forest.extents[d][1]), D)
     hi = ntuple(d -> Float64(forest.extents[d][2]), D)
     w = hi .- lo
-    below(d) = forest.periodic[d] || forest.reflecting[d][1] ? w[d] / 2 : 0.0
-    above(d) = forest.periodic[d] || forest.reflecting[d][2] ? w[d] / 2 : 0.0
+    walls = TreeAMR.reflecting_faces(forest)
+    below(d) = forest.periodic[d] || walls[d][1] ? w[d] / 2 : 0.0
+    above(d) = forest.periodic[d] || walls[d][2] ? w[d] / 2 : 0.0
     xs = NTuple{D,Float64}[ntuple(d -> lo[d] - below(d) +
                                        (w[d] + below(d) + above(d)) * rand(rng), D)
                            for _ in 1:nrandom]
@@ -54,7 +55,7 @@ end
     # last bit. Random data over every stored point, ghosts included, so
     # no smooth field hides either.
     serial = faces_forest(kinds; N=D == 3 ? 6 : 8)
-    walls = any(d -> any(serial.reflecting[d]), 1:D)
+    walls = any(d -> any(TreeAMR.reflecting_faces(serial)[d]), 1:D)
     parity = walls ? EXCHANGE_PARITY : nothing
     G = ghosts_for(C, 4)
     sfs = FieldSet{T}(serial, 3; G=G, centering=C, parity=parity)
@@ -74,7 +75,8 @@ end
         comms = gather_ranks(P)
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                            reflecting=serial.reflecting, extents=serial.extents,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                             rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = FieldSet{T}(forest, 3; G=G, centering=C, parity=parity)
@@ -181,7 +183,8 @@ function seam_points(rng, forest::Forest{D}; nrandom=160) where {D}
     turn(x, r) = r == 0 ? x : turn(Base.setindex(Base.setindex(x, -x[2], 1), x[1], 2),
                                    r - 1)
     third(t) = D == 2 ? () :
-               (forest.periodic[3] || forest.reflecting[3][1] ? 3.0 * t - 1.0 : 2.0 * t,)
+               (forest.periodic[3] || TreeAMR.reflecting_faces(forest)[3][1] ?
+                3.0 * t - 1.0 : 2.0 * t,)
     xs = NTuple{D,Float64}[(4.0 * rand(rng) - 2.0, 4.0 * rand(rng) - 2.0,
                             third(rand(rng))...) for _ in 1:nrandom]
     for (i, k) in enumerate(forest.leaves)
@@ -217,7 +220,8 @@ end
         comms = gather_ranks(P)
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                            reflecting=serial.reflecting, extents=serial.extents,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                             rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = rotating_set(forest, layout)

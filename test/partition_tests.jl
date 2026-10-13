@@ -31,7 +31,8 @@ TreeAMR.allgather(c::PartitionCommunicator, d::TreeAMR.ForestDigest) = fill(d, c
 # same brick, through the validated `leaves` path.
 rank_forest(serial::Forest{D,T}, r, P) where {D,T} =
     Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
-              reflecting=serial.reflecting, extents=serial.extents,
+              reflecting=TreeAMR.reflecting_faces(serial),
+              outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
               rotating=TreeAMR.rotating_dims(serial),
               leaves=serial.leaves, comm=PartitionCommunicator(r, P))
 
