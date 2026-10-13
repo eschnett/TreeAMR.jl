@@ -5,7 +5,9 @@ reductions.
 
 ```@docs
 statelength
+staterange
 statevector
+stateview
 statearray
 scatter!
 gather!

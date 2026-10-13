@@ -61,10 +61,11 @@ gathered(forest, v) = TreeAMR.allgatherv(forest.comm, collect(vec(v)))
 # A forest refined twice around `centre`, so that three levels meet. A
 # forest mutation is collective: every rank makes the same calls.
 function forest_of(roots::NTuple{D,Int}, N; periodic=ntuple(_ -> false, D),
-                   reflecting=ntuple(_ -> (false, false), D), rotating=nothing,
+                   reflecting=ntuple(_ -> (false, false), D),
+                   outflow=ntuple(_ -> (false, false), D), rotating=nothing,
                    centre=nothing, levels=2) where {D}
     forest = Forest(roots; N=N, periodic=periodic, reflecting=reflecting,
-                    rotating=rotating, comm=COMM)
+                    outflow=outflow, rotating=rotating, comm=COMM)
     centre === nothing && return forest
     for lvl in 0:(levels - 1)
         r = 0.6 / 2^lvl
@@ -80,7 +81,7 @@ function forest_of(roots::NTuple{D,Int}, N; periodic=ntuple(_ -> false, D),
 end
 
 hasouter(forest::Forest{D}) where {D} =
-    any(d -> !forest.periodic[d] && !all(forest.reflecting[d]), 1:D)
+    any(d -> !forest.periodic[d] && TreeAMR.OuterFace in forest.faces[d], 1:D)
 
 # The serial schedule's transfer count, summed over the ranks: each
 # rank's local transfers and those it receives. The ones it sends are
@@ -235,7 +236,7 @@ end
 
 function fill_case(tag, forest::Forest{D}, centerings; G, ops) where {D}
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
-    walls = findall(d -> any(forest.reflecting[d]), 1:D)
+    walls = findall(d -> any(TreeAMR.reflecting_faces(forest)[d]), 1:D)
     f = (x, v) -> sum(d -> (d + v) * x[d]^2 - x[d], 1:D) + v
     for (name, C) in centerings
         parity = isempty(walls) ? nothing :
@@ -1002,6 +1003,8 @@ end
 const OPS4 = Operators(prolongation=4, restriction=4)
 const OPS2 = Operators(prolongation=2, restriction=2)
 const OPSC = Operators(family=Conservative, prolongation=3, restriction=2)
+const OPSCB = Operators(family=Conservative, prolongation=3, restriction=2,
+                        bounded=true)
 
 function main()
     emit("# ranks", NRANKS)
@@ -1021,13 +1024,14 @@ function main()
               centering=cellcentered(3), ops=OPS2, steps=3)
     # A reflecting box: walls at both ends of every dimension, vertex-
     # centered so that the derived wall plane occurs, and the low walls
-    # only, cell-centered, with outer faces opposite. The first variable
-    # is odd across the x₁ walls.
+    # only, cell-centered, with an outflow face and an outer one
+    # opposite. The first variable is odd across the x₁ walls.
     parity = [(OddParity, EvenParity), (EvenParity, EvenParity)]
     wave_case("R2v", forest_of((3, 3), 8; reflecting=((true, true), (true, true)),
                                centre=(0.4, 0.5)); G=1,
               centering=vertexcentered(2), ops=OPS4, steps=6, parity=parity)
     wave_case("R2c", forest_of((3, 3), 8; reflecting=((true, false), (true, false)),
+                               outflow=((false, true), (false, false)),
                                centre=(0.4, 0.5)); G=2,
               centering=cellcentered(2), ops=OPS4, steps=6, parity=parity)
     # Burgers' equation with the fixup at coarse-fine faces.
@@ -1042,10 +1046,17 @@ function main()
               G=2, ops=OPS4)
     fill_case("F3", forest_of((2, 2, 2), 4; periodic=(true, false, false),
                               reflecting=((false, false), (true, false), (false, false)),
+                              outflow=((false, false), (false, false), (false, true)),
                               centre=(0.7, 0.4, 1.2)),
               ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
                "edge1" => edgecentered(3, 1));
               G=1, ops=OPS2)
+    # The bounded prolongation across ranks, mirrored and clamped
+    # rows included: computed by the sender, read through the same columns.
+    fill_case("B2", forest_of((3, 3), 8; reflecting=((true, false), (false, false)),
+                              outflow=((false, true), (true, false)),
+                              centre=(0.4, 0.5)),
+              ("cell" => cellcentered(2),); G=1, ops=OPSCB)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,
     # the initial-data cycle from one leaf, and blocks moving between
     # ranks over several field sets, in Float64 and Float32x2. Float32 is

@@ -709,3 +709,160 @@ end
         end
     end
 end
+
+@testset "Each field set may bring its own boundary hook to regrid!: D=$D" for D in (1, 2)
+    # An all-variables hook is checked against its set's `nvars`, so one
+    # shared hook cannot fill sets with different `nvars`; and sets of
+    # different physics have different boundary data. Regridding them in
+    # one call, each with its own hook, must move exactly what two
+    # single-set calls move — the prolongation onto a fresh child at an
+    # outer face reads the hook's ghosts.
+    function setup()
+        # `local`, or the assignments would rebind the testset's own names.
+        local forest = Forest(ntuple(_ -> 2, D); N=8,
+                              extents=ntuple(_ -> (0.0, 1.0), D))
+        local cell = FieldSet(forest, 2; G=1)
+        local vert = FieldSet(forest, 1; G=1, centering=vertexcentered(D))
+        fill_by_coordinates!((x, v) -> v + sum(x)^2, cell)
+        fill_by_coordinates!((x, v) -> 3 - prod(x), vert)
+        return forest, cell, vert
+    end
+    hcell = CellBoundary(AllVariables((x, δ) -> (1 + sum(x)^2, 2 + sum(x)^2)))
+    hvert = CellBoundary(AllVariables((x, δ) -> (3 - prod(x),)))
+    flags(forest) = flag_blocks((b, k) -> b == 1 ? Refine : Keep, forest)
+
+    forest, cell, vert = setup()
+    @test regrid!(forest, (cell => (GhostSchedule(cell, OPS2), hcell),
+                           vert => (GhostSchedule(vert, OPS2), hvert));
+                  flags=flags(forest))
+    f1, c1, _ = setup()
+    @test regrid!(f1, c1 => GhostSchedule(c1, OPS2); flags=flags(f1), boundary=hcell)
+    f2, _, v2 = setup()
+    @test regrid!(f2, v2 => GhostSchedule(v2, OPS2); flags=flags(f2), boundary=hvert)
+    @test forest.leaves == f1.leaves == f2.leaves
+    @test cell.work == c1.work
+    @test vert.work == v2.work
+
+    # One shared all-variables hook cannot serve both, which is why.
+    forest, cell, vert = setup()
+    @test_throws "one value per variable" regrid!(
+        forest, (cell => GhostSchedule(cell, OPS2), vert => GhostSchedule(vert, OPS2));
+        flags=flags(forest), boundary=hcell)
+    # A set's own hook replaces the shared one, which the other set uses.
+    forest, cell, vert = setup()
+    f2, _, v2 = setup()
+    @test regrid!(forest, (cell => GhostSchedule(cell, OPS2),
+                           vert => (GhostSchedule(vert, OPS2), hvert));
+                  flags=flags(forest), boundary=hcell)
+    @test regrid!(f2, v2 => GhostSchedule(v2, OPS2); flags=flags(f2), boundary=hvert)
+    @test vert.work == v2.work
+end
+
+@testset "A per-set hook is refused where it would never run" begin
+    # A set that is only resized is never filled, so a hook given for it
+    # would be silently ignored; two schedules are a RotationPair's form.
+    forest = Forest((2, 2); N=4)
+    fs = FieldSet(forest, 1; G=1)
+    hook = boundary_by_coordinates((x, v) -> 0.0)
+    flags = flag_blocks((b, k) -> Keep, forest)
+    @test_throws "would never run" regrid!(forest, fs => (nothing, hook); flags=flags)
+    s = GhostSchedule(fs, OPS2)
+    @test_throws "RotationPair" regrid!(forest, fs => (s, s); flags=flags)
+    @test_throws "fs => schedule" regrid!(forest, fs => 3; flags=flags)
+end
+
+@testset "Several field sets adapt to their initial data together: D=$D" for D in (1, 2)
+    # Sets with different `nvars` and centerings, each re-evaluated on the
+    # final mesh — the adapted set alone would leave the others to be
+    # filled afterwards, and a criterion reading the second set would
+    # have nothing to read.
+    L = 1.0
+    bump(c) = x -> exp(-sum((x[d] - c)^2 for d in 1:D) / (2 * 0.08^2))
+    matter = (x, v) -> v * bump(0.3)(x)
+    metric = AllVariables(x -> (1 + bump(0.7)(x),))
+    function flag(forest)
+        return function (b, k)
+            ext = block_extent(forest, k)
+            c = ntuple(d -> (ext[d][1] + ext[d][2]) / 2, D)
+            r = sqrt(sum((c[d] - 0.3L)^2 for d in 1:D))
+            want = r < 0.15 ? 2 : r < 0.3 ? 1 : 0
+            return level(k) < want ? Refine : level(k) > want ? Coarsen : Keep
+        end
+    end
+    newforest() = Forest(ntuple(_ -> 4, D); N=4, periodic=ntuple(_ -> true, D),
+                         extents=ntuple(_ -> (0.0, L), D))
+
+    # The same mesh as the single-set cycle on the first set.
+    alone = newforest()
+    a1 = FieldSet(alone, 2; G=1)
+    adapt_to_initial_data!(a1, OPS2; initial=matter, flag=flag(alone))
+
+    forest = newforest()
+    a = FieldSet(forest, 2; G=1)
+    g = FieldSet(forest, 1; G=1, centering=vertexcentered(D))
+    flux = FieldSet(forest, 3; G=0)
+    schedules, passes, converged = adapt_to_initial_data!(
+        (a => OPS2, g => OPS2, flux => nothing); initial=(matter, metric, nothing),
+        flag=flag(forest))
+    @test converged && passes > 1
+    @test forest.leaves == alone.leaves
+    @test length(schedules) == 3 && schedules[3] === nothing
+    @test !isstale(schedules[1]) && !isstale(schedules[2])
+    @test nblocks(flux) == nblocks(a) == nblocks(g) == nleaves(forest)
+    # Every set holds its own initial data on the final mesh.
+    for (fs, f) in ((a, matter), (g, (x, v) -> metric.f(x)[v]))
+        worst = 0.0
+        for b in 1:nblocks(fs), v in 1:fs.nvars
+            blk = blockview(fs, b, v)
+            for idx in CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N),
+                                               D))
+                worst = max(worst, abs(blk[idx] - f(coordinates(fs, b, Tuple(idx)), v)))
+            end
+        end
+        @test worst == 0
+    end
+
+    # The criterion sees every set: refining on the second set's bump
+    # refines there, where the first set is flat.
+    forest = newforest()
+    a = FieldSet(forest, 2; G=1)
+    g = FieldSet(forest, 1; G=1, centering=vertexcentered(D))
+    seen = Ref{Any}(nothing)
+    byg = function (sets)
+        seen[] = map(fs -> fs.nvars, sets)
+        hi = block_mapreduce(identity, max, -Inf, sets[2])
+        return [level(blockkey(sets[2], b)) < 1 && hi[b] > 1.5 ? Refine : Keep
+                for b in 1:nblocks(sets[2])]
+    end
+    _, _, converged = adapt_to_initial_data!((a => OPS2, g => OPS2);
+                                             initial=(matter, metric), flags=byg)
+    @test converged
+    @test seen[] == (2, 1)
+    refined = filter(k -> level(k) == 1, forest.leaves)
+    @test !isempty(refined)
+    @test all(refined) do k
+        ext = block_extent(forest, k)
+        all(d -> ext[d][1] - 0.25 <= 0.7 <= ext[d][2] + 0.25, 1:D)
+    end
+end
+
+@testset "The several-set initial-data cycle refuses inconsistent arguments" begin
+    # A set without operators cannot be filled, a set with them must be;
+    # one callback too few would leave a set's data to whatever it held.
+    forest = Forest((2, 2); N=4, periodic=(true, true))
+    a = FieldSet(forest, 1; G=1)
+    b = FieldSet(forest, 1; G=1)
+    init = (x, v) -> 1.0
+    flag = (i, k) -> Keep
+    @test_throws "2 entries for 1" adapt_to_initial_data!((a => OPS2,);
+                                                          initial=(init, init), flag=flag)
+    @test_throws "only resized" adapt_to_initial_data!((a => OPS2, b => nothing);
+                                                       initial=(init, init), flag=flag)
+    @test_throws "`nothing` as its initial data" adapt_to_initial_data!(
+        (a => OPS2, b => OPS2); initial=(init, nothing), flag=flag)
+    @test_throws "different forest" adapt_to_initial_data!(
+        (a => OPS2, FieldSet(Forest((2, 2); N=4), 1; G=1) => OPS2);
+        initial=(init, init), flag=flag)
+    @test_throws "fs => operators" adapt_to_initial_data!((a => 3,); initial=(init,),
+                                                          flag=flag)
+end

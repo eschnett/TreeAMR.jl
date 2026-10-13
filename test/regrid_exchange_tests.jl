@@ -41,12 +41,14 @@ end
 # received; the number of mismatched layout entries and segments, and of
 # ranks whose own classification kept other transfers than the whole
 # one; and the number of transfers that crossed a rank boundary.
-function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T}) where {D,T}
-    ops = exchange_operators(C, family)
+function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
+                         bounded=false) where {D,T}
+    ops = exchange_operators(C, family; bounded=bounded)
     G = exchange_ghosts(C, family)
     nvars = length(EXCHANGE_PARITY)
     forest = Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
-                       reflecting=serial.reflecting, extents=serial.extents,
+                       reflecting=TreeAMR.reflecting_faces(serial),
+                       outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                        rotating=TreeAMR.rotating_dims(serial),
                        leaves=serial.leaves)
     fs = FieldSet{T}(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
@@ -174,6 +176,9 @@ end
         end
         same, _, bad, _, _, _ = lockstep_regrid(serial, 3, cellcentered(D), Conservative,
                                                 Float64)
+        @test same && bad == 0
+        same, _, bad, _, _, _ = lockstep_regrid(serial, 3, cellcentered(D), Conservative,
+                                                Float64; bounded=true)
         @test same && bad == 0
     end
     @test ncross > 0
@@ -363,7 +368,8 @@ end
         f === Refine ? (Refine, ntuple(_ -> 1:2, D)) : f
     end
     reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                       reflecting=serial.reflecting, extents=serial.extents,
+                       reflecting=TreeAMR.reflecting_faces(serial),
+                       outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                        rotating=TreeAMR.rotating_dims(serial),
                        leaves=serial.leaves)
     sfs = sets(reference)
@@ -381,7 +387,8 @@ end
         comms = gather_ranks(P)
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                            reflecting=serial.reflecting, extents=serial.extents,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                             rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             owned = blockrange(forest)
@@ -411,7 +418,8 @@ end
         comms = gather_ranks(P)
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                            reflecting=serial.reflecting, extents=serial.extents,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                             rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             fs = first(sets(forest))
@@ -479,7 +487,8 @@ TreeAMR.waitall(c::StagingCommunicator, requests::AbstractVector) =
     C = vertexcentered(D)
     G = exchange_ghosts(C, PointValue)
     rebuilt(comm) = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                           reflecting=serial.reflecting, extents=serial.extents,
+                           reflecting=TreeAMR.reflecting_faces(serial),
+                           outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                            rotating=TreeAMR.rotating_dims(serial),
                            leaves=serial.leaves, comm=comm)
     reference = rebuilt(nothing)
@@ -777,7 +786,8 @@ end
                 pair => (GhostSchedule(a, ops), GhostSchedule(b, ops))), (fs, a, b)
     end
     reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                       reflecting=serial.reflecting, extents=serial.extents,
+                       reflecting=TreeAMR.reflecting_faces(serial),
+                       outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                        rotating=TreeAMR.rotating_dims(serial), leaves=serial.leaves)
     rentries, rsets = entries(reference)
     old = copy(reference.leaves)
@@ -790,7 +800,8 @@ end
         comms = gather_ranks(P)
         results = on_ranks(P) do r
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                            reflecting=serial.reflecting, extents=serial.extents,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                             rotating=TreeAMR.rotating_dims(serial),
                             leaves=serial.leaves, comm=comms[r])
             es, sets = entries(forest)

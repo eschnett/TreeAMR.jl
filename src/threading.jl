@@ -158,7 +158,7 @@ function innermost_error(err)
 end
 
 """
-    launch_by_owner!(kernel, backend, args...; ndrange)
+    launch_by_owner!(kernel, backend, args...; ndrange, workgroupsize=nothing)
 
 Launch the KernelAbstractions `kernel` over a block-shaped `ndrange`,
 whose last axis is the block index, so that on the CPU every block runs
@@ -172,16 +172,26 @@ not depend on the workgroup size. The static schedule is
 `Threads.@threads :static` underneath, which refuses to run inside
 another threaded region, so there — a caller's own `@threads` loop — the
 launch falls back to the default schedule and simply loses the affinity.
-A device backend is launched as it always was.
+A device backend is launched as it always was, with the caller's
+`workgroupsize` if it gives one. The CPU ignores `workgroupsize`: there
+the workgroup *is* the block, which is what puts it on its owner's
+thread.
 """
-function launch_by_owner!(kernel, backend::Backend, args...; ndrange)
+function launch_by_owner!(kernel, backend::Backend, args...; ndrange,
+                          workgroupsize=nothing)
     # A rank without blocks (M7) launches nothing.
     any(iszero, ndrange) && return nothing
-    kernel(backend)(args...; ndrange=ndrange)
+    # Without a size the call is the one it always was, so a caller that
+    # never passes one compiles nothing new.
+    if workgroupsize === nothing
+        kernel(backend)(args...; ndrange=ndrange)
+    else
+        kernel(backend)(args...; ndrange=ndrange, workgroupsize=workgroupsize)
+    end
     return nothing
 end
 
-function launch_by_owner!(kernel, backend::CPU, args...; ndrange)
+function launch_by_owner!(kernel, backend::CPU, args...; ndrange, workgroupsize=nothing)
     any(iszero, ndrange) && return nothing
     if Threads.nthreads() == 1 || ccall(:jl_in_threaded_region, Cint, ()) != 0
         kernel(backend)(args...; ndrange=ndrange)

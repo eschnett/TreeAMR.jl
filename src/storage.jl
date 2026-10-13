@@ -330,7 +330,7 @@ function parities_of(parity, forest::Forest{D}, nvars::Int) where {D}
         return ntuple(d -> p[d], D)
     end
     for (v, p) in enumerate(parities), d in 1:D
-        any(forest.reflecting[d]) && p[d] === NoParity && throw(ArgumentError(
+        any(reflecting_faces(forest)[d]) && p[d] === NoParity && throw(ArgumentError(
             "variable $v has NoParity in dimension $d, which has a reflecting face. " *
             "A variable without a parity has no value beyond the wall, and its " *
             "ghosts there would not stay ghosts: the first prolongation that reads " *
@@ -459,7 +459,7 @@ function check_rotation_parity(forest::Forest{D}, target, source, q::Vector{Int}
                                what::AbstractString) where {D}
     (target === nothing || source === nothing) && return nothing
     for v in eachindex(q), d in 1:D
-        any(forest.reflecting[d]) || continue
+        any(reflecting_faces(forest)[d]) || continue
         w = abs(q[v])
         target[v][d] == source[w][d] || throw(ArgumentError(
             "$what sends variable $v to variable $w, but in dimension $d, which has a " *

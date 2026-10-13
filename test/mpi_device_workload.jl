@@ -127,7 +127,7 @@ function forest_of(roots::NTuple{D,Int}, N; periodic=ntuple(_ -> false, D),
 end
 
 hasouter(forest::Forest{D}) where {D} =
-    any(d -> !forest.periodic[d] && !all(forest.reflecting[d]), 1:D)
+    any(d -> !forest.periodic[d] && TreeAMR.OuterFace in forest.faces[d], 1:D)
 
 # Which stages of a schedule went through host mirrors on this rank, and
 # how many have messages at all: a `#` line, since it depends on the

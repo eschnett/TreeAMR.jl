@@ -392,6 +392,12 @@ end
     @test isfinite(r.l1)
     @test r.drift <= 64 * eps(T) * r.scale
     @test control.drift > 100 * eps(T) * control.scale
+    # The bounded prolongation conserves too, on the same backend.
+    bounded = burgers_errors(Val(D); common...,
+                             ops=Operators(family=Conservative, prolongation=3,
+                                           restriction=2, bounded=true))
+    @test isfinite(bounded.l1)
+    @test bounded.drift <= 64 * eps(T) * bounded.scale
 end
 
 @testset "$bname: the cell hook reproduces the host hook exactly: T=$T, D=$D" for
@@ -446,6 +452,20 @@ end
     @test all(==(T(2)), view(work, ntuple(_ -> Colon(), D)..., 1, :))
     @test all(==(one(T)), view(work, ntuple(_ -> Colon(), D)..., 2, :))
     @test count(==(T(2)), work) == prod(want) * nblocks(fs)
+end
+
+@testset "$bname: a launch with a workgroup size covers the same range: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # A device hands `workgroupsize` to the launch, the CPU keeps its
+    # block-per-workgroup launch; either way every stored cell is visited
+    # exactly once, including when the size does not divide the extent.
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    fs = FieldSet{T}(forest, 1; G=1, backend=backend)
+    fill!(fs.work, one(T))
+    map_blocks!(double_stored!, fs, fs.work, Val(D); stored=true,
+                workgroupsize=(ntuple(_ -> 4, D)..., 1))
+    @test all(==(T(2)), Array(fs.work))
 end
 
 @testset "$bname: the all-variables callbacks match the per-variable: T=$T, D=$D" for

@@ -525,7 +525,7 @@ function completed_leaves(forest::Forest{D}, marks::Vector{RegridFlag}) where {D
     # holds the whole tree and arrives at the same leaves. Its state is
     # its own, so it has no buffer pool, and would make its own if it
     # exchanged anything.
-    scratch = typeof(forest)(forest.roots, forest.periodic, forest.reflecting,
+    scratch = typeof(forest)(forest.roots, forest.periodic, forest.faces,
                              forest.rotating, forest.extents, forest.N, candidate,
                              ForestState(), forest.comm)
     balance!(scratch)
@@ -730,14 +730,17 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     local_, sent, received = serial ? (pairs, nothing, nothing) :
                              split_regrid(pairs, oldrange, newrange)
     GRP = grouptype(backend, T, Val(D))
+    # A bounded prolongation bounds the new children too.
+    bounded = boundedkernel(operators)
     locals = GRP[todevice(backend, TransferGroup{T,D}(key.kind, stencils(key), targets,
-                                                      sources))
+                                                      sources, 0, 0, (0, 0),
+                                                      key.kind === :prolong && bounded))
                  for (key, (targets, sources)) in local_]
     ST = stagetype(backend, T, Val(D))
     remote = serial ? nothing :
              remote_stage(remotetype(ST), T, backend, sent, received, stencils, key -> 0;
                           targetowner=newowner, sourceowner=oldowner,
-                          targetrange=newrange, sourcerange=oldrange)
+                          targetrange=newrange, sourcerange=oldrange, bounded=bounded)
     return ST(REGRID_TAG, locals, remote)
 end
 
@@ -788,7 +791,13 @@ function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer:
             check_regrid_set!(layout, forest, p.first.a, scheds[1])
             check_regrid_set!(layout, forest, p.first.b, scheds[2])
         else
-            fs, sched = p
+            fs = p.first
+            sched, hook = set_schedule_hook(p.second)
+            sched === nothing && hook !== nothing && throw(ArgumentError(
+                "`fs => (nothing, hook)` names a boundary hook for a field set that is " *
+                "only resized: such a set is not filled before the regrid, so the hook " *
+                "would never run. Write `fs => nothing`, or pass the set's schedule."))
+            push!(layout, hook === nothing)
             check_regrid_set!(layout, forest, fs, sched)
             # What `fill_ghosts!` would refuse before the transfer, refused
             # here, where the refusal is agreed between the ranks.
@@ -811,6 +820,23 @@ function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer:
     marks = RegridMark{D}[RegridMark{D}(m, forest.N) for m in flags]
     return marks, layouthash(layout...)
 end
+
+# The schedule and the set's own boundary hook of a `fs => …` element:
+# `fs => schedule`, `fs => nothing`, or `fs => (schedule, hook)` (for
+# TreeGRRMHD: sets with different `nvars` cannot share one all-variables
+# hook). A 2-tuple of schedules is a `RotationPair`'s and is refused here
+# with the form a field set takes.
+set_schedule_hook(x::Union{GhostSchedule,Nothing}) = (x, nothing)
+set_schedule_hook(x::Tuple{Union{GhostSchedule,Nothing},Any}) =
+    x[2] isa GhostSchedule ? throw(ArgumentError(
+        "a field set is regridded with one schedule, `fs => schedule`, or with a " *
+        "schedule and its own boundary hook, `fs => (schedule, hook)`; two " *
+        "schedules are a RotationPair's, `RotationPair(a, b) => (schedule_a, " *
+        "schedule_b)`")) : (x[1], x[2])
+set_schedule_hook(x) = throw(ArgumentError(
+    "a field set is regridded as `fs => schedule`, `fs => (schedule, hook)` with a " *
+    "boundary hook of its own, or `fs => nothing` to resize it only; got " *
+    "`fs => ` a $(typeof(x))"))
 
 # The checks of one field set and its schedule (or `nothing`), adding what
 # the ranks must agree on to `layout`.
@@ -845,7 +871,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "built for $(nameof(typeof(sched.backend))); pair each field set with its " *
         "own schedule"))
     ops = sched.operators
-    push!(layout, (Int(ops.family), ops.prolongation, ops.restriction))
+    push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded))
     return nothing
 end
 
@@ -897,8 +923,12 @@ first.
 
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
-if the domain has outer faces (neither periodic nor reflecting —
-reflecting faces are filled by the schedule itself). Write `fs => nothing` for a set
+if the domain has outer faces (neither periodic, reflecting nor outflow —
+those faces are filled by the schedule itself). A set whose boundary
+condition differs from the others' — another `nvars`, which an
+[`AllVariables`](@ref) hook is checked against, or other data — brings
+its own hook as `fs => (schedule, hook)`, which replaces `boundary` for
+that set's fill. Write `fs => nothing` for a set
 that should only be **resized** — a computed quantity such as a flux,
 which the next right-hand side overwrites anyway, and whose ghost-free
 layout has no schedule to fill it from. Afterwards every schedule is
@@ -967,7 +997,7 @@ function regrid!(forest::Forest{D}, pairs;
     newowner(j) = equalsplit_part(nnew, P, Int(j)) - 1
     sources = nothing                            # classified once, on first use
 
-    for (fs, sched, fill) in regrid_steps(sets)
+    for (fs, sched, fill, hook) in regrid_steps(sets)
         # Per field set, not once from the first one: nothing says two
         # field sets over the same forest share a backend, a ghost width,
         # or an operator family.
@@ -979,7 +1009,8 @@ function regrid!(forest::Forest{D}, pairs;
             # Over a distributed forest this is the distributed fill, so a
             # parent's ghosts are current on its owner. A `RotationPair`
             # is filled as a pair before either of its sets moves (M12).
-            fill_ghosts!(fill.first, fill.second; boundary=boundary)
+            fill_ghosts!(fill.first, fill.second;
+                         boundary=(hook === nothing ? boundary : hook))
         end
         stored = storedsize(forest.N, fs.G, staggers(fs))
         fresh = similar(fs.work, stored..., fs.nvars, length(newrange))
@@ -1015,19 +1046,21 @@ function regrid!(forest::Forest{D}, pairs;
     return true
 end
 
-# The field sets `regrid!` moves, in order, each with its schedule and
-# what to fill before its transfer: itself with its schedule, or for the
-# first set of a `RotationPair` the pair with both schedules, which
-# fills the second set too, so that it moves without a fill of its own.
-# The transfers are δ = 0 and never cross the seam, so once both sets'
+# The field sets `regrid!` moves, in order, each with its schedule, what
+# to fill before its transfer, and its own boundary hook (`nothing` for
+# the call's `boundary`): itself with its schedule, or for the first set
+# of a `RotationPair` the pair with both schedules, which fills the
+# second set too, so that it moves without a fill of its own. The
+# transfers are δ = 0 and never cross the seam, so once both sets'
 # ghosts are current the two move independently.
 function regrid_steps(sets)
-    steps = Tuple{FieldSet,Any,Any}[]
-    for (x, sched) in sets
+    steps = Tuple{FieldSet,Any,Any,Any}[]
+    for (x, s) in sets
         if x isa RotationPair
-            push!(steps, (x.a, sched[1], x => sched), (x.b, sched[2], nothing))
+            push!(steps, (x.a, s[1], x => s, nothing), (x.b, s[2], nothing, nothing))
         else
-            push!(steps, (x, sched, x => sched))
+            sched, hook = set_schedule_hook(s)
+            push!(steps, (x, sched, x => sched, hook))
         end
     end
     return steps
@@ -1045,6 +1078,7 @@ regrid!(::Forest, ::Any, ::GhostSchedule; kwargs...) = throw(ArgumentError(
     adapt_to_initial_data!(fs, operators; initial, flag, buffer=0, maxpasses=10,
                            boundary=nothing)
     adapt_to_initial_data!(pair::RotationPair, operators; initial, flag, …)
+    adapt_to_initial_data!(pairs::Tuple; initial::Tuple, flag, …)
 
 Run the initialization cycle from `CODE.md`: fill the initial data, flag,
 regrid, then **re-evaluate** the initial data on the new mesh rather than
@@ -1083,6 +1117,28 @@ callback for both sets or a tuple of two, `flags` receives the pair, and
 `boundary` is one hook or a tuple of two, as for
 [`fill_ghosts!`](@ref). It returns `((schedule_a, schedule_b), passes,
 converged)`.
+
+Several field sets over one forest adapt together through the third
+form, so that the criterion may read all of them and every set is
+re-evaluated on the final mesh:
+
+```julia
+(schedules, passes, converged) = adapt_to_initial_data!(
+    (matter => ops, metric => (ops, metric_hook), flux => nothing);
+    initial = (matter_data, metric_data, nothing),
+    flags = sets -> my_flags(sets...))
+```
+
+Each element of `pairs` is `fs => operators`, `fs => (operators, hook)`
+with a boundary hook of the set's own that replaces `boundary` — sets
+with different `nvars` cannot share one [`AllVariables`](@ref) hook — or
+`fs => nothing` for a set that is only resized, as in
+[`regrid!`](@ref). `initial` has one entry per element: a callback as
+above, or `nothing` exactly for the sets that are only resized. Every
+set with data is refilled after every pass, and its ghosts are filled
+before the criterion runs; `flags` receives the tuple of field sets, in
+the order of `pairs`. It returns `(schedules, passes, converged)` with
+one schedule per element, `nothing` for a set only resized.
 
 Over a distributed forest (M7) the cycle is collective, as every
 [`regrid!`](@ref) in it is: `flag` is called for this rank's blocks,
@@ -1140,6 +1196,80 @@ function adapt_to_initial_data!(pair::RotationPair, operators::Operators;
     return (schedules, Int(maxpasses), false)
 end
 
+# The several-set form (for TreeGRRMHD): the same cycle over every set of
+# the tuple, each filled with its own initial data and its own hook, and
+# the forest regridded once per pass for all of them.
+function adapt_to_initial_data!(pairs::Tuple{Vararg{Pair}}; initial::Tuple,
+                                flag=nothing, flags=nothing, buffer::Integer=0,
+                                maxpasses::Integer=10, boundary=nothing)
+    criterion = adapt_criterion(flag, flags)
+    entries = adapt_entries(pairs, initial)
+    sets = map(e -> e.fs, entries)
+    forest = first(sets).forest
+    build() = map(e -> e.ops === nothing ? nothing : GhostSchedule(e.fs, e.ops), entries)
+    refill() = foreach(e -> e.init === nothing || fill_by_coordinates!(e.init, e.fs),
+                       entries)
+    schedules = build()
+    refill()
+
+    for pass in 1:maxpasses
+        for (e, sched) in zip(entries, schedules)
+            sched === nothing && continue
+            fill_ghosts!(e.fs, sched; boundary=(e.hook === nothing ? boundary : e.hook))
+        end
+        changed = regrid!(forest, map((e, sched) -> e.fs => sched, entries, schedules);
+                          flags=criterion(sets), buffer=buffer, transfer=false)
+        schedules = build()
+        refill()
+        changed || return (schedules, pass, true)
+    end
+    return (schedules, Int(maxpasses), false)
+end
+
+# The elements of the several-set form, checked and taken apart: each
+# set with its operators (or `nothing`), its own hook, and its initial
+# data.
+function adapt_entries(pairs::Tuple, initial::Tuple)
+    isempty(pairs) && throw(ArgumentError(
+        "adapt_to_initial_data! needs at least one `fs => operators` element"))
+    length(initial) == length(pairs) || throw(ArgumentError(
+        "initial has $(length(initial)) entries for $(length(pairs)) field sets: give " *
+        "one callback per set, in the order of the pairs, and `nothing` for a set " *
+        "that is only resized"))
+    forest = nothing
+    return ntuple(length(pairs)) do i
+        p = pairs[i]
+        p.first isa FieldSet || throw(ArgumentError(
+            "element $i is a `$(typeof(p.first)) => …`; the several-set form takes " *
+            "`fs => operators` with a FieldSet. A RotationPair adapts through its own " *
+            "form, `adapt_to_initial_data!(pair, operators; …)`"))
+        fs = p.first
+        forest === nothing && (forest = fs.forest)
+        fs.forest === forest || throw(ArgumentError(
+            "field set $i is over a different forest from field set 1: the sets adapt " *
+            "together, so they must share the forest"))
+        x = p.second
+        ops, hook = x isa Operators ? (x, nothing) :
+                    x === nothing ? (nothing, nothing) :
+                    x isa Tuple{Operators,Any} ? (x[1], x[2]) :
+                    throw(ArgumentError(
+                        "element $i is `fs => ` a $(typeof(x)); write " *
+                        "`fs => operators`, `fs => (operators, hook)` with a boundary " *
+                        "hook of the set's own, or `fs => nothing` for a set that is " *
+                        "only resized"))
+        init = initial[i]
+        (ops === nothing) == (init === nothing) || throw(ArgumentError(
+            ops === nothing ?
+            "field set $i is only resized (`fs => nothing`) but has initial data: a " *
+            "set without operators has no schedule to fill ghosts with, so give it " *
+            "operators, or `nothing` as its initial data" :
+            "field set $i has operators but `nothing` as its initial data: the cycle " *
+            "re-evaluates every set with operators on each new mesh, so give it a " *
+            "callback, or write `fs => nothing` to resize it only"))
+        return (fs=fs, ops=ops, hook=hook, init=init)
+    end
+end
+
 # The criterion of `adapt_to_initial_data!` as a callable of what is
 # adapted, a field set or a pair, from exactly one of its two forms.
 function adapt_criterion(flag, flags)
@@ -1152,6 +1282,7 @@ end
 
 adapted_forest(fs::FieldSet) = fs.forest
 adapted_forest(pair::RotationPair) = pair.a.forest
+adapted_forest(sets::Tuple) = first(sets).forest
 
 """
     total_mass(fs::FieldSet, var=1)

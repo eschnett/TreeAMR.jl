@@ -115,8 +115,9 @@ end
         V === Val(2) && trial == 1 &&
             @test balanced_by_geometry(full, full.leaves) && tiles_brick(full, full.leaves)
         # And accepted by the checked leaf path, as it was produced.
-        @test Forest(quad.roots; N=4, periodic=quad.periodic, reflecting=quad.reflecting,
-                     rotating=rot, leaves=quad.leaves).leaves == quad.leaves
+        @test Forest(quad.roots; N=4, periodic=quad.periodic,
+                     reflecting=TreeAMR.reflecting_faces(quad), rotating=rot,
+                     leaves=quad.leaves).leaves == quad.leaves
     end
     # Every orientation met every kind of neighbor, and none at all:
     # beyond an outer face, or across the seam and out again.
@@ -141,13 +142,13 @@ end
     @test oriented_neighbors(forest, k, (1, 0)) == (0, MortonKey{2}[])
     @test neighbor_keys(forest, k, (-1, 0)) == [k]
 
-    # The seam is not a reflecting face: reflect_direction masks only the
+    # The seam is not a reflecting face: wall_direction finds only the
     # wall outside the plane.
     octant = Forest((1, 1, 1); N=4, rotating=(1, 2),
                     reflecting=((false, false), (false, false), (true, false)))
     k = only(octant.leaves)
-    @test TreeAMR.reflect_direction(octant, k, (-1, 0, -1)) ==
-          ((-1, 0, 0), (false, false, true))
+    @test TreeAMR.wall_direction(octant, k, (-1, 0, -1)) ==
+          ((-1, 0, 0), (TreeAMR.OuterFace, TreeAMR.OuterFace, TreeAMR.ReflectingFace))
     @test oriented_neighbors(octant, k, (-1, 0, 0)) == (1, [k])
 end
 
@@ -221,7 +222,8 @@ end
         end
         @test moved == 0
         rebuilt = Forest(forest.roots; N=4, periodic=forest.periodic,
-                         reflecting=forest.reflecting, rotating=rot, leaves=new)
+                         reflecting=TreeAMR.reflecting_faces(forest),
+                         outflow=TreeAMR.outflow_faces(forest), rotating=rot, leaves=new)
         @test seam_conforming(first(unfolded_forest(rebuilt)), rot...)
     end
 end

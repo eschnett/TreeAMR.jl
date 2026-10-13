@@ -452,6 +452,39 @@ declared up front:
   So reflection runs on every backend, in the same kernel and the same
   phases as every other transfer, and the boundary hook never sees a
   reflecting face.
+- **Outflow** (per face): zero-gradient extrapolation, the ghosts
+  beyond the face repeating the nearest owned cell or point. It is
+  declared as `outflow = ((lo, hi), …)`, shaped like `reflecting`; a
+  dimension cannot be both periodic and outflow, and a face cannot be
+  both reflecting and outflow. It is a reflecting face without the
+  mirror: the schedule fills it by the same transfers, with the target
+  rows **clamped** onto the nearest owned row rather than mirrored (see
+  [Ghost filling](#ghost-filling)), and with no sign, so it needs no
+  parity and runs on every backend and across ranks with nothing new
+  in the kernel. It was asked for as a device-capable boundary hook that
+  reads the interior (TreeGRRMHD's AMR-6), and is this instead because
+  the common case is linear and the precedent was there: the hook
+  stays a function of position, and a condition that is not a copy —
+  forbidding inflow, say — is the application's, applied to the outer
+  ghosts after the fill (a `map_blocks!(…; stored = true)` pass that
+  tests the position). How the request was weighed is in
+  [HISTORY.md](HISTORY.md#domain-and-boundaries).
+
+  The zero-gradient copy is first order at the face: on a refined
+  mesh a coarse block's clamped ghosts reach the tangential
+  prolongation of a fine neighbor next to the face, so data varying
+  along the outflow dimension are not reproduced there, as they are not
+  by the condition itself. Higher-order extrapolation would be a
+  stencil of its own in place of the clamped copy; it is an open
+  question.
+
+  The forest stores the kind of every face, `faces[d][side]`, an `Int8`
+  enum (`OuterFace`, `ReflectingFace`, `OutflowFace`), in the bytes the
+  `(lo, hi)` `Bool` pairs of `reflecting` took, so the struct did not
+  grow; `reflecting_faces(forest)` and `outflow_faces(forest)` give the
+  pairs back in the keywords' shape, and so do the properties
+  `forest.reflecting` and `forest.outflow`, through `getproperty`, since
+  physics packages read `forest.reflecting` as the field it was.
 - **Rotating** (a pair of dimensions): a quarter-plane symmetry. Only one quadrant of the
   `(d1, d2)` plane is simulated, and the other three are its images
   under rotations by 90° about the line where the low faces of `d1` and
@@ -473,10 +506,10 @@ declared up front:
     the low face of `d2` (once the root counts agree, the cube check
     makes the extents' lengths agree);
   - `d1` or `d2` periodic;
-  - a reflecting face on either side of `d1` or `d2`. The two low faces
-    are the seam, and the two high faces stay outer, the hook's;
-    reflecting high walls together with the rotation are an open
-    question (see [Open questions](#open-questions)).
+  - a reflecting or outflow face on either side of `d1` or `d2`. The
+    two low faces are the seam, and the two high faces stay outer, the
+    hook's; reflecting or outflow high faces together with the rotation
+    are an open question (see [Open questions](#open-questions)).
 
   Every field set over such a forest declares its **rotation**, a
   signed variable map with one entry per variable, required with no
@@ -531,9 +564,9 @@ declared up front:
   two `Int8`s, which fit in the struct's alignment padding (what a
   field of `Forest` costs is under "The buffer pool" in
   [Distributed meshes](#distributed-meshes)).
-- **Physical** (per face, neither periodic, reflecting nor a rotating
-  seam): ghost cells are filled by a user-supplied boundary condition
-  hook. For a vertex-like dimension the domain's upper boundary plane
+- **Physical** (per face, neither periodic, reflecting, outflow nor a
+  rotating seam): ghost cells are filled by a user-supplied boundary
+  condition hook. For a vertex-like dimension the domain's upper boundary plane
   is the first plane of an outward-facing region and is filled by the
   hook too (see [Centerings](#centerings)).
 
@@ -738,6 +771,28 @@ level and joins the sweep at that level. This is what the hook could not
 do. At a mixed edge or corner region whose tangential neighbor is
 coarser, the mirrored values are the block's *own* prolongated ghosts,
 and the hook, which runs before the sweep, would have read them stale.
+
+**Outflow faces** are the same transfers with the target rows
+**clamped** instead of mirrored: every ghost row beyond the face takes
+the tangential stencil's row at the nearest owned row,
+
+| | low face | high face |
+|---|---|---|
+| every centering | `j* = G + 1` | `j* = G + N` |
+
+over the whole ghost slab, which on the high side of a vertex-like
+dimension includes the unowned wall row `G + N + 1`: it is a ghost like
+the rows beyond it, and is clamped like them. The source search, the
+wall-side children of a restriction and the phasing are the
+reflecting face's, unchanged — `wall_direction` returns the kind of
+each wall a direction crosses, `mirror_sources!` records a clamped
+dimension as mirror state 3, and `clamp_rows` builds its stencil beside
+`mirror_rows`. A clamped dimension takes no sign, so it counts as
+unmirrored in the factor column: a transfer that is only clamped is an
+ordinary one to the kernel (`factorcol = 0`), and one that is also
+mirrored in another dimension carries that dimension's parity. A corner
+region crossing an outflow face and an outer one is the hook's, as for
+a reflecting face.
 
 **The upper wall point in a vertex-like dimension**. On a high reflecting face the wall plane `G + N + 1` belongs to
 nobody (see [Centerings](#centerings)), and the mirror maps it onto
@@ -1037,7 +1092,7 @@ is visible only through ghost cells.
 
 Transfers are **batched by stencil**: everything sharing a kind, a
 direction, a child offset, a mirror state per dimension — none,
-mirrored rows, or the vertex-like upper wall row — and an
+mirrored rows, the vertex-like upper wall row, or clamped rows — and an
 orientation shares one set of one-dimensional stencils and so one
 kernel launch. The orientation joins `keyorder` as well, so both ends
 of an MPI message still derive one layout. A group carries its
@@ -1325,15 +1380,139 @@ two operator families:
   [Blocks](#blocks). How the interface-order rule below transfers to
   this family is predicted and measured below.
 
+**Bounded prolongation.** The order-3 conservative prolongation
+overshoots a discontinuity by an eighth of the jump, so across a shock,
+or a stellar surface where the density drops by orders of magnitude, a
+fine ghost or a child the regrid makes can leave the range of the data
+around it — a density below the atmosphere, or negative. Order 1 does
+not, but costs the interface its order. `Operators(…; bounded = true)`,
+allowed only with `Conservative` at `prolongation = 3` or `1`, bounds it.
+At order 1 there is nothing to do — a child is a copy of its parent — and
+the flag is accepted only so that an application can switch between the
+two orders without touching it; the schedule then builds the ordinary
+order-1 groups, bit for bit the unbounded ones. At order 3, per
+variable, for a parent cell with average `ū`, one-sided differences
+`a = ū₊ − ū`, `b = ū − ū₋` along each dimension, the monotonized central
+slope `s_d = minmod(2a, 2b, (a + b)/2)`, and a child on sides
+`σ_d = ±1`:
+
+    child = ū + φ Σ_d σ_d s_d / 4,   φ = min(1, (M − ū)/S, (ū − m)/S),
+    S = Σ_d |s_d| / 4,
+
+with `M`, `m` the extremes of `ū` and its `2D` face neighbours (`φ = 1`
+where every slope is zero). So every child lies in `[m, M]`: no new
+extrema. The bound comes from `φ`, whatever the slope, so the slope is a
+matter of accuracy alone, and there is no choice of it to offer: the MC
+slope is the central one wherever the data are monotone, and it kept the
+interface order where minmod did not (the tables below; the minmod
+measurements are in [HISTORY.md](HISTORY.md#operators)). The children of
+a cell still average to it, to roundoff — opposite children's sums are
+exact negatives — so the transfer stays conservative, and linear data
+are reproduced (`φ = 1` for them when `D ≤ 3`). It is not a tensor
+product: it drops the mixed terms of the unbounded `3^D` stencil, so on
+smooth data it differs from the unbounded operator by `O(h²)` in
+`D ≥ 2`, still second order; in 1D, on smooth monotone data, it is the
+order-3 operator itself. `bounded = false`, the default, is the
+tensor-product operator, bit for bit as before. The bound holds
+everywhere the prolongation runs — the ghost fill, the regrid transfer
+and the fill the regrid does first.
+
+*Where the mesh stops.* The bound is a property of the interpolation, as
+conservation is, and needs nothing but the values. Whether a state is
+physically *admissible* — a positive pressure, an entropy inside the
+equation of state's window, a con2prim that succeeds — is not: it is a
+joint condition on all of a cell's variables, which no per-variable
+bound on conserved variables implies. That is the application's, applied
+cell by cell after the mesh has done its part: over the ghosts after the
+fill (`map_blocks!(…; stored = true)`), and over the new children after
+a regrid. The use this is built for, TreeGRRMHD with EntropyEOS for
+con2prim and admissibility, prolongates the *primitive* variables in the
+ghost fill, bounded, and the conserved ones only in the regrid. For
+primitives the per-variable bound has the right shape: the density and
+the electron fraction stay within their neighbours' range and so within
+the table's, rapidity components need no bound, and only the entropy
+window, which depends on the other two, can still be missed — which the
+application's projection after the fill catches. The projection is no
+substitute for the bound: at a surface with coarse densities `10⁻²`,
+`10⁻³` and `10⁻¹³`, the unbounded child next to the atmosphere is about
+`−2.5·10⁻⁴`, which a projection resets to the atmosphere, ten orders
+below the cell beside it; the bounded children are `5·10⁻⁴` and
+`1.5·10⁻³`. A primitive set needs no conservation from its ghosts —
+the flux fixup conserves at coarse-fine faces whatever they hold — but
+the conservative family is still the one for it: its restriction is the
+plain average, a convex combination, so the coarse ghosts stay bounded
+too, where an order-4 point-value restriction has negative weights.
+
+It enters the one transfer kernel rather than a kernel of its own. A
+`TransferGroup` carries a `bounded` flag, set only on a prolongation
+built from bounded order-3 operators (`boundedkernel`): the schedule's
+local groups, its packs —
+the sender computes, so the pack bounds and the unpack stays a copy —
+and the regrid's groups. The flag reaches `transfer_kernel!` as a `Val`,
+in the same run-time dispatch the stencil orders already go through, so
+a bounded kernel is compiled only where one runs, and the unbounded path
+is the code it was. The bounded sum reads the parent at the centre of
+the order-3 window and its face neighbours through `transfer_load`, and
+the child's side off its stencil column — `(1/8, 1, −1/8)` is the low
+child, `(−1/8, 1, 1/8)` the high one — not off the target position; so a
+mirrored, clamped or rotated row, whose column is its image's, and a
+pack, which keeps the serial columns, need nothing of their own. The
+parity or rotation sign comes afterwards, as for every transfer, and
+commutes with the bounded sum, which is odd. A `NaN` neighbour would
+vanish into a zero slope through `minmod`'s comparisons, so the result
+carries `0 · (M − m)`, keeping an undefined source as visible as the
+stencil sum keeps it. The operators' `bounded` joins what the ranks
+agree on, for the schedule and for the regrid. How it came to be a
+property rather than a choice of limiters is in
+[HISTORY.md](HISTORY.md#operators).
+
+**Measured** with TreeHydro (2026-10-13, its `main` against this
+checkout, prolongating the *conserved* variables, which is what
+TreeHydro does; deterministic counts and errors, not timings). The
+static Sedov blast whose shock crosses a coarse-fine face
+(`sedov_static`, `refined = :center`, the same step count for every row,
+L1 against the uniformly fine run by TreeHydro's `l1_difference`, energy
+drift relative to its scale):
+
+| prolongation | `D` | floor / reset / ghost hits | L1 | energy drift |
+|---|---|---|---|---|
+| 3 | 2 | 0 / 4136 / 40 | 4.4066e-2 | 1.2e-5 |
+| 3, bounded | 2 | 0 / 0 / 0 | 4.4117e-2 | 1.1e-15 |
+| 1 | 2 | 0 / 0 / 0 | 4.4272e-2 | 1.9e-15 |
+| 3 | 3 | 89 / 24576 / 4786 | 2.313e-3 | 4.3e-5 |
+| 3, bounded | 3 | 0 / 0 / 0 | 1.717e-3 | 1.9e-15 |
+| 1 | 3 | 0 / 0 / 0 | 1.808e-3 | 1.7e-15 |
+
+So the bound buys order 1's freedom from floors and resets — energy
+conserved to roundoff — at almost all of order 3's accuracy in 2D, and
+better accuracy than either in 3D, where the unbounded prolongation's
+floors and resets cost more than its order gains. TreeHydro's
+interface-order study (smooth entropy wave across a static coarse-fine
+face, reconstruction unlimited) measures the price on smooth data:
+
+| prolongation | L∞ rate `D = 1` | L∞ rate `D = 2` | L1 rate `D = 1` | L1 rate `D = 2` |
+|---|---|---|---|---|
+| 3 | 2.034 | 2.041 | 1.971 | 2.009 |
+| 3, bounded | 2.034 | 2.027 | 1.987 | 2.013 |
+| 1 | 0.963 | 0.925 | 1.966 | 1.900 |
+| *unrefined control* | 2.024 | 2.029 | 2.015 | 2.021 |
+
+The bounded prolongation keeps the interface order: its finest 2D L∞
+error is within 3 % of the unbounded one's. These are conserved
+variables; prolongating primitives, as TreeGRRMHD will, has yet to be
+measured.
+
 There is **no default order**: the
 right order depends on the application's differencing order via the
 interface-order rule below, which the mesh library cannot know, so
 `Operators` requires both orders explicitly. The application chooses
 `G`; the package verifies at construction that `N`, `G`, and the
 requested operator orders satisfy the invariants listed under
-[Blocks](#blocks). Physics-specific operators —
-hydro-aware limited interpolation, primitive-variable-based prolongation
-— live in application packages and plug into the same interface.
+[Blocks](#blocks). Physics stays out of the operators: the bounded
+prolongation above keeps values within their neighbours' range, which
+needs nothing but the values, while admissibility — and the choice of
+which variables to prolongate — is the application's (see "Where the
+mesh stops" above).
 
 Operators are configured per field set, not per variable — and that
 *is* per-variable selection: a field set is the unit of
@@ -1772,6 +1951,13 @@ the strongest available statement that nothing in it is fp64-dependent.
    aux_schedule); flags, …)` — since operators are per field set; a set
    paired with `nothing` is **resized without transfer**, which is what
    flux sets want (fluxes are recomputed at the next RHS evaluation).
+   The pre-transfer fill uses the call's `boundary` hook unless a set
+   brings its own, `fs => (schedule, hook)`: an `AllVariables` hook is
+   checked against its set's `nvars`, so sets of different `nvars`
+   cannot share one, and sets of different physics have different
+   boundary data. Whether a set has its own hook is part of what the
+   ranks agree on. `fs => (nothing, hook)` is refused, since a set only
+   resized is never filled.
    For a staggered field the target of every transfer is the *owned*
    range: the shared plane and the ghosts of a fresh block are left to
    the next `fill_ghosts!`, as ghosts are today. Coarsening a vertex-like
@@ -1800,6 +1986,16 @@ family drifts at the percent level.
 **Initialization** iterates the same machinery: fill initial data →
 flag → regrid → *re-evaluate* the initial data on the new mesh (rather
 than prolongating it) → repeat until the hierarchy stops changing.
+Several field sets over one forest adapt together through the tuple
+form, `adapt_to_initial_data!((fs₁ => ops₁, fs₂ => (ops₂, hook₂), fs₃ =>
+nothing); initial = (init₁, init₂, nothing), flag | flags, …)`: every set
+with operators is refilled and has its ghosts filled (with its own hook,
+if it has one) in every pass, the criterion `flags` receives the tuple
+of sets, so it may read any of them, and a set paired with `nothing` —
+a flux — is only resized, its `initial` entry `nothing`. One schedule
+comes back per element, `nothing` for a set only resized. Adapting one
+set and filling the others on the final mesh afterwards gives the same
+mesh only while the criterion reads that set alone.
 
 When driven by an ODE integrator, regridding changes both the size and
 the meaning of the state vector. DiffEq callbacks support `resize!`, but
@@ -2134,10 +2330,22 @@ evolved set, but constrained-transport MHD evolves cell-centered hydro
 variables *and* face-centered `B`, and the integrator must see both as
 one vector. The state functions accept a tuple of field sets and lay them
 out contiguously in tuple order — `statevector((hydro, Bx, By, Bz))`,
-`scatter!(sets, u)`, `statearray(du, sets, i)` for the `i`-th set's view.
+`scatter!(sets, u)`, `gather!(u, sets)`, `staterange(sets, i)` for the
+`i`-th set's entries, `stateview(u, sets, i)` for its segment as a view
+and `statearray(du, sets, i)` for that segment in its set's array shape.
 Each set contributes `N^D · nvars · nblocks` entries whatever its
 centering; half-open ownership (see [Centerings](#centerings)) is what
-makes this a plain concatenation.
+makes this a plain concatenation. Each segment has exactly its set's
+single-set layout, so every single-set function applied to
+`stateview(u, sets, i)` and `sets[i]` — the reductions included —
+behaves as on a separate vector, and the tuple methods are loops over
+segments that call them. The sets may mix centerings, `nvars` and ghost
+widths but share the forest, the backend and the element type, and each
+must hold this rank's blocks of the current leaves (compared with
+`length(blockrange(forest))`, never with `nleaves`, which would refuse
+every rank but one of a distributed forest). `volume_weighted_norm(sets,
+u)` is the whole vector's norm, every set's domain counted once per
+variable, which is what an adaptive integrator's `internalnorm` wants.
 
 Because external integrators own the stages, ghosts are filled at
 *every* RHS evaluation; the classic wide-ghost/fewer-exchanges
@@ -2521,6 +2729,11 @@ entries per volume.
      package must substitute `CPU(; static = true)` itself, because
      `get_backend(::Array)` returns the default `CPU()` and the flag
      cannot travel on the storage. A device backend is untouched.
+     `map_blocks!(…; workgroupsize)` hands an application's workgroup
+     size (a register-heavy kernel may want a small one) to a device
+     launch only: on the CPU the workgroup *is* the block, so the
+     keyword is ignored there rather than refused, and code written
+     once for every backend may pass it unconditionally.
      Nothing upstream is required. KernelAbstractions' default is
      reasonable for a kernel run once and wrong for one run every step
      over the same data, which is worth an issue there, not a
@@ -3135,7 +3348,7 @@ collective.
   unchanged (checked). So the digest folds `hash(key, h)` over every
   leaf.
 - *It carries the brick and the layout too.* The brick (roots, `N`,
-  the periodic and reflecting faces, the extents) is hashed through its
+  the kinds of the faces, the extents) is hashed through its
   printed form. Beside it goes a hash of the layout the schedule is
   built for — the ghost widths, the centering, the operator family and
   orders, the element type and the backend's name — since a rank that
@@ -3940,22 +4153,26 @@ The ideas that span several files and are easy to violate:
   sweep filled. The hook runs *between* the phases, not last: prolongation
   stencils at a domain edge reach tangentially into the source's outer
   ghosts.
-- **Reflecting faces are transfers, not hooks** (M10). `reflecting` is a
-  per-face `(lo, hi)` property of the `Forest`, `parity` a per-variable,
-  per-dimension property of the `FieldSet` (required when the forest has
-  a reflecting face; `NoParity` refused in a reflected dimension). The
-  tree does not see the walls — `neighbor_keys` finds nothing across
-  them — but `block_sources!` asks `reflect_direction` (in `forest.jl`,
-  since it is brick knowledge) for `δ′`, the direction with the masked
-  components zeroed, and takes the source that `δ′` finds. Along a
-  masked dimension the stencil is the *tangential* one with its target
-  rows remapped across the wall (`mirror_rows`), and the kernel
-  multiplies by a parity factor from `fs.factors` (column
-  `TransferGroup.factorcol`; 0 = an ordinary transfer, left unscaled).
-  So mirrored transfers sit in the ordinary phases and run on devices.
-  The unowned upper wall plane of a vertex-like dimension is derived by
-  `wall_stencil` (odd → 0, even → the folded order-`p` interpolant).
-  The boundary hook sees only *outer* faces.
+- **Reflecting and outflow faces are transfers, not hooks** (M10). The
+  kind of each face is a property of the `Forest` (`faces`, read
+  through `reflecting_faces`, `outflow_faces` and `facekind`), `parity` a
+  per-variable, per-dimension property of the `FieldSet` (required when
+  the forest has a reflecting face; `NoParity` refused in a reflected
+  dimension; never needed for an outflow face). The tree does not see
+  the walls — `neighbor_keys` finds nothing across them — but
+  `block_sources!` asks `wall_direction` (in `forest.jl`, since it is
+  brick knowledge) for `δ′`, the direction with the wall components
+  zeroed, and takes the source that `δ′` finds. Along a wall dimension
+  the stencil is the *tangential* one with its target rows remapped
+  across the wall (`mirror_rows`) or clamped onto the nearest owned row
+  (`clamp_rows`), and the kernel multiplies a mirrored transfer by a
+  parity factor from `fs.factors` (column `TransferGroup.factorcol`; 0 =
+  an ordinary or clamped-only transfer, left unscaled). So these
+  transfers sit in the ordinary phases and run on devices. The unowned
+  upper wall plane of a vertex-like dimension is derived by
+  `wall_stencil` at a reflecting face (odd → 0, even → the folded
+  order-`p` interpolant) and clamped at an outflow face. The boundary
+  hook sees only *outer* faces.
 - **Rotating seams are oriented transfers** (M12, see "Rotating
   seams" under "Ghost filling"). `rotating = (d1, d2)` is a property of
   the `Forest` (a ninth field, `NTuple{2,Int8}` because an `Int` pair
@@ -4215,8 +4432,11 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
+- the face kinds: `reflecting_faces`, `outflow_faces` (`forest.jl`),
+  each a `(lo, hi)` pair per dimension, in the shape of the `Forest`
+  keywords;
 - the fields it reads: of a `Forest`, `N`, `roots`, `periodic`,
-  `reflecting`, `extents`, `leaves` and `comm`; of a `FieldSet`,
+  `extents`, `leaves` and `comm`; of a `FieldSet`,
   `work`, `nvars`, `G`, `centering`, `parity`, `rotation` and `forest`;
   of a `MortonKey`, `root`, `level` and `coords`.
 
@@ -4229,11 +4449,12 @@ which companion releases go with it.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`rotate_tests.jl` (M12),
+`outflow_tests.jl`, `rotate_tests.jl` (M12),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
-`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`, `wave_tests.jl`,
+`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`,
+`bounded_tests.jl` (the bounded prolongation), `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `mpi_tests.jl` (M7) and
 `gpu_tests.jl` (M2–M8).
@@ -4508,7 +4729,8 @@ collective `interpolate`, only redundant.
 All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
 
-- Wiring `volume_weighted_norm` into adaptive
+- Wiring `volume_weighted_norm` (of one set, or of the state vector of
+  several) into adaptive
   integrators as `internalnorm`. Its cost objection on a
   device — the norm at one work item per block cost three RHS
   evaluations — went with the two-launch reduction: the norm is 7 % of
@@ -4518,9 +4740,12 @@ Remaining, none blocking before their milestone:
   vertex-like dimension: refused until an application needs them, with
   order-`(p+1)` Lagrange as the recorded candidate (see
   [Operators](#operators)).
-- A state vector spanning several field sets: specified under
-  [Time integration](#time-integration), implemented with the first
-  application that needs it (constrained-transport MHD).
+- **Higher-order outflow.** An outflow face repeats the nearest owned
+  row, which is first order at the face (see
+  [Domain and boundaries](#domain-and-boundaries)). Linear or quadratic
+  extrapolation would be a stencil of its own along the wall dimension,
+  in place of `clamp_rows`'s copy, reading owned rows only; it needs an
+  application that asks for it.
 - **What M12 leaves open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
   - *A 180° rotation, the π-symmetry* (deferred).
@@ -4531,12 +4756,15 @@ Remaining, none blocking before their milestone:
     more, a face that is its own neighbor across the seam, which a
     leaf's image on the same face can make coarse-fine unless
     conformity is extended to it.
-  - *Reflecting high walls together with the rotation*, a symmetric box
-    rather than a quadrant open at its high faces. `R` carries the high
+  - *Reflecting or outflow high faces together with the rotation*, a
+    symmetric box, or a quadrant whose outer boundary is outflow, rather
+    than a quadrant open at its high faces. `R` carries the high
     face of `d1` onto that of `d2`, so both would have to reflect, the
     parities along `d1` and `d2` would have to agree with the map (`vx`
     odd in `x` exactly when `vy` is odd in `y`), and a mirrored transfer
-    across one high wall can then also cross the seam. Refused for now.
+    across one high wall can then also cross the seam. An outflow high
+    face needs no parity, but its clamped transfers would cross the seam
+    the same way, in the virtual frame. Both are refused for now.
   - *Interpolation of a paired set beyond the seam.* The value there is
     the partner's, so the kernel would need both working arrays, or the
     host would route the folded point to the partner and swap the

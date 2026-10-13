@@ -324,3 +324,108 @@ end
     @test mesh_mapreduce(identity, +, 0.0, fs; weight=vol) === sum(weighted)
     @test total_mass(fs) === sum(weighted)
 end
+
+@testset "Several field sets share one state vector, segment by segment: D=$D" for
+        D in (1, 2, 3)
+    # Constrained-transport MHD hands the integrator cell-centered hydro
+    # variables and staggered fields as one vector. A segment laid out in
+    # any other way than its set's own vector would scatter one set's
+    # data into another's ghosts, or read a set's reduction off the
+    # wrong entries — and still look plausible.
+    forest = Forest(ntuple(_ -> 2, D); N=8, periodic=ntuple(_ -> true, D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    sets = (FieldSet(forest, 10; G=3),
+            ntuple(d -> FieldSet(forest, 1; G=3, centering=facecentered(D, d)), D)...,
+            FieldSet(forest, 1; G=3, centering=vertexcentered(D)),
+            FieldSet(forest, 10; G=0, centering=facecentered(D, 1)))
+    for (i, fs) in enumerate(sets)
+        fill_by_coordinates!((x, v) -> i + v / 7 + sum(x) * x[1] - prod(x), fs)
+    end
+
+    n = sum(statelength, sets)
+    @test statelength(sets) == n
+    @test staterange(sets, 1) == 1:statelength(sets[1])
+    @test all(i -> last(staterange(sets, i)) + 1 == first(staterange(sets, i + 1)),
+              1:(length(sets) - 1))
+    @test last(staterange(sets, length(sets))) == n
+    @test_throws "outside 1:" staterange(sets, length(sets) + 1)
+
+    u = statevector(sets)
+    @test length(u) == n && all(iszero, u)
+    @test gather!(u, sets) === u
+    # Every segment is bit for bit the set's own state vector.
+    for (i, fs) in enumerate(sets)
+        own = gather!(statevector(fs), fs)
+        @test stateview(u, sets, i) == own
+        @test statearray(u, sets, i) == statearray(own, fs)
+    end
+
+    # Scattering reproduces every interior, set by set.
+    copies = map(fs -> FieldSet(forest, fs.nvars; G=fs.G, centering=fs.centering), sets)
+    @test scatter!(copies, u) === copies
+    @test all(i -> all(b -> interiorview(copies[i], b) == interiorview(sets[i], b),
+                       1:nblocks(sets[i])), eachindex(sets))
+
+    # The views alias the vector.
+    stateview(u, sets, 2)[1] = 42.0
+    @test u[first(staterange(sets, 2))] == 42.0
+    statearray(u, sets, 3)[ntuple(_ -> 1, D)..., 1, 1] = -1.0
+    @test u[first(staterange(sets, 3))] == -1.0
+    gather!(u, sets)
+
+    # A reduction over a segment is the reduction over a vector of its own.
+    for (i, fs) in enumerate(sets)
+        own = gather!(statevector(fs), fs)
+        seg = stateview(u, sets, i)
+        @test block_mapreduce(abs2, +, 0.0, fs, seg) ==
+              block_mapreduce(abs2, +, 0.0, fs, own)
+        @test mesh_mapreduce(abs, max, 0.0, fs, seg) ==
+              mesh_mapreduce(abs, max, 0.0, fs, own)
+        @test volume_weighted_norm(fs, seg) == volume_weighted_norm(fs, own)
+        @test volume_weighted_norm((fs,), own) == volume_weighted_norm(fs, own)
+    end
+    # The norm of the whole vector weights every set's cells by volume,
+    # each set's domain counted once per variable.
+    parts = map(i -> (volume_weighted_norm(sets[i], stateview(u, sets, i))^2,
+                      sets[i].nvars), eachindex(sets))
+    @test volume_weighted_norm(sets, u) ≈
+          sqrt(sum(p -> p[1] * p[2], parts) / sum(p -> p[2], parts))
+    @test volume_weighted_norm(sets, u; p=Inf) ==
+          maximum(i -> volume_weighted_norm(sets[i], stateview(u, sets, i); p=Inf),
+                  eachindex(sets))
+end
+
+@testset "A state vector over several sets refuses sets that do not belong together" begin
+    # Sets over another forest, of another element type, or not resized
+    # with the last regrid would lay the vector out against the wrong
+    # blocks; a vector of the wrong length would be read past its end.
+    forest = Forest((2, 2); N=4)
+    a = FieldSet(forest, 1; G=1)
+    @test_throws "different forest" statevector((a, FieldSet(Forest((2, 2); N=4), 1;
+                                                              G=1)))
+    @test_throws "element type" statevector((a, FieldSet{Float32}(forest, 1; G=1)))
+    @test_throws "at least one set" statelength(())
+    @test_throws DimensionMismatch scatter!((a, a), zeros(3))
+    @test_throws DimensionMismatch stateview(zeros(3), (a,), 1)
+    b = FieldSet(forest, 2; G=1)
+    refine!(forest, forest.leaves[1])
+    @test_throws "was not resized" statevector((a, b))
+end
+
+@testset "map_blocks! accepts a workgroup size and the CPU keeps its own: D=$D" for
+        D in (1, 2, 3)
+    # Backend-agnostic code passes the workgroup size a device kernel
+    # wants unconditionally. On the CPU the workgroup is the block, which
+    # keeps every block on its owner's thread, so the size changes
+    # nothing there.
+    forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
+    fs = FieldSet(forest, 1; G=1)
+    fill_by_coordinates!((x, v) -> sum(x), fs)
+    du = statevector(fs)
+    map_blocks!(double_interior!, fs, statearray(du, fs), fs.work, Val(D), Val(fs.G))
+    dv = statevector(fs)
+    map_blocks!(double_interior!, fs, statearray(dv, fs), fs.work, Val(D), Val(fs.G);
+                workgroupsize=(ntuple(_ -> 2, D)..., 1))
+    @test dv == du
+end

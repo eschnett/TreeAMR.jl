@@ -32,9 +32,9 @@ const EXCHANGE_PARITY = [EvenParity, OddParity, OddParity]
 
 const XOPS4 = Operators(prolongation=4, restriction=4)
 
-exchange_operators(C, family) =
+exchange_operators(C, family; bounded=false) =
     family === Conservative ?
-    Operators(prolongation=3, restriction=2, family=Conservative) :
+    Operators(prolongation=3, restriction=2, family=Conservative, bounded=bounded) :
     Operators(prolongation=4, restriction=4)
 exchange_ghosts(C, family) = ghosts_for(C, family === Conservative ? 3 : 4)
 
@@ -264,8 +264,8 @@ bitwise_equal(a, b) = size(a) == size(b) && all(map(===, a, b))
 # number of `−0` in the serial result; how many mirrored transfers were
 # received across a rank boundary; and the lockstep's segment mismatches.
 function lockstep_ghost_fill(serial::Forest{D}, P, C, family, ::Type{T};
-                             backend=CPU(), seed=1) where {D,T}
-    ops = exchange_operators(C, family)
+                             backend=CPU(), seed=1, bounded=false) where {D,T}
+    ops = exchange_operators(C, family; bounded=bounded)
     G = exchange_ghosts(C, family)
     nvars = length(EXCHANGE_PARITY)
     sfs = FieldSet{T}(serial, nvars; G=G, centering=C, parity=EXCHANGE_PARITY,
@@ -520,6 +520,11 @@ end
         if T === Float64
             same, _, _, bad = lockstep_ghost_fill(serial, 3, cellcentered(D), Conservative, T)
             @test same && bad == 0
+            # A bounded prolongation is computed by the sender too, its
+            # child side read off the stencil column the pack keeps.
+            same, _, _, bad = lockstep_ghost_fill(serial, 3, cellcentered(D), Conservative,
+                                                  T; bounded=true)
+            @test same && bad == 0
         end
     end
     # MultiFloats' product returns `+0` for `0 · (−1)`, so the serial fill
@@ -639,7 +644,8 @@ end
         fill_ghosts!(sfs, GhostSchedule(sfs, XOPS4); boundary=hook)
         box = Mailbox()
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                          reflecting=serial.reflecting, extents=serial.extents,
+                          reflecting=TreeAMR.reflecting_faces(serial),
+                          outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                           rotating=TreeAMR.rotating_dims(serial),
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]
@@ -704,7 +710,8 @@ end
                                                        Val(nvars))))
     box = Mailbox()
     forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                      reflecting=serial.reflecting, extents=serial.extents,
+                      reflecting=TreeAMR.reflecting_faces(serial),
+                      outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                       rotating=TreeAMR.rotating_dims(serial),
                       leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                for r in 0:(P - 1)]
@@ -995,7 +1002,8 @@ end
     for P in (3, 5)
         box = Mailbox()
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                          reflecting=serial.reflecting, extents=serial.extents,
+                          reflecting=TreeAMR.reflecting_faces(serial),
+                          outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                           rotating=TreeAMR.rotating_dims(serial),
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]

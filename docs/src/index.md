@@ -292,6 +292,39 @@ odd variable, the symmetric interpolant of the prolongation order for an
 even one. See "Domain and boundaries" and "Ghost filling" in the design
 document.
 
+## Outflow boundaries
+
+A face can be declared **outflow** on the forest, one `(lo, hi)` pair per
+dimension like `reflecting`: the ghosts beyond it repeat the nearest
+owned cell or point (zero-gradient extrapolation). The schedule fills
+them itself, as clamped copies, restrictions and prolongations, on every
+backend and across ranks; no parity is needed and the boundary hook
+never sees the face. A condition beyond a plain copy, such as forbidding
+inflow, is the application's, applied to the ghosts after the fill.
+
+```jldoctest outflow
+julia> using TreeAMR
+
+julia> line = Forest((1,); N = 4, outflow = ((true, true),));
+
+julia> fs = FieldSet(line, 1; G = 2);
+
+julia> fill_by_coordinates!((x, v) -> x[1], fs);
+
+julia> fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=2, restriction=2)));
+
+julia> fs.work[:, 1, 1]        # two ghosts at each end, repeating the end cells
+8-element Vector{Float64}:
+ 0.125
+ 0.125
+ 0.125
+ 0.375
+ 0.625
+ 0.875
+ 0.875
+ 0.875
+```
+
 ## Rotating symmetry
 
 A pair of dimensions `(d1, d2)` can be declared **rotating** on the
@@ -457,6 +490,23 @@ not locally conservative. Coarsening alone conserves either way.
 ```julia
 ops = Operators(prolongation = 3, restriction = 2, family = Conservative)
 ```
+
+Where the data have jumps — a shock, a stellar surface — the order-3
+reconstruction overshoots by an eighth of the jump, which can make a
+positive quantity negative in a fresh child or a fine ghost. A bounded
+prolongation keeps every prolongated value between the extremes of its
+parent and the parent's face neighbours, still conservative and still
+exact for linear data:
+
+```julia
+ops = Operators(prolongation = 3, restriction = 2, family = Conservative,
+                bounded = true)
+```
+
+The bound is all the mesh promises: whether a state is physically
+admissible — a positive pressure, say — is a condition on all of a cell's
+variables together, and the application checks it after the fill or the
+regrid.
 
 ## Interpolating to points
 

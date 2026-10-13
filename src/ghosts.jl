@@ -212,6 +212,50 @@ end
 # is multiplied by -1, 0 or 1, which is exact. So does a rotated
 # transfer across a seam (M12), whose column holds the sign of the turned
 # variable times its parity, if it is also mirrored.
+#
+# The bounded prolongation ("Bounded prolongation" in CODE.md). A group
+# built from bounded operators reaches the kernel with `B = true` and the
+# conservative order-3 stencils, whose window along each dimension is the
+# parent coarse cell and its two neighbours, so the parent is at
+# `base .+ 1`. The child's side along `d` is read off its stencil column —
+# `(1/8, 1, -1/8)` for the low child, `(-1/8, 1, 1/8)` for the high one —
+# rather than from the target position, so that a mirrored, clamped or
+# rotated row, whose column is its image's, and a pack, which keeps the
+# serial columns, need nothing of their own. The parity or rotation sign
+# `scaled` applies afterwards commutes with the bounded sum, which is odd.
+#
+# Per variable: one-sided differences `a`, `b` along each dimension, the
+# monotonized central slope `s_d`, the child `ū + φ Σ σ_d s_d / 4`, and
+# `φ` the largest scaling in `[0, 1]` that keeps every child of the
+# parent within the extremes of the parent and its `2D` face neighbours.
+# The comparisons of `minmod` would turn a `NaN` neighbour into a zero
+# slope, so the result carries `0 · (M − m)`, which is `NaN` exactly when
+# an extreme is: an undefined source stays visible, as it does in
+# `stencil_sum`.
+@inline minmod(a, b) = a > 0 && b > 0 ? min(a, b) : a < 0 && b < 0 ? max(a, b) : zero(a)
+@inline mc_slope(a, b) = minmod(2a, minmod(2b, (a + b) / 2))
+
+# Left to right, so the sum is the same on every backend.
+@inline tuplesum(t::Tuple{Any}) = t[1]
+@inline tuplesum(t::Tuple) = t[1] + tuplesum(Base.tail(t))
+
+Base.@propagate_inbounds function bounded_sum(src, weights, base::NTuple{D,Int},
+                                              wcol::NTuple{D,Int}, v, sblock,
+                                              ::Val{D}) where {D}
+    c = ntuple(d -> base[d] + 1, Val(D))
+    u = transfer_load(src, c, v, sblock)
+    lo = ntuple(d -> transfer_load(src, Base.setindex(c, c[d] - 1, d), v, sblock), Val(D))
+    hi = ntuple(d -> transfer_load(src, Base.setindex(c, c[d] + 1, d), v, sblock), Val(D))
+    s = ntuple(d -> mc_slope(hi[d] - u, u - lo[d]), Val(D))
+    high = ntuple(d -> weights[d][3, wcol[d]] > weights[d][1, wcol[d]], Val(D))
+    Δ = tuplesum(ntuple(d -> high[d] ? s[d] : -s[d], Val(D))) / 4
+    S = tuplesum(ntuple(d -> abs(s[d]), Val(D))) / 4
+    M = max(u, lo..., hi...)
+    m = min(u, lo..., hi...)
+    φ = S > 0 ? min(one(u), (M - u) / S, (u - m) / S) : one(u)
+    return u + φ * Δ + zero(u) * (M - m)
+end
+
 @inline scaled(acc, ::Nothing, v, col) = acc
 @inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
 
@@ -219,8 +263,8 @@ end
                                   @Const(targetblocks), @Const(sourceblocks),
                                   srcstarts, weights, unit::Bool,
                                   targetfirst::NTuple{D,Int}, toffset::Int,
-                                  factors, fcol::Int,
-                                  ::Val{Ps}, ::Val{D}) where {Ps,D}
+                                  factors, fcol::Int, ::Val{B},
+                                  ::Val{Ps}, ::Val{D}) where {B,Ps,D}
     J = @index(Global, NTuple)
     I = kernel_position(shape, J)
     # `I[1:D]` is the position within the target region, one-based.
@@ -238,7 +282,8 @@ end
     # nothing on a device, where it is uniform across a warp. Only a
     # one-point stencil can be a copy, and `Ps` is a type parameter, so
     # every other kernel compiles without the branch.
-    acc = all(isone, Ps) && unit ? (@inbounds copy_load(src, base, v, sblock)) :
+    acc = B ? (@inbounds bounded_sum(src, weights, base, wcol, v, sblock, Val(D))) :
+          all(isone, Ps) && unit ? (@inbounds copy_load(src, base, v, sblock)) :
           stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
     @inbounds transfer_store!(dest, scaled(acc, factors, v, fcol), tidx, v, tblock)
 end
@@ -278,6 +323,14 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     tfirst = ntuple(d -> group.stencils[d].targetfirst, Val(D))
     # One width per dimension, not one shared width: see the kernel.
     orders = ntuple(d -> stencilorder(group.stencils[d]), Val(D))
+    # A bounded group's kernel reads the parent and its face neighbours
+    # out of the order-3 conservative window; anything else is a bug in
+    # whatever built the group.
+    !group.bounded || all(==(3), orders) || error(
+        "a bounded prolongation group has stencils of orders $orders, not 3")
+    # Like `Val(orders)`, a run-time `Val`: the launch below is dispatched
+    # on it, so a bounded kernel is compiled only where one runs.
+    bounded = Val(group.bounded)
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
     weights = ntuple(d -> group.stencils[d].weights, Val(D))
     # A copy goes without its weights: see `copy_load`. A run-time flag
@@ -310,13 +363,14 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
         launch_transfer!(backend, flat, extents, single, kdest, rsrc, group.targetblocks,
                          group.sourceblocks, srcstarts, weights, unit, tfirst,
-                         first(range) - 1, gfactors, Int(group.factorcol), Val(orders),
-                         Val(D))
+                         first(range) - 1, gfactors, Int(group.factorcol), bounded,
+                         Val(orders), Val(D))
         return nothing
     end
     launch_transfer!(backend, flat, extents, single, kdest, ksrc, group.targetblocks,
                      group.sourceblocks, srcstarts, weights, unit, tfirst,
-                     first(range) - 1, gfactors, Int(group.factorcol), Val(orders), Val(D))
+                     first(range) - 1, gfactors, Int(group.factorcol), bounded,
+                     Val(orders), Val(D))
     return nothing
 end
 
