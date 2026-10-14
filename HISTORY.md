@@ -3589,6 +3589,11 @@ floor to 1.11. 0.1.4 carried checkpointing (M9a), 0.1.5 the distribution
 over MPI (M7), and 0.1.6 the fix for the `AllVariables` boundary hook on
 a rank without blocks. 0.1.7 (2026-10-04) carried the rotating symmetry
 (M12), together with the interpolator's second derivatives from `main`,
-and 0.1.8 (2026-10-06) the device copy kernels; 0.1.8 is the current
+and 0.1.8 (2026-10-06) the device copy kernels. 0.2.0 (2026-10-09)
+moved the checkpoints out into the companion package TreeIOHDF5, an API
+break. 0.2.1 (2026-10-14) carried TreeGRRMHD's mesh requests — the
+multi-set state vector, `map_blocks!`'s `workgroupsize`, per-set
+boundary hooks in `regrid!`, the multi-set `adapt_to_initial_data!`,
+outflow faces and the bounded prolongation — and is the current
 release. The repository keeps no changelog; the release commit says what
 changed.
