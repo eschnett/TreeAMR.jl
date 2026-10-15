@@ -4904,3 +4904,77 @@ Remaining, none blocking before their milestone:
   machine at 6 threads (960 blocks of `16³`, a 63 MB state) the RHS is
   most of a step and the two integrators are within 6 %; it is the
   Symmetry run that will say what the serial passes cost there.
+- **Element-local DG stencils (proposed).** Miller and Schnetter's
+  operator-based local discontinuous Galerkin method (OLDG,
+  arXiv:1604.00075) replaces a finite-difference derivative by a DG one
+  without touching the equations. It is a stencil with non-constant
+  coefficients over elements of `P + 1` Gauss–Lobatto nodes. Both face
+  nodes of every element are stored, so each face position carries two
+  values, one per side. The derivative at a node reads its own element
+  and, at the two face nodes only, the neighbouring element's face node
+  at the same position: one ghost layer. A second derivative applies the
+  operator twice through an auxiliary first-derivative field, which
+  needs its ghosts filled in between (or `G = P + 2` and the auxiliary
+  field computed in the ghost element too). Filtering and truncation are
+  modal and element-local, and time stepping is the method of lines with
+  a global `dt ∼ h/(P+1)²`: all the application's.
+  - *What fits today.* A block holds `E = N/(P+1)` elements per
+    dimension; one element a block would break "`N` even" and cost a
+    tree node per element. The node-duplicated layout owns as a
+    cell-centered dimension does — `N` points, no shared plane, the
+    state layout `N^D` — and at `G = 1` the existing exchange already
+    delivers OLDG's outside value: a same-level copy puts the
+    neighbour's first owned node, its low face node, into ghost
+    `N + G + 1`; the reflecting mirror `j* = 2G + 1 − j` maps ghost `G`
+    onto the face node (an odd variable's ghost is then `−ψ`, so the
+    face average is zero); an outflow copy gives `ψ* = ψ`, no penalty.
+    Faces between elements inside a block need no exchange. So an
+    application can run OLDG on an *unrefined* forest now, with
+    `cellcentered(D)`, `G = 1`, operators that never run, and its own
+    node positions, since `coordinates` reports uniform ones.
+  - *What a refined forest needs.* A per-dimension Gauss–Lobatto
+    centering beside `:cell` and `:vertex` ([Centerings](#centerings)),
+    with `P` a field-set property: `coordinates`,
+    `fill_by_coordinates!` and `boundary_by_coordinates` at the nodes,
+    `volume_weighted_norm` with the quadrature weights (the norm the
+    summation-by-parts property holds in), and the invariant that a
+    fine block covers whole parent elements, `N` divisible by
+    `2(P + 1)`. An operator family local to an element
+    ([Operators](#operators)), still a tensor product of
+    one-dimensional operators: prolongation evaluates the coarse
+    element's degree-`P` polynomial at the fine nodes, exact to degree
+    `P` and reading no ghosts; restriction cannot be injection, since a
+    coarse node is not a fine one, and is the `L²` projection of the
+    two fine polynomials, which keeps `∫ψ`. The interface-order rule
+    then costs nothing: both are exact to the element's degree. At a
+    coarse-fine face the ghost is injection normal to the face and that
+    element-local interpolation or projection along it. `Stencil1D`
+    and the transfer kernel need no change — a per-target start and
+    weight column of width `P + 1` is what they carry already — but
+    the weights do: the nodes are irrational from `P = 3`, so the
+    exact rational construction ([Precision](#precision)) becomes a
+    `BigFloat` one, still rounded once. `interpolate` needs a basis
+    that maps a position to the containing element's nodes; the
+    current extension point assumes a uniform continuous stored index
+    ([Point interpolation](#point-interpolation)).
+  - *The structural change* is in the schedule builder. A point belongs
+    to the block whose half-open box contains it, and a coarse-fine
+    ghost is placed by its distance from the face. An OLDG ghost sits
+    *at* the face, on the other side of the discontinuity, so which
+    side's value it takes has to become part of how a ghost names its
+    source.
+  - *Not settled by the mesh.* The paper's summation-by-parts argument
+    assumes conforming element faces. At a coarse-fine face the
+    neighbour's value is interpolated, which is consistent but may lose
+    the energy estimate; mortar projections that satisfy the
+    summation-by-parts compatibility condition are the known remedy.
+    The ghost operators at coarse-fine faces have to be tested for
+    stability, not only for order. A conservative system would further
+    need the mortar form of the interface restriction
+    ([Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces));
+    BSSN-like systems do not. `P` adaptivity is out of scope (`N` is
+    the forest's). Nothing here obstructs the multi-block forest: face
+    coupling by mortars is how multi-block DG codes are built.
+  - *Next step* is the unrefined prototype in an application, to judge
+    the method on its equations before the centering and the operator
+    family are built.
