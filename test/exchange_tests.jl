@@ -35,7 +35,7 @@ const XOPS4 = Operators(prolongation=4, restriction=4)
 exchange_operators(C, family; bounded=false) =
     family === Conservative ?
     Operators(prolongation=3, restriction=2, family=Conservative, bounded=bounded) :
-    Operators(prolongation=4, restriction=4)
+    Operators(prolongation=4, restriction=4, bounded=bounded)
 exchange_ghosts(C, family) = ghosts_for(C, family === Conservative ? 3 : 4)
 
 # The schedule's stencils as plain values, so that two schedules' can be
@@ -525,6 +525,14 @@ end
             same, _, _, bad = lockstep_ghost_fill(serial, 3, cellcentered(D), Conservative,
                                                   T; bounded=true)
             @test same && bad == 0
+            # So is a bounded point-value interpolation, its bracket read
+            # off the multilinear rows the pack keeps; vertex-centered, so
+            # that the derived wall row is bounded too.
+            for C in (cellcentered(D), vertexcentered(D))
+                same, _, _, bad = lockstep_ghost_fill(serial, 3, C, PointValue, T;
+                                                      bounded=true)
+                @test same && bad == 0
+            end
         end
     end
     # MultiFloats' product returns `+0` for `0 · (−1)`, so the serial fill

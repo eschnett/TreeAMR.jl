@@ -716,13 +716,12 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # These stencils are rebuilt on every regrid — the child offsets
     # involved depend on which blocks moved — so, like the schedule's,
     # they are uploaded here, once, rather than at the launch.
-    build1(key) =
-        key.kind === :copy ? ntuple(d -> copy_stencil(T, N, G[d], c[d], 0), D) :
-        key.kind === :restrict ?
-        ntuple(d -> restriction_stencil(T, N, G[d], c[d], 0, key.offset[d], operators),
-               D) :
-        ntuple(d -> prolongation_stencil(T, N, G[d], c[d], 0, key.offset[d], operators),
-               D)
+    # Bounded operators bound the new blocks too: the children a
+    # prolongation makes, and the parent a point-value restriction
+    # interpolates.
+    bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
+    build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
+                                           operators, bounded(key)), D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -730,11 +729,8 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     local_, sent, received = serial ? (pairs, nothing, nothing) :
                              split_regrid(pairs, oldrange, newrange)
     GRP = grouptype(backend, T, Val(D))
-    # A bounded prolongation bounds the new children too.
-    bounded = boundedkernel(operators)
     locals = GRP[todevice(backend, TransferGroup{T,D}(key.kind, stencils(key), targets,
-                                                      sources, 0, 0, (0, 0),
-                                                      key.kind === :prolong && bounded))
+                                                      sources, 0, 0, (0, 0), bounded(key)))
                  for (key, (targets, sources)) in local_]
     ST = stagetype(backend, T, Val(D))
     remote = serial ? nothing :
@@ -847,7 +843,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, eltype(fs.work),
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.walls, eltype(fs.work),
                    nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
@@ -861,6 +857,9 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "the field set has centering $(fs.centering) but its schedule was " *
         "built for $(sched.centering); pair each field set with its own " *
         "schedule"))
+    fs.walls === sched.walls || throw(ArgumentError(
+        "the field set has walls = :$(fs.walls) but its schedule was built for " *
+        ":$(sched.walls); pair each field set with its own schedule"))
     # What `fill_ghosts!` would refuse further down, refused here,
     # where the refusal is agreed between the ranks.
     eltype(fs.work) == scheduletype(sched) || throw(ArgumentError(
@@ -871,7 +870,8 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "built for $(nameof(typeof(sched.backend))); pair each field set with its " *
         "own schedule"))
     ops = sched.operators
-    push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded))
+    push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded,
+                   ops.vertex_prolongation))
     return nothing
 end
 

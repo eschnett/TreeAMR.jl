@@ -234,18 +234,21 @@ function pseudorandom!(fs::FieldSet{T,D}) where {T,D}
     return fs
 end
 
-function fill_case(tag, forest::Forest{D}, centerings; G, ops) where {D}
+function fill_case(tag, forest::Forest{D}, centerings; G, ops,
+                   walls::Symbol=:half_open, relative::Bool=false) where {D}
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
-    walls = findall(d -> any(TreeAMR.reflecting_faces(forest)[d]), 1:D)
+    mirrored = findall(d -> any(TreeAMR.reflecting_faces(forest)[d]), 1:D)
     f = (x, v) -> sum(d -> (d + v) * x[d]^2 - x[d], 1:D) + v
     for (name, C) in centerings
-        parity = isempty(walls) ? nothing :
-                 [ntuple(d -> d == first(walls) ? OddParity : EvenParity, D),
+        parity = isempty(mirrored) ? nothing :
+                 [ntuple(d -> d == first(mirrored) ? OddParity : EvenParity, D),
                   ntuple(_ -> EvenParity, D)]
-        fs = FieldSet(forest, 2; G=G, centering=C, parity=parity)
+        fs = FieldSet(forest, 2; G=G, centering=C, parity=parity, walls=walls)
         pseudorandom!(fs)
         sched = GhostSchedule(fs, ops)
-        boundary = hasouter(forest) ? boundary_by_coordinates(f) : nothing
+        boundary = !hasouter(forest) ? nothing :
+                   relative ? CellBoundary(Relative(AllVariables(x -> (f(x, 1), f(x, 2))))) :
+                   boundary_by_coordinates(f)
         fill_ghosts!(fs, sched; boundary=boundary)
         emit(tag, name, "transfers", transfers(forest, sched))
         emit(tag, name, "filled", digest(gathered(forest, fs.work)))
@@ -1005,6 +1008,9 @@ const OPS2 = Operators(prolongation=2, restriction=2)
 const OPSC = Operators(family=Conservative, prolongation=3, restriction=2)
 const OPSCB = Operators(family=Conservative, prolongation=3, restriction=2,
                         bounded=true)
+const OPS4B = Operators(prolongation=4, restriction=4, bounded=true)
+const OPSCS = Operators(family=Conservative, prolongation=3, restriction=2,
+                        vertex_prolongation=4)
 
 function main()
     emit("# ranks", NRANKS)
@@ -1057,6 +1063,35 @@ function main()
                               outflow=((false, true), (true, false)),
                               centre=(0.4, 0.5)),
               ("cell" => cellcentered(2),); G=1, ops=OPSCB)
+    # The bounded point-value interpolation across ranks: prolongations,
+    # interpolating restrictions and the derived wall row of a reflecting
+    # vertex-like face, each clamped by the sender into its bracket.
+    fill_case("BP", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
+                              outflow=((false, false), (true, false)),
+                              centre=(0.4, 0.5)),
+              ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4B)
+    # Staggered sets under the conservative family: averages along the
+    # cell-like dimension, point values along the vertex-like one, the
+    # derived wall row at the reflecting faces included.
+    # Symmetric walls: the owned low wall planes at the reflecting and the
+    # outflow faces are written by the fill, on whichever rank owns them.
+    fill_case("SW", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
+                              outflow=((false, false), (true, true)),
+                              centre=(0.4, 0.5)),
+              ("vertex" => vertexcentered(2), "face1" => facecentered(2, 1)); G=2,
+              ops=OPS4, walls=:symmetric)
+    # The relative hook: the ghosts beyond the outer faces from the block's
+    # own data, its corner rows read across block faces after the stage
+    # that fills them, on whichever rank holds them; with symmetric walls.
+    fill_case("RH", forest_of((3, 3), 8; outflow=((false, false), (true, false)),
+                              centre=(0.4, 0.5)),
+              ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4,
+              walls=:symmetric, relative=true)
+    fill_case("CS", forest_of((3, 3), 8; periodic=(true, false),
+                              reflecting=((false, false), (true, true)),
+                              centre=(1.4, 0.5)),
+              ("face1" => facecentered(2, 1), "face2" => facecentered(2, 2)); G=2,
+              ops=OPSCS)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,
     # the initial-data cycle from one leaf, and blocks moving between
     # ranks over several field sets, in Float64 and Float32x2. Float32 is

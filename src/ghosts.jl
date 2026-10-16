@@ -256,6 +256,53 @@ Base.@propagate_inbounds function bounded_sum(src, weights, base::NTuple{D,Int},
     return u + φ * Δ + zero(u) * (M - m)
 end
 
+# The bounded point-value interpolation (AMR-10; "Bounded point values"
+# in CODE.md). The stencils are `stack_linear`'s: rows `1:Ps[d]` the
+# order-`p` weights, rows `Ps[d]+1:2Ps[d]` the multilinear ones over the
+# same window. The order-`p` sum is formed exactly as `stencil_sum` forms
+# it, and beside it the extremes of the points with a nonzero multilinear
+# weight in every dimension — the target's bracket. The result is the sum
+# clamped into them, which is `u_lin + φ(u_w − u_lin)` with the largest
+# `φ ∈ [0, 1]` that stays in range, since `u_lin` lies in it. Where no
+# clamp acts it is the unbounded sum, bit for bit but for `-0`. `min` and
+# `max` propagate a `NaN` bracket point and `clamp` a `NaN` sum, and the
+# result carries `0 · (M − m)`, as `bounded_sum` does, so an undefined
+# source stays visible.
+@generated function bracket_clamp_sum(src, weights, base::NTuple{D,Int},
+                                      wcol::NTuple{D,Int}, v, sblock,
+                                      ::Val{Ps}) where {D,Ps}
+    idx = [:(base[$d] + $(Symbol(:m_, d)) - 1) for d in 1:D]
+    wprod = foldl((a, d) -> :($a * $(Symbol(:wt_, d))), 2:D;
+                  init=Symbol(:wt_, 1))
+    inbracket = foldl((a, d) -> :($a && !iszero($(Symbol(:lt_, d)))), 2:D;
+                      init=:(!iszero($(Symbol(:lt_, 1)))))
+    body = quote
+        u = transfer_load(src, ($(idx...),), v, sblock)
+        acc += $wprod * u
+        if $inbracket
+            lo = min(lo, u)
+            hi = max(hi, u)
+        end
+    end
+    for d in 1:D
+        body = quote
+            for $(Symbol(:m_, d)) in 1:$(Ps[d])
+                $(Symbol(:wt_, d)) = weights[$d][$(Symbol(:m_, d)), wcol[$d]]
+                $(Symbol(:lt_, d)) = weights[$d][$(Ps[d]) + $(Symbol(:m_, d)), wcol[$d]]
+                $body
+            end
+        end
+    end
+    return quote
+        Base.@_inline_meta
+        acc = zero(transfer_eltype(src))
+        lo = typemax(transfer_eltype(src))
+        hi = typemin(transfer_eltype(src))
+        @inbounds $body
+        clamp(acc, lo, hi) + zero(acc) * (hi - lo)
+    end
+end
+
 @inline scaled(acc, ::Nothing, v, col) = acc
 @inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
 
@@ -282,7 +329,10 @@ end
     # nothing on a device, where it is uniform across a warp. Only a
     # one-point stencil can be a copy, and `Ps` is a type parameter, so
     # every other kernel compiles without the branch.
-    acc = B ? (@inbounds bounded_sum(src, weights, base, wcol, v, sblock, Val(D))) :
+    acc = B == BOUNDED_CONSERVATIVE ?
+          (@inbounds bounded_sum(src, weights, base, wcol, v, sblock, Val(D))) :
+          B == BOUNDED_POINTVALUE ?
+          bracket_clamp_sum(src, weights, base, wcol, v, sblock, Val(Ps)) :
           all(isone, Ps) && unit ? (@inbounds copy_load(src, base, v, sblock)) :
           stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
     @inbounds transfer_store!(dest, scaled(acc, factors, v, fcol), tidx, v, tblock)
@@ -322,12 +372,17 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     prod(blen) == 0 && return nothing
     tfirst = ntuple(d -> group.stencils[d].targetfirst, Val(D))
     # One width per dimension, not one shared width: see the kernel.
-    orders = ntuple(d -> stencilorder(group.stencils[d]), Val(D))
-    # A bounded group's kernel reads the parent and its face neighbours
-    # out of the order-3 conservative window; anything else is a bug in
-    # whatever built the group.
-    !group.bounded || all(==(3), orders) || error(
-        "a bounded prolongation group has stencils of orders $orders, not 3")
+    rows = ntuple(d -> stencilorder(group.stencils[d]), Val(D))
+    # A bounded conservative group's kernel reads the parent and its face
+    # neighbours out of the order-3 window, and a bounded point-value
+    # group's stencils stack two sets of weights (`stack_linear`), so its
+    # order is half its rows; anything else is a bug in whatever built
+    # the group.
+    group.bounded != BOUNDED_CONSERVATIVE || all(==(3), rows) || error(
+        "a bounded conservative group has stencils of orders $rows, not 3")
+    group.bounded != BOUNDED_POINTVALUE || all(iseven, rows) || error(
+        "a bounded point-value group has stencils of $rows rows, not stacked pairs")
+    orders = group.bounded == BOUNDED_POINTVALUE ? map(r -> r ÷ 2, rows) : rows
     # Like `Val(orders)`, a run-time `Val`: the launch below is dispatched
     # on it, so a bounded kernel is compiled only where one runs.
     bounded = Val(group.bounded)
@@ -709,12 +764,21 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
 
     # Phase 2: prolongations, coarsest targets first. A prolongation may
     # read its coarse source's ghosts, which the earlier sweeps filled.
+    # The relative hook's regions that read prolongated ghosts run after
+    # the stage that fills them (`boundary_after_stage!`).
     for i in 2:length(stages)
         sends = run_stage!(fs, stages[i], forest, backend, sends)
+        boundary === nothing ||
+            boundary_after_stage!(fs, boundary, schedule, backend, stages[i].tag)
     end
     sends === nothing || waitall(forest.comm, sends)
     return fs
 end
+
+# The part of a hook that runs after a phase-2 stage: nothing, but for the
+# relative hook, whose regions next to a coarser block read the ghosts
+# that stage prolongates (see `BoundaryRegion`).
+boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
 
 # The cell-wise boundary form (M6).
 #
@@ -779,9 +843,63 @@ end
     end
 end
 
+# The relative hook (AMR-7): the ghost at `idx` is `f(x_g) + (u(r) −
+# f(x_r))`, `r` the nearest evolved point (`clamps`, see
+# `BoundaryRegion`) and both positions formed as `coordinates` forms them.
+# In that order, so that data equal to `f` come back as `f(x_g)` bit for
+# bit. `r` never lies in a region this launch writes: along a clamped
+# component it is an evolved point, along every other one a ghost that
+# transfers filled before this batch runs, so the kernel reads `work`
+# where it writes it without a race.
+@inline relative_point(idx, clamps, ::Val{D}) where {D} =
+    ntuple(d -> clamps[d] == 0 ? idx[d] : Int(clamps[d]), Val(D))
+
+@kernel function relative_kernel!(work, f, @Const(blocks), @Const(firsts),
+                                  @Const(clamps), @Const(origins), @Const(spacings),
+                                  ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+    I = @index(Global, NTuple)
+    t = I[D + 1]
+    @inbounds b = blocks[t]
+    @inbounds first_ = firsts[t]
+    @inbounds cl = clamps[t]
+    idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
+    r = relative_point(idx, cl, Val(D))
+    @inbounds origin, h = origins[b], spacings[b]
+    poff = pointoffsets(h, C)
+    xg = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
+    xr = ntuple(d -> origin[d] + (r[d] - G[d] - poff[d]) * h, Val(D))
+    @inbounds ur = work[r..., 1, b]
+    @inbounds work[idx..., 1, b] = f(xg) + (ur - f(xr))
+end
+
+@kernel function relative_all_kernel!(work, f, @Const(blocks), @Const(firsts),
+                                      @Const(clamps), @Const(origins), @Const(spacings),
+                                      ::Val{D}, ::Val{G}, ::Val{C},
+                                      ::Val{NV}) where {D,G,C,NV}
+    I = @index(Global, NTuple)
+    t = I[D + 1]
+    @inbounds b = blocks[t]
+    @inbounds first_ = firsts[t]
+    @inbounds cl = clamps[t]
+    idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
+    r = relative_point(idx, cl, Val(D))
+    @inbounds origin, h = origins[b], spacings[b]
+    poff = pointoffsets(h, C)
+    xg = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
+    xr = ntuple(d -> origin[d] + (r[d] - G[d] - poff[d]) * h, Val(D))
+    fg = f(xg)
+    fr = f(xr)
+    ntuple(Val(NV)) do v
+        @inbounds work[idx..., v, b] = fg[v] + (work[r..., v, b] - fr[v])
+        nothing
+    end
+end
+
 """
     CellBoundary(g)
     CellBoundary(AllVariables(g))
+    CellBoundary(Relative(f))
+    CellBoundary(Relative(AllVariables(f)))
 
 A boundary hook expressed **per cell**: `g(x, v, δ) -> value`, with `x`
 the cell center, `v` the variable index, and `δ` the outward direction
@@ -795,11 +913,18 @@ the block's interior.
 
 That is the trade. Conditions defined by position alone — Dirichlet
 data, a manufactured solution, an analytic exterior — are exactly this
-shape. Conditions that read the interior (extrapolating outflow) are
-not, and stay with the region form [`fill_ghosts!`](@ref) also accepts,
-which is CPU-only. A reflection needs no hook at all: declare the face
-`reflecting` on the [`Forest`](@ref) and the schedule fills it, on every
-backend (M10).
+shape. A condition relative to the block's own data takes the
+[`Relative`](@ref) form below, which also runs on a device. Anything else
+that reads the interior stays with the region form [`fill_ghosts!`](@ref)
+also accepts, which is CPU-only. A reflection needs no hook at all:
+declare the face `reflecting` on the [`Forest`](@ref) and the schedule
+fills it, on every backend (M10); a zero-gradient outflow neither,
+declared `outflow`.
+
+Wrapping a function of position alone in [`Relative`](@ref) selects the
+relative form, `f(x) -> value`: a ghost becomes `f(x_g) + (u(r) − f(x_r))`,
+the case's value plus the evolution's offset from the case at the
+nearest evolved point `r`. See [`Relative`](@ref).
 
 Wrapping `g` in [`AllVariables`](@ref) selects the once-per-cell form,
 `g(x, δ) -> vals`, which drops the variable index and returns all
@@ -829,6 +954,59 @@ struct CellBoundary{F}
     g::F
 end
 
+"""
+    Relative(f)
+    Relative(AllVariables(f))
+
+A boundary condition relative to the block's own data, for
+[`CellBoundary`](@ref): every ghost `x_g` beyond an outer face is set to
+
+    u(x_g) = f(x_g) + (u(x_r) − f(x_r)),
+
+with `x_r` the nearest *evolved* point — the case's value `f` plus the
+evolution's offset from it there. `f(x)` returns one variable's value,
+and is accepted only by a field set with one variable; wrapped in
+[`AllVariables`](@ref), `f(x)` returns all `nvars` values as a tuple. `f
+≡ 0` is a zero-gradient outflow; `f` the case's analytic field holds the
+ghosts to the case's differences while the level follows the evolution —
+Dirichlet data "in the field", which keeps `curl A` of a vector
+potential the case's in the ghosts while the potential's gauge level is
+the evolution's (TreeGRRMHD's AMR-7). The formula is evaluated in that
+order, so that data equal to `f` come back as `f(x_g)` bit for bit.
+
+`x_r` is the ghost's point clamped, along each component of its region's
+direction that leaves the domain through an outer face, onto the block's
+last evolved point there: `G + N` on the high side — the shared high
+plane of a vertex-like dimension counts as a ghost — and `G + 1` on the
+low side, or `G + 2` for a set with symmetric walls, whose low wall
+plane the fill writes. Along every other component the point keeps the
+ghost's own index: in a corner region beyond an outer face along one
+dimension and across another block's face along another, `x_r` is the
+block's own ghost there, filled from the neighbour — never the block's
+last column, which would make the value at a point two blocks share
+depend on which block fills it. So the hook runs in parts, each after
+the stage that fills what it reads: after phase 1, as every hook does,
+or, where those ghosts are prolongated from a coarser block, after the
+prolongations onto the block's level. Every fill — [`fill_ghosts!`](@ref),
+[`regrid!`](@ref)'s fill before its transfer, and
+[`adapt_to_initial_data!`](@ref)'s — applies the whole condition, so
+nothing reads a partial value.
+
+It is a kernel on every backend. `f` is called twice per ghost, at
+`x_g` and `x_r`, and must be a pure function of position: time-dependent
+data are captured in `f` by the caller, who builds a fresh hook per fill.
+That costs nothing — a closure capturing a `Float64` keeps one type
+whatever its value, so the kernel compiled for it is reused — as long as
+what it captures is `isbits` and keeps its type from fill to fill: a
+`Ref`, or a time that is sometimes a `Rational`, would compile anew.
+
+    hook = CellBoundary(Relative(x -> A_case(x, t)))       # nvars == 1
+    fill_ghosts!(fs, schedule; boundary = hook)
+"""
+struct Relative{F}
+    f::F
+end
+
 # The cell form runs through the kernel on every backend, the CPU
 # included — that is the point of it, and it is what keeps the form
 # under test without a device attached. Two dispatch entries rather than
@@ -854,6 +1032,50 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
     synchronize(backend)
     return nothing
 end
+
+# The relative form (AMR-7): only the batches whose slot is `slot`, so
+# that each runs after the stage that fills what it reads. The first call
+# of a fill, after phase 1, is `apply_boundary!`'s; the others come from
+# `boundary_after_stage!`.
+function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative},
+                        schedule::GhostSchedule{T,D}, backend;
+                        slot::Int=PHASE1_TAG) where {T,D}
+    nblocks(fs) == 0 && return nothing
+    f = hook.g.f
+    fs.nvars == 1 || throw(ArgumentError(
+        "CellBoundary(Relative(f)) sets one variable from `f(x)`, but the field set " *
+        "has nvars = $(fs.nvars); for several, wrap the function in AllVariables, " *
+        "`CellBoundary(Relative(AllVariables(x -> (u1, u2, ...))))`"))
+    return relative_launch!(relative_kernel!(backend), fs, f, schedule, backend, slot)
+end
+
+function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative{<:AllVariables}},
+                        schedule::GhostSchedule{T,D}, backend;
+                        slot::Int=PHASE1_TAG) where {T,D}
+    nblocks(fs) == 0 && return nothing
+    f = hook.g.f.f
+    check_allvariables(f(allvariables_sample(fs)), fs, "boundary hook")
+    return relative_launch!(relative_all_kernel!(backend), fs, f, schedule, backend, slot,
+                            Val(fs.nvars))
+end
+
+function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot,
+                          nv...) where {T,D}
+    plan = schedule.boundaryplan
+    for batch in plan.batches
+        batch.slot == slot || continue
+        n = nregions(batch)
+        n == 0 && continue
+        kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
+                plan.spacings, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
+                ndrange=(batch.boxlen..., n))
+    end
+    synchronize(backend)
+    return nothing
+end
+
+boundary_after_stage!(fs::FieldSet, hook::CellBoundary{<:Relative}, schedule, backend,
+                      tag) = cell_boundary!(fs, hook, schedule, backend; slot=tag)
 
 # The all-variables form. The length check runs here rather than in
 # `AllVariables` because only the field set knows `nvars`; it costs one
@@ -894,8 +1116,10 @@ function apply_boundary!(fs::FieldSet{T,D}, hook,
         "which is a host form: it indexes the working array cell by cell, and " *
         "this field set lives on $(nameof(typeof(backend))). Wrap a per-cell " *
         "function in `CellBoundary((x, v, δ) -> ...)`, which the package launches " *
-        "as a kernel. A condition that has to read the block's interior has no " *
-        "device form yet and needs the CPU backend."))
+        "as a kernel; a condition relative to the nearest evolved point is " *
+        "`CellBoundary(Relative(f))`, a kernel too, and a zero-gradient one an outflow " *
+        "face. Any other condition that has to read the block's interior needs the " *
+        "CPU backend."))
 end
 
 # The region form on the host, as it has always run: one parallel loop
@@ -972,6 +1196,9 @@ the price of a uniform `N^D` state layout for every centering; see
     ghosts; filling those last would feed unwritten memory into the
     interpolation. The hook may therefore read the block's interior
     (as an extrapolating condition does) but not other blocks' ghosts.
+    The [`Relative`](@ref) form reads the block's own ghosts across a
+    block face too, and runs each of its regions after the stage that
+    fills those — phase 1, or the prolongations onto the block's level.
 
 !!! note "Over a distributed forest"
     The fill is collective (M7): every rank calls it, with its own field
@@ -1041,6 +1268,10 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "for $(schedule.centering); the stored extent, the target ranges and the " *
         "one-dimensional operators all differ between a cell-centered and a " *
         "vertex-like dimension. Build one with `GhostSchedule(fs, operators)`."))
+    fs.walls === schedule.walls || throw(ArgumentError(
+        "the field set has walls = :$(fs.walls) but this schedule was built for " *
+        ":$(schedule.walls); the target ranges at a low domain face differ between " *
+        "the two. Build one with `GhostSchedule(fs, operators)`."))
 
     backend = get_backend(fs.work)
     samebackend(backend, schedule.backend) || throw(ArgumentError(
@@ -1108,6 +1339,8 @@ function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule
         i === nothing || (sends = runa(sa.stages[i], sends))
         j = findfirst(st -> st.tag == tag, sb.stages)
         j === nothing || (sends = runb(sb.stages[j], sends))
+        hooks[1] === nothing || boundary_after_stage!(a, hooks[1], sa, backend, tag)
+        hooks[2] === nothing || boundary_after_stage!(b, hooks[2], sb, backend, tag)
     end
     sends === nothing || waitall(forest.comm, sends)
     return pair

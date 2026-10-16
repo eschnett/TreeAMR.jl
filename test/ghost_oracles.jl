@@ -618,7 +618,7 @@ function undefined_ghosts(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
     f, parity = parity_data(T, kinds, p)
     ops = family === Conservative ?
           Operators(prolongation=p, restriction=2, family=Conservative, bounded=bounded) :
-          Operators(prolongation=p, restriction=p)
+          Operators(prolongation=p, restriction=p, bounded=bounded)
     fs = FieldSet{T}(forest, 2; G=ghosts_for(C, p), centering=C, parity=parity,
                      backend=backend)
     fill!(fs.work, T(NaN))
@@ -634,6 +634,59 @@ function undefined_ghosts(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
         end
     end
     return nnan, worst
+end
+
+"""
+The owned low wall planes of `fs` that a fill writes under symmetric
+walls (AMR-8), by the oracle's own geometry: every vertex-like dimension
+of every block whose box starts at the domain's non-periodic low face.
+Returns `(b, d)` pairs.
+"""
+function low_wall_planes(fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    out = Tuple{Int,Int}[]
+    for b in 1:nblocks(fs), d in 1:D
+        fs.centering[d] === :vertex && !forest.periodic[d] || continue
+        block_extent(forest, blockkey(fs, b))[d][1] == forest.extents[d][1] &&
+            push!(out, (b, d))
+    end
+    return out
+end
+
+"""
+[`undefined_ghosts`](@ref) for a set with `walls`: every stored value
+`NaN`, the data written into the owned points, then the owned low wall
+planes a symmetric fill is to write set back to `NaN` before the fill.
+Returns `(nnan, worst, nwalls)`: with `walls = :symmetric` nothing may
+stay `NaN` and every value must be the data, which a wall read before it
+is written would spoil; with `:half_open` the walls are not the fill's,
+and stay `NaN`.
+"""
+function undefined_walls(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
+                         T::Type=Float64, p::Int=4, N::Int=8, walls::Symbol=:symmetric,
+                         backend=CPU(), bounded=false) where {D}
+    forest = faces_forest(kinds; T=T, N=N)
+    f, parity = parity_data(T, kinds, p)
+    ops = Operators(prolongation=p, restriction=p, bounded=bounded)
+    fs = FieldSet{T}(forest, 2; G=ghosts_for(C, p), centering=C, parity=parity,
+                     walls=walls, backend=backend)
+    fill!(fs.work, T(NaN))
+    fill_by_coordinates!(f, fs)
+    work = Array(fs.work)
+    planes = low_wall_planes(fs)
+    for (b, d) in planes
+        sel = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : Colon(), D)
+        work[sel..., :, b] .= T(NaN)
+    end
+    copyto!(fs.work, work)
+    fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+    work = Array(fs.work)
+    worst = 0.0
+    for b in 1:nblocks(fs), v in 1:2, idx in CartesianIndices(size(work)[1:D])
+        x = coordinates(fs, b, Tuple(idx))
+        worst = max(worst, Float64(abs(work[idx, v, b] - f(x, v))))
+    end
+    return count(isnan, work), worst, length(planes)
 end
 
 """

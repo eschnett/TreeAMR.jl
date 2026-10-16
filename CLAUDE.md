@@ -325,7 +325,11 @@ the one that says why.
   `@index` at statement level, so assign it before passing it to a
   function.
 - **Phased ghost fill**: the boundary hook runs *between* the phases,
-  not last.
+  not last; the relative hook's regions run after the stage that fills
+  what they read ("Ghost filling").
+- **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
+  block at a low domain face has its own range start at `G+2` along that
+  vertex-like dimension; the trim is part of `GroupKey` ("Centerings").
 - **Reflecting and outflow faces are transfers, not hooks**, and
   **rotating seams are oriented transfers**; the boundary hook sees only
   outer faces ("Domain and boundaries", "Ghost filling"). The face kinds

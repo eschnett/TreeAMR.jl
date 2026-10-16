@@ -425,20 +425,38 @@ end
     @test exchange_error(forest, cons1, makepoly(2, 0); G=(0, 0)) == 0
 end
 
-@testset "The conservative family is refused along a vertex-like dimension" begin
+@testset "A staggered conservative set needs its vertex-direction width" begin
     # What a staggered quantity stores is an average along its cell-like
     # dimensions and a *point value* along its vertex-like ones, so there
-    # the family has nothing to conserve and would merely interpolate --
-    # at an even order that its odd orders do not name. Refused rather
-    # than guessed at.
+    # the family interpolates point values at a width its odd orders do
+    # not name. Without `vertex_prolongation` that width would be guessed,
+    # so the set is refused, saying which keyword is missing.
     cons = Operators(prolongation=3, restriction=2, family=Conservative)
     forest = Forest((2, 2); N=8)
     face = FieldSet(forest, 1; G=1, centering=facecentered(2, 1))
     @test_throws ArgumentError GhostSchedule(face, cons)
-    @test_throws "not defined along a vertex-like dimension" GhostSchedule(face, cons)
-    @test_throws "nothing to conserve" check_operators(face, cons)
+    @test_throws "needs vertex_prolongation" GhostSchedule(face, cons)
+    @test_throws "needs vertex_prolongation" check_operators(face, cons)
     @test_throws ArgumentError check_operators(
         FieldSet(forest, 1; G=1, centering=vertexcentered(2)), cons)
+    # With it the set is accepted, and its ghost width is checked against it.
+    staggered = Operators(prolongation=3, restriction=2, family=Conservative,
+                          vertex_prolongation=4)
+    @test GhostSchedule(face, staggered) isa GhostSchedule
+    @test_throws "into a vertex-like dimension needs G >= 2" check_operators(
+        face, Operators(prolongation=3, restriction=2, family=Conservative,
+                        vertex_prolongation=6))
+    # The keyword means nothing to the point-value family, an odd width
+    # nothing to anyone, and the bound is not implemented with it.
+    @test_throws "uses its own prolongation order" Operators(
+        prolongation=4, restriction=4, vertex_prolongation=4)
+    @test_throws "must be even and at least 2" Operators(
+        prolongation=3, restriction=2, family=Conservative, vertex_prolongation=3)
+    @test_throws "is not implemented" Operators(
+        prolongation=3, restriction=2, family=Conservative, bounded=true,
+        vertex_prolongation=4)
+    @test sprint(show, staggered) == "Operators(prolongation=3, restriction=2, " *
+                                     "family=Conservative, vertex_prolongation=4)"
     # A cell-centered set is of course still fine.
     @test GhostSchedule(FieldSet(forest, 1; G=1), cons) isa GhostSchedule
 end

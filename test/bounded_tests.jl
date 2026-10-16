@@ -47,10 +47,12 @@ end
     # always has.
     @test BOUNDED.bounded
     @test !Operators(prolongation=3, restriction=2, family=Conservative).bounded
-    @test_throws "needs family = Conservative and prolongation = 3" Operators(
-        prolongation=4, restriction=4, bounded=true)
-    @test_throws "needs family = Conservative and prolongation = 3" Operators(
+    @test_throws "conservative family needs prolongation = 3 or 1" Operators(
         prolongation=5, restriction=2, family=Conservative, bounded=true)
+    # Every point-value order has an interpolant to bound.
+    @test Operators(prolongation=6, restriction=4, bounded=true).bounded
+    @test sprint(show, Operators(prolongation=4, restriction=4, bounded=true)) ==
+          "Operators(prolongation=4, restriction=4, family=PointValue, bounded=true)"
     @test sprint(show, Operators(prolongation=3, restriction=2, family=Conservative)) ==
           "Operators(prolongation=3, restriction=2, family=Conservative)"
     @test sprint(show, BOUNDED) ==
@@ -73,7 +75,7 @@ end
         # threaded, so a random stream would differ between the two runs.
         fill_by_coordinates!((x, v) -> mod(sum(d -> 97.13 * (d + 0.37) * x[d], 1:D), 1), fs)
         sched = GhostSchedule(fs, o)
-        @test !any(g -> g.bounded, Iterators.flatten(sched.phase2))
+        @test all(g -> g.bounded == TreeAMR.UNBOUNDED, Iterators.flatten(sched.phase2))
         fill_ghosts!(fs, sched)
         filled = copy(fs.work)
         flags = flag_blocks((b, k) -> isodd(b) ? Refine : Keep, forest)
@@ -264,4 +266,230 @@ end
         worst = max(worst, abs(blockview(fs, b, 1)[idx] - bounded_child(U, I, σ)))
     end
     @test worst < 1e-6
+end
+
+# --- Bounded point values (AMR-10) ------------------------------------------
+#
+# `Operators(…; family = PointValue, bounded = true)` clamps every
+# interpolated value into the range of the source points that enclose it,
+# its bracket. The oracle below knows only that definition and the
+# geometry of a periodic coarse grid: where a fine point sits in it, the
+# centered Lagrange window of width `p` around it, and the bracket.
+
+const BOUNDED_PV = Operators(prolongation=4, restriction=4, bounded=true)
+const PLAIN_PV = Operators(prolongation=4, restriction=4)
+
+# The bounded value at position `x` of a periodic coarse grid `U` with
+# spacing `h`, centering `cen` (`:cell`, values at `(I − 1/2)h`, or
+# `:vertex`, at `(I − 1)h`), from the width-`p` interpolant.
+function bounded_point(U::AbstractArray{<:Real,D}, x, h, cen, p; raw=false) where {D}
+    n = size(U)
+    # Along each dimension the window's first node, its weights, and the
+    # bracket: two nodes, or the one the point coincides with.
+    axis = ntuple(D) do d
+        ξ = Rational{Int}(round(Int, 4 * x[d] / h), 4) + (cen === :cell ? 1 // 2 : 1)
+        if isinteger(ξ)
+            return Int(ξ), [1.0], [Int(ξ)]
+        end
+        f = floor(Int, ξ)
+        lo = f - p ÷ 2 + 1
+        w = TreeAMR.lagrange_weights([Rational(j) for j in lo:(lo + p - 1)], ξ)
+        return lo, Float64.(w), [f, f + 1]
+    end
+    wrap(J) = CartesianIndex(ntuple(d -> mod1(J[d], n[d]), D))
+    acc = 0.0
+    for m in CartesianIndices(ntuple(d -> length(axis[d][2]), D))
+        wt = prod(axis[d][2][m[d]] for d in 1:D)
+        acc += wt * U[wrap(ntuple(d -> axis[d][1] + m[d] - 1, D))]
+    end
+    raw && return acc
+    corners = [U[wrap(Tuple(c))] for c in Iterators.product(ntuple(d -> axis[d][3], D)...)]
+    return clamp(acc, minimum(corners), maximum(corners))
+end
+
+# Monotone in every coordinate, and a cubic, so the order-4 interpolant
+# reproduces it and its value lies strictly inside every bracket.
+monotone_cubic(D) = (x, v) -> v + sum(d -> 0.4d * x[d] + 0.05 * x[d]^3, 1:D)
+
+@testset "Bounded point values: width 2 is bounded already and changes nothing: D=$D" for
+        D in (1, 2, 3)
+    # Linear interpolation is a convex combination of its bracket, so
+    # `bounded = true` must take the plain kernel at width 2 — every group
+    # unbounded — and fill and regrid bit for bit as without it.
+    plain = Operators(prolongation=2, restriction=2)
+    ops = Operators(prolongation=2, restriction=2, bounded=true)
+    for C in (cellcentered(D), vertexcentered(D))
+        results = map((plain, ops)) do o
+            forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
+            fs = FieldSet(forest, 1; G=1, centering=C)
+            fill_by_coordinates!((x, v) -> mod(sum(d -> 97.13 * (d + 0.37) * x[d], 1:D), 1),
+                                 fs)
+            sched = GhostSchedule(fs, o)
+            @test all(g -> g.bounded == TreeAMR.UNBOUNDED,
+                      Iterators.flatten((sched.phase1, Iterators.flatten(sched.phase2))))
+            fill_ghosts!(fs, sched)
+            filled = copy(fs.work)
+            flags = flag_blocks((b, k) -> isodd(b) ? Refine : Keep, forest)
+            regrid!(forest, fs => GhostSchedule(fs, o); flags=flags)
+            return filled, copy(fs.work)
+        end
+        @test results[1][1] == results[2][1]
+        @test results[1][2] == results[2][2]
+    end
+end
+
+@testset "A refined point is the bounded interpolant of the coarse grid: D=$D, $cen" for
+        D in (1, 2, 3), cen in (:cell, :vertex)
+    # The definition. A periodic brick refined everywhere at once: every
+    # new point is the oracle's clamped interpolant of the coarse grid,
+    # whatever the data, so a wrong bracket, a missing clamp or a clamp
+    # into the wrong window shows. Random data clamp often.
+    N = 8
+    forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, 2.0), D))
+    n = 2N
+    h = 2 / n
+    U = rand(MersenneTwister(80 + D), n * ones(Int, D)...)
+    C = ntuple(_ -> cen, D)
+    fs = FieldSet(forest, 1; G=2, centering=C)
+    at(x) = CartesianIndex(ntuple(d -> mod1(round(Int, x[d] / h + (cen === :cell ? 0.5 : 1)),
+                                            n), D))
+    fill_by_coordinates!((x, v) -> U[at(x)], fs)
+    @test regrid!(forest, fs => GhostSchedule(fs, BOUNDED_PV);
+                  flags=fill(Refine, nleaves(forest)))
+    worst, nclamped = 0.0, 0
+    for b in 1:nblocks(fs)
+        blk = blockview(fs, b, 1)
+        for idx in CartesianIndices(ntuple(_ -> 3:(N + 2), D))
+            x = coordinates(fs, b, Tuple(idx))
+            want = bounded_point(U, x, h, cen, 4)
+            worst = max(worst, abs(blk[idx] - want))
+            want == bounded_point(U, x, h, cen, 4; raw=true) || (nclamped += 1)
+        end
+    end
+    @test worst < 1e-14
+    @test nclamped > 0
+end
+
+@testset "Bounded point values reproduce a monotone cubic bit for bit: D=$D" for
+        D in (1, 2, 3)
+    # Where no clamp acts the bounded value is the order-p interpolant
+    # itself, so the bound costs no order on smooth monotone data: the
+    # cubic is reproduced, and every value is the unbounded fill's, bit
+    # for bit, on every centering.
+    forest = nested_forest(Val(D); N=8)
+    f = monotone_cubic(D)
+    for C in allcenterings(Val(D))
+        G = ghosts_for(C, 4)
+        works = map((PLAIN_PV, BOUNDED_PV)) do ops
+            fs = FieldSet(forest, 2; G=G, centering=C)
+            fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops);
+                         boundary=boundary_by_coordinates(f))
+            @test max_deviation(fs, f) < 1e-11
+            fs.work
+        end
+        @test works[1] == works[2]
+    end
+end
+
+@testset "Bounded point values create no new extrema: D=$D, $cen" for
+        D in (1, 2, 3), cen in (:cell, :vertex)
+    # The point of the bound: through the ghost fill — prolongations,
+    # interpolating restrictions — and random regrids, data stay within
+    # their initial range, and a surface dropping over thirteen orders of
+    # magnitude stays positive. The unbounded control overshoots.
+    initial = Dict(:random => (x, rng) -> rand(rng),
+                   :step => (x, rng) -> x[1] < 1.3 ? 0.0 : 1.0,
+                   :surface => (x, rng) -> x[1] < 1.3 ? 1.0 : 1.0e-13)
+    C = ntuple(_ -> cen, D)
+    G = ghosts_for(C, 4)
+    for data in (:random, :step, :surface)
+        forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
+        fs = FieldSet(forest, 1; G=G, centering=C)
+        rng = MersenneTwister(90 + D)
+        fill_by_coordinates!((x, v) -> initial[data](x, rng), fs)
+        fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
+        lower = data === :surface ? 1.0e-13 : 0.0
+        lo, hi = extrema(fs.work)
+        @test lower <= lo && hi <= 1
+        for pass in 1:3
+            flags = flag_blocks(forest) do b, k
+                r = rand(rng)
+                r < 0.4 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
+            end
+            regrid!(forest, fs => GhostSchedule(fs, BOUNDED_PV); flags=flags)
+            fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
+            lo, hi = extrema(fs.work)
+            @test lower <= lo && hi <= 1
+        end
+    end
+    forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
+    fs = FieldSet(forest, 1; G=G, centering=C)
+    fill_by_coordinates!((x, v) -> x[1] < 1.3 ? 1.0 : 1.0e-13, fs)
+    regrid!(forest, fs => GhostSchedule(fs, PLAIN_PV); flags=fill(Refine, nleaves(forest)))
+    @test minimum(fs.work) < 0
+end
+
+@testset "A bounded derived wall point stays in its bracket" begin
+    # The derived upper wall point of a reflecting vertex-like dimension is
+    # an interpolation at the prolongation order, `(4u₁ − u₂)/3` at order 4,
+    # whatever kind of transfer fills it. Its bracket is the point beside
+    # the wall and that point's mirror image, so a bounded wall of an even
+    # variable is that point: a surface at the wall stays positive where
+    # the unbounded derivation goes negative.
+    N = 8
+    h = 2 / 2N
+    forest = Forest((2,); N=N, reflecting=((false, true),), extents=((0.0, 2.0),))
+    f(x, v) = x[1] > 2 - 1.5h ? 1.0e-13 : 1.0
+    walls = map((PLAIN_PV, BOUNDED_PV)) do ops
+        fs = FieldSet(forest, 1; G=1, centering=vertexcentered(1), parity=[(EvenParity,)])
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+        blockview(fs, nblocks(fs), 1)[1 + N + 1]
+    end
+    @test walls[1] < 0
+    @test walls[2] == 1.0e-13
+end
+
+@testset "Bounded point values are mirrored, turned and clamped as the data are: D=$D" for
+        D in (1, 2, 3)
+    # The bracket is read off the multilinear rows, which a mirrored,
+    # rotated or clamped row takes from its image with the rest of its
+    # column. If that went wrong the half domain would not be the fold of
+    # the doubled one, the quadrant not the fold of the full plane, and an
+    # outflow or reflecting corner would read a ghost before it is written.
+    for (C, sides) in ((cellcentered(D), (:lo, :hi)), (vertexcentered(D), (:lo,)))
+        for side in sides
+            result = reflecting_vs_doubled(Val(D); side=side, centering=C, N=8,
+                                           ops=BOUNDED_PV)
+            @test result !== nothing
+            result === nothing && continue
+            worst, ncells = result
+            @test ncells > 0 && worst < 1e-13
+        end
+        if D >= 2
+            result = rotating_vs_quadrupled(Val(D); rotating=(1, 2), centering=C,
+                                            ops=BOUNDED_PV)
+            @test result !== nothing
+            if result !== nothing
+                worst, npoints = result
+                @test npoints > 0 && worst < 1e-13
+            end
+        end
+        kinds = ntuple(d -> isodd(d) ? :outflow_lo : :reflect_hi, D)
+        nnan, _ = undefined_ghosts(kinds, C; p=4, bounded=true)
+        @test nnan == 0
+    end
+end
+
+@testset "Bounded point values run in Float32 too" begin
+    # No Float64 literal may leak into the clamp or its extremes.
+    D = 2
+    forest = nested_forest(Val(D); T=Float32, N=8, periodic=(true, true))
+    fs = FieldSet{Float32}(forest, 1; G=2)
+    fill_by_coordinates!((x, v) -> x[1] < 1.3f0 ? 1.0f0 : 1.0f-13, fs)
+    fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
+    @test eltype(fs.work) === Float32
+    lo, hi = extrema(fs.work)
+    @test 1.0f-13 <= lo && hi <= 1
 end
