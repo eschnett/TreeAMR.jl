@@ -49,7 +49,8 @@ See [`Operators`](@ref).
 @enum OperatorFamily PointValue Conservative
 
 """
-    Operators(; prolongation, restriction, family=PointValue, bounded=false)
+    Operators(; prolongation, restriction, family=PointValue, bounded=false,
+              vertex_prolongation=nothing)
 
 The operator family and orders a [`GhostSchedule`](@ref) is built with.
 Both orders are required — there is deliberately **no default**. The
@@ -150,11 +151,13 @@ forest, each with its own schedule.
     for a second-order-in-space application — which is what a default of
     2 used to hide.
 
-**Bounded prolongation.** `bounded = true`, allowed only with the
-conservative family at `prolongation = 3` or `1`, makes the prolongation
-create no new extrema: a ghost filled across a coarse-fine face, or a child made
-by [`regrid!`](@ref), lies between the smallest and the largest of its
-parent cell and the parent's `2D` face neighbours. That is a property of
+**Bounded operators.** `bounded = true` makes the inter-grid operators
+create no new extrema. With the conservative family, allowed at
+`prolongation = 3` or `1`, a ghost filled across a coarse-fine face, or a
+child made by [`regrid!`](@ref), lies between the smallest and the
+largest of its parent cell and the parent's `2D` face neighbours. With
+the point-value family, at any order, see "Bounded point values" below.
+That is a property of
 the interpolation, as conservation is, and it is what keeps a fine ghost
 from leaving the range of the data around it where the unlimited order-3
 slope overshoots — across a shock, or a stellar surface where the
@@ -184,6 +187,24 @@ of the tensor-product stencil, so on smooth data it differs from the
 unbounded operator by `O(h²)` in `D ≥ 2`, and it stays second order.
 `bounded = false`, the default, is the tensor-product operator,
 unchanged. See "Bounded prolongation" under "Operators" in `CODE.md`.
+
+**Bounded point values.** With the point-value family `bounded = true`
+keeps every interpolated value — a prolongated ghost or child, a
+restricted ghost or coarse point where restriction interpolates (along a
+cell-like dimension at `restriction > 2`), and the derived wall point of
+a reflecting vertex-like dimension — within `[m, M]`, the smallest and
+largest of the `2^D` source points that enclose it, the points
+multilinear interpolation would read. It is `u_lin + φ(u_w − u_lin)` with
+`u_w` the order-`p` interpolant, `u_lin` the multilinear one and `φ ∈
+[0, 1]` the largest value that stays in range; since `u_lin` lies in
+`[m, M]`, that is `u_w` clamped to `[m, M]`, which is how it is computed.
+Monotone data stay monotone, a positive field stays positive, linear data
+are reproduced exactly, and where no clamp is active the value is the
+unbounded one bit for bit, of order `p`. Width 2 is linear interpolation,
+bounded already, and is accepted so that an application can change
+orders without touching the flag. It is for primitive variables in the
+ghost fill (TreeGRRMHD's AMR-10). See "Bounded point values" under
+"Operators" in `CODE.md`.
 
 The two operators behave differently at a coarse-fine interface.
 
@@ -217,21 +238,41 @@ dimension against that dimension's ghost width *and centering* (see
 In a vertex-like dimension neither operator is the same object:
 restriction is injection (no order, no shifting) and prolongation
 evaluates at integer or half-integer coarse coordinates, so the whole
-requirement is `G ≥ prolongation ÷ 2 - 1` — and the conservative family
-is refused there outright.
+requirement is `G ≥ prolongation ÷ 2 - 1`.
+
+**Staggered conservative sets.** What a face- or edge-centered quantity
+stores is an average along its cell-like dimensions and a point value
+along its vertex-like ones — a magnetic flux through a face, a vector
+potential's line integral along an edge. The conservative family serves
+such a set as a tensor product of the two: conservative operators along
+the cell-like dimensions (the two-cell average, and subcell averages of
+the order-`prolongation` reconstruction), and along the vertex-like ones
+injection and point-value Lagrange prolongation of width
+`vertex_prolongation`, which must be even and is then required — there
+is no default, as for the other orders. A coarse edge's line integral is
+then the sum of its fine edges' after every restriction, prolongation,
+ghost fill and regrid, so the circulation around a coarse face is the sum
+around its fine faces, and a coarse face's flux the sum of its fine
+faces' (TreeGRRMHD's AMR-9, for `B = curl A`). A cell-centered set
+ignores `vertex_prolongation`, and without it a conservative set with a
+vertex-like dimension is refused. `bounded = true` is not implemented
+together with it. The vertex-like requirement is `G ≥
+vertex_prolongation ÷ 2 - 1`.
 """
 struct Operators
     family::OperatorFamily
     prolongation::Int
     restriction::Int
-    bounded::Bool                      # the prolongation creates no new extrema
+    bounded::Bool                      # the operators create no new extrema
+    vertex_prolongation::Int           # conservative, along a stagger; 0 if none
 
     # Sentinel defaults rather than required keywords, so that omitting
     # one reports *why* there is no default instead of a bare
     # UndefKeywordError.
     function Operators(; prolongation::Union{Integer,Nothing}=nothing,
                        restriction::Union{Integer,Nothing}=nothing,
-                       family::OperatorFamily=PointValue, bounded::Bool=false)
+                       family::OperatorFamily=PointValue, bounded::Bool=false,
+                       vertex_prolongation::Union{Integer,Nothing}=nothing)
         for (name, p) in (("prolongation", prolongation), ("restriction", restriction))
             p === nothing && throw(ArgumentError(
                 "Operators has no default order: pass $name explicitly. The order " *
@@ -261,25 +302,75 @@ struct Operators
                 "$restriction. It is exact for any field, so there is no higher order " *
                 "to ask for."))
         end
-        !bounded || (family === Conservative && prolongation in (1, 3)) ||
+        !bounded || family === PointValue || prolongation in (1, 3) ||
             throw(ArgumentError(
-                "bounded = true needs family = Conservative and prolongation = 3 or 1, " *
-                "got family = $family and prolongation = $prolongation: the bound limits " *
-                "the slope of the order-3 conservative reconstruction, the one operator " *
-                "that has a slope to limit and cell averages whose range it can keep, " *
-                "and order 1, which copies the parent, is bounded already"))
-        return new(family, Int(prolongation), Int(restriction), bounded)
+                "bounded = true with the conservative family needs prolongation = 3 or " *
+                "1, got $prolongation: the bound limits the slope of the order-3 " *
+                "reconstruction, the one conservative prolongation with a slope to " *
+                "limit, and order 1, which copies the parent, is bounded already"))
+        if vertex_prolongation !== nothing
+            family === Conservative || throw(ArgumentError(
+                "vertex_prolongation names the point-value width the conservative " *
+                "family uses along a vertex-like dimension; the point-value family " *
+                "uses its own prolongation order there, so pass that instead"))
+            vertex_prolongation >= 2 && iseven(vertex_prolongation) ||
+                throw(ArgumentError(
+                    "vertex_prolongation must be even and at least 2 (a vertex-like " *
+                    "point sits half a coarse spacing off its neighbours, so a " *
+                    "symmetric stencil has even width), got $vertex_prolongation"))
+            bounded && throw(ArgumentError(
+                "bounded = true together with vertex_prolongation is not implemented: " *
+                "the bounded conservative prolongation is built for an order-3 cell " *
+                "stencil in every dimension. Use the unbounded operators for a " *
+                "staggered conservative set"))
+        end
+        return new(family, Int(prolongation), Int(restriction), bounded,
+                   vertex_prolongation === nothing ? 0 : Int(vertex_prolongation))
     end
 end
 
-# Whether the prolongation groups take the bounded kernel: at order 1 a
-# child is a copy of its parent, bounded already, so only order 3 does.
-boundedkernel(ops::Operators) = ops.bounded && ops.prolongation == 3
+# How a transfer group's kernel bounds what it computes (see
+# `TransferGroup`): not at all, by the bounded conservative prolongation,
+# or by clamping the point-value interpolant into its bracket.
+const UNBOUNDED = Int8(0)
+const BOUNDED_CONSERVATIVE = Int8(1)
+const BOUNDED_POINTVALUE = Int8(2)
+
+# The bound a group of `kind` takes, from its operators, its mirror state
+# per dimension and the set's staggers `c`. Only an operator that can make
+# a new extremum takes one. Conservative order 1 copies the parent, and a
+# point-value stencil of width 2 is linear interpolation, a convex
+# combination of its bracket, so both are bounded already and take the
+# plain kernel; so does injection, a vertex-like restriction. A point-value
+# restriction interpolates along every cell-like dimension, and the
+# derived wall row of a reflecting vertex-like dimension (mirror state 2)
+# interpolates at the prolongation order whatever the group's kind.
+function boundedmode(ops::Operators, kind::Symbol, mirror::NTuple{D,Int8},
+                     c::NTuple{D,Int}) where {D}
+    ops.bounded || return UNBOUNDED
+    if ops.family === Conservative
+        return kind === :prolong && ops.prolongation == 3 ? BOUNDED_CONSERVATIVE :
+               UNBOUNDED
+    end
+    kind === :prolong && ops.prolongation > 2 && return BOUNDED_POINTVALUE
+    kind === :restrict && ops.restriction > 2 && any(iszero, c) &&
+        return BOUNDED_POINTVALUE
+    any(==(Int8(2)), mirror) && ops.prolongation > 2 && return BOUNDED_POINTVALUE
+    return UNBOUNDED
+end
 
 Base.show(io::IO, ops::Operators) =
     print(io, "Operators(prolongation=", ops.prolongation,
           ", restriction=", ops.restriction, ", family=", ops.family,
-          ops.bounded ? ", bounded=true" : "", ")")
+          ops.bounded ? ", bounded=true" : "",
+          ops.vertex_prolongation == 0 ? "" :
+          ", vertex_prolongation=$(ops.vertex_prolongation)", ")")
+
+# The prolongation width along a vertex-like dimension: the family's own
+# order for point values, `vertex_prolongation` for the conservative
+# family (0 when it has none, which `check_operators` refuses there).
+vertex_order(ops::Operators) =
+    ops.family === Conservative ? ops.vertex_prolongation : ops.prolongation
 
 """
     ghost_layers_read(ops::Operators)
@@ -308,7 +399,10 @@ centering, so what a dimension needs depends on where its values sit.
 | cell | `PointValue` | shifted Lagrange | quarter offsets | `G ≥ p/2`, `N ≥ 2G+p/2-1` |
 | cell | `Conservative` | 2-cell average | subcell averages | `G ≥ (p-1)/2` |
 | vertex | `PointValue` | injection | integer / half-integer | `G ≥ p/2 - 1` |
-| vertex | `Conservative` | *refused* | *refused* | — |
+| vertex | `Conservative` | injection | point values of width `vertex_prolongation` | `G ≥ vp/2 - 1` |
+
+A conservative set with a vertex-like dimension needs
+`vertex_prolongation`, and is refused without it.
 
 A cell-centered dimension additionally needs `N ≥ restriction`, so that
 the restriction window fits inside a fine block's interior; along a
@@ -345,21 +439,20 @@ function check_operators(N::Integer, G::NTuple{D,Int}, c::NTuple{D,Int},
             # What a face- or edge-centered quantity stores is an average
             # along its cell-like dimensions and a *point value* along
             # its vertex-like ones, so along a vertex dimension the
-            # conservative family has nothing to conserve and would
-            # merely interpolate — at an even order its odd `p` does not
-            # name. Refused rather than guessed at; see "Operators" in
-            # CODE.md.
-            ops.family === Conservative && throw(ArgumentError(
-                "the Conservative family is not defined along a vertex-like " *
-                "dimension (dimension $d of centering with c=$c). What a staggered " *
-                "quantity stores is a point value there, not an average, so there " *
-                "is nothing to conserve and the family's odd orders do not name " *
-                "the interpolation that would be wanted. Use PointValue for a " *
-                "staggered field set; fluxes and EMFs are never ghost-filled at " *
-                "all."))
-            g >= pp ÷ 2 - 1 || throw(ArgumentError(
-                "prolongation of order $pp into a vertex-like dimension needs " *
-                "G >= $(pp ÷ 2 - 1), because its stencil reaches that many planes " *
+            # conservative family interpolates point values, at a width
+            # its odd `p` does not name: `vertex_prolongation`, required
+            # here. See "Operators" in CODE.md.
+            pv = vertex_order(ops)
+            pv == 0 && throw(ArgumentError(
+                "a Conservative field set with a vertex-like dimension (dimension $d " *
+                "of centering with c=$c) needs vertex_prolongation, the even width of " *
+                "the point-value interpolation along it. What a staggered quantity " *
+                "stores is a point value there, not an average, and the family's odd " *
+                "orders do not name that interpolation; there is no default, as for " *
+                "the other orders"))
+            g >= pv ÷ 2 - 1 || throw(ArgumentError(
+                "prolongation of order $pv into a vertex-like dimension needs " *
+                "G >= $(pv ÷ 2 - 1), because its stencil reaches that many planes " *
                 "past the source's shared boundary plane, but G=$G (dimension $d)"))
         else
             # No blanket `g >= 1` here: the order constraints below imply

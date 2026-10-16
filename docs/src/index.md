@@ -153,6 +153,13 @@ julia> size(flux.work)
 (9, 8, 2, 7)
 ```
 
+At a non-periodic face of the domain this makes the two walls of a
+vertex-like dimension differ: the high wall plane belongs to nobody and
+the fill derives it, while the low one is owned and evolved. A field set
+built with `walls = :symmetric` has the fill write the owned low wall
+too, by the rule the high wall gets at a face of that kind, so that a
+closed box stays mirror-symmetric; the state vector does not change.
+
 [`interiorview`](@ref) returns the owned points and [`closedview`](@ref)
 the owned points plus the shared plane — a block's `N+1` faces in the
 staggered dimension, which is what a flux kernel launched with
@@ -503,10 +510,35 @@ ops = Operators(prolongation = 3, restriction = 2, family = Conservative,
                 bounded = true)
 ```
 
+Point values can be bounded too, at any order: every interpolated value —
+a prolongated ghost or child, a restricted coarse value where restriction
+interpolates, the derived wall point of a reflecting vertex-like face — is
+clamped into the range of the source points that enclose it. Linear data
+are still reproduced, and where no clamp acts the value is the unbounded
+interpolant's, bit for bit. It is meant for primitive variables, which an
+application may prolongate in the ghost fill:
+
+```julia
+ops = Operators(prolongation = 4, restriction = 4, bounded = true)
+```
+
 The bound is all the mesh promises: whether a state is physically
 admissible — a positive pressure, say — is a condition on all of a cell's
 variables together, and the application checks it after the fill or the
 regrid.
+
+A face- or edge-centered set holds averages along its cell-like
+dimensions and point values along its vertex-like ones — a flux through
+a face, a vector potential along an edge. The conservative family serves
+it with point values of a width of their own along the vertex-like
+dimensions, so that a coarse edge's line integral stays the sum of its
+fine edges', and the flux of `B = curl A` through a coarse face the sum
+of its fine faces':
+
+```julia
+ops = Operators(prolongation = 3, restriction = 2, family = Conservative,
+                vertex_prolongation = 4)
+```
 
 ## Interpolating to points
 
@@ -665,11 +697,14 @@ loops over block data:
   cell — `g(x, v, δ)`, or `g(x, δ)` returning every variable at once
   under [`AllVariables`](@ref) — and the package launches it as a
   kernel. [`boundary_by_coordinates`](@ref) is one of these, so it runs
-  anywhere. The older whole-region form, `boundary(fs, b, key, δ,
-  region)`, is still accepted and is still what a condition that reads
-  the block's interior (reflecting, extrapolating) needs — but it
-  indexes the working array cell by cell, so it is CPU-only, and says so
-  if handed a device field set.
+  anywhere. A condition relative to the block's own data,
+  [`Relative`](@ref)`(f)` — a ghost set to `f(x)` plus the evolution's
+  offset from `f` at the nearest evolved point, Dirichlet data "in the
+  field" — is a kernel too. The older whole-region form, `boundary(fs,
+  b, key, δ, region)`, is still accepted and is still what any other
+  condition that reads the block's interior needs — but it indexes the
+  working array cell by cell, so it is CPU-only, and says so if handed a
+  device field set.
 - **Refinement criteria.** [`flag_blocks`](@ref) calls `f(b, key)` on
   the host, which cannot read device data. [`firing_boxes`](@ref) is the
   device form: it evaluates a per-cell predicate over every block in one

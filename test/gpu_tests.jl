@@ -204,6 +204,60 @@ end
     end
 end
 
+@testset "$bname: bounded point values are clamped on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # The clamp is a branch of the one transfer kernel, its bracket read
+    # off stencil rows uploaded with the rest. On a device it must leave
+    # nothing unwritten at reflecting and outflow faces, the derived wall
+    # row included, and keep a surface positive through the fill.
+    kinds = ntuple(d -> isodd(d) ? :reflect_hi : :outflow_lo, D)
+    for C in (cellcentered(D), vertexcentered(D))
+        nnan, _ = undefined_ghosts(kinds, C; T=T, backend=backend, bounded=true)
+        @test nnan == 0
+        forest = nested_forest(Val(D); T=T, N=8, periodic=ntuple(_ -> true, D))
+        fs = FieldSet{T}(forest, 1; G=2, centering=C, backend=backend)
+        fill_by_coordinates!((x, v) -> x[1] < T(1.3) ? one(T) : T(1.0e-13), fs)
+        fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4,
+                                                     bounded=true)))
+        lo, hi = extrema(Array(fs.work))
+        @test T(1.0e-13) <= lo && hi <= 1
+    end
+end
+
+@testset "$bname: symmetric walls are written on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # The owned low wall planes, set to NaN, are written by the device's
+    # fill — mirrored, clamped or by the cell hook — before anything reads
+    # them, at every face kind.
+    for kinds in Iterators.product(ntuple(_ -> (:outer, :reflect_lo, :outflow_lo), D)...)
+        nnan, worst, _ = undefined_walls(kinds, vertexcentered(D); T=T, backend=backend)
+        @test nnan == 0
+        @test worst < 16 * gputol(T)
+    end
+end
+
+@testset "$bname: the relative hook runs on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2, 3)
+    # A linear case with data equal to it comes back exactly at every hook
+    # ghost and to rounding everywhere, on every centering, from a kernel
+    # that reads the block's own data; and nothing is left undefined.
+    forest = nested_forest(Val(D); T=T, N=8)
+    f = x -> T(0.3) + sum(d -> T(0.2 + 0.1d) * x[d], 1:D)
+    for C in allcenterings(Val(D))
+        fs = FieldSet{T}(forest, 1; G=ghosts_for(C, 4), centering=C, backend=backend)
+        fill!(fs.work, T(NaN))
+        fill_by_coordinates!((x, v) -> f(x), fs)
+        fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                     boundary=CellBoundary(Relative(f)))
+        work = Array(fs.work)
+        @test count(isnan, work) == 0
+        worst = maximum(b -> maximum(idx -> abs(work[Tuple(idx)..., 1, b] -
+                                                 f(coordinates(fs, b, Tuple(idx)))),
+                                     CartesianIndices(size(work)[1:D])), 1:nblocks(fs))
+        @test worst < 16 * gputol(T)
+    end
+end
+
 @testset "$bname: a rotating seam is filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
     # M12. Turned transfers are ordinary groups too, read through the

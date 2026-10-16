@@ -135,8 +135,9 @@ dimension's `G_d`):
   prolongation reads `p/2 − 1` planes beyond the shared plane, so
   `G ≥ p/2 − 1` — and nothing else, in particular neither of the two
   restriction bullets above, which are about a window that no longer
-  exists. The conservative family is refused along a vertex-like
-  dimension (see [Operators](#operators)). Derivations under
+  exists. The conservative family takes point values along a
+  vertex-like dimension, of the even width `vertex_prolongation`, which
+  is then required (see [Operators](#operators)). Derivations under
   [Centerings](#centerings) and [Ghost filling](#ghost-filling).
 
 ### Centerings
@@ -181,9 +182,51 @@ tie-breaking. Consequences:
   *reflecting* upper face the exchange derives the wall points instead
   of the hook (see [Ghost filling](#ghost-filling)), and the
   asymmetry remains: the low wall evolves, the high one interpolates.
-  Accepted: treating both boundary planes alike would have the lowest
-  blocks own `N − 1` points in that dimension and the uniform state
-  layout would be gone.
+  Accepted as the default: treating both boundary planes alike *in the
+  ownership* would have the lowest blocks own `N − 1` points in that
+  dimension and the uniform state layout would be gone.
+- **Symmetric walls** (`FieldSet(…; walls = :symmetric)`, TreeGRRMHD's
+  AMR-8) remove the asymmetry without touching ownership: the low wall
+  plane stays owned and in the state vector, and the fill writes it, by
+  the rule the high wall gets at a high face of that kind — the hook at
+  an outer face (the low region becomes `1 … G+1`), the derivation at a
+  reflecting one (a mirrored wall stencil reading `G+2 …`), the clamp at
+  an outflow one (from the nearest evolved point, `G+2`). A closed box is
+  then mirror-symmetric; under half-open walls it is not, by an error of
+  the scheme's order (1.3e−4 in a 16³ blast after three steps, measured
+  by TreeGRRMHD). The set opts in because the fill then writes owned
+  points, which an application must expect: it gathers the filled wall
+  into its state after the fill if it wants it there. Per field set,
+  since it is a property of what the set stores, and carried by the
+  schedule as `G` and the centering are; a schedule built for the other
+  kind is refused. A cell-like dimension has no wall plane.
+  *How.* For a block whose low face along a vertex-like dimension is a
+  domain face — one with no block across it, so outer, reflecting or
+  outflow, never periodic nor a rotating seam — the low region along it
+  is `1 : G+1` and the block's own range `G+2 : G+N`, the halved low
+  half included: the mirror image of the high side, where the wall is
+  the first plane of the high region. Widening the low region alone would
+  not do: the tangential regions of the other directions also cover
+  `G+1`, so two regions would write it in one phase, and a phase-1 copy
+  would read it while it is written. With the trim, copies and
+  restrictions read only `G+2 …` there, as they read only up to `G+N` on
+  the high side. The trimmed ranges differ from an interior block's with
+  the same direction and offset, so `GroupKey` carries a per-dimension
+  `low` flag, and it is part of the key's order, which is the message
+  layout's. `regrid!` is untouched: its targets are owned ranges, and the
+  wall is state. *Symmetric to what.* On a uniform mesh the fill is
+  mirror-symmetric bit for bit, except where two derived walls meet in a
+  corner (two reflecting vertex-like dimensions), whose four-term stencil
+  the two corners sum in mirrored order, to rounding. On a mesh refined
+  somewhere a vertex-like set is not mirror-symmetric under either kind
+  of wall, and AMR-8 does not change that: a plane on a coarse-fine face
+  is the fine block's owned plane when the face is its low face, and the
+  coarse block's, interpolated at the fine points between the coarse
+  ones, when it is its high face (4.7 × 10⁻⁵ on a refined unit-spacing
+  box with the point-symmetric data of `test/walls_tests.jl`; cell-
+  centered sets are symmetric to rounding there). **(open)** Whether
+  that half-open asymmetry at coarse-fine faces matters to an application
+  is not settled; nothing has asked.
 
 **Stored layout.** Per dimension `d`, with `c_d = 1` for `:vertex` and
 `0` for `:cell`, a field set with ghost width `G_d` stores `N + 2G_d +
@@ -568,7 +611,8 @@ declared up front:
   rotating seam): ghost cells are filled by a user-supplied boundary
   condition hook. For a vertex-like dimension the domain's upper boundary plane
   is the first plane of an outward-facing region and is filled by the
-  hook too (see [Centerings](#centerings)).
+  hook too, and under symmetric walls the owned lower one the last plane
+  of the low region (see [Centerings](#centerings)).
 
 ### Data layout
 
@@ -727,6 +771,40 @@ may therefore read its block's interior (as extrapolating conditions
 do) but not other blocks' ghosts, and not ghosts that prolongation has
 yet to fill.
 
+**The relative hook** (`CellBoundary(Relative(f))`, TreeGRRMHD's AMR-7)
+reads the block's own data and so has to run later in places. A ghost
+becomes `f(x_g) + (u(x_r) − f(x_r))`, `x_r` the nearest evolved point:
+clamped onto the block along each component of the region's direction
+that leaves the domain through an outer face (`G + N`, `G + 1`, or
+`G + 2` under symmetric walls), and the ghost's own index along every
+other one. In a corner region beyond an outer face along one dimension
+and across a block face along another, `x_r` is therefore the block's
+own ghost across that face, which a transfer fills — not the block's
+last column, which made a point two blocks share depend on which block
+filled it (7.1 × 10⁻⁶ of mirror symmetry lost in a closed 32² box, and two
+blocks computing different fluxes at their common face, measured by
+TreeGRRMHD with a region-form hook). Those ghosts are filled at phase 1
+— a copy, a restriction, a mirror or a clamp — or, from a coarser
+neighbour, by the prolongations onto the block's level. So each hook
+region records the stage it waits for (`BoundaryRegion`'s `slot`, found
+by the same neighbour search, `boundary_region`) and the clamped
+indices (`clamps`), and the plan batches the regions by slot as well as
+shape; `exchange_ghosts!` runs the relative hook's phase-1 batches where
+every hook runs and the others after their stage
+(`boundary_after_stage!`), every other hook form all at once after
+phase 1, bit for bit as before. Running the corner rows after *all* the
+prolongations, as first asked for, would starve a reader: a finer
+block's prolongation reads a coarse block's corner ghosts beyond the
+outer face in the stage after the coarse block's level, so the corner
+must be filled by then; under 2:1 balance it is, since its own source
+is at most one level coarser. `x_r` never lies in a region the same
+launch writes — an evolved point, or a ghost transfers filled — so the
+kernel reads `work` where it writes it without a race. Every fill
+applies the whole condition, `regrid!`'s and `adapt_to_initial_data!`'s
+included, since they go through the same exchange: one fill is the
+condition's fixed point, which the tests check on NaN-prefilled data,
+where the same hook run after phase 1 alone leaves ghosts undefined.
+
 **Reflecting faces** are transfers, not hook calls. A ghost region
 in direction `δ` that crosses reflecting faces in the dimensions of a
 mask `m` is the mirror image of a region that lies inside the domain.
@@ -782,7 +860,9 @@ the tangential stencil's row at the nearest owned row,
 
 over the whole ghost slab, which on the high side of a vertex-like
 dimension includes the unowned wall row `G + N + 1`: it is a ghost like
-the rows beyond it, and is clamped like them. The source search, the
+the rows beyond it, and is clamped like them. Under symmetric walls the
+low side is the mirror of that: the slab includes the owned wall row
+`G + 1`, and every row of it takes `G + 2`. The source search, the
 wall-side children of a restriction and the phasing are the
 reflecting face's, unchanged — `wall_direction` returns the kind of
 each wall a direction crosses, `mirror_sources!` records a clamped
@@ -811,12 +891,16 @@ the same whatever kind the transfer is, and it reads the source's own
 points beside the wall. A coarser source's points are further apart,
 `O(H^p)`, as prolongation's are. The row is its own batch, because its
 parity factor is `(1 + s)/2` where the mirrored rows' is `s`. The low
-wall point is owned and evolved, as on any face. So a vertex-centered
-reflecting box is not symmetric under exchanging its two walls: the low
-wall evolves, the high one interpolates. Nor is an odd variable's low
-wall point forced to zero. It stays zero if the right-hand side respects
-the parity, as a centered stencil does, since the mirrored ghosts give
-`u(−h) = −u(h)` exactly.
+wall point is owned and evolved, as on any face, unless the set has
+symmetric walls. So a half-open vertex-centered reflecting box is not
+symmetric under exchanging its two walls: the low wall evolves, the high
+one interpolates. Nor is an odd variable's low wall point forced to zero.
+It stays zero if the right-hand side respects the parity, as a centered
+stencil does, since the mirrored ghosts give `u(−h) = −u(h)` exactly.
+Under symmetric walls (AMR-8) the low wall row is derived as the high one
+is, from `G + 2 … G + 1 + p/2` with the same weights in mirrored order
+(`wall_stencil(…; low = true)`), mirror state 2 on the low side; an odd
+variable's low wall is then zero, and the box is symmetric.
 
 **Rotating seams.**
 A rotating seam (see [Domain and boundaries](#domain-and-boundaries))
@@ -997,8 +1081,8 @@ its own image and is owned once, by the blocks along it. A sum
 over owned points, such as `volume_weighted_norm`, holds the seam's
 points once per face, so it is not exactly a quarter of the full
 domain's. A vertex-like set carries no conserved total (the
-conservative family is refused along a stagger), so this is recorded
-rather than corrected. The choice is about ownership only and assumes
+conservative family takes point values along a stagger), so this is
+recorded rather than corrected. The choice is about ownership only and assumes
 nothing about aligned axes.
 
 *Asymmetric layouts, and pairs*. The virtual frame needs the rotated source to have the target's
@@ -1385,8 +1469,9 @@ overshoots a discontinuity by an eighth of the jump, so across a shock,
 or a stellar surface where the density drops by orders of magnitude, a
 fine ghost or a child the regrid makes can leave the range of the data
 around it — a density below the atmosphere, or negative. Order 1 does
-not, but costs the interface its order. `Operators(…; bounded = true)`,
-allowed only with `Conservative` at `prolongation = 3` or `1`, bounds it.
+not, but costs the interface its order. `Operators(…; bounded = true)`
+bounds it; with `Conservative` it is allowed at `prolongation = 3` or `1`
+(the point-value family's bound is "Bounded point values" below).
 At order 1 there is nothing to do — a child is a copy of its parent — and
 the flag is accepted only so that an application can switch between the
 two orders without touching it; the schedule then builds the ordinary
@@ -1444,11 +1529,11 @@ plain average, a convex combination, so the coarse ghosts stay bounded
 too, where an order-4 point-value restriction has negative weights.
 
 It enters the one transfer kernel rather than a kernel of its own. A
-`TransferGroup` carries a `bounded` flag, set only on a prolongation
-built from bounded order-3 operators (`boundedkernel`): the schedule's
-local groups, its packs —
+`TransferGroup` carries a `bounded` mode, `BOUNDED_CONSERVATIVE` only on
+a prolongation built from bounded order-3 operators (`boundedmode`): the
+schedule's local groups, its packs —
 the sender computes, so the pack bounds and the unpack stays a copy —
-and the regrid's groups. The flag reaches `transfer_kernel!` as a `Val`,
+and the regrid's groups. The mode reaches `transfer_kernel!` as a `Val`,
 in the same run-time dispatch the stencil orders already go through, so
 a bounded kernel is compiled only where one runs, and the unbounded path
 is the code it was. The bounded sum reads the parent at the centre of
@@ -1502,6 +1587,55 @@ error is within 3 % of the unbounded one's. These are conserved
 variables; prolongating primitives, as TreeGRRMHD will, has yet to be
 measured.
 
+**Bounded point values.** TreeGRRMHD prolongates its primitive variables
+in the ghost fill and builds the conserved ghosts from them, keeping the
+conservative family for the regrid of the conserved variables (its
+AMR-10). The primitives are point values, and the order-`p` Lagrange
+interpolant overshoots a surface as the conservative reconstruction does.
+So `bounded = true` is allowed with `PointValue` at any order, and keeps
+every value it interpolates within `[m, M]`, the extremes of the `2^D`
+source points that enclose it — its *bracket*, the points multilinear
+interpolation reads (one point along a dimension where the target
+coincides with a source point). Asked for as `u_lin + φ(u_w − u_lin)`,
+with `u_w` the order-`p` value, `u_lin` the multilinear one and `φ ∈
+[0, 1]` the largest that stays in range, it is simply `u_w` clamped to
+`[m, M]`, because `u_lin` lies in that range; that is how it is computed.
+Linear data are reproduced, monotone data stay monotone, and where no
+clamp acts the value is the unbounded one, bit for bit (but for `-0`), so
+smooth monotone data keep order `p`. At a smooth extremum the clamp cuts
+the order to first locally, as any bound must. The bound applies to
+every operator that interpolates: the prolongation, in the fill and the
+regrid; the restriction along a cell-like dimension at `restriction > 2`
+(at 2 it is the average, a convex combination, and along a vertex-like
+dimension it is injection), in the fill and in the regrid's coarsening;
+and the derived wall row of a reflecting vertex-like dimension, which is
+interpolated at the prolongation order whatever kind of transfer fills it.
+The wall row's bracket is the point beside the wall and its mirror image,
+so a bounded wall of an even variable is that point: a surface at the wall
+stays positive where `(4u₁ − u₂)/3` goes negative. Width 2 is bounded
+already and takes the plain kernel, as conservative order 1 does
+(`boundedmode`), so an application can switch orders without touching
+the flag.
+
+The bracket's position in the window varies by column — a shifted
+restriction window, a prolongation window clamped near the stored edge —
+so it cannot be read off the order-`p` weights. Each stencil of a bounded
+point-value group (`BOUNDED_POINTVALUE`) therefore stacks the
+multilinear weights below its own, over the same window (`stack_linear`):
+rows `1:p` and `p+1:2p` of one weight matrix. The bracket always lies
+inside the window — `p` consecutive integer nodes containing the target
+contain the integers either side of it — so the second set needs no
+window of its own, and everything that remaps target rows (mirrors,
+clamps, packs) moves whole columns and carries both. The kernel
+(`bracket_clamp_sum`) forms the order-`p` sum exactly as `stencil_sum`
+does and, beside it, the extremes of the points whose multilinear weight
+is nonzero in every dimension, then clamps; `run_group!` halves the row
+count to get the order. A `NaN` source stays visible through `min`, `max`
+and `clamp`, and the result carries `0 · (M − m)` as the conservative
+bound's does. Admissibility stays the application's, as above: the bound
+keeps each primitive within its bracket, which is what keeps a density
+positive and an electron fraction inside the table.
+
 There is **no default order**: the
 right order depends on the application's differencing order via the
 interface-order rule below, which the mesh library cannot know, so
@@ -1509,7 +1643,7 @@ interface-order rule below, which the mesh library cannot know, so
 `G`; the package verifies at construction that `N`, `G`, and the
 requested operator orders satisfy the invariants listed under
 [Blocks](#blocks). Physics stays out of the operators: the bounded
-prolongation above keeps values within their neighbours' range, which
+operators above keep values within their neighbours' range, which
 needs nothing but the values, while admissibility — and the choice of
 which variables to prolongate — is the application's (see "Where the
 mesh stops" above).
@@ -1656,7 +1790,7 @@ against that dimension's `G_d`:
 | cell | `PointValue` | shifted Lagrange, even `p` | Lagrange at quarter offsets, even `p` | `G ≥ p/2`, `N ≥ 2G + p/2 − 1`, `N ≥ p` |
 | cell | `Conservative` | 2-cell average | subcell averages of the reconstruction, odd `p` | `G ≥ (p−1)/2` |
 | vertex | `PointValue` | injection | Lagrange at integers / half-integers, even `p` | `G ≥ p/2 − 1` |
-| vertex | `Conservative` | *refused* | *refused* | — |
+| vertex | `Conservative` | injection | Lagrange at integers / half-integers, even `vertex_prolongation` | `G ≥ vertex_prolongation/2 − 1` |
 
 The first two rows are the cell-centered ones; the third follows from
 [Ghost filling](#ghost-filling) and is measured twice — as exactness to
@@ -1664,18 +1798,44 @@ degree `p − 1` and no further, over all `2^D` centerings in `D = 1, 2, 3`
 at `p = 2` and `p = 4`, with `G = p/2 − 1` accepted where `G = p/2 − 2`
 is refused; and as the convergence rate of an application
 that reads those ghosts, in the vertex-centered wave table under
-[the interface-order rule](#operators) above. The last row
-is deliberately empty. What a face- or
-edge-centered quantity stores is an *average* along its cell-like
-dimensions and a *point value* along its vertex-like ones, so along a
-vertex dimension the conservative family has nothing to conserve and
-would merely interpolate — at an even order that the family's odd `p`
-does not name (`p + 1` was the candidate). Rather than
-fix that rule before anything exercises it, `GhostSchedule` refuses a
-conservative field set with a vertex-like dimension, with a message
-saying why. Nothing needs it: fluxes and EMFs are never
-ghost-filled or transferred, and constrained-transport `B` needs a
-divergence-preserving operator that is not a tensor product in any case.
+[the interface-order rule](#operators) above.
+
+**Staggered conservative sets.** What a face- or edge-centered quantity
+stores is an *average* along its cell-like dimensions and a *point
+value* along its vertex-like ones: a magnetic flux through a face
+divided by its area, a vector potential's line integral along an edge
+divided by its length. So the conservative family on such a set is the
+tensor product of the two rules, the last row: conservative along the
+cell-like dimensions, point values along the vertex-like ones, at an
+even width that the family's odd `prolongation` does not name, so it is
+a keyword of its own, `vertex_prolongation`, required — with no default,
+as for every order — wherever a conservative set has a vertex-like
+dimension, and refused without it. The restriction needs nothing new:
+the point-value builder at width 2 is already the two-cell average along
+a cell-like dimension and injection along a vertex-like one, and the
+prolongation chooses its builder per dimension in `prolongation_stencil`,
+the one place both the schedule and the regrid take it from. A coarse
+edge's line integral is then the sum of its two fine edges' after a
+restriction (the average), a prolongation (subcell averages along the
+edge, which average to it) and so a ghost fill and a regrid; the fine
+edges strictly inside a coarse face cancel in its circulation, so the
+circulation around a coarse face is the sum around its fine faces, and
+with `B = curl A` the flux through it the sum of theirs. A face set's
+flux is conserved the same way. The point-value family interpolates along
+the edge instead, which is what TreeGRRMHD measured as a drift of the
+flux across levels (its AMR-9): 5.8 × 10⁻⁴ of its scale in an eighth of
+a period of an oblique Alfvén wave on a two-level box, against
+5 × 10⁻¹⁷ uniformly. The tests check the stronger per-edge statement,
+on data with no structure, with the point-value family as the negative
+control (`test/staggered_conservative_tests.jl`). A cell-centered set
+ignores the keyword, bit for bit. `bounded = true` is not implemented
+together with it: the bounded conservative kernel assumes an order-3
+cell stencil in every dimension, and nothing needs the combination yet.
+Fluxes and EMFs are still never ghost-filled or transferred, and
+constrained-transport `B` evolved as a face set still needs a
+divergence-preserving prolongation that is not a tensor product; an edge
+potential `A`, transferred conservatively, gives `B = curl A`
+divergence-free by construction.
 
 ### Conservation at coarse-fine faces
 
@@ -2859,16 +3019,15 @@ entries per volume.
     of these, and it reproduces the old host loop *bit for bit*: the
     kernel forms the position from the same per-block origin and spacing
     `cell_center` uses, so M5's thread-independence digests did not
-    move. The region form is kept and is still what a condition reading
-    the block's interior needs — extrapolating outflow — and
-    is CPU-only, which it says if handed a device field set. That
-    limitation is real and is not papered over: outer boundaries that
-    read their own interior are a CPU-only capability until the cell
-    form grows an interior accessor. Reflection is not among them: it
-    is a property of the domain and a transfer in
+    move. The region form is kept and is still what an arbitrary
+    condition reading the block's interior needs, and is CPU-only,
+    which it says if handed a device field set. Reflection is not among
+    those conditions: it is a property of the domain and a transfer in
     the schedule, so it runs on every backend; see
-    [Ghost filling](#ghost-filling). Extrapolating outflow, and anything
-    else that reads the interior, is what remains CPU-only.
+    [Ghost filling](#ghost-filling). Neither is zero-gradient outflow,
+    an outflow face since AMR-6, nor a condition relative to the nearest
+    evolved point, `Relative` since AMR-7, a kernel on every backend.
+    What remains CPU-only is anything else that reads the interior.
   - The **flagging function** received `(b, key)` and no data, so an
     application closed over its field set and read it on the host.
     `firing_boxes(fires, fs)` is the device form: `fires(work, idx, b, x)`
@@ -4152,7 +4311,9 @@ The ideas that span several files and are easy to violate:
   prolongation may read its coarse source's *own ghosts*, which an earlier
   sweep filled. The hook runs *between* the phases, not last: prolongation
   stencils at a domain edge reach tangentially into the source's outer
-  ghosts.
+  ghosts. The relative hook's regions that read prolongated ghosts run
+  after the stage that fills them, not with the others ("Ghost
+  filling").
 - **Reflecting and outflow faces are transfers, not hooks** (M10). The
   kind of each face is a property of the `Forest` (`faces`, read
   through `reflecting_faces`, `outflow_faces` and `facekind`), `parity` a
@@ -4437,7 +4598,9 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   keywords;
 - the fields it reads: of a `Forest`, `N`, `roots`, `periodic`,
   `extents`, `leaves` and `comm`; of a `FieldSet`,
-  `work`, `nvars`, `G`, `centering`, `parity`, `rotation` and `forest`;
+  `work`, `nvars`, `G`, `centering`, `walls`, `parity`, `rotation` and
+  `forest` (`walls` since AMR-8: a checkpoint saves it, and a restart
+  rebuilds the set with it);
   of a `MortonKey`, `root`, `level` and `coords`.
 
 Beside these it uses the validated `leaves` keyword of `Forest`, which
@@ -4736,10 +4899,6 @@ Remaining, none blocking before their milestone:
   evaluations — went with the two-launch reduction: the norm is 7 % of
   an RHS evaluation on Metal and 10 % on the H200, measured under
   [Parallelism](#parallelism).
-- The one-dimensional operators of the conservative family along a
-  vertex-like dimension: refused until an application needs them, with
-  order-`(p+1)` Lagrange as the recorded candidate (see
-  [Operators](#operators)).
 - **Higher-order outflow.** An outflow face repeats the nearest owned
   row, which is first order at the face (see
   [Domain and boundaries](#domain-and-boundaries)). Linear or quadratic

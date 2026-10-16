@@ -164,6 +164,25 @@ with this field set must be built for the same backend. On a device with
 no hardware fp64 a `Float64` field set is rejected here, with a message,
 rather than failing later inside a kernel compilation.
 
+`walls` says how a vertex-like dimension's two wall planes are filled at
+the domain's non-periodic faces (TreeGRRMHD's AMR-8). Ownership is
+half-open, so along a vertex-like dimension the domain's *high* wall plane
+`G+N+1` belongs to nobody and the fill derives it — by the boundary hook
+at an outer face, by the reflection at a reflecting one, by the clamp at
+an outflow one — while the *low* wall `G+1` is owned and evolved. With
+`walls = :half_open`, the default, that is what happens. With
+`walls = :symmetric` the fill also writes the owned low wall plane of
+every vertex-like dimension at a low domain face, by the rule the high
+wall gets at a high face of that kind: the hook's low region becomes
+`1 … G+1`, a reflecting face derives the wall as the high one is derived,
+and an outflow face clamps it with the ghosts beyond it from the nearest
+evolved point `G+2`. A closed box is then mirror-symmetric, which it is
+not under half-open walls. The wall stays an owned point — the state
+vector does not change — so an application that wants the filled value in
+its state gathers it after the fill. A cell-like dimension has no wall
+plane and is unaffected. See "Shared points and half-open ownership"
+under "Centerings" in `CODE.md`.
+
 `parity` gives each variable its [`Parity`](@ref) under a mirror, and
 is **required** when the forest has a reflecting face (M10): whether a
 variable changes sign in a mirror is physics, which the mesh cannot
@@ -199,6 +218,8 @@ block slots and rebuilds the storage.
     FieldSet(forest, nvars; G)          # element type = floattype(forest)
     FieldSet{Float32}(forest, nvars; G = (2, 0))
     FieldSet(forest, nvars; G = 0, centering = facecentered(3, 1))
+    FieldSet(forest, nvars; G = 1, centering = edgecentered(3, 1),
+             walls = :symmetric)
     FieldSet{Float32}(forest, nvars; G = 2, backend = CUDABackend())
     FieldSet(octant, 4; G = 2,          # ρ, and a vector (vx, vy, vz)
              parity = [EvenParity, (OddParity, EvenParity, EvenParity),
@@ -230,6 +251,9 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const nvars::Int
     const G::NTuple{D,Int}
     const centering::NTuple{D,Symbol}
+    # `:half_open` or `:symmetric`: whether the fill also writes the
+    # owned low wall plane of a vertex-like dimension (AMR-8).
+    const walls::Symbol
     const parity::Union{Nothing,Vector{NTuple{D,Parity}}}
     # The signed variable map of a rotating seam (M12), as checked by
     # `rotations_of`; `nothing` when none was given.
@@ -262,9 +286,10 @@ end
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D),
-                     parity=nothing, rotation=nothing,
+                     parity=nothing, rotation=nothing, walls::Symbol=:half_open,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
+    check_walls(walls)
     G === nothing && throw(ArgumentError(
         "FieldSet has no default ghost width: pass `G` explicitly. It follows " *
         "from what this field set stores and from the operator orders that read " *
@@ -294,13 +319,19 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
-    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, parities,
-                                        rotations, factors, rotvars, work)
+    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, walls,
+                                        parities, rotations, factors, rotvars, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
 
 staggers(fs::FieldSet) = staggers(fs.centering)
+
+check_walls(walls::Symbol) =
+    walls === :half_open || walls === :symmetric || throw(ArgumentError(
+        "walls must be :half_open (the owned low wall plane of a vertex-like " *
+        "dimension is evolved, the high one filled) or :symmetric (both are " *
+        "filled at the domain's faces), got :$walls"))
 
 # Validate a user-supplied `parity` into one `NTuple{D,Parity}` per
 # variable — the same shape `ghostwidths` gives `G` — against the faces
@@ -571,6 +602,10 @@ function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
         "turns into another, and each fills its ghosts alone"))
     d1, d2 = rotating_dims(forest)
     swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
+    a.walls === b.walls || throw(ArgumentError(
+        "the two sets of a RotationPair must fill their walls alike, since each " *
+        "reads the other's points beside them: got walls = :$(a.walls) and " *
+        ":$(b.walls)"))
     (a.G == swap(b.G) && a.centering == swap(b.centering)) || throw(ArgumentError(
         "the two sets of a RotationPair must have each other's layout with the " *
         "seam's dimensions $d1 and $d2 exchanged, since a quarter turn of one is the " *

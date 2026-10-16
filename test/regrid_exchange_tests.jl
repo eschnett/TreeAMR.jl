@@ -180,6 +180,9 @@ end
         same, _, bad, _, _, _ = lockstep_regrid(serial, 3, cellcentered(D), Conservative,
                                                 Float64; bounded=true)
         @test same && bad == 0
+        same, _, bad, _, _, _ = lockstep_regrid(serial, 3, cellcentered(D), PointValue,
+                                                Float64; bounded=true)
+        @test same && bad == 0
     end
     @test ncross > 0
     @test nstraddling > 0
