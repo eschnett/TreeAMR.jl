@@ -4733,10 +4733,9 @@ by 2 %. CI gains nothing from such a change in any case, since
 
 **CI and coverage.** `julia-actions/julia-runtest` defaults `coverage`
 to `true`; CI.yml ties coverage to `threads == 1`, which keeps
-it on the four cheap cells (both operating systems, both Julia
-versions, merged by Codecov) and drops it from the expensive threaded
-ones. Instrumentation cost **2.61x** locally
-(measured: 3m23.6s → 8m51.8s, 88819 tests, 4 threads both times) —
+it on the two cheap cells (both operating systems, merged by Codecov)
+and drops it from the expensive threaded ones. Instrumentation cost
+**2.61x** locally (measured: 3m23.6s → 8m51.8s, 88819 tests, 4 threads both times) —
 though that is not the CI factor, because the action also defaults
 `check_bounds` to `yes` and a plain `Pkg.test` no longer does.
 `Base.julia_cmd()` forwards `--code-coverage` to the subprocesses the

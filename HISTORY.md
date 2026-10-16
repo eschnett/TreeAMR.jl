@@ -3568,7 +3568,11 @@ raised to 1.11 for 0.1.3 (2026-09-25) across all the Tree* packages, so
 that unregistered dependencies can be located with `[sources]` entries,
 a 1.11 key. The procedure for checking a test on 1.11 in a copy without
 manifests was worked out, and measured at 97744 tests in ~2m55 after M10,
-on 1.10.
+on 1.10. Erik raised the floor to 1.13 for 0.2.3 (2026-10-16), again
+across all the Tree* packages (TreeGRRMHD had gone there the day
+before): supporting the older versions slowed development and was of no
+use at the moment. CI went to 1.13 alone, on Linux and arm64 macOS, and
+the 1.11 procedure left `CLAUDE.md`.
 
 **Coverage.** `julia-actions/julia-runtest` defaults `coverage` to
 `true`, so until the Codecov upload was added *every* CI cell was paying
@@ -3603,6 +3607,8 @@ moved the checkpoints out into the companion package TreeIOHDF5, an API
 break. 0.2.1 (2026-10-14) carried TreeGRRMHD's mesh requests — the
 multi-set state vector, `map_blocks!`'s `workgroupsize`, per-set
 boundary hooks in `regrid!`, the multi-set `adapt_to_initial_data!`,
-outflow faces and the bounded prolongation — and is the current
-release. The repository keeps no changelog; the release commit says what
+outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
+TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
+staggered sets, symmetric walls and the relative boundary hook — and
+0.2.3 (2026-10-16) raised the Julia floor to 1.13. The repository keeps no changelog; the release commit says what
 changed.

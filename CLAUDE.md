@@ -118,8 +118,8 @@ julia --project=test -e 'using Test, Random, TreeAMR; include("test/oracles.jl")
 The MPI tests (M7) are part of `Pkg.test`: `test/mpi_tests.jl` launches
 `test/mpi_workload.jl` under `MPI.mpiexec()` — the launcher of the MPI
 binary MPIPreferences selects for the load path: MPICH_jll by default
-(CI, Julia 1.11 here), MPIABI_jll on Julia 1.13 here, which a
-`LocalPreferences.toml` in the global v1.13 environment selects — with
+(CI), MPIABI_jll here, which a `LocalPreferences.toml` in the global
+v1.13 environment selects — with
 `setenv(cmd, mpiexec().env)`, since interpolating `mpiexec()` into a
 larger command drops its library paths. On its own (it needs no helper
 file; about 2 min here, where both jobs start beside the serial
@@ -180,21 +180,6 @@ julia --project=docs -e 'using Pkg; Pkg.instantiate()'
 
 ```bash
 julia --project=docs docs/make.jl
-```
-
-Julia 1.11, the floor. `juliaup` has 1.11 installed, but checking a
-suspect test on it is not simply `Pkg.test()` in this checkout: an older
-Julia may not read a `Manifest.toml` a newer one resolved (on 1.11.9
-`Pkg.test()` died with "can not merge projects" whenever
-`test/Manifest.toml` existed). Copy the tree without any manifest and
-run the test file directly (the whole suite takes about 8 min there):
-
-```bash
-rm -rf /tmp/amr111 && mkdir /tmp/amr111 && tar -cf - --exclude=Manifest.toml --exclude=.git --exclude=.claude . | tar -xf - -C /tmp/amr111
-```
-
-```bash
-cd /tmp/amr111 && julia +1.11 --project=test -e 'using Pkg; Pkg.instantiate()' && julia +1.11 --project=test test/runtests.jl
 ```
 
 Downstream checks. Before tagging a release that touches the API, run
@@ -377,7 +362,7 @@ the one that says why.
   `stored = true`, and still in bounds ("Index conventions").
 - **A seeded RNG stream can differ across Julia versions**, so a test
   whose *assertions* depend on a particular random draw can pass locally
-  and fail on the floor: use a seeded RNG for the inputs, but make what
+  and fail on the next Julia release: use a seeded RNG for the inputs, but make what
   the test asserts follow deterministically from the setup.
 - **Mesh machinery belongs here; physics belongs downstream.** If a
   downstream change turns out to be about trees, ghosts, or
@@ -424,14 +409,14 @@ the one that says why.
   file says why. All three downstreams bound TreeAMR by `[compat]` over
   the `0.1` series, so a `0.1.x` release lands on their next resolve, and
   an API break has to go to `0.2`.
-- CI (`.github/workflows/CI.yml`) tests on Julia **1.11** and latest, on
-  Linux and macOS. `Project.toml` says `julia = "1.11"`, so no 1.12+
-  features. Your local Julia is newer.
+- CI (`.github/workflows/CI.yml`) tests on Julia **1.13** only, on Linux
+  and macOS (arm64). `Project.toml` says `julia = "1.13"`, the floor of
+  every Tree* package, so 1.13 features are fine and no 1.14 ones.
 - The `[sources]` entries in `test/Project.toml` and `docs/Project.toml`
-  are committed and meant to be (a 1.11 key, the reason for the floor).
-  Do not `Pkg.develop` TreeAMR into either any more: that is what they
-  replace. IMEXRungeKutta is taken from `main`, so its next push reaches
-  the next resolve here; `Pkg.update` in `test/` picks it up locally.
+  are committed and meant to be. Do not `Pkg.develop` TreeAMR into
+  either any more: that is what they replace. IMEXRungeKutta is taken
+  from `main`, so its next push reaches the next resolve here;
+  `Pkg.update` in `test/` picks it up locally.
 - All `Manifest.toml` files (root, `test/`, `docs/`) and `docs/build/` are
   gitignored.
 - `.claude/worktrees/` holds a leftover git worktree from an earlier session.
