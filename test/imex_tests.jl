@@ -1,8 +1,8 @@
 # TreeAMR under IMEXRungeKutta's explicit tableaus (M3 and M8b through a
 # second integrator). IMEXRungeKutta is not in the General registry;
-# `test/Project.toml` locates it by `[sources]`, which is why the floor
-# is Julia 1.11. The by-owner checks need more than one thread to say
-# anything, so run the suite threaded too (see CLAUDE.md, "Commands").
+# `test/Project.toml` locates it by `[sources]`. The by-owner checks need
+# more than one thread to say anything, so run the suite threaded too
+# (see CLAUDE.md, "Commands").
 #
 # What it claims (see "Open questions" in `CODE.md`): the stage
 # arithmetic can run by owner with the partition TreeAMR's block

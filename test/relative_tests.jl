@@ -195,12 +195,10 @@ end
     hookat(t) = CellBoundary(Relative(x -> sin(x[1] - t)))
     @test typeof(hookat(0.1)) === typeof(hookat(0.2))
     fill_ghosts!(one, sched; boundary=hookat(0.1))
-    if isdefined(Base, :cumulative_compile_timing)
-        Base.cumulative_compile_timing(true)
-        before = Base.cumulative_compile_time_ns()[1]
-        fill_ghosts!(one, sched; boundary=hookat(0.2))
-        after = Base.cumulative_compile_time_ns()[1]
-        Base.cumulative_compile_timing(false)
-        @test after == before
-    end
+    Base.cumulative_compile_timing(true)
+    before = Base.cumulative_compile_time_ns()[1]
+    fill_ghosts!(one, sched; boundary=hookat(0.2))
+    after = Base.cumulative_compile_time_ns()[1]
+    Base.cumulative_compile_timing(false)
+    @test after == before
 end

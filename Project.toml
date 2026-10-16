@@ -1,6 +1,6 @@
 name = "TreeAMR"
 uuid = "91bc416d-811c-44c1-9bc4-b9c8bbdbbd08"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
@@ -15,4 +15,4 @@ TreeAMRMPIExt = "MPI"
 [compat]
 KernelAbstractions = "0.9.42, 1"
 MPI = "0.20"
-julia = "1.11"
+julia = "1.13"
