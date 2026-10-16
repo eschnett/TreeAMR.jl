@@ -1,11 +1,20 @@
 # TreeAMR.jl
 
-TreeAMR.jl implements a tree-based (octree-style) AMR discretization
-for Julia. It provides mesh, storage, and inter-grid operations.
+TreeAMR.jl implements a tree-based (octree-style) adaptive mesh
+refinement (AMR) discretization for Julia. It provides mesh, storage,
+and inter-grid operations.
 
 [![CI](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eschnett/TreeAMR.jl/actions/workflows/CI.yml)
 [![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://eschnett.github.io/TreeAMR.jl/dev)
 [![codecov](https://codecov.io/gh/eschnett/TreeAMR.jl/graph/badge.svg?token=IHXP23WQ1H)](https://codecov.io/gh/eschnett/TreeAMR.jl)
+
+[Partial differential equations
+(PDEs)](https://en.wikipedia.org/wiki/Partial_differential_equation)
+are often discretized on a spatial mesh. This package provides such a
+mesh, consisting of squares (in 2d) or cubes (in 3d). In regions where
+the solution requires a higher resolution,
+[AMR](https://en.wikipedia.org/wiki/Adaptive_mesh_refinement) replaces
+the mesh with a set of finer meshes.
 
 See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
 for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
