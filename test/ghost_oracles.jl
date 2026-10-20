@@ -653,8 +653,8 @@ deviation of any stored value from the data.
 never writes stays `NaN`; one it writes from a ghost that has not been
 written yet becomes `NaN`, since `NaN` survives any finite combination.
 (Along a dimension where a target's column has a single nonzero weight,
-the fill reads only that source, so there an unwritten ghost shows only
-if the value depends on it.) A zero-initialized field set shows
+the CPU's shaped fill reads only that source, so there an unwritten ghost
+shows only if the value depends on it.) A zero-initialized field set shows
 neither: a stale zero is just a wrong number, and may even be the right
 one.
 """

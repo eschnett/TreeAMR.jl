@@ -517,14 +517,26 @@ function awkward_fill!(work::AbstractArray{T}) where {T}
     return work
 end
 
+# A group with every column's `single` row cleared: the same transfer,
+# computed as the full tensor-product sum over every weight.
+function full_sum(g::TreeAMR.TransferGroup{T,D}) where {T,D}
+    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, s.unit,
+                                             zero(s.single)),
+                   g.stencils)
+    return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
+                                      g.factorcol, g.orientation, g.plane, g.bounded)
+end
+
 @testset "The flat launch and the copy path fill bit for bit: D=$D" for D in (1, 2, 3)
     # The device's form of the transfer launch (flat, the position from
     # inverses) runs on no device in CI, and the copy path skips the
     # weights: either one going wrong would show as a ghost that is
     # right to roundoff, or off by a sign of zero. Every group of a
     # schedule with copies, restrictions, prolongations, mirrored and
-    # turned transfers is run three ways from the same array, and the
-    # arrays must agree in every bit.
+    # turned transfers is run from the same array flat, shaped with the
+    # full sum the flat form takes (the data hold a `NaN` and an infinity,
+    # which the CPU's one-tap skip drops under a zero weight), and a copy
+    # also through its weights, and the arrays must agree in every bit.
     N = D == 3 ? 6 : 8
     setups = Any[]
     two = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
@@ -554,9 +566,8 @@ end
             end
             unit = all(s -> s.unit, g.stencils)
             nunit += unit
-            shaped = fillwith(g; flat=false)
-            @test fillwith(g; flat=true) == shaped
-            unit && @test fillwith(weighted(g); flat=false) == shaped
+            @test fillwith(g; flat=true) == fillwith(full_sum(g); flat=false)
+            unit && @test fillwith(weighted(g); flat=false) == fillwith(g; flat=false)
         end
     end
     @test nunit > 0                                # the copy path was taken
@@ -565,16 +576,6 @@ end
     wallsched = GhostSchedule(setups[3], ops)
     @test any(g -> g.kind === :copy && !all(s -> s.unit, g.stencils),
               wallsched.phase1)
-end
-
-# A group with every column's `single` row cleared: the same transfer,
-# computed as the full tensor-product sum over every weight.
-function full_sum(g::TreeAMR.TransferGroup{T,D}) where {T,D}
-    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, s.unit,
-                                             zero(s.single)),
-                   g.stencils)
-    return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
-                                      g.factorcol, g.orientation, g.plane, g.bounded)
 end
 
 # Finite data with what a dropped `±0` term could still change: signed
@@ -588,16 +589,18 @@ function finite_fill!(rng, work::AbstractArray{T}) where {T}
 end
 
 @testset "Skipping zero-weight taps fills bit for bit: D=$D" for D in (1, 2, 3)
-    # A column with one nonzero weight takes one tap along its dimension
-    # instead of the whole window. Got wrong — the wrong row, the row of
-    # a column a mirror, a clamp or a turn remapped, a product formed in
-    # another order — it shows as a ghost that is right to roundoff, or
-    # off by a sign of zero, and only along the vertex-like dimensions
-    # that have such columns. Every group of schedules over both
-    # centerings, both families, the prolongation orders, reflecting and
-    # outflow faces and a rotating seam is run with the skip and without
-    # it, shaped and flat, from the same finite data, and the arrays must
-    # agree in every bit.
+    # On the CPU a column with one nonzero weight takes one tap along its
+    # dimension instead of the whole window; a device, the flat launch,
+    # takes the full sum. Got wrong — the wrong row, the row of a column a
+    # mirror, a clamp or a turn remapped, a product formed in another
+    # order — it shows as a ghost that is right to roundoff, or off by a
+    # sign of zero, and only along the vertex-like dimensions that have
+    # such columns, and the CPU and a device would disagree. Every group
+    # of schedules over both centerings, both families, the prolongation
+    # orders, reflecting and outflow faces and a rotating seam is run with
+    # the skip (shaped) and without it (shaped with `single` cleared, and
+    # flat), from the same finite data, and the arrays must agree in every
+    # bit.
     rng = Xoshiro(20261019)
     N = 8
     kinds = ((:reflect_hi,), (:reflect_hi, :outflow_lo),

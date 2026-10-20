@@ -196,6 +196,8 @@ inferred.
 
 That the per-launch allocation is KernelAbstractions' corrected the downstream brief, which put it on `run_group!` reassembling the group's geometry. Four costs were named by the downstream profile; all four were real, one was diagnosed wrongly, and a fifth (bounds checking, not on the list) turned out to be the largest.
 
+The one-tap skip for a column with one nonzero weight first ran on every backend. Measured on Symmetry on 2026-10-19 on the downstream's nested mesh, it made each prolongation stage 3.7× faster on one EPYC thread but 2.27× slower on an H200, so the same day the flat launch, a device's, was made to take the full sum, and the CPU's shaped launch kept the skip; the numbers and the likely causes, which were not profiled, are in [CODE.md](CODE.md#what-the-ghost-fill-costs) ("A column with one nonzero weight takes one tap"). Both forms compute the same bits for finite data, so no result changed.
+
 ### The copy kernels on a device
 
 Measured and changed 2026-10-05; released as 0.1.8, 2026-10-06.

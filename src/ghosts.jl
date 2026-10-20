@@ -27,13 +27,24 @@
 # data at all — a G = 0 face field has none beyond its high face — and
 # `0 * NaN` is `NaN`.
 #
-# Within a width the zero weights are skipped too, where that is cheap to
-# know: a column with a single nonzero weight (`Stencil1D`'s `single`)
-# takes that one tap along its dimension instead of all `Ps[d]`. In
-# vertex-centered refinement every other fine point along a dimension
-# coincides with a coarse node, and its column is an exact one among
-# exact zeros, so a prolongation of order 6 averages 3.5 taps instead of
-# 6 along each dimension where its targets alternate.
+# Within a width the zero weights are skipped too on the CPU, where that
+# is cheap to know: a column with a single nonzero weight (`Stencil1D`'s
+# `single`) takes that one tap along its dimension instead of all
+# `Ps[d]`. In vertex-centered refinement every other fine point along a
+# dimension coincides with a coarse node, and its column is an exact one
+# among exact zeros, so a prolongation of order 6 averages 3.5 taps
+# instead of 6 along each dimension where its targets alternate.
+#
+# A device takes the full sum: the flat launch passes `singles =
+# nothing`, and for that type the nest below is generated without the
+# branches. There the skip made a prolongation stage slower, not faster
+# — 2.3 times on an H200, where one EPYC thread ran it 3.7 times faster
+# ("A column with one nonzero weight takes one tap" in CODE.md has the
+# numbers): neighbouring lanes along dimension 1 alternate between the
+# one tap and the loop, and the `2^D` bodies cost the unrolled nest its
+# registers.
+# Both forms compute the same bits for finite data, by the argument
+# below, so the choice by backend changes no result.
 #
 # The skip is exact for finite data. A skipped term is `0 · u`, which is
 # `±0`. The accumulator starts at `+0`, and in round-to-nearest a sum is
@@ -48,10 +59,11 @@
 # nest with literal trip counts instead of iterating
 # `CartesianIndices(Ps)`. That iterator spent its time in `__inc`, and
 # it hid the fact that D-1 of the D weight loads per stencil point are
-# invariant in the inner loops. Each dimension wider than one point is a
-# branch on its `single` row — the one tap, or the literal loop — so the
-# nest holds up to `2^D` copies of the innermost body; a width-1
-# dimension has no branch.
+# invariant in the inner loops. With `singles` given, each dimension
+# wider than one point is a branch on its `single` row — the one tap, or
+# the literal loop — so the nest holds up to `2^D` copies of the
+# innermost body; a width-1 dimension has no branch, and with `singles =
+# nothing` none has.
 #
 # The order of the sum is fixed, not merely its accuracy: `m_1` runs
 # innermost, as column-major `CartesianIndices` iteration does, and the
@@ -77,7 +89,7 @@
                 $body
             end
         end
-        body = Ps[d] == 1 ? loop : quote
+        body = Ps[d] == 1 || singles === Nothing ? loop : quote
             if $k != 0
                 $m = $k
                 $wt = weights[$d][$m, wcol[$d]]
@@ -88,7 +100,7 @@
         end
     end
     singlerows = [:($(Symbol(:k_, d)) = Int(singles[$d][wcol[$d]]))
-                  for d in 1:D if Ps[d] > 1]
+                  for d in 1:D if Ps[d] > 1 && singles !== Nothing]
     return quote
         Base.@_inline_meta
         acc = zero(transfer_eltype(src))
@@ -424,7 +436,9 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     bounded = Val(group.bounded)
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
     weights = ntuple(d -> group.stencils[d].weights, Val(D))
-    # The row of each column's one nonzero weight, or zero: see `stencil_sum`.
+    # The row of each column's one nonzero weight, or zero: see
+    # `stencil_sum`. The shaped launch reads it; the flat one, a device's,
+    # takes the full sum instead.
     singles = ntuple(d -> group.stencils[d].single, Val(D))
     # A copy goes without its weights: see `copy_load`. A run-time flag
     # rather than `weights = nothing`, which would make every launch site
@@ -469,14 +483,21 @@ end
 
 # The launch itself, in its two forms (see above). Each branch makes its
 # own call, so that the shaped one stays type-stable; a closure over the
-# arguments instead was allocated at every launch.
-@inline function launch_transfer!(backend, flat::Bool, extents, single::Bool, args...)
+# arguments instead was allocated at every launch. The flat launch drops
+# `singles` for `nothing`, so a device's kernel takes the full sum (see
+# `stencil_sum`); behind the inference barrier the different argument
+# type costs the shaped launch nothing.
+@inline function launch_transfer!(backend, flat::Bool, extents, single::Bool,
+                                  dest, src, targetblocks, sourceblocks, srcstarts,
+                                  weights, singles, args...)
     if flat
         shape, ndrange = launch_shape(true, extents)
         kernel! = Base.inferencebarrier(transfer_kernel!(backend))
-        kernel!(shape, args...; ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
+        kernel!(shape, dest, src, targetblocks, sourceblocks, srcstarts, weights, nothing,
+                args...; ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
     else
-        transfer_kernel!(backend)(nothing, args...; ndrange=extents,
+        transfer_kernel!(backend)(nothing, dest, src, targetblocks, sourceblocks, srcstarts,
+                                  weights, singles, args...; ndrange=extents,
                                   workgroupsize=(single ? extents : nothing))
     end
     return nothing

@@ -52,12 +52,13 @@ the wall plane it does not own by interpolation (`wall_stencil`), and a
 vertex-centered `PointValue` restriction is an injection, which is unit.
 
 `single[i]` is the row of column `i`'s only nonzero weight, or zero when
-the column has more than one (or none). Along that dimension the kernel
-then takes the one tap instead of all `order` of them (see
+the column has more than one (or none). Along that dimension the CPU's
+kernel then takes the one tap instead of all `order` of them (see
 `stencil_sum`): in vertex-centered refinement every other fine point
 coincides with a coarse node, and its column is an exact one among exact
 zeros. Like `unit`, it is decided from the weights on the host and
-carried to a device beside them. A stacked bounded point-value stencil
+carried to a device beside them, where the flat launch takes the full sum
+instead and does not read it. A stacked bounded point-value stencil
 has it zero: its columns hold two sets of weights, so none has a single
 nonzero one, and its kernel does not read it.
 """

@@ -750,7 +750,8 @@ its high face), and `0 × NaN = NaN`. The interface restriction under
 [Conservation](#conservation-at-coarse-fine-faces) is width one normally
 and width two tangentially and needs this in any case. Within a width,
 a column whose one nonzero weight is the coincident node's takes that
-single tap (see "A column with one nonzero weight takes one tap" under
+single tap on the CPU, and a device takes the full sum (see "A column
+with one nonzero weight takes one tap" under
 [What the ghost fill costs](#what-the-ghost-fill-costs)).
 
 Ghost filling is **phased**. Phase 1: all same-level copies and all
@@ -1306,28 +1307,48 @@ innermost, as column-major `CartesianIndices` iteration does, and the
 weight product is formed as `((w₁ · w₂) · …) · w_D`, since
 floating-point multiplication does not associate. Only the loads move.
 
-**A column with one nonzero weight takes one tap.** In vertex-centered
-refinement every other fine point along a dimension coincides with a
-coarse node, and the prolongation's column there is the unit vector
-exactly ([Ghost filling](#ghost-filling)). `Stencil1D` records, per
-column, the row of its only nonzero weight, or zero (`single`, decided
-on the host from the weights, as `unit` is, and uploaded with them), and
-along each dimension wider than one point the nest branches on it: the
-one tap, or the loop over the window. So a dimension whose targets
-alternate averages `(p + 1)/2` taps at order `p` instead of `p`, and the
-nest holds up to `2^D` copies of its innermost body. A cell-like
-dimension has no such column, in either family, and takes the loop. The
-skip is exact for finite data. A skipped term is `0 · u = ±0`; the
-accumulator starts at `+0`, and in round-to-nearest a sum is `−0` only
-when both addends are, so it never becomes `−0` and adding `±0` leaves
-it as it was; and the terms that remain are the same products, summed in
-the same order. What differs is a `NaN` or an infinity under a zero
-weight, which the full sum carries into the result and the skip does not
-— the choice the per-dimension widths make for the slots outside a
-window. The bounded point-value sum (`bracket_clamp_sum`) does not skip,
-and is the same sum for finite data by the same argument. The suite
+**A column with one nonzero weight takes one tap**, on the CPU. In
+vertex-centered refinement every other fine point along a dimension
+coincides with a coarse node, and the prolongation's column there is the
+unit vector exactly ([Ghost filling](#ghost-filling)). `Stencil1D`
+records, per column, the row of its only nonzero weight, or zero
+(`single`, decided on the host from the weights, as `unit` is, and
+uploaded with them), and along each dimension wider than one point the
+nest branches on it: the one tap, or the loop over the window. So a
+dimension whose targets alternate averages `(p + 1)/2` taps at order `p`
+instead of `p`, and the nest holds up to `2^D` copies of its innermost
+body. A cell-like dimension has no such column, in either family, and
+takes the loop. On one EPYC 7532 thread, at `N = 16`, this took each
+prolongation stage of the downstream's nested mesh from 368 to 100 ms.
+
+A device takes the full sum. The flat launch passes `singles = nothing`,
+and for that type `stencil_sum` is generated without the branches, so
+the device's kernel is the plain nest; the CPU's shaped launch keeps its
+argument types and stays type-stable. With the branches, each
+prolongation stage of the same mesh on an H200 (`N = 32`, 20 variables,
+`G = 3`, order 6, vertex-centered) went from 1.8 to 4.1 ms, while the
+copies and restrictions of phase 1 were unchanged (Symmetry jobs 578815
+and 578817, 2026-10-19). Neighbouring lanes along dimension 1 alternate
+between the one tap and the loop, so a warp takes both paths, and the
+`2^D` bodies cost the unrolled nest its registers. A device-friendly
+form of the skip — launching each parity class of a group separately,
+for example, so that a warp's lanes agree — is **(open)**.
+
+The skip is exact for finite data, so the choice by backend changes no
+result. A skipped term is `0 · u = ±0`; the accumulator starts at `+0`,
+and in round-to-nearest a sum is `−0` only when both addends are, so it
+never becomes `−0` and adding `±0` leaves it as it was; and the terms
+that remain are the same products, summed in the same order. What
+differs is a `NaN` or an infinity under a zero weight, which the full
+sum carries into the result and the skip does not — the choice the
+per-dimension widths make for the slots outside a window — so there a
+device's fill shows a non-finite value the CPU's does not. The bounded
+point-value sum (`bracket_clamp_sum`) does not skip, and is the same sum
+for finite data by the same argument. The suite
 compares every group of a range of schedules with the skip and without
-it, bit for bit ("Skipping zero-weight taps fills bit for bit").
+it, shaped and flat, bit for bit ("Skipping zero-weight taps fills bit
+for bit"), so the flat form the suite runs on the CPU tests the device's
+sum.
 
 **The per-launch allocation is KernelAbstractions', not ours.** Rebuilding the geometry tuples costs
 nothing measurable; what allocates is the argument tuple that
@@ -1397,7 +1418,11 @@ owner, as before, because a flat launch there cost the scatter 2.3×
 (38.8 → 89 ns a point at `16³`, 20 variables, one thread): half of that
 was the inverses, and half was stores that no longer ran along a row. The
 suite runs the flat form on the CPU too (`flat = true`), since CI has no
-device, and requires it to fill bit for bit as the shaped form does.
+device, and requires it to fill bit for bit as the shaped form does
+with the full sum, from data that hold a `NaN` and an infinity, which
+the shaped form's one-tap skip drops under a zero weight (see "A column
+with one nonzero weight takes one tap" under
+[What the ghost fill costs](#what-the-ghost-fill-costs)).
 
 **A copy skips its weights.** `Stencil1D` records whether it is one point
 of weight exactly one (`unit`, decided on the host from the weights), and
