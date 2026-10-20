@@ -54,7 +54,8 @@ end
 
 # The group with every stencil marked not unit: the copy through its weights.
 function weighted(g::TreeAMR.TransferGroup{TT,DD}) where {TT,DD}
-    stencils = map(s -> TreeAMR.Stencil1D{TT}(s.targetfirst, s.srcstart, s.weights, false),
+    stencils = map(s -> TreeAMR.Stencil1D{TT}(s.targetfirst, s.srcstart, s.weights, false,
+                                              s.single),
                    g.stencils)
     return TreeAMR.TransferGroup{TT,DD}(g.kind, stencils, g.targetblocks, g.sourceblocks,
                                         g.factorcol, g.orientation, g.plane)

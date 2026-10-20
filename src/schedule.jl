@@ -50,28 +50,47 @@ host, where they are built, and carried to a device with them. It is
 not the group's kind: a mirrored copy at a vertex-like high wall derives
 the wall plane it does not own by interpolation (`wall_stencil`), and a
 vertex-centered `PointValue` restriction is an injection, which is unit.
+
+`single[i]` is the row of column `i`'s only nonzero weight, or zero when
+the column has more than one (or none). Along that dimension the kernel
+then takes the one tap instead of all `order` of them (see
+`stencil_sum`): in vertex-centered refinement every other fine point
+coincides with a coarse node, and its column is an exact one among exact
+zeros. Like `unit`, it is decided from the weights on the host and
+carried to a device beside them. A stacked bounded point-value stencil
+has it zero: its columns hold two sets of weights, so none has a single
+nonzero one, and its kernel does not read it.
 """
 struct Stencil1D{T,VI<:AbstractVector{Int32},MW<:AbstractMatrix{T}}
     targetfirst::Int
     srcstart::VI
     weights::MW
     unit::Bool
+    single::VI
 end
 
 Stencil1D{T}(targetfirst::Int, srcstart::AbstractVector{Int32},
              weights::Matrix{T}) where {T} =
     Stencil1D{T}(targetfirst, srcstart, weights,
-                 size(weights, 1) == 1 && all(isone, weights))
+                 size(weights, 1) == 1 && all(isone, weights), single_rows(weights))
 Stencil1D{T}(targetfirst::Int, srcstart::AbstractVector{Int32},
-             weights::AbstractMatrix{T}, unit::Bool) where {T} =
-    Stencil1D{T,typeof(srcstart),typeof(weights)}(targetfirst, srcstart, weights, unit)
+             weights::AbstractMatrix{T}, unit::Bool,
+             single::AbstractVector{Int32}) where {T} =
+    Stencil1D{T,typeof(srcstart),typeof(weights)}(targetfirst, srcstart, weights, unit,
+                                                  single)
+
+# Per column, the row of its only nonzero weight, or zero.
+function single_rows(weights::Matrix)
+    return Int32[count(!iszero, col) == 1 ? Int32(findfirst(!iszero, col)) : Int32(0)
+                 for col in eachcol(weights)]
+end
 
 ntarget(s::Stencil1D) = length(s.srcstart)
 Base.@propagate_inbounds stencilorder(s::Stencil1D) = size(s.weights, 1)
 
 todevice(backend::Backend, s::Stencil1D{T}) where {T} =
     Stencil1D{T}(s.targetfirst, todevice(backend, s.srcstart),
-                 todevice(backend, s.weights), s.unit)
+                 todevice(backend, s.weights), s.unit, todevice(backend, s.single))
 
 """
     TransferGroup{T,D}
@@ -909,7 +928,7 @@ function stack_linear(s::Stencil1D{T}, lin::Stencil1D{T}) where {T}
             "order-$p window")
         weights[p + 1 + off, i] = w
     end
-    return Stencil1D{T}(s.targetfirst, s.srcstart, weights, false)
+    return Stencil1D{T}(s.targetfirst, s.srcstart, weights, false, zeros(Int32, n))
 end
 
 # --- Mirrored stencils (M10) ---------------------------------------------
@@ -1402,7 +1421,8 @@ function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
     for key in sort!(collect(keys(sendslots)))
         order = sort!([(sendlayout[slot].source - first(sourcerange) + 1, slot)
                        for slot in sendslots[key]])
-        st = map(s -> Stencil1D{T}(1, s.srcstart, s.weights, s.unit), host(key))
+        st = map(s -> Stencil1D{T}(1, s.srcstart, s.weights, s.unit, s.single),
+                 host(key))
         push!(packs, todevice(backend, TransferGroup{T,D}(
             key.kind, st, Int32[o[2] for o in order], Int32[o[1] for o in order], 0,
             key.orientation, plane, bounded(key)::Int8)))

@@ -352,7 +352,8 @@ end
 # A group with every stencil marked not unit: the same transfer, computed
 # through the weights.
 function weighted(g::TreeAMR.TransferGroup{T,D}) where {T,D}
-    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, false),
+    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, false,
+                                             s.single),
                    g.stencils)
     return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
                                       g.factorcol, g.orientation, g.plane)
@@ -417,6 +418,93 @@ end
     wallsched = GhostSchedule(setups[3], ops)
     @test any(g -> g.kind === :copy && !all(s -> s.unit, g.stencils),
               wallsched.phase1)
+end
+
+# A group with every column's `single` row cleared: the same transfer,
+# computed as the full tensor-product sum over every weight.
+function full_sum(g::TreeAMR.TransferGroup{T,D}) where {T,D}
+    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, s.unit,
+                                             zero(s.single)),
+                   g.stencils)
+    return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
+                                      g.factorcol, g.orientation, g.plane, g.bounded)
+end
+
+# Finite data with what a dropped `±0` term could still change: signed
+# zeros and subnormals, beside ordinary numbers of both signs.
+function finite_fill!(rng, work::AbstractArray{T}) where {T}
+    specials = T[-zero(T), zero(T), floatmin(T) / 4, -floatmin(T) / 3]
+    for I in eachindex(work)
+        work[I] = rand(rng) < 0.1 ? rand(rng, specials) : T(randn(rng))
+    end
+    return work
+end
+
+@testset "Skipping zero-weight taps fills bit for bit: D=$D" for D in (1, 2, 3)
+    # A column with one nonzero weight takes one tap along its dimension
+    # instead of the whole window. Got wrong — the wrong row, the row of
+    # a column a mirror, a clamp or a turn remapped, a product formed in
+    # another order — it shows as a ghost that is right to roundoff, or
+    # off by a sign of zero, and only along the vertex-like dimensions
+    # that have such columns. Every group of schedules over both
+    # centerings, both families, the prolongation orders, reflecting and
+    # outflow faces and a rotating seam is run with the skip and without
+    # it, shaped and flat, from the same finite data, and the arrays must
+    # agree in every bit.
+    rng = Xoshiro(20261019)
+    N = 8
+    kinds = ((:reflect_hi,), (:reflect_hi, :outflow_lo),
+             (:reflect_hi, :reflect_lo, :outflow_hi))[D]
+    configs = Any[]
+    for C in (vertexcentered(D), cellcentered(D)), p in (2, 4, 6, 8)
+        push!(configs, (C, Operators(prolongation=p, restriction=2), p))
+    end
+    for p in (3, 5, 7)
+        push!(configs, (cellcentered(D), Operators(prolongation=p, restriction=2,
+                                                   family=Conservative), p))
+    end
+    push!(configs, (facecentered(D, 1),
+                    Operators(prolongation=3, restriction=2, family=Conservative,
+                              vertex_prolongation=4), 4))
+    nsingle = 0
+    for (C, ops, p) in configs
+        G = ghosts_for(C, p)
+        _, parity = parity_data(Float64, kinds, p)
+        setups = Any[FieldSet(faces_forest(kinds; N=N), 2; G=G, centering=C,
+                              parity=parity)]
+        # The seam reads through the axis map whatever the order, so one
+        # order per family turns it: each order is kernels of its own to
+        # compile, and the suite is compilation-bound.
+        if D >= 2 && p in (3, 4)
+            quad = rotating_forest(Val(D); rotating=(1, 2), N=N)
+            push!(setups, FieldSet(quad, D + 1; G=G, centering=C,
+                                   rotation=vector_rotation(D, (1, 2))))
+        end
+        for fs in setups
+            schedule = GhostSchedule(fs, ops)
+            vertexprolong = 0
+            data = finite_fill!(rng, similar(fs.work))
+            work, full = similar(data), Vector{UInt64}(undef, length(data))
+            for g in Iterators.flatten((schedule.phase1, schedule.phase2...))
+                fillwith(group; flat) = begin
+                    copyto!(work, data)
+                    TreeAMR.run_group!(work, work, group, fs.nvars, TreeAMR.CPU();
+                                       flat=flat, factors=fs.factors, rotvars=fs.rotvars)
+                    reinterpret(UInt64, vec(work))
+                end
+                skips = any(s -> any(!iszero, s.single), g.stencils)
+                nsingle += skips
+                g.kind === :prolong && ops.family === PointValue && C[1] === :vertex &&
+                    (vertexprolong += skips)
+                copyto!(full, fillwith(full_sum(g); flat=false))
+                @test fillwith(g; flat=false) == full
+                @test fillwith(g; flat=true) == full
+            end
+            # The vertex-centered prolongations are what the skip is for.
+            ops.family === PointValue && C[1] === :vertex && @test vertexprolong > 0
+        end
+    end
+    @test nsingle > 0                              # the one-tap path was taken
 end
 
 @testset "The flat scatter and gather match the shaped ones: D=$D" for D in (1, 2, 3)

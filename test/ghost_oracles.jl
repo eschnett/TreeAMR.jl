@@ -606,8 +606,10 @@ deviation of any stored value from the data.
 
 `NaN` is what makes the fill's *order* visible. A ghost the schedule
 never writes stays `NaN`; one it writes from a ghost that has not been
-written yet becomes `NaN`, since every stencil weight is nonzero and
-`NaN` survives any finite combination. A zero-initialized field set shows
+written yet becomes `NaN`, since `NaN` survives any finite combination.
+(Along a dimension where a target's column has a single nonzero weight,
+the fill reads only that source, so there an unwritten ghost shows only
+if the value depends on it.) A zero-initialized field set shows
 neither: a stale zero is just a wrong number, and may even be the right
 one.
 """

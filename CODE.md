@@ -748,7 +748,10 @@ an injection padded to width `p` with zero weights reads `p − 1` slots
 that need not hold data (a `G = 0` face field has no slot at all beyond
 its high face), and `0 × NaN = NaN`. The interface restriction under
 [Conservation](#conservation-at-coarse-fine-faces) is width one normally
-and width two tangentially and needs this in any case.
+and width two tangentially and needs this in any case. Within a width,
+a column whose one nonzero weight is the coincident node's takes that
+single tap (see "A column with one nonzero weight takes one tap" under
+[What the ghost fill costs](#what-the-ghost-fill-costs)).
 
 Ghost filling is **phased**. Phase 1: all same-level copies and all
 restrictions (each reads only interior cells of other blocks — race
@@ -1244,14 +1247,35 @@ divides by precomputed inverses, while the CPU keeps this launch — see
 **The tensor-product sum is generated, not iterated.** `for m in
 CartesianIndices(Ps)` cost its trip count in `__inc` even though `Ps` is
 a compile-time constant, and it recomputed the full `D`-fold weight
-product at every stencil point. It is now a generated loop nest with
+product at every stencil point. The sum is a generated loop nest with
 literal trip counts, which hoists `D − 1` of the `D` weight loads out of
-the inner loops. The nest reproduces the old loop *exactly*, not merely
-to the same accuracy: `m_1` runs innermost, as column-major
-`CartesianIndices` iteration did, so the contributions are summed in the
-same order, and the weight product is still formed as
-`((w₁ · w₂) · …) · w_D`, since floating-point multiplication does not
-associate. Only the loads move. 
+the inner loops. Its order is fixed, not merely its accuracy: `m_1` runs
+innermost, as column-major `CartesianIndices` iteration does, and the
+weight product is formed as `((w₁ · w₂) · …) · w_D`, since
+floating-point multiplication does not associate. Only the loads move.
+
+**A column with one nonzero weight takes one tap.** In vertex-centered
+refinement every other fine point along a dimension coincides with a
+coarse node, and the prolongation's column there is the unit vector
+exactly ([Ghost filling](#ghost-filling)). `Stencil1D` records, per
+column, the row of its only nonzero weight, or zero (`single`, decided
+on the host from the weights, as `unit` is, and uploaded with them), and
+along each dimension wider than one point the nest branches on it: the
+one tap, or the loop over the window. So a dimension whose targets
+alternate averages `(p + 1)/2` taps at order `p` instead of `p`, and the
+nest holds up to `2^D` copies of its innermost body. A cell-like
+dimension has no such column, in either family, and takes the loop. The
+skip is exact for finite data. A skipped term is `0 · u = ±0`; the
+accumulator starts at `+0`, and in round-to-nearest a sum is `−0` only
+when both addends are, so it never becomes `−0` and adding `±0` leaves
+it as it was; and the terms that remain are the same products, summed in
+the same order. What differs is a `NaN` or an infinity under a zero
+weight, which the full sum carries into the result and the skip does not
+— the choice the per-dimension widths make for the slots outside a
+window. The bounded point-value sum (`bracket_clamp_sum`) does not skip,
+and is the same sum for finite data by the same argument. The suite
+compares every group of a range of schedules with the skip and without
+it, bit for bit ("Skipping zero-weight taps fills bit for bit").
 
 **The per-launch allocation is KernelAbstractions', not ours.** Rebuilding the geometry tuples costs
 nothing measurable; what allocates is the argument tuple that
@@ -3757,9 +3781,10 @@ which keeps "one kernel for every transfer" true.
   so the remote `−0` case exists from 2D on.)
 - **Why the ghosts are bit-identical.** Every ghost is written once, by
   the same kernel, from the same source values and the same stencil,
-  summed in the same order as in the serial fill; the unpack adds an
-  identity. So the ghosts are bit-identical to serial for any
-  partition, and so is everything computed from them. It is the
+  summed in the same order as in the serial fill — a pack keeps the
+  serial stencil's one-tap rows (`single`), so it skips the same zero
+  weights; the unpack adds an identity. So the ghosts are bit-identical
+  to serial for any partition, and so is everything computed from them. It is the
   argument the thread invariant rests on, with a rank boundary in place
   of a thread boundary. It needs the transfer arithmetic not to depend
   on the destination type: no `@fastmath` or `@simd` reassociation in

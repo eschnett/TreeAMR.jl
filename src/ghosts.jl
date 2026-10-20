@@ -19,28 +19,48 @@
 # overrides `@inbounds` package-wide, so a stencil that walks out of its
 # block fails there even though it would not fail locally.
 
-# Tensor-product stencil: `prod(Ps)` contributions, the weight of each
-# the product of its D one-dimensional weights. The widths are **per
+# Tensor-product stencil: up to `prod(Ps)` contributions, the weight of
+# each the product of its D one-dimensional weights. The widths are **per
 # dimension** (M8): a transfer can be injection in one dimension and
 # order-p interpolation in another, and padding the narrow one to the
 # common width with zero weights would read slots that need not hold
 # data at all — a G = 0 face field has none beyond its high face — and
 # `0 * NaN` is `NaN`.
 #
+# Within a width the zero weights are skipped too, where that is cheap to
+# know: a column with a single nonzero weight (`Stencil1D`'s `single`)
+# takes that one tap along its dimension instead of all `Ps[d]`. In
+# vertex-centered refinement every other fine point along a dimension
+# coincides with a coarse node, and its column is an exact one among
+# exact zeros, so a prolongation of order 6 averages 3.5 taps instead of
+# 6 along each dimension where its targets alternate.
+#
+# The skip is exact for finite data. A skipped term is `0 · u`, which is
+# `±0`. The accumulator starts at `+0`, and in round-to-nearest a sum is
+# `-0` only when both addends are, so it never becomes `-0`, and adding
+# `±0` to it leaves it as it was. The terms that remain are the same
+# products, summed in the same order. What differs is a `NaN` or an
+# infinity under a zero weight: the full sum carries it into the result
+# and the skip does not, which is the choice the per-dimension widths
+# make for the slots outside the window.
+#
 # `Ps` is a compile-time constant, so the sum is *generated* as a loop
 # nest with literal trip counts instead of iterating
 # `CartesianIndices(Ps)`. That iterator spent its time in `__inc`, and
 # it hid the fact that D-1 of the D weight loads per stencil point are
-# invariant in the inner loops.
+# invariant in the inner loops. Each dimension wider than one point is a
+# branch on its `single` row — the one tap, or the literal loop — so the
+# nest holds up to `2^D` copies of the innermost body; a width-1
+# dimension has no branch.
 #
-# The nest reproduces the old loop exactly, not merely to the same
-# accuracy: `m_1` runs innermost, as column-major `CartesianIndices`
-# iteration did, so the contributions are summed in the same order; and
-# the weight product is still formed as `((w₁ * w₂) * …) * w_D`, since
+# The order of the sum is fixed, not merely its accuracy: `m_1` runs
+# innermost, as column-major `CartesianIndices` iteration does, and the
+# weight product is formed as `((w₁ * w₂) * …) * w_D`, since
 # floating-point multiplication does not associate and hoisting a
 # partial product out of the inner loop would reassociate it. Only the
-# *loads* are hoisted.
-@generated function stencil_sum(src, weights, base::NTuple{D,Int},
+# *loads* are hoisted. That is what makes the skip exact, and what keeps
+# `bracket_clamp_sum`'s full sum equal to this one.
+@generated function stencil_sum(src, weights, singles, base::NTuple{D,Int},
                                 wcol::NTuple{D,Int}, v, sblock,
                                 ::Val{Ps}) where {D,Ps}
     idx = [:(base[$d] + $(Symbol(:m_, d)) - 1) for d in 1:D]
@@ -50,17 +70,32 @@
         acc += $wprod * transfer_load(src, ($(idx...),), v, sblock)
     end
     for d in 1:D
-        body = quote
-            for $(Symbol(:m_, d)) in 1:$(Ps[d])
-                $(Symbol(:wt_, d)) = weights[$d][$(Symbol(:m_, d)), wcol[$d]]
+        m, wt, k = Symbol(:m_, d), Symbol(:wt_, d), Symbol(:k_, d)
+        loop = quote
+            for $m in 1:$(Ps[d])
+                $wt = weights[$d][$m, wcol[$d]]
                 $body
             end
         end
+        body = Ps[d] == 1 ? loop : quote
+            if $k != 0
+                $m = $k
+                $wt = weights[$d][$m, wcol[$d]]
+                $body
+            else
+                $loop
+            end
+        end
     end
+    singlerows = [:($(Symbol(:k_, d)) = Int(singles[$d][wcol[$d]]))
+                  for d in 1:D if Ps[d] > 1]
     return quote
         Base.@_inline_meta
         acc = zero(transfer_eltype(src))
-        @inbounds $body
+        @inbounds begin
+            $(singlerows...)
+            $body
+        end
         acc
     end
 end
@@ -259,15 +294,16 @@ end
 # The bounded point-value interpolation (AMR-10; "Bounded point values"
 # in CODE.md). The stencils are `stack_linear`'s: rows `1:Ps[d]` the
 # order-`p` weights, rows `Ps[d]+1:2Ps[d]` the multilinear ones over the
-# same window. The order-`p` sum is formed exactly as `stencil_sum` forms
-# it, and beside it the extremes of the points with a nonzero multilinear
-# weight in every dimension — the target's bracket. The result is the sum
-# clamped into them, which is `u_lin + φ(u_w − u_lin)` with the largest
-# `φ ∈ [0, 1]` that stays in range, since `u_lin` lies in it. Where no
-# clamp acts it is the unbounded sum, bit for bit but for `-0`. `min` and
-# `max` propagate a `NaN` bracket point and `clamp` a `NaN` sum, and the
-# result carries `0 · (M − m)`, as `bounded_sum` does, so an undefined
-# source stays visible.
+# same window. The order-`p` sum is formed as `stencil_sum` forms it, but
+# in full, without its one-tap skip, and beside it the extremes of the
+# points with a nonzero multilinear weight in every dimension — the
+# target's bracket. The result is the sum clamped into them, which is
+# `u_lin + φ(u_w − u_lin)` with the largest `φ ∈ [0, 1]` that stays in
+# range, since `u_lin` lies in it. Where no clamp acts it is the unbounded
+# sum, bit for bit but for `-0` (for finite data, since the skip is exact
+# there). `min` and `max` propagate a `NaN` bracket point and `clamp` a
+# `NaN` sum, and the result carries `0 · (M − m)`, as `bounded_sum` does,
+# so an undefined source stays visible.
 @generated function bracket_clamp_sum(src, weights, base::NTuple{D,Int},
                                       wcol::NTuple{D,Int}, v, sblock,
                                       ::Val{Ps}) where {D,Ps}
@@ -308,7 +344,7 @@ end
 
 @kernel function transfer_kernel!(shape, dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
-                                  srcstarts, weights, unit::Bool,
+                                  srcstarts, weights, singles, unit::Bool,
                                   targetfirst::NTuple{D,Int}, toffset::Int,
                                   factors, fcol::Int, ::Val{B},
                                   ::Val{Ps}, ::Val{D}) where {B,Ps,D}
@@ -334,7 +370,7 @@ end
           B == BOUNDED_POINTVALUE ?
           bracket_clamp_sum(src, weights, base, wcol, v, sblock, Val(Ps)) :
           all(isone, Ps) && unit ? (@inbounds copy_load(src, base, v, sblock)) :
-          stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
+          stencil_sum(src, weights, singles, base, wcol, v, sblock, Val(Ps))
     @inbounds transfer_store!(dest, scaled(acc, factors, v, fcol), tidx, v, tblock)
 end
 
@@ -388,6 +424,8 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     bounded = Val(group.bounded)
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
     weights = ntuple(d -> group.stencils[d].weights, Val(D))
+    # The row of each column's one nonzero weight, or zero: see `stencil_sum`.
+    singles = ntuple(d -> group.stencils[d].single, Val(D))
     # A copy goes without its weights: see `copy_load`. A run-time flag
     # rather than `weights = nothing`, which would make every launch site
     # compile both forms of the kernel (see below).
@@ -417,13 +455,13 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     if group.orientation != 0
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
         launch_transfer!(backend, flat, extents, single, kdest, rsrc, group.targetblocks,
-                         group.sourceblocks, srcstarts, weights, unit, tfirst,
+                         group.sourceblocks, srcstarts, weights, singles, unit, tfirst,
                          first(range) - 1, gfactors, Int(group.factorcol), bounded,
                          Val(orders), Val(D))
         return nothing
     end
     launch_transfer!(backend, flat, extents, single, kdest, ksrc, group.targetblocks,
-                     group.sourceblocks, srcstarts, weights, unit, tfirst,
+                     group.sourceblocks, srcstarts, weights, singles, unit, tfirst,
                      first(range) - 1, gfactors, Int(group.factorcol), bounded,
                      Val(orders), Val(D))
     return nothing
