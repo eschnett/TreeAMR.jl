@@ -1458,6 +1458,24 @@ did, plus the flag (11312 B a uniform fill against 10896). Compilation
 is 65.4 s against 63.0, within its noise, and the workload's output is
 unchanged.
 
+**What the stage groups and the one-tap nest cost to compile.** The
+serial `test/mpi_workload.jl` of 0.2.3 compiles in 82.3–82.6 s with 969
+compiled roots against that release (one EPYC 7543, Symmetry job
+579285, three alternating runs each, the workload's output identical).
+Against a build of the stage groups and the one-tap nest that also held
+the since-parked per-class partition ([HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill)),
+it compiled in 86.4–86.8 s with 995 roots, and in 85.3–86.0 s with the
+shaped launch passing `singles = nothing`, so the `2^D` bodies of the
+one-tap nest are about 1 s of the difference, the price of its 3.7
+times faster prolongations on the CPU; the rest was spread over the new
+code on the default path, with no call tree standing out. A second
+driver for groups, with an iterator over the stages' locals, compiled
+in 88.6–89.5 s with 1034 roots, which is why there is one ("Stages"
+under [Distributed meshes](#distributed-meshes)). Without the
+partition the same workload compiles 993 roots against 0.2.3's 971 on
+the laptop (Apple silicon, Julia 1.13.2, two alternating runs, output
+identical); its time on Symmetry is to be measured.
+
 **What it buys on an H200** (job 570290, `bench/copies.jl` from
 `bench/symmetry_copies.sh`: a uniform periodic mesh, 20 variables,
 `G = 3`, vertex-centered, `Float64`; 0.1.7 measured in the same job
@@ -3816,8 +3834,9 @@ driver, or an iterator over the stages' locals handed to `run_phase!`,
 is a second copy of it; the message steps are functions of their own
 (`send_stages!`, `receive_stages!`), each specialized on what it reads,
 and the call's `sends`, `nothing` or a `Vector{Any}`, is not specialized
-on at all (`@nospecializeinfer`). See "Every run-time choice of type is
-compiled at every launch site" for what the copies cost.
+on at all (`@nospecializeinfer`). "What the stage groups and the
+one-tap nest cost to compile" under [The copy kernels on a
+device](#the-copy-kernels-on-a-device) has what the copies cost.
 
 **Deadlock freedom and message matching.** Messages are nonblocking
 and matched by peer and tag, and the tag names the stage: phase 1, the
