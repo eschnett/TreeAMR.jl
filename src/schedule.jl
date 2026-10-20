@@ -539,6 +539,17 @@ The phasing follows `CODE.md`:
   computes for another one's ghosts and those it receives — together
   exactly the serial schedule's transfers, split by where their two
   blocks live; see "Distributed meshes" in `CODE.md`.
+- `stagegroups` are runs of consecutive `stages` that run as one on this
+  rank: phase 1 alone, and the prolongation levels in runs within which
+  no level reads or writes a point another one writes here — no
+  prolongation reads a ghost of its coarse source that the level below
+  prolongated, nor one that the relative hook fills after it. Those
+  levels then run together: their messages in flight at once, their
+  local groups in one parallel loop, one wait. A level with a rotated
+  prolongation runs alone. The decision is the rank's own, from the
+  transfers it holds, and is permission rather than obligation: each
+  stage keeps its tag and its messages, so ranks may group differently;
+  see "Ghost filling" in `CODE.md`.
 
 Periodic boundaries appear nowhere special here: the tree wraps around,
 so they are ordinary copies, restrictions, and prolongations. Reflecting
@@ -605,6 +616,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     boundaries::Vector{BoundaryRegion{D}}
     boundaryplan::BP
     stages::Vector{ST}                           # phase 1, then phase 2 by level
+    stagegroups::Vector{UnitRange{Int}}          # runs of `stages` that run together
 end
 
 """
@@ -1476,6 +1488,161 @@ function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, locals
               for tag in tags]
 end
 
+# --- Stage groups ----------------------------------------------------------
+#
+# Which phase-2 stages run together on this rank (`GhostSchedule`'s
+# `stagegroups`; "Ghost filling" in CODE.md). The prolongations onto
+# level ℓ wait for those onto ℓ − 1 only because one of them may read a
+# ghost of its coarse source that the stage below wrote. Where none
+# does, the two stages can run as one: their messages in flight
+# together, their local groups in one parallel loop, one wait. A group
+# is permission, not obligation — running its stages one after another
+# is always correct — so the decision is this rank's own, and ranks may
+# decide differently: a message's tag and layout are its stage's, not
+# its group's.
+#
+# The test is on the points themselves, per local block, from the host
+# stencils the groups are built from, before anything goes to a device.
+# A stage writes the target boxes of its local groups and its unpacks,
+# and the relative hook's regions that run after it (`BoundaryRegion`'s
+# `slot`); it reads the source windows of its local groups and its packs
+# on their source blocks, and the hook regions' nearest evolved points.
+# Every write to a block is made on the block's own rank, so a rank sees
+# every write that a read of its blocks could meet. A level with any
+# rotated prolongation never joins: its source windows are in the
+# virtual frame, which the axis map turns into the real source's only at
+# the launch, and an odd orientation of a `RotationPair` reads the
+# partner's array, which this rank's boxes do not describe. The cost is
+# one pass over the transfers and one over the hook regions, with a few
+# boxes per block.
+
+const Box{D} = NTuple{D,UnitRange{Int}}
+
+# The target box of a group's transfers, per dimension, in stored indices.
+function write_box(stencils::NTuple{D,Stencil1D}) where {D}
+    return ntuple(d -> stencils[d].targetfirst:(stencils[d].targetfirst +
+                                                ntarget(stencils[d]) - 1), D)
+end
+
+# The window a group's transfers read on their source block: along each
+# dimension from the first column's start to the last one's end. The
+# width is the kernel's (see `run_group!`): a bounded point-value
+# stencil stacks two sets of weights over one window, so it reads half
+# its rows, and a bounded conservative one reads its three. A column that
+# takes a single tap reads less, which the window covers. Mirrored and
+# clamped rows keep their image's columns, which are in the source's
+# frame, and so does the derived wall row, which reads the source beside
+# its own wall.
+function read_box(stencils::NTuple{D,Stencil1D}, mode::Int8) where {D}
+    return ntuple(D) do d
+        s = stencils[d]
+        w = stencilorder(s)
+        mode == BOUNDED_POINTVALUE && (w ÷= 2)
+        return Int(minimum(s.srcstart)):(Int(maximum(s.srcstart)) + w - 1)
+    end
+end
+
+# The points the relative hook reads for a region: the nearest evolved
+# point along each dimension it clamps, the ghost's own index along every
+# other (see `BoundaryRegion`).
+hook_read_box(r::BoundaryRegion{D}) where {D} =
+    ntuple(d -> r.clamps[d] == 0 ? r.region.indices[d] : (Int(r.clamps[d]):Int(r.clamps[d])),
+           D)
+
+overlaps(a::Box{D}, b::Box{D}) where {D} =
+    all(d -> max(first(a[d]), first(b[d])) <= min(last(a[d]), last(b[d])), 1:D)
+
+# What one phase-2 stage touches on this rank, each box on a local block,
+# and whether any of its prolongations is rotated.
+struct StageAccess{D}
+    writes::Vector{Tuple{Int32,Box{D}}}
+    reads::Vector{Tuple{Int32,Box{D}}}
+    rotated::Base.RefValue{Bool}
+end
+StageAccess{D}() where {D} =
+    StageAccess{D}(Tuple{Int32,Box{D}}[], Tuple{Int32,Box{D}}[], Ref(false))
+
+# Boxes by local block, for the stages of the group being formed.
+const BlockBoxes{D} = Dict{Int32,Vector{Box{D}}}
+
+meets(boxes::BlockBoxes{D}, (b, box)::Tuple{Int32,Box{D}}) where {D} =
+    any(w -> overlaps(w, box), get(boxes, b, ()))
+
+function add_boxes!(boxes::BlockBoxes{D}, list::Vector{Tuple{Int32,Box{D}}}) where {D}
+    for (b, box) in list
+        push!(get!(Vector{Box{D}}, boxes, b), box)
+    end
+    return boxes
+end
+
+# The stage groups of a schedule whose stages have the tags `tags`, phase
+# 1 first. `pairs` are the local transfers in local block indices; `sent`
+# and `received` the remote ones in global leaf indices, `offset` this
+# rank's first leaf less one; `boundaries` the hook regions in local
+# indices; `build(key)` a group's host stencils and `boundedof(key)` its
+# bound.
+#
+# Phase 1 is alone: the boundary hook runs after it. A stage joins the
+# group below it when it is the next level up, when none of its
+# prolongations is rotated, and when it conflicts with no stage already
+# in the group: none of its points is written by one of them and read or
+# written by the other. Only the stage just below can write what it
+# reads — a level-ℓ prolongation reads level-(ℓ − 1) blocks, which
+# nothing but the level-(ℓ − 1) stage and its hook regions write — and no
+# stage of a group writes a block another one reads; but testing every
+# pair costs the same and needs neither argument to be right.
+function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
+                      sent::TransferPairs{D}, received::TransferPairs{D},
+                      boundaries::Vector{BoundaryRegion{D}}, build, boundedof,
+                      offset::Int) where {D}
+    length(tags) <= 2 && return [i:i for i in eachindex(tags)]
+    index = Dict(tag => i for (i, tag) in enumerate(tags))
+    access = [StageAccess{D}() for _ in tags]
+    record!(list, blocks, shift, box) =
+        for b in blocks
+            push!(list, (Int32(b - shift), box))
+        end
+    for (lists, shift, reads, writes) in ((pairs, 0, true, true), (sent, offset, true, false),
+                                          (received, offset, false, true))
+        for (key, (targets, sources)) in lists
+            key.kind === :prolong || continue
+            i = get(index, prolongation_tag(key.level), 0)
+            i == 0 && continue
+            stencils = build(key)
+            any(s -> ntarget(s) == 0, stencils) && continue
+            a = access[i]
+            key.orientation == 0 || (a.rotated[] = true)
+            reads && record!(a.reads, sources, shift, read_box(stencils, boundedof(key)))
+            writes && record!(a.writes, targets, shift, write_box(stencils))
+        end
+    end
+    for r in boundaries
+        i = get(index, r.slot, 0)
+        i <= 1 && continue
+        push!(access[i].writes, (r.block, r.region.indices))
+        push!(access[i].reads, (r.block, hook_read_box(r)))
+    end
+
+    groups = [1:1]
+    written, read = BlockBoxes{D}(), BlockBoxes{D}()   # by the stages of the open group
+    for i in 2:length(tags)
+        a = access[i]
+        joins = i > 2 && tags[i] == tags[i - 1] + 1 && !a.rotated[] &&
+                !any(rb -> meets(written, rb), a.reads) &&
+                !any(wb -> meets(written, wb) || meets(read, wb), a.writes)
+        if joins
+            groups[end] = first(groups[end]):i
+        else
+            push!(groups, i:i)
+            empty!(written)
+            empty!(read)
+        end
+        add_boxes!(written, a.writes)
+        add_boxes!(read, a.reads)
+    end
+    return groups
+end
+
 function localize_boundaries(boundaries::Vector{BoundaryRegion{D}},
                              range::UnitRange{Int}) where {D}
     offset = Int32(first(range) - 1)
@@ -1638,9 +1805,12 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     stages = build_stages(ST, T, backend, leveltags, localsof, bystage(stageof, sent),
                           bystage(stageof, received), build, factorcol, forest;
                           required=[PHASE1_TAG], plane=plane, bounded=boundedof)
+    # Which of them may run together here, from the host stencils.
+    groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
+                          build, boundedof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, walls, operators, backend, phase1,
-        phase2, levels, boundaries, bplan, stages)
+        phase2, levels, boundaries, bplan, stages, groups)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
@@ -1657,7 +1827,18 @@ function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
           " restrictions, ", nprol, " prolongations over ", length(s.phase2),
           " level(s), ", nmirror == 0 ? "" : "$nmirror mirrored transfers, ",
           nrot == 0 ? "" : "$nrot rotated transfers, ",
-          length(s.boundaries), " boundary regions", messages_summary(s.stages), ")")
+          length(s.boundaries), " boundary regions", groups_summary(s),
+          messages_summary(s.stages), ")")
+end
+
+# The prolongation levels that run together, said only when some do, so
+# that a schedule whose stages each run alone prints as it always has.
+function groups_summary(s::GhostSchedule)
+    runs = filter(r -> length(r) > 1, s.stagegroups)
+    isempty(runs) && return ""
+    lvl(i) = s.stages[i].tag - prolongation_tag(0)
+    return "; levels " * join(("$(lvl(first(r)))-$(lvl(last(r)))" for r in runs), ", ") *
+           " run together"
 end
 
 # Whether a group mirrors across a reflecting face: a factor column

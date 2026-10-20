@@ -311,7 +311,9 @@ the one that says why.
   function.
 - **Phased ghost fill**: the boundary hook runs *between* the phases,
   not last; the relative hook's regions run after the stage that fills
-  what they read ("Ghost filling").
+  what they read ("Ghost filling"). Prolongation levels run as groups
+  of stages where `stage_groups` finds no conflict in the boxes they
+  write and read: a new write or read in phase 2 must be among them.
 - **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
   block at a low domain face has its own range start at `G+2` along that
   vertex-like dimension; the trim is part of `GroupKey` ("Centerings").

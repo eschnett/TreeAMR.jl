@@ -691,11 +691,13 @@ end
 # mesh's in the regrid transfer. A rotated pack (M12) reads through the
 # variable table `rotvars`, from `altsrc` for an odd orientation (the
 # partner's array in a `RotationPair`), and computes the unscaled sum.
+# A group of stages packs them all and synchronizes once (`sync=false`
+# and a `synchronize` of its own; see `run_stages!`).
 function pack_stage!(src::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
-                     backend; altsrc=src, rotvars=nothing)
+                     backend; altsrc=src, rotvars=nothing, sync::Bool=true)
     run_phase!((buf=bufs[1], offsets=remote.sendoffsets), src, remote.packs, nvars,
                backend; altsrc=altsrc, rotvars=rotvars)
-    synchronize(backend)
+    sync && synchronize(backend)
     return nothing
 end
 pack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
@@ -781,6 +783,112 @@ run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
     run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends,
                fs.work, fs.rotvars)
 
+# The local groups of the stages `stages[range]`, one after another: what
+# a group of stages runs as one phase. An iterator of its own rather than
+# `Iterators.flatten`, whose element type inference loses, which would
+# dispatch every launch of the phase at run time.
+struct GroupedLocals{ST<:ExchangeStage}
+    stages::Vector{ST}
+    range::UnitRange{Int}
+end
+
+Base.IteratorSize(::Type{<:GroupedLocals}) = Base.SizeUnknown()
+Base.eltype(::Type{GroupedLocals{ExchangeStage{GRP,RS}}}) where {GRP,RS} = GRP
+
+function Base.iterate(g::GroupedLocals, (i, j)=(first(g.range), 1))
+    while i <= last(g.range)
+        groups = g.stages[i].locals
+        j <= length(groups) && return (groups[j], (i, j + 1))
+        i, j = i + 1, 1
+    end
+    return nothing
+end
+
+# Run the stages `stages[range]` on this rank as one group (a run of
+# `GhostSchedule`'s `stagegroups`): the five steps of `run_stage!`, each
+# taken for every stage of the group before the next. Every stage's
+# receives are posted; every stage packs, and the backend is
+# synchronized once; every stage's sends are posted; the local groups
+# of all of them run as one phase, one parallel loop on the CPU; and
+# once all the receives are in, every stage unpacks. Nothing a pack or a
+# local group of the group reads is written by another stage of it
+# (`stage_groups`), so this is the stages run one after another without
+# the waits between them, and the ghosts come out bit for bit the same.
+# The local groups of different stages write ghosts of blocks at
+# different levels, so the one phase writes each point once, as a phase
+# does.
+#
+# Each stage keeps its own tag, buffers and host mirrors, so the
+# messages are those the stages send alone, and a peer may run the same
+# stages one at a time. The send mirrors are copied down after the one
+# synchronization and each receive mirror up before its unpack, as
+# `run_stage!` does. A group of one stage is `run_stage!` itself, and a
+# group without messages is one phase and one barrier.
+function run_stages!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
+                     stages::Vector{<:ExchangeStage}, range::UnitRange{Int},
+                     forest::Forest, backend, sends, altsrc::AbstractArray=src,
+                     rotvars=nothing)
+    length(range) == 1 && return run_stage!(dest, src, nvars, factors, stages[only(range)],
+                                            forest, backend, sends, altsrc, rotvars)
+    locals = GroupedLocals(stages, range)
+    if all(i -> stages[i].remote === nothing, range)
+        run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
+                   rotvars=rotvars)
+        synchronize(backend)
+        return sends
+    end
+    comm = forest.comm
+    # The buffers and mirrors are fetched again at each step rather than
+    # kept from the first: they are cached with the stage, and a
+    # container of them would hand every launch below an abstract type.
+    recvs = Any[]
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        bufs = stagebuffers(remote, nvars, backend, forest)
+        wire = hoststaging(comm, bufs[1]) ? stagemirrors(remote, nvars, backend, forest) :
+               bufs
+        for (peer, r) in zip(remote.recvpeers, segment_ranges(remote.recvcounts, nvars))
+            push!(recvs, irecv(comm, view(wire[2], r), peer, stages[i].tag))
+        end
+    end
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        pack_stage!(src, remote, stagebuffers(remote, nvars, backend, forest), nvars,
+                    backend; altsrc=altsrc, rotvars=rotvars, sync=false)
+    end
+    synchronize(backend)
+    sends === nothing && (sends = Any[])
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        bufs = stagebuffers(remote, nvars, backend, forest)
+        staged = hoststaging(comm, bufs[1])
+        wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
+        staged && copyto!(wire[1], bufs[1])
+        for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
+            push!(sends, isend(comm, view(wire[1], r), peer, stages[i].tag))
+        end
+    end
+    run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
+               rotvars=rotvars)
+    waitall(comm, recvs)
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        bufs = stagebuffers(remote, nvars, backend, forest)
+        staged = hoststaging(comm, bufs[1])
+        staged && copyto!(bufs[2], stagemirrors(remote, nvars, backend, forest)[2])
+        unpack_stage!(dest, remote, bufs, nvars, factors, backend)
+    end
+    synchronize(backend)
+    return sends
+end
+run_stages!(fs::FieldSet, stages, range::UnitRange{Int}, forest::Forest, backend, sends) =
+    run_stages!(fs.work, fs.work, fs.nvars, fs.factors, stages, range, forest, backend,
+                sends, fs.work, fs.rotvars)
+
 # A whole staged ghost fill: phase 1, the boundary hook on this rank's
 # own blocks, then phase 2 by target level. This is `fill_ghosts!` once
 # its checks have passed; over a serial forest every stage is a plain
@@ -801,13 +909,18 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     end
 
     # Phase 2: prolongations, coarsest targets first. A prolongation may
-    # read its coarse source's ghosts, which the earlier sweeps filled.
-    # The relative hook's regions that read prolongated ghosts run after
-    # the stage that fills them (`boundary_after_stage!`).
-    for i in 2:length(stages)
-        sends = run_stage!(fs, stages[i], forest, backend, sends)
-        boundary === nothing ||
+    # read its coarse source's ghosts, which the earlier sweeps filled;
+    # levels that read nothing the ones below them write run together, as
+    # one group of stages (`stagegroups`). The relative hook's regions
+    # that read prolongated ghosts run after the group whose stage fills
+    # them (`boundary_after_stage!`), in level order.
+    groups = schedule.stagegroups
+    for k in 2:length(groups)
+        sends = run_stages!(fs, stages, groups[k], forest, backend, sends)
+        boundary === nothing && continue
+        for i in groups[k]
             boundary_after_stage!(fs, boundary, schedule, backend, stages[i].tag)
+        end
     end
     sends === nothing || waitall(forest.comm, sends)
     return fs
@@ -1185,7 +1298,10 @@ prolongation from a coarser neighbor — run in the phases described in
 prolongations swept coarsest target first, then the physical boundary
 hook. Each phase is one parallel loop with a barrier after it; on the
 CPU each thread fills the ghosts of the blocks it owns (see
-[`threadchunks`](@ref TreeAMR.threadchunks)).
+[`threadchunks`](@ref TreeAMR.threadchunks)). Prolongation levels that
+read nothing the levels below them write run as one such loop, and over
+a distributed forest with their messages in flight together (see
+[`GhostSchedule`](@ref)).
 
 Periodic boundaries need nothing special; the tree wraps around, so they
 are ordinary transfers. Reflecting faces need nothing either (M10): the

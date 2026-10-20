@@ -762,6 +762,58 @@ prolongated from a still-coarser block (levels l−2, l−1, l side by side
 are legal under 2:1 balance). Each phase/sweep step is an embarrassingly
 parallel loop over blocks, with barriers in between.
 
+**Levels that do not depend on each other run together.** The sweep's
+order matters only where a level-`ℓ` prolongation reads a point that
+the level-`(ℓ − 1)` step writes. Where none does, as on a nested mesh
+whose shells are two blocks thick, the two steps can be one. Under MPI
+each level's prolongations are packed where their sources live, and a
+level's shell is one stretch of the curve, so mostly on one rank: in
+sequence the fill's critical path is the sum over the levels, together
+it is one level. So the schedule records which
+runs of consecutive levels may run as one *group of stages*
+(`GhostSchedule`'s `stagegroups`), and a group runs as one parallel
+loop, its messages in flight together, with one wait (see "Stages"
+under [Distributed meshes](#distributed-meshes)). The test is on the
+points, per local block, from the host stencils at schedule build, in
+one pass over the transfers and the hook regions (`stage_groups`):
+
+- a level *writes* the target boxes of its local groups and its
+  unpacks, and the regions of the relative hook that run after it (their
+  `slot` is its tag): those run after the whole group, so a level above
+  that read them would read them unfilled;
+- it *reads* each local group's and each pack's source window on the
+  source block — along each dimension from the first column's start to
+  the last one's end, at the kernel's width (half the rows of a bounded
+  point-value stencil) — and the hook regions' nearest evolved points;
+- a level joins the group below it when it is the next level up on this
+  rank, when it conflicts with no level of the group — no point one of
+  them writes is read or written by the other — and when none of its
+  prolongations is rotated: a rotated window is in the virtual frame,
+  which the axis map turns into the real source's only at the launch,
+  and an odd orientation of a `RotationPair` reads the partner's array,
+  which a rank's boxes do not describe. Phase 1 is always alone, since
+  the hook runs after it.
+
+Only the level just below can write what a level reads, but the test
+asks every pair of the group, which costs the same and needs no
+argument. Mirrored and clamped transfers keep their image's source
+columns, which are in the source's frame, and the derived wall row reads
+the source beside its own wall, so their windows are found the same
+way. Every write to a block is made on the block's own rank, so each
+rank decides alone, from what it holds; ranks may decide differently,
+which the messages allow (see "Deadlock freedom and message matching").
+A group is permission, not obligation: its stages run one after another
+are the same fill, which is how a `RotationPair`'s merged stages still
+run, and the tests check it — a grouped fill against the same groups
+run in reverse level order and against every stage alone, from `NaN`
+ghosts, bit for bit. **(open)** Whether any mesh under the package's
+2:1 balance, which counts edge and corner neighbours, has a level that
+reads what the level below writes: a prolongation's source window
+reaches the source's ghosts only next to the fine block, where every
+block that fills them touches the fine block and so is within one level
+of it, and no mesh the tests build, nested, side by side, mirrored,
+clamped or rotated, has one. The check does not rely on the argument.
+
 Periodic boundaries need no special handling here — the tree wraps
 around (see [Domain and boundaries](#domain-and-boundaries)). Physical
 (outer) boundaries are filled by the user-supplied boundary hook,
@@ -3659,7 +3711,10 @@ before the next one starts there:
 - phase 1 is one stage. The boundary hook then runs locally, on each
   rank's own blocks, after that stage's unpacks — exactly where it runs
   today;
-- phase 2 is one stage per target level, ascending;
+- phase 2 is one stage per target level, ascending, and consecutive
+  levels that do not depend on each other run as one *group* of stages
+  (see "Levels that do not depend on each other run together" under
+  [Ghost filling](#ghost-filling));
 - `restrict_interfaces!` is one stage per face dimension, ascending.
   Its serial phases exist because a point on the line where two
   coarse-fine faces meet is written in two of them (`InterfaceSchedule`'s
@@ -3693,6 +3748,19 @@ written by an unpack:
 So the order inside a stage is free, as the order inside a serial
 phase is, and only the stage boundaries carry the serial ordering.
 
+A group of stages (`run_stages!`) takes each of the five steps for all
+of its stages before the next: every stage's receives, every stage's
+packs and one synchronization, every stage's sends, the local groups of
+all of them as one phase, and the unpacks once every receive is in;
+then the relative hook's regions of each stage, in level order. Each
+stage keeps its tag, its buffers and its host mirrors, so its messages
+are the ones it sends alone. The same argument covers the group: its
+levels write ghosts of blocks at different levels, so the one phase
+writes each point once, and the dependency check is exactly that no
+pack or local group of the group reads a point another of its stages
+writes, an unpack's or a hook region's included. So the order inside a
+group is free too, and a group of one stage is `run_stage!` itself.
+
 **Deadlock freedom and message matching.** Messages are nonblocking
 and matched by peer and tag, and the tag names the stage: phase 1, the
 target level, the face dimension, or the regrid. A rank enters only the
@@ -3704,6 +3772,17 @@ cannot be confused with another, since its tag is its own.
   completed locally, so every rank can pack and post its stage-`k`
   sends without waiting for anyone. Then every stage-`k` receive has
   its send posted, and the `waitall` returns.
+- *Groups of stages, by induction on the level.* A group posts all
+  its stages' sends before it waits for any of their receives, so a
+  rank posts its level-`ℓ` sends having waited only for phase 1 and the
+  levels below `ℓ`, grouped or not. Suppose every receive of those
+  completes, on every rank. Then every rank posts its level-`ℓ` sends,
+  and every level-`ℓ` receive completes; a group's one wait returns
+  once each of its levels' receives has, level by level. Phase 1
+  starts the induction, as above. Ranks may group differently, since a
+  message's tag and layout are its stage's and not its group's, and a
+  receive is matched alike whether it was posted early, with its group,
+  or late, alone.
 - *Across calls*, MPI's non-overtaking rule — two messages from one
   sender with one tag arrive in the order they were sent — matches each
   fill's message to the same fill's receive, provided every rank makes
@@ -4338,7 +4417,11 @@ The ideas that span several files and are easy to violate:
   stencils at a domain edge reach tangentially into the source's outer
   ghosts. The relative hook's regions that read prolongated ghosts run
   after the stage that fills them, not with the others ("Ghost
-  filling").
+  filling"). Levels that conflict in no point run as one group of
+  stages, decided per rank by `stage_groups` from the boxes each level
+  writes and reads; anything new that a phase-2 stage writes or reads
+  there — a transfer kind, a hook that runs after a stage — has to be
+  among those boxes, or levels that depend on it will run together.
 - **Reflecting and outflow faces are transfers, not hooks** (M10). The
   kind of each face is a property of the `Forest` (`faces`, read
   through `reflecting_faces`, `outflow_faces` and `facekind`), `parity` a
@@ -4716,6 +4799,11 @@ files are not tests:
   through the seam), interpolation beyond it, and the wave on a quadrant
   against the full plane (`rotating_wave`, scalar and vector, which the
   vertex-centered seam planes keep equal bit for bit).
+  `nested_octant` is the downstream's nested mesh, whose prolongation
+  levels run as one group of stages, and `fill_stagewise!` runs a fill
+  through the package's stages in groups of the caller's choosing, in
+  reverse level order if asked: the oracle for the stage groups'
+  dependency check.
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.

@@ -32,7 +32,9 @@
 # serial answers in global order. From M12 on it runs a rotating
 # quadrant too: the wave, a set that turns into itself and a
 # `RotationPair` through a fill, a regrid and interpolation beyond the
-# seam. The checkpoints moved to TreeIOHDF5, whose own workload runs them.
+# seam. It fills a nested mesh too, whose prolongation levels every rank
+# runs as one group of stages. The checkpoints moved to TreeIOHDF5, whose
+# own workload runs them.
 
 using TreeAMR
 using MPI: MPI
@@ -258,6 +260,43 @@ function fill_case(tag, forest::Forest{D}, centerings; G, ops,
         emit(tag, name, "interfaces", transfers(forest, isched))
         emit(tag, name, "restricted", digest(gathered(forest, fs.work)))
     end
+    return nothing
+end
+
+# --- prolongation levels run as one group of stages ----------------------
+
+# The nested mesh TreeGeneralizedHarmonic reported, small: a reflecting
+# octant of 4³ roots over [0, 32]³, with the cubes [0, 16)³, [0, 8)³ and
+# [0, 4)³ at levels 1, 2 and 3. Every shell is two blocks thick, so no
+# level reads what the one below writes, and each rank runs the levels
+# it holds as one group of stages, their messages in flight together;
+# a serial run has the group without the messages.
+function nested_octant_of(N)
+    forest = Forest((4, 4, 4); N=N, reflecting=ntuple(_ -> (true, false), 3),
+                    extents=ntuple(_ -> (0, 32), 3), comm=COMM)
+    for (lvl, side) in ((0, 16), (1, 8), (2, 4))
+        refine!(forest, filter(k -> level(k) == lvl &&
+                                    all(e -> e[2] <= side, block_extent(forest, k)),
+                               forest.leaves))
+        balance!(forest)
+    end
+    return forest
+end
+
+function grouped_case(tag)
+    forest = nested_octant_of(8)
+    fill_case(tag, forest, ("vertex" => vertexcentered(3),); G=3, ops=OPS6, relative=true)
+    # How the ranks grouped, which depends on the rank count: per rank,
+    # the stages of its largest group, and how many of them have messages.
+    fs = FieldSet(forest, 1; G=3, centering=vertexcentered(3),
+                  parity=[ntuple(_ -> EvenParity, 3)])
+    sched = GhostSchedule(fs, OPS6)
+    largest = argmax(length, sched.stagegroups)
+    staged = count(i -> sched.stages[i].remote !== nothing, largest)
+    groups = TreeAMR.allgather(forest.comm,
+                               (length(largest), length(largest) > 1 ? staged : 0))
+    emit("#", tag, "largest groups", join(first.(groups), " "), "with messages",
+         join(last.(groups), " "))
     return nothing
 end
 
@@ -1005,6 +1044,7 @@ end
 
 const OPS4 = Operators(prolongation=4, restriction=4)
 const OPS2 = Operators(prolongation=2, restriction=2)
+const OPS6 = Operators(prolongation=6, restriction=6)
 const OPSC = Operators(family=Conservative, prolongation=3, restriction=2)
 const OPSCB = Operators(family=Conservative, prolongation=3, restriction=2,
                         bounded=true)
@@ -1123,6 +1163,9 @@ function main()
               parity=[ntuple(_ -> EvenParity, 3), ntuple(_ -> EvenParity, 3)])
     rotating_case("Q2")
     rotating_empty_case("QE2")
+    # The nested octant, whose prolongation levels every rank runs as one
+    # group of stages.
+    grouped_case("N3")
     refusals()
     verbs()
     return nothing
