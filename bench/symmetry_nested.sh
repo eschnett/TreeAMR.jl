@@ -6,6 +6,8 @@
 #
 #     TREEAMR_REPO=<this checkout> TREEAMR_BASE=<baseline checkout> \
 #         sbatch bench/symmetry_nested.sh            # cpu, an AMD node
+#     TREEAMR_REPO=… TREEAMR_NESTED_VERSIONS="base=<dir> step1=<dir> step2=<dir>" \
+#         sbatch bench/symmetry_nested.sh            # any number of versions
 #     TREEAMR_REPO=… TREEAMR_BASE=… sbatch bench/symmetry_nested_gpu.sh
 #
 # The second is this script in mode `gpu` under an H200 job's
@@ -20,8 +22,11 @@
 # where Step 1's single-tap columns change nothing: the control) on one
 # domain at 1 and 8 threads; and the `--trace-compile-timing` comparison
 # of `test/mpi_workload.jl`, serial, three runs of each checkout, with
-# the compilation times summed and the two outputs compared byte for
-# byte (CLAUDE.md's rule for a change to a launch path).
+# the compilation times summed and the outputs compared byte for byte
+# (CLAUDE.md's rule for a change to a launch path). Every checkout runs
+# the same workload file, the first version's (`TREEAMR_NESTED_WORKLOAD`
+# to choose another), so that a version whose workload gained a case is
+# not charged for compiling it.
 #
 # `gpu`, on an H200 node, one rank a GPU: `bench/nested.jl` at `N = 32`
 # on 1, 2 and 4 GPUs, under MPICH_jll (always staged through host
@@ -35,7 +40,12 @@
 # nested` for cpu, `setup nested` for gpu; `smoke` runs `nested.jl` at a
 # tiny size instead of the timed sizes, to check the setup).
 # `TREEAMR_NESTED_ROUNDS` (default 2) is how often each configuration is
-# run per checkout, the order of the two alternating between rounds.
+# run per checkout, the order of the checkouts rotating between rounds.
+# `TREEAMR_NESTED_VERSIONS` names the checkouts, `name=dir` each, the
+# first the reference of the tables (default `base=$TREEAMR_BASE
+# new=$TREEAMR_REPO`); the bench files are always `$TREEAMR_REPO`'s.
+# `TREEAMR_NESTED_SHAPES` picks the cpu rank shapes (default `1x1 2x1
+# 4x1 8x8`), `TREEAMR_NESTED_GPUS` the gpu rank counts (default `1 2 4`).
 #
 # Each checkout gets environments of its own under `TREEAMR_NESTED_ENVS`,
 # per mode, so that the compile caches of the two node types do not
@@ -63,7 +73,10 @@ MODE="${1:-cpu}"
 case $MODE in cpu|gpu) ;; *) echo "mode must be cpu or gpu, got $MODE" >&2; exit 2 ;; esac
 export PATH="$HOME/.juliaup/bin:$PATH"
 REPO="${TREEAMR_REPO:?set TREEAMR_REPO to this checkout}"
-BASE="${TREEAMR_BASE:?set TREEAMR_BASE to the baseline checkout}"
+VERSIONS="${TREEAMR_NESTED_VERSIONS:-base=${TREEAMR_BASE:?set TREEAMR_BASE or TREEAMR_NESTED_VERSIONS} new=$REPO}"
+NAMES=$(for v in $VERSIONS; do printf '%s ' "${v%%=*}"; done)
+SHAPES="${TREEAMR_NESTED_SHAPES:-1x1 2x1 4x1 8x8}"
+GPUS="${TREEAMR_NESTED_GPUS:-1 2 4}"
 ENVS="${TREEAMR_NESTED_ENVS:-$HOME/claude/treeamr-nested/envs}/$MODE"
 RUNDIR="${SLURM_SUBMIT_DIR:-$PWD}/${SLURM_JOB_NAME:-nested}-${SLURM_JOB_ID:-local}"
 OUT="${TREEAMR_NESTED_OUT:-$RUNDIR}"
@@ -89,14 +102,19 @@ simwatch_begin "$RUNDIR" "nested-mesh ghost fill, $MODE" "$nstages"
 
 rev() { git -C "$1" rev-parse --short HEAD 2>/dev/null || cat "$1/.revision" 2>/dev/null || echo '?'; }
 echo "# $(hostname) $(date -Iseconds) mode=$MODE stages=$STAGES rounds=$ROUNDS"
-echo "# new  $REPO ($(rev "$REPO"))"
-echo "# base $BASE ($(rev "$BASE"))"
+for v in $VERSIONS; do echo "# ${v%%=*} ${v#*=} ($(rev "${v#*=}"))"; done
+echo "# bench files from $REPO ($(rev "$REPO"))"
 echo "# output in $OUT"
 lscpu | grep -E 'Model name|^Socket|^NUMA|L3' || true
 [ "$MODE" = gpu ] && { nvidia-smi -L; nvidia-smi topo -m || true; }
 
 # The checkouts by name, and the environments of each.
-repo_of() { [ "$1" = base ] && echo "$BASE" || echo "$REPO"; }
+repo_of() {
+    local v
+    for v in $VERSIONS; do [ "${v%%=*}" = "$1" ] && { echo "${v#*=}"; return; }; done
+    echo "no version $1" >&2
+    return 1
+}
 cpuenv() { echo "$ENVS/$1"; }
 gpuenv() { echo "$ENVS/$1-$2"; }                 # which, jll or hpcx
 
@@ -183,12 +201,16 @@ nested_gpu() {
     )
 }
 
-# The order of the two checkouts in round `r`: base first in odd rounds.
-order() { [ $(( $1 % 2 )) = 1 ] && echo "base new" || echo "new base"; }
+# The order of the checkouts in round `r`: the list rotated by `r - 1`.
+order() {
+    local -a n=($NAMES)
+    local k=${#n[@]} i
+    for ((i = 0; i < k; i++)); do printf '%s ' "${n[$(( (i + $1 - 1) % k ))]}"; done
+}
 
 if want setup; then
     simwatch_stage "setting up environments"
-    for which in base new; do
+    for which in $NAMES; do
         if [ "$MODE" = cpu ]; then
             setup_cpu "$which"
         else
@@ -198,7 +220,7 @@ if want setup; then
     done
     # Not under HPC-X: a singleton `MPI.Init` of Open MPI in a job waits
     # for a daemon (bench/symmetry_mpi_gpu.sh), so ask MPICH_jll's env.
-    [ "$MODE" = gpu ] && "$JULIA" --project="$(gpuenv new jll)" -e '
+    [ "$MODE" = gpu ] && "$JULIA" --project="$(gpuenv "${NAMES%% *}" jll)" -e '
         using CUDA, MPI
         MPI.versioninfo(); CUDA.versioninfo()' || true
 fi
@@ -207,7 +229,7 @@ if want smoke; then
     simwatch_stage "smoke runs at a tiny size"
     export TREEAMR_BENCH_N=8 TREEAMR_BENCH_NVARS=4 TREEAMR_BENCH_REPS=1
     export TREEAMR_BENCH_FOOTPRINT_P=""
-    for which in base new; do
+    for which in $NAMES; do
         if [ "$MODE" = cpu ]; then
             nested_cpu "$which" 2 1 "smoke-$which-2x1"
             nested_cpu "$which" 8 8 "smoke-$which-8x8"
@@ -223,6 +245,8 @@ fi
 
 if want compile; then
     simwatch_stage "compile timing of test/mpi_workload.jl"
+    WORKLOAD="${TREEAMR_NESTED_WORKLOAD:-$(repo_of "${NAMES%% *}")/test/mpi_workload.jl}"
+    echo "# workload $WORKLOAD"
     for r in 1 2 3; do
         for which in $(order "$r"); do
             repo=$(repo_of "$which")
@@ -231,20 +255,24 @@ if want compile; then
             (cd "$repo" && numactl --cpunodebind=0 --membind=0 \
                 "$JULIA" --project="$(cpuenv "$which")" -t 1 \
                 --trace-compile="$OUT/$stem.trace" --trace-compile-timing \
-                test/mpi_workload.jl > "$OUT/$stem.out")
+                "$WORKLOAD" > "$OUT/$stem.out")
             t1=$(date +%s.%N)
             awk -v which="$which" -v r="$r" -v wall="$(awk -v a="$t0" -v b="$t1" 'BEGIN { print b - a }')" '
                 /^#= *[0-9.]+ ms =#/ { n++; t += $2; if ($0 ~ /TreeAMR/) { m++; u += $2 } }
-                END { printf "C\t%s\t%d\t%.2f\t%d\t%.2f\t%d\t%.2f\n", which, r, wall,
+                END { printf "C\t%s\t%d\t%.2f\t%.2f\t%d\t%.2f\t%d\n", which, r, wall,
                       t / 1000, n, u / 1000, m }' "$OUT/$stem.trace" | tee -a "$OUT/compile.tsv"
         done
     done
-    if cmp -s "$OUT/compile-base-1.out" "$OUT/compile-new-1.out"; then
-        echo "# mpi_workload.jl output: base and new identical"
-    else
-        echo "# mpi_workload.jl output: base and new DIFFER"
-        diff "$OUT/compile-base-1.out" "$OUT/compile-new-1.out" | head -20 || true
-    fi
+    first=${NAMES%% *}
+    for which in $NAMES; do
+        [ "$which" = "$first" ] && continue
+        if cmp -s "$OUT/compile-$first-1.out" "$OUT/compile-$which-1.out"; then
+            echo "# mpi_workload.jl output: $first and $which identical"
+        else
+            echo "# mpi_workload.jl output: $first and $which DIFFER"
+            diff "$OUT/compile-$first-1.out" "$OUT/compile-$which-1.out" | head -20 || true
+        fi
+    done
 fi
 
 if want ghosts; then
@@ -266,12 +294,12 @@ if want ghosts; then
 fi
 
 if want nested; then
-    simwatch_stage "bench/nested.jl, base and new"
+    simwatch_stage "bench/nested.jl, every version"
     if [ "$MODE" = cpu ]; then
         export TREEAMR_BENCH_N="${TREEAMR_BENCH_N:-16}"
         for r in $(seq 1 "$ROUNDS"); do
-            for shape in "1 1" "2 1" "4 1" "8 8"; do
-                set -- $shape
+            for shape in $SHAPES; do
+                set -- ${shape/x/ }
                 for which in $(order "$r"); do
                     nested_cpu "$which" "$1" "$2" "nested-$which-$1x$2-r$r"
                 done
@@ -280,10 +308,14 @@ if want nested; then
     else
         export TREEAMR_BENCH_N="${TREEAMR_BENCH_N:-32}"
         for r in $(seq 1 "$ROUNDS"); do
-            for which in $(order "$r"); do
-                nested_gpu "$which" jll 1 0 "nested-$which-1gpu-jll-r$r"
+            for ranks in $GPUS; do
+                [ "$ranks" = 1 ] || continue
+                for which in $(order "$r"); do
+                    nested_gpu "$which" jll 1 0 "nested-$which-1gpu-jll-r$r"
+                done
             done
-            for ranks in 2 4; do
+            for ranks in $GPUS; do
+                [ "$ranks" = 1 ] && continue
                 for v in "jll 0 staged" "hpcx 0 staged" "hpcx 1 direct"; do
                     set -- $v
                     for which in $(order "$r"); do
@@ -302,7 +334,8 @@ simwatch_stage "tables"
 # per-rank minima of the packs, per stage.
 if ls "$OUT"/nested-*.tsv > /dev/null 2>&1; then
     echo "=== nested.jl: slowest rank, min over rounds (ms) ==="
-    awk -F'\t' '
+    awk -F'\t' -v names="$NAMES" '
+        BEGIN { nv = split(names, vs, " ") }
         FNR == 1 { split(FILENAME, p, "/"); f = p[length(p)]; split(f, q, "-"); which = q[2] }
         $1 == "T" {
             k = $2 SUBSEP $3
@@ -311,12 +344,22 @@ if ls "$OUT"/nested-*.tsv > /dev/null 2>&1; then
             if (!((k, which) in best) || v < best[k, which]) best[k, which] = v
         }
         END {
-            printf "%-24s %-26s %12s %12s %8s\n", "config", "quantity", "base", "new", "new/base"
+            printf "%-24s %-26s", "config", "quantity"
+            for (j = 1; j <= nv; j++) printf " %10s", vs[j]
+            for (j = 2; j <= nv; j++) printf " %11s", vs[j] "/" vs[1]
+            printf "\n"
             for (i = 1; i <= nk; i++) {
                 split(keys[i], kk, SUBSEP)
-                b = best[keys[i], "base"]; n = best[keys[i], "new"]
-                printf "%-24s %-26s %12.3f %12.3f %8.3f\n", kk[1], kk[2], b, n,
-                       (b > 0 ? n / b : 0)
+                printf "%-24s %-26s", kk[1], kk[2]
+                for (j = 1; j <= nv; j++)
+                    if ((keys[i], vs[j]) in best) printf " %10.3f", best[keys[i], vs[j]]
+                    else printf " %10s", "-"
+                b = best[keys[i], vs[1]]
+                for (j = 2; j <= nv; j++)
+                    if (b > 0 && (keys[i], vs[j]) in best)
+                        printf " %11.3f", best[keys[i], vs[j]] / b
+                    else printf " %11s", "-"
+                printf "\n"
             }
         }' "$OUT"/nested-*.tsv
     echo "=== nested.jl: per-rank minimum of the packs and stages, round 1 (ms) ==="
@@ -328,8 +371,9 @@ if ls "$OUT"/nested-*.tsv > /dev/null 2>&1; then
             for (i = 1; i <= n; i++) s = s sprintf(" %9.3f", t[i] * 1000)
             printf "%-22s%s\n", $3, s }' "$f"
     done
-    echo "=== nested.jl: counts (round 1, new) ==="
-    for f in "$OUT"/nested-new-*-r1.tsv; do
+    last=$(echo $NAMES | awk '{ print $NF }')
+    echo "=== nested.jl: counts (round 1, $last) ==="
+    for f in "$OUT"/nested-"$last"-*-r1.tsv; do
         echo "## $(basename "$f" .tsv)"
         grep -E '^(ranks|# )' "$f" | grep -v '^# footprint P=[0-9]* L[0-9] [0-9]' || true
     done

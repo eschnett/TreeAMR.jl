@@ -37,10 +37,11 @@
 #     stage:L<l>      the prolongation stage onto level l alone
 #     phase2          every prolongation stage, one after another, as a
 #                     fill without stage groups runs them
-#     phase2:grouped  the same through this rank's stage groups, where the
-#                     schedule has `stagegroups`: each through
-#                     `run_stages!` if this TreeAMR has one, else its
-#                     stages one after another, said in the name
+#     phase2:grouped  the same through this rank's stage groups but phase 1's,
+#                     where the schedule has `stagegroups`, as the fill
+#                     runs them: each through `run_stages!` if this
+#                     TreeAMR has it, else its stages one after another,
+#                     said in the name
 #     group:<a>-<b>   each stage group alone, where every rank groups alike
 #                     (otherwise a rank would wait in one group's window
 #                     for messages its peer sends in the next one's)
@@ -313,20 +314,18 @@ end
 
 # --- The run ------------------------------------------------------------------
 
-# A stage group: `run_stages!` where this TreeAMR has one of the forms
-# tried here, else its stages one after another.
+# A stage group, a range of `schedule.stages`: through `run_stages!`
+# where this TreeAMR has it, else its stages one after another. Either
+# takes the call's sends so far and returns them, as `run_stage!` does.
 function group_runner(fs, schedule, forest, g)
-    stages = schedule.stages[g]
     if isdefined(TreeAMR, :run_stages!)
         f = TreeAMR.run_stages!
-        applicable(f, fs, stages, forest, BACKEND, nothing) &&
-            return "", () -> f(fs, stages, forest, BACKEND, nothing)
-        applicable(f, fs, schedule, g, BACKEND, nothing) &&
-            return "", () -> f(fs, schedule, g, BACKEND, nothing)
+        args(sends) = (fs.work, fs.work, fs.nvars, fs.factors, schedule.stages, g, forest,
+                       BACKEND, sends, fs.work, fs.rotvars)
+        applicable(f, args(nothing)...) && return "", sends -> f(args(sends)...)
     end
-    return "(sequential)", () -> begin
-        sends = nothing
-        for st in stages
+    return "(sequential)", sends -> begin
+        for st in schedule.stages[g]
             sends = TreeAMR.run_stage!(fs, st, forest, BACKEND, sends)
         end
         sends
@@ -434,19 +433,26 @@ function main()
         sync()
     end))
     if grouped
-        runners = [group_runner(fs, schedule, forest, g) for g in schedule.stagegroups]
-        how = isempty(runners) ? "" : first(first(runners))
+        # Phase 2 through this rank's groups, as the fill runs it: every
+        # group but phase 1's, the sends waited on at the end.
+        runners = [(g, group_runner(fs, schedule, forest, g)...)
+                   for g in schedule.stagegroups]
+        how = isempty(runners) ? "" : runners[1][2]
+        later = [f for (g, _, f) in runners
+                 if !any(i -> stages[i].tag == TreeAMR.PHASE1_TAG, g)]
         report("phase2:grouped$how", measure(() -> begin
-            for (_, f) in runners
-                waitsends(f())
+            sends = nothing
+            for f in later
+                sends = f(sends)
             end
+            waitsends(sends)
             sync()
         end))
         if samegroups
-            for (g, (_, f)) in zip(schedule.stagegroups, runners)
+            for (g, _, f) in runners
                 name = "group:$(stagename(stages[first(g)]))-" *
                        "$(stagename(stages[last(g)]))$how"
-                report(name, measure(() -> (waitsends(f()); sync())))
+                report(name, measure(() -> (waitsends(f(nothing)); sync())))
             end
         end
     end
