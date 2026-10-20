@@ -99,8 +99,13 @@
             end
         end
     end
-    singlerows = [:($(Symbol(:k_, d)) = Int(singles[$d][wcol[$d]]))
-                  for d in 1:D if Ps[d] > 1 && singles !== Nothing]
+    # A loop, not a filtered comprehension: the generator itself is
+    # compiled for every type it closes over.
+    singlerows = Expr[]
+    for d in 1:D
+        Ps[d] > 1 && singles !== Nothing &&
+            push!(singlerows, :($(Symbol(:k_, d)) = Int(singles[$d][wcol[$d]])))
+    end
     return quote
         Base.@_inline_meta
         acc = zero(transfer_eltype(src))
@@ -588,7 +593,7 @@ run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
 # wait for the receives and unpack. The sends are waited on once, at the
 # end of the call. The pieces are separate functions so that the tests
 # can run every simulated rank's stage in lockstep in one process,
-# wiring the buffers between ranks directly; `run_stage!` composes them
+# wiring the buffers between ranks directly; `run_stages!` composes them
 # through the communicator verbs, which is the path a real run takes.
 #
 # A stage without messages is a phase exactly as before M7, so a serial
@@ -736,17 +741,43 @@ end
 unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
     unpack_stage!(fs.work, remote, bufs, fs.nvars, fs.factors, backend)
 
-# Run one stage on this rank through the forest's communicator, from
-# `src` into `dest`: the same working array in an exchange, since its
-# targets are ghosts and its sources interiors, and the old and the new
-# mesh's arrays in the regrid transfer (step 4 of M7), whose packs read
-# the old blocks and whose local groups and unpacks write the new ones.
-# `sends` collects the send requests of the call so far — `nothing`
-# until the first one — and is returned, to be waited on at the end of
-# the call. The communicator is fetched only where a stage has
+# Run the stages `stages[range]` on this rank as one group through the
+# forest's communicator (a run of `GhostSchedule`'s `stagegroups`, or a
+# single stage), from `src` into `dest`: the same working array in an
+# exchange, since its targets are ghosts and its sources interiors, and
+# the old and the new mesh's arrays in the regrid transfer (step 4 of
+# M7), whose packs read the old blocks and whose local groups and unpacks
+# write the new ones. `locals` are the local groups of all of them, in
+# stage order: a single stage's own `locals`, or the group's
+# concatenation (`GhostSchedule`'s `grouplocals`), built with the
+# schedule. `sends` collects the send requests of the call so far —
+# `nothing` until the first one — and is returned, to be waited on at the
+# end of the call. The communicator is fetched only where a stage has
 # messages: the field is abstractly typed, and a call that took it as an
 # argument would be dispatched at run time on every stage of a serial
 # fill too.
+#
+# A stage runs in five steps, and a group takes each for every stage of
+# it before the next: every stage's receives are posted; every stage
+# packs, and the backend is synchronized once; every stage's sends are
+# posted; the local groups of all of them run as one phase, one parallel
+# loop on the CPU; and once all the receives are in, every stage unpacks.
+# Nothing a pack or a local group of a group reads is written by another
+# stage of it (`stage_groups`), so this is the stages run one after
+# another without the waits between them, and the ghosts come out bit
+# for bit the same. The local groups of different stages write ghosts of
+# blocks at different levels, so the one phase writes each point once, as
+# a phase does. Each stage keeps its own tag, buffers and host mirrors,
+# so the messages are those the stages send alone, and a peer may run the
+# same stages one at a time. A group without messages is one phase and
+# one barrier.
+#
+# One driver, for a group and for a single stage alike, with the locals
+# handed in as the `Vector` a stage holds: a second driver, or an
+# iterator over the stages' locals, is a second specialization of the
+# whole fill's call tree for every field-set type, which the
+# compilation-bound MPI workload paid for in seconds ("Stages" in
+# CODE.md has the count).
 #
 # On a device whose buffers the communicator cannot take (`hoststaging`,
 # step 8 of M7) the messages go through host mirrors: the receives are
@@ -762,106 +793,55 @@ unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
 # can receive into the mirror again (each stage has mirrors of its own,
 # and the send mirror is rewritten only after the call's sends have been
 # waited on). A CPU buffer is an `Array` and goes to the communicator
-# directly, as before.
+# directly, as before. The buffers and mirrors are fetched again at each
+# step rather than kept from the first: they are cached with the stage,
+# and a container of them would hand every launch below an abstract
+# type.
 #
 # `altsrc` and `rotvars` are what a rotated transfer (M12) reads through:
 # the array its odd orientations read — the partner's in a
 # `RotationPair`, `src` itself otherwise — and the variable table. The
 # packs read them as the local groups do; an unpack is a plain copy with
 # the factor column, so it needs neither.
-function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
-                    stage::ExchangeStage, forest::Forest, backend, sends,
-                    altsrc::AbstractArray=src, rotvars=nothing)
-    remote = stage.remote
-    if remote === nothing
-        run_phase!(dest, src, stage.locals, nvars, backend; factors=factors,
-                   altsrc=altsrc, rotvars=rotvars)
-        synchronize(backend)
-        return sends
-    end
-    comm = forest.comm
-    bufs = stagebuffers(remote, nvars, backend, forest)
-    staged = hoststaging(comm, bufs[1])
-    wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
-    recvs = Any[irecv(comm, view(wire[2], r), peer, stage.tag)
-                for (peer, r) in zip(remote.recvpeers,
-                                     segment_ranges(remote.recvcounts, nvars))]
-    pack_stage!(src, remote, bufs, nvars, backend; altsrc=altsrc, rotvars=rotvars)
-    staged && copyto!(wire[1], bufs[1])
-    sends === nothing && (sends = Any[])
-    for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
-        push!(sends, isend(comm, view(wire[1], r), peer, stage.tag))
-    end
-    run_phase!(dest, src, stage.locals, nvars, backend; factors=factors, altsrc=altsrc,
-               rotvars=rotvars)
-    waitall(comm, recvs)
-    staged && copyto!(bufs[2], wire[2])
-    unpack_stage!(dest, remote, bufs, nvars, factors, backend)
-    synchronize(backend)
-    return sends
-end
-run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
-    run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends,
-               fs.work, fs.rotvars)
-
-# The local groups of the stages `stages[range]`, one after another: what
-# a group of stages runs as one phase. An iterator of its own rather than
-# `Iterators.flatten`, whose element type inference loses, which would
-# dispatch every launch of the phase at run time.
-struct GroupedLocals{ST<:ExchangeStage}
-    stages::Vector{ST}
-    range::UnitRange{Int}
-end
-
-Base.IteratorSize(::Type{<:GroupedLocals}) = Base.SizeUnknown()
-Base.eltype(::Type{GroupedLocals{ExchangeStage{GRP,RS}}}) where {GRP,RS} = GRP
-
-function Base.iterate(g::GroupedLocals, (i, j)=(first(g.range), 1))
-    while i <= last(g.range)
-        groups = g.stages[i].locals
-        j <= length(groups) && return (groups[j], (i, j + 1))
-        i, j = i + 1, 1
-    end
-    return nothing
-end
-
-# Run the stages `stages[range]` on this rank as one group (a run of
-# `GhostSchedule`'s `stagegroups`): the five steps of `run_stage!`, each
-# taken for every stage of the group before the next. Every stage's
-# receives are posted; every stage packs, and the backend is
-# synchronized once; every stage's sends are posted; the local groups
-# of all of them run as one phase, one parallel loop on the CPU; and
-# once all the receives are in, every stage unpacks. Nothing a pack or a
-# local group of the group reads is written by another stage of it
-# (`stage_groups`), so this is the stages run one after another without
-# the waits between them, and the ghosts come out bit for bit the same.
-# The local groups of different stages write ghosts of blocks at
-# different levels, so the one phase writes each point once, as a phase
-# does.
-#
-# Each stage keeps its own tag, buffers and host mirrors, so the
-# messages are those the stages send alone, and a peer may run the same
-# stages one at a time. The send mirrors are copied down after the one
-# synchronization and each receive mirror up before its unpack, as
-# `run_stage!` does. A group of one stage is `run_stage!` itself, and a
-# group without messages is one phase and one barrier.
-function run_stages!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
-                     stages::Vector{<:ExchangeStage}, range::UnitRange{Int},
-                     forest::Forest, backend, sends, altsrc::AbstractArray=src,
-                     rotvars=nothing)
-    length(range) == 1 && return run_stage!(dest, src, nvars, factors, stages[only(range)],
-                                            forest, backend, sends, altsrc, rotvars)
-    locals = GroupedLocals(stages, range)
-    if all(i -> stages[i].remote === nothing, range)
+Base.@nospecializeinfer function run_stages!(dest::AbstractArray, src::AbstractArray,
+                                             nvars::Integer, factors,
+                                             stages::Vector{<:ExchangeStage},
+                                             range::UnitRange{Int},
+                                             locals::Vector{<:TransferGroup},
+                                             forest::Forest, backend, @nospecialize(sends),
+                                             altsrc::AbstractArray, rotvars)
+    if !anyremote(stages, range)
         run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
                    rotvars=rotvars)
         synchronize(backend)
-        return sends
+        return sends::Union{Nothing,Vector{Any}}
     end
+    recvs, out = send_stages!(src, stages, range, nvars, forest, backend, sends, altsrc,
+                              rotvars)
+    run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
+               rotvars=rotvars)
+    receive_stages!(dest, stages, range, nvars, factors, forest, backend, recvs)
+    return out
+end
+run_stages!(fs::FieldSet, stages, range::UnitRange{Int}, locals, forest::Forest, backend,
+            sends) =
+    run_stages!(fs.work, fs.work, fs.nvars, fs.factors, stages, range, locals, forest,
+                backend, sends, fs.work, fs.rotvars)
+
+# The message steps of `run_stages!`, each a function of only what it
+# reads, so that the larger part of the driver is compiled once per
+# source and once per target rather than for every combination of the
+# two. `sends` is not specialized on either: it is `nothing` or a
+# `Vector{Any}`, and every call site would otherwise compile both.
+#
+# The receives posted, the packs and the one synchronization, and the
+# sends posted: the receive requests, and the call's sends so far.
+Base.@nospecializeinfer function send_stages!(src::AbstractArray,
+                                              stages::Vector{<:ExchangeStage},
+                                              range::UnitRange{Int}, nvars::Integer,
+                                              forest::Forest, backend, @nospecialize(sends),
+                                              altsrc::AbstractArray, rotvars)
     comm = forest.comm
-    # The buffers and mirrors are fetched again at each step rather than
-    # kept from the first: they are cached with the stage, and a
-    # container of them would hand every launch below an abstract type.
     recvs = Any[]
     for i in range
         remote = stages[i].remote
@@ -880,7 +860,7 @@ function run_stages!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fa
                     backend; altsrc=altsrc, rotvars=rotvars, sync=false)
     end
     synchronize(backend)
-    sends === nothing && (sends = Any[])
+    out = sends === nothing ? Any[] : sends::Vector{Any}
     for i in range
         remote = stages[i].remote
         remote === nothing && continue
@@ -889,11 +869,17 @@ function run_stages!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fa
         wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
         staged && copyto!(wire[1], bufs[1])
         for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
-            push!(sends, isend(comm, view(wire[1], r), peer, stages[i].tag))
+            push!(out, isend(comm, view(wire[1], r), peer, stages[i].tag))
         end
     end
-    run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
-               rotvars=rotvars)
+    return recvs, out
+end
+
+# The wait for the receives, the unpacks, and the closing synchronization.
+function receive_stages!(dest::AbstractArray, stages::Vector{<:ExchangeStage},
+                         range::UnitRange{Int}, nvars::Integer, factors, forest::Forest,
+                         backend, recvs::Vector{Any})
+    comm = forest.comm
     waitall(comm, recvs)
     for i in range
         remote = stages[i].remote
@@ -904,11 +890,25 @@ function run_stages!(dest::AbstractArray, src::AbstractArray, nvars::Integer, fa
         unpack_stage!(dest, remote, bufs, nvars, factors, backend)
     end
     synchronize(backend)
-    return sends
+    return nothing
 end
-run_stages!(fs::FieldSet, stages, range::UnitRange{Int}, forest::Forest, backend, sends) =
-    run_stages!(fs.work, fs.work, fs.nvars, fs.factors, stages, range, forest, backend,
-                sends, fs.work, fs.rotvars)
+
+# Whether any of the stages `stages[range]` sends or receives here. A loop
+# rather than `all` over a closure, which would be one more method per
+# stage type.
+function anyremote(stages::Vector{<:ExchangeStage}, range::UnitRange{Int})
+    for i in range
+        stages[i].remote === nothing || return true
+    end
+    return false
+end
+
+# One stage alone, which is the group of one: what the tests and the
+# benchmarks run a stage with. The one-element vector is allocated per
+# call, so the fill itself goes through `run_stages!` with its schedule's
+# own vectors.
+run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
+    run_stages!(fs, [stage], 1:1, stage.locals, forest, backend, sends)
 
 # A whole staged ghost fill: phase 1, the boundary hook on this rank's
 # own blocks, then phase 2 by target level. This is `fill_ghosts!` once
@@ -917,9 +917,11 @@ run_stages!(fs::FieldSet, stages, range::UnitRange{Int}, forest::Forest, backend
 function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backend)
     forest = schedule.forest
     stages = schedule.stages
+    groups = schedule.stagegroups
+    locals = schedule.grouplocals
     # Phase 1: same-level copies and restrictions. Both read interiors
     # only, so they cannot race with each other.
-    sends = run_stage!(fs, stages[1], forest, backend, nothing)
+    sends = run_stages!(fs, stages, groups[1], locals[1], forest, backend, nothing)
 
     # Physical boundaries, before prolongation rather than after
     # everything: a block against the domain edge has prolongation
@@ -935,9 +937,8 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     # one group of stages (`stagegroups`). The relative hook's regions
     # that read prolongated ghosts run after the group whose stage fills
     # them (`boundary_after_stage!`), in level order.
-    groups = schedule.stagegroups
     for k in 2:length(groups)
-        sends = run_stages!(fs, stages, groups[k], forest, backend, sends)
+        sends = run_stages!(fs, stages, groups[k], locals[k], forest, backend, sends)
         boundary === nothing && continue
         for i in groups[k]
             boundary_after_stage!(fs, boundary, schedule, backend, stages[i].tag)
@@ -1499,21 +1500,23 @@ function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule
                         backend)
     a, b = pair.a, pair.b
     forest = sa.forest
-    runa(stage, sends) = run_stage!(a.work, a.work, a.nvars, pair.afactors, stage, forest,
-                                    backend, sends, b.work, pair.arotvars)
-    runb(stage, sends) = run_stage!(b.work, b.work, b.nvars, pair.bfactors, stage, forest,
-                                    backend, sends, a.work, pair.brotvars)
-    sends = runa(sa.stages[1], nothing)
-    sends = runb(sb.stages[1], sends)
+    runa(i, sends) = run_stages!(a.work, a.work, a.nvars, pair.afactors, sa.stages, i:i,
+                                 sa.stages[i].locals, forest, backend, sends, b.work,
+                                 pair.arotvars)
+    runb(i, sends) = run_stages!(b.work, b.work, b.nvars, pair.bfactors, sb.stages, i:i,
+                                 sb.stages[i].locals, forest, backend, sends, a.work,
+                                 pair.brotvars)
+    sends = runa(1, nothing)
+    sends = runb(1, sends)
     hooks[1] === nothing || apply_boundary!(a, hooks[1], sa, backend)
     hooks[2] === nothing || apply_boundary!(b, hooks[2], sb, backend)
     tags = sort!(unique!([[st.tag for st in sa.stages[2:end]];
                           [st.tag for st in sb.stages[2:end]]]))
     for tag in tags
         i = findfirst(st -> st.tag == tag, sa.stages)
-        i === nothing || (sends = runa(sa.stages[i], sends))
+        i === nothing || (sends = runa(i, sends))
         j = findfirst(st -> st.tag == tag, sb.stages)
-        j === nothing || (sends = runb(sb.stages[j], sends))
+        j === nothing || (sends = runb(j, sends))
         hooks[1] === nothing || boundary_after_stage!(a, hooks[1], sa, backend, tag)
         hooks[2] === nothing || boundary_after_stage!(b, hooks[2], sb, backend, tag)
     end

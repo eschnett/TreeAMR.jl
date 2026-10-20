@@ -318,11 +318,18 @@ end
 # --- The run ------------------------------------------------------------------
 
 # A stage group, a range of `schedule.stages`: through `run_stages!`
-# where this TreeAMR has it, else its stages one after another. Either
-# takes the call's sends so far and returns them, as `run_stage!` does.
+# where this TreeAMR has it — with the group's `grouplocals` where the
+# schedule holds them, else in the form that gathered them itself — else
+# its stages one after another. Either takes the call's sends so far and
+# returns them, as `run_stage!` does.
 function group_runner(fs, schedule, forest, g)
     if isdefined(TreeAMR, :run_stages!)
         f = TreeAMR.run_stages!
+        if hasfield(typeof(schedule), :grouplocals)
+            locals = schedule.grouplocals[findfirst(==(g), schedule.stagegroups)]
+            largs(sends) = (fs, schedule.stages, g, locals, forest, BACKEND, sends)
+            applicable(f, largs(nothing)...) && return "", sends -> f(largs(sends)...)
+        end
         args(sends) = (fs.work, fs.work, fs.nvars, fs.factors, schedule.stages, g, forest,
                        BACKEND, sends, fs.work, fs.rotvars)
         applicable(f, args(nothing)...) && return "", sends -> f(args(sends)...)

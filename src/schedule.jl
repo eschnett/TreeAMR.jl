@@ -550,7 +550,9 @@ The phasing follows `CODE.md`:
   prolongation runs alone. The decision is the rank's own, from the
   transfers it holds, and is permission rather than obligation: each
   stage keeps its tag and its messages, so ranks may group differently;
-  see "Ghost filling" in `CODE.md`.
+  see "Ghost filling" in `CODE.md`. `grouplocals[k]` holds the local
+  groups of `stagegroups[k]`, its stages' in order, which is what the
+  group runs as one phase.
 
 Periodic boundaries appear nowhere special here: the tree wraps around,
 so they are ordinary copies, restrictions, and prolongations. Reflecting
@@ -618,6 +620,18 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     boundaryplan::BP
     stages::Vector{ST}                           # phase 1, then phase 2 by level
     stagegroups::Vector{UnitRange{Int}}          # runs of `stages` that run together
+    grouplocals::Vector{Vector{GRP}}             # each run's local groups, in stage order
+
+    # The constructor the build calls, which derives `grouplocals`: inside
+    # it every type is static, which the build's own body is not.
+    function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
+        forest, generation, G, centering, walls, operators, backend, phase1, phase2,
+        levels, boundaries, boundaryplan, stages, stagegroups) where {T,D,R,BK,GRP,BP,ST}
+        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, walls, operators,
+                                       backend, phase1, phase2, levels, boundaries,
+                                       boundaryplan, stages, stagegroups,
+                                       group_locals(stages, stagegroups))
+    end
 end
 
 """
@@ -1553,6 +1567,16 @@ hook_read_box(r::BoundaryRegion{D}) where {D} =
 overlaps(a::Box{D}, b::Box{D}) where {D} =
     all(d -> max(first(a[d]), first(b[d])) <= min(last(a[d]), last(b[d])), 1:D)
 
+# The boxes a group's transfers write and read, or `nothing` for a group
+# with no target. The one step that sees the stencils, whose type is the
+# element type's as well as the dimension's; `stage_groups` around it
+# depends on `D` alone.
+function stage_boxes(stencils::NTuple{D,Stencil1D}, mode::Int8) where {D}
+    write = write_box(stencils)
+    any(isempty, write) && return nothing
+    return (write, read_box(stencils, mode))
+end
+
 # What one phase-2 stage touches on this rank, each box on a local block,
 # and whether any of its prolongations is rotated.
 struct StageAccess{D}
@@ -1566,8 +1590,30 @@ StageAccess{D}() where {D} =
 # Boxes by local block, for the stages of the group being formed.
 const BlockBoxes{D} = Dict{Int32,Vector{Box{D}}}
 
-meets(boxes::BlockBoxes{D}, (b, box)::Tuple{Int32,Box{D}}) where {D} =
-    any(w -> overlaps(w, box), get(boxes, b, ()))
+# Whether a box of `list` meets one of `boxes` on its block. Loops rather
+# than `any` over closures, each of which would be methods of their own
+# for every `D`.
+function meets(boxes::BlockBoxes{D}, list::Vector{Tuple{Int32,Box{D}}}) where {D}
+    for (b, box) in list
+        others = get(boxes, b, nothing)
+        others === nothing && continue
+        for w in others
+            overlaps(w, box) && return true
+        end
+    end
+    return false
+end
+
+# Record `box` on each of `blocks`, shifted by `shift` to local blocks:
+# zero for blocks already local, this rank's first leaf less one for
+# global leaf indices.
+function record_boxes!(list::Vector{Tuple{Int32,Box{D}}}, blocks, shift::Int,
+                       box::Box{D}) where {D}
+    for b in blocks
+        push!(list, (Int32(b - shift), box))
+    end
+    return list
+end
 
 function add_boxes!(boxes::BlockBoxes{D}, list::Vector{Tuple{Int32,Box{D}}}) where {D}
     for (b, box) in list
@@ -1581,7 +1627,9 @@ end
 # and `received` the remote ones in global leaf indices, `offset` this
 # rank's first leaf less one; `boundaries` the hook regions in local
 # indices; `build(key)` a group's host stencils and `boundedof(key)` its
-# bound.
+# bound. Neither of the two is specialized on: their types carry the
+# element type, and the boxes they give are the same `Box{D}` for every
+# one, so the function is compiled once per dimension.
 #
 # Phase 1 is alone: the boundary hook runs after it. A stage joins the
 # group below it when it is the next level up, when none of its
@@ -1594,27 +1642,28 @@ end
 # pair costs the same and needs neither argument to be right.
 function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
                       sent::TransferPairs{D}, received::TransferPairs{D},
-                      boundaries::Vector{BoundaryRegion{D}}, build, boundedof,
-                      offset::Int) where {D}
+                      boundaries::Vector{BoundaryRegion{D}}, @nospecialize(build),
+                      @nospecialize(boundedof), offset::Int) where {D}
     length(tags) <= 2 && return [i:i for i in eachindex(tags)]
-    index = Dict(tag => i for (i, tag) in enumerate(tags))
-    access = [StageAccess{D}() for _ in tags]
-    record!(list, blocks, shift, box) =
-        for b in blocks
-            push!(list, (Int32(b - shift), box))
-        end
+    index = Dict{Int,Int}()
+    access = Vector{StageAccess{D}}(undef, length(tags))
+    for (i, tag) in enumerate(tags)
+        index[tag] = i
+        access[i] = StageAccess{D}()
+    end
     for (lists, shift, reads, writes) in ((pairs, 0, true, true), (sent, offset, true, false),
                                           (received, offset, false, true))
         for (key, (targets, sources)) in lists
             key.kind === :prolong || continue
             i = get(index, prolongation_tag(key.level), 0)
             i == 0 && continue
-            stencils = build(key)
-            any(s -> ntarget(s) == 0, stencils) && continue
+            boxes = stage_boxes(build(key), boundedof(key)::Int8)::Union{Nothing,
+                                                                         NTuple{2,Box{D}}}
+            boxes === nothing && continue
             a = access[i]
             key.orientation == 0 || (a.rotated[] = true)
-            reads && record!(a.reads, sources, shift, read_box(stencils, boundedof(key)))
-            writes && record!(a.writes, targets, shift, write_box(stencils))
+            reads && record_boxes!(a.reads, sources, shift, boxes[2])
+            writes && record_boxes!(a.writes, targets, shift, boxes[1])
         end
     end
     for r in boundaries
@@ -1629,8 +1678,8 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
     for i in 2:length(tags)
         a = access[i]
         joins = i > 2 && tags[i] == tags[i - 1] + 1 && !a.rotated[] &&
-                !any(rb -> meets(written, rb), a.reads) &&
-                !any(wb -> meets(written, wb) || meets(read, wb), a.writes)
+                !meets(written, a.reads) && !meets(written, a.writes) &&
+                !meets(read, a.writes)
         if joins
             groups[end] = first(groups[end]):i
         else
@@ -1642,6 +1691,28 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
         add_boxes!(read, a.reads)
     end
     return groups
+end
+
+# The local groups each stage group runs as one phase, in stage order: a
+# stage alone runs its own `locals`, the very vector, and a group of
+# several the concatenation of theirs, made once here. So the fill hands
+# `run_phase!` a `Vector` of the schedule's group type for a group as for
+# a stage, and compiles one phase per field-set type, not two.
+function group_locals(stages::Vector{<:ExchangeStage{GRP}},
+                      groups::Vector{UnitRange{Int}}) where {GRP}
+    out = Vector{Vector{GRP}}(undef, length(groups))
+    for (k, r) in enumerate(groups)
+        if length(r) == 1
+            out[k] = stages[first(r)].locals
+        else
+            joined = GRP[]
+            for i in r
+                append!(joined, stages[i].locals)
+            end
+            out[k] = joined
+        end
+    end
+    return out
 end
 
 function localize_boundaries(boundaries::Vector{BoundaryRegion{D}},

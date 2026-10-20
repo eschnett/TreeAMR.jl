@@ -3758,9 +3758,9 @@ A stage runs in five steps:
 5. `waitall` on the receives, then unpack.
 
 The sends are waited on at the end of the call, before any buffer is
-reused. `run_stage!` in `ghosts.jl` runs these five steps
-through the communicator verbs. A stage without messages is the serial
-phase, the same launch and the same barrier. Within a stage, nothing a pack or a local group reads is
+reused. `run_stages!` in `ghosts.jl` runs these five steps through the
+communicator verbs, for one stage or a group of them. A stage without
+messages is the serial phase, the same launch and the same barrier. Within a stage, nothing a pack or a local group reads is
 written by an unpack:
 
 - phase 1 reads interiors and writes ghosts;
@@ -3784,7 +3784,21 @@ levels write ghosts of blocks at different levels, so the one phase
 writes each point once, and the dependency check is exactly that no
 pack or local group of the group reads a point another of its stages
 writes, an unpack's or a hook region's included. So the order inside a
-group is free too, and a group of one stage is `run_stage!` itself.
+group is free too.
+
+One driver runs a group and a single stage alike, `run_stages!(…,
+stages, range, locals, …)`, every fill's stage included: phase 1, the
+interface stages, a rotation pair's and the regrid's are each the group
+of one. The group's local groups come in as the `Vector` a stage holds,
+its own for a stage alone and for a group the concatenation of its
+stages', made once with the schedule (`GhostSchedule`'s `grouplocals`).
+The fill's call tree is compiled per field-set type, and a second
+driver, or an iterator over the stages' locals handed to `run_phase!`,
+is a second copy of it; the message steps are functions of their own
+(`send_stages!`, `receive_stages!`), each specialized on what it reads,
+and the call's `sends`, `nothing` or a `Vector{Any}`, is not specialized
+on at all (`@nospecializeinfer`). See "Every run-time choice of type is
+compiled at every launch site" for what the copies cost.
 
 **Deadlock freedom and message matching.** Messages are nonblocking
 and matched by peer and tag, and the tag names the stage: phase 1, the
@@ -3965,7 +3979,7 @@ of a 2.5 ms fill on four H200s.
   its own stage and of the next schedule's first fill, and, staged,
   allocated and page-locked their host mirrors. The pool keeps them.
   - *Where it lives.* In the forest, whose leaves every schedule and
-    regrid is over and which `run_stage!` already has: a mutable
+    regrid is over and which `run_stages!` already has: a mutable
     `ForestState` holds the generation, which was a `Ref` of its own
     before, and the pool, made on first use. One object for both keeps
     `Forest` the size it was. A ninth field made the schedule build
@@ -4166,9 +4180,9 @@ is a loop of collective calls, the second a `mesh_mapreduce`.
   their own sources, so children with different owners are simply
   received from different peers; nothing about them is special. Over
   one rank both ranges are every leaf, nothing is split, and the stage
-  is the serial groups with no messages. `run_stage!` has a form
+  is the serial groups with no messages. `run_stages!` has a form
   over a separate `dest` and `src` — the new mesh's array and the old
-  one's — which the exchange's form now calls with `fs.work` twice.
+  one's — which the exchange's form calls with `fs.work` twice.
   `transfer_groups` keeps its signature, as the serial stage's groups,
   for `thread_tests.jl` and `bench/gpu.jl`.
 - *The ghost fill's checks stay rank-local*.
@@ -4616,7 +4630,7 @@ The ideas that span several files and are easy to violate:
   turn the serial fill's `−0` into `+0`. Every ordering point of the
   serial fill is a stage with its own tag — phase 1 (1), each phase-2
   target level (`2 + ℓ`), each interface dimension (`40 + d`), the
-  regrid (50) — run by `run_stage!` in five steps (post receives, pack
+  regrid (50) — run by `run_stages!` in five steps (post receives, pack
   and synchronize, send, run the local groups, wait and unpack). Both
   ends derive a message's layout from the replicated forest, sorted by
   `keyorder`, so no descriptor is ever sent and `Dict` order must never

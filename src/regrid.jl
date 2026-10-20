@@ -1031,8 +1031,8 @@ function regrid!(forest::Forest{D}, pairs;
             # distributed forest it is one stage, which is also the
             # repartitioning: a kept block whose owner changes is a copy
             # between ranks.
-            sends = run_stage!(fresh, fs.work, fs.nvars, nothing, stage, forest, backend,
-                               nothing)
+            sends = run_stages!(fresh, fs.work, fs.nvars, nothing, [stage], 1:1,
+                                stage.locals, forest, backend, nothing, fs.work, nothing)
             sends === nothing || waitall(comm, sends)
             # The stage lives for this call, so its buffers go back to the
             # forest's pool now that nothing is in flight, for the next
