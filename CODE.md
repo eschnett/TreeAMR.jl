@@ -1472,9 +1472,11 @@ code on the default path, with no call tree standing out. A second
 driver for groups, with an iterator over the stages' locals, compiled
 in 88.6–89.5 s with 1034 roots, which is why there is one ("Stages"
 under [Distributed meshes](#distributed-meshes)). Without the
-partition the same workload compiles 993 roots against 0.2.3's 971 on
-the laptop (Apple silicon, Julia 1.13.2, two alternating runs, output
-identical); its time on Symmetry is to be measured.
+partition, as the package is, the same workload compiles in 115.4–115.8
+s with 991 roots against 110.9–111.7 s and 969 for 0.2.3, 4 % more (one
+EPYC 7532, a slower node than the one above, Symmetry job 579510,
+2026-10-20, three alternating runs each, the workload's output
+identical).
 
 **What it buys on an H200** (job 570290, `bench/copies.jl` from
 `bench/symmetry_copies.sh`: a uniform periodic mesh, 20 variables,
