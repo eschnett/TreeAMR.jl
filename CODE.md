@@ -4,8 +4,8 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
-**Status.** Milestones M0–M8, M10, M11, M9a, M7 and M12 are done;
-next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12 and M13 are
+done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -774,7 +774,11 @@ it is one level. So the schedule records which
 runs of consecutive levels may run as one *group of stages*
 (`GhostSchedule`'s `stagegroups`), and a group runs as one parallel
 loop, its messages in flight together, with one wait (see "Stages"
-under [Distributed meshes](#distributed-meshes)). The test is on the
+under [Distributed meshes](#distributed-meshes)). On the downstream's
+nested mesh at four ranks of one thread (`bench/nested.jl`, `N = 16`,
+one EPYC 7543 core a rank) phase 2 takes 143 ms grouped against 253 ms
+in sequence ([HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill) has
+the tables). The test is on the
 points, per local block, from the host stencils at schedule build, in
 one pass over the transfers and the hook regions (`stage_groups`):
 
@@ -1330,9 +1334,11 @@ prolongation stage of the same mesh on an H200 (`N = 32`, 20 variables,
 copies and restrictions of phase 1 were unchanged (Symmetry jobs 578815
 and 578817, 2026-10-19). Neighbouring lanes along dimension 1 alternate
 between the one tap and the loop, so a warp takes both paths, and the
-`2^D` bodies cost the unrolled nest its registers. A device-friendly
-form of the skip — launching each parity class of a group separately,
-for example, so that a warp's lanes agree — is **(open)**.
+`2^D` bodies cost the unrolled nest its registers. With the full sum
+each stage takes 1.81 ms again, and one H200's fill 7.90 ms, as on
+0.2.3 (2026-10-20). A device-friendly form of the skip —
+launching each parity class of a group separately, for example, so that
+a warp's lanes agree — is **(open)**.
 
 The skip is exact for finite data, so the choice by backend changes no
 result. A skipped term is `0 · u = ±0`; the accumulator starts at `+0`,
@@ -3642,8 +3648,16 @@ contiguous Morton ranges one level apart, as "Where the 64-thread
 efficiency goes" anticipated. Equal counts balance the load because
 every block costs the same under a global `dt` (the MPI bullet above).
 The one imbalance is ghost work concentrating at level boundaries,
-noted under "What one process loses"; a cost-weighted split would
-change only the helper, at both levels.
+noted under "What one process loses", and across ranks the prolongation
+work of a nested mesh, whose balance is open (see "Balancing
+prolongation over ranks" under "Performance work left for later",
+below). Another split would change more than the helper: `blockrange`
+and `leafowner` go through it, but the regrid's old and new owners
+(`regrid.jl`) and the routing of point interpolation (`interpolate.jl`)
+call `equalsplit` and `equalsplit_part` themselves, and so does
+TreeIOHDF5 for the owners of a checkpoint's blocks; and a split that is
+not one range per rank changes every site that turns a local block into
+a leaf by an offset.
 
 - **Block index `b` becomes local, everywhere.** `nblocks(fs)` is the
   rank's count, the last axis of `fs.work`, and `blockkey(fs, b)` is
@@ -3696,9 +3710,13 @@ The target's rank only copies it into place. Three reasons:
   exchange.
 - *The message is the transfer's target box.* A restriction's source
   footprint is `2^D` times its target and more, so sending the result
-  is much smaller. For a prolongation the two are about the same size:
-  in 3D at `N = 16`, `G = 2` and order 4, a fine face slab is 512
-  points and the coarse footprint it is computed from about 480.
+  is much smaller. For a prolongation the footprint is the smaller of
+  the two, but not by much: in 3D at `N = 16`, `G = 2` and order 4, a
+  fine face slab is 512 points and the coarse footprint it is computed
+  from about 480, and on the downstream's nested mesh (`G = 3`, order 6)
+  a message's stencils read 0.55–0.70 coarse points per fine point it
+  carries (see "Receiver-side prolongation" under "Performance work
+  left for later").
 - *The receiver needs nothing but a layout*: no stencils, no second
   schedule, no knowledge of the source's ghosts. Unpacking is a copy.
 
@@ -3760,8 +3778,9 @@ A stage runs in five steps:
 The sends are waited on at the end of the call, before any buffer is
 reused. `run_stages!` in `ghosts.jl` runs these five steps through the
 communicator verbs, for one stage or a group of them. A stage without
-messages is the serial phase, the same launch and the same barrier. Within a stage, nothing a pack or a local group reads is
-written by an unpack:
+messages is the serial phase, the same launch and the same barrier.
+Within a stage, nothing a pack or a local group reads is written by an
+unpack:
 
 - phase 1 reads interiors and writes ghosts;
 - a level-`ℓ` stage reads level-`ℓ − 1` sources and their ghosts, and
@@ -3902,11 +3921,11 @@ which keeps "one kernel for every transfer" true.
   summed in the same order as in the serial fill — a pack keeps the
   serial stencil's one-tap rows (`single`), so it skips the same zero
   weights; the unpack adds an identity. So the ghosts are bit-identical
-  to serial for any partition, and so is everything computed from them. It is the
-  argument the thread invariant rests on, with a rank boundary in place
-  of a thread boundary. It needs the transfer arithmetic not to depend
-  on the destination type: no `@fastmath` or `@simd` reassociation in
-  `transfer_kernel!`. That holds today, since "What the ghost fill
+  to serial for any partition, and so is everything computed from
+  them. It is the argument the thread invariant rests on, with a rank
+  boundary in place of a thread boundary. It needs the transfer
+  arithmetic not to depend on the destination type: no `@fastmath` or
+  `@simd` reassociation in `transfer_kernel!`. That holds today, since "What the ghost fill
   costs" fixed its summation order.
 
 **MPI+GPU.** The pack and receive buffers live on the field set's
@@ -4335,6 +4354,50 @@ before it is built):
   source, step 7), the flags' `allgatherv`, the forest digest gathered
   by every checked call, the number of peers and messages per rank on
   a deeper hierarchy, and GPUs across nodes, which no run has used.
+- *Balancing prolongation over ranks.* The sender computes, so a
+  level's prolongations are packed on the owners of its coarse sources,
+  and on a nested mesh those are one stretch of the curve, which the
+  contiguous split gives to one or two ranks. On the downstream's mesh
+  (`bench/nested.jl`: the reflecting octant `[0,32]³` of `4³` roots
+  with cubes nested to level 3, 232 blocks, 20 variables, `G = 3`,
+  order 6, vertex-centered, `Float64`; one EPYC 7543 thread a rank,
+  `N = 16`, Symmetry, 2026-10-20) at four ranks, rank 2 packs 66.6 ms of
+  level 2 and rank 1 62.5 ms of level 3, while ranks 0 and 3 pack
+  nothing; the stage groups run the two at once, and the fill takes
+  236 ms, its phase 2 143 ms. A partition that splits every class of
+  leaves over all the ranks — a class is a level and the kind of
+  prolongation source a leaf is: none, across an edge or corner only,
+  or across a face — was built as an option and measured, and is not
+  shipped (the branch `eschnett-claude/partition-levels`; the record is
+  in [HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill)). It balances
+  the packing, every rank packing 10–20 ms of each level, as the counts
+  of `bench/partition_cost.jl` predict (the most-loaded rank's
+  prolongation at 1.05 of an even split with the stages in sequence and
+  1.01 grouped, at four ranks, against 3.42 and 1.87). But it scatters
+  every level over every rank, which multiplies the phase-1 halo: at
+  four ranks each rank sends 165k–186k points in phase 1 against
+  26k–56k, about four times, and 7–15 times at two. That costs more
+  than the balance gains, at every rank count measured: the fill takes
+  300 ms against 236 at four ranks of one thread, 93.1 against 58.3 at
+  eight ranks of eight threads, 19.2 against 7.39 ms on two H200s
+  under HPC-X staged and 14.6 against 9.07 on four under HPC-X direct,
+  and a whole time step of TreeGeneralizedHarmonic on four H200s (HPC-X
+  staged) 127.2 against 87.2 ms. What is left to try keeps a rank's
+  blocks in few runs: a contiguous split weighted by the prolongation
+  cost, moving only the prolongation sources, or overlapping the packs
+  with work that needs no ghosts.
+- *Receiver-side prolongation*, request 3 of the downstream report
+  (eschnett/TreeGeneralizedHarmonic.jl#11): send the coarse points a
+  prolongation message's stencils read, and prolong on the receiver.
+  Counted from the schedule (`bench/nested.jl`'s footprint lines), a
+  message's stencils read 0.55–0.70 distinct coarse points, on the
+  source block and in its ghosts, per fine target point the message
+  carries, at `N = 32` over eight ranks, and 0.62–0.65 at `N = 16`; so
+  those messages would shrink by about a third to a half. The receiver
+  would need the stencils, and the coarse block's own ghosts complete
+  before they are sent — filled by phase 1, the boundary hook and the
+  levels below — which is the second, wider exchange that "The
+  exchange: the sender computes" avoids.
 
 **The multi-block check** (the standing instruction). Nothing here obstructs a conforming multi-block forest.
 

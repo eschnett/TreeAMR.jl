@@ -8,8 +8,12 @@
 # puts each level's sources — one stretch of the curve on a nested mesh —
 # on one or two ranks. A partition balanced per class of leaves spreads
 # them. This script prices the candidate classes before any of them is
-# built (the plan's step 4a), so that the rule the option offers is
-# chosen from numbers.
+# built (M13 step 4), so that the rule the option offers is chosen from
+# numbers. The rule chosen, `level-face-rot`, was built as `partition =
+# :levels`, timed, and parked: it multiplied the phase-1 halo, which
+# cost more than the balance gained ("Balancing prolongation over ranks"
+# in CODE.md; the branch `eschnett-claude/partition-levels`). The script
+# needs no partition code, and stays as the record of the counts.
 #
 # Every prolongation transfer of the serial schedule is charged to
 # `owner(source)`, at its target level's stage, as target points ×
