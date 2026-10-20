@@ -92,6 +92,9 @@
 #                                "2 4 8"; empty for none)
 #     TREEAMR_BENCH_PIECES       0 to time the fill, the boundary and the
 #                                stages only (default 1)
+#
+# The `# ownership` line gives per rank the blocks and the blocks per
+# level, from the forest's own `leafowner`.
 
 const USE_MPI = "mpi" in ARGS || get(ENV, "TREEAMR_BENCH_MPI", "0") == "1"
 if USE_MPI
@@ -349,6 +352,13 @@ function main()
         join(["L$l $(count(k -> level(k) == l, forest.leaves))"
               for l in 0:maxlevel(forest)], ", ") *
         "; blocks per rank $(join(nb, ", "))")
+    # Who owns what: per rank the blocks, and the blocks per level.
+    own = [TreeAMR.leafowner(forest, i) for i in 1:nleaves(forest)]
+    lv = level.(forest.leaves)
+    say("# ownership per rank (blocks, blocks per level L0/L1/…): " *
+        join(["r$q $(count(==(q), own)) blocks, " *
+              join([count(i -> own[i] == q && lv[i] == l, eachindex(own))
+                    for l in 0:maxlevel(forest)], "/") for q in 0:(NRANKS - 1)], "; "))
     # A rank holds a stage only where it has transfers of that tag, so
     # everything collective below runs over the tags of every rank, a
     # rank without the stage taking part with nothing to do.

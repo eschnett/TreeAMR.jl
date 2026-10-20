@@ -371,11 +371,13 @@ if ls "$OUT"/nested-*.tsv > /dev/null 2>&1; then
             for (i = 1; i <= n; i++) s = s sprintf(" %9.3f", t[i] * 1000)
             printf "%-22s%s\n", $3, s }' "$f"
     done
-    last=$(echo $NAMES | awk '{ print $NF }')
-    echo "=== nested.jl: counts (round 1, $last) ==="
-    for f in "$OUT"/nested-"$last"-*-r1.tsv; do
-        echo "## $(basename "$f" .tsv)"
-        grep -E '^(ranks|# )' "$f" | grep -v '^# footprint P=[0-9]* L[0-9] [0-9]' || true
+    for which in $NAMES; do
+        echo "=== nested.jl: counts (round 1, $which) ==="
+        for f in "$OUT"/nested-"$which"-*-r1.tsv; do
+            [ -f "$f" ] || continue
+            echo "## $(basename "$f" .tsv)"
+            grep -E '^(ranks|# )' "$f" | grep -v '^# footprint P=[0-9]* L[0-9] [0-9]' || true
+        done
     done
 fi
 if [ -f "$OUT/compile.tsv" ]; then
