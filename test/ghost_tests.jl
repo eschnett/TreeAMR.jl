@@ -279,10 +279,11 @@ end
 end
 
 @testset "Three-level corners: D=$D" for D in (1, 2, 3)
-    # Levels l-1, l and l+1 meeting is legal under 2:1 balance, and is
-    # what forces the prolongation sweep to run coarsest-target-first:
-    # the level l+1 blocks prolongate from level l ghosts that were
-    # themselves prolongated from level l-1.
+    # Levels l-1, l and l+1 meeting is legal under 2:1 balance, and the
+    # prolongation sweep runs coarsest target first, one stage per level:
+    # a level l+1 block may prolongate from level l ghosts that were
+    # themselves prolongated from level l-1. (Here none does, and the two
+    # levels run as one group; see the stage-group testsets below.)
     forest = nested_forest(Val(D))
     @test isbalanced(forest)
     @test length(unique(level.(forest.leaves))) >= 3
@@ -295,6 +296,152 @@ end
     @test length(schedule.phase2) == length(schedule.levels)
 
     @test exchange_error(forest, ops, makepoly(D, 1)) < 1e-12
+end
+
+@testset "Independent prolongation levels run as one group: D=$D" for D in (2, 3)
+    # On a nested mesh whose shells are two blocks thick no prolongation
+    # reads a ghost that the level below prolongated, so the levels need
+    # not wait for each other; run one after another, the fill's
+    # critical path under MPI is the sum over the levels, each packed on
+    # one rank. A dependency check that refused too much would leave them
+    # apart, and one that ignored the rotation rule would trust windows
+    # in a rotated source's virtual frame.
+    octant = nested_octant(Val(D))
+    @test sort!(unique(level.(octant.leaves))) == 0:3
+    ops = Operators(prolongation=6, restriction=6)
+    parity = [ntuple(_ -> EvenParity, D)]
+    for C in (vertexcentered(D), cellcentered(D))
+        s = GhostSchedule(FieldSet(octant, 1; G=3, centering=C, parity=parity), ops)
+        @test s.levels == [1, 2, 3]
+        @test s.stagegroups == [1:1, 2:4]
+        @test occursin("levels 1-3 run together", sprint(show, s))
+    end
+    # A level with rotated prolongations runs alone, and so does every
+    # level of a schedule printed as before.
+    quad = rotating_forest(Val(D); rotating=(1, 2))
+    s = GhostSchedule(FieldSet(quad, 1; G=2, centering=vertexcentered(D), rotation=[1]),
+                      Operators(prolongation=4, restriction=4))
+    @test length(s.levels) == 2
+    @test all(gs -> any(g -> g.orientation != 0, gs), s.phase2)
+    @test s.stagegroups == [1:1, 2:2, 3:3]
+    @test !occursin("run together", sprint(show, s))
+end
+
+@testset "A level that reads what the level below writes runs after it" begin
+    # No mesh the tests build has a prolongation that reads what the
+    # level below writes, so the rule is checked on transfer lists made
+    # for it, in one dimension. Level 1 (`lo`) writes its target's
+    # `1:2` and reads its source's `7:8`; level 2 (`hi`) reads and writes
+    # as the case says. A rule that missed a read of a written point — by
+    # a local group or a pack, of a target box, an unpack's or a hook
+    # region's, or the other way round, a write over a point the level
+    # below reads — would let a level run before the one it depends on.
+    S(first, starts) =
+        (TreeAMR.Stencil1D{Float64}(first, Int32.(starts), ones(2, length(starts))),)
+    key(l, r=0) = TreeAMR.GroupKey{1}(:prolong, (-1,), (0,), l, (Int8(0),), r)
+    lo, hi, turned, lvl3 = key(1), key(2), key(2, 1), key(3)
+    tag(l) = TreeAMR.prolongation_tag(l)
+    pairs(kv...) = TreeAMR.TransferPairs{1}(k => (Int32[t], Int32[s]) for (k, t, s) in kv)
+    nobound(k) = TreeAMR.UNBOUNDED
+    # The groups of phase 1 and levels 1 and 2 (or `levels`) on a rank
+    # whose first leaf is 11, `hi` read through `stencil`.
+    function grouped(local_, stencil; sent=pairs(), received=pairs(), boundaries=[],
+                     levels=(1, 2), upper=hi)
+        stencils = Dict(lo => S(1, [7, 7]), upper => stencil)
+        return TreeAMR.stage_groups([TreeAMR.PHASE1_TAG; collect(tag.(levels))], local_,
+                                    sent, received,
+                                    TreeAMR.BoundaryRegion{1}[boundaries...],
+                                    k -> stencils[k], nobound, 10)
+    end
+    apart, together = [1:1, 2:2, 3:3], [1:1, 2:3]
+    # Level 2 reads block 1 at `3:5`, beside what level 1 writes there,
+    # at `2:4`, over it, and at `1:2` of block 4, another block.
+    @test grouped(pairs((lo, 1, 2), (hi, 3, 1)), S(1, [3, 4])) == together
+    @test grouped(pairs((lo, 1, 2), (hi, 3, 1)), S(1, [2, 3])) == apart
+    @test grouped(pairs((lo, 1, 2), (hi, 3, 4)), S(1, [1, 1])) == together
+    # The same write as an unpack, and the same read as a pack, in global
+    # leaf indices.
+    @test grouped(pairs((hi, 3, 1)), S(1, [2, 3]); received=pairs((lo, 11, 99))) == apart
+    @test grouped(pairs((lo, 1, 2)), S(1, [2, 3]); sent=pairs((hi, 99, 11))) == apart
+    # A relative hook region on block 1 at `1:2`, which level 2 reads,
+    # run after level 1, against one run after phase 1.
+    hook(slot, clamp=0) = TreeAMR.BoundaryRegion{1}(Int32(1), (-1,),
+                                                    CartesianIndices((1:2,)),
+                                                    (Int32(clamp),), slot)
+    @test grouped(pairs((lo, 2, 5), (hi, 3, 1)), S(1, [1, 1]);
+                  boundaries=[hook(tag(1))]) == apart
+    @test grouped(pairs((lo, 2, 5), (hi, 3, 1)), S(1, [1, 1]);
+                  boundaries=[hook(TreeAMR.PHASE1_TAG)]) == together
+    # Level 2 writing block 3 where level 1 reads it, at `7:8`, or beside
+    # it; and writing block 1 where level 1's hook region reads it, at
+    # `4`, or beside it.
+    @test grouped(pairs((lo, 1, 3), (hi, 3, 5)), S(7, [1, 1])) == apart
+    @test grouped(pairs((lo, 1, 3), (hi, 3, 5)), S(1, [1, 1])) == together
+    @test grouped(pairs((lo, 2, 5), (hi, 1, 6)), S(3, [1, 1]);
+                  boundaries=[hook(tag(1), 4)]) == apart
+    @test grouped(pairs((lo, 2, 5), (hi, 1, 6)), S(5, [1, 1]);
+                  boundaries=[hook(tag(1), 4)]) == together
+    # A rotated level runs alone whatever it reads, and levels that are
+    # not consecutive here never group.
+    @test grouped(pairs((lo, 1, 2), (turned, 3, 4)), S(1, [1, 1]); upper=turned) == apart
+    @test grouped(pairs((lo, 1, 2), (lvl3, 3, 4)), S(1, [1, 1]); upper=lvl3,
+                  levels=(1, 3)) == apart
+end
+
+@testset "A grouped fill is the same in any order within the group: D=$D" for D in (2, 3)
+    # The oracle for the dependency check. Run in reverse, a level that
+    # read a ghost the level below writes would read it before it was
+    # written — NaN here, from the prefill — and a level that read a
+    # hook region filled after the level below would read it NaN even in
+    # level order, against the fill with every stage alone. Each fill
+    # starts from NaN in every ghost, and the three must agree in every
+    # bit and leave no NaN. Serial: a level wrongly grouped would also
+    # race in the one parallel loop at more threads, which the suite at
+    # eight threads exercises.
+    f = (x, v) -> sin(sum(x) + v) + x[1]^2
+    relative = CellBoundary(Relative(x -> cos(sum(x))))
+    even = [ntuple(_ -> EvenParity, D)]
+    ops6, ops4 = Operators(prolongation=6, restriction=6), Operators(prolongation=4,
+                                                                     restriction=4)
+    octant = nested_octant(Val(D))
+    kinds = D == 2 ? (:reflect_lo, :outer) : (:reflect_lo, :outer, :outflow_hi)
+    cases = Any[(octant, vertexcentered(D), 3, ops6, boundary_by_coordinates(f), even),
+                (octant, cellcentered(D), 3, ops6, relative, even),
+                (faces_forest(kinds), vertexcentered(D), 2, ops4, relative, even),
+                (nested_forest(Val(D)), cellcentered(D), 1,
+                 Operators(prolongation=2, restriction=2), boundary_by_coordinates(f),
+                 nothing),
+                (rotating_forest(Val(D); rotating=(1, 2)), vertexcentered(D), 2, ops4,
+                 boundary_by_coordinates(f), nothing)]
+    D == 2 && append!(cases, [(octant, vertexcentered(D), 3, ops6, relative, even),
+                              (octant, cellcentered(D), 3, ops6, boundary_by_coordinates(f),
+                               even),
+                              (faces_forest(kinds), cellcentered(D), 2, ops4,
+                               boundary_by_coordinates(f), even)])
+    ngrouped = 0
+    for (forest, C, G, ops, hook, parity) in cases
+        rotating = TreeAMR.hasrotating(forest)
+        fs = FieldSet(forest, 1; G=G, centering=C, parity=parity,
+                      rotation=rotating ? [1] : nothing)
+        s = GhostSchedule(fs, ops)
+        @test length(s.stages) >= 3                 # two levels or more to group
+        ngrouped += any(r -> length(r) >= 2, s.stagegroups)
+        fills = map((:grouped, :reversed, :alone)) do how
+            fill!(fs.work, NaN)
+            fill_by_coordinates!(f, fs)
+            if how === :grouped
+                fill_ghosts!(fs, s; boundary=hook)
+            elseif how === :reversed
+                fill_stagewise!(fs, s, s.stagegroups; boundary=hook, reverse=true)
+            else
+                fill_stagewise!(fs, s, [i:i for i in eachindex(s.stages)]; boundary=hook)
+            end
+            @test !any(isnan, fs.work)
+            copy(reinterpret(UInt64, vec(fs.work)))
+        end
+        @test fills[1] == fills[2] == fills[3]
+    end
+    @test ngrouped >= 3                             # the order was free somewhere
 end
 
 @testset "Periodic wraparound equals an explicit tiling: D=$D" for D in (1, 2, 3)
@@ -352,7 +499,8 @@ end
 # A group with every stencil marked not unit: the same transfer, computed
 # through the weights.
 function weighted(g::TreeAMR.TransferGroup{T,D}) where {T,D}
-    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, false),
+    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, false,
+                                             s.single),
                    g.stencils)
     return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
                                       g.factorcol, g.orientation, g.plane)
@@ -369,14 +517,26 @@ function awkward_fill!(work::AbstractArray{T}) where {T}
     return work
 end
 
+# A group with every column's `single` row cleared: the same transfer,
+# computed as the full tensor-product sum over every weight.
+function full_sum(g::TreeAMR.TransferGroup{T,D}) where {T,D}
+    stencils = map(s -> TreeAMR.Stencil1D{T}(s.targetfirst, s.srcstart, s.weights, s.unit,
+                                             zero(s.single)),
+                   g.stencils)
+    return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
+                                      g.factorcol, g.orientation, g.plane, g.bounded)
+end
+
 @testset "The flat launch and the copy path fill bit for bit: D=$D" for D in (1, 2, 3)
     # The device's form of the transfer launch (flat, the position from
     # inverses) runs on no device in CI, and the copy path skips the
     # weights: either one going wrong would show as a ghost that is
     # right to roundoff, or off by a sign of zero. Every group of a
     # schedule with copies, restrictions, prolongations, mirrored and
-    # turned transfers is run three ways from the same array, and the
-    # arrays must agree in every bit.
+    # turned transfers is run from the same array flat, shaped with the
+    # full sum the flat form takes (the data hold a `NaN` and an infinity,
+    # which the CPU's one-tap skip drops under a zero weight), and a copy
+    # also through its weights, and the arrays must agree in every bit.
     N = D == 3 ? 6 : 8
     setups = Any[]
     two = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
@@ -406,9 +566,8 @@ end
             end
             unit = all(s -> s.unit, g.stencils)
             nunit += unit
-            shaped = fillwith(g; flat=false)
-            @test fillwith(g; flat=true) == shaped
-            unit && @test fillwith(weighted(g); flat=false) == shaped
+            @test fillwith(g; flat=true) == fillwith(full_sum(g); flat=false)
+            unit && @test fillwith(weighted(g); flat=false) == fillwith(g; flat=false)
         end
     end
     @test nunit > 0                                # the copy path was taken
@@ -417,6 +576,85 @@ end
     wallsched = GhostSchedule(setups[3], ops)
     @test any(g -> g.kind === :copy && !all(s -> s.unit, g.stencils),
               wallsched.phase1)
+end
+
+# Finite data with what a dropped `±0` term could still change: signed
+# zeros and subnormals, beside ordinary numbers of both signs.
+function finite_fill!(rng, work::AbstractArray{T}) where {T}
+    specials = T[-zero(T), zero(T), floatmin(T) / 4, -floatmin(T) / 3]
+    for I in eachindex(work)
+        work[I] = rand(rng) < 0.1 ? rand(rng, specials) : T(randn(rng))
+    end
+    return work
+end
+
+@testset "Skipping zero-weight taps fills bit for bit: D=$D" for D in (1, 2, 3)
+    # On the CPU a column with one nonzero weight takes one tap along its
+    # dimension instead of the whole window; a device, the flat launch,
+    # takes the full sum. Got wrong — the wrong row, the row of a column a
+    # mirror, a clamp or a turn remapped, a product formed in another
+    # order — it shows as a ghost that is right to roundoff, or off by a
+    # sign of zero, and only along the vertex-like dimensions that have
+    # such columns, and the CPU and a device would disagree. Every group
+    # of schedules over both centerings, both families, the prolongation
+    # orders, reflecting and outflow faces and a rotating seam is run with
+    # the skip (shaped) and without it (shaped with `single` cleared, and
+    # flat), from the same finite data, and the arrays must agree in every
+    # bit.
+    rng = Xoshiro(20261019)
+    N = 8
+    kinds = ((:reflect_hi,), (:reflect_hi, :outflow_lo),
+             (:reflect_hi, :reflect_lo, :outflow_hi))[D]
+    configs = Any[]
+    for C in (vertexcentered(D), cellcentered(D)), p in (2, 4, 6, 8)
+        push!(configs, (C, Operators(prolongation=p, restriction=2), p))
+    end
+    for p in (3, 5, 7)
+        push!(configs, (cellcentered(D), Operators(prolongation=p, restriction=2,
+                                                   family=Conservative), p))
+    end
+    push!(configs, (facecentered(D, 1),
+                    Operators(prolongation=3, restriction=2, family=Conservative,
+                              vertex_prolongation=4), 4))
+    nsingle = 0
+    for (C, ops, p) in configs
+        G = ghosts_for(C, p)
+        _, parity = parity_data(Float64, kinds, p)
+        setups = Any[FieldSet(faces_forest(kinds; N=N), 2; G=G, centering=C,
+                              parity=parity)]
+        # The seam reads through the axis map whatever the order, so one
+        # order per family turns it: each order is kernels of its own to
+        # compile, and the suite is compilation-bound.
+        if D >= 2 && p in (3, 4)
+            quad = rotating_forest(Val(D); rotating=(1, 2), N=N)
+            push!(setups, FieldSet(quad, D + 1; G=G, centering=C,
+                                   rotation=vector_rotation(D, (1, 2))))
+        end
+        for fs in setups
+            schedule = GhostSchedule(fs, ops)
+            vertexprolong = 0
+            data = finite_fill!(rng, similar(fs.work))
+            work, full = similar(data), Vector{UInt64}(undef, length(data))
+            for g in Iterators.flatten((schedule.phase1, schedule.phase2...))
+                fillwith(group; flat) = begin
+                    copyto!(work, data)
+                    TreeAMR.run_group!(work, work, group, fs.nvars, TreeAMR.CPU();
+                                       flat=flat, factors=fs.factors, rotvars=fs.rotvars)
+                    reinterpret(UInt64, vec(work))
+                end
+                skips = any(s -> any(!iszero, s.single), g.stencils)
+                nsingle += skips
+                g.kind === :prolong && ops.family === PointValue && C[1] === :vertex &&
+                    (vertexprolong += skips)
+                copyto!(full, fillwith(full_sum(g); flat=false))
+                @test fillwith(g; flat=false) == full
+                @test fillwith(g; flat=true) == full
+            end
+            # The vertex-centered prolongations are what the skip is for.
+            ops.family === PointValue && C[1] === :vertex && @test vertexprolong > 0
+        end
+    end
+    @test nsingle > 0                              # the one-tap path was taken
 end
 
 @testset "The flat scatter and gather match the shaped ones: D=$D" for D in (1, 2, 3)

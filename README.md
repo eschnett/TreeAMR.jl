@@ -19,11 +19,12 @@ the mesh with a set of finer meshes.
 See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
 for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
 package got here, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M12** (after M8's every
+The package is currently at milestone **M13** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, M7's
-distribution over MPI, and M12's rotating symmetry). M7 is measured on a
+distribution over MPI, M12's rotating symmetry, and M13's faster ghost
+fill on nested meshes). M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the
@@ -34,7 +35,11 @@ a thousand verified saves on four nodes lost nothing. M12 stores one
 quadrant of a plane and fills the ghosts across its seam as the turned
 image of the data, vector components mixed as each field set declares,
 for a spinning object that no mirror maps onto itself; with a
-reflecting face below `z = 0` it stores an octant.
+reflecting face below `z = 0` it stores an octant. M13 prolongs a
+vertex-centered fine point that sits on a coarse node by one tap per
+dimension on the CPU, and lets the prolongation levels of a mesh that
+do not depend on each other run at once, which on a nested mesh over
+MPI takes the fill from the sum over its levels to one level.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.

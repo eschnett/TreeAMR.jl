@@ -283,6 +283,51 @@ function nested_forest(::Val{D}; T=Float64, N=4, roots=4,
     return forest
 end
 
+"""
+The nested mesh TreeGeneralizedHarmonic reported (its issue 11), at a
+size of the caller's choosing: a reflecting octant `[0, 32]^D` of `4^D`
+roots, with the cubes `[0, 16)^D`, `[0, 8)^D` and `[0, 4)^D` refined to
+levels 1, 2 and 3. Every shell is two blocks thick, so no prolongation
+reads a ghost of its coarse source that another prolongation wrote.
+"""
+function nested_octant(::Val{D}; T=Float64, N=8) where {D}
+    forest = Forest{T}(ntuple(_ -> 4, D); N=N, reflecting=ntuple(_ -> (true, false), D),
+                       extents=ntuple(_ -> (0, 32), D))
+    for (lvl, side) in ((0, 16), (1, 8), (2, 4))
+        inside = filter(k -> level(k) == lvl &&
+                             all(e -> e[2] <= side, block_extent(forest, k)), forest.leaves)
+        refine!(forest, inside)
+        balance!(forest)
+    end
+    return forest
+end
+
+"""
+A serial ghost fill run stage by stage through the package's own pieces,
+as `fill_ghosts!` runs it, but with the phase-2 stages in the groups
+`groups` (runs of `schedule.stages`) instead of `schedule.stagegroups`:
+each group's stages one at a time, in reverse level order when
+`reverse`, and the relative hook's regions after the whole group, in
+level order, as the grouped fill runs them. `[i:i for i in
+eachindex(schedule.stages)]` is the fill with every stage alone.
+"""
+function fill_stagewise!(fs, schedule, groups; boundary=nothing, reverse=false)
+    forest, stages, backend = schedule.forest, schedule.stages, TreeAMR.CPU()
+    first(groups) == 1:1 || error("phase 1 runs alone")
+    TreeAMR.run_stage!(fs, stages[1], forest, backend, nothing)
+    boundary === nothing || TreeAMR.apply_boundary!(fs, boundary, schedule, backend)
+    for group in groups[2:end]
+        for i in (reverse ? Base.reverse(group) : group)
+            TreeAMR.run_stage!(fs, stages[i], forest, backend, nothing)
+        end
+        boundary === nothing && continue
+        for i in group
+            TreeAMR.boundary_after_stage!(fs, boundary, schedule, backend, stages[i].tag)
+        end
+    end
+    return fs
+end
+
 """Refine wherever `pred(block center, level)` holds, then rebalance."""
 function refine_where!(forest, pred, passes)
     for _ in 1:passes
@@ -606,8 +651,10 @@ deviation of any stored value from the data.
 
 `NaN` is what makes the fill's *order* visible. A ghost the schedule
 never writes stays `NaN`; one it writes from a ghost that has not been
-written yet becomes `NaN`, since every stencil weight is nonzero and
-`NaN` survives any finite combination. A zero-initialized field set shows
+written yet becomes `NaN`, since `NaN` survives any finite combination.
+(Along a dimension where a target's column has a single nonzero weight,
+the CPU's shaped fill reads only that source, so there an unwritten ghost
+shows only if the value depends on it.) A zero-initialized field set shows
 neither: a stale zero is just a wrong number, and may even be the right
 one.
 """

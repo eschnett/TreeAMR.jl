@@ -4,8 +4,8 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
-**Status.** Milestones M0–M8, M10, M11, M9a, M7 and M12 are done;
-next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12 and M13 are
+done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -748,7 +748,11 @@ an injection padded to width `p` with zero weights reads `p − 1` slots
 that need not hold data (a `G = 0` face field has no slot at all beyond
 its high face), and `0 × NaN = NaN`. The interface restriction under
 [Conservation](#conservation-at-coarse-fine-faces) is width one normally
-and width two tangentially and needs this in any case.
+and width two tangentially and needs this in any case. Within a width,
+a column whose one nonzero weight is the coincident node's takes that
+single tap on the CPU, and a device takes the full sum (see "A column
+with one nonzero weight takes one tap" under
+[What the ghost fill costs](#what-the-ghost-fill-costs)).
 
 Ghost filling is **phased**. Phase 1: all same-level copies and all
 restrictions (each reads only interior cells of other blocks — race
@@ -758,6 +762,62 @@ the coarse source block's own ghosts, which may themselves be
 prolongated from a still-coarser block (levels l−2, l−1, l side by side
 are legal under 2:1 balance). Each phase/sweep step is an embarrassingly
 parallel loop over blocks, with barriers in between.
+
+**Levels that do not depend on each other run together.** The sweep's
+order matters only where a level-`ℓ` prolongation reads a point that
+the level-`(ℓ − 1)` step writes. Where none does, as on a nested mesh
+whose shells are two blocks thick, the two steps can be one. Under MPI
+each level's prolongations are packed where their sources live, and a
+level's shell is one stretch of the curve, so mostly on one rank: in
+sequence the fill's critical path is the sum over the levels, together
+it is one level. So the schedule records which
+runs of consecutive levels may run as one *group of stages*
+(`GhostSchedule`'s `stagegroups`), and a group runs as one parallel
+loop, its messages in flight together, with one wait (see "Stages"
+under [Distributed meshes](#distributed-meshes)). On the downstream's
+nested mesh at four ranks of one thread (`bench/nested.jl`, `N = 16`,
+one EPYC 7543 core a rank) phase 2 takes 143 ms grouped against 253 ms
+in sequence ([HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill) has
+the tables). The test is on the
+points, per local block, from the host stencils at schedule build, in
+one pass over the transfers and the hook regions (`stage_groups`):
+
+- a level *writes* the target boxes of its local groups and its
+  unpacks, and the regions of the relative hook that run after it (their
+  `slot` is its tag): those run after the whole group, so a level above
+  that read them would read them unfilled;
+- it *reads* each local group's and each pack's source window on the
+  source block — along each dimension from the first column's start to
+  the last one's end, at the kernel's width (half the rows of a bounded
+  point-value stencil) — and the hook regions' nearest evolved points;
+- a level joins the group below it when it is the next level up on this
+  rank, when it conflicts with no level of the group — no point one of
+  them writes is read or written by the other — and when none of its
+  prolongations is rotated: a rotated window is in the virtual frame,
+  which the axis map turns into the real source's only at the launch,
+  and an odd orientation of a `RotationPair` reads the partner's array,
+  which a rank's boxes do not describe. Phase 1 is always alone, since
+  the hook runs after it.
+
+Only the level just below can write what a level reads, but the test
+asks every pair of the group, which costs the same and needs no
+argument. Mirrored and clamped transfers keep their image's source
+columns, which are in the source's frame, and the derived wall row reads
+the source beside its own wall, so their windows are found the same
+way. Every write to a block is made on the block's own rank, so each
+rank decides alone, from what it holds; ranks may decide differently,
+which the messages allow (see "Deadlock freedom and message matching").
+A group is permission, not obligation: its stages run one after another
+are the same fill, which is how a `RotationPair`'s merged stages still
+run, and the tests check it — a grouped fill against the same groups
+run in reverse level order and against every stage alone, from `NaN`
+ghosts, bit for bit. **(open)** Whether any mesh under the package's
+2:1 balance, which counts edge and corner neighbours, has a level that
+reads what the level below writes: a prolongation's source window
+reaches the source's ghosts only next to the fine block, where every
+block that fills them touches the fine block and so is within one level
+of it, and no mesh the tests build, nested, side by side, mirrored,
+clamped or rotated, has one. The check does not rely on the argument.
 
 Periodic boundaries need no special handling here — the tree wraps
 around (see [Domain and boundaries](#domain-and-boundaries)). Physical
@@ -1244,14 +1304,57 @@ divides by precomputed inverses, while the CPU keeps this launch — see
 **The tensor-product sum is generated, not iterated.** `for m in
 CartesianIndices(Ps)` cost its trip count in `__inc` even though `Ps` is
 a compile-time constant, and it recomputed the full `D`-fold weight
-product at every stencil point. It is now a generated loop nest with
+product at every stencil point. The sum is a generated loop nest with
 literal trip counts, which hoists `D − 1` of the `D` weight loads out of
-the inner loops. The nest reproduces the old loop *exactly*, not merely
-to the same accuracy: `m_1` runs innermost, as column-major
-`CartesianIndices` iteration did, so the contributions are summed in the
-same order, and the weight product is still formed as
-`((w₁ · w₂) · …) · w_D`, since floating-point multiplication does not
-associate. Only the loads move. 
+the inner loops. Its order is fixed, not merely its accuracy: `m_1` runs
+innermost, as column-major `CartesianIndices` iteration does, and the
+weight product is formed as `((w₁ · w₂) · …) · w_D`, since
+floating-point multiplication does not associate. Only the loads move.
+
+**A column with one nonzero weight takes one tap**, on the CPU. In
+vertex-centered refinement every other fine point along a dimension
+coincides with a coarse node, and the prolongation's column there is the
+unit vector exactly ([Ghost filling](#ghost-filling)). `Stencil1D`
+records, per column, the row of its only nonzero weight, or zero
+(`single`, decided on the host from the weights, as `unit` is, and
+uploaded with them), and along each dimension wider than one point the
+nest branches on it: the one tap, or the loop over the window. So a
+dimension whose targets alternate averages `(p + 1)/2` taps at order `p`
+instead of `p`, and the nest holds up to `2^D` copies of its innermost
+body. A cell-like dimension has no such column, in either family, and
+takes the loop. On one EPYC 7532 thread, at `N = 16`, this took each
+prolongation stage of the downstream's nested mesh from 368 to 100 ms.
+
+A device takes the full sum. The flat launch passes `singles = nothing`,
+and for that type `stencil_sum` is generated without the branches, so
+the device's kernel is the plain nest; the CPU's shaped launch keeps its
+argument types and stays type-stable. With the branches, each
+prolongation stage of the same mesh on an H200 (`N = 32`, 20 variables,
+`G = 3`, order 6, vertex-centered) went from 1.8 to 4.1 ms, while the
+copies and restrictions of phase 1 were unchanged (Symmetry jobs 578815
+and 578817, 2026-10-19). Neighbouring lanes along dimension 1 alternate
+between the one tap and the loop, so a warp takes both paths, and the
+`2^D` bodies cost the unrolled nest its registers. With the full sum
+each stage takes 1.81 ms again, and one H200's fill 7.90 ms, as on
+0.2.3 (2026-10-20). A device-friendly form of the skip —
+launching each parity class of a group separately, for example, so that
+a warp's lanes agree — is **(open)**.
+
+The skip is exact for finite data, so the choice by backend changes no
+result. A skipped term is `0 · u = ±0`; the accumulator starts at `+0`,
+and in round-to-nearest a sum is `−0` only when both addends are, so it
+never becomes `−0` and adding `±0` leaves it as it was; and the terms
+that remain are the same products, summed in the same order. What
+differs is a `NaN` or an infinity under a zero weight, which the full
+sum carries into the result and the skip does not — the choice the
+per-dimension widths make for the slots outside a window — so there a
+device's fill shows a non-finite value the CPU's does not. The bounded
+point-value sum (`bracket_clamp_sum`) does not skip, and is the same sum
+for finite data by the same argument. The suite
+compares every group of a range of schedules with the skip and without
+it, shaped and flat, bit for bit ("Skipping zero-weight taps fills bit
+for bit"), so the flat form the suite runs on the CPU tests the device's
+sum.
 
 **The per-launch allocation is KernelAbstractions', not ours.** Rebuilding the geometry tuples costs
 nothing measurable; what allocates is the argument tuple that
@@ -1321,7 +1424,11 @@ owner, as before, because a flat launch there cost the scatter 2.3×
 (38.8 → 89 ns a point at `16³`, 20 variables, one thread): half of that
 was the inverses, and half was stores that no longer ran along a row. The
 suite runs the flat form on the CPU too (`flat = true`), since CI has no
-device, and requires it to fill bit for bit as the shaped form does.
+device, and requires it to fill bit for bit as the shaped form does
+with the full sum, from data that hold a `NaN` and an infinity, which
+the shaped form's one-tap skip drops under a zero weight (see "A column
+with one nonzero weight takes one tap" under
+[What the ghost fill costs](#what-the-ghost-fill-costs)).
 
 **A copy skips its weights.** `Stencil1D` records whether it is one point
 of weight exactly one (`unit`, decided on the host from the weights), and
@@ -1350,6 +1457,26 @@ launch's arguments raised it further; the form kept allocates what 0.1.7
 did, plus the flag (11312 B a uniform fill against 10896). Compilation
 is 65.4 s against 63.0, within its noise, and the workload's output is
 unchanged.
+
+**What the stage groups and the one-tap nest cost to compile.** The
+serial `test/mpi_workload.jl` of 0.2.3 compiles in 82.3–82.6 s with 969
+compiled roots against that release (one EPYC 7543, Symmetry job
+579285, three alternating runs each, the workload's output identical).
+Against a build of the stage groups and the one-tap nest that also held
+the since-parked per-class partition ([HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill)),
+it compiled in 86.4–86.8 s with 995 roots, and in 85.3–86.0 s with the
+shaped launch passing `singles = nothing`, so the `2^D` bodies of the
+one-tap nest are about 1 s of the difference, the price of its 3.7
+times faster prolongations on the CPU; the rest was spread over the new
+code on the default path, with no call tree standing out. A second
+driver for groups, with an iterator over the stages' locals, compiled
+in 88.6–89.5 s with 1034 roots, which is why there is one ("Stages"
+under [Distributed meshes](#distributed-meshes)). Without the
+partition, as the package is, the same workload compiles in 115.4–115.8
+s with 991 roots against 110.9–111.7 s and 969 for 0.2.3, 4 % more (one
+EPYC 7532, a slower node than the one above, Symmetry job 579510,
+2026-10-20, three alternating runs each, the workload's output
+identical).
 
 **What it buys on an H200** (job 570290, `bench/copies.jl` from
 `bench/symmetry_copies.sh`: a uniform periodic mesh, 20 variables,
@@ -3541,8 +3668,16 @@ contiguous Morton ranges one level apart, as "Where the 64-thread
 efficiency goes" anticipated. Equal counts balance the load because
 every block costs the same under a global `dt` (the MPI bullet above).
 The one imbalance is ghost work concentrating at level boundaries,
-noted under "What one process loses"; a cost-weighted split would
-change only the helper, at both levels.
+noted under "What one process loses", and across ranks the prolongation
+work of a nested mesh, whose balance is open (see "Balancing
+prolongation over ranks" under "Performance work left for later",
+below). Another split would change more than the helper: `blockrange`
+and `leafowner` go through it, but the regrid's old and new owners
+(`regrid.jl`) and the routing of point interpolation (`interpolate.jl`)
+call `equalsplit` and `equalsplit_part` themselves, and so does
+TreeIOHDF5 for the owners of a checkpoint's blocks; and a split that is
+not one range per rank changes every site that turns a local block into
+a leaf by an offset.
 
 - **Block index `b` becomes local, everywhere.** `nblocks(fs)` is the
   rank's count, the last axis of `fs.work`, and `blockkey(fs, b)` is
@@ -3595,9 +3730,13 @@ The target's rank only copies it into place. Three reasons:
   exchange.
 - *The message is the transfer's target box.* A restriction's source
   footprint is `2^D` times its target and more, so sending the result
-  is much smaller. For a prolongation the two are about the same size:
-  in 3D at `N = 16`, `G = 2` and order 4, a fine face slab is 512
-  points and the coarse footprint it is computed from about 480.
+  is much smaller. For a prolongation the footprint is the smaller of
+  the two, but not by much: in 3D at `N = 16`, `G = 2` and order 4, a
+  fine face slab is 512 points and the coarse footprint it is computed
+  from about 480, and on the downstream's nested mesh (`G = 3`, order 6)
+  a message's stencils read 0.55–0.70 coarse points per fine point it
+  carries (see "Receiver-side prolongation" under "Performance work
+  left for later").
 - *The receiver needs nothing but a layout*: no stencils, no second
   schedule, no knowledge of the source's ghosts. Unpacking is a copy.
 
@@ -3635,7 +3774,10 @@ before the next one starts there:
 - phase 1 is one stage. The boundary hook then runs locally, on each
   rank's own blocks, after that stage's unpacks — exactly where it runs
   today;
-- phase 2 is one stage per target level, ascending;
+- phase 2 is one stage per target level, ascending, and consecutive
+  levels that do not depend on each other run as one *group* of stages
+  (see "Levels that do not depend on each other run together" under
+  [Ghost filling](#ghost-filling));
 - `restrict_interfaces!` is one stage per face dimension, ascending.
   Its serial phases exist because a point on the line where two
   coarse-fine faces meet is written in two of them (`InterfaceSchedule`'s
@@ -3654,10 +3796,11 @@ A stage runs in five steps:
 5. `waitall` on the receives, then unpack.
 
 The sends are waited on at the end of the call, before any buffer is
-reused. `run_stage!` in `ghosts.jl` runs these five steps
-through the communicator verbs. A stage without messages is the serial
-phase, the same launch and the same barrier. Within a stage, nothing a pack or a local group reads is
-written by an unpack:
+reused. `run_stages!` in `ghosts.jl` runs these five steps through the
+communicator verbs, for one stage or a group of them. A stage without
+messages is the serial phase, the same launch and the same barrier.
+Within a stage, nothing a pack or a local group reads is written by an
+unpack:
 
 - phase 1 reads interiors and writes ghosts;
 - a level-`ℓ` stage reads level-`ℓ − 1` sources and their ghosts, and
@@ -3668,6 +3811,34 @@ written by an unpack:
 
 So the order inside a stage is free, as the order inside a serial
 phase is, and only the stage boundaries carry the serial ordering.
+
+A group of stages (`run_stages!`) takes each of the five steps for all
+of its stages before the next: every stage's receives, every stage's
+packs and one synchronization, every stage's sends, the local groups of
+all of them as one phase, and the unpacks once every receive is in;
+then the relative hook's regions of each stage, in level order. Each
+stage keeps its tag, its buffers and its host mirrors, so its messages
+are the ones it sends alone. The same argument covers the group: its
+levels write ghosts of blocks at different levels, so the one phase
+writes each point once, and the dependency check is exactly that no
+pack or local group of the group reads a point another of its stages
+writes, an unpack's or a hook region's included. So the order inside a
+group is free too.
+
+One driver runs a group and a single stage alike, `run_stages!(…,
+stages, range, locals, …)`, every fill's stage included: phase 1, the
+interface stages, a rotation pair's and the regrid's are each the group
+of one. The group's local groups come in as the `Vector` a stage holds,
+its own for a stage alone and for a group the concatenation of its
+stages', made once with the schedule (`GhostSchedule`'s `grouplocals`).
+The fill's call tree is compiled per field-set type, and a second
+driver, or an iterator over the stages' locals handed to `run_phase!`,
+is a second copy of it; the message steps are functions of their own
+(`send_stages!`, `receive_stages!`), each specialized on what it reads,
+and the call's `sends`, `nothing` or a `Vector{Any}`, is not specialized
+on at all (`@nospecializeinfer`). "What the stage groups and the
+one-tap nest cost to compile" under [The copy kernels on a
+device](#the-copy-kernels-on-a-device) has what the copies cost.
 
 **Deadlock freedom and message matching.** Messages are nonblocking
 and matched by peer and tag, and the tag names the stage: phase 1, the
@@ -3680,6 +3851,17 @@ cannot be confused with another, since its tag is its own.
   completed locally, so every rank can pack and post its stage-`k`
   sends without waiting for anyone. Then every stage-`k` receive has
   its send posted, and the `waitall` returns.
+- *Groups of stages, by induction on the level.* A group posts all
+  its stages' sends before it waits for any of their receives, so a
+  rank posts its level-`ℓ` sends having waited only for phase 1 and the
+  levels below `ℓ`, grouped or not. Suppose every receive of those
+  completes, on every rank. Then every rank posts its level-`ℓ` sends,
+  and every level-`ℓ` receive completes; a group's one wait returns
+  once each of its levels' receives has, level by level. Phase 1
+  starts the induction, as above. Ranks may group differently, since a
+  message's tag and layout are its stage's and not its group's, and a
+  receive is matched alike whether it was posted early, with its group,
+  or late, alone.
 - *Across calls*, MPI's non-overtaking rule — two messages from one
   sender with one tag arrive in the order they were sent — matches each
   fill's message to the same fill's receive, provided every rank makes
@@ -3757,13 +3939,14 @@ which keeps "one kernel for every transfer" true.
   so the remote `−0` case exists from 2D on.)
 - **Why the ghosts are bit-identical.** Every ghost is written once, by
   the same kernel, from the same source values and the same stencil,
-  summed in the same order as in the serial fill; the unpack adds an
-  identity. So the ghosts are bit-identical to serial for any
-  partition, and so is everything computed from them. It is the
-  argument the thread invariant rests on, with a rank boundary in place
-  of a thread boundary. It needs the transfer arithmetic not to depend
-  on the destination type: no `@fastmath` or `@simd` reassociation in
-  `transfer_kernel!`. That holds today, since "What the ghost fill
+  summed in the same order as in the serial fill — a pack keeps the
+  serial stencil's one-tap rows (`single`), so it skips the same zero
+  weights; the unpack adds an identity. So the ghosts are bit-identical
+  to serial for any partition, and so is everything computed from
+  them. It is the argument the thread invariant rests on, with a rank
+  boundary in place of a thread boundary. It needs the transfer
+  arithmetic not to depend on the destination type: no `@fastmath` or
+  `@simd` reassociation in `transfer_kernel!`. That holds today, since "What the ghost fill
   costs" fixed its summation order.
 
 **MPI+GPU.** The pack and receive buffers live on the field set's
@@ -3836,7 +4019,7 @@ of a 2.5 ms fill on four H200s.
   its own stage and of the next schedule's first fill, and, staged,
   allocated and page-locked their host mirrors. The pool keeps them.
   - *Where it lives.* In the forest, whose leaves every schedule and
-    regrid is over and which `run_stage!` already has: a mutable
+    regrid is over and which `run_stages!` already has: a mutable
     `ForestState` holds the generation, which was a `Ref` of its own
     before, and the pool, made on first use. One object for both keeps
     `Forest` the size it was. A ninth field made the schedule build
@@ -4037,9 +4220,9 @@ is a loop of collective calls, the second a `mesh_mapreduce`.
   their own sources, so children with different owners are simply
   received from different peers; nothing about them is special. Over
   one rank both ranges are every leaf, nothing is split, and the stage
-  is the serial groups with no messages. `run_stage!` has a form
+  is the serial groups with no messages. `run_stages!` has a form
   over a separate `dest` and `src` — the new mesh's array and the old
-  one's — which the exchange's form now calls with `fs.work` twice.
+  one's — which the exchange's form calls with `fs.work` twice.
   `transfer_groups` keeps its signature, as the serial stage's groups,
   for `thread_tests.jl` and `bench/gpu.jl`.
 - *The ghost fill's checks stay rank-local*.
@@ -4192,6 +4375,50 @@ before it is built):
   source, step 7), the flags' `allgatherv`, the forest digest gathered
   by every checked call, the number of peers and messages per rank on
   a deeper hierarchy, and GPUs across nodes, which no run has used.
+- *Balancing prolongation over ranks.* The sender computes, so a
+  level's prolongations are packed on the owners of its coarse sources,
+  and on a nested mesh those are one stretch of the curve, which the
+  contiguous split gives to one or two ranks. On the downstream's mesh
+  (`bench/nested.jl`: the reflecting octant `[0,32]³` of `4³` roots
+  with cubes nested to level 3, 232 blocks, 20 variables, `G = 3`,
+  order 6, vertex-centered, `Float64`; one EPYC 7543 thread a rank,
+  `N = 16`, Symmetry, 2026-10-20) at four ranks, rank 2 packs 66.6 ms of
+  level 2 and rank 1 62.5 ms of level 3, while ranks 0 and 3 pack
+  nothing; the stage groups run the two at once, and the fill takes
+  236 ms, its phase 2 143 ms. A partition that splits every class of
+  leaves over all the ranks — a class is a level and the kind of
+  prolongation source a leaf is: none, across an edge or corner only,
+  or across a face — was built as an option and measured, and is not
+  shipped (the branch `eschnett-claude/partition-levels`; the record is
+  in [HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill)). It balances
+  the packing, every rank packing 10–20 ms of each level, as the counts
+  of `bench/partition_cost.jl` predict (the most-loaded rank's
+  prolongation at 1.05 of an even split with the stages in sequence and
+  1.01 grouped, at four ranks, against 3.42 and 1.87). But it scatters
+  every level over every rank, which multiplies the phase-1 halo: at
+  four ranks each rank sends 165k–186k points in phase 1 against
+  26k–56k, about four times, and 7–15 times at two. That costs more
+  than the balance gains, at every rank count measured: the fill takes
+  300 ms against 236 at four ranks of one thread, 93.1 against 58.3 at
+  eight ranks of eight threads, 19.2 against 7.39 ms on two H200s
+  under HPC-X staged and 14.6 against 9.07 on four under HPC-X direct,
+  and a whole time step of TreeGeneralizedHarmonic on four H200s (HPC-X
+  staged) 127.2 against 87.2 ms. What is left to try keeps a rank's
+  blocks in few runs: a contiguous split weighted by the prolongation
+  cost, moving only the prolongation sources, or overlapping the packs
+  with work that needs no ghosts.
+- *Receiver-side prolongation*, request 3 of the downstream report
+  (eschnett/TreeGeneralizedHarmonic.jl#11): send the coarse points a
+  prolongation message's stencils read, and prolong on the receiver.
+  Counted from the schedule (`bench/nested.jl`'s footprint lines), a
+  message's stencils read 0.55–0.70 distinct coarse points, on the
+  source block and in its ghosts, per fine target point the message
+  carries, at `N = 32` over eight ranks, and 0.62–0.65 at `N = 16`; so
+  those messages would shrink by about a third to a half. The receiver
+  would need the stencils, and the coarse block's own ghosts complete
+  before they are sent — filled by phase 1, the boundary hook and the
+  levels below — which is the second, wider exchange that "The
+  exchange: the sender computes" avoids.
 
 **The multi-block check** (the standing instruction). Nothing here obstructs a conforming multi-block forest.
 
@@ -4313,7 +4540,11 @@ The ideas that span several files and are easy to violate:
   stencils at a domain edge reach tangentially into the source's outer
   ghosts. The relative hook's regions that read prolongated ghosts run
   after the stage that fills them, not with the others ("Ghost
-  filling").
+  filling"). Levels that conflict in no point run as one group of
+  stages, decided per rank by `stage_groups` from the boxes each level
+  writes and reads; anything new that a phase-2 stage writes or reads
+  there — a transfer kind, a hook that runs after a stage — has to be
+  among those boxes, or levels that depend on it will run together.
 - **Reflecting and outflow faces are transfers, not hooks** (M10). The
   kind of each face is a property of the `Forest` (`faces`, read
   through `reflecting_faces`, `outflow_faces` and `facekind`), `parity` a
@@ -4483,7 +4714,7 @@ The ideas that span several files and are easy to violate:
   turn the serial fill's `−0` into `+0`. Every ordering point of the
   serial fill is a stage with its own tag — phase 1 (1), each phase-2
   target level (`2 + ℓ`), each interface dimension (`40 + d`), the
-  regrid (50) — run by `run_stage!` in five steps (post receives, pack
+  regrid (50) — run by `run_stages!` in five steps (post receives, pack
   and synchronize, send, run the local groups, wait and unpack). Both
   ends derive a message's layout from the replicated forest, sorted by
   `keyorder`, so no descriptor is ever sent and `Dict` order must never
@@ -4691,6 +4922,11 @@ files are not tests:
   through the seam), interpolation beyond it, and the wave on a quadrant
   against the full plane (`rotating_wave`, scalar and vector, which the
   vertex-centered seam planes keep equal bit for bit).
+  `nested_octant` is the downstream's nested mesh, whose prolongation
+  levels run as one group of stages, and `fill_stagewise!` runs a fill
+  through the package's stages in groups of the caller's choosing, in
+  reverse level order if asked: the oracle for the stage groups'
+  dependency check.
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.

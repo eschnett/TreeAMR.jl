@@ -279,7 +279,7 @@ hoststaging(::Communicator, buffer::AbstractVector) = !(buffer isa Array)
 #
 # - It belongs to the forest (`bufferpool`), which outlives every
 #   schedule and regrid over it, and is reached from every place that
-#   stages: `run_stage!` has the forest. It is made on first use, and a
+#   stages: `run_stages!` has the forest. It is made on first use, and a
 #   serial forest, which has no stage with messages, never makes one.
 # - A *lease* is a buffer of at least the length asked for, handed out as
 #   an object of exactly that length over the pooled memory: for a host

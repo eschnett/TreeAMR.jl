@@ -20,6 +20,7 @@ milestones were planned in, and the list below is in execution order.
   - [M9a — Checkpoint and restart](#m9a--checkpoint-and-restart)
   - [M7 — MPI](#m7--mpi)
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
+  - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
   - [M9b — Visualization export](#m9b--visualization-export)
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
 
@@ -76,6 +77,10 @@ Done, 2026-10-02 (steps 0–9 and 6b). The design is under "Distributed meshes" 
 ### M12 — Rotating symmetry
 
 Done, 2026-10-03 (steps 0–10). The design is under "Domain and boundaries" and "Rotating seams" in "Ghost filling" in [CODE.md](CODE.md#ghost-filling), and what it leaves open under "Open questions"; the record is in [HISTORY.md](HISTORY.md#m12--rotating-symmetry).
+
+### M13 — Nested-mesh ghost fill
+
+Done, 2026-10-20 (steps 1–4; step 4, a partition balanced per class of leaves, parked). The design is under "Ghost filling", "What the ghost fill costs" and "Stages" in "Distributed meshes" in [CODE.md](CODE.md#ghost-filling), and what it leaves open under "Performance work left for later" there; the record is in [HISTORY.md](HISTORY.md#m13--nested-mesh-ghost-fill).
 
 ### M9b — Visualization export
 

@@ -7,13 +7,13 @@ milestone records, the downstream checks and the release history. The
 current design, with the reasons for it, is in [CODE.md](CODE.md), and
 the plan in [PLAN.md](PLAN.md). The sections follow CODE.md's.
 
-**Step numbers.** The milestones M0–M12 are those of
+**Step numbers.** The milestones M0–M13 are those of
 [PLAN.md](PLAN.md), numbered in the order they were planned and done in
-the order M0–M6, M8, M10, M11, M9a, M7, M12. Several were built in
+the order M0–M6, M8, M10, M11, M9a, M7, M12, M13. Several were built in
 numbered steps — M8a steps 1–3 and M8b steps 4–5, M7 steps 0–9 with a
-step 6b, M12 steps 0–10 — and a reference such as "M7 step 6b", or
-"step 8" inside a milestone's record, names one of them. Each
-milestone's steps are listed in its record under
+step 6b, M12 steps 0–10, M13 steps 1–4 — and a reference such as "M7
+step 6b", or "step 8" inside a milestone's record, names one of them.
+Each milestone's steps are listed in its record under
 [Milestones](#milestones).
 
 **Contents**
@@ -53,6 +53,7 @@ milestone's steps are listed in its record under
   - [M9a — Checkpoint and restart](#m9a--checkpoint-and-restart)
   - [M7 — MPI](#m7--mpi)
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
+  - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -158,6 +159,10 @@ The design said a set with `G = 0` in both plane dimensions "fills alone, as tod
 
 The M12 design said the two members "can share a stage's tag ...; an offset per member on the tag is the alternative if it turns out cleaner". Step 7 (2026-10-03) confirmed the shared tag and made it precise (what a stage completes before the next is its receives); no ordering hazard was found, and the members keep the shared tag. Step 3 (2026-10-03) found the schedule need record nothing for the plain fill's refusal, which decides from the layout. The design had "`regrid!` and `adapt_to_initial_data!` take `pair => (sa, sb)` and fill the pair before the transfers"; step 4 (2026-10-03) amended that: `regrid!` takes the element, and `adapt_to_initial_data!` has a pair form instead.
 
+Stage groups were added in M13 step 2 (2026-10-19) for a downstream report, eschnett/TreeGeneralizedHarmonic.jl#11: the phase-2 stages ran one after another, and on a nested mesh each on the rank that owns its level's shell, so the distributed fill's critical path was the sum over the levels. The sweep had encoded the dependency between levels by stage order alone, without checking whether a level reads what the level below writes; the check is now made per rank at schedule build. Neither the tests' meshes nor some 230 random ones have such a level, which left the open question in [CODE.md](CODE.md#ghost-filling). The measurements are in the M13 entry under [Milestones](#milestones).
+
+Stage groups first ran through a driver of their own, `run_stages!` beside `run_stage!`, which handed `run_phase!` an iterator over its stages' locals (`GroupedLocals`), and the schedule build compiled `stage_groups` per element type and dimension. Measured on Symmetry on 2026-10-20 with the serial `test/mpi_workload.jl` of 0.2.3 under `--trace-compile-timing` (one EPYC 7543, three alternating runs), in a build that also held the per-class partition of M13 step 4, that branch compiled in 88.6–89.5 s with 1034 roots against 82.3–82.6 s and 969 for 0.2.3 (job 579285). The same day the drivers became one, with a group's locals concatenated at schedule build (`grouplocals`), the message steps split out of it and `sends` left unspecialized; `stage_groups` became one method per dimension; the partition's policy stopped being specialized on and its owner function inferred through; and `stencil_sum`'s generator lost a filtered comprehension. That compiled in 86.4–86.8 s with 995 roots. Along the way: without the split and with `sends` specialized, 87.1–87.3 s (job 579274); and a wrapper that did not specialize on `sends` made the fill's call into the driver dynamic, which moved its compilation into roots of its own without changing the total (86.3–86.7 s in job 579274, 86.4–86.8 in 579285). When the partition was parked the branch was rebuilt without it, and the driver commit kept everything but the partition's part. The rebuilt branch compiles the same workload in 115.4–115.8 s with 991 roots against 110.9–111.7 s and 969 for 0.2.3 (job 579510, 2026-10-20, on an EPYC 7532, cn086, three alternating runs, output identical): 4 % more, where the build with the partition was 5 % more. The one-tap nest's share, about 1 s, is in [CODE.md](CODE.md#the-copy-kernels-on-a-device).
+
 Batching by target level was amended in M5. The original keying did span levels; it was found while threading the schedule build, and no configuration could be constructed in which it actually produced wrong ghosts — but the ordering the sweep exists to guarantee was not in fact enforced, which is enough reason to fix it. The mirror state joined the group key in M10 and the orientation in M12; the M12 design had a group carry its axis map, and step 3 (2026-10-03) amended that to the orientation and plane, with `factorcol` becoming an `Int32`.
 
 ### What the ghost fill costs
@@ -195,6 +200,8 @@ operator families — checked by digest against the previous commit, not
 inferred.
 
 That the per-launch allocation is KernelAbstractions' corrected the downstream brief, which put it on `run_group!` reassembling the group's geometry. Four costs were named by the downstream profile; all four were real, one was diagnosed wrongly, and a fifth (bounds checking, not on the list) turned out to be the largest.
+
+The one-tap skip for a column with one nonzero weight was added in M13 step 1 (2026-10-19), for the same downstream report: every prolonged point summed the full `6³` tensor product, where a vertex-centered fine face slab has about 53 taps with a nonzero weight, so the plan expected about 4× on vertex-centered prolongation. It first ran on every backend. Measured on Symmetry on 2026-10-19 on the downstream's nested mesh, it made each prolongation stage 3.7× faster on one EPYC thread but 2.27× slower on an H200, so the same day the flat launch, a device's, was made to take the full sum, and the CPU's shaped launch kept the skip; the numbers and the likely causes, which were not profiled, are in [CODE.md](CODE.md#what-the-ghost-fill-costs) ("A column with one nonzero weight takes one tap"). Both forms compute the same bits for finite data, so no result changed.
 
 ### The copy kernels on a device
 
@@ -383,6 +390,8 @@ in-process. CI runners have three or four cores, while `-n 3` at two
 threads wants six, and MPICH polls while it waits; on CI the ranks
 should therefore run one thread each.
 
+**A partition balanced per class of leaves was built and parked** (M13 step 4, 2026-10-19 and 20). The contiguous split puts a nested mesh's prolongation sources, one stretch of the curve per level, on one or two ranks, and the sender computes. Erik decided to add a balanced partition as an option, `Forest(…; partition = :levels)`, rather than change the default, and chose its rule from the counts of `bench/partition_cost.jl`, which prices candidate owner functions from the serial schedule without timing anything: the face-aware rule, whose class is a level and the kind of prolongation source a leaf is (none, across an edge or corner only, across a face). It was built with an immutable `Partition` per generation in `ForestState`, a new export `ownedleaves`, `blockrange` refusing under the option, a reorder of the flags' gather into curve order, and tests under a round-robin test policy. Timed on Symmetry on 2026-10-20 it balanced the packing and made the fill slower at every rank count, on the CPU and on H200s, because it multiplied the phase-1 halo; Erik parked it the same day. It stays on the branch `eschnett-claude/partition-levels`; the design, the tables and the reasons are in the M13 entry under [Milestones](#milestones), and what is left to try under "Performance work left for later" in [CODE.md](CODE.md#distributed-meshes).
+
 "Performance work left for later" was recorded on 2026-10-02 after the buffer pool; none of it blocked M7. Its item on compression where the data are was added in step 6b.
 
 The multi-block check was made on 2026-10-01 and amended by the M12 design on 2026-10-03.
@@ -427,7 +436,9 @@ M7. M9a's layout was chosen so that M7 need not change it, subject to
 M7's benchmarks (in the end it did change it: format version 2, M7 step
 6b). The list below is in execution order. M7 is done (2026-10-02).
 M12, the rotating symmetry, was added after it on 2026-10-03 and done
-the same day, so it comes before M9b, which follows it.
+the same day, so it comes before M9b, which follows it. So does M13,
+the nested-mesh ghost fill, added on 2026-10-19 for a downstream report
+and done on 2026-10-20.
 
 M9b was split from M9, "I/O and visualization", on 2026-09-29, when its checkpoint half became M9a.
 
@@ -3499,6 +3510,185 @@ M12 was decided with Erik, after M7 and before M9b.
     `0.1.x` release: *released as 0.1.7 (2026-10-04)*, together with the
     interpolator's second derivatives from `main`.
 
+### M13 — Nested-mesh ghost fill
+
+- **M13 — Nested-mesh ghost fill.** *(Planned 2026-10-19. Done
+  2026-10-20.)* TreeGeneralizedHarmonic reported
+  (eschnett/TreeGeneralizedHarmonic.jl#11) that on a nested mesh a
+  distributed `fill_ghosts!` does not strong-scale. Its mesh has four
+  levels and three coarse-fine shells, 232 blocks of `32³`, `G = 3`,
+  prolongation order 6, vertex-centered; the fill took 9.5 ms on one
+  H200, 15–16 ms on four with HPC-X and 42 ms on four with MPICH_jll,
+  and on the CPU prolongation was 600 ms of a 1266 ms right-hand side.
+  The plan found two causes in TreeAMR: the prolongation stages ran one
+  after another, each on the one rank that owns its level's coarse
+  sources, so the critical path was the sum over the levels; and every
+  prolonged point summed the full `6³` tensor product, although in
+  vertex-centered refinement every other fine point along a dimension
+  sits on a coarse node, whose column is an exact one among exact
+  zeros. Steps 1 and 2 change neither a ghost nor a digest for finite
+  data; step 3 measures them; step 4, a partition balanced per class
+  of leaves, Erik decided to add as an option rather than as a new
+  default, and parked after it was measured. The report's third
+  request, receiver-side prolongation, and a sum factorization across
+  targets, which would change the rounding, were left out of the
+  round; the first is open in CODE.md, with its measurement.
+  - **Step 1 — a column with one nonzero weight takes one tap.**
+    *(Done, 2026-10-19.)* `Stencil1D` gained `single`, and
+    `stencil_sum` branches on it along each dimension; the argument
+    that it is bit-identical for finite data, and the test that
+    compares every group with and without it, are in CODE.md ("A
+    column with one nonzero weight takes one tap"). On the H200 it
+    made each prolongation stage 2.27× slower (below), so the same day
+    the flat launch, a device's, was made to take the full sum.
+  - **Step 2 — independent levels run as one group of stages.**
+    *(Done, 2026-10-19.)* `GhostSchedule`'s `stagegroups`, decided per
+    rank from the host stencils (`stage_groups`), and one wait per
+    group; deadlock freedom by induction on the level. The tests:
+    "Independent prolongation levels run as one group", "A level that
+    reads what the level below writes runs after it", "A grouped fill
+    is the same in any order within the group", a mailbox test with
+    messages at two and three ranks, and the nested octant at three
+    ranks in `mpi_workload.jl` (case N3).
+  - **Step 3 — measurements.** *(Done, 2026-10-20.)* `bench/nested.jl`
+    is the downstream's mesh: the reflecting octant `[0,32]³` of `4³`
+    roots, cubes nested to level 3, 232 blocks, 20 variables, `G = 3`,
+    order 6, vertex-centered, `Float64`, `N = 16` on the CPU and 32 on
+    the H200s. It times the fill, phase 1, every stage and stage group,
+    the packs, unpacks and locals, per rank in synchronized windows,
+    and counts each prolongation message's footprint.
+    `bench/symmetry_nested.sh` runs it for several checkouts in one
+    job. Times are the slowest rank's, in ms.
+    - *Round 1* (2026-10-19; jobs 578814–578817; CPU cn082, EPYC 7532,
+      one rank a NUMA domain; H200 cn113): 0.2.3 (a1f742f), step 1
+      (3ea7129), and step 2 on top (055c935). On the CPU each
+      prolongation stage went from 368 to 100 ms with step 1; on the
+      H200 from 1.8 to 4.1 ms, the regression. Four H200s under HPC-X
+      direct filled in 15.5, 25.0 and 14.9 ms.
+
+      | fill, ranks × threads | 0.2.3 | step 1 | steps 1–2 |
+      |---|---|---|---|
+      | 1 × 1 | 1561 | 758 | 753 |
+      | 2 × 1 | 1374 | 567 | 568 |
+      | 4 × 1 | 1109 | 414 | 285 |
+      | 8 × 8 | 352 | 112 | 74 |
+
+    - *Round 2* (2026-10-20; jobs 578974–578978, 579035, 579048,
+      579058 and 579059; CPU cn093 and cn102, EPYC 7543; H200 cn111
+      and h200q): 0.2.3, the branch with the device's full sum under
+      the contiguous split (5ec5db9, `curve`), and the same under
+      `partition = :levels` (`levels`). `bench/ghosts.jl`, the
+      cell-centered control, was within 1–4 % between 0.2.3 and the
+      branch.
+
+      | CPU, ranks × threads | 0.2.3 | `curve` | `levels` |
+      |---|---|---|---|
+      | fill, 1 × 1 | 1293 | 598 | 595 |
+      | fill, 2 × 1 | 1157 | 462 | 541 |
+      | fill, 4 × 1 | 949 | 236 | 300 |
+      | fill, 8 × 8 | 305 | 58.3 | 93.1 |
+      | phase 1, 4 × 1 | 96.2 | 95.5 | 150 |
+      | phase 1, 8 × 8 | 17.5 | 17.3 | 29.5 |
+      | phase 2 in sequence, 4 × 1 | 855 | 253 | 131 |
+      | phase 2 grouped, 4 × 1 | – | 143 | 82.4 |
+      | phase 2 grouped, 8 × 8 | – | 38.0 | 44.1 |
+
+      At 4 × 1 the packs per rank (ranks 0–3) were, under `curve`,
+      0 / 0 / 66.6 / 1.2 ms for level 2 and 0 / 62.5 / 0 / 0 for level
+      3; under `levels` 13.8 / 11.6 / 13.5 / 13.5 and 19.0 / 18.5 /
+      12.2 / 18.4. Each rank sent 26k–56k points in phase 1 under
+      `curve` and 165k–186k under `levels`.
+
+      | H200, fill | 0.2.3 | `curve` | `levels` |
+      |---|---|---|---|
+      | 1 GPU | 7.90 | 7.90 | 7.92 |
+      | 2 GPUs, HPC-X staged | 10.5 | 7.39 | 19.2 |
+      | 2 GPUs, HPC-X direct | 11.0 | 9.92 | 14.1 |
+      | 2 GPUs, MPICH_jll | 18.4 | 17.5 | 57.1 |
+      | 4 GPUs, HPC-X direct | 14.3 | 9.07 | 14.6 |
+      | 4 GPUs, HPC-X staged | 23.8 | 14.9 | 26.4 |
+      | 4 GPUs, MPICH_jll | 34.2 | 24.7 | 62.0 |
+      | phase 1, 4 GPUs, HPC-X direct | 3.68 | 3.59 | 8.44 |
+      | phase 2, 4 GPUs, HPC-X direct | 11.1 | 10.9 | 5.92 |
+      | phase 2 grouped, the same | – | 5.45 | 5.43 |
+
+      With the full sum each prolongation stage on one H200 took
+      1.81 ms again. TreeGeneralizedHarmonic's `bench/mpi_breakdown.jl`
+      (its commit 0742491), in a scratch copy, a whole time step and its
+      speedup over one GPU (156.1 ms on 0.2.3, 156.5 on the branch):
+
+      | step | 0.2.3 | `curve` | `levels` |
+      |---|---|---|---|
+      | 2 GPUs, HPC-X staged | 104.2 (1.50×) | 92.4 (1.69×) | 130.9 (1.19×) |
+      | 4 GPUs, HPC-X staged | 111.0 (1.41×) | 87.2 (1.79×) | 127.2 (1.23×) |
+      | 4 GPUs, MPICH_jll | 159.4 (0.98×) | 134.5 (1.16×) | 253.5 (0.62×) |
+
+      Its fill at four GPUs under HPC-X staged took 24.0, 15.3 and
+      24.5 ms.
+    - *The footprint* of each prolongation message, the distinct
+      coarse points its stencils read against the fine target points it
+      carries: 0.55–0.70 at `N = 32` over eight ranks, 0.62–0.65 at
+      `N = 16`, against CODE.md's earlier estimate that the two are
+      about the same (in "The exchange: the sender computes" now).
+  - **Step 4 — a partition balanced per class of leaves, as an
+    option.** *(Built 2026-10-19; measured and parked 2026-10-20.)*
+    Erik's decision was an option, the contiguous split staying the
+    default, so that nothing changed for an application that did not
+    ask, and the benchmarks and the downstreams would decide the
+    default later.
+    - *The rule, chosen by counting* (`bench/partition_cost.jl`,
+      2026-10-19): each prolongation charged to its source's owner as
+      target points times nonzero taps, the most-loaded rank against an
+      even split, the stages in sequence and grouped, and the phase-1
+      target points that cross ranks. Plain per-level, rotated, was
+      2.26 in sequence and 1.39 grouped at four ranks; the face-aware
+      rule, whose class is the level and the kind of prolongation
+      source (none, across an edge or corner only, across a face; a
+      face source costs some hundred times a corner source), with each
+      class's pieces rotated, was the best, and Erik chose it:
+
+      | P | contiguous, seq / grp | face-aware, seq / grp | phase-1 halo, contiguous / face-aware |
+      |---|---|---|---|
+      | 2 | 2.00 / 1.33 | 1.00 / 1.00 | 36k / 421k |
+      | 4 | 3.42 / 1.87 | 1.05 / 1.01 | 175k / 680k |
+      | 8 | 4.56 / 1.97 | 1.38 / 1.13 | 374k / 869k |
+
+    - *What was built* (`partition = :levels`): each class's leaves,
+      in curve order, cut into `P` equal pieces, piece `k` to rank
+      `(k − 1 + s) mod P`, with `s = ⌊P · frac(ℓ/φ² + kind/2)⌋`, which
+      depends on the class and `P` only, so a regrid moved no leaf of a
+      class it left alone; the rotation by the class index that the
+      counts were first taken with gave every source class one residue
+      when 3 divides `P`. An immutable `Partition` per generation and
+      rank count in `ForestState` (owner per leaf, the owned leaves,
+      their inverse, every rank's runs); `ownedleaves` exported;
+      `blockrange` refusing under the option, serially too, since an
+      answer right only serially would pass every serial test, and a
+      new return type would have broken every caller under the
+      default; the flags' gather put back in curve order; the policy in
+      the forest digest; every offset site going through the
+      `Partition`; and the in-process exchange, regrid and
+      interpolation tests under the contiguous split, `:levels` and a
+      round-robin test policy, bit for bit against serial.
+      `bench/replicated.jl` (cn093) priced its build at 227 ms for
+      180224 leaves at four threads, and a whole `regrid!` on one rank
+      at 384 / 270 ms refining / coarsening against 32 / 22 under the
+      contiguous split.
+    - *Parked* (2026-10-20, Erik). It balanced the packing, as counted,
+      and multiplied the phase-1 halo, about four times at four ranks
+      and 7–15 times at two, which cost more than the balance gained at
+      every rank count (round 2 above). The commits stay on the branch
+      `eschnett-claude/partition-levels`; `bench/partition_cost.jl`
+      stays here as the record of the counts.
+  - **Verification** (2026-10-20, the laptop, Apple silicon, Julia
+    1.13.2, with the partition commits taken out of the branch): the
+    suite passes, 130365 tests in 10m40 at one thread and 130417 in
+    10m03 at eight; `thread_workload.jl` at one and four threads prints
+    what 0.2.3 prints, and the serial `mpi_workload.jl` too but for the
+    six lines of the new case N3; at three ranks the workload agrees
+    with serial in every line but the `#` lines and the last digits of
+    the `sum` lines; the docs build, doctests included.
+
 ## Downstream checks
 
 **TreeWave.** The `[sources]` pins to `main` went when 0.1.1 was
@@ -3610,5 +3800,6 @@ boundary hooks in `regrid!`, the multi-set `adapt_to_initial_data!`,
 outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
-0.2.3 (2026-10-16) raised the Julia floor to 1.13. The repository keeps no changelog; the release commit says what
+0.2.3 (2026-10-16) raised the Julia floor to 1.13, and 0.2.4 carries the
+nested-mesh ghost fill (M13). The repository keeps no changelog; the release commit says what
 changed.
