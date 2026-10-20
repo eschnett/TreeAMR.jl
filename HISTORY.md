@@ -3800,5 +3800,6 @@ boundary hooks in `regrid!`, the multi-set `adapt_to_initial_data!`,
 outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
-0.2.3 (2026-10-16) raised the Julia floor to 1.13. The repository keeps no changelog; the release commit says what
+0.2.3 (2026-10-16) raised the Julia floor to 1.13, and 0.2.4 carries the
+nested-mesh ghost fill (M13). The repository keeps no changelog; the release commit says what
 changed.
