@@ -7,11 +7,11 @@ milestone records, the downstream checks and the release history. The
 current design, with the reasons for it, is in [CODE.md](CODE.md), and
 the plan in [PLAN.md](PLAN.md). The sections follow CODE.md's.
 
-**Step numbers.** The milestones M0–M12 are those of
+**Step numbers.** The milestones M0–M13 are those of
 [PLAN.md](PLAN.md), numbered in the order they were planned and done in
-the order M0–M6, M8, M10, M11, M9a, M7, M12. Several were built in
+the order M0–M6, M8, M10, M11, M9a, M7, M12, M13. Several were built in
 numbered steps — M8a steps 1–3 and M8b steps 4–5, M7 steps 0–9 with a
-step 6b, M12 steps 0–10 — and a reference such as "M7 step 6b", or
+step 6b, M12 steps 0–10, M13 steps 0–8 — and a reference such as "M7 step 6b", or
 "step 8" inside a milestone's record, names one of them. Each
 milestone's steps are listed in its record under
 [Milestones](#milestones).
@@ -53,6 +53,7 @@ milestone's steps are listed in its record under
   - [M9a — Checkpoint and restart](#m9a--checkpoint-and-restart)
   - [M7 — MPI](#m7--mpi)
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
+  - [M13 — Half-turn symmetry](#m13--half-turn-symmetry)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -413,7 +414,7 @@ over tilde bounds and over a run-time interface version.
 
 ## Open questions
 
-The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05.
+The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed, and taken up on 2026-10-21 as M13, when Erik asked for it. His decisions that day: a keyword of its own, `halfturn = (d1, d2)`, rather than an angle on `rotating`; a field-set keyword of its own too, `halfturn`, rather than `rotation` with a second meaning; exactly M12's refusals of periodic, reflecting and outflow faces on the plane's dimensions; and the axis on a root boundary ("the origin is at the edge of a box"), so `roots[d2]` even. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05.
 
 ## Milestones
 
@@ -3498,6 +3499,22 @@ M12 was decided with Erik, after M7 and before M9b.
     checkpoint feature that only a rotating forest writes — so it is a
     `0.1.x` release: *released as 0.1.7 (2026-10-04)*, together with the
     interpolator's second derivatives from `main`.
+
+### M13 — Half-turn symmetry
+
+- **M13 — Half-turn symmetry.** *(Specified 2026-10-21.)* The π-symmetry
+  of Cactus's RotatingSymmetry180, as specified in [PLAN.md](PLAN.md#m13--half-turn-symmetry),
+  under "Half turn" in [Domain and boundaries](CODE.md#domain-and-boundaries)
+  and *Half turns* under "Rotating seams" in
+  [Ghost filling](CODE.md#ghost-filling). The decisions are under
+  [Open questions](#open-questions). The design found one thing M12's
+  deferral had not named: a half turn flips the dimension tangential to
+  the seam, which a quarter turn never does, and in a vertex-like `d2`
+  half-open ownership does not survive the flip, so the seam slab's
+  partition along `d2` moves up a plane (checked by hand for every copy
+  and restriction range in the design, then by the `NaN` test).
+  - **Step 0 — specification.** *(Done, 2026-10-21.)* CODE.md, PLAN.md
+    and this record.
 
 ## Downstream checks
 

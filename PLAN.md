@@ -20,6 +20,7 @@ milestones were planned in, and the list below is in execution order.
   - [M9a — Checkpoint and restart](#m9a--checkpoint-and-restart)
   - [M7 — MPI](#m7--mpi)
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
+  - [M13 — Half-turn symmetry](#m13--half-turn-symmetry)
   - [M9b — Visualization export](#m9b--visualization-export)
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
 
@@ -76,6 +77,56 @@ Done, 2026-10-02 (steps 0–9 and 6b). The design is under "Distributed meshes" 
 ### M12 — Rotating symmetry
 
 Done, 2026-10-03 (steps 0–10). The design is under "Domain and boundaries" and "Rotating seams" in "Ghost filling" in [CODE.md](CODE.md#ghost-filling), and what it leaves open under "Open questions"; the record is in [HISTORY.md](HISTORY.md#m12--rotating-symmetry).
+
+### M13 — Half-turn symmetry
+
+*(Specified 2026-10-21.)* A 180° rotating symmetry, the π-symmetry of
+Cactus's RotatingSymmetry180: half of the `(d1, d2)` plane is
+simulated, and the low face of `d1` is glued to itself, reversed about
+the centre plane of `d2`. `halfturn = (d1, d2)` on the forest and a
+`halfturn` variable map on every field set, as specified under "Half
+turn" in [Domain and boundaries](CODE.md#domain-and-boundaries) and
+*Half turns* under "Rotating seams" in
+[Ghost filling](CODE.md#ghost-filling). It reuses M12's orientation 2 —
+the oriented search, the virtual frame, the axis map, the tables,
+conformity, the MPI path — and adds the turn about the centre line and
+the shifted partition of a vertex-like `d2` in the seam slab. The change
+is additive, a new keyword on `Forest` and on `FieldSet`, so it is a
+`0.2.x` release, 0.2.4, with a TreeIOHDF5 release that saves the new
+keywords. *Accept:*
+- **refusals**, each with its reason: every case listed for the forest
+  and the field set, a leaf list not conforming at the seam, and a
+  `RotationPair` over a half-turn forest;
+- **the neighbor oracle**: the half plane's oriented neighbors equal the
+  images of the neighbors in an independently built *unfolded* forest of
+  `2M₁ × M₂` roots, made by turning the leaves with exact `Rational`
+  boxes, on random refinements and after `balance!`; the unfolded forest
+  is 2:1 balanced and the seam conforming;
+- **no ghost undefined, and none read before it is defined**, in
+  `D = 2` and `3` with `z` periodic, outer or reflecting at its low
+  face, for every centering, rotated restrictions and prolongations
+  included (which a half turn has in 2D, at the seam's edges);
+- **`halfturn_vs_doubled`**: data covariant under the half turn and not
+  polynomial, on a refinement symmetric under it that reaches the seam
+  and the axis, where every stored point, ghosts included, equals the
+  full plane's within `1e-13`, cell, vertex and face centering, under
+  half-open and symmetric walls;
+- **write counts**: the schedule partitions the stored points, and every
+  hook region's image leaves through an outer face;
+- **the wave equation on a half plane against the full box**, a scalar
+  and a vector wave: `linf` equal to the full box's to `rtol = 1e-8`,
+  the vertex-centered seam half-planes equal to each other as measured,
+  and the rate 2;
+- **a regrid across the seam**, conformity kept, no block moved by more
+  than one level, the ghosts afterwards equal to the oracle's;
+- **conservation through the seam** under the rigid rotation, with the
+  fixup, to roundoff;
+- **interpolation beyond the seam**: values and first derivatives;
+- **MPI**: lockstep packs in process, bitwise with a turned `−0`, and a
+  half-turn case in `mpi_workload.jl` at `-n 2` and `-n 3`; a cycle in
+  `thread_workload.jl`, a fill in `gpu_tests.jl`;
+- **TreeIOHDF5**: a round trip and a restart that continues byte for
+  byte.
 
 ### M9b — Visualization export
 

@@ -5,7 +5,8 @@ Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
 **Status.** Milestones M0–M8, M10, M11, M9a, M7 and M12 are done;
-next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+M13, the half-turn symmetry, is under way, and visualization export
+(M9b) follows it. The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -607,6 +608,73 @@ declared up front:
   two `Int8`s, which fit in the struct's alignment padding (what a
   field of `Forest` costs is under "The buffer pool" in
   [Distributed meshes](#distributed-meshes)).
+- **Half turn** (a pair of dimensions): a half-plane symmetry, the
+  180° counterpart of the quarter turn above, as Cactus's
+  RotatingSymmetry180 is of its RotatingSymmetry90. Only the half of the
+  `(d1, d2)` plane above the low face of `d1` is simulated, and the
+  other half is its image under the rotation `P` by 180° about the line
+  where the low face of `d1` meets the centre plane of `d2`: with
+  `a = x_{d1} − lo_{d1}`, `P` takes `(a, x_{d2})` to
+  `(−a, lo_{d2} + hi_{d2} − x_{d2})` and leaves every other dimension
+  alone. A binary, or a spinning black hole off the octant's axes, has
+  this symmetry where it has no quarter-turn one. It is declared on the
+  forest as `halfturn = (d1, d2)`, default `nothing`: `d1` is the
+  dimension whose low face is the seam, and `d2` the dimension the turn
+  reverses. The forest refuses, each time saying why:
+
+  - `D < 2`, `d1 == d2`, or either dimension out of range, as for
+    `rotating`;
+  - both `rotating` and `halfturn`: one plane, one seam;
+  - an odd `roots[d2]`. The axis must lie on a root boundary, so that no
+    root — and at no level any block — is its own image across the seam,
+    and the image of a family of siblings is a family. Unlike a quarter
+    turn, `roots[d1]` is free: the seam glues one face to itself;
+  - `d1` or `d2` periodic;
+  - a reflecting or outflow face on either side of `d1` or `d2`. The
+    high face of `d1` and both faces of `d2` stay outer, the hook's;
+    other kinds there are an open question (see
+    [Open questions](#open-questions)).
+
+  Every field set over such a forest declares its **`halfturn`** map, a
+  signed variable map with one entry per variable, required with no
+  default, as `rotation` is: variable `v` at `Pp` equals
+  `sign(halfturn[v])` times variable `|halfturn[v]|` at `p`. A half turn
+  negates both axes of its plane, so a Cartesian tensor component takes
+  the sign `(−1)^k`, `k` the number of its indices in the plane, and an
+  application that stores Cartesian components declares a diagonal map:
+  for `(ρ, vx, vy, vz)` with `halfturn = (1, 2)` it is
+  `halfturn = (1, −2, −3, 4)`. A signed permutation is accepted all the
+  same, for variables stored otherwise. The field set refuses a map that
+  is not a signed permutation, a map of the wrong length, a map `Q` with
+  `Q² ≠ I`, since two half turns are the identity, and one that sends a
+  variable to one of another parity in a reflecting dimension. The map
+  has a keyword of its own rather than giving `rotation` a second
+  meaning, since it is another piece of physics (Erik's decision; the
+  record is in [HISTORY.md](HISTORY.md#open-questions)). Over a forest
+  without a half turn it may be omitted, and if given is checked for its
+  shape, kept and otherwise ignored, as `rotation` is over a forest
+  without a quarter turn — a half-turn forest included.
+
+  A half turn exchanges no dimensions, so it maps every layout onto
+  itself: every field set turns into itself, whatever its centering and
+  ghost widths, and there is no pair. A `RotationPair` over a half-turn
+  forest is refused.
+
+  The tree sees the seam as it sees a quarter turn's: the low face of
+  `d1` is glued to itself, reversed along `d2`, and across it neighbor
+  finding returns the real leaves in **orientation 2**, the only one a
+  half turn has. **Conformity at the seam** is the same rule: a leaf on
+  the low face of `d1` and its image, on the same face, are at the same
+  level. How the schedule fills across the seam is under "Rotating
+  seams" in [Ghost filling](#ghost-filling), *Half turns*.
+
+  The forest keeps the half turn in its `rotating` field, as
+  `(d1, −d2)`: a third `Int8` would not fit in the padding at `D = 2`,
+  where the struct has none left. `hasrotating` is true for either seam,
+  `ishalfturn` tells them apart, `seam_plane` gives `(d1, d2)` for
+  either, `rotating_dims` and `halfturn_dims` give the keyword's pair or
+  `nothing`, and `seam_keywords` both, as the keywords that rebuild the
+  forest.
 - **Physical** (per face, neither periodic, reflecting, outflow nor a
   rotating seam): ghost cells are filled by a user-supplied boundary
   condition hook. For a vertex-like dimension the domain's upper boundary plane
@@ -1053,8 +1121,9 @@ real source's points nearest the seam: its low owned points. In a
 vertex-like set the virtual source's high shared plane, flipped, is the
 real source's owned seam plane. It lies where the target's own owned
 seam plane lies, which is not a ghost, so no copy targets that position
-and none reads the plane. The tangential dimension is not flipped and is
-read as an ordinary transfer reads it. That was checked by hand in the
+and none reads the plane. The tangential dimension is not flipped by a
+quarter turn and is read as an ordinary transfer reads it; a half turn
+flips it, and *Half turns* below says what that takes. That was checked by hand in the
 design, and the `NaN` test checks it again. Phase 2 needs no new rule: a
 rotated prolongation targets the block's own level and joins the sweep
 there. The ghosts it reads in its coarse source are the virtual
@@ -1164,10 +1233,87 @@ the value `−B_y` across the low face of `x`. Two cases:
   fills ghosts before it flags, for a criterion that reads them, which
   is why it needs the pair at all.
 
-*90° only*. A 180° rotation, the
-π-symmetry, needs the same machinery and one thing more, a face glued
-to itself and flipped about the domain's centre line; it is an open
-question (see [Open questions](#open-questions)).
+*Half turns*. A half-turn seam (see
+[Domain and boundaries](#domain-and-boundaries)) has orientation 2
+only. The machinery above serves it unchanged:
+- the kernel;
+- the axis map, which flips both dimensions of the plane and exchanges
+  none;
+- the tables: column 3 of `rotvars` is the set's `halfturn` map itself,
+  and the factor column `mirror + 3^D·2` carries its signs;
+- the MPI path, and conformity's rule.
+
+What changes is where a step lands and which target points a source
+covers:
+
+- *The real node.* A naive neighbor with `g_{d1} < 0` lies in
+  orientation 2, whatever its `g_{d2}`, and maps to
+  `(−1 − g_{d1}, n₂ − 1 − g_{d2})`, with `n₂ = roots[d2]·2^l` the
+  nodes along `d2` at the level. A step beyond a face of `d2` is an
+  ordinary step beyond an outer face. The real direction and the
+  virtual offset are those of `r = 2`: the seam is a root boundary at
+  every level and the axis lies on one (`roots[d2]` even), so the
+  parent of a node maps to the parent of its image (`n₂ − 1 − g` halves
+  to `n₂/2 − 1 − ⌊g/2⌋`), and all the neighbors of a block in one
+  direction share the orientation. Conformity is the same
+  `balance_slack` rule, a face direction across the seam; here it
+  relates a leaf to one on its own face.
+- *The flipped tangential dimension.* A quarter turn flips only
+  dimensions normal to the seam, which is why a rotated copy reads only
+  the real source's points nearest the seam (*Phase 1 stays race free*
+  above). A half turn also flips `d2`, which is tangential to the seam.
+  A cell-like `d2` is unaffected: the flip maps the owned range onto
+  itself. In a vertex-like `d2` half-open ownership does not survive
+  the flip. A real block owns `[gN, (g+1)N)` along `d2`, and its image
+  owns the high-closed `((n₂−1−g)N, (n₂−g)N]`. So with the ordinary
+  target ranges a seam copy would read the real source's shared plane
+  `G+N+1`: that is a ghost written in the same phase, or, at the high
+  face of `d2`, the hook's.
+
+  So in the seam slab (`δ_{d1} = −1`), along a vertex-like `d2`, the
+  target's partition is the image of the real blocks', with every
+  boundary one plane up:
+  - `δ_{d2} = −1` covers `1 : G+1`;
+  - `δ_{d2} = 0` covers `G+2 : G+N+1`, its halves meeting between
+    `G+1+N/2` and `G+2+N/2`;
+  - `δ_{d2} = +1` covers `G+N+2 : N+2G+1`.
+
+  Each region is then the image of owned points of one real block. A
+  copy reads `G+1 … G+N`, `N+1 … N+G` or `G+1 … 2G+1` of its source,
+  and a restriction, which is injection there, reads `G+1 … G+N−1`,
+  `N+1 … N+G−1` or `G+1 … 3G+1`. All of these are owned by
+  `N ≥ 2G + 2`. A prolongation runs in phase 2 and reads filled ghosts
+  anyway. The shift changes target ranges, so it is part of the
+  `GroupKey` (`shift`), and with it of the message layout. The hook's
+  regions in the slab take the same partition: the corner beyond the
+  low face of `d2` then holds the plane `G+1` at negative `a`, the image
+  of the high face's hook-filled plane.
+
+  Under symmetric walls (AMR-8) the image of plane `G+N+1` of a block on
+  the high face of `d2`, in the slab, is the bottom block's low wall,
+  which the fill writes from the hook. So on that block the upper
+  boundary stays where it was: `δ_{d2} = 0` covers `G+2 : G+N`, and the
+  hook's `δ_{d2} = +1` region covers `G+N+1 : N+2G+1`. The lower
+  boundary moves all the same (`shift` state 2, against 1).
+- *Hook regions.* A region whose image leaves the domain leaves through
+  a face of `d2` (the low or the high one, since `P` exchanges them) or
+  through the high face of `d1`, and all three are outer. So the hook
+  still sees outer faces only. It is evaluated at the virtual position,
+  outside the half plane, and a hook covariant under the half turn,
+  such as `boundary_by_coordinates` of covariant data, gives there what
+  the image would get, as for a quarter turn.
+- *Two owned seam half-planes.* In a vertex-like `d1` the seam plane
+  `a = 0` is owned and evolved by the blocks on it, and its points at
+  `x_{d2}` and `lo_{d2} + hi_{d2} − x_{d2}` are each other's images.
+  Under conformity they evolve from same-level ghosts that are each
+  other's images, as a quarter turn's two seam planes do. The axis line,
+  `a = 0` on the centre plane of `d2`, is its own image, and is owned
+  once, by the block above it.
+
+A periodic `d2` would be consistent with the flip, which is a symmetry
+of the torus, and reflecting or outflow faces of `d2` or the high face
+of `d1` with it; they are refused, and open (see
+[Open questions](#open-questions)).
 
 Edge and corner ghost regions are always filled — some stencils don't
 need them, but filling unconditionally is simpler, and cross-derivative
@@ -1933,6 +2079,10 @@ obligation therefore gains one clause: its flux must be covariant
 under the rotation, which a flux written in Cartesian components is.
 The flux sets themselves, with `G = 0`, have no seam ghosts and fill
 alone. The rigid-rotation advection test of M12 puts a number on it.
+A half-turn seam is conforming too, and the argument is the same with
+the image on the same face: `F_{d1}(0, y) = −F_{d1}(0, y′)` at mirrored
+points `y′ = lo_{d2} + hi_{d2} − y`, so the mass that leaves through one
+part of the face enters through its image (M13's advection test).
 The interface schedule searches with
 `oriented_neighbors`, and a finer neighbor with a nonzero orientation
 is an `error` — a bug, since only a forest that bypassed the checked
@@ -2227,7 +2377,11 @@ first step on its own.
   [Open questions](#open-questions)).
   `fold_point` returns the orientation with the folded point, and the
   turn is taken about the low corner of the plane, `(a, b) ↦ (b, −a)`,
-  `(−a, −b)` and `(−b, a)` for `r = 1, 2, 3`. An odd `r` contracts with
+  `(−a, −b)` and `(−b, a)` for `r = 1, 2, 3`. Under a half turn a point
+  with `a < 0` lies in orientation 2 whatever its `d2` coordinate, and
+  turns about the axis on the centre plane of `d2`,
+  `(a, x_{d2}) ↦ (−a, lo_{d2} + hi_{d2} − x_{d2})`; its derivatives
+  take the signs of `r = 2`. An odd `r` contracts with
   the requested multi-indices with `d1` and `d2` exchanged, a second
   compile-time tuple beside `derivs`, so that the selections stay
   static (run-time ones cost M11 21 %); each derivative takes the turn's
@@ -4589,7 +4743,8 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   implements them);
 - the cross-rank agreement: `ForestDigest`, `digest_verdict`,
   `layouthash` (`forest.jl`);
-- the rotating seam: `hasrotating`, `rotating_dims` (`forest.jl`);
+- the rotating seam: `hasrotating`, `rotating_dims`, `ishalfturn`,
+  `halfturn_dims` and `seam_keywords` (`forest.jl`);
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
@@ -4598,9 +4753,9 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   keywords;
 - the fields it reads: of a `Forest`, `N`, `roots`, `periodic`,
   `extents`, `leaves` and `comm`; of a `FieldSet`,
-  `work`, `nvars`, `G`, `centering`, `walls`, `parity`, `rotation` and
-  `forest` (`walls` since AMR-8: a checkpoint saves it, and a restart
-  rebuilds the set with it);
+  `work`, `nvars`, `G`, `centering`, `walls`, `parity`, `rotation`,
+  `halfturn` and `forest` (`walls` since AMR-8, `halfturn` since M13: a
+  checkpoint saves them, and a restart rebuilds the set with them);
   of a `MortonKey`, `root`, `level` and `coords`.
 
 Beside these it uses the validated `leaves` keyword of `Forest`, which
@@ -4904,16 +5059,8 @@ Remaining, none blocking before their milestone:
   extrapolation would be a stencil of its own along the wall dimension,
   in place of `clamp_rows`'s copy, reading owned rows only; it needs an
   application that asks for it.
-- **What M12 leaves open** (see "Rotating seams" under
+- **What M12 and M13 leave open** (see "Rotating seams" under
   [Ghost filling](#ghost-filling)).
-  - *A 180° rotation, the π-symmetry* (deferred).
-    Half of the plane is simulated, and the low face of `d1` is glued to
-    itself, flipped about the domain's centre line in `d2`. It needs the
-    machinery of M12 — the oriented search, the virtual frame, the axis
-    map with orientation 2 only, the signed variable map — and one thing
-    more, a face that is its own neighbor across the seam, which a
-    leaf's image on the same face can make coarse-fine unless
-    conformity is extended to it.
   - *Reflecting or outflow high faces together with the rotation*, a
     symmetric box, or a quadrant whose outer boundary is outflow, rather
     than a quadrant open at its high faces. `R` carries the high
@@ -4923,6 +5070,13 @@ Remaining, none blocking before their milestone:
     across one high wall can then also cross the seam. An outflow high
     face needs no parity, but its clamped transfers would cross the seam
     the same way, in the virtual frame. Both are refused for now.
+    Under a half turn the same holds for the faces of `d2`, which `P`
+    exchanges, so both would have to be of one kind; the high face of
+    `d1` is not carried anywhere by `P` and could be of any kind, but no
+    transfer across it has been checked against the seam's. A periodic
+    `d2` would be consistent with the flip, a symmetry of the torus, and
+    needs the real node wrapped after it is turned. All refused, as for
+    the quarter turn.
   - *Interpolation of a paired set beyond the seam.* The value there is
     the partner's, so the kernel would need both working arrays, or the
     host would route the folded point to the partner and swap the
