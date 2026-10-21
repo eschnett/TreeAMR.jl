@@ -3635,7 +3635,10 @@ M12 was decided with Erik, after M7 and before M9b.
     guide gained "Half turns" with a doctest; README, the guide and
     CODE.md say M13; the version is 0.2.4, additive. TreeIOHDF5 saves
     the forest's pair under a new feature `halfturn` and each set's map,
-    on a branch of its own, with `=0.2.4` appended to its `[compat]`.
+    on a branch of its own, with `=0.2.4` appended to its `[compat]`;
+    its 889 tests pass against this checkout. Downstream, in scratch
+    copies developing this checkout: TreeWave's 349 tests pass (1 min
+    20 s), TreeHydro's 12,679 (5 min, with the TreeIOHDF5 branch).
     Tagging, registering and the TreeIOHDF5 release are Erik's.
 
 ## Downstream checks
