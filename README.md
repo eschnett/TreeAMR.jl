@@ -19,11 +19,11 @@ the mesh with a set of finer meshes.
 See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
 for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
 package got here, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M12** (after M8's every
+The package is currently at milestone **M13** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, M7's
-distribution over MPI, and M12's rotating symmetry). M7 is measured on a
+distribution over MPI, M12's rotating symmetry and M13's half turn). M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the
@@ -34,7 +34,9 @@ a thousand verified saves on four nodes lost nothing. M12 stores one
 quadrant of a plane and fills the ghosts across its seam as the turned
 image of the data, vector components mixed as each field set declares,
 for a spinning object that no mirror maps onto itself; with a
-reflecting face below `z = 0` it stores an octant.
+reflecting face below `z = 0` it stores an octant. M13 stores half a
+plane, its low face glued to itself by a half turn about its middle, as
+Cactus's RotatingSymmetry180 does.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.
@@ -67,7 +69,8 @@ variable, and the ghost exchange fills them itself; so are outflow
 faces, whose ghosts repeat the nearest interior cell, and so is a rotating
 symmetry, a quadrant whose two low faces are glued to each other by a
 quarter turn, with a signed map per field set saying how a vector's
-components turn. Other physical
+components turn, or a half plane whose low face is glued to itself by a
+half turn. Other physical
 boundaries need to go through a per-cell hook that the application
 needs to define. The dimension `D`
 is a type parameter, and the same code runs in 1D, 2D, and 3D, and the

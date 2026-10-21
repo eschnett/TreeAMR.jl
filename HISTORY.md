@@ -3502,7 +3502,7 @@ M12 was decided with Erik, after M7 and before M9b.
 
 ### M13 — Half-turn symmetry
 
-- **M13 — Half-turn symmetry.** *(Specified 2026-10-21.)* The π-symmetry
+- **M13 — Half-turn symmetry.** *(Specified 2026-10-21. Done 2026-10-21.)* The π-symmetry
   of Cactus's RotatingSymmetry180, as specified in [PLAN.md](PLAN.md#m13--half-turn-symmetry),
   under "Half turn" in [Domain and boundaries](CODE.md#domain-and-boundaries)
   and *Half turns* under "Rotating seams" in
@@ -3513,8 +3513,130 @@ M12 was decided with Erik, after M7 and before M9b.
   half-open ownership does not survive the flip, so the seam slab's
   partition along `d2` moves up a plane (checked by hand for every copy
   and restriction range in the design, then by the `NaN` test).
+  *Accept:*
+  - **refusals**, each with its reason: every case listed for the forest
+    and the field set, a leaf list not conforming at the seam, and a
+    `RotationPair` over a half-turn forest;
+  - **the neighbor oracle**: the half plane's oriented neighbors equal the
+    images of the neighbors in an independently built *unfolded* forest of
+    `2M₁ × M₂` roots, made by turning the leaves with exact `Rational`
+    boxes, on random refinements and after `balance!`; the unfolded forest
+    is 2:1 balanced and the seam conforming;
+  - **no ghost undefined, and none read before it is defined**, in
+    `D = 2` and `3` with `z` periodic, outer or reflecting at its low
+    face, for every centering, rotated restrictions and prolongations
+    included (which a half turn has in 2D, at the seam's edges);
+  - **`halfturn_vs_doubled`**: data covariant under the half turn and not
+    polynomial, on a refinement symmetric under it that reaches the seam
+    and the axis, where every stored point, ghosts included, equals the
+    full plane's within `1e-13`, cell, vertex and face centering, under
+    half-open and symmetric walls;
+  - **write counts**: the schedule partitions the stored points, and every
+    hook region's image leaves through an outer face;
+  - **the wave equation on a half plane against the full box**, a scalar
+    and a vector wave: `linf` equal to the full box's to `rtol = 1e-8`,
+    the vertex-centered seam half-planes equal to each other as measured,
+    and the rate 2;
+  - **a regrid across the seam**, conformity kept, no block moved by more
+    than one level, the ghosts afterwards equal to the oracle's;
+  - **conservation through the seam** under the rigid rotation, with the
+    fixup, to roundoff;
+  - **interpolation beyond the seam**: values and first derivatives;
+  - **MPI**: lockstep packs in process, bitwise with a turned `−0`, and a
+    half-turn case in `mpi_workload.jl` at `-n 2` and `-n 3`; a cycle in
+    `thread_workload.jl`, a fill in `gpu_tests.jl`;
+  - **TreeIOHDF5**: a round trip and a restart that continues byte for
+    byte.
   - **Step 0 — specification.** *(Done, 2026-10-21.)* CODE.md, PLAN.md
     and this record.
+  - **Step 1 — the forest.** *(Done, 2026-10-21.)* The keyword and its
+    refusals (`check_halfturn`), the signed encoding `(d1, −d2)` in
+    `rotating` with `ishalfturn`, `seam_plane`, `halfturn_dims` and
+    `seam_keywords`, and the real node through `unrotate_node`'s new
+    argument `n2` (zero for a quarter turn, so its `r = 2` is the same
+    map). Everything else in the tree — `real_direction`,
+    `virtual_offset`, `balance_slack`, `balance!`, `isbalanced`,
+    `check_leaves`, regrid completion, the buffer — needed no change,
+    as the plan expected: conformity is "a face direction across a
+    nonzero orientation", which a half turn's one face satisfies.
+    `oriented_neighbors`, `seam_offset` and the schedule's `plane`
+    read the raw pair and now go through `seam_plane`. The neighbor
+    oracle, on random half planes before and after `balance!`, found no
+    mismatch and met every `(r, kind)` for `r ∈ {0, 2}`.
+  - **Step 2 — field sets.** *(Done, 2026-10-21.)* `halfturn` on
+    `FieldSet`, stored beside `rotation`; `halfturns_of` with the
+    shape checks shared with `rotation` (`signed_map`); `seamtables`
+    puts the map itself in column 3; `symmetric_layout` is true for
+    every layout; `RotationPair` refuses a half-turn forest.
+  - **Step 3 — the schedule.** *(Done, 2026-10-21.)* `GroupKey.shift`,
+    `target_range`'s shifted ranges (`shifted_range`), `seam_shift`, and
+    the shift threaded through every stencil builder and the hook's
+    regions and clamps. The kernel is unchanged. Measured: without the
+    shift the `NaN` test leaves 9 to 4720 ghosts undefined in vertex-like
+    `d2` cases (2D and 3D, `p = 2, 4`); with it, none, and the polynomial
+    data is reproduced to 1.8e−15. Without state 2, the symmetric-walls
+    exception, the same test with the low walls poisoned leaves 3 (2D)
+    and 116–204 (3D) `NaN`s; with it, none. Against the full plane, the
+    smooth data agree to 6.7e−16 where `d2` is cell-like; where it is
+    vertex-like they differ by 4.1e−7 (2D) and 1.8e−4 (3D), at the
+    points where levels meet along `d2` in the seam slab, and the pairs
+    of differing points are each other's images, the half plane
+    interpolated at one and the full plane at the other. This was not
+    foreseen in the design, whose acceptance asked for `1e-13`
+    everywhere; the half-open asymmetry M12 found for interpolation
+    (step 5 of M12) reaches the ghosts here because the turn flips the
+    tangential dimension. The test asserts the measured bounds.
+  - **Step 4 — regrid, initial data, interface, conservation.** *(Done,
+    2026-10-21.)* No source change beyond step 1's. A regrid against the
+    doubled plane: exact for cell-like `d2` (2.7e−15), 4.2e−6 (2D) and
+    1.9e−4 (3D) for vertex-like `d2`, the parent's differing ghosts
+    carried in by prolongation. The rigid rotation conserves the mass to
+    8.1e−15 over 136 SSPRK3 steps while 90 % of it crosses the seam; the
+    negative control drifts 1.5e−4, less than M12's 1.9 %, because less
+    of the bump crosses a refinement boundary.
+  - **Step 5 — interpolation.** *(Done, 2026-10-21.)* `PointGeometry`
+    carries the positive plane and a `half` flag; `fold_point` and
+    `turn_point` turn about the centre plane. Polynomial data to
+    2.2e−14, the turned identity bit for bit, and smooth data at the
+    point itself 3.1e−14 (cell) and 4.1e−4 / 2.3e−3 (vertex, 2D / 3D),
+    as for M12.
+  - **Step 6 — MPI, threads, device.** *(Done, 2026-10-21.)* The test
+    sites that rebuild a forest by hand splat `seam_keywords`. In
+    process: transfers, layouts, write counts and values bit for bit
+    with a turned `−0`, over 2, 3 and 5 ranks; a distributed regrid and
+    interpolation. `mpi_workload.jl` gained `H2v` and `H2`; at 2 and 3
+    ranks every line matches the serial run, with 52 and 44 rotated
+    transfers received. `thread_workload.jl` gained `D2ovh`, the same
+    bits at 1 and 4 threads. `gpu_tests.jl` gained a half-turn fill and
+    interpolation, run on the CPU backend here; Metal by hand is still
+    to do. No launch path changed (the kernel and `TransferGroup` are as
+    they were; only the schedule's `plane` is computed differently), so
+    no compile-time comparison was run.
+  - **Step 7 — the wave.** *(Done, 2026-10-21.)* A scalar and a vector
+    standing wave invariant under the half turn bit for bit. Cell
+    centering agrees with the full plane to 3.0e−13 at every stored
+    point. Vertex centering lies within the full plane's own covariance
+    defect (2.1e−4 against 3.5e−3), and so does its `linf`. The two seam
+    half-planes `(0, y)` and `(0, −y)` were expected to stay equal, as a
+    quarter turn's seam planes do, and do not: they differ by 9e−6
+    (`K = 1`) and 4.7e−5 (`K = 2`) after 143 steps, because the turn
+    reverses `d2` along the seam, which exchanges an evolved low wall
+    with a hook-filled high one and moves a coarse-fine face's shared
+    point to the other block. On a uniform half plane with symmetric
+    walls they stay equal bit for bit, which the test asserts; CODE.md
+    records the rest under *Half turns*. Rate 2 in every case.
+  - **Step 8 — measurements, documentation, release.** *(Done,
+    2026-10-21.)* `bench/ghosts.jl` (D = 3, N = 8, 4 roots, 4 threads)
+    against `main`: the schedule build allocates 0.6 % more on the
+    uniform mesh (422,416 bytes against 420,000) and 2.7 % more on the
+    two-level one (4,892,672 against 4,763,872), from the larger
+    `GroupKey`; fill times and allocations unchanged within the noise.
+    The suite takes 8 min 49 s at eight threads, 116,813 tests. The
+    guide gained "Half turns" with a doctest; README, the guide and
+    CODE.md say M13; the version is 0.2.4, additive. TreeIOHDF5 saves
+    the forest's pair under a new feature `halfturn` and each set's map,
+    on a branch of its own, with `=0.2.4` appended to its `[compat]`.
+    Tagging, registering and the TreeIOHDF5 release are Erik's.
 
 ## Downstream checks
 

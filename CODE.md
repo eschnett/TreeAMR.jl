@@ -4,9 +4,8 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
-**Status.** Milestones M0–M8, M10, M11, M9a, M7 and M12 are done;
-M13, the half-turn symmetry, is under way, and visualization export
-(M9b) follows it. The plan is in [PLAN.md](PLAN.md).
+**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12 and M13 are done;
+next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -1305,10 +1304,29 @@ covers:
 - *Two owned seam half-planes.* In a vertex-like `d1` the seam plane
   `a = 0` is owned and evolved by the blocks on it, and its points at
   `x_{d2}` and `lo_{d2} + hi_{d2} − x_{d2}` are each other's images.
-  Under conformity they evolve from same-level ghosts that are each
-  other's images, as a quarter turn's two seam planes do. The axis line,
-  `a = 0` on the centre plane of `d2`, is its own image, and is owned
-  once, by the block above it.
+  The axis line, `a = 0` on the centre plane of `d2`, is its own image,
+  and is owned once, by the block above it. Unlike a quarter turn's two
+  seam planes, the two halves do not stay each other's image in general,
+  when `d2` is vertex-like too. The turn reverses `d2` along the seam,
+  and half-open ownership is not symmetric under that reversal in two
+  places:
+  - an outer face of `d2` under half-open walls, where the low wall is
+    evolved and the high one is the hook's;
+  - a coarse-fine face along the seam, whose shared point belongs to its
+    upper block, which the turn makes the lower one.
+
+  On a uniform half plane with symmetric walls they evolve identically,
+  bit for bit; elsewhere they drift apart by the scheme's error. The
+  wave test measures 9 × 10⁻⁶ after 143 steps on the refined half plane,
+  against a covariance defect of 1 × 10⁻³ in the full plane's own
+  solution. This is the **(open)** asymmetry of vertex-like sets at
+  coarse-fine faces under [Centerings](#centerings), which the flip of
+  `d2` brings onto the seam. For the same reason a vertex-like `d2`
+  makes the full plane a test oracle only to interpolation accuracy
+  where levels meet along `d2` in the seam slab. There a point the full
+  plane interpolates is one the half plane owns, and the other way
+  round at its image. A cell-like `d2` agrees with the full plane to
+  roundoff.
 
 A periodic `d2` would be consistent with the flip, which is a symmetry
 of the torus, and reflecting or outflow faces of `d2` or the high face
@@ -4767,7 +4785,8 @@ which companion releases go with it.
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
 `ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
-`outflow_tests.jl`, `rotate_tests.jl` (M12),
+`outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M13,
+which uses `rotate_tests.jl`'s helpers),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -4846,6 +4865,15 @@ files are not tests:
   through the seam), interpolation beyond it, and the wave on a quadrant
   against the full plane (`rotating_wave`, scalar and vector, which the
   vertex-centered seam planes keep equal bit for bit).
+  For M13 the same oracles for a half plane: `unfolded_halfturn_forest`,
+  `halfturn_neighbor_mismatches`, `halfturn_conforming`, `halfturn_data`
+  (invariant under the half turn and under neither a quarter turn nor a
+  mirror), `halfturn_forest` (and, with `full = true`, the full plane),
+  `undefined_halfturn_ghosts` (with `poison_low_walls!` under symmetric
+  walls), `halfturn_vs_doubled`, `halfturn_hook_regions_leave` and
+  `halfturn_regrid_vs_doubled`, exact against the full plane where `d2`
+  is cell-like and to the measured interpolation bound where it is
+  vertex-like (see *Half turns*).
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.

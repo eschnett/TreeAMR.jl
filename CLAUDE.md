@@ -315,6 +315,12 @@ the one that says why.
 - **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
   block at a low domain face has its own range start at `G+2` along that
   vertex-like dimension; the trim is part of `GroupKey` ("Centerings").
+- **A half turn shifts its seam slab.** Across a half-turn seam (M13) a
+  vertex-like `d2` has the target's partition one plane up, so that each
+  region is the image of one real block's owned points; the shift is
+  part of `GroupKey`. Read the seam through `seam_plane`, `ishalfturn`
+  and `seam_keywords`, never `forest.rotating` raw, whose second entry
+  is negative for a half turn ("Rotating seams", *Half turns*).
 - **Reflecting and outflow faces are transfers, not hooks**, and
   **rotating seams are oriented transfers**; the boundary hook sees only
   outer faces ("Domain and boundaries", "Ghost filling"). The face kinds
