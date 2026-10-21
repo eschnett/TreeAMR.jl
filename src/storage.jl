@@ -208,8 +208,23 @@ variable stored in Cartesian components. Refused, with the reason: a map
 that is not a signed permutation of `1:nvars`; for a symmetric set, one
 whose fourth power is not the identity; and one that sends a variable to
 another of a different parity in a reflecting dimension. Over a forest
-without a seam it may be omitted, and if given is checked for its shape
-and otherwise ignored, as `parity` is.
+without a quarter-turn seam it may be omitted, and if given is checked
+for its shape and otherwise ignored, as `parity` is.
+
+`halfturn` says how the variables turn under the half turn of a
+half-turn seam, and is **required** when the forest has one (M13; see
+[`Forest`](@ref)'s `halfturn`), with the same meaning: variable `v` at
+the turned point equals `sign(halfturn[v])` times variable
+`abs(halfturn[v])` at the point. A half turn negates both axes of its
+plane, so a Cartesian component takes the sign `(-1)^k`, `k` the number
+of its indices in the plane: for `(ρ, vx, vy, vz)` with
+`halfturn = (1, 2)` it is `halfturn = (1, -2, -3, 4)`. Every set turns
+into itself, whatever its layout, so there is no pair. Refused, with the
+reason: a map that is not a signed permutation of `1:nvars`, one whose
+square is not the identity, and one that sends a variable to another of
+a different parity in a reflecting dimension. Over a forest without a
+half turn it may be omitted, and if given is checked for its shape and
+otherwise ignored.
 
 A field set is tied to the forest's *current* leaf array. Block indices
 are deliberately not stable across regridding (M4), which compacts the
@@ -227,6 +242,8 @@ block slots and rebuilds the storage.
                        (EvenParity, EvenParity, OddParity)])
     FieldSet(quadrant, 4; G = 2,        # the same, on a rotating forest
              rotation = (1, -3, 2, 4))
+    FieldSet(half, 4; G = 2,            # the same, on a half-turn forest
+             halfturn = (1, -2, -3, 4))
 
 # Examples
 
@@ -258,6 +275,9 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # The signed variable map of a rotating seam (M12), as checked by
     # `rotations_of`; `nothing` when none was given.
     const rotation::Union{Nothing,Vector{Int}}
+    # The signed variable map of a half-turn seam (M13), as checked by
+    # `halfturns_of`; `nothing` when none was given.
+    const halfturn::Union{Nothing,Vector{Int}}
     # The per-variable factor each mirrored or rotated transfer
     # multiplies by, `factors[v, col]`, on the storage's backend: the
     # `3^D` mirror states of a transfer group (see `parityfactors`), and
@@ -270,7 +290,8 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const factors::Union{Nothing,AbstractMatrix{T}}
     # The variable a rotated transfer reads for each target variable,
     # `rotvars[v, r + 1]` (M12; see `seamtables`), as `Int32` on the
-    # storage's backend; `nothing` over a forest without a seam.
+    # storage's backend; `nothing` over a forest without a seam. Over a
+    # half-turn forest only `r = 2` is read (M13).
     const rotvars::Union{Nothing,AbstractMatrix{Int32}}
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
@@ -286,7 +307,8 @@ end
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D),
-                     parity=nothing, rotation=nothing, walls::Symbol=:half_open,
+                     parity=nothing, rotation=nothing, halfturn=nothing,
+                     walls::Symbol=:half_open,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
     check_walls(walls)
@@ -302,7 +324,13 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     parities = parities_of(parity, forest, Int(nvars))
     rotations = rotations_of(rotation, forest, Int(nvars), ghosts, staggers(centers),
                              parities)
-    factors, rotvars = if hasrotating(forest)
+    halfturns = halfturns_of(halfturn, forest, Int(nvars), parities)
+    factors, rotvars = if ishalfturn(forest)
+        # Every set turns into itself under a half turn, and only
+        # orientation 2 occurs (see `seamtables`).
+        f, v = seamtables(T, parities, nothing, Int(nvars), Val(D); half=halfturns)
+        todevice(backend, f), todevice(backend, v)
+    elseif hasrotating(forest)
         # A symmetric set turns into itself, so every orientation applies
         # its own map; an asymmetric one turns into its partner, whose
         # map it does not know (see `seamtables`).
@@ -320,7 +348,8 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # in `zerofill!` below.
     zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, walls,
-                                        parities, rotations, factors, rotvars, work)
+                                        parities, rotations, halfturns, factors,
+                                        rotvars, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
@@ -410,8 +439,10 @@ mirrorcolumn(state::NTuple{D,<:Integer}) where {D} =
 
 # Whether a layout turns into itself under the quarter turn: equal ghost
 # widths and equal staggers along the seam's two dimensions. Such a set
-# rotates from itself; any other from its partner.
+# rotates from itself; any other from its partner. Under a half turn
+# (M13) every layout turns into itself, since it exchanges no dimensions.
 function symmetric_layout(forest::Forest, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    ishalfturn(forest) && return true
     d1, d2 = rotating_dims(forest)
     return G[d1] == G[d2] && c[d1] == c[d2]
 end
@@ -425,8 +456,9 @@ symmetric_layout(fs::FieldSet) = symmetric_layout(fs.forest, fs.G, staggers(fs))
 # by `RotationPair`.
 function rotations_of(rotation, forest::Forest{D}, nvars::Int, G::NTuple{D,Int},
                       c::NTuple{D,Int}, parities) where {D}
+    quarter = rotating_dims(forest) !== nothing
     if rotation === nothing
-        hasrotating(forest) && throw(ArgumentError(
+        quarter && throw(ArgumentError(
             "this forest has a rotating seam, rotating = $(rotating_dims(forest)), so " *
             "the field set needs `rotation`: one signed variable index per variable, " *
             "saying which variable, and with which sign, each one equals a quarter " *
@@ -435,23 +467,8 @@ function rotations_of(rotation, forest::Forest{D}, nvars::Int, G::NTuple{D,Int},
             "cannot know."))
         return nothing
     end
-    (rotation isa AbstractVector || rotation isa Tuple) || throw(ArgumentError(
-        "rotation must be a vector or tuple with one signed variable index per " *
-        "variable, got a $(typeof(rotation))"))
-    length(rotation) == nvars || throw(ArgumentError(
-        "rotation must have one entry per variable: got $(length(rotation)) for " *
-        "nvars = $nvars"))
-    q = map(collect(rotation)) do x
-        x isa Integer || throw(ArgumentError(
-            "each rotation entry must be a nonzero integer, a signed variable index; " *
-            "got $(repr(x))"))
-        return Int(x)
-    end
-    sort!(abs.(q)) == 1:nvars || throw(ArgumentError(
-        "rotation = $(Tuple(q)) is not a signed permutation of 1:$nvars: a quarter " *
-        "turn sends each variable to plus or minus exactly one variable, so the " *
-        "absolute values must name every variable once, and none may be zero"))
-    hasrotating(forest) || return q
+    q = signed_map(rotation, nvars, "rotation", "a quarter turn")
+    quarter || return q
     if symmetric_layout(forest, G, c)
         steps = (q, q, q, q)
         σ, s = composed_rotation(steps, nvars)
@@ -463,6 +480,55 @@ function rotations_of(rotation, forest::Forest{D}, nvars::Int, G::NTuple{D,Int},
             "turns into itself.)"))
         check_rotation_parity(forest, parities, parities, q, "rotation")
     end
+    return q
+end
+
+# A user-supplied signed variable map, `rotation` or `halfturn`, checked
+# for its shape: one nonzero integer per variable, naming every variable
+# once. `name` is the keyword, `turn` what the map is the effect of.
+function signed_map(map_, nvars::Int, name::AbstractString, turn::AbstractString)
+    (map_ isa AbstractVector || map_ isa Tuple) || throw(ArgumentError(
+        "$name must be a vector or tuple with one signed variable index per " *
+        "variable, got a $(typeof(map_))"))
+    length(map_) == nvars || throw(ArgumentError(
+        "$name must have one entry per variable: got $(length(map_)) for " *
+        "nvars = $nvars"))
+    q = map(collect(map_)) do x
+        x isa Integer || throw(ArgumentError(
+            "each $name entry must be a nonzero integer, a signed variable index; " *
+            "got $(repr(x))"))
+        return Int(x)
+    end
+    sort!(abs.(q)) == 1:nvars || throw(ArgumentError(
+        "$name = $(Tuple(q)) is not a signed permutation of 1:$nvars: $turn sends " *
+        "each variable to plus or minus exactly one variable, so the absolute " *
+        "values must name every variable once, and none may be zero"))
+    return q
+end
+
+# Validate a user-supplied `halfturn` (M13) into a `Vector{Int}`, the
+# signed map the half turn applies, against the forest's seam: required
+# over a half-turn forest, where its square must be the identity and it
+# must keep the parities; checked for its shape anywhere else.
+function halfturns_of(halfturn, forest::Forest, nvars::Int, parities)
+    if halfturn === nothing
+        ishalfturn(forest) && throw(ArgumentError(
+            "this forest has a half-turn seam, halfturn = $(halfturn_dims(forest)), " *
+            "so the field set needs `halfturn`: one signed variable index per " *
+            "variable, saying which variable, and with which sign, each one equals " *
+            "at the turned point. How a variable turns — a scalar into itself, a " *
+            "vector component in the plane into minus itself — is physics, which " *
+            "the mesh cannot know."))
+        return nothing
+    end
+    q = signed_map(halfturn, nvars, "halfturn", "a half turn")
+    ishalfturn(forest) || return q
+    σ, s = composed_rotation((q, q), nvars)
+    all(v -> σ[v] == v && s[v] == 1, 1:nvars) || throw(ArgumentError(
+        "halfturn = $(Tuple(q)) applied twice is not the identity: two half turns " *
+        "are no turn at all, so applying the map twice must return every variable " *
+        "to itself with its sign"))
+    check_rotation_parity(forest, parities, parities, q, "halfturn")
     return q
 end
 
@@ -496,7 +562,7 @@ function check_rotation_parity(forest::Forest{D}, target, source, q::Vector{Int}
             "$what sends variable $v to variable $w, but in dimension $d, which has a " *
             "reflecting face, the first has $(target[v][d]) and the second " *
             "$(source[w][d]). The rotation and the mirror commute, so a variable and " *
-            "its image under the quarter turn must have the same parity there."))
+            "its image under the turn must have the same parity there."))
     end
     return nothing
 end
@@ -517,12 +583,18 @@ end
 # `RotationPair` builds. Its own tables hold the `r = 0` columns only,
 # with zero factors and the identity map for `r ≥ 1`, which no fill
 # reads — a schedule that has such transfers is refused for it alone.
-function seamtables(::Type{T}, parities, steps, nvars::Int, ::Val{D}) where {T,D}
+#
+# A half-turn set (M13) passes its map as `half`: orientation 2 is the
+# half turn itself, `Q` rather than `Q²`, and orientations 1 and 3, which
+# a half-turn seam never has, are left as an asymmetric set's are.
+function seamtables(::Type{T}, parities, steps, nvars::Int, ::Val{D};
+                    half=nothing) where {T,D}
     nstates = 3^D
     factors = Matrix{T}(undef, nvars, 4 * nstates)
     rotvars = Matrix{Int32}(undef, nvars, 4)
     for r in 0:3
         σ, s = r == 0 ? (collect(1:nvars), ones(Int, nvars)) :
+               half !== nothing && r == 2 ? composed_rotation((half,), nvars) :
                steps === nothing ? (collect(1:nvars), zeros(Int, nvars)) :
                composed_rotation(steps[1:r], nvars)
         rotvars[:, r + 1] .= σ
@@ -600,6 +672,10 @@ function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
     hasrotating(forest) || throw(ArgumentError(
         "a RotationPair needs a forest with a rotating seam: without one no set " *
         "turns into another, and each fills its ghosts alone"))
+    ishalfturn(forest) && throw(ArgumentError(
+        "a RotationPair needs a quarter-turn seam, and this forest's is a half " *
+        "turn, halfturn = $(halfturn_dims(forest)): a half turn exchanges no " *
+        "dimensions, so every set turns into itself and fills its ghosts alone"))
     d1, d2 = rotating_dims(forest)
     swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
     a.walls === b.walls || throw(ArgumentError(

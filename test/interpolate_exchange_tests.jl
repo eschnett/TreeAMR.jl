@@ -77,7 +77,7 @@ end
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=TreeAMR.reflecting_faces(serial),
                             outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                            rotating=TreeAMR.rotating_dims(serial),
+                            TreeAMR.seam_keywords(serial)...,
                             leaves=serial.leaves, comm=comms[r])
             fs = FieldSet{T}(forest, 3; G=G, centering=C, parity=parity)
             copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
@@ -222,7 +222,7 @@ end
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=TreeAMR.reflecting_faces(serial),
                             outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                            rotating=TreeAMR.rotating_dims(serial),
+                            TreeAMR.seam_keywords(serial)...,
                             leaves=serial.leaves, comm=comms[r])
             fs = rotating_set(forest, layout)
             copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
@@ -267,5 +267,48 @@ end
         @test occursin("this one (rank $(r - 1)) included", msgs[r])
         @test occursin("On rank 1, point 2, (-0.5, 0.7), lies 1 quarter turn(s) away",
                        msgs[r])
+    end
+end
+
+@testset "A distributed interpolate through a half-turn seam is the serial one: D=$D" for
+        D in (2, 3)
+    # Routing turns a point beyond the seam back about the centre line on
+    # the host, to find its owner, and the owner's kernel turns it again;
+    # a rank that turned it otherwise gives a wrong value or sign. Random
+    # data over every stored point; every value and first derivative, bit
+    # for bit, over 3 ranks and more ranks than leaves.
+    other = D == 3 ? :reflect_lo : :outer
+    serial = halfturn_forest(Val(D); plane=(1, 2), other=other, N=D == 3 ? 6 : 8)
+    layout = halfturn_exchange_layouts(D, other)[2]           # vertex-centered
+    sfs = halfturn_set(serial, layout)
+    data = rand(MersenneTwister(50 + D), size(sfs.work)...) .- 0.5
+    copyto!(sfs.work, data)
+    rng = Xoshiro(51 + D)
+    third(t) = D == 2 ? () : (3.0 * t - 1.0,)
+    xs = NTuple{D,Float64}[(3.9 * rand(rng) - 1.95, 3.9 * rand(rng) - 1.95,
+                            third(rand(rng))...) for _ in 1:200]
+    basis = Lagrange(4)
+    derivs = gradient_derivs(D)
+    full = interpolate(sfs, xs, basis; derivs=derivs, vars=[3, 1, 2])
+    @test count(x -> x[1] < 0, xs) > length(xs) ÷ 4
+    for P in (3, nleaves(serial) + 2)
+        parts = uneven_parts(length(xs), P)
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
+                            TreeAMR.seam_keywords(serial)...,
+                            leaves=serial.leaves, comm=comms[r])
+            fs = halfturn_set(forest, layout)
+            copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+            (interpolate(fs, xs[parts[r]], basis; derivs=derivs, vars=[3, 1, 2]),
+             nblocks(fs))
+        end
+        P > nleaves(serial) && @test any(res -> res[2] == 0, results)
+        for (r, (a, _)) in enumerate(results)
+            @test bitwise_equal(a.values, full.values[:, :, parts[r]])
+            @test !any(a.excluded)
+        end
     end
 end

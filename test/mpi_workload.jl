@@ -32,7 +32,8 @@
 # serial answers in global order. From M12 on it runs a rotating
 # quadrant too: the wave, a set that turns into itself and a
 # `RotationPair` through a fill, a regrid and interpolation beyond the
-# seam. The checkpoints moved to TreeIOHDF5, whose own workload runs them.
+# seam; from M13 on a half plane, the wave and two sets through the same.
+# The checkpoints moved to TreeIOHDF5, whose own workload runs them.
 
 using TreeAMR
 using MPI: MPI
@@ -63,9 +64,9 @@ gathered(forest, v) = TreeAMR.allgatherv(forest.comm, collect(vec(v)))
 function forest_of(roots::NTuple{D,Int}, N; periodic=ntuple(_ -> false, D),
                    reflecting=ntuple(_ -> (false, false), D),
                    outflow=ntuple(_ -> (false, false), D), rotating=nothing,
-                   centre=nothing, levels=2) where {D}
+                   halfturn=nothing, centre=nothing, levels=2) where {D}
     forest = Forest(roots; N=N, periodic=periodic, reflecting=reflecting,
-                    outflow=outflow, rotating=rotating, comm=COMM)
+                    outflow=outflow, rotating=rotating, halfturn=halfturn, comm=COMM)
     centre === nothing && return forest
     for lvl in 0:(levels - 1)
         r = 0.6 / 2^lvl
@@ -186,8 +187,9 @@ function perturbed_digest_differs(forest, fs, sched, before)
 end
 
 function wave_case(tag, forest::Forest{D}; G, centering, ops, steps, parity=nothing,
-                   rotation=nothing, control=false) where {D}
-    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity, rotation=rotation)
+                   rotation=nothing, halfturn=nothing, control=false) where {D}
+    fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity, rotation=rotation,
+                  halfturn=halfturn)
     initial = pulse(ntuple(d -> 0.37 * forest.roots[d] + 0.05d, D), 0.3)
     boundary = hasouter(forest) ? boundary_by_coordinates(initial) : nothing
     fill_by_coordinates!(initial, fs)
@@ -858,6 +860,62 @@ function rotating_empty_case(tag)
     return nothing
 end
 
+# --- half-turn seams (M13) -------------------------------------------------
+
+# A half plane `[0, 2] × [0, 4]` with a half-turn seam on the low face of
+# the first dimension, the axis at `y = 2`, refined beside the seam above
+# the axis, so that conformity refines its image below: the fill of a
+# cell-centered scalar and vector and of a vertex-centered one, whose
+# seam slab is partitioned one plane up; a regrid of both; and
+# interpolation over the whole plane, about half of the points turned
+# back across the seam. The vector's second component is zero
+# everywhere, so the turned ghosts hold `−0`.
+function halfturn_fill!(fs)
+    sched = GhostSchedule(fs, OPS4)
+    fill_ghosts!(fs, sched; boundary=QUAD_HOOK)
+    return sched
+end
+
+function halfturn_case(tag)
+    forest = forest_of((2, 4), 8; halfturn=(1, 2), centre=(0.4, 2.9))
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    fc = FieldSet(forest, 3; G=2, halfturn=(1, -2, -3))
+    fv = FieldSet(forest, 3; G=2, centering=vertexcentered(2), halfturn=(1, -2, -3))
+    quad_data!(fc, 3)
+    quad_data!(fv, 3)
+    sc, sv = halfturn_fill!(fc), halfturn_fill!(fv)
+    emit(tag, "transfers", transfers(forest, sc), transfers(forest, sv))
+    emit(tag, "filled", digest(gathered(forest, fc.work)), digest(gathered(forest, fv.work)))
+    emit(tag, "negzero", negzeros(forest, fc), negzeros(forest, fv))
+    emit("#", tag, "rotated received", rotated_received(forest, sc, sv))
+
+    # Refine along the seam below the axis, which conformity carries above
+    # it, and coarsen the finest blocks off the seam.
+    flags = map(1:nblocks(fc)) do b
+        k = blockkey(fc, b)
+        ext = block_extent(forest, k)
+        level(k) < 2 && ext[1][1] == 0 && 1 <= ext[2][1] < 2 ? Refine :
+        level(k) == 2 && ext[1][1] != 0 ? Coarsen : Keep
+    end
+    regridded("$tag.regrid", forest, (fc => sc, fv => sv); flags=flags, boundary=QUAD_HOOK)
+    sc, sv = halfturn_fill!(fc), halfturn_fill!(fv)
+    emit(tag, "refilled", digest(gathered(forest, fc.work)),
+         digest(gathered(forest, fv.work)))
+
+    all_points = [(-1.9 + 3.8 * mod(j * (sqrt(5.0) - 1) / 2, 1.0),
+                   0.1 + 3.8 * mod(j * (sqrt(2.0) - 1), 1.0)) for j in 1:257]
+    weights = [(2, 0, 5, 1, 3)[r % 5 + 1] for r in 0:(NRANKS - 1)]
+    cuts = [0; round.(Int, 257 .* cumsum(weights) ./ sum(weights))]
+    xs = all_points[(cuts[RANK + 1] + 1):cuts[RANK + 2]]
+    for (name, fs) in (("cell", fc), ("vertex", fv))
+        r = interpolate(fs, xs, Lagrange(4); derivs=((0, 0), (1, 0), (0, 1)),
+                        vars=[2, 3, 1])
+        emit(tag, "interpolated", name, length(gathered(forest, r.excluded)),
+             count(x -> x[1] < 0, all_points), digest(gathered(forest, r.values)))
+    end
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -1123,6 +1181,12 @@ function main()
               parity=[ntuple(_ -> EvenParity, 3), ntuple(_ -> EvenParity, 3)])
     rotating_case("Q2")
     rotating_empty_case("QE2")
+    # A half plane (M13): the vertex-centered wave, whose seam slab is
+    # partitioned one plane up, and two sets through a fill, a regrid and
+    # interpolation beyond the seam.
+    wave_case("H2v", forest_of((2, 4), 8; halfturn=(1, 2), centre=(0.4, 2.9)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6, halfturn=(1, 2))
+    halfturn_case("H2")
     refusals()
     verbs()
     return nothing

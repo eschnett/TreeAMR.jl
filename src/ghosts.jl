@@ -1160,7 +1160,8 @@ interpolant of the prolongation order for an even one.
 A rotating seam needs nothing either (M12): its ghosts are the turned
 image of real data, filled by transfers from the real blocks across it,
 read through the quarter turn and the field set's `rotation`, in the
-same phases. A set whose layout is not symmetric under exchanging the
+same phases; across a half-turn seam (M13) through the half turn and the
+field set's `halfturn`, and every set turns into itself. A set whose layout is not symmetric under exchanging the
 seam's two dimensions turns into another set, and if it has ghosts
 there it is refused here: fill it with its partner, as a
 [`RotationPair`](@ref), through the second form. That form runs the two

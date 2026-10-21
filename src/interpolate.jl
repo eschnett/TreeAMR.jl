@@ -275,14 +275,17 @@ struct PointGeometry{D,T}
     periodic::NTuple{D,Bool}
     reflecting::NTuple{D,Tuple{Bool,Bool}}
     rotating::NTuple{2,Int}
+    # Whether the seam is a half turn's (M13), about the centre plane of
+    # `d2`, rather than a quarter turn's.
+    half::Bool
     L::Int
 end
 
 PointGeometry(::Type{T}, forest::Forest{D}) where {T,D} =
     PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]), T(forest.extents[d][2])), D),
                        forest.roots, forest.periodic, reflecting_faces(forest),
-                       (Int(forest.rotating[1]), Int(forest.rotating[2])),
-                       maxlevel(forest))
+                       hasrotating(forest) ? seam_plane(forest) : (0, 0),
+                       ishalfturn(forest), maxlevel(forest))
 
 # One coordinate brought into the domain: wrapped along a periodic
 # dimension, mirrored once across a reflecting face it lies beyond.
@@ -322,7 +325,10 @@ end
 #   r = 2 (beyond both):                     (a, b) ↦ (−a, −b)
 #   r = 3 (beyond the low face of d2 only):  (a, b) ↦ (−b, a)
 #
-# with `(a, b)` the coordinates along `(d1, d2)` from the axis. The plane's
+# with `(a, b)` the coordinates along `(d1, d2)` from the axis. Across a
+# half turn (M13) a point is in orientation 2 when it lies beyond the low
+# face of `d1`, whatever its `d2` coordinate, and turns about the centre
+# plane of `d2`: `(a, x2) ↦ (−a, lo2 + hi2 − x2)`. The plane's
 # dimensions are neither periodic nor reflecting, so the per-coordinate
 # folds leave them alone and the order of the two steps is a convention.
 # A point the turn takes beyond a high face is outside. The plane's
@@ -339,7 +345,8 @@ end
     d1 == 0 && return y, folded, 0, inside
     lo1, lo2 = g.extents[d1][1], g.extents[d2][1]
     a, b = y[d1] - lo1, y[d2] - lo2
-    r = a < zero(T) ? (b < zero(T) ? 2 : 1) : (b < zero(T) ? 3 : 0)
+    r = g.half ? (a < zero(T) ? 2 : 0) :
+        a < zero(T) ? (b < zero(T) ? 2 : 1) : (b < zero(T) ? 3 : 0)
     r == 0 && return y, folded, 0, inside
     return turn_point(g, y, folded, f, d1, d2, r, a, b)
 end
@@ -350,7 +357,7 @@ end
                             r::Int, a::T, b::T) where {D,T}
     lo1, lo2 = g.extents[d1][1], g.extents[d2][1]
     q1, q2 = r == 1 ? (b, -a) : r == 2 ? (-a, -b) : (-b, a)
-    y1, y2 = lo1 + q1, lo2 + q2
+    y1, y2 = lo1 + q1, g.half ? (lo2 + g.extents[d2][2]) - y[d2] : lo2 + q2
     in1 = lo1 <= y1 <= g.extents[d1][2]
     in2 = lo2 <= y2 <= g.extents[d2][2]
     z = ntuple(d -> d == d1 ? y1 : d == d2 ? y2 : y[d], Val(D))
@@ -690,10 +697,12 @@ end
 
 # The refusal of point `j`, `x`, which the kernel marked: outside the
 # domain after every fold, or (M12) beyond a rotating seam of a set that
-# cannot turn it. Decided again here, by the same fold.
+# cannot turn it. Decided again here, by the same fold. A half-turn set
+# (M13) turns every point, so only the first applies to it.
 function outside_error(fs::FieldSet, x, j)
     forest = fs.forest
     seam = rotating_dims(forest)
+    half = halfturn_dims(forest)
     if seam !== nothing
         _, _, r, ok = fold_point(PointGeometry(eltype(fs.work), forest), x)
         ok && r != 0 && return ArgumentError(
@@ -711,13 +720,14 @@ function outside_error(fs::FieldSet, x, j)
         lo, hi = facename.(forest.faces[d])
         forest.periodic[d] ? "periodic" :
         seam !== nothing && d in seam ? "rotating seam below" :
+        half !== nothing && d == half[1] ? "half-turn seam below, $(facename(forest.faces[d][2])) above" :
         lo == hi ? lo : "$lo below, $hi above"
     end
     return ArgumentError(
         "point $j, $(Tuple(x)), is outside the domain $(forest.extents) (faces " *
         "$(kinds)), so no block holds data there. A periodic dimension wraps, a " *
         "reflecting face mirrors a point once and a rotating seam turns it back by " *
-        "quarter turns; beyond an outer or outflow face there is nothing to " *
+        "quarter turns or a half turn; beyond an outer or outflow face there is nothing to " *
         "interpolate from, " *
         "and taking the nearest block would extrapolate without saying so.")
 end
@@ -930,7 +940,7 @@ seam_turns(fs::FieldSet) = hasrotating(fs.forest) && symmetric_layout(fs)
 # The requested multi-indices with the seam's two dimensions exchanged:
 # what an odd number of quarter turns contracts with.
 function swapped_derivs(forest::Forest, ms)
-    d1, d2 = rotating_dims(forest)
+    d1, d2 = seam_plane(forest)
     return map(m -> ntuple(d -> d == d1 ? m[d2] : d == d2 ? m[d1] : m[d], length(m)), ms)
 end
 

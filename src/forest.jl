@@ -63,6 +63,15 @@ leaf-only linear octree.
   side of it at one level (*conformity*). The two dimensions must have
   as many roots as each other and be neither periodic, reflecting nor
   outflow; their high faces stay outer. See "Rotating seams" in `CODE.md`.
+- `halfturn = (d1, d2)` declares a **half-turn seam** (M13) instead: only
+  the half of the `(d1, d2)` plane above the low face of `d1` is
+  simulated, and the other half is its image under the rotation by 180°
+  about the line where that face meets the centre plane of `d2`. The low
+  face of `d1` is glued to itself, reversed along `d2`; the tree sees it
+  as it sees a quarter turn's seam, and keeps a leaf and its image at one
+  level. `roots[d2]` must be even, so that the axis lies on a root
+  boundary, and `d1` and `d2` must be neither periodic, reflecting nor
+  outflow. A forest has one seam at most. See "Half turn" in `CODE.md`.
 - `N` is the per-block interior size, and it is even: cells are the
   tree's geometry, so `N` belongs here. The ghost width `G` does **not**
   — it says how far a stencil reaches into a neighbor's data, which is a
@@ -78,7 +87,8 @@ Root indices are linearized 0-based, dimension 1 fastest, over `roots`;
 see [`root_position`](@ref) and [`root_index`](@ref).
 
     Forest(roots; N, periodic=all false, reflecting=all false, outflow=all false,
-           rotating=nothing, extents=one unit per root, leaves=nothing, comm=nothing)
+           rotating=nothing, halfturn=nothing, extents=one unit per root,
+           leaves=nothing, comm=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
 
 Without `leaves` the forest starts as its unrefined roots. With it, it
@@ -89,7 +99,7 @@ package such as TreeIOHDF5 restores a forest. Everything
 built over a forest trusts its leaves, so the list is refused unless
 every key lies in the brick, the keys strictly increase, they tile the
 brick exactly — no gap, no overlap — and they are 2:1 balanced and, on a
-rotating forest, conforming at the seam (see [`balance!`](@ref)).
+forest with a seam, conforming at it (see [`balance!`](@ref)).
 
 `comm` is the communicator the forest is distributed over (M7), as
 [`communicator`](@ref) converts it; `nothing`, the default, is a serial
@@ -114,6 +124,8 @@ julia> quadrant = Forest((2, 2, 1); N = 8, rotating = (1, 2),
 
 julia> star = Forest((1, 1, 1); N = 8, reflecting = ntuple(_ -> (true, false), 3),
                      outflow = ntuple(_ -> (false, true), 3));
+
+julia> half = Forest((1, 2); N = 8, halfturn = (1, 2), extents = ((0, 1), (-1, 1)));
 ```
 """
 struct Forest{D,T}
@@ -126,8 +138,11 @@ struct Forest{D,T}
     # outflow faces came, so the struct stays as large as it was (see
     # `rotating` below).
     faces::NTuple{D,NTuple{2,FaceKind}}
-    # The rotating seam's pair of dimensions `(d1, d2)` (M12), `(0, 0)` for
-    # none; read it through `hasrotating` and `rotating_dims`. `Int8`
+    # The rotating seam's pair of dimensions `(d1, d2)` (M12), `(d1, -d2)`
+    # for a half turn (M13), `(0, 0)` for none; read it through
+    # `hasrotating`, `ishalfturn`, `seam_plane`, `rotating_dims` and
+    # `halfturn_dims`. The sign, not a third byte, because at D = 2 the two
+    # bytes fill the padding exactly. `Int8`
     # because the cost of a ninth field was its size, not its count: two
     # bytes fit in the padding before `extents` (for D ≤ 4), so the struct
     # stays as large as it was and so does the schedule build's
@@ -178,6 +193,7 @@ function Forest{T}(roots::NTuple{D,Integer};
                        ntuple(_ -> (false, false), D),
                    outflow::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                    rotating::Union{Nothing,Tuple{Integer,Integer}}=nothing,
+                   halfturn::Union{Nothing,Tuple{Integer,Integer}}=nothing,
                    extents::NTuple{D,Tuple{Real,Real}}=
                        ntuple(d -> (zero(T), T(roots[d])), D),
                    leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
@@ -204,7 +220,9 @@ function Forest{T}(roots::NTuple{D,Integer};
                 "the interior or a copy of the nearest interior cell, not both"))
         end
     end
-    rot = check_rotating(rotating, roots, periodic, reflecting, outflow)
+    rot = halfturn === nothing ?
+          check_rotating(rotating, roots, periodic, reflecting, outflow) :
+          check_halfturn(halfturn, rotating, roots, periodic, reflecting, outflow)
     faces = ntuple(d -> ntuple(s -> reflecting[d][s] ? ReflectingFace :
                                     outflow[d][s] ? OutflowFace : OuterFace, 2), D)
 
@@ -247,20 +265,21 @@ function Forest(roots::NTuple{D,Integer};
                 reflecting::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 outflow::NTuple{D,Tuple{Bool,Bool}}=ntuple(_ -> (false, false), D),
                 rotating::Union{Nothing,Tuple{Integer,Integer}}=nothing,
+                halfturn::Union{Nothing,Tuple{Integer,Integer}}=nothing,
                 extents::Union{Nothing,NTuple{D,Tuple{Real,Real}}}=nothing,
                 leaves::Union{Nothing,AbstractVector{MortonKey{D}}}=nothing,
                 comm=nothing, G=nothing) where {D}
     G === nothing || throw(no_forest_ghosts)
     if extents === nothing
         return Forest{Float64}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                               outflow=outflow, rotating=rotating, leaves=leaves,
-                               comm=comm)
+                               outflow=outflow, rotating=rotating, halfturn=halfturn,
+                               leaves=leaves, comm=comm)
     end
     T = float(promote_type(ntuple(d -> promote_type(typeof(extents[d][1]),
                                                     typeof(extents[d][2])), D)...))
     return Forest{T}(roots; N=N, periodic=periodic, reflecting=reflecting,
-                     outflow=outflow, rotating=rotating, extents=extents, leaves=leaves,
-                     comm=comm)
+                     outflow=outflow, rotating=rotating, halfturn=halfturn,
+                     extents=extents, leaves=leaves, comm=comm)
 end
 
 # The `rotating` keyword, checked, as the forest stores it: `(0, 0)` for
@@ -310,14 +329,83 @@ function check_rotating(rotating, roots::NTuple{D,Integer}, periodic::NTuple{D,B
     return (Int8(d1), Int8(d2))
 end
 
-# Whether the forest has a rotating seam (M12).
+# The `halfturn` keyword (M13), checked, as the forest stores it:
+# `(d1, -d2)`, the sign telling it from a quarter turn's pair. Each refusal
+# says why the seam cannot be glued that way (CODE.md, "Half turn" under
+# "Domain and boundaries").
+function check_halfturn(halfturn, rotating, roots::NTuple{D,Integer},
+                        periodic::NTuple{D,Bool}, reflecting::NTuple{D,Tuple{Bool,Bool}},
+                        outflow::NTuple{D,Tuple{Bool,Bool}}) where {D}
+    rotating === nothing || throw(ArgumentError(
+        "rotating = $rotating and halfturn = $halfturn are both given: a forest has " *
+        "one seam at most, and the two glue the low face of $(halfturn[1]) " *
+        "differently — to another face by a quarter turn, or to itself by a half " *
+        "turn. Declare one."))
+    d1, d2 = Int(halfturn[1]), Int(halfturn[2])
+    D >= 2 || throw(ArgumentError(
+        "halfturn = $halfturn needs at least two dimensions, and this forest has " *
+        "$D: the half turn rotates the plane of two dimensions about a line in " *
+        "it, and a $D-dimensional forest has no such plane"))
+    (1 <= d1 <= D && 1 <= d2 <= D) || throw(ArgumentError(
+        "halfturn = $halfturn names a dimension outside 1:$D: the pair (d1, d2) is " *
+        "the plane of the rotation, two of the forest's own dimensions"))
+    d1 != d2 || throw(ArgumentError(
+        "halfturn = $halfturn names dimension $d1 twice: the half turn glues the " *
+        "low face of the first dimension to itself, reversed along the second, a " *
+        "different one"))
+    iseven(roots[d2]) || throw(ArgumentError(
+        "halfturn = $halfturn needs an even number of roots along dimension $d2, " *
+        "got $(roots[d2]): the axis of the turn lies on the centre plane of $d2, " *
+        "and it must lie on a root boundary, so that no block is its own image " *
+        "across the seam"))
+    for d in (d1, d2)
+        periodic[d] && throw(ArgumentError(
+            "halfturn = $halfturn, but dimension $d is periodic: the low face of " *
+            "$d1 is the seam and the faces of $d2 are mapped onto each other by " *
+            "the turn, and a periodic dimension has no faces. A periodic $d2 with " *
+            "a half turn is an open question in CODE.md, not implemented."))
+        any(reflecting[d]) && throw(ArgumentError(
+            "halfturn = $halfturn, but dimension $d has a reflecting face, " *
+            "reflecting[$d] = $(reflecting[d]): the low face of $d1 is the seam, " *
+            "and the high face of $d1 and both faces of $d2 stay outer, the " *
+            "boundary hook's. A reflecting face together with the half turn is an " *
+            "open question in CODE.md, not implemented. Reflect along a dimension " *
+            "outside the plane of the rotation instead."))
+        any(outflow[d]) && throw(ArgumentError(
+            "halfturn = $halfturn, but dimension $d has an outflow face, " *
+            "outflow[$d] = $(outflow[d]): the low face of $d1 is the seam, and the " *
+            "high face of $d1 and both faces of $d2 stay outer, the boundary " *
+            "hook's. An outflow face together with the half turn is an open " *
+            "question in CODE.md, not implemented."))
+    end
+    return (Int8(d1), Int8(-d2))
+end
+
+# Whether the forest has a rotating seam, a quarter turn's (M12) or a half
+# turn's (M13).
 hasrotating(forest::Forest) = forest.rotating[1] != 0
 
+# Whether the forest's seam is a half turn's (M13).
+ishalfturn(forest::Forest) = forest.rotating[2] < 0
+
+# The plane `(d1, d2)` of either seam, as positive dimensions: what the
+# kernels and the stencils need, whatever the turn.
+seam_plane(forest::Forest) = (Int(forest.rotating[1]), abs(Int(forest.rotating[2])))
+
 # The rotating pair `(d1, d2)` as the `rotating` keyword takes it: `nothing`
-# when the forest has no seam. What rebuilds a forest from another one's
-# parameters passes on.
+# when the forest has no quarter-turn seam. What rebuilds a forest from
+# another one's parameters passes on, through `seam_keywords`.
 rotating_dims(forest::Forest) =
-    hasrotating(forest) ? (Int(forest.rotating[1]), Int(forest.rotating[2])) : nothing
+    hasrotating(forest) && !ishalfturn(forest) ? seam_plane(forest) : nothing
+
+# The pair `(d1, d2)` as the `halfturn` keyword takes it, `nothing` when the
+# forest has no half-turn seam (M13).
+halfturn_dims(forest::Forest) = ishalfturn(forest) ? seam_plane(forest) : nothing
+
+# The seam as the keywords that rebuild it, `(; rotating, halfturn)`, for a
+# forest rebuilt from another one's parameters to splat.
+seam_keywords(forest::Forest) =
+    (rotating=rotating_dims(forest), halfturn=halfturn_dims(forest))
 
 # Validate a caller's leaf list (the `leaves` keyword), already copied
 # into the candidate `forest`. The storage, the ghost schedule and the
@@ -397,8 +485,9 @@ function check_leaves(forest::Forest{D}) where {D}
             balance_slack(r, δ) == 0 && level(nb) != level(k) && throw(ArgumentError(
                 "the leaves are not conforming at the rotating seam: leaf $i, $k, " *
                 "touches $nb across the seam's face in direction $δ, and their levels " *
-                "differ. On a rotating forest a leaf on the low face of one dimension " *
-                "of the plane and its image on the low face of the other are at one " *
+                "differ. On a rotating forest a leaf on the seam and its image " *
+                "across it — on the low face of the other dimension of the plane " *
+                "for a quarter turn, on the same face for a half turn — are at one " *
                 "level, so that no coarse-fine face crosses the seam (CODE.md, " *
                 "\"Rotating seams\"); balance! keeps a forest so, so this list was " *
                 "damaged, made by hand, or written for a forest without the seam"))
@@ -750,21 +839,36 @@ isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) 
 # with (g1, g2) the coordinates along (d1, d2) and every other one kept.
 # The `-1` is a cell's width: the cell at `g` spans `[g, g + 1)`, and
 # `R^{-1}` takes it to the cell spanning `(-g - 1, -g]` along `d2`.
+#
+# A half turn (M13) has orientation 2 only, entered by stepping beyond the
+# low face of `d1` alone — a face of `d2` is an outer face — and turns
+# about the centre plane of `d2` rather than its low face (CODE.md, *Half
+# turns*):
+#
+#     r = 2:  (g1, g2) ↦ (-1 - g1, n2 - 1 - g2)
+#
+# with `n2 = roots[d2] << level` the nodes along `d2` at the level. A
+# quarter turn's `r = 2` is the same map with `n2 = 0`, which is how
+# `unrotate_node` takes both.
 
 # The orientation of the naive node at global coordinates `g`: 0 off the
 # seam, or with no seam at all.
 @inline function seam_orientation(forest::Forest{D}, g::NTuple{D,Int}) where {D}
     hasrotating(forest) || return 0
-    d1, d2 = Int(forest.rotating[1]), Int(forest.rotating[2])
+    d1, d2 = seam_plane(forest)
+    ishalfturn(forest) && return g[d1] < 0 ? 2 : 0
     a, b = g[d1] < 0, g[d2] < 0
     return a ? (b ? 2 : 1) : (b ? 3 : 0)
 end
 
-# The real node of the naive node `g` in orientation `r` (the table above).
-@inline function unrotate_node(g::NTuple{D,Int}, r::Int, d1::Int, d2::Int) where {D}
+# The real node of the naive node `g` in orientation `r` (the tables above):
+# `n2` is 0 for a quarter turn, and the nodes along `d2` at the level for a
+# half turn.
+@inline function unrotate_node(g::NTuple{D,Int}, r::Int, d1::Int, d2::Int,
+                               n2::Int=0) where {D}
     g1, g2 = g[d1], g[d2]
     r1, r2 = r == 1 ? (g2, -1 - g1) : r == 3 ? (-1 - g2, g1) :
-             r == 2 ? (-1 - g1, -1 - g2) : (g1, g2)
+             r == 2 ? (-1 - g1, n2 - 1 - g2) : (g1, g2)
     return Base.setindex(Base.setindex(g, r1, d1), r2, d2)
 end
 
@@ -808,7 +912,9 @@ end
     g = ntuple(d -> (rootpos[d] << lvl) + Int(k.coords[d]) + δ[d], D)
     r = seam_orientation(forest, g)
     r == 0 && return g, 0
-    return unrotate_node(g, r, Int(forest.rotating[1]), Int(forest.rotating[2])), r
+    d1, d2 = seam_plane(forest)
+    n2 = ishalfturn(forest) ? forest.roots[d2] << lvl : 0
+    return unrotate_node(g, r, d1, d2, n2), r
 end
 
 # The same-level anchor node reached by stepping one cell from `k` in
@@ -956,7 +1062,9 @@ Across a rotating seam (M12; see [`Forest`](@ref)) the keys are the real
 leaves whose image under the rotation abuts `k`, the leaves that supply
 that ghost region turned by a quarter turn or two. A block at the axis
 is then its own neighbor in three directions of the plane, as a single
-periodic root is its own neighbor.
+periodic root is its own neighbor. Across a half-turn seam (M13) they
+are the leaves on the same face, at the mirrored position along `d2`,
+turned by a half turn.
 
 Note that this is not symmetric under `δ -> -δ` when levels differ: a
 coarse neighbor found across `k`'s *corner* also spans the face beyond
@@ -987,7 +1095,7 @@ function oriented_neighbors(forest::Forest{D}, k::MortonKey{D},
     i = find_covering_leaf(forest, nbroot, level(k), nbcoords)
     i !== nothing && return r, [forest.leaves[i]]
 
-    δreal = r == 0 ? δ : real_direction(δ, r, forest.rotating[1], forest.rotating[2])
+    δreal = r == 0 ? δ : real_direction(δ, r, seam_plane(forest)...)
     return r, collect_touching_leaves!(MortonKey{D}[], forest, nbroot, level(k), nbcoords,
                                        δreal)
 end
@@ -1078,7 +1186,8 @@ that is more than one level coarser than a leaf it touches, repeating
 until the refinement stops rippling outward. On a forest with a rotating
 seam (M12) it also enforces **conformity** there: a leaf across a seam
 *face* that is coarser by any amount is refined, so the leaves on the low
-face of `d1` and their images on the low face of `d2` end at one level.
+face of `d1` and their images on the low face of `d2` end at one level —
+or, across a half-turn seam (M13), their images on the same face.
 
 Afterwards every ghost region of every block touches at most one level
 up or down, which is what bounds the ghost-filling cases and the
@@ -1121,8 +1230,10 @@ end
 # How many levels two adjacent leaves may differ by: one, but none across
 # a rotating seam's *face* (M12, conformity; CODE.md "Rotating seams").
 # An edge or corner across the seam keeps the ordinary 2:1 rule. A seam
-# face is a direction with one nonzero component in orientation 1 or 3;
-# orientation 2 needs two.
+# face is a direction with one nonzero component and a nonzero
+# orientation: 1 or 3 for a quarter turn, whose orientation 2 needs two
+# components and is a corner, and 2 for a half turn (M13), whose only
+# face across the seam is the low face of `d1`, glued to itself.
 @inline balance_slack(r::Int, δ::NTuple{D,Int}) where {D} =
     r != 0 && count(!=(0), δ) == 1 ? 0 : 1
 
@@ -1130,7 +1241,7 @@ end
     isbalanced(forest)
 
 Whether `forest` satisfies 2:1 balance across all faces, edges, and
-corners, and conformity at a rotating seam (M12) — the postcondition of
+corners, and conformity at a rotating seam (M12, M13) — the postcondition of
 [`balance!`](@ref).
 """
 function isbalanced(forest::Forest{D}) where {D}

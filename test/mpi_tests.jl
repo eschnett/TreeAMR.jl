@@ -16,7 +16,8 @@
 # that turns into itself and a `RotationPair` filled, regridded and
 # interpolated beyond the seam, the pair's
 # merged stages sharing their tags, and a single leaf at the axis that
-# leaves every rank but one empty — and prints
+# leaves every rank but one empty; and (M13) a half plane, the wave and
+# two sets through a fill, a regrid and interpolation — and prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
 # reductions and the floating-point sums. Run serially in this
@@ -109,7 +110,7 @@ end
     @test any(l -> startswith(l, "B2 conserved true"), lines)
     # The regrid cycles (step 4) changed the mesh every time, Burgers'
     # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 17
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 18
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
     @test count(l -> occursin(" unchanged false", l), lines) == 3
@@ -132,6 +133,11 @@ end
     # across the seam.
     @test all(w -> parse(Int, w) > 0, words("Q2 negzero")[3:5])
     @test words("Q2 interpolated")[3:4] == ["257", "193"]
+    # The half plane (M13): the turned ghosts hold `−0` in both sets, and
+    # about half of the points were turned back across the seam.
+    @test all(w -> parse(Int, w) > 0, words("H2 negzero")[3:4])
+    @test all(l -> split(l)[4:5] == ["257", "128"],
+              filter(startswith("H2 interpolated "), lines))
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.
@@ -166,6 +172,8 @@ end
         # single leaf left all ranks but one empty before its regrids and
         # after them, and none in between.
         @test parse(Int, split(only(filter(startswith("# Q2 rotated received"),
+                                           hashes)))[end]) > 0
+        @test parse(Int, split(only(filter(startswith("# H2 rotated received"),
                                            hashes)))[end]) > 0
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes

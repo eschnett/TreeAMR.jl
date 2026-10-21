@@ -33,7 +33,7 @@ rank_forest(serial::Forest{D,T}, r, P) where {D,T} =
     Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
               reflecting=TreeAMR.reflecting_faces(serial),
               outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-              rotating=TreeAMR.rotating_dims(serial),
+              TreeAMR.seam_keywords(serial)...,
               leaves=serial.leaves, comm=PartitionCommunicator(r, P))
 
 # The equal-count split as `threadchunks` computed it through 0.1.4, a
