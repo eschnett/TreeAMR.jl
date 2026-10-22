@@ -49,7 +49,7 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
     forest = Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=TreeAMR.reflecting_faces(serial),
                        outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                       rotating=TreeAMR.rotating_dims(serial),
+                       TreeAMR.seam_keywords(serial)...,
                        leaves=serial.leaves)
     fs = FieldSet{T}(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
     copyto!(fs.work, exchange_data(MersenneTwister(5), T, size(fs.work)))
@@ -373,7 +373,7 @@ end
     reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=TreeAMR.reflecting_faces(serial),
                        outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                       rotating=TreeAMR.rotating_dims(serial),
+                       TreeAMR.seam_keywords(serial)...,
                        leaves=serial.leaves)
     sfs = sets(reference)
     alldata = map(enumerate(sfs)) do (i, fs)
@@ -392,7 +392,7 @@ end
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=TreeAMR.reflecting_faces(serial),
                             outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                            rotating=TreeAMR.rotating_dims(serial),
+                            TreeAMR.seam_keywords(serial)...,
                             leaves=serial.leaves, comm=comms[r])
             owned = blockrange(forest)
             fss = sets(forest)
@@ -423,7 +423,7 @@ end
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=TreeAMR.reflecting_faces(serial),
                             outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                            rotating=TreeAMR.rotating_dims(serial),
+                            TreeAMR.seam_keywords(serial)...,
                             leaves=serial.leaves, comm=comms[r])
             fs = first(sets(forest))
             fs.work .= 1
@@ -492,7 +492,7 @@ TreeAMR.waitall(c::StagingCommunicator, requests::AbstractVector) =
     rebuilt(comm) = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                            reflecting=TreeAMR.reflecting_faces(serial),
                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                           rotating=TreeAMR.rotating_dims(serial),
+                           TreeAMR.seam_keywords(serial)...,
                            leaves=serial.leaves, comm=comm)
     reference = rebuilt(nothing)
     sfs = FieldSet(reference, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
@@ -791,7 +791,7 @@ end
     reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                        reflecting=TreeAMR.reflecting_faces(serial),
                        outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                       rotating=TreeAMR.rotating_dims(serial), leaves=serial.leaves)
+                       TreeAMR.seam_keywords(serial)..., leaves=serial.leaves)
     rentries, rsets = entries(reference)
     old = copy(reference.leaves)
     @test regrid!(reference, rentries; flags=[mark(reference, k) for k in reference.leaves],
@@ -805,7 +805,7 @@ end
             forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                             reflecting=TreeAMR.reflecting_faces(serial),
                             outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                            rotating=TreeAMR.rotating_dims(serial),
+                            TreeAMR.seam_keywords(serial)...,
                             leaves=serial.leaves, comm=comms[r])
             es, sets = entries(forest)
             flags = Any[mark(forest, forest.leaves[i]) for i in blockrange(forest)]
@@ -875,6 +875,65 @@ end
             @test leaves == reference.leaves
             @test all(((w, s),) -> bitwise_equal(w, s.work[:, :, :, owned]),
                       zip(works, members(sx)))
+        end
+    end
+end
+
+@testset "regrid! over a distributed half plane is the serial regrid: D=$D" for D in (2, 3)
+    # The seam is kept conforming by the replicated completion, and a
+    # prolongation reads its parent's ghosts across the seam. Over 3 and
+    # 5 ranks, a cell- and a vertex-centered set regridded together —
+    # refining at the seam on one side of the axis, which conformity
+    # carries to the other, and coarsening the finest blocks — must end
+    # with the serial leaves and the serial arrays, bit for bit.
+    N = D == 3 ? 4 : 8
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    other = D == 3 ? :reflect_lo : :outer
+    serial = halfturn_forest(Val(D); plane=(1, 2), other=other, N=N)
+    chosen = halfturn_exchange_layouts(D, other; p=p)[1:2]
+    hook = exchange_hook()
+    colons = ntuple(_ -> :, D + 1)
+    rng = MersenneTwister(60 + D)
+    alldata = [rotating_exchange_data(rng, Float64, size(halfturn_set(serial, l).work), 2)
+               for l in chosen]
+    mark(forest, k) = level(k) == maxlevel(forest) ? Coarsen :
+                      level(k) == 0 && block_extent(forest, k)[1][1] == 0 &&
+                      block_extent(forest, k)[2][1] >= 1 ? Refine : Keep
+    function entries(forest)
+        sets = map(l -> halfturn_set(forest, l), chosen)
+        for (s, d) in zip(sets, alldata)
+            copyto!(s.work, d[colons..., blockrange(forest)])
+        end
+        return Tuple(s => GhostSchedule(s, ops) for s in sets), sets
+    end
+    reference = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                       reflecting=TreeAMR.reflecting_faces(serial),
+                       outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
+                       TreeAMR.seam_keywords(serial)..., leaves=serial.leaves)
+    rentries, rsets = entries(reference)
+    old = copy(reference.leaves)
+    @test regrid!(reference, rentries; flags=[mark(reference, k) for k in reference.leaves],
+                  boundary=hook)
+    @test reference.leaves != old
+    @test isbalanced(reference)
+    for P in (3, 5)
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                            reflecting=TreeAMR.reflecting_faces(serial),
+                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
+                            TreeAMR.seam_keywords(serial)...,
+                            leaves=serial.leaves, comm=comms[r])
+            es, sets = entries(forest)
+            flags = Any[mark(forest, forest.leaves[i]) for i in blockrange(forest)]
+            got = regrid!(forest, es; flags=flags, boundary=hook)
+            (got, copy(forest.leaves), blockrange(forest), map(s -> copy(s.work), sets))
+        end
+        @test all(res -> res[1], results)
+        @test all(res -> res[2] == reference.leaves, results)
+        for (_, _, owned, works) in results, (w, s) in zip(works, rsets)
+            @test bitwise_equal(w, s.work[colons..., owned])
         end
     end
 end

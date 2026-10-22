@@ -654,7 +654,7 @@ end
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                           reflecting=TreeAMR.reflecting_faces(serial),
                           outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                          rotating=TreeAMR.rotating_dims(serial),
+                          TreeAMR.seam_keywords(serial)...,
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]
         sets = map(forests) do forest
@@ -768,7 +768,7 @@ end
     forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                       reflecting=TreeAMR.reflecting_faces(serial),
                       outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                      rotating=TreeAMR.rotating_dims(serial),
+                      TreeAMR.seam_keywords(serial)...,
                       leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                for r in 0:(P - 1)]
     @test count(f -> isempty(blockrange(f)), forests) == 1
@@ -1060,7 +1060,7 @@ end
         forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
                           reflecting=TreeAMR.reflecting_faces(serial),
                           outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                          rotating=TreeAMR.rotating_dims(serial),
+                          TreeAMR.seam_keywords(serial)...,
                           leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
                    for r in 0:(P - 1)]
         sets = map(forests) do forest
@@ -1095,6 +1095,88 @@ end
                 bitwise_equal(pairs[r].b.work, sb.work[colons..., range])
         end
     end
+end
+
+# --- Half-turn seams (M14) --------------------------------------------------
+#
+# A half turn's transfers are orientation 2, packed and unpacked as a
+# quarter turn's are; what is new is the shifted seam slab of a
+# vertex-like `d2`, whose ranges both ends of a message must derive alike.
+# The half plane of `halfturn_forest` (`ghost_oracles.jl`), refined at the
+# axis and off it, split over 2, 3 and 5 ranks: the transfers, the layouts,
+# one write per point, and the values bit for bit, with `−0` from the
+# negated component.
+
+# Cell, vertex and a face normal to `d2`, each a scalar and a vector, as
+# `(name, nvars, G, centering, parity, halfturn)`.
+function halfturn_exchange_layouts(D, other; p=4)
+    plane = (1, 2)
+    return [(string(C), D + 1, ghosts_for(C, p), C, vector_parity(D, plane, other),
+             vector_halfturn(D, plane))
+            for C in (cellcentered(D), vertexcentered(D), facecentered(D, 2))]
+end
+
+halfturn_set(forest, (_, nvars, G, C, parity, map_), ::Type{T}=Float64) where {T} =
+    FieldSet{T}(forest, nvars; G=G, centering=C, parity=parity, halfturn=map_)
+
+@testset "Across a half-turn seam the ranks hold the serial transfers and its values bitwise: D=$D" for
+        D in (2, 3)
+    # A shifted slab whose range one end derives differently from the other
+    # misplaces a whole message; a pack that applied the sign turns the
+    # serial fill's `−0` into `+0`. So over 2, 3 and 5 ranks the transfers
+    # of all ranks are the serial ones, both ends of every message derive
+    # one layout, every point is written once per stage, and every rank's
+    # working array, ghosts included, equals the serial fill on its blocks
+    # bit for bit, the hook between the stages included.
+    N = D == 3 ? 4 : 8
+    p = D == 3 ? 2 : 4
+    ops = Operators(prolongation=p, restriction=p)
+    hook = exchange_hook()
+    colons = ntuple(_ -> :, D + 1)
+    nrotated = nnegzero = nrot = 0
+    for other in ROTATING_OTHERS[D], layout in halfturn_exchange_layouts(D, other; p=p)
+        serial = halfturn_forest(Val(D); plane=(1, 2), other=other, N=N)
+        sfs = halfturn_set(serial, layout)
+        sched = GhostSchedule(sfs, ops)
+        stransfers = serial_transfers(sched)
+        @test any(t -> t[4] == 2, stransfers)
+        @test all(t -> t[4] in (0, 2), stransfers)
+        _, _, G, C, _, _ = layout
+        stored = ntuple(d -> N + 2G[d] + (C[d] === :vertex), D)
+        scounts = stage_write_counts([sched], stored, nleaves(serial))
+        # The serial fill, with `v_{d1}` zero: the turn negates it.
+        data = rotating_exchange_data(MersenneTwister(31), Float64, size(sfs.work), 2)
+        copyto!(sfs.work, data)
+        fill_ghosts!(sfs, sched; boundary=hook)
+        reference = Array(sfs.work)
+        nnegzero += count(x -> iszero(x) && signbit(x), reference)
+        for P in (2, 3, 5)
+            sets = map(0:(P - 1)) do r
+                fs = halfturn_set(rank_forest(serial, r, P), layout)
+                copyto!(fs.work, data[colons..., blockrange(fs.forest)])
+                fs
+            end
+            scheds = [GhostSchedule(fs, ops) for fs in sets]
+            locals, remote, unmatched, bad, nsent = distributed_transfers(scheds)
+            @test bad == 0
+            @test unmatched == 0
+            @test Set(locals) ∪ Set(remote) == stransfers
+            nrotated += count(t -> t[4] != 0, remote)
+            @test layout_mismatches(scheds)[1] == 0
+            counts = stage_write_counts(scheds, stored, nleaves(serial))
+            @test counts == scounts
+            @test lockstep!(sets, scheds, CPU();
+                            between=r -> apply_boundary!(sets[r], hook, scheds[r],
+                                                         CPU())) == 0
+            @test all(r -> bitwise_equal(sets[r].work,
+                                         reference[colons..., blockrange(sets[r].forest)]),
+                      1:P)
+            nrot += nrotated_remote(scheds)
+        end
+    end
+    @test nrotated > 0
+    @test nnegzero > 0
+    @test nrot > 0
 end
 
 @testset "A serial schedule's stages are its phases, and send nothing" begin

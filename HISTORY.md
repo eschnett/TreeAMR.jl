@@ -7,13 +7,13 @@ milestone records, the downstream checks and the release history. The
 current design, with the reasons for it, is in [CODE.md](CODE.md), and
 the plan in [PLAN.md](PLAN.md). The sections follow CODE.md's.
 
-**Step numbers.** The milestones M0–M13 are those of
+**Step numbers.** The milestones M0–M14 are those of
 [PLAN.md](PLAN.md), numbered in the order they were planned and done in
-the order M0–M6, M8, M10, M11, M9a, M7, M12, M13. Several were built in
+the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14. Several were built in
 numbered steps — M8a steps 1–3 and M8b steps 4–5, M7 steps 0–9 with a
-step 6b, M12 steps 0–10, M13 steps 1–4 — and a reference such as "M7
-step 6b", or "step 8" inside a milestone's record, names one of them.
-Each milestone's steps are listed in its record under
+step 6b, M12 steps 0–10, M13 steps 1–4, M14 steps 0–8 — and a reference
+such as "M7 step 6b", or "step 8" inside a milestone's record, names one
+of them. Each milestone's steps are listed in its record under
 [Milestones](#milestones).
 
 **Contents**
@@ -54,6 +54,7 @@ Each milestone's steps are listed in its record under
   - [M7 — MPI](#m7--mpi)
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
   - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
+  - [M14 — Half-turn symmetry](#m14--half-turn-symmetry)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -422,7 +423,7 @@ over tilde bounds and over a run-time interface version.
 
 ## Open questions
 
-The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05.
+The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed, and taken up on 2026-10-21 as M14, when Erik asked for it. His decisions that day: a keyword of its own, `halfturn = (d1, d2)`, rather than an angle on `rotating`; a field-set keyword of its own too, `halfturn`, rather than `rotation` with a second meaning; exactly M12's refusals of periodic, reflecting and outflow faces on the plane's dimensions; and the axis on a root boundary ("the origin is at the edge of a box"), so `roots[d2]` even. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05.
 
 ## Milestones
 
@@ -438,7 +439,9 @@ M7's benchmarks (in the end it did change it: format version 2, M7 step
 M12, the rotating symmetry, was added after it on 2026-10-03 and done
 the same day, so it comes before M9b, which follows it. So does M13,
 the nested-mesh ghost fill, added on 2026-10-19 for a downstream report
-and done on 2026-10-20.
+and done on 2026-10-20, and M14, the half turn, specified and built on
+2026-10-21 beside it, on a branch of its own, which is why it took the
+next number when the two were merged.
 
 M9b was split from M9, "I/O and visualization", on 2026-09-29, when its checkpoint half became M9a.
 
@@ -3689,6 +3692,148 @@ M12 was decided with Erik, after M7 and before M9b.
     with serial in every line but the `#` lines and the last digits of
     the `sum` lines; the docs build, doctests included.
 
+### M14 — Half-turn symmetry
+
+- **M14 — Half-turn symmetry.** *(Specified 2026-10-21. Done 2026-10-21.)* The π-symmetry
+  of Cactus's RotatingSymmetry180, as specified in [PLAN.md](PLAN.md#m14--half-turn-symmetry),
+  under "Half turn" in [Domain and boundaries](CODE.md#domain-and-boundaries)
+  and *Half turns* under "Rotating seams" in
+  [Ghost filling](CODE.md#ghost-filling). The decisions are under
+  [Open questions](#open-questions). The design found one thing M12's
+  deferral had not named: a half turn flips the dimension tangential to
+  the seam, which a quarter turn never does, and in a vertex-like `d2`
+  half-open ownership does not survive the flip, so the seam slab's
+  partition along `d2` moves up a plane (checked by hand for every copy
+  and restriction range in the design, then by the `NaN` test).
+  *Accept:*
+  - **refusals**, each with its reason: every case listed for the forest
+    and the field set, a leaf list not conforming at the seam, and a
+    `RotationPair` over a half-turn forest;
+  - **the neighbor oracle**: the half plane's oriented neighbors equal the
+    images of the neighbors in an independently built *unfolded* forest of
+    `2M₁ × M₂` roots, made by turning the leaves with exact `Rational`
+    boxes, on random refinements and after `balance!`; the unfolded forest
+    is 2:1 balanced and the seam conforming;
+  - **no ghost undefined, and none read before it is defined**, in
+    `D = 2` and `3` with `z` periodic, outer or reflecting at its low
+    face, for every centering, rotated restrictions and prolongations
+    included (which a half turn has in 2D, at the seam's edges);
+  - **`halfturn_vs_doubled`**: data covariant under the half turn and not
+    polynomial, on a refinement symmetric under it that reaches the seam
+    and the axis, where every stored point, ghosts included, equals the
+    full plane's within `1e-13`, cell, vertex and face centering, under
+    half-open and symmetric walls;
+  - **write counts**: the schedule partitions the stored points, and every
+    hook region's image leaves through an outer face;
+  - **the wave equation on a half plane against the full box**, a scalar
+    and a vector wave: `linf` equal to the full box's to `rtol = 1e-8`,
+    the vertex-centered seam half-planes equal to each other as measured,
+    and the rate 2;
+  - **a regrid across the seam**, conformity kept, no block moved by more
+    than one level, the ghosts afterwards equal to the oracle's;
+  - **conservation through the seam** under the rigid rotation, with the
+    fixup, to roundoff;
+  - **interpolation beyond the seam**: values and first derivatives;
+  - **MPI**: lockstep packs in process, bitwise with a turned `−0`, and a
+    half-turn case in `mpi_workload.jl` at `-n 2` and `-n 3`; a cycle in
+    `thread_workload.jl`, a fill in `gpu_tests.jl`;
+  - **TreeIOHDF5**: a round trip and a restart that continues byte for
+    byte.
+  - **Step 0 — specification.** *(Done, 2026-10-21.)* CODE.md, PLAN.md
+    and this record.
+  - **Step 1 — the forest.** *(Done, 2026-10-21.)* The keyword and its
+    refusals (`check_halfturn`), the signed encoding `(d1, −d2)` in
+    `rotating` with `ishalfturn`, `seam_plane`, `halfturn_dims` and
+    `seam_keywords`, and the real node through `unrotate_node`'s new
+    argument `n2` (zero for a quarter turn, so its `r = 2` is the same
+    map). Everything else in the tree — `real_direction`,
+    `virtual_offset`, `balance_slack`, `balance!`, `isbalanced`,
+    `check_leaves`, regrid completion, the buffer — needed no change,
+    as the plan expected: conformity is "a face direction across a
+    nonzero orientation", which a half turn's one face satisfies.
+    `oriented_neighbors`, `seam_offset` and the schedule's `plane`
+    read the raw pair and now go through `seam_plane`. The neighbor
+    oracle, on random half planes before and after `balance!`, found no
+    mismatch and met every `(r, kind)` for `r ∈ {0, 2}`.
+  - **Step 2 — field sets.** *(Done, 2026-10-21.)* `halfturn` on
+    `FieldSet`, stored beside `rotation`; `halfturns_of` with the
+    shape checks shared with `rotation` (`signed_map`); `seamtables`
+    puts the map itself in column 3; `symmetric_layout` is true for
+    every layout; `RotationPair` refuses a half-turn forest.
+  - **Step 3 — the schedule.** *(Done, 2026-10-21.)* `GroupKey.shift`,
+    `target_range`'s shifted ranges (`shifted_range`), `seam_shift`, and
+    the shift threaded through every stencil builder and the hook's
+    regions and clamps. The kernel is unchanged. Measured: without the
+    shift the `NaN` test leaves 9 to 4720 ghosts undefined in vertex-like
+    `d2` cases (2D and 3D, `p = 2, 4`); with it, none, and the polynomial
+    data is reproduced to 1.8e−15. Without state 2, the symmetric-walls
+    exception, the same test with the low walls poisoned leaves 3 (2D)
+    and 116–204 (3D) `NaN`s; with it, none. Against the full plane, the
+    smooth data agree to 6.7e−16 where `d2` is cell-like; where it is
+    vertex-like they differ by 4.1e−7 (2D) and 1.8e−4 (3D), at the
+    points where levels meet along `d2` in the seam slab, and the pairs
+    of differing points are each other's images, the half plane
+    interpolated at one and the full plane at the other. This was not
+    foreseen in the design, whose acceptance asked for `1e-13`
+    everywhere; the half-open asymmetry M12 found for interpolation
+    (step 5 of M12) reaches the ghosts here because the turn flips the
+    tangential dimension. The test asserts the measured bounds.
+  - **Step 4 — regrid, initial data, interface, conservation.** *(Done,
+    2026-10-21.)* No source change beyond step 1's. A regrid against the
+    doubled plane: exact for cell-like `d2` (2.7e−15), 4.2e−6 (2D) and
+    1.9e−4 (3D) for vertex-like `d2`, the parent's differing ghosts
+    carried in by prolongation. The rigid rotation conserves the mass to
+    8.1e−15 over 136 SSPRK3 steps while 90 % of it crosses the seam; the
+    negative control drifts 1.5e−4, less than M12's 1.9 %, because less
+    of the bump crosses a refinement boundary.
+  - **Step 5 — interpolation.** *(Done, 2026-10-21.)* `PointGeometry`
+    carries the positive plane and a `half` flag; `fold_point` and
+    `turn_point` turn about the centre plane. Polynomial data to
+    2.2e−14, the turned identity bit for bit, and smooth data at the
+    point itself 3.1e−14 (cell) and 4.1e−4 / 2.3e−3 (vertex, 2D / 3D),
+    as for M12.
+  - **Step 6 — MPI, threads, device.** *(Done, 2026-10-21.)* The test
+    sites that rebuild a forest by hand splat `seam_keywords`. In
+    process: transfers, layouts, write counts and values bit for bit
+    with a turned `−0`, over 2, 3 and 5 ranks; a distributed regrid and
+    interpolation. `mpi_workload.jl` gained `H2v` and `H2`; at 2 and 3
+    ranks every line matches the serial run, with 52 and 44 rotated
+    transfers received. `thread_workload.jl` gained `D2ovh`, the same
+    bits at 1 and 4 threads. `gpu_tests.jl` gained a half-turn fill and
+    interpolation, run on the CPU backend here; Metal by hand is still
+    to do. No launch path changed (the kernel and `TransferGroup` are as
+    they were; only the schedule's `plane` is computed differently), so
+    no compile-time comparison was run.
+  - **Step 7 — the wave.** *(Done, 2026-10-21.)* A scalar and a vector
+    standing wave invariant under the half turn bit for bit. Cell
+    centering agrees with the full plane to 3.0e−13 at every stored
+    point. Vertex centering lies within the full plane's own covariance
+    defect (2.1e−4 against 3.5e−3), and so does its `linf`. The two seam
+    half-planes `(0, y)` and `(0, −y)` were expected to stay equal, as a
+    quarter turn's seam planes do, and do not: they differ by 9e−6
+    (`K = 1`) and 4.7e−5 (`K = 2`) after 143 steps, because the turn
+    reverses `d2` along the seam, which exchanges an evolved low wall
+    with a hook-filled high one and moves a coarse-fine face's shared
+    point to the other block. On a uniform half plane with symmetric
+    walls they stay equal bit for bit, which the test asserts; CODE.md
+    records the rest under *Half turns*. Rate 2 in every case.
+  - **Step 8 — measurements, documentation, release.** *(Done,
+    2026-10-21.)* `bench/ghosts.jl` (D = 3, N = 8, 4 roots, 4 threads)
+    against 0.2.3: the schedule build allocates 0.6 % more on the
+    uniform mesh (422,416 bytes against 420,000) and 2.7 % more on the
+    two-level one (4,892,672 against 4,763,872), from the larger
+    `GroupKey`; fill times and allocations unchanged within the noise.
+    The suite takes 8 min 49 s at eight threads, 116,813 tests, and
+    after the merge with 0.2.4 9 min 39 s, 131,748 tests. The
+    guide gained "Half turns" with a doctest; README, the guide and
+    CODE.md say M14; the version is 0.2.5, additive. TreeIOHDF5 saves
+    the forest's pair under a new feature `halfturn` and each set's map,
+    on a branch of its own, with `=0.2.5` appended to its `[compat]`;
+    its 889 tests pass against this checkout. Downstream, in scratch
+    copies developing this checkout: TreeWave's 349 tests pass (1 min
+    20 s), TreeHydro's 12,679 (5 min, with the TreeIOHDF5 branch).
+    Tagging, registering and the TreeIOHDF5 release are Erik's.
+
 ## Downstream checks
 
 **TreeWave.** The `[sources]` pins to `main` went when 0.1.1 was
@@ -3800,6 +3945,6 @@ boundary hooks in `regrid!`, the multi-set `adapt_to_initial_data!`,
 outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
-0.2.3 (2026-10-16) raised the Julia floor to 1.13, and 0.2.4 carries the
-nested-mesh ghost fill (M13). The repository keeps no changelog; the release commit says what
+0.2.3 (2026-10-16) raised the Julia floor to 1.13, 0.2.4 carries the
+nested-mesh ghost fill (M13), and 0.2.5 the half turn (M14). The repository keeps no changelog; the release commit says what
 changed.

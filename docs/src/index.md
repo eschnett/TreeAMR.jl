@@ -8,7 +8,7 @@ See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.
 for the full design, and [PLAN.md](https://github.com/eschnett/TreeAMR.jl/blob/main/PLAN.md)
 for the milestone roadmap.
 
-The package has completed milestone **M13**: the tree core (Morton keys over a
+The package has completed milestone **M14**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -72,7 +72,11 @@ M13 made the ghost fill of nested meshes cheaper: a vertex-centered fine
 point that sits on a coarse node is prolonged by one tap per dimension
 on the CPU, and prolongation levels that read nothing from each other
 run as one group, so over MPI a nested mesh's fill no longer waits for
-its levels one after another. Next is visualization export (M9b).
+its levels one after another.
+
+M14 added the 180° counterpart of the rotating symmetry, a half plane
+whose low face is glued to itself by a half turn about its middle (see
+[Half turns](@ref)). Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -405,6 +409,41 @@ point beyond the seam back and turns its value and gradient),
 checkpoints and MPI all know the seam. See "Rotating" under "Domain and
 boundaries" and "Rotating seams" under "Ghost filling" in the design
 document.
+
+### Half turns
+
+A forest declared `halfturn = (d1, d2)` instead stores the half of the
+plane above the low face of `d1`, and the other half is its image under
+a rotation by 180° about the line where that face meets the centre plane
+of `d2`, as Cactus's RotatingSymmetry180 does, for a binary or for a
+spinning black hole off the octant's axes. The low face of `d1` is
+glued to itself, reversed along `d2`; `roots[d2]` must be even, so that
+the axis lies on a root boundary. A half turn negates both axes of its
+plane and exchanges none, so every field set turns into itself, and
+each says how its variables turn with `halfturn`, a signed map like
+`rotation`, usually signs alone:
+
+```jldoctest rotating
+julia> half = Forest((1, 2); N = 4, halfturn = (1, 2), extents = ((0, 1), (-1, 1)));
+
+julia> hs = FieldSet(half, 3; G = 1, halfturn = (1, -2, -3));      # (ρ, v_x, v_y)
+
+julia> fill_by_coordinates!((x, v) -> v == 1 ? x[1] * x[2] : x[v - 1], hs);
+
+julia> fill_ghosts!(hs, GhostSchedule(hs, ops));
+
+julia> coordinates(hs, 1, (1, 2))     # a ghost beyond the low face of x
+(-0.125, -0.875)
+
+julia> hs.work[1, 2, :, 1]            # ρ = xy and v = x, turned from (0.125, 0.875)
+3-element Vector{Float64}:
+  0.109375
+ -0.125
+ -0.875
+```
+
+See "Half turn" under "Domain and boundaries" and *Half turns* under
+"Rotating seams" in the design document.
 
 ## Conservation at coarse-fine faces
 

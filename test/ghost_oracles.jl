@@ -1509,3 +1509,382 @@ function rotating_regrid_vs_quadrupled(::Val{D}; rotating, other=:periodic, N=8,
     end
     return results
 end
+
+# --- M14: half turns -----------------------------------------------------------
+#
+# The half plane is checked as the quadrant is, against an unfolded forest
+# built from turned `Rational` boxes and against the full plane holding the
+# turned data explicitly. In root units from the brick's low corner the
+# half plane spans `[0, M1] × [0, M2]` in its plane, and the half turn is
+# `(x1, x2) ↦ (−x1, M2 − x2)`, about the line where the low face of `d1`
+# meets the centre plane of `d2`.
+
+"""The box `(lo, hi)` turned by a half turn about `(0, c)` in the plane `(d1, d2)`."""
+function halfturn_box(box, d1::Int, d2::Int, c)
+    lo, hi = box
+    return (Base.setindex(Base.setindex(lo, -hi[d1], d1), 2c - hi[d2], d2),
+            Base.setindex(Base.setindex(hi, -lo[d1], d1), 2c - lo[d2], d2))
+end
+
+"""
+The unfolded forest of the half plane `half`: `2M1` roots along `d1`, the
+half plane's leaves and their half-turned images, the other dimensions as
+the half plane's. Returns `(full, image, back)` as
+[`unfolded_forest`](@ref) does, with `r` 0 or 2.
+"""
+function unfolded_halfturn_forest(half::Forest{D}) where {D}
+    d1, d2 = TreeAMR.halfturn_dims(half)
+    M1, c = half.roots[d1], half.roots[d2] // 2
+    roots = ntuple(d -> d == d1 ? 2M1 : half.roots[d], D)
+    full = Forest(roots; N=half.N, periodic=half.periodic,
+                  reflecting=TreeAMR.reflecting_faces(half))
+    shift = ntuple(d -> d == d1 ? M1 : 0, D)
+    turn(box, r) = r == 0 ? box : halfturn_box(box, d1, d2, c)
+    image(k, r) = box_key(roots, map(x -> x .+ shift, turn(leafbox(half, k), r)))
+    function back(kf)
+        box = map(x -> x .- shift, leafbox(full, kf))
+        r = box[2][d1] <= 0 ? 2 : 0
+        return r, box_key(half.roots, turn(box, r))
+    end
+    leaves = sort!([image(k, r) for k in half.leaves for r in (0, 2)]; lt=naive_isless)
+    TreeAMR.rebuild_leaves!(full, leaves)
+    return full, image, back
+end
+
+"""
+[`seam_neighbor_mismatches`](@ref) for a half plane: its oriented
+neighbors against the unfolded forest's, turned back, with the
+orientation of an empty region that of the region stepped into.
+"""
+function halfturn_neighbor_mismatches(half::Forest{D}) where {D}
+    d1, d2 = TreeAMR.halfturn_dims(half)
+    full, image, back = unfolded_halfturn_forest(half)
+    mismatches = 0
+    seen = Dict{Tuple{Int,Symbol},Int}()
+    for k in half.leaves, δ in alldirections(Val(D))
+        r, keys = TreeAMR.oriented_neighbors(half, k, δ)
+        unfolded = neighbor_keys(full, image(k, 0), δ)
+        expected = map(back, unfolded)
+        ok = if isempty(expected)
+            lo, hi = leafbox(half, k)
+            s = hi[1] - lo[1]
+            isempty(keys) && r == (hi[d1] + s * δ[d1] <= 0 ? 2 : 0)
+        else
+            all(e -> first(e) == r, expected) &&
+                sort(keys; lt=naive_isless) == sort(last.(expected); lt=naive_isless) &&
+                all(zip(unfolded, expected)) do (kf, (_, kq))
+                    level(kf) <= level(k) ||
+                        TreeAMR.virtual_offset(parity_offset(kq), r, d1, d2) ==
+                        parity_offset(kf)
+                end
+        end
+        mismatches += !ok
+        kind = isempty(keys) ? :none : level(first(keys)) == level(k) ? :same :
+               level(first(keys)) < level(k) ? :coarser : :finer
+        seen[(r, kind)] = get(seen, (r, kind), 0) + 1
+    end
+    return mismatches, seen
+end
+
+"""
+Whether the unfolded forest `full` is conforming across the image of the
+seam, the plane `x_{d1} = M1` of the unfolded brick.
+"""
+function halfturn_conforming(full::Forest{D}, d1::Int) where {D}
+    M = full.roots[d1] ÷ 2
+    for kf in full.leaves, s in (-1, 1)
+        δ = ntuple(e -> e == d1 ? s : 0, D)
+        hi = leafbox(full, kf)[2][d1]
+        for nf in neighbor_keys(full, kf, δ)
+            across = (hi <= M) != (leafbox(full, nf)[2][d1] <= M)
+            across && level(nf) != level(kf) && return false
+        end
+    end
+    return true
+end
+
+"""
+A half plane refined and coarsened at random, unbalanced: `M1` roots
+along `d1`, `M2` (even) along `d2`, and the other dimension `other` as in
+[`random_rotating_forest`](@ref).
+"""
+function random_halfturn_forest(rng, ::Val{D}; halfturn, M1, M2, other=:outer, nsteps,
+                                maxlvl) where {D}
+    d1, d2 = halfturn
+    roots = ntuple(d -> d == d1 ? M1 : d == d2 ? M2 : rand(rng, 1:2), D)
+    inplane(d) = d in halfturn
+    periodic = ntuple(d -> !inplane(d) && other === :periodic, D)
+    reflecting = ntuple(d -> (!inplane(d) && other === :reflecting, false), D)
+    forest = Forest(roots; N=4, periodic=periodic, reflecting=reflecting,
+                    halfturn=halfturn)
+    for _ in 1:nsteps
+        k = rand(rng, forest.leaves)
+        if level(k) < maxlvl && rand(rng) < 0.75
+            refine!(forest, k)
+        elseif level(k) > 0
+            p = parentkey(k)
+            all(c -> isleaf(forest, c), childkeys(p)) && coarsen!(forest, p)
+        end
+    end
+    return forest
+end
+
+# The data: a scalar invariant under the half turn `(a, b) ↦ (−a, −b)`
+# about the axis, and a vector that it negates, both in the coordinates
+# about the axis and neither covariant under a quarter turn nor under a
+# mirror, so that a quarter turn's tables or a reflection's would show.
+# The half plane spans `[0, 2] × [−2, 2]` in its plane, the axis at the
+# origin, and the full plane `[−2, 2]²`.
+
+"""
+The signed map of a half turn for a scalar followed by a vector's
+components in Cartesian order: the components in the plane negated,
+written from the definition, `v(Pp) = P v(p)`.
+"""
+vector_halfturn(D, (d1, d2)) = [1; [e == d1 || e == d2 ? -(1 + e) : 1 + e for e in 1:D]]
+
+"""The half-turn-invariant scalar at `(a, b)`; `poly = p` as for [`invariant_scalar`](@ref)."""
+function halfturn_scalar(a, b; poly::Int=0)
+    c = literal(a)
+    if poly > 0
+        q = poly > 2 ? a^2 - c(0.5) * b^2 : zero(a)
+        return c(1.3) + c(0.1) * a * b + c(0.4) * q
+    end
+    return exp(c(-0.4) * (a * a + b * b)) + c(0.3) * sin(c(0.7) * a * b + c(0.2)) +
+           c(0.2) * cos(c(0.5) * (a * a - c(0.6) * b * b))
+end
+
+"""
+The vector field `(v_a, v_b)` at `(a, b)` that the half turn negates: a
+matrix of invariants times `(a, b)`; `poly = p` keeps it of degree `< p`
+per dimension.
+"""
+function halfturn_vector(a, b; poly::Int=0)
+    c = literal(a)
+    if poly > 0
+        return c(0.8) * a - c(0.6) * b + (poly > 3 ? c(0.2) * a^3 : zero(a)),
+               c(0.3) * a + c(0.9) * b + (poly > 2 ? c(0.1) * a^2 * b : zero(a))
+    end
+    s = halfturn_scalar(a, b)
+    t = cos(c(0.8) * a * b) + c(0.4) * sin(c(0.3) * (a * a - b * b))
+    return s * a - c(0.6) * t * b + c(0.2) * a * b * a, c(0.3) * t * a + c(0.9) * s * b
+end
+
+"""
+A scalar and a vector, as [`vector_halfturn`](@ref) orders them, as
+`f(x, v)`, the third dimension's factor as for [`rotating_data`](@ref).
+"""
+function halfturn_data(D, plane, other; poly::Int=0)
+    d1, d2 = plane
+    z = outofplane(D, plane)
+    kind = Val(other)
+    return function (x, v)
+        o = valsymbol(kind)
+        a, b = x[d1], x[d2]
+        v == 1 && return halfturn_scalar(a, b; poly=poly) *
+                         outofplane_factor(x, D, plane, o, false; poly=poly)
+        e = v - 1
+        if e == z
+            c = literal(a)
+            return (c(0.9) + c(0.2) * halfturn_scalar(a, b; poly=min(poly, 3))) *
+                   outofplane_factor(x, D, plane, o, true; poly=poly)
+        end
+        va, vb = halfturn_vector(a, b; poly=poly)
+        return (e == d1 ? va : vb) * outofplane_factor(x, D, plane, o, false; poly=poly)
+    end
+end
+
+"""
+The refinement both the half plane and the full plane get, as a function
+of a block's centre and level: symmetric under both mirrors of the plane,
+so under the half turn and with the seam conforming in the full plane by
+symmetry. It reaches the axis with levels 2, 1 and 0 side by side along
+the seam, and refines a spot on the seam away from the axis; in 3D it
+stops halfway up the third dimension.
+"""
+function halfturn_refinement(D, plane)
+    d1, d2 = plane
+    z = outofplane(D, plane)
+    low(c, r) = D == 2 || c[z] < r
+    spot(c) = hypot(abs(c[d1]) - 0.3, abs(c[d2]) - 1.3) < 0.45
+    return (c, lvl) -> (lvl == 0 && (hypot(c[d1], c[d2]) < 1.2 || spot(c)) &&
+                        low(c, 1.0)) ||
+                       (lvl == 1 && hypot(c[d1], c[d2]) < 0.6 && low(c, 0.5))
+end
+
+"""
+The half plane, `[0, 2]` along `d1` (2 roots), `[−2, 2]` along `d2` (4
+roots) and `[0, 2]` along the third dimension (2 roots, `other`),
+refined by [`halfturn_refinement`](@ref) unless `refine = false`; with
+`full = true` the full plane, `[−2, 2]` along `d1` too, without the seam.
+"""
+function halfturn_forest(::Val{D}; plane, other=:periodic, T::Type=Float64, N=8,
+                         full::Bool=false, refine::Bool=true) where {D}
+    d1, d2 = plane
+    z = outofplane(D, plane)
+    roots = ntuple(d -> d == d2 || (full && d == d1) ? 4 : 2, D)
+    extents = ntuple(d -> d == d2 || (full && d == d1) ? (-2, 2) : (0, 2), D)
+    forest = Forest{T}(roots; N=N, periodic=ntuple(d -> d == z && other === :periodic, D),
+                       reflecting=ntuple(d -> (d == z && other === :reflect_lo, false), D),
+                       halfturn=full ? nothing : plane, extents=extents)
+    refine || return forest
+    return refine_where!(forest, halfturn_refinement(D, plane), 2)
+end
+
+"""
+[`undefined_rotated_ghosts`](@ref) for a half plane: `(nnan, worst,
+schedule)` after one fill of `NaN`-prefilled storage with the polynomial
+[`halfturn_data`](@ref).
+"""
+function undefined_halfturn_ghosts(::Val{D}; plane, other, C, p, T::Type=Float64, N=8,
+                                   walls=:half_open, backend=CPU()) where {D}
+    forest = halfturn_forest(Val(D); plane=plane, other=other, T=T, N=N)
+    f = halfturn_data(D, plane, other; poly=p)
+    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C, walls=walls,
+                     halfturn=vector_halfturn(D, plane),
+                     parity=vector_parity(D, plane, other), backend=backend)
+    fill!(fs.work, T(NaN))
+    fill_by_coordinates!(f, fs)
+    # Under symmetric walls the low wall planes are owned but written by
+    # the hook: `NaN` there catches a transfer that reads one before the
+    # hook has written it.
+    walls === :symmetric && poison_low_walls!(fs)
+    schedule = GhostSchedule(fs, Operators(prolongation=p, restriction=p))
+    fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
+    work = Array(fs.work)
+    nnan = count(isnan, work)
+    worst = 0.0
+    for b in 1:nblocks(fs), idx in CartesianIndices(size(work)[1:D])
+        x = coordinates(fs, b, Tuple(idx))
+        for v in 1:fs.nvars
+            worst = max(worst, Float64(abs(work[idx, v, b] - f(x, v))))
+        end
+    end
+    return nnan, worst, schedule
+end
+
+"""
+Set the owned low wall planes of a set with symmetric walls to `NaN`:
+plane `G + 1` along every vertex-like dimension whose low face is a face
+of the domain, in the blocks on it.
+"""
+function poison_low_walls!(fs::FieldSet{T,D}) where {T,D}
+    c = staggers(fs.centering)
+    work = fs.work
+    for b in 1:nblocks(fs)
+        walls = TreeAMR.lowwalls(fs.forest, blockkey(fs, b), c, true)
+        for d in 1:D
+            walls[d] || continue
+            idx = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : (:), D)
+            work[idx..., :, b] .= T(NaN)
+        end
+    end
+    return fs
+end
+
+"""
+Whether every region the schedule hands the hook leaves the domain
+through an outer face: the block's box stepped by the direction, the
+reflected components dropped, and turned back if it lies beyond the
+seam, lies beyond a face of the half plane's brick that is not periodic.
+"""
+function halfturn_hook_regions_leave(schedule::GhostSchedule{T,D}) where {T,D}
+    forest = schedule.forest
+    d1, d2 = TreeAMR.halfturn_dims(forest)
+    c = forest.roots[d2] // 2
+    return all(schedule.boundaries) do region
+        k = forest.leaves[region.block]
+        δ′, _ = TreeAMR.wall_direction(forest, k, region.direction)
+        lo, hi = leafbox(forest, k)
+        s = hi[1] - lo[1]
+        box = (lo .+ s .* δ′, hi .+ s .* δ′)
+        box[2][d1] <= 0 && (box = halfturn_box(box, d1, d2, c))
+        slo, shi = box
+        any(d -> !forest.periodic[d] && (slo[d] < 0 || shi[d] > forest.roots[d]), 1:D)
+    end
+end
+
+"""
+Compare a half plane against the full plane holding the turned data
+explicitly, for the smooth [`halfturn_data`](@ref) and `centering`: both
+`NaN`-prefilled, filled and exchanged once, the outer faces through the
+hook from the same formula. Returns [`compare_matching_blocks`](@ref)'s
+`(worst, npoints)`, or `nothing`.
+"""
+function halfturn_vs_doubled(::Val{D}; plane, centering::NTuple{D,Symbol},
+                             other=:periodic, N=8, p=4, walls=:half_open,
+                             ops=Operators(prolongation=p, restriction=p)) where {D}
+    half = halfturn_forest(Val(D); plane=plane, other=other, N=N)
+    full = halfturn_forest(Val(D); plane=plane, other=other, N=N, full=true)
+    G = ghosts_for(centering, p)
+    f = halfturn_data(D, plane, other)
+    parity = vector_parity(D, plane, other)
+    fsh = FieldSet(half, D + 1; G=G, centering=centering, parity=parity, walls=walls,
+                   halfturn=vector_halfturn(D, plane))
+    fsf = FieldSet(full, D + 1; G=G, centering=centering, parity=parity, walls=walls)
+    for fs in (fsh, fsf)
+        fill!(fs.work, NaN)
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+    end
+    return compare_matching_blocks(fsh, fsf)
+end
+
+"""
+The leaf of `half` that the full plane's leaf `kf` is the image of, with
+the orientation `r` (0 or 2), by the boxes: in root units the full plane
+is the half plane's brick with `M1` more roots below it along `d1`.
+"""
+function halfturn_preimage(half::Forest{D}, full::Forest{D}, kf) where {D}
+    d1, d2 = TreeAMR.halfturn_dims(half)
+    shift = ntuple(d -> d == d1 ? half.roots[d1] : 0, D)
+    box = map(c -> c .- shift, leafbox(full, kf))
+    box[2][d1] <= 0 || return 0, box_key(half.roots, box)
+    return 2, box_key(half.roots, halfturn_box(box, d1, d2, half.roots[d2] // 2))
+end
+
+"""
+[`rotating_regrid_vs_quadrupled`](@ref) for a half plane: regrid it
+through `passes`, and the full plane after it to the turned image of each
+result; then fill both and compare. Returns per pass `(moved,
+conforming, images, worst, npoints, nleaves)`.
+"""
+function halfturn_regrid_vs_doubled(::Val{D}; plane, other=:periodic, N=8, p=4,
+                                    C=cellcentered(D), passes) where {D}
+    half = halfturn_forest(Val(D); plane=plane, other=other, N=N)
+    full = halfturn_forest(Val(D); plane=plane, other=other, N=N, full=true)
+    ops = Operators(prolongation=p, restriction=p)
+    f = halfturn_data(D, plane, other)
+    par = vector_parity(D, plane, other)
+    G = ghosts_for(C, p)
+    hs = FieldSet(half, D + 1; G=G, centering=C, parity=par,
+                  halfturn=vector_halfturn(D, plane))
+    fs = FieldSet(full, D + 1; G=G, centering=C, parity=par)
+    fill_by_coordinates!(f, hs)
+    fill_by_coordinates!(f, fs)
+    hhook = formula_hook(hs => f)
+    fhook = formula_hook(fs => f)
+    results = []
+    for rule in passes
+        old = copy(half.leaves)
+        regrid!(half, [hs => GhostSchedule(hs, ops)]; flags=[rule(half, k) for k in half.leaves],
+                boundary=hhook)
+        new = Set(half.leaves)
+        moved = all(k -> regrid_move(k, new) !== nothing, old)
+        fflags = map(full.leaves) do kf
+            _, kh = halfturn_preimage(half, full, kf)
+            something(regrid_move(kh, new), Keep)
+        end
+        regrid!(full, [fs => GhostSchedule(fs, ops)]; flags=fflags, boundary=fhook)
+        images = sort!([last(halfturn_preimage(half, full, kf)) for kf in full.leaves];
+                       lt=naive_isless) ==
+                 sort!(repeat(half.leaves, 2); lt=naive_isless)
+        fill_ghosts!(hs, GhostSchedule(hs, ops); boundary=hhook)
+        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=fhook)
+        result = compare_matching_blocks(hs, fs)
+        worst, npoints = result === nothing ? (Inf, 0) : result
+        push!(results, (moved=moved, conforming=isbalanced(half), images=images,
+                        worst=worst, npoints=npoints, nleaves=nleaves(half)))
+    end
+    return results
+end

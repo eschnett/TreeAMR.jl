@@ -84,12 +84,13 @@ transfer, more evolution — reduced to a handful of printed lines.
 """
 function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
                   centering=cellcentered(D), reflecting=nothing, x0=0.35,
-                  rotating=nothing) where {D}
+                  rotating=nothing, halfturn=nothing) where {D}
     L = 1.0
     walls = reflecting === nothing ? ntuple(_ -> (false, false), D) : reflecting
     forest = Forest(ntuple(_ -> roots, D); N=N,
                     periodic=ntuple(_ -> periodic, D), reflecting=walls,
-                    rotating=rotating, extents=ntuple(_ -> (0.0, L), D))
+                    rotating=rotating, halfturn=halfturn,
+                    extents=ntuple(_ -> (0.0, L), D))
     # A wall normal to x₁ that the pulse runs into: odd along x₁, even
     # along the rest, for both variables.
     parity = reflecting === nothing ? nothing :
@@ -97,11 +98,14 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     # A rotating seam (M12) turns a scalar into itself, and the pulse is
     # a ring about the axis, so that the refinement follows the seam
     # faces and reaches the axis.
+    # So does a half turn (M14), whose axis is at the middle of the low x₁
+    # face.
     rotation = rotating === nothing ? nothing : (1, 2)
     fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity,
-                  rotation=rotation)
-    initial = rotating === nothing ? workload_pulse(D, L, x0, σ, 0.0) :
-              workload_ring(x0, σ)
+                  rotation=rotation, halfturn=halfturn === nothing ? nothing : (1, 2))
+    initial = rotating !== nothing ? workload_ring(x0, σ) :
+              halfturn !== nothing ? workload_ring(x0, σ; centre=(0.0, L / 2)) :
+              workload_pulse(D, L, x0, σ, 0.0)
     outer = !periodic && !all(w -> w[1] && w[2], walls)
     boundary = outer ? boundary_by_coordinates(initial) : nothing
 
@@ -134,12 +138,13 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     rk4!(u, fs, schedule, dt, steps, Val(D), Val(fs.G), boundary)
 
     tag = "D$(D)$(periodic ? "p" : "o")$(all(==(:cell), centering) ? "c" : "v")" *
-          (reflecting === nothing ? "" : "r") * (rotating === nothing ? "" : "q")
+          (reflecting === nothing ? "" : "r") * (rotating === nothing ? "" : "q") *
+          (halfturn === nothing ? "" : "h")
     println(tag, " passes ", passes, " ", converged, " changed ", changed)
     println(tag, " leaves ", nleaves(forest), " ", digest(string(forest.leaves)))
     println(tag, " schedule ", length(schedule.phase1), " ", schedule.levels, " ",
             length(schedule.boundaries))
-    rotating === nothing ||
+    rotating === nothing && halfturn === nothing ||
         println(tag, " rotated ", sum(g -> g.orientation == 0 ? 0 : TreeAMR.ntransfers(g),
                                       Iterators.flatten((schedule.phase1,
                                                          schedule.phase2...))))
@@ -156,6 +161,7 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     # Beyond a rotating seam the points spread over the whole plane, so
     # that three quarters of them are turned back.
     below(d) = rotating !== nothing && d in rotating ? L :
+               halfturn !== nothing && d == halfturn[1] ? L :
                d == 1 && walls[1][1] ? 0.2 : 0.0
     xs = [ntuple(d -> mod(0.6180339887498949 * j * (d + 1) + 0.1d, 1.0) *
                       (L + below(d)) - below(d), D)
@@ -169,9 +175,9 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
 end
 
 """A ring about the axis travelling outwards, as an `(x, v) -> value` callback."""
-function workload_ring(ρ0, σ)
+function workload_ring(ρ0, σ; centre=(0.0, 0.0))
     return function (x, var)
-        d = hypot(x[1], x[2]) - ρ0
+        d = hypot(x[1] - centre[1], x[2] - centre[2]) - ρ0
         g = exp(-d^2 / (2σ^2))
         return var == 1 ? g : (d / σ^2) * g
     end
@@ -236,6 +242,11 @@ workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12,
          rotating=(1, 2), x0=0.3)
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2), rotating=(1, 2), x0=0.3)
+
+# A half-turn seam (M14): orientation 2 about the middle of the low x₁
+# face, with the vertex-centered seam slab partitioned one plane up.
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2), halfturn=(1, 2), x0=0.3)
 
 # --- the conservative cycle (M8b) ----------------------------------------
 #

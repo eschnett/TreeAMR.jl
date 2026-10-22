@@ -304,6 +304,39 @@ end
     end
 end
 
+@testset "$bname: a half-turn seam is filled on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
+    # M14. Orientation 2 about the centre line, with the vertex-centered
+    # seam slab partitioned one plane up: nothing unwritten or read before
+    # it is written in the device's own launch order, and the polynomial
+    # data reproduced; and interpolation beyond the seam on the host's
+    # numbers.
+    other = D == 2 ? :periodic : :reflect_lo
+    for C in (cellcentered(D), vertexcentered(D))
+        nnan, worst, s = undefined_halfturn_ghosts(Val(D); plane=(1, 2), other=other, C=C,
+                                                   p=4, T=T, backend=backend)
+        @test nnan == 0
+        @test worst < 16 * gputol(T)
+        @test any(g -> g.orientation == 2, s.phase1)
+    end
+    if D == 2
+        f = halfturn_data(2, (1, 2), :periodic; poly=4)
+        xs = [ntuple(d -> T((13j + 5d) % 97 // 97) * T(4) - T(2), 2) for j in 1:97]
+        results = map((CPU(), backend)) do bk
+            forest = halfturn_forest(Val(2); plane=(1, 2), other=:periodic, T=T)
+            fs = FieldSet{T}(forest, 3; G=2, halfturn=vector_halfturn(2, (1, 2)),
+                             backend=bk)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                         boundary=boundary_by_coordinates(f))
+            r = interpolate(fs, TreeAMR.todevice(bk, xs), Lagrange(4);
+                            derivs=((0, 0), (1, 0), (0, 1)))
+            Array(r.values)
+        end
+        @test maximum(abs, results[1] - results[2]) < gputol(T) * maximum(abs, results[1])
+    end
+end
+
 @testset "$bname: interpolation through a rotating seam agrees with the host: T=$T" for
         (bname, backend, types) in BACKENDS, T in types
     # M12. The kernel folds a point beyond the seam back, reads the
