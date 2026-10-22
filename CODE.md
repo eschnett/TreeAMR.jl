@@ -1592,7 +1592,18 @@ device, and requires it to fill bit for bit as the shaped form does
 with the full sum, from data that hold a `NaN` and an infinity, which
 the shaped form's one-tap skip drops under a zero weight (see "A column
 with one nonzero weight takes one tap" under
-[What the ghost fill costs](#what-the-ghost-fill-costs)).
+[What the ghost fill costs](#what-the-ghost-fill-costs)). Bit for bit
+but for *which* `NaN` a result is: the two forms are separate
+compilations of the same sum, and where two `NaN`s meet in an addition,
+x86 returns the first operand's while LLVM picks the operand order
+freely. On x86 `0 · ∞` gives a `NaN` with the sign bit set, which the
+data's `NaN` has not, and on a Sapphire Rapids the two forms disagree
+on which `NaN` a result is in a quarter of the `D = 3` groups; nothing
+in IEEE 754 or LLVM makes either one right. On ARM the default `NaN` is
+the data's.
+So the test compares every `NaN` as one pattern and every other value,
+`±0` included, by its bits
+([HISTORY.md](HISTORY.md#the-copy-kernels-on-a-device)).
 
 **A copy skips its weights.** `Stencil1D` records whether it is one point
 of weight exactly one (`unit`, decided on the host from the weights), and

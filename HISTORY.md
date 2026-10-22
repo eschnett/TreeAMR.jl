@@ -222,6 +222,24 @@ already near its 900 s deadline — it had missed it once on `main`, on
 it still missed it in one cell, so on a small machine the three-rank job
 now runs after the reference instead (M7 step 9, amended). 
 
+Found 2026-10-22, when the suite failed on Symmetry's H200 node cn113
+(SLURM job 580862, `TREEAMR_TEST_BACKEND=cuda --threads=8`, `main` at
+98f1a82): "The flat launch and the copy path fill bit for bit: D=3"
+failed once a schedule group, 262 times by the time the log was read,
+on CPU kernels alone. Rerun on cn113 (an Intel Xeon Platinum 8452Y,
+Sapphire Rapids; job 580879), 275 of the 1059 `D = 3` groups differed,
+in 4866 words, and every one was a `NaN` in both forms: `0xfff8…` (x86's
+default `NaN`, from `0 · ∞`) in one and `0x7ff8…` (the data's) in the
+other, 2709 points one way round and 2157 the other. No finite result
+differed, `±0` included, and `D = 1, 2` did not differ at all. With the
+data's `NaN` set to `0xfff8…` no word differed; with a payload `NaN`
+the payload came out where `0x7ff8…` had. On the laptop (Apple M3)
+nothing differed with any of the three `NaN`s, nor on CI's x86 runners.
+So the two compilations order a `NaN + NaN` differently on that CPU —
+x86 returns the first operand, and LLVM commutes `fadd` at will — and
+the finite-data claim stands. The test's claim was too strict, not the
+fill: it now compares every `NaN` as one pattern.
+
 ### Operators
 
 The original specification had a default order of 2; M3 showed it silently producing first-order convergence, and the default was removed. Putting physics-specific operators in application packages resolved the original sketch's open question about where hydro-specific operators belong. Per-variable operator selection through field sets was decided in the M8 design. The interface-order rule was measured in M3, and its form along a stagger in M8a step 3.

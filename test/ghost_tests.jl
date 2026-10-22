@@ -536,7 +536,16 @@ end
     # turned transfers is run from the same array flat, shaped with the
     # full sum the flat form takes (the data hold a `NaN` and an infinity,
     # which the CPU's one-tap skip drops under a zero weight), and a copy
-    # also through its weights, and the arrays must agree in every bit.
+    # also through its weights, and the arrays must agree in every bit —
+    # but for *which* `NaN` a `NaN` is. Where two `NaN`s meet in a sum,
+    # x86 returns the first operand's, and makes `0 · ∞` its default
+    # `NaN`, which has the sign bit set; LLVM treats `+` as commutative
+    # and picks the operand order per compilation. So on a Sapphire
+    # Rapids the two launches return the data's `NaN` and the default one
+    # at swapped points, while ARM's default `NaN` is the data's. Every
+    # `NaN` is compared as one pattern; every other value, `±0` included,
+    # by its bits.
+    nanbits(x) = reinterpret(UInt64, isnan(x) ? oftype(x, NaN) : x)
     N = D == 3 ? 6 : 8
     setups = Any[]
     two = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
@@ -562,7 +571,7 @@ end
                 work = awkward_fill!(similar(fs.work))
                 TreeAMR.run_group!(work, work, group, fs.nvars, TreeAMR.CPU(); flat=flat,
                                    factors=fs.factors, rotvars=fs.rotvars)
-                reinterpret(UInt64, vec(work))
+                map(nanbits, vec(work))
             end
             unit = all(s -> s.unit, g.stencils)
             nunit += unit
