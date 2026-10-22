@@ -7,9 +7,9 @@ milestone records, the downstream checks and the release history. The
 current design, with the reasons for it, is in [CODE.md](CODE.md), and
 the plan in [PLAN.md](PLAN.md). The sections follow CODE.md's.
 
-**Step numbers.** The milestones M0–M14 are those of
+**Step numbers.** The milestones M0–M15 are those of
 [PLAN.md](PLAN.md), numbered in the order they were planned and done in
-the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14. Several were built in
+the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14, M15. Several were built in
 numbered steps — M8a steps 1–3 and M8b steps 4–5, M7 steps 0–9 with a
 step 6b, M12 steps 0–10, M13 steps 1–4, M14 steps 0–8 — and a reference
 such as "M7 step 6b", or "step 8" inside a milestone's record, names one
@@ -32,6 +32,7 @@ of them. Each milestone's steps are listed in its record under
   - [Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces)
   - [Regridding](#regridding)
   - [Point interpolation](#point-interpolation)
+  - [Folds over points](#folds-over-points)
   - [Checkpoint and restart](#checkpoint-and-restart)
 - [Application interface](#application-interface)
 - [Time integration](#time-integration)
@@ -55,6 +56,7 @@ of them. Each milestone's steps are listed in its record under
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
   - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
   - [M14 — Half-turn symmetry](#m14--half-turn-symmetry)
+  - [M15 — Folds over points](#m15--folds-over-points)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -272,6 +274,72 @@ Folding through a rotating seam was designed for M12 on 2026-10-03 and implement
 Derivatives were first order until 2026-10-03, when the second order was added.
 
 Under M7 the routing was "the one place this design will change". It was designed on 2026-10-01 under "Distributed meshes" and implemented in M7's step 5, with the kernel unchanged except for the block offset. The serial path measured the same before and after.
+
+### Folds over points
+
+The fold was asked for by TreeGeneralizedHarmonic (TreeGH) on 2026-10-22,
+and designed with it in a draft that went back and forth once before
+anything was written. The analysis row of its `test/octant_runs.jl`
+(branch `eschnett-claude/black-hole-binary-merger-d20a2d`, commit
+`1b8a4ea` onwards) is shaped like this:
+
+- it holds norms over the whole evolved region, by point and by volume,
+  per refinement level, over the boundary band, and over six spherical
+  shells about the moving center `c(t)`, plus, with the split on, each
+  shell's trailing and leading half: twelve half-shells;
+- each number was its own `mesh_mapreduce`, about 280 a row without the
+  split and 70 more with it;
+- each shell re-ran `gh_constraint!`, `adm_constraint!` and `gh_error!`
+  with a mask, and each half-shell the last two.
+
+TreeGH's own H200 benchmark of 2026-10-21 placed the cost. It ran the
+moving, spinning hole at `h = 1/32`: 856 blocks, 28 M points, one H200.
+
+- A row without the split cost about 30 s, as much as 240 right-hand
+  sides.
+- The split added about 54 s a row for its twelve half-shells, about
+  4.5 s each. Six reductions would have come to about 0.7 s, so the
+  re-run monitors are the cost: about 4 s per ADM and error pair, or
+  140 ns a point.
+- A reduction costs at most about 15 ms.
+- The monitors had never been rewritten for the device. TreeGH's
+  `CODE.md` lists them among the kernels that still have closures.
+
+Three facts settled the design:
+
+- the monitors' values at an evolved point do not depend on the mask;
+- TreeGH's recorded series need not stay bit-identical, which allows a
+  per-point weight;
+- one field set per fold, `p.level` and a host-side `tag(key)` are
+  enough. The boundary band is "touches an outer face that is neither a
+  mirror nor a seam", decided per block. Everything else is a point
+  criterion on `p.x`, and "evolved" is `DIAG_MASK` in `p.u`.
+
+TreeGH asked for `Min` for its validity rows (`min_α`, `min_detγ`), and
+for a typed `combine` over hand-written `op`s, as less error-prone. It
+also proposed two things:
+
+- **A smaller accumulator.** It records 7 numbers per shell, not the
+  draft's 19, by folding ℳ and `C_a` into one sum of squares each. That
+  changes what its `mom_l2` and `gauge_l2` mean, and is TreeGH's choice.
+- **No device tuning yet.** Next to a 4 s monitor pass, register spilling
+  and the choice between one fold and three barely matter, so the
+  register budget can wait.
+
+The alternatives the draft weighed:
+
+- **A tuple-valued `mesh_mapreduce`.** `f` already may return one, but it
+  still sees one value at a time and no position.
+- **A batched `mesh_mapreduce_many`.** It would keep today's numbers bit
+  for bit, but the monitor re-runs would stay; it was not needed once
+  bit-identity was not.
+- **A TreeGH-only interim fix:** run the monitors once, keep the unmasked
+  values in spare slots, and mask per shell with a trivial kernel. That
+  is clumsy and keeps every reduction. TreeGH preferred to wait for the
+  fold.
+- **Bin indices written into `diag`.** That is still one sweep per bin.
+- **Device atomics** and **a custom `MPI.Allreduce`** were rejected, for
+  the reasons `CODE.md` gives.
 
 ### Checkpoint and restart
 
@@ -3833,6 +3901,75 @@ M12 was decided with Erik, after M7 and before M9b.
     copies developing this checkout: TreeWave's 349 tests pass (1 min
     20 s), TreeHydro's 12,679 (5 min, with the TreeIOHDF5 branch).
     Tagging, registering and the TreeIOHDF5 release are Erik's.
+
+### M15 — Folds over points
+
+- **M15 — Folds over points.** *(Designed 2026-10-22 with
+  TreeGeneralizedHarmonic. Done 2026-10-22.)* `mesh_fold` and
+  `block_fold`, with the wrappers `Sum`, `Max` and `Min`, the typed `op`
+  `TreeAMR.combine` and `addto`, as designed under
+  [Folds over points](CODE.md#folds-over-points). How the design came
+  about is in [Folds over points](#folds-over-points) above. The work is
+  one change on branch `eschnett-claude/fold`.
+
+  *Accept:*
+  - **`test/fold_tests.jl`**, in `D = 1, 2, 3`, cell- and
+    vertex-centered:
+    - every owned point is visited once, its `p.x` bit for bit
+      `coordinates`, and its spacing, level, block and index those of
+      the tree, with no ghost read;
+    - several variables at once from either array, each block
+      bit-identical to a host fold in index order;
+    - the extrema and counts of `mesh_mapreduce` exactly, its sums to
+      roundoff;
+    - shells and half-shells against a host loop, with points on the
+      half-shells' plane in neither half;
+    - a tag against a 0/1 weight;
+    - the host path against the lane path at 7, 64 and 256 lanes;
+    - the wrappers, including NaN and the `MethodError`s;
+    - the lane count against the 64 KB cap;
+    - a `Float32` set, with `@inferred`;
+    - the refusals, each with its reason.
+  - **`test/gpu_tests.jl`**: a binned, tagged fold against the host on
+    every backend.
+  - **`test/thread_workload.jl`**: a per-level fold line, bit-identical
+    across thread counts.
+  - **`test/mpi_workload.jl`**: fold lines, exact at any rank count, with
+    the sum marked.
+
+  *Measured* on one H200 on 2026-10-22 (job 580862 on cn113,
+  `bench/symmetry_fold.sh`), with `bench/fold.jl` on 842 blocks of `32³`
+  (27.6 M points, 22 variables, vertex-centered, `Float64`, the
+  downstream's 856 blocks in the downstream's brick):
+
+  | | time |
+  |---|---|
+  | one one-slot `mesh_mapreduce` | 0.27 ms |
+  | 280 of them, the row's reductions | 81 ms |
+  | the shells fold, 18 bins of 7 numbers (1,008 bytes) | 35 ms |
+  | the levels fold, the whole region, the band and 4 levels | 12 ms |
+  | the fused fold, both in one (1,344 bytes) | 56 ms |
+
+  At `16³` (3.45 M points) the same five take 0.12, 37, 6.5, 5.0 and
+  9.2 ms. From these numbers:
+
+  - **A reduction is cheaper than TreeGH inferred.** It costs about
+    0.3 ms, against TreeGH's upper bound of about 15 ms.
+  - **The two separate folds beat the 280 reductions only modestly**
+    (47 ms against 81). The fold's gain is the monitor re-runs it makes
+    unnecessary, 30 to 80 s a row.
+  - **The fused fold is slower than the two separate ones.** It reads
+    the slots once, but its larger accumulator spills more, as TreeGH
+    expected. At these times nothing is worth tuning, so the device's
+    lane cap and register use stay untuned.
+
+  The suite at eight threads on the laptop passes, 132,061 tests in
+  10 min 35 s, with other work on the machine. On the H200 the suite's
+  only failures are in `ghost_tests.jl`'s "The flat launch and the copy
+  path fill bit for bit" (D = 3). That test compares two CPU launch
+  forms on cn113's x86 CPU, and this change leaves both untouched. It is
+  being investigated on its own branch. TreeGH's own before-and-after
+  timing of its row is TreeGH's to run.
 
 ## Downstream checks
 
