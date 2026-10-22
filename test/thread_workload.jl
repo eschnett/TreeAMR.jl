@@ -78,6 +78,29 @@ digest(bytes::AbstractVector{UInt8}) = bytes2hex(sha256(bytes))[1:32]
 digest(u::Vector{Float64}) = digest(reinterpret(UInt8, u))
 digest(s::AbstractString) = digest(codeunits(s))
 
+# A fold over points (M15): per-level bins of the count, the sum of
+# squares and the peak of the first variable, beside its minimum, in one
+# sweep. Each block is one sequential fold on its owner's thread and the
+# blocks combine in block order, so every number here — the sums
+# included — must be bit-identical at any thread count.
+function workload_fold(fs, u)
+    bin = (n = Sum(0), sq = Sum(0.0), peak = Max(0.0))
+    init = (bins = ntuple(_ -> bin, 4), low = Min(Inf))
+    r = mesh_fold(TreeAMR.combine, init, fs, u; vars=1) do acc, p
+        q = p.u[1]
+        return (bins = addto(acc.bins, min(p.level + 1, 4),
+                             (n = Sum(1), sq = Sum(q * q), peak = Max(abs(q)))),
+                low = TreeAMR.combine(acc.low, Min(q)))
+    end
+    words = String[]
+    for b in r.bins
+        push!(words, string(b.n.value), @sprintf("%.17g", b.sq.value),
+              @sprintf("%.17g", b.peak.value))
+    end
+    push!(words, @sprintf("%.17g", r.low.value))
+    return join(words, " ")
+end
+
 """
 One full cycle — initial-data adaptation, evolution, a regrid with data
 transfer, more evolution — reduced to a handful of printed lines.
@@ -152,6 +175,7 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     println(tag, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
     println(tag, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
     println(tag, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
+    println(tag, " fold ", workload_fold(fs, u))
 
     # Point interpolation over the final mesh, value and gradient, with an
     # excluded ball: a fixed low-discrepancy set of points, reaching

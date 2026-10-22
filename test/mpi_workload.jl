@@ -120,6 +120,19 @@ function reductions(tag, fs, u)
                                           weight=k -> 0.5)))
     emit(tag, "sum l2", @sprintf("%.17g", volume_weighted_norm(fs, u)))
     emit(tag, "sum mass", @sprintf("%.17g", total_mass(fs, 1)))
+    # A fold over points (M15): several results from one sweep and one
+    # allgather. The count, the maximum and the minimum, and the count of
+    # points in a slab of the domain, are exact at any rank count; the sum
+    # of squares is marked as a sum.
+    init = (n = Sum(0), hi = Max(-Inf), lo = Min(Inf), slab = Sum(0), sq = Sum(0.0))
+    r = mesh_fold(TreeAMR.combine, init, fs; vars=1) do acc, p
+        q = p.u[1]
+        return TreeAMR.combine(acc, (n = Sum(1), hi = Max(q), lo = Min(q),
+                                     slab = Sum(Int(p.x[1] < 0.5)), sq = Sum(q * q)))
+    end
+    emit(tag, "fold", r.n.value, @sprintf("%.17g", r.hi.value),
+         @sprintf("%.17g", r.lo.value), r.slab.value)
+    emit(tag, "sum fold", @sprintf("%.17g", r.sq.value))
     return nothing
 end
 

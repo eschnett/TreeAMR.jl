@@ -744,6 +744,52 @@ end
           block_mapreduce(abs, max, zero(T), host, uh)
 end
 
+@testset "$bname: a fold agrees with the host's: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # The fold over points (M15) runs over lanes on a device and in one
+    # lane per block on the host: the extrema, the counts and the bins
+    # must agree exactly and the sums to roundoff. The accumulator holds
+    # bins chosen by position and a tag, so the geometry and the tags
+    # reach the device as well as the values. No point lies near the
+    # slab's edge at 0.45, so an ulp in a device position cannot move one.
+    forest = Forest(ntuple(_ -> 3, D); N=8, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, forest.leaves[1])
+    balance!(forest)
+    four = T(4)
+    f = (x, v) -> sin(four * x[1]) + oftype(x[1], v)
+    dev = FieldSet{T}(forest, 2; G=2, backend=backend)
+    fill_by_coordinates!(f, dev)
+    host = FieldSet{T}(forest, 2; G=2)
+    copyto!(host.work, Array(dev.work))
+
+    edge = T(0.45)
+    bin = (n = Sum(0), sq = Sum(zero(T)), peak = Max(zero(T)), low = Min(T(Inf)))
+    init = (bins = (bin, bin), fine = Sum(0))
+    rf(acc, p) = (bins = addto(acc.bins, p.x[1] < edge ? 1 : 2,
+                               (n = Sum(1), sq = Sum(p.u[1] * p.u[2]),
+                                peak = Max(abs(p.u[1])), low = Min(p.u[2]))),
+                  fine = TreeAMR.combine(acc.fine, Sum(Int(p.tag))))
+    fine = k -> level(k) == 1
+    rd = mesh_fold(rf, TreeAMR.combine, init, dev; tag=fine)
+    rh = mesh_fold(rf, TreeAMR.combine, init, host; tag=fine)
+    @test rd.fine == rh.fine
+    for k in 1:2
+        @test rd.bins[k].n == rh.bins[k].n
+        @test rd.bins[k].peak == rh.bins[k].peak
+        @test rd.bins[k].low == rh.bins[k].low
+        @test rd.bins[k].sq.value ≈ rh.bins[k].sq.value rtol = gputol(T)
+    end
+    @test isequal(rd, mesh_fold(rf, TreeAMR.combine, init, dev; tag=fine))
+
+    u = statevector(dev)
+    gather!(u, dev)
+    uh = statevector(host)
+    gather!(uh, host)
+    @test mesh_fold(rf, TreeAMR.combine, init, dev, u; tag=fine).bins[2].peak ==
+          rh.bins[2].peak
+end
+
 @testset "$bname: a device reduction returns the same bits twice: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # Two launches with a fixed lane fold and no atomics: the result may
