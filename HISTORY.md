@@ -3982,12 +3982,24 @@ M12 was decided with Erik, after M7 and before M9b.
     lane cap and register use stay untuned.
 
   The suite at eight threads on the laptop passes, 132,061 tests in
-  10 min 35 s, with other work on the machine. On the H200 the suite's
-  only failures are in `ghost_tests.jl`'s "The flat launch and the copy
-  path fill bit for bit" (D = 3). That test compares two CPU launch
-  forms on cn113's x86 CPU, and this change leaves both untouched. It is
-  being investigated on its own branch. TreeGH's own before-and-after
-  timing of its row is TreeGH's to run.
+  10 min 35 s, with other work on the machine.
+
+  The suite on the H200's CUDA backend ran 133,559 tests in 32 min:
+  133,274 pass, including the fold's GPU testset in all four cases. None
+  of the rest is in code this change touches:
+  - **275 failures** in `ghost_tests.jl`'s "The flat launch and the copy
+    path fill bit for bit" (D = 3). On cn113's Sapphire Rapids CPU the
+    two CPU launch forms keep different NaNs where two NaNs meet in an
+    addition. eschnett/TreeAMR.jl#29, merged beside this change, makes
+    the test compare every NaN as one pattern.
+  - **10 errors** in two older GPU testsets, "bounded point values are
+    clamped on the device" and "symmetric walls are written on the
+    device". Their test callbacks close over a `Type`, which CUDA refuses
+    as a kernel argument; only a device shows it.
+
+  TreeGH's own before-and-after timing of its row is TreeGH's to run. The
+  version is 0.2.6, additive. No companion name changes, but TreeIOHDF5
+  pins exact versions, so it needs `=0.2.6` appended to its `[compat]`.
 
 ## Downstream checks
 
@@ -4101,5 +4113,5 @@ outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
 0.2.3 (2026-10-16) raised the Julia floor to 1.13, 0.2.4 carries the
-nested-mesh ghost fill (M13), and 0.2.5 the half turn (M14). The repository keeps no changelog; the release commit says what
+nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), and 0.2.6 the folds over points (M15). The repository keeps no changelog; the release commit says what
 changed.
