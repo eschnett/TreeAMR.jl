@@ -3823,7 +3823,8 @@ M12 was decided with Erik, after M7 and before M9b.
     uniform mesh (422,416 bytes against 420,000) and 2.7 % more on the
     two-level one (4,892,672 against 4,763,872), from the larger
     `GroupKey`; fill times and allocations unchanged within the noise.
-    The suite takes 8 min 49 s at eight threads, 116,813 tests. The
+    The suite takes 8 min 49 s at eight threads, 116,813 tests, and
+    after the merge with 0.2.4 9 min 39 s, 131,748 tests. The
     guide gained "Half turns" with a doctest; README, the guide and
     CODE.md say M14; the version is 0.2.5, additive. TreeIOHDF5 saves
     the forest's pair under a new feature `halfturn` and each set's map,
