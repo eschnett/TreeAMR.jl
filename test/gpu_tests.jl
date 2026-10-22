@@ -246,8 +246,9 @@ end
     # that reads the block's own data; and nothing is left undefined.
     forest = nested_forest(Val(D); T=T, N=8)
     # The hook passes `f` to its kernel, so it takes its element type
-    # from `x` rather than closing over `T`, which is not `isbits`.
-    f = x -> oftype(x[1], 0.3) + sum(d -> oftype(x[1], 0.2 + 0.1d) * x[d], 1:D)
+    # from `x` rather than closing over `T`, which is not `isbits`, and
+    # does its arithmetic in that type: Metal has no `Float64`.
+    f = x -> oftype(x[1], 0.3) + sum(d -> oftype(x[1], 2 + d) / 10 * x[d], 1:D)
     for C in allcenterings(Val(D))
         fs = FieldSet{T}(forest, 1; G=ghosts_for(C, 4), centering=C, backend=backend)
         fill!(fs.work, T(NaN))
