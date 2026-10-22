@@ -216,7 +216,10 @@ end
         @test nnan == 0
         forest = nested_forest(Val(D); T=T, N=8, periodic=ntuple(_ -> true, D))
         fs = FieldSet{T}(forest, 1; G=2, centering=C, backend=backend)
-        fill_by_coordinates!((x, v) -> x[1] < T(1.3) ? one(T) : T(1.0e-13), fs)
+        # The element type comes from `x`, not a captured `T`, which is
+        # not `isbits` and so cannot reach a device kernel.
+        cliff = (x, v) -> x[1] < oftype(x[1], 1.3) ? one(x[1]) : oftype(x[1], 1.0e-13)
+        fill_by_coordinates!(cliff, fs)
         fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4,
                                                      bounded=true)))
         lo, hi = extrema(Array(fs.work))
@@ -242,7 +245,9 @@ end
     # ghost and to rounding everywhere, on every centering, from a kernel
     # that reads the block's own data; and nothing is left undefined.
     forest = nested_forest(Val(D); T=T, N=8)
-    f = x -> T(0.3) + sum(d -> T(0.2 + 0.1d) * x[d], 1:D)
+    # The hook passes `f` to its kernel, so it takes its element type
+    # from `x` rather than closing over `T`, which is not `isbits`.
+    f = x -> oftype(x[1], 0.3) + sum(d -> oftype(x[1], 0.2 + 0.1d) * x[d], 1:D)
     for C in allcenterings(Val(D))
         fs = FieldSet{T}(forest, 1; G=ghosts_for(C, 4), centering=C, backend=backend)
         fill!(fs.work, T(NaN))
