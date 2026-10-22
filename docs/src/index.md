@@ -8,7 +8,7 @@ See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.
 for the full design, and [PLAN.md](https://github.com/eschnett/TreeAMR.jl/blob/main/PLAN.md)
 for the milestone roadmap.
 
-The package has completed milestone **M14**: the tree core (Morton keys over a
+The package has completed milestone **M15**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -76,7 +76,13 @@ its levels one after another.
 
 M14 added the 180° counterpart of the rotating symmetry, a half plane
 whose low face is glued to itself by a half turn about its middle (see
-[Half turns](@ref)). Next is visualization export (M9b).
+[Half turns](@ref)).
+
+M15 added folds over points: [`mesh_fold`](@ref) hands its callback every
+owned point with its variables, position, level and a per-block tag, and
+carries any `isbits` accumulator, so that an analysis computes the norms
+of many regions — spherical shells, levels, a band of blocks — in one
+sweep and one collective. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),

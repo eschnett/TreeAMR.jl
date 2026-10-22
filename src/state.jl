@@ -690,6 +690,350 @@ function combine_blocks(op, init::R, fs::FieldSet, values::Vector{R}, weight) wh
     return acc
 end
 
+# Folds over points (M15).
+#
+# `block_mapreduce` hands its `f` one value at a time and nothing else, so
+# one call yields one number, and a region smaller than a block has to be
+# written into the data by a kernel of its own before it can be reduced.
+# A fold hands its `rf` a whole point instead — every selected variable,
+# the position, the spacing, the level and a per-block tag — and carries
+# any `isbits` accumulator, so one sweep and one collective yield every
+# norm of every region at once. The case that asked for it is
+# TreeGeneralizedHarmonic's analysis row, which re-ran its constraint
+# monitors once per spherical shell only to select the shell's points
+# (`CODE.md`, "Folds over points").
+#
+# One kernel serves both paths. Lane `l` of block `b` folds the block's
+# points `l, l + W, l + 2W, …` in linear order into its own slot, as the
+# device reduction above does; the CPU runs it with `W = 1`, so that each
+# block is one sequential fold in index order, on its owner's thread, and
+# its value is bit-identical whatever the thread count. A device runs as
+# many lanes as the accumulator's size allows, then folds them in lane
+# order with `fold_lanes_kernel!`.
+
+"""
+    Sum(x)
+
+An accumulator field that [`TreeAMR.combine`](@ref) combines with `+`.
+`Sum`, [`Max`](@ref) and [`Min`](@ref) let a fold's accumulator say how
+each of its fields combines, so that the caller writes only the per-point
+`rf` of [`mesh_fold`](@ref) and passes `TreeAMR.combine` as its `op`:
+
+```julia
+acc = (n = Sum(0), sq = Sum(0.0), peak = Max(0.0))
+```
+
+The two sides of a `Sum` must have the same type for the accumulator to
+keep its type: a `Sum(0)` and a `Sum(1.0)` do not combine to a `Sum{Int}`.
+"""
+struct Sum{T}
+    value::T
+end
+
+"""
+    Max(x)
+
+An accumulator field that [`TreeAMR.combine`](@ref) combines with `max`.
+`NaN` propagates, as it does through `max`, so a blown-up run shows up
+in the result instead of being skipped. See [`Sum`](@ref).
+"""
+struct Max{T}
+    value::T
+end
+
+"""
+    Min(x)
+
+An accumulator field that [`TreeAMR.combine`](@ref) combines with `min`,
+propagating `NaN` as `min` does. See [`Sum`](@ref).
+"""
+struct Min{T}
+    value::T
+end
+
+"""
+    TreeAMR.combine(a, b)
+
+Combine two accumulators built from [`Sum`](@ref), [`Max`](@ref) and
+[`Min`](@ref), recursing through tuples and `NamedTuple`s: each leaf is
+combined by its own wrapper. This is the `op` a fold built from those
+wrappers passes to [`mesh_fold`](@ref) and [`block_fold`](@ref).
+
+Accumulators of different shapes do not combine: a `Sum` against a `Max`,
+tuples of different lengths or `NamedTuple`s with different names are a
+`MethodError`, never a silently wrong number. It is not called `merge`
+because `Base.merge` on two `NamedTuple`s does something else entirely,
+and quietly.
+"""
+combine(a::Sum, b::Sum) = Sum(a.value + b.value)
+combine(a::Max, b::Max) = Max(max(a.value, b.value))
+combine(a::Min, b::Min) = Min(min(a.value, b.value))
+combine(a::NTuple{N,Any}, b::NTuple{N,Any}) where {N} = map(combine, a, b)
+combine(a::NamedTuple{K}, b::NamedTuple{K}) where {K} =
+    NamedTuple{K}(map(combine, Tuple(a), Tuple(b)))
+
+"""
+    addto(bins::NTuple{K}, k, x)
+
+`bins` with `x` combined into slot `k` by [`TreeAMR.combine`](@ref), and
+every other slot unchanged. A `k` outside `1:K` changes nothing, so a
+fold can use `0` for a point that falls in no bin.
+
+This is how a fold bins its points, by shell or by level, say. The tuple
+is rebuilt with every index a literal rather than indexed at `k`: a
+run-time index into a tuple makes a device spill it to local memory,
+while this keeps the bins in registers for the cost of `K` selects.
+"""
+@inline addto(bins::NTuple{K,Any}, k::Integer, x) where {K} =
+    ntuple(i -> i == k ? combine(bins[i], x) : bins[i], Val(K))
+
+"""
+    TreeAMR.FoldPoint
+
+What a fold's `rf` is handed for each owned point (see
+[`mesh_fold`](@ref)). It is built inside the kernel and is `isbits`:
+
+- `p.u`: the selected variables at this point, an `NTuple` in the field
+  set's element type, `p.u[1]` being variable `first(vars)`;
+- `p.x`: the point's position, an `NTuple{D}`, bit for bit what
+  [`coordinates`](@ref) returns, so a cell center, a vertex or a face
+  center as the field set's centering says;
+- `p.h`: the block's spacing, so `p.h^D` is the point's volume weight;
+- `p.level`: the block's refinement level;
+- `p.tag`: the block's value of the fold's `tag` function, or `nothing`;
+- `p.I`: the owned index, each entry in `1:N` (add `G[d]` for the
+  stored index, as in [`map_blocks!`](@ref));
+- `p.b`: the local block index.
+"""
+struct FoldPoint{D,NV,T,TG}
+    u::NTuple{NV,T}
+    x::NTuple{D,T}
+    h::T
+    level::Int
+    tag::TG
+    I::NTuple{D,Int}
+    b::Int
+end
+
+# The tags of a fold without a `tag` function: indexing gives `nothing`,
+# so `p.tag` is `nothing` without an array to upload.
+struct NoTags end
+@inline Base.getindex(::NoTags, ::Integer) = nothing
+tagtype(::NoTags) = Nothing
+tagtype(tags::AbstractArray) = eltype(tags)
+
+# Bytes of lane partials per block a device fold may use: the lane count
+# starts at `REDUCE_LANES` and halves until `W · sizeof(acc)` fits. With
+# the 100-odd numbers of TreeGH's accumulators that is 32 or 64 lanes, and
+# at its 856 blocks the buffer stays under 56 MB whatever the accumulator.
+# A first guess, not a measurement (`CODE.md`, "Folds over points").
+const FOLD_LANE_BYTES = 64 * 1024
+
+function fold_lanes(::Type{R}) where {R}
+    W = REDUCE_LANES
+    while W > 1 && W * sizeof(R) > FOLD_LANE_BYTES
+        W ÷= 2
+    end
+    return W
+end
+
+# Lane `l` of block `b` folds points `l, l + W, …` of the block, in
+# linear order with the first dimension fastest, into its own slot. The
+# position is formed by `coordinates_kernel!`'s expression, on the same
+# origin and spacing in the same order, so it reproduces `coordinates`
+# bit for bit.
+@kernel function fold_points_kernel!(partials, @Const(array), rf, init,
+                                     @Const(origins), @Const(spacings), @Const(levels),
+                                     tags, firstvar::Int,
+                                     ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}, ::Val{NV},
+                                     ::Val{W}) where {D,G,C,N,NV,W}
+    g = @index(Global)
+    b, l = divrem(g - 1, W) .+ 1
+    origin, h = origins[b], spacings[b]
+    lev, tag = levels[b], tags[b]
+    off = pointoffsets(h, C)
+    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    acc = init
+    for j in l:W:length(cells)
+        I = Tuple(cells[j])
+        x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+        c = ntuple(d -> I[d] + G[d], Val(D))
+        u = ntuple(v -> array[c..., firstvar + v - 1, b], Val(NV))
+        acc = rf(acc, FoldPoint(u, x, h, lev, tag, I, b))
+    end
+    partials[l, b] = acc
+end
+
+# The per-block tags, or `NoTags()`. The tag type is taken from inference
+# rather than from the values, so that it is the same on every rank — a
+# refusal that fired on some ranks only would leave the others waiting in
+# the allgather — and a rank with no blocks gets the same type as the
+# rest.
+fold_tags(::Backend, ::Nothing, forest::Forest) = NoTags()
+function fold_tags(backend::Backend, tag, forest::Forest{D}) where {D}
+    TG = Base.promote_op(tag, MortonKey{D})
+    isconcretetype(TG) && isbitstype(TG) || throw(ArgumentError(
+        "a fold's tag function must return one isbits type for every block, " *
+        "inferred as $TG: the tags are uploaded as one array, which needs a " *
+        "concrete element type, and a kernel argument must be plain bits. " *
+        "Return a Bool or a number, and the same type on every path"))
+    return todevice(backend, TG[tag(k) for k in localleaves(forest)])
+end
+
+# The checks a fold can make before launching, on the types alone so that
+# every rank makes the same decision.
+function check_fold(rf, ::Type{R}, ::Type{P}) where {R,P}
+    isbitstype(R) || throw(ArgumentError(
+        "a fold's accumulator must be an isbits value — a number, a tuple, a " *
+        "NamedTuple or a plain struct of them — but init is a $R: a device " *
+        "holds one per lane, and every rank's partial is allgathered, which " *
+        "sends plain bits only"))
+    S = Base.promote_op(rf, R, P)
+    isconcretetype(S) && S !== R && throw(ArgumentError(
+        "a fold's rf returns a $S where the accumulator is a $R, the type of " *
+        "init: rf(acc, p) must return the accumulator's own type, since a " *
+        "lane holds it in place from point to point. A Sum(1) beside an init " *
+        "holding Sum(0.0) is the usual cause"))
+    return nothing
+end
+
+# The fold over `array` — the working array at offset `g = fs.G`, or the
+# state array at `g = 0` — with `W` lanes per block: 1 on the CPU, and
+# `fold_lanes(R)` on a device unless the caller says otherwise, which the
+# tests do to reach the device path on `CPU()`.
+function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
+                     vars::UnitRange{Int}, tag, lanes=nothing) where {R,T,D}
+    forest = fs.forest
+    backend = get_backend(array)
+    tags = fold_tags(backend, tag, forest)
+    NV = length(vars)
+    check_fold(rf, R, FoldPoint{D,NV,T,tagtype(tags)})
+    n = nblocks(fs)
+    n == 0 && return R[]
+    W = lanes !== nothing ? Int(lanes) : backend isa CPU ? 1 : fold_lanes(R)
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
+    partials = allocate(backend, R, (W, n))
+    launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
+                     spacings, levels, tags, first(vars), Val(D), Val(g),
+                     Val(staggers(fs)), Val(forest.N), Val(NV), Val(W); ndrange=(W * n,))
+    if W == 1
+        synchronize(backend)
+        return tohost(vec(partials))
+    end
+    values = allocate(backend, R, (n,))
+    fold_lanes_kernel!(backend)(values, partials, op, Val(W); ndrange=n)
+    synchronize(backend)
+    return tohost(values)
+end
+
+"""
+    block_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
+    block_fold(rf, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars, tag=nothing)
+
+Fold each block's owned points into one accumulator: a host `Vector` of
+length `nblocks(fs)`, indexed by local block, of the type of `init`. This
+is the per-block half of [`mesh_fold`](@ref), which says what `rf`, `op`,
+`init`, `vars` and `tag` are; the values are this rank's blocks only, as
+for [`block_mapreduce`](@ref).
+"""
+function block_fold(rf, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars,
+                    tag=nothing) where {T,D}
+    return _block_fold(rf, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars), tag)
+end
+
+function block_fold(rf, op, init, fs::FieldSet{T,D}, u::AbstractVector; vars=1:fs.nvars,
+                    tag=nothing) where {T,D}
+    return _block_fold(rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
+                       _varrange(vars, fs.nvars), tag)
+end
+
+"""
+    mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
+    mesh_fold(rf, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars, tag=nothing)
+
+Fold every owned point of the mesh into one accumulator, which can hold
+as many results as the caller likes: the norms of several variables, of
+several regions, of several weightings, in one sweep and one collective.
+
+- `rf(acc, p) -> acc` folds one point into the accumulator. `p` is a
+  [`TreeAMR.FoldPoint`](@ref): the selected variables at the point
+  (`p.u`), its position (`p.x`), the block's spacing, level and tag, and
+  its indices.
+- `op(a, b) -> acc` combines two accumulators — of two lanes, two blocks
+  or two ranks. For an accumulator built from [`Sum`](@ref),
+  [`Max`](@ref) and [`Min`](@ref), it is [`TreeAMR.combine`](@ref).
+- `init` is the empty accumulator, and its type is the result's. It must
+  be `isbits`: a number, a tuple, a `NamedTuple` or a plain struct of
+  them.
+- `vars` is an integer or a contiguous range of variable indices, as for
+  [`block_mapreduce`](@ref); it selects what `p.u` holds, not which
+  points are visited.
+- `tag = key -> t` is an optional host function of a block's
+  [`MortonKey`](@ref), whose value reaches `rf` as `p.tag`: a block
+  region such as "touches an outer face" is a `Bool` tag. It must return
+  one `isbits` type for every block.
+
+The first form reads the working array, skipping the ghosts; the second
+reads a state vector. Either way the points are exactly the owned points
+[`map_blocks!`](@ref) visits, `N` per dimension, so a vertex-centered
+block's shared upper plane is not counted and every physical point is
+counted once.
+
+The laws are those that let a block be split across a device's lanes:
+`op` is associative, to roundoff at least; `op(init, init) == init`; and
+`rf(a, p) == op(a, rf(init, p))`. Every sum, maximum, minimum and
+[`addto`](@ref) bin update obeys them. A weight is per point: `rf`
+multiplies by `p.h^D` itself where a volume weight is wanted, unlike the
+per-block `weight` of [`mesh_mapreduce`](@ref), so the same norm through
+the two differs in its last bits.
+
+Determinism follows the package's rules ("Parallelism" in `CODE.md`). On
+the CPU each block is one sequential fold in index order on its owner's
+thread, so a block's accumulator is bit-identical at every thread count,
+and the blocks combine in block order. A device folds each block over
+lanes and then the lanes in order, reproducible from run to run and equal
+to the CPU's to roundoff. Across ranks the per-rank partials are
+allgathered and folded in rank order, so maxima, minima and integer
+counts are bit-identical at any rank count and sums agree to roundoff.
+
+The point count, the sum of squares and the peak of variable 1 inside the
+shell `1 ≤ |x| < 2`, and the sum of squares outside it, in one sweep:
+
+```julia
+init = (n = Sum(0), sq = (Sum(0.0), Sum(0.0)), peak = Max(0.0))
+function rf(acc, p)
+    inside = 1 ≤ sqrt(sum(abs2, p.x)) < 2
+    q = p.u[1]
+    return TreeAMR.combine(acc, (n = Sum(Int(inside)),
+                                 sq = addto((Sum(0.0), Sum(0.0)), inside ? 1 : 2,
+                                            Sum(q * q)),
+                                 peak = Max(inside ? abs(q) : 0.0)))
+end
+r = mesh_fold(rf, TreeAMR.combine, init, fs; vars=1)
+l2 = sqrt(r.sq[1].value / r.n.value)
+```
+
+!!! note "Callbacks on a device"
+    `rf`, `op` and `init` become kernel arguments, so everything they
+    hold or close over must be `isbits`: shell radii go in as a tuple,
+    not a `Vector`, and a captured `Type` is the usual trip — write
+    `oftype(x, 2)` rather than closing over `T` and calling `T(2)`. The
+    accumulator lives in each lane's registers; a large one spills,
+    which costs time but not correctness.
+"""
+function mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
+    values = block_fold(rf, op, init, fs; vars=vars, tag=tag)
+    return combine_blocks(op, init, fs, values, nothing)
+end
+
+function mesh_fold(rf, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars,
+                   tag=nothing)
+    values = block_fold(rf, op, init, fs, u; vars=vars, tag=tag)
+    return combine_blocks(op, init, fs, values, nothing)
+end
+
 """
     volume_weighted_norm(fs::FieldSet, u::AbstractVector; p=2)
 

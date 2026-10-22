@@ -4,8 +4,8 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
-**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13 and M14 are
-done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13, M14 and M15
+are done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -31,6 +31,7 @@ tried, measurements that later ones replaced, and the milestone records
   - [Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces)
   - [Regridding](#regridding)
   - [Point interpolation](#point-interpolation)
+  - [Folds over points](#folds-over-points)
   - [Checkpoint and restart](#checkpoint-and-restart)
 - [Application interface (sketch)](#application-interface-sketch)
 - [Time integration](#time-integration)
@@ -2646,6 +2647,123 @@ Over a distributed forest an outside point is found on the host before
 anything is routed, and refused on every rank there, rather than after
 the launch. A device batch goes through the host for the messages.
 
+### Folds over points
+
+`block_mapreduce` hands its `f` one value at a time. It never sees
+several variables at the same point, where the point is, or which block
+it belongs to, except through the per-block `weight` of
+`mesh_mapreduce`. So one reduction yields one number, and a region
+smaller than a block has to be written into the data by a kernel of its
+own before it can be reduced. TreeGeneralizedHarmonic's analysis row is
+the case that showed the cost. It ran its constraint monitors again for
+each spherical shell, only to select the shell's points, and then made
+one reduction, and one collective, per number: about 30 s per row on an
+H200 (the measurement is in [HISTORY.md](HISTORY.md#folds-over-points)).
+
+A **fold** hands its callback a whole point and carries any accumulator:
+
+```julia
+mesh_fold(rf, op, init, fs[, u]; vars, tag) -> acc
+block_fold(rf, op, init, fs[, u]; vars, tag) -> Vector   # per local block
+```
+
+- `rf(acc, p)` folds one owned point into the accumulator.
+- `op` combines two accumulators, of two lanes, two blocks or two ranks.
+- `init` is the empty accumulator. It is `isbits`, because a device holds
+  one per lane and every rank's partial is allgathered.
+- `tag(key)` is an optional host function; its value per block reaches
+  `rf` as `p.tag`.
+- The point `p` (`FoldPoint`) carries:
+  - the selected variables (`p.u`);
+  - the position (`p.x`), formed by `coordinates_kernel!`'s expression
+    and therefore bit for bit what `coordinates` returns;
+  - the spacing, the level and the tag;
+  - the owned and block indices.
+
+So one sweep and one collective yield every norm of every region: shells
+by `p.x`, levels by `p.level`, and block bands by `p.tag`.
+
+The accumulator wrappers `Sum`, `Max` and `Min` let an accumulator say
+how each of its fields combines. Then `TreeAMR.combine`, which recurses
+through tuples and `NamedTuple`s, is the `op`, and the caller writes only
+`rf`.
+
+- **Mismatched shapes are refused.** A `Sum` against a `Max`, or two
+  accumulators of different shapes, is a `MethodError`, never a silently
+  wrong number.
+- **`addto` bins a point.** It combines into one slot of a tuple of bins,
+  with every index a literal, so the bins stay in a device's registers
+  where a run-time tuple index would spill them. A slot outside the
+  range changes nothing, so 0 means "no bin".
+
+The fold is a public, typed `op` rather than a hand-written one because
+an `op` written per field is exactly where a sum gets combined with a
+maximum.
+
+**One kernel for both paths.** Lane `l` of block `b` folds the block's
+points `l, l + W, …` in linear order into its own slot, as the two-launch
+reduction does.
+
+- **The CPU** runs it with `W = 1` through `launch_by_owner!`. Each block
+  is one sequential fold in index order on its owner's thread, so a
+  block's accumulator is bit-identical at every thread count.
+- **A device** runs `W` lanes and folds them in lane order with
+  `fold_lanes_kernel!`, which makes the result reproducible from run to
+  run. `W` starts at `REDUCE_LANES` and halves while `W · sizeof(acc)`
+  exceeds 64 KB a block. That keeps the partials buffer bounded: at 856
+  blocks it is at most 56 MB, whatever the accumulator. `W` depends only
+  on the accumulator's type.
+- **Testing:** both paths run on `CPU()`, and the suite checks that they
+  agree.
+- **Combining:** the per-block values combine through `combine_blocks`,
+  the one cross-rank step of every reduction (see "Reductions" under
+  [Distributed meshes](#distributed-meshes)).
+- **Exactness:** maxima, minima and integer counts are exact at any
+  thread or rank count. Sums agree to roundoff across rank counts and
+  backends.
+
+**The laws** are those that let a block be split across lanes:
+
+- `op` is associative, to roundoff at least;
+- `op(init, init) == init`;
+- `rf(a, p) == op(a, rf(init, p))`.
+
+**Which points.** Exactly the owned points `map_blocks!` visits, so a
+vertex-like block's shared upper plane is not counted, and every
+physical point is counted once. `vars` selects what `p.u` holds, not
+which points are visited.
+
+**A weight is per point.** `rf` multiplies by `p.h^D` itself. The same
+norm through `mesh_mapreduce`, whose weight scales a block's value after
+the fact, differs in its last bits. The existing reductions keep their
+numbers, because the fold is a separate function rather than a new form
+of them.
+
+**The checks look at types only.** A non-`isbits` `init`, a tag
+function not inferred to one `isbits` type, and an `rf` inferred to
+return something other than `init`'s type are refused before anything
+is launched. Because the checks look only at types, every rank decides
+alike. A refusal that fired on one rank, from a tag value seen only
+there, would leave the others waiting in the allgather.
+
+Three alternatives were rejected:
+
+- **A batched `mesh_mapreduce`**, which fused a list of reductions into
+  one sweep. It still has no positions, so the per-shell monitor runs
+  would stay.
+- **Device atomics into a bins array**, because the result would depend
+  on scheduling.
+- **A custom `MPI.Allreduce`**, for the reasons given under "Reductions".
+
+**(open)** The 64 KB a block is a first guess, not a measurement. It
+needs revisiting only if an accumulator runs a device out of memory.
+Register spilling is accepted rather than tuned: next to a monitor pass
+of seconds, whether a fold of 100-odd numbers spills barely matters.
+
+**(open)** The allgather sends `P × sizeof(acc)` to every rank: nothing
+at 32 ranks, but 10 MB per call for a 1 KB accumulator at 10⁴ ranks. A
+fixed-order reduction tree would be the remedy if that ever shows.
+
 ### Checkpoint and restart
 
 Checkpoint and restart are the companion package
@@ -4653,7 +4771,7 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
 | conservation | `interfaces.jl` | `InterfaceSchedule` and `restrict_interfaces!`: the flux fixup at coarse-fine faces, over the same `TransferGroup`/`run_phase!` machinery |
-| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm` |
+| ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm`; the folds over points `block_fold` and `mesh_fold` with `FoldPoint`, `Sum`/`Max`/`Min`, `combine` and `addto` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 | interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first and second derivatives, periodic wrap and reflecting fold, `exclude` region flags |
 
@@ -5032,7 +5150,8 @@ which uses `rotate_tests.jl`'s helpers),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
-`allvariables_tests.jl`, `state_tests.jl`, `regrid_tests.jl`,
+`allvariables_tests.jl`, `state_tests.jl`, `fold_tests.jl` (M15, which
+uses `state_tests.jl`'s `poisoned_fieldset`), `regrid_tests.jl`,
 `bounded_tests.jl` (the bounded prolongation), `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`, `type_tests.jl`,
 `thread_tests.jl`, `mpi_tests.jl` (M7) and

@@ -61,6 +61,10 @@ export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
 # Distributed meshes (M7)
 export communicator, blockrange
 
+# Folds over points (M15)
+export mesh_fold, block_fold, Sum, Max, Min, addto
+public combine, FoldPoint
+
 include("threading.jl")
 include("device.jl")
 include("communicator.jl")

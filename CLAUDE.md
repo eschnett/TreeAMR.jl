@@ -242,6 +242,12 @@ an H200 for a baseline checkout beside this one (`TREEAMR_BASE`,
 `TREEAMR_COPIES_STAGES`), then the suite on CUDA. `CODE.md`'s "The copy
 kernels on a device" has the numbers.
 
+`bench/fold.jl` times the folds over points (M15) against the one-number
+reductions they replace, at TreeGeneralizedHarmonic's analysis sizes by
+default (its quadrant refined about the origin, 22 variables, `32³`,
+vertex-centered); `bench/symmetry_fold.sh` runs it, then the suite, on an
+H200. `HISTORY.md`'s M15 entry has the numbers.
+
 `bench/nested.jl` times the ghost fill of the downstream's nested mesh
 (eschnett/TreeGeneralizedHarmonic.jl#11) stage by stage and rank by
 rank, serially or under `MPI.mpiexec()`, and counts each prolongation
@@ -372,7 +378,7 @@ the one that says why.
   layout, and MPI is called from the calling task only.
 - **Reductions are an allgather of per-rank partials**, folded in
   `combine_blocks` (the only site); a number combined from
-  `block_mapreduce` is rank-local.
+  `block_mapreduce` or `block_fold` is rank-local.
 - **MPI is a weak dependency.** Do not make it a hard dependency, do not
   call MPI from `src/`, and do not use `MPI.Comm_dup` ("Distributed
   meshes"). Checkpoints are TreeIOHDF5's; do not bring HDF5 back.

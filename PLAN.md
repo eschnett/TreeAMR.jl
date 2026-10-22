@@ -22,6 +22,7 @@ milestones were planned in, and the list below is in execution order.
   - [M12 — Rotating symmetry](#m12--rotating-symmetry)
   - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
   - [M14 — Half-turn symmetry](#m14--half-turn-symmetry)
+  - [M15 — Folds over points](#m15--folds-over-points)
   - [M9b — Visualization export](#m9b--visualization-export)
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
 
@@ -86,6 +87,10 @@ Done, 2026-10-20 (steps 1–4; step 4, a partition balanced per class of leaves,
 ### M14 — Half-turn symmetry
 
 Done, 2026-10-21 (steps 0–8). The design is under "Half turn" in "Domain and boundaries" and *Half turns* under "Rotating seams" in "Ghost filling" in [CODE.md](CODE.md#ghost-filling), and what it leaves open under "Open questions"; the record is in [HISTORY.md](HISTORY.md#m14--half-turn-symmetry).
+
+### M15 — Folds over points
+
+Done, 2026-10-22. The design is under "Folds over points" in "Operations" in [CODE.md](CODE.md#folds-over-points), and what it leaves open there; the record is in [HISTORY.md](HISTORY.md#m15--folds-over-points).
 
 ### M9b — Visualization export
 
