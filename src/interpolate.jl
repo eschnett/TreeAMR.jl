@@ -275,7 +275,7 @@ struct PointGeometry{D,T}
     periodic::NTuple{D,Bool}
     reflecting::NTuple{D,Tuple{Bool,Bool}}
     rotating::NTuple{2,Int}
-    # Whether the seam is a half turn's (M13), about the centre plane of
+    # Whether the seam is a half turn's (M14), about the centre plane of
     # `d2`, rather than a quarter turn's.
     half::Bool
     L::Int
@@ -326,7 +326,7 @@ end
 #   r = 3 (beyond the low face of d2 only):  (a, b) ↦ (−b, a)
 #
 # with `(a, b)` the coordinates along `(d1, d2)` from the axis. Across a
-# half turn (M13) a point is in orientation 2 when it lies beyond the low
+# half turn (M14) a point is in orientation 2 when it lies beyond the low
 # face of `d1`, whatever its `d2` coordinate, and turns about the centre
 # plane of `d2`: `(a, x2) ↦ (−a, lo2 + hi2 − x2)`. The plane's
 # dimensions are neither periodic nor reflecting, so the per-coordinate
@@ -698,7 +698,7 @@ end
 # The refusal of point `j`, `x`, which the kernel marked: outside the
 # domain after every fold, or (M12) beyond a rotating seam of a set that
 # cannot turn it. Decided again here, by the same fold. A half-turn set
-# (M13) turns every point, so only the first applies to it.
+# (M14) turns every point, so only the first applies to it.
 function outside_error(fs::FieldSet, x, j)
     forest = fs.forest
     seam = rotating_dims(forest)

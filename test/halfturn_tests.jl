@@ -1,4 +1,4 @@
-# M13: a half-turn seam — the forest (step 1), the field sets (step 2), the
+# M14: a half-turn seam — the forest (step 1), the field sets (step 2), the
 # turned ghosts (step 3), regrid and conservation (step 4), interpolation
 # (step 5), and the wave equation on a half plane against the full plane
 # (step 7).

@@ -8,7 +8,7 @@ See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.
 for the full design, and [PLAN.md](https://github.com/eschnett/TreeAMR.jl/blob/main/PLAN.md)
 for the milestone roadmap.
 
-The package has completed milestone **M13**: the tree core (Morton keys over a
+The package has completed milestone **M14**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -66,10 +66,17 @@ M12 added a rotating symmetry: a forest declared `rotating = (d1, d2)`
 stores one quadrant of the plane, and the exchange fills the ghosts
 across the seam as the turned image of the data, mixing the components
 of vectors as each field set's `rotation` says, on every backend and
-across ranks (see [Rotating symmetry](@ref)). M13 added its 180°
-counterpart, a half plane whose low face is glued to itself by a half
-turn about its middle (see [Half turns](@ref)). Next is visualization
-export (M9b).
+across ranks (see [Rotating symmetry](@ref)).
+
+M13 made the ghost fill of nested meshes cheaper: a vertex-centered fine
+point that sits on a coarse node is prolonged by one tap per dimension
+on the CPU, and prolongation levels that read nothing from each other
+run as one group, so over MPI a nested mesh's fill no longer waits for
+its levels one after another.
+
+M14 added the 180° counterpart of the rotating symmetry, a half plane
+whose low face is glued to itself by a half turn about its middle (see
+[Half turns](@ref)). Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),

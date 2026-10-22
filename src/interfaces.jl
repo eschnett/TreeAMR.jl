@@ -277,8 +277,9 @@ end
 function exchange_interfaces!(fs::FieldSet, isched::InterfaceSchedule, backend)
     forest = isched.forest
     sends = nothing
-    for stage in isched.stages
-        sends = run_stage!(fs, stage, forest, backend, sends)
+    stages = isched.stages
+    for i in eachindex(stages)
+        sends = run_stages!(fs, stages, i:i, stages[i].locals, forest, backend, sends)
     end
     sends === nothing || waitall(forest.comm, sends)
     return fs

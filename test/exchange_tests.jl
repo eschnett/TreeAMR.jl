@@ -697,6 +697,54 @@ end
     end
 end
 
+@testset "Grouped prolongation stages over a communicator fill as serially: D=$D" for
+        D in (2, 3)
+    # A rank that runs several prolongation levels as one group posts
+    # every level's receives and sends before it waits for any, and its
+    # peers may group otherwise. A send posted only after a wait, a
+    # message under another level's tag or into another level's buffer,
+    # an unpack before its wait, or a hook region run before the level
+    # that fills what it reads would deadlock here, or change a ghost.
+    # The nested octant groups the levels each rank holds, and its
+    # levels' sources lie on different ranks, so the groups carry
+    # messages.
+    serial = nested_octant(Val(D))
+    parity = [ntuple(_ -> EvenParity, D)]
+    ops = Operators(prolongation=6, restriction=6)
+    f = (x, v) -> sin(sum(x)) + x[1]^2
+    for (C, hook) in ((vertexcentered(D), CellBoundary(Relative(x -> cos(sum(x))))),
+                      (cellcentered(D), boundary_by_coordinates(f))), P in (2, 3)
+        sfs = FieldSet(serial, 1; G=3, centering=C, parity=parity)
+        data = rand(MersenneTwister(11), size(sfs.work)...) .- 0.5
+        copyto!(sfs.work, data)
+        fill_ghosts!(sfs, GhostSchedule(sfs, ops); boundary=hook)
+        box = Mailbox()
+        forests = [Forest(serial.roots; N=serial.N,
+                          reflecting=TreeAMR.reflecting_faces(serial),
+                          extents=serial.extents, leaves=serial.leaves,
+                          comm=MailboxCommunicator(r, P, box))
+                   for r in 0:(P - 1)]
+        sets = map(forests) do forest
+            fs = FieldSet(forest, 1; G=3, centering=C, parity=parity)
+            copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+            fs
+        end
+        scheds = [GhostSchedule(fs, ops) for fs in sets]
+        # Some rank runs a group of levels with messages: of one of them at
+        # two ranks, of two or three at three.
+        @test any(s -> any(r -> length(r) >= 2 &&
+                                count(i -> s.stages[i].remote !== nothing, r) >= P - 1,
+                           s.stagegroups), scheds)
+        @sync for r in 1:P
+            @async fill_ghosts!(sets[r], scheds[r]; boundary=hook)
+        end
+        @test all(isempty ∘ last, box.channels)          # every message consumed
+        @test all(r -> bitwise_equal(sets[r].work,
+                                     sfs.work[ntuple(_ -> :, D + 1)...,
+                                              blockrange(forests[r])]), 1:P)
+    end
+end
+
 @testset "An AllVariables boundary hook runs on a rank with no blocks: D=$D" for D in (2, 3)
     # The all-variables hook's length check evaluates the callback at a
     # point of block 1, and a rank of a forest with fewer leaves than
@@ -1049,7 +1097,7 @@ end
     end
 end
 
-# --- Half-turn seams (M13) --------------------------------------------------
+# --- Half-turn seams (M14) --------------------------------------------------
 #
 # A half turn's transfers are orientation 2, packed and unpacked as a
 # quarter turn's are; what is new is the shifted seam slab of a

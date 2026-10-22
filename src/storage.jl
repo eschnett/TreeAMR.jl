@@ -212,7 +212,7 @@ without a quarter-turn seam it may be omitted, and if given is checked
 for its shape and otherwise ignored, as `parity` is.
 
 `halfturn` says how the variables turn under the half turn of a
-half-turn seam, and is **required** when the forest has one (M13; see
+half-turn seam, and is **required** when the forest has one (M14; see
 [`Forest`](@ref)'s `halfturn`), with the same meaning: variable `v` at
 the turned point equals `sign(halfturn[v])` times variable
 `abs(halfturn[v])` at the point. A half turn negates both axes of its
@@ -275,7 +275,7 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # The signed variable map of a rotating seam (M12), as checked by
     # `rotations_of`; `nothing` when none was given.
     const rotation::Union{Nothing,Vector{Int}}
-    # The signed variable map of a half-turn seam (M13), as checked by
+    # The signed variable map of a half-turn seam (M14), as checked by
     # `halfturns_of`; `nothing` when none was given.
     const halfturn::Union{Nothing,Vector{Int}}
     # The per-variable factor each mirrored or rotated transfer
@@ -291,7 +291,7 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # The variable a rotated transfer reads for each target variable,
     # `rotvars[v, r + 1]` (M12; see `seamtables`), as `Int32` on the
     # storage's backend; `nothing` over a forest without a seam. Over a
-    # half-turn forest only `r = 2` is read (M13).
+    # half-turn forest only `r = 2` is read (M14).
     const rotvars::Union{Nothing,AbstractMatrix{Int32}}
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
@@ -440,7 +440,7 @@ mirrorcolumn(state::NTuple{D,<:Integer}) where {D} =
 # Whether a layout turns into itself under the quarter turn: equal ghost
 # widths and equal staggers along the seam's two dimensions. Such a set
 # rotates from itself; any other from its partner. Under a half turn
-# (M13) every layout turns into itself, since it exchanges no dimensions.
+# (M14) every layout turns into itself, since it exchanges no dimensions.
 function symmetric_layout(forest::Forest, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
     ishalfturn(forest) && return true
     d1, d2 = rotating_dims(forest)
@@ -506,7 +506,7 @@ function signed_map(map_, nvars::Int, name::AbstractString, turn::AbstractString
     return q
 end
 
-# Validate a user-supplied `halfturn` (M13) into a `Vector{Int}`, the
+# Validate a user-supplied `halfturn` (M14) into a `Vector{Int}`, the
 # signed map the half turn applies, against the forest's seam: required
 # over a half-turn forest, where its square must be the identity and it
 # must keep the parities; checked for its shape anywhere else.
@@ -584,7 +584,7 @@ end
 # with zero factors and the identity map for `r ≥ 1`, which no fill
 # reads — a schedule that has such transfers is refused for it alone.
 #
-# A half-turn set (M13) passes its map as `half`: orientation 2 is the
+# A half-turn set (M14) passes its map as `half`: orientation 2 is the
 # half turn itself, `Q` rather than `Q²`, and orientations 1 and 3, which
 # a half-turn seam never has, are left as an asymmetric set's are.
 function seamtables(::Type{T}, parities, steps, nvars::Int, ::Val{D};

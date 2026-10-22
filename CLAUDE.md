@@ -242,6 +242,17 @@ an H200 for a baseline checkout beside this one (`TREEAMR_BASE`,
 `TREEAMR_COPIES_STAGES`), then the suite on CUDA. `CODE.md`'s "The copy
 kernels on a device" has the numbers.
 
+`bench/nested.jl` times the ghost fill of the downstream's nested mesh
+(eschnett/TreeGeneralizedHarmonic.jl#11) stage by stage and rank by
+rank, serially or under `MPI.mpiexec()`, and counts each prolongation
+message's coarse footprint; `bench/symmetry_nested.sh` runs it for
+several checkouts in one job (`TREEAMR_NESTED_VERSIONS`,
+`TREEAMR_NESTED_STAGES`), on an AMD node with the compile-timing
+comparison of `test/mpi_workload.jl`, or through
+`bench/symmetry_nested_gpu.sh` on H200s. `bench/partition_cost.jl`
+counts what candidate ownership rules would cost the fill, timing
+nothing. `HISTORY.md`'s M13 entry has the numbers.
+
 The Symmetry jobs write SimWatch status files through `bench/simwatch.sh`
 (`simwatch_begin DIR NAME NSTAGES`, `simwatch_stage MESSAGE`, an exit
 trap for `finished`/`failed`, a 60 s heartbeat; `simwatch_queued` on the
@@ -311,11 +322,13 @@ the one that says why.
   function.
 - **Phased ghost fill**: the boundary hook runs *between* the phases,
   not last; the relative hook's regions run after the stage that fills
-  what they read ("Ghost filling").
+  what they read ("Ghost filling"). Prolongation levels run as groups
+  of stages where `stage_groups` finds no conflict in the boxes they
+  write and read: a new write or read in phase 2 must be among them.
 - **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
   block at a low domain face has its own range start at `G+2` along that
   vertex-like dimension; the trim is part of `GroupKey` ("Centerings").
-- **A half turn shifts its seam slab.** Across a half-turn seam (M13) a
+- **A half turn shifts its seam slab.** Across a half-turn seam (M14) a
   vertex-like `d2` has the target's partition one plane up, so that each
   region is the image of one real block's owned points; the shift is
   part of `GroupKey`. Read the seam through `seam_plane`, `ishalfturn`

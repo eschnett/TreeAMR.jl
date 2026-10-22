@@ -19,28 +19,60 @@
 # overrides `@inbounds` package-wide, so a stencil that walks out of its
 # block fails there even though it would not fail locally.
 
-# Tensor-product stencil: `prod(Ps)` contributions, the weight of each
-# the product of its D one-dimensional weights. The widths are **per
+# Tensor-product stencil: up to `prod(Ps)` contributions, the weight of
+# each the product of its D one-dimensional weights. The widths are **per
 # dimension** (M8): a transfer can be injection in one dimension and
 # order-p interpolation in another, and padding the narrow one to the
 # common width with zero weights would read slots that need not hold
 # data at all — a G = 0 face field has none beyond its high face — and
 # `0 * NaN` is `NaN`.
 #
+# Within a width the zero weights are skipped too on the CPU, where that
+# is cheap to know: a column with a single nonzero weight (`Stencil1D`'s
+# `single`) takes that one tap along its dimension instead of all
+# `Ps[d]`. In vertex-centered refinement every other fine point along a
+# dimension coincides with a coarse node, and its column is an exact one
+# among exact zeros, so a prolongation of order 6 averages 3.5 taps
+# instead of 6 along each dimension where its targets alternate.
+#
+# A device takes the full sum: the flat launch passes `singles =
+# nothing`, and for that type the nest below is generated without the
+# branches. There the skip made a prolongation stage slower, not faster
+# — 2.3 times on an H200, where one EPYC thread ran it 3.7 times faster
+# ("A column with one nonzero weight takes one tap" in CODE.md has the
+# numbers): neighbouring lanes along dimension 1 alternate between the
+# one tap and the loop, and the `2^D` bodies cost the unrolled nest its
+# registers.
+# Both forms compute the same bits for finite data, by the argument
+# below, so the choice by backend changes no result.
+#
+# The skip is exact for finite data. A skipped term is `0 · u`, which is
+# `±0`. The accumulator starts at `+0`, and in round-to-nearest a sum is
+# `-0` only when both addends are, so it never becomes `-0`, and adding
+# `±0` to it leaves it as it was. The terms that remain are the same
+# products, summed in the same order. What differs is a `NaN` or an
+# infinity under a zero weight: the full sum carries it into the result
+# and the skip does not, which is the choice the per-dimension widths
+# make for the slots outside the window.
+#
 # `Ps` is a compile-time constant, so the sum is *generated* as a loop
 # nest with literal trip counts instead of iterating
 # `CartesianIndices(Ps)`. That iterator spent its time in `__inc`, and
 # it hid the fact that D-1 of the D weight loads per stencil point are
-# invariant in the inner loops.
+# invariant in the inner loops. With `singles` given, each dimension
+# wider than one point is a branch on its `single` row — the one tap, or
+# the literal loop — so the nest holds up to `2^D` copies of the
+# innermost body; a width-1 dimension has no branch, and with `singles =
+# nothing` none has.
 #
-# The nest reproduces the old loop exactly, not merely to the same
-# accuracy: `m_1` runs innermost, as column-major `CartesianIndices`
-# iteration did, so the contributions are summed in the same order; and
-# the weight product is still formed as `((w₁ * w₂) * …) * w_D`, since
+# The order of the sum is fixed, not merely its accuracy: `m_1` runs
+# innermost, as column-major `CartesianIndices` iteration does, and the
+# weight product is formed as `((w₁ * w₂) * …) * w_D`, since
 # floating-point multiplication does not associate and hoisting a
 # partial product out of the inner loop would reassociate it. Only the
-# *loads* are hoisted.
-@generated function stencil_sum(src, weights, base::NTuple{D,Int},
+# *loads* are hoisted. That is what makes the skip exact, and what keeps
+# `bracket_clamp_sum`'s full sum equal to this one.
+@generated function stencil_sum(src, weights, singles, base::NTuple{D,Int},
                                 wcol::NTuple{D,Int}, v, sblock,
                                 ::Val{Ps}) where {D,Ps}
     idx = [:(base[$d] + $(Symbol(:m_, d)) - 1) for d in 1:D]
@@ -50,17 +82,37 @@
         acc += $wprod * transfer_load(src, ($(idx...),), v, sblock)
     end
     for d in 1:D
-        body = quote
-            for $(Symbol(:m_, d)) in 1:$(Ps[d])
-                $(Symbol(:wt_, d)) = weights[$d][$(Symbol(:m_, d)), wcol[$d]]
+        m, wt, k = Symbol(:m_, d), Symbol(:wt_, d), Symbol(:k_, d)
+        loop = quote
+            for $m in 1:$(Ps[d])
+                $wt = weights[$d][$m, wcol[$d]]
                 $body
             end
         end
+        body = Ps[d] == 1 || singles === Nothing ? loop : quote
+            if $k != 0
+                $m = $k
+                $wt = weights[$d][$m, wcol[$d]]
+                $body
+            else
+                $loop
+            end
+        end
+    end
+    # A loop, not a filtered comprehension: the generator itself is
+    # compiled for every type it closes over.
+    singlerows = Expr[]
+    for d in 1:D
+        Ps[d] > 1 && singles !== Nothing &&
+            push!(singlerows, :($(Symbol(:k_, d)) = Int(singles[$d][wcol[$d]])))
     end
     return quote
         Base.@_inline_meta
         acc = zero(transfer_eltype(src))
-        @inbounds $body
+        @inbounds begin
+            $(singlerows...)
+            $body
+        end
         acc
     end
 end
@@ -259,15 +311,16 @@ end
 # The bounded point-value interpolation (AMR-10; "Bounded point values"
 # in CODE.md). The stencils are `stack_linear`'s: rows `1:Ps[d]` the
 # order-`p` weights, rows `Ps[d]+1:2Ps[d]` the multilinear ones over the
-# same window. The order-`p` sum is formed exactly as `stencil_sum` forms
-# it, and beside it the extremes of the points with a nonzero multilinear
-# weight in every dimension — the target's bracket. The result is the sum
-# clamped into them, which is `u_lin + φ(u_w − u_lin)` with the largest
-# `φ ∈ [0, 1]` that stays in range, since `u_lin` lies in it. Where no
-# clamp acts it is the unbounded sum, bit for bit but for `-0`. `min` and
-# `max` propagate a `NaN` bracket point and `clamp` a `NaN` sum, and the
-# result carries `0 · (M − m)`, as `bounded_sum` does, so an undefined
-# source stays visible.
+# same window. The order-`p` sum is formed as `stencil_sum` forms it, but
+# in full, without its one-tap skip, and beside it the extremes of the
+# points with a nonzero multilinear weight in every dimension — the
+# target's bracket. The result is the sum clamped into them, which is
+# `u_lin + φ(u_w − u_lin)` with the largest `φ ∈ [0, 1]` that stays in
+# range, since `u_lin` lies in it. Where no clamp acts it is the unbounded
+# sum, bit for bit but for `-0` (for finite data, since the skip is exact
+# there). `min` and `max` propagate a `NaN` bracket point and `clamp` a
+# `NaN` sum, and the result carries `0 · (M − m)`, as `bounded_sum` does,
+# so an undefined source stays visible.
 @generated function bracket_clamp_sum(src, weights, base::NTuple{D,Int},
                                       wcol::NTuple{D,Int}, v, sblock,
                                       ::Val{Ps}) where {D,Ps}
@@ -308,7 +361,7 @@ end
 
 @kernel function transfer_kernel!(shape, dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
-                                  srcstarts, weights, unit::Bool,
+                                  srcstarts, weights, singles, unit::Bool,
                                   targetfirst::NTuple{D,Int}, toffset::Int,
                                   factors, fcol::Int, ::Val{B},
                                   ::Val{Ps}, ::Val{D}) where {B,Ps,D}
@@ -334,7 +387,7 @@ end
           B == BOUNDED_POINTVALUE ?
           bracket_clamp_sum(src, weights, base, wcol, v, sblock, Val(Ps)) :
           all(isone, Ps) && unit ? (@inbounds copy_load(src, base, v, sblock)) :
-          stencil_sum(src, weights, base, wcol, v, sblock, Val(Ps))
+          stencil_sum(src, weights, singles, base, wcol, v, sblock, Val(Ps))
     @inbounds transfer_store!(dest, scaled(acc, factors, v, fcol), tidx, v, tblock)
 end
 
@@ -388,6 +441,10 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     bounded = Val(group.bounded)
     srcstarts = ntuple(d -> group.stencils[d].srcstart, Val(D))
     weights = ntuple(d -> group.stencils[d].weights, Val(D))
+    # The row of each column's one nonzero weight, or zero: see
+    # `stencil_sum`. The shaped launch reads it; the flat one, a device's,
+    # takes the full sum instead.
+    singles = ntuple(d -> group.stencils[d].single, Val(D))
     # A copy goes without its weights: see `copy_load`. A run-time flag
     # rather than `weights = nothing`, which would make every launch site
     # compile both forms of the kernel (see below).
@@ -417,13 +474,13 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     if group.orientation != 0
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
         launch_transfer!(backend, flat, extents, single, kdest, rsrc, group.targetblocks,
-                         group.sourceblocks, srcstarts, weights, unit, tfirst,
+                         group.sourceblocks, srcstarts, weights, singles, unit, tfirst,
                          first(range) - 1, gfactors, Int(group.factorcol), bounded,
                          Val(orders), Val(D))
         return nothing
     end
     launch_transfer!(backend, flat, extents, single, kdest, ksrc, group.targetblocks,
-                     group.sourceblocks, srcstarts, weights, unit, tfirst,
+                     group.sourceblocks, srcstarts, weights, singles, unit, tfirst,
                      first(range) - 1, gfactors, Int(group.factorcol), bounded,
                      Val(orders), Val(D))
     return nothing
@@ -431,14 +488,21 @@ end
 
 # The launch itself, in its two forms (see above). Each branch makes its
 # own call, so that the shaped one stays type-stable; a closure over the
-# arguments instead was allocated at every launch.
-@inline function launch_transfer!(backend, flat::Bool, extents, single::Bool, args...)
+# arguments instead was allocated at every launch. The flat launch drops
+# `singles` for `nothing`, so a device's kernel takes the full sum (see
+# `stencil_sum`); behind the inference barrier the different argument
+# type costs the shaped launch nothing.
+@inline function launch_transfer!(backend, flat::Bool, extents, single::Bool,
+                                  dest, src, targetblocks, sourceblocks, srcstarts,
+                                  weights, singles, args...)
     if flat
         shape, ndrange = launch_shape(true, extents)
         kernel! = Base.inferencebarrier(transfer_kernel!(backend))
-        kernel!(shape, args...; ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
+        kernel!(shape, dest, src, targetblocks, sourceblocks, srcstarts, weights, nothing,
+                args...; ndrange=ndrange, workgroupsize=(single ? ndrange : nothing))
     else
-        transfer_kernel!(backend)(nothing, args...; ndrange=extents,
+        transfer_kernel!(backend)(nothing, dest, src, targetblocks, sourceblocks, srcstarts,
+                                  weights, singles, args...; ndrange=extents,
                                   workgroupsize=(single ? extents : nothing))
     end
     return nothing
@@ -529,7 +593,7 @@ run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
 # wait for the receives and unpack. The sends are waited on once, at the
 # end of the call. The pieces are separate functions so that the tests
 # can run every simulated rank's stage in lockstep in one process,
-# wiring the buffers between ranks directly; `run_stage!` composes them
+# wiring the buffers between ranks directly; `run_stages!` composes them
 # through the communicator verbs, which is the path a real run takes.
 #
 # A stage without messages is a phase exactly as before M7, so a serial
@@ -653,11 +717,13 @@ end
 # mesh's in the regrid transfer. A rotated pack (M12) reads through the
 # variable table `rotvars`, from `altsrc` for an odd orientation (the
 # partner's array in a `RotationPair`), and computes the unscaled sum.
+# A group of stages packs them all and synchronizes once (`sync=false`
+# and a `synchronize` of its own; see `run_stages!`).
 function pack_stage!(src::AbstractArray, remote::RemoteStage, bufs, nvars::Integer,
-                     backend; altsrc=src, rotvars=nothing)
+                     backend; altsrc=src, rotvars=nothing, sync::Bool=true)
     run_phase!((buf=bufs[1], offsets=remote.sendoffsets), src, remote.packs, nvars,
                backend; altsrc=altsrc, rotvars=rotvars)
-    synchronize(backend)
+    sync && synchronize(backend)
     return nothing
 end
 pack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
@@ -675,17 +741,43 @@ end
 unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
     unpack_stage!(fs.work, remote, bufs, fs.nvars, fs.factors, backend)
 
-# Run one stage on this rank through the forest's communicator, from
-# `src` into `dest`: the same working array in an exchange, since its
-# targets are ghosts and its sources interiors, and the old and the new
-# mesh's arrays in the regrid transfer (step 4 of M7), whose packs read
-# the old blocks and whose local groups and unpacks write the new ones.
-# `sends` collects the send requests of the call so far — `nothing`
-# until the first one — and is returned, to be waited on at the end of
-# the call. The communicator is fetched only where a stage has
+# Run the stages `stages[range]` on this rank as one group through the
+# forest's communicator (a run of `GhostSchedule`'s `stagegroups`, or a
+# single stage), from `src` into `dest`: the same working array in an
+# exchange, since its targets are ghosts and its sources interiors, and
+# the old and the new mesh's arrays in the regrid transfer (step 4 of
+# M7), whose packs read the old blocks and whose local groups and unpacks
+# write the new ones. `locals` are the local groups of all of them, in
+# stage order: a single stage's own `locals`, or the group's
+# concatenation (`GhostSchedule`'s `grouplocals`), built with the
+# schedule. `sends` collects the send requests of the call so far —
+# `nothing` until the first one — and is returned, to be waited on at the
+# end of the call. The communicator is fetched only where a stage has
 # messages: the field is abstractly typed, and a call that took it as an
 # argument would be dispatched at run time on every stage of a serial
 # fill too.
+#
+# A stage runs in five steps, and a group takes each for every stage of
+# it before the next: every stage's receives are posted; every stage
+# packs, and the backend is synchronized once; every stage's sends are
+# posted; the local groups of all of them run as one phase, one parallel
+# loop on the CPU; and once all the receives are in, every stage unpacks.
+# Nothing a pack or a local group of a group reads is written by another
+# stage of it (`stage_groups`), so this is the stages run one after
+# another without the waits between them, and the ghosts come out bit
+# for bit the same. The local groups of different stages write ghosts of
+# blocks at different levels, so the one phase writes each point once, as
+# a phase does. Each stage keeps its own tag, buffers and host mirrors,
+# so the messages are those the stages send alone, and a peer may run the
+# same stages one at a time. A group without messages is one phase and
+# one barrier.
+#
+# One driver, for a group and for a single stage alike, with the locals
+# handed in as the `Vector` a stage holds: a second driver, or an
+# iterator over the stages' locals, is a second specialization of the
+# whole fill's call tree for every field-set type, which the
+# compilation-bound MPI workload paid for in seconds ("Stages" in
+# CODE.md has the count).
 #
 # On a device whose buffers the communicator cannot take (`hoststaging`,
 # step 8 of M7) the messages go through host mirrors: the receives are
@@ -701,47 +793,122 @@ unpack_stage!(fs::FieldSet, remote::RemoteStage, bufs, backend) =
 # can receive into the mirror again (each stage has mirrors of its own,
 # and the send mirror is rewritten only after the call's sends have been
 # waited on). A CPU buffer is an `Array` and goes to the communicator
-# directly, as before.
+# directly, as before. The buffers and mirrors are fetched again at each
+# step rather than kept from the first: they are cached with the stage,
+# and a container of them would hand every launch below an abstract
+# type.
 #
 # `altsrc` and `rotvars` are what a rotated transfer (M12) reads through:
 # the array its odd orientations read — the partner's in a
 # `RotationPair`, `src` itself otherwise — and the variable table. The
 # packs read them as the local groups do; an unpack is a plain copy with
 # the factor column, so it needs neither.
-function run_stage!(dest::AbstractArray, src::AbstractArray, nvars::Integer, factors,
-                    stage::ExchangeStage, forest::Forest, backend, sends,
-                    altsrc::AbstractArray=src, rotvars=nothing)
-    remote = stage.remote
-    if remote === nothing
-        run_phase!(dest, src, stage.locals, nvars, backend; factors=factors,
-                   altsrc=altsrc, rotvars=rotvars)
+Base.@nospecializeinfer function run_stages!(dest::AbstractArray, src::AbstractArray,
+                                             nvars::Integer, factors,
+                                             stages::Vector{<:ExchangeStage},
+                                             range::UnitRange{Int},
+                                             locals::Vector{<:TransferGroup},
+                                             forest::Forest, backend, @nospecialize(sends),
+                                             altsrc::AbstractArray, rotvars)
+    if !anyremote(stages, range)
+        run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
+                   rotvars=rotvars)
         synchronize(backend)
-        return sends
+        return sends::Union{Nothing,Vector{Any}}
     end
-    comm = forest.comm
-    bufs = stagebuffers(remote, nvars, backend, forest)
-    staged = hoststaging(comm, bufs[1])
-    wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
-    recvs = Any[irecv(comm, view(wire[2], r), peer, stage.tag)
-                for (peer, r) in zip(remote.recvpeers,
-                                     segment_ranges(remote.recvcounts, nvars))]
-    pack_stage!(src, remote, bufs, nvars, backend; altsrc=altsrc, rotvars=rotvars)
-    staged && copyto!(wire[1], bufs[1])
-    sends === nothing && (sends = Any[])
-    for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
-        push!(sends, isend(comm, view(wire[1], r), peer, stage.tag))
-    end
-    run_phase!(dest, src, stage.locals, nvars, backend; factors=factors, altsrc=altsrc,
+    recvs, out = send_stages!(src, stages, range, nvars, forest, backend, sends, altsrc,
+                              rotvars)
+    run_phase!(dest, src, locals, nvars, backend; factors=factors, altsrc=altsrc,
                rotvars=rotvars)
-    waitall(comm, recvs)
-    staged && copyto!(bufs[2], wire[2])
-    unpack_stage!(dest, remote, bufs, nvars, factors, backend)
-    synchronize(backend)
-    return sends
+    receive_stages!(dest, stages, range, nvars, factors, forest, backend, recvs)
+    return out
 end
+run_stages!(fs::FieldSet, stages, range::UnitRange{Int}, locals, forest::Forest, backend,
+            sends) =
+    run_stages!(fs.work, fs.work, fs.nvars, fs.factors, stages, range, locals, forest,
+                backend, sends, fs.work, fs.rotvars)
+
+# The message steps of `run_stages!`, each a function of only what it
+# reads, so that the larger part of the driver is compiled once per
+# source and once per target rather than for every combination of the
+# two. `sends` is not specialized on either: it is `nothing` or a
+# `Vector{Any}`, and every call site would otherwise compile both.
+#
+# The receives posted, the packs and the one synchronization, and the
+# sends posted: the receive requests, and the call's sends so far.
+Base.@nospecializeinfer function send_stages!(src::AbstractArray,
+                                              stages::Vector{<:ExchangeStage},
+                                              range::UnitRange{Int}, nvars::Integer,
+                                              forest::Forest, backend, @nospecialize(sends),
+                                              altsrc::AbstractArray, rotvars)
+    comm = forest.comm
+    recvs = Any[]
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        bufs = stagebuffers(remote, nvars, backend, forest)
+        wire = hoststaging(comm, bufs[1]) ? stagemirrors(remote, nvars, backend, forest) :
+               bufs
+        for (peer, r) in zip(remote.recvpeers, segment_ranges(remote.recvcounts, nvars))
+            push!(recvs, irecv(comm, view(wire[2], r), peer, stages[i].tag))
+        end
+    end
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        pack_stage!(src, remote, stagebuffers(remote, nvars, backend, forest), nvars,
+                    backend; altsrc=altsrc, rotvars=rotvars, sync=false)
+    end
+    synchronize(backend)
+    out = sends === nothing ? Any[] : sends::Vector{Any}
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        bufs = stagebuffers(remote, nvars, backend, forest)
+        staged = hoststaging(comm, bufs[1])
+        wire = staged ? stagemirrors(remote, nvars, backend, forest) : bufs
+        staged && copyto!(wire[1], bufs[1])
+        for (peer, r) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
+            push!(out, isend(comm, view(wire[1], r), peer, stages[i].tag))
+        end
+    end
+    return recvs, out
+end
+
+# The wait for the receives, the unpacks, and the closing synchronization.
+function receive_stages!(dest::AbstractArray, stages::Vector{<:ExchangeStage},
+                         range::UnitRange{Int}, nvars::Integer, factors, forest::Forest,
+                         backend, recvs::Vector{Any})
+    comm = forest.comm
+    waitall(comm, recvs)
+    for i in range
+        remote = stages[i].remote
+        remote === nothing && continue
+        bufs = stagebuffers(remote, nvars, backend, forest)
+        staged = hoststaging(comm, bufs[1])
+        staged && copyto!(bufs[2], stagemirrors(remote, nvars, backend, forest)[2])
+        unpack_stage!(dest, remote, bufs, nvars, factors, backend)
+    end
+    synchronize(backend)
+    return nothing
+end
+
+# Whether any of the stages `stages[range]` sends or receives here. A loop
+# rather than `all` over a closure, which would be one more method per
+# stage type.
+function anyremote(stages::Vector{<:ExchangeStage}, range::UnitRange{Int})
+    for i in range
+        stages[i].remote === nothing || return true
+    end
+    return false
+end
+
+# One stage alone, which is the group of one: what the tests and the
+# benchmarks run a stage with. The one-element vector is allocated per
+# call, so the fill itself goes through `run_stages!` with its schedule's
+# own vectors.
 run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
-    run_stage!(fs.work, fs.work, fs.nvars, fs.factors, stage, forest, backend, sends,
-               fs.work, fs.rotvars)
+    run_stages!(fs, [stage], 1:1, stage.locals, forest, backend, sends)
 
 # A whole staged ghost fill: phase 1, the boundary hook on this rank's
 # own blocks, then phase 2 by target level. This is `fill_ghosts!` once
@@ -750,9 +917,11 @@ run_stage!(fs::FieldSet, stage::ExchangeStage, forest::Forest, backend, sends) =
 function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backend)
     forest = schedule.forest
     stages = schedule.stages
+    groups = schedule.stagegroups
+    locals = schedule.grouplocals
     # Phase 1: same-level copies and restrictions. Both read interiors
     # only, so they cannot race with each other.
-    sends = run_stage!(fs, stages[1], forest, backend, nothing)
+    sends = run_stages!(fs, stages, groups[1], locals[1], forest, backend, nothing)
 
     # Physical boundaries, before prolongation rather than after
     # everything: a block against the domain edge has prolongation
@@ -763,13 +932,17 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     end
 
     # Phase 2: prolongations, coarsest targets first. A prolongation may
-    # read its coarse source's ghosts, which the earlier sweeps filled.
-    # The relative hook's regions that read prolongated ghosts run after
-    # the stage that fills them (`boundary_after_stage!`).
-    for i in 2:length(stages)
-        sends = run_stage!(fs, stages[i], forest, backend, sends)
-        boundary === nothing ||
+    # read its coarse source's ghosts, which the earlier sweeps filled;
+    # levels that read nothing the ones below them write run together, as
+    # one group of stages (`stagegroups`). The relative hook's regions
+    # that read prolongated ghosts run after the group whose stage fills
+    # them (`boundary_after_stage!`), in level order.
+    for k in 2:length(groups)
+        sends = run_stages!(fs, stages, groups[k], locals[k], forest, backend, sends)
+        boundary === nothing && continue
+        for i in groups[k]
             boundary_after_stage!(fs, boundary, schedule, backend, stages[i].tag)
+        end
     end
     sends === nothing || waitall(forest.comm, sends)
     return fs
@@ -1147,7 +1320,10 @@ prolongation from a coarser neighbor — run in the phases described in
 prolongations swept coarsest target first, then the physical boundary
 hook. Each phase is one parallel loop with a barrier after it; on the
 CPU each thread fills the ghosts of the blocks it owns (see
-[`threadchunks`](@ref TreeAMR.threadchunks)).
+[`threadchunks`](@ref TreeAMR.threadchunks)). Prolongation levels that
+read nothing the levels below them write run as one such loop, and over
+a distributed forest with their messages in flight together (see
+[`GhostSchedule`](@ref)).
 
 Periodic boundaries need nothing special; the tree wraps around, so they
 are ordinary transfers. Reflecting faces need nothing either (M10): the
@@ -1160,7 +1336,7 @@ interpolant of the prolongation order for an even one.
 A rotating seam needs nothing either (M12): its ghosts are the turned
 image of real data, filled by transfers from the real blocks across it,
 read through the quarter turn and the field set's `rotation`, in the
-same phases; across a half-turn seam (M13) through the half turn and the
+same phases; across a half-turn seam (M14) through the half turn and the
 field set's `halfturn`, and every set turns into itself. A set whose layout is not symmetric under exchanging the
 seam's two dimensions turns into another set, and if it has ghosts
 there it is refused here: fill it with its partner, as a
@@ -1325,21 +1501,23 @@ function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule
                         backend)
     a, b = pair.a, pair.b
     forest = sa.forest
-    runa(stage, sends) = run_stage!(a.work, a.work, a.nvars, pair.afactors, stage, forest,
-                                    backend, sends, b.work, pair.arotvars)
-    runb(stage, sends) = run_stage!(b.work, b.work, b.nvars, pair.bfactors, stage, forest,
-                                    backend, sends, a.work, pair.brotvars)
-    sends = runa(sa.stages[1], nothing)
-    sends = runb(sb.stages[1], sends)
+    runa(i, sends) = run_stages!(a.work, a.work, a.nvars, pair.afactors, sa.stages, i:i,
+                                 sa.stages[i].locals, forest, backend, sends, b.work,
+                                 pair.arotvars)
+    runb(i, sends) = run_stages!(b.work, b.work, b.nvars, pair.bfactors, sb.stages, i:i,
+                                 sb.stages[i].locals, forest, backend, sends, a.work,
+                                 pair.brotvars)
+    sends = runa(1, nothing)
+    sends = runb(1, sends)
     hooks[1] === nothing || apply_boundary!(a, hooks[1], sa, backend)
     hooks[2] === nothing || apply_boundary!(b, hooks[2], sb, backend)
     tags = sort!(unique!([[st.tag for st in sa.stages[2:end]];
                           [st.tag for st in sb.stages[2:end]]]))
     for tag in tags
         i = findfirst(st -> st.tag == tag, sa.stages)
-        i === nothing || (sends = runa(sa.stages[i], sends))
+        i === nothing || (sends = runa(i, sends))
         j = findfirst(st -> st.tag == tag, sb.stages)
-        j === nothing || (sends = runb(sb.stages[j], sends))
+        j === nothing || (sends = runb(j, sends))
         hooks[1] === nothing || boundary_after_stage!(a, hooks[1], sa, backend, tag)
         hooks[2] === nothing || boundary_after_stage!(b, hooks[2], sb, backend, tag)
     end

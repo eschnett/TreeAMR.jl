@@ -306,7 +306,7 @@ end
 
 @testset "$bname: a half-turn seam is filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
-    # M13. Orientation 2 about the centre line, with the vertex-centered
+    # M14. Orientation 2 about the centre line, with the vertex-centered
     # seam slab partitioned one plane up: nothing unwritten or read before
     # it is written in the device's own launch order, and the polynomial
     # data reproduced; and interpolation beyond the seam on the host's

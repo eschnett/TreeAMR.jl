@@ -63,7 +63,7 @@ leaf-only linear octree.
   side of it at one level (*conformity*). The two dimensions must have
   as many roots as each other and be neither periodic, reflecting nor
   outflow; their high faces stay outer. See "Rotating seams" in `CODE.md`.
-- `halfturn = (d1, d2)` declares a **half-turn seam** (M13) instead: only
+- `halfturn = (d1, d2)` declares a **half-turn seam** (M14) instead: only
   the half of the `(d1, d2)` plane above the low face of `d1` is
   simulated, and the other half is its image under the rotation by 180°
   about the line where that face meets the centre plane of `d2`. The low
@@ -139,7 +139,7 @@ struct Forest{D,T}
     # `rotating` below).
     faces::NTuple{D,NTuple{2,FaceKind}}
     # The rotating seam's pair of dimensions `(d1, d2)` (M12), `(d1, -d2)`
-    # for a half turn (M13), `(0, 0)` for none; read it through
+    # for a half turn (M14), `(0, 0)` for none; read it through
     # `hasrotating`, `ishalfturn`, `seam_plane`, `rotating_dims` and
     # `halfturn_dims`. The sign, not a third byte, because at D = 2 the two
     # bytes fill the padding exactly. `Int8`
@@ -329,7 +329,7 @@ function check_rotating(rotating, roots::NTuple{D,Integer}, periodic::NTuple{D,B
     return (Int8(d1), Int8(d2))
 end
 
-# The `halfturn` keyword (M13), checked, as the forest stores it:
+# The `halfturn` keyword (M14), checked, as the forest stores it:
 # `(d1, -d2)`, the sign telling it from a quarter turn's pair. Each refusal
 # says why the seam cannot be glued that way (CODE.md, "Half turn" under
 # "Domain and boundaries").
@@ -382,10 +382,10 @@ function check_halfturn(halfturn, rotating, roots::NTuple{D,Integer},
 end
 
 # Whether the forest has a rotating seam, a quarter turn's (M12) or a half
-# turn's (M13).
+# turn's (M14).
 hasrotating(forest::Forest) = forest.rotating[1] != 0
 
-# Whether the forest's seam is a half turn's (M13).
+# Whether the forest's seam is a half turn's (M14).
 ishalfturn(forest::Forest) = forest.rotating[2] < 0
 
 # The plane `(d1, d2)` of either seam, as positive dimensions: what the
@@ -399,7 +399,7 @@ rotating_dims(forest::Forest) =
     hasrotating(forest) && !ishalfturn(forest) ? seam_plane(forest) : nothing
 
 # The pair `(d1, d2)` as the `halfturn` keyword takes it, `nothing` when the
-# forest has no half-turn seam (M13).
+# forest has no half-turn seam (M14).
 halfturn_dims(forest::Forest) = ishalfturn(forest) ? seam_plane(forest) : nothing
 
 # The seam as the keywords that rebuild it, `(; rotating, halfturn)`, for a
@@ -840,7 +840,7 @@ isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) 
 # The `-1` is a cell's width: the cell at `g` spans `[g, g + 1)`, and
 # `R^{-1}` takes it to the cell spanning `(-g - 1, -g]` along `d2`.
 #
-# A half turn (M13) has orientation 2 only, entered by stepping beyond the
+# A half turn (M14) has orientation 2 only, entered by stepping beyond the
 # low face of `d1` alone — a face of `d2` is an outer face — and turns
 # about the centre plane of `d2` rather than its low face (CODE.md, *Half
 # turns*):
@@ -1062,7 +1062,7 @@ Across a rotating seam (M12; see [`Forest`](@ref)) the keys are the real
 leaves whose image under the rotation abuts `k`, the leaves that supply
 that ghost region turned by a quarter turn or two. A block at the axis
 is then its own neighbor in three directions of the plane, as a single
-periodic root is its own neighbor. Across a half-turn seam (M13) they
+periodic root is its own neighbor. Across a half-turn seam (M14) they
 are the leaves on the same face, at the mirrored position along `d2`,
 turned by a half turn.
 
@@ -1187,7 +1187,7 @@ until the refinement stops rippling outward. On a forest with a rotating
 seam (M12) it also enforces **conformity** there: a leaf across a seam
 *face* that is coarser by any amount is refined, so the leaves on the low
 face of `d1` and their images on the low face of `d2` end at one level —
-or, across a half-turn seam (M13), their images on the same face.
+or, across a half-turn seam (M14), their images on the same face.
 
 Afterwards every ghost region of every block touches at most one level
 up or down, which is what bounds the ghost-filling cases and the
@@ -1232,7 +1232,7 @@ end
 # An edge or corner across the seam keeps the ordinary 2:1 rule. A seam
 # face is a direction with one nonzero component and a nonzero
 # orientation: 1 or 3 for a quarter turn, whose orientation 2 needs two
-# components and is a corner, and 2 for a half turn (M13), whose only
+# components and is a corner, and 2 for a half turn (M14), whose only
 # face across the seam is the low face of `d1`, glued to itself.
 @inline balance_slack(r::Int, δ::NTuple{D,Int}) where {D} =
     r != 0 && count(!=(0), δ) == 1 ? 0 : 1
@@ -1241,7 +1241,7 @@ end
     isbalanced(forest)
 
 Whether `forest` satisfies 2:1 balance across all faces, edges, and
-corners, and conformity at a rotating seam (M12, M13) — the postcondition of
+corners, and conformity at a rotating seam (M12, M14) — the postcondition of
 [`balance!`](@ref).
 """
 function isbalanced(forest::Forest{D}) where {D}

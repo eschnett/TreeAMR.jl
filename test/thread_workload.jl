@@ -98,7 +98,7 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     # A rotating seam (M12) turns a scalar into itself, and the pulse is
     # a ring about the axis, so that the refinement follows the seam
     # faces and reaches the axis.
-    # So does a half turn (M13), whose axis is at the middle of the low x₁
+    # So does a half turn (M14), whose axis is at the middle of the low x₁
     # face.
     rotation = rotating === nothing ? nothing : (1, 2)
     fs = FieldSet(forest, 2; G=G, centering=centering, parity=parity,
@@ -243,7 +243,7 @@ workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12,
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2), rotating=(1, 2), x0=0.3)
 
-# A half-turn seam (M13): orientation 2 about the middle of the low x₁
+# A half-turn seam (M14): orientation 2 about the middle of the low x₁
 # face, with the vertex-centered seam slab partitioned one plane up.
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2), halfturn=(1, 2), x0=0.3)

@@ -16,8 +16,10 @@
 # that turns into itself and a `RotationPair` filled, regridded and
 # interpolated beyond the seam, the pair's
 # merged stages sharing their tags, and a single leaf at the axis that
-# leaves every rank but one empty; and (M13) a half plane, the wave and
-# two sets through a fill, a regrid and interpolation — and prints
+# leaves every rank but one empty; a nested mesh whose prolongation
+# levels each rank runs as one group of stages; and (M14) a half plane,
+# the wave and two sets through a fill, a regrid and interpolation — and
+# prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
 # reductions and the floating-point sums. Run serially in this
@@ -120,10 +122,14 @@ end
                                                      startswith(l, "I2"), lines))
     @test 0 < parse(Int, split(only(filter(startswith("I2.F64 excluded"), lines)))[3]) < 301
     words(prefix) = split(only(filter(startswith(prefix * " "), lines)))
-    # Three levels wherever they were asked for.
+    # Three levels wherever they were asked for, and four in the nested
+    # octant, whose three prolongation levels run as one group.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p") &&
-                                                    !startswith(l, "E2"), lines))
+                                                    !startswith(l, "E2") &&
+                                                    !startswith(l, "N3"), lines))
+    @test words("N3 leaves")[3:4] == ["232", "3"]
+    @test "# N3 largest groups 3 with messages 0" in lines
     # The ranks without blocks (E2): everything ran, and both initial-data
     # cycles refined and converged.
     @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
@@ -133,7 +139,7 @@ end
     # across the seam.
     @test all(w -> parse(Int, w) > 0, words("Q2 negzero")[3:5])
     @test words("Q2 interpolated")[3:4] == ["257", "193"]
-    # The half plane (M13): the turned ghosts hold `−0` in both sets, and
+    # The half plane (M14): the turned ghosts hold `−0` in both sets, and
     # about half of the points were turned back across the seam.
     @test all(w -> parse(Int, w) > 0, words("H2 negzero")[3:4])
     @test all(l -> split(l)[4:5] == ["257", "128"],
@@ -178,6 +184,11 @@ end
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes
         @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
+        # The nested octant (N3): some rank ran a group of levels with
+        # messages, one of them at two ranks and more at three.
+        nmessages = parse.(Int, split(only(filter(startswith("# N3 largest groups"),
+                                                  hashes)))[(n + 7):end])
+        @test length(nmessages) == n && maximum(nmessages) >= n - 1
         # The negative control: one received ghost rewritten from a
         # corrupted message buffer changes the gathered digest.
         @test "# W2v perturbed-ghost-changes-digest true" in hashes
