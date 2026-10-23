@@ -1,5 +1,7 @@
 # TreeAMR.jl
 
+<img src="docs/src/assets/logo.svg" alt="TreeAMR.jl logo" width="160" align="right">
+
 TreeAMR.jl implements a tree-based (octree-style) adaptive mesh
 refinement (AMR) discretization for Julia. It provides mesh, storage,
 and inter-grid operations.
