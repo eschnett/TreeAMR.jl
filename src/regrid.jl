@@ -89,14 +89,12 @@ end
     ntuple(d -> max(hi[d], Int32(i[d])), Val(D))
 
 @kernel function firing_lanes_kernel!(counts, los, his, @Const(work), fires,
-                                      @Const(origins), @Const(spacings),
+                                      @Const(origins), @Const(spacings), nodes,
                                       ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
                                       ::Val{W}) where {D,G,C,N,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
     origin, h = origins[b], spacings[b]
-    # The same expression `coordinates` forms, per centering.
-    off = pointoffsets(h, C)
     cells = CartesianIndices(ntuple(_ -> N, Val(D)))
 
     n = 0
@@ -106,7 +104,8 @@ end
         c = Tuple(cells[k])
         i = ntuple(d -> c[d], Val(D))                  # owned index, 1:N
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
-        x = ntuple(d -> origin[d] + (i[d] - off[d]) * h, Val(D))
+        # The same expression `coordinates` forms, per centering.
+        x = ntuple(d -> nodeposition(origin[d], h, i[d], C[d], nodes), Val(D))
         if fires(work, idx, b, x)
             n += 1
             lo = widen_lo(lo, i)
@@ -193,8 +192,9 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     his = allocate(backend, NTuple{D,Int32}, (n,))
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
+    nodes = element_offsets(backend, T, fs.P)
     firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
-                                  spacings, Val(D), Val(fs.G), Val(staggers(fs)),
+                                  spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
                                   Val(forest.N), Val(W); ndrange=W * n)
     firing_fold_kernel!(backend)(counts, los, his, lcounts, llos, lhis, Val(D), Val(W);
                                  ndrange=n)
@@ -1289,6 +1289,8 @@ adapted_forest(sets::Tuple) = first(sets).forest
 
 The volume integral of one variable over the domain — `Σ hᴰ u` over
 every interior cell, with each block weighted by its own cell volume.
+For an element-centered set (M16) it is the Gauss–Lobatto quadrature,
+each node weighted by the tensor product of `(P+1)ŵᵢ/2` times `hᴰ`.
 
 What [`regrid!`](@ref) does to this depends on the operator family:
 
@@ -1313,6 +1315,11 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     # roundoff only, and the suite asserts exactly that on a device,
     # where the lanes split the cells differently.
     # `float(real(T))` inline, not the local `R`: see `volume_weighted_norm`.
-    return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
-                          weight=key -> spacing(float(real(T)), forest, key)^D)
+    cellvolume(key) = spacing(float(real(T)), forest, key)^D
+    fs.P == 0 && return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
+                                       weight=cellvolume)
+    # An element set's nodes are weighted by the GLL quadrature (M16).
+    vars = _varrange(var, fs.nvars)
+    values = element_quadrature(identity, R, fs.work, fs, fs.G, vars)
+    return combine_blocks(+, zero(R), fs, values, cellvolume)
 end

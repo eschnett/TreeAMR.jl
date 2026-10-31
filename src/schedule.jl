@@ -250,16 +250,18 @@ BoundaryBatch{D}(boxlen, slot, blocks::VB, directions::VD, firsts::VF,
 
 Everything the cell-wise boundary kernel reads that is not field data:
 the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
-origin and spacing it turns a stored index into a position with.
+origin and spacing it turns a stored index into a position with, and for
+an element-centered layout (M16) the node offsets, `nothing` otherwise.
 
 The geometry is here rather than recomputed per fill for the same reason
 the exchange itself is precomputed: it depends only on the tree, which
 is exactly what a schedule is rebuilt for.
 """
-struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector}
+struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,VN}
     batches::Vector{BT}
     origins::VO
     spacings::VS
+    nodes::VN               # `element_offsets` of the layout, on the backend
 end
 
 function batchtype(backend::Backend, ::Val{D}) where {D}
@@ -273,7 +275,7 @@ end
 # hook may run them and by shape, then move the result to wherever the
 # kernels will run.
 function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
-                      boundaries::Vector{BoundaryRegion{D}}) where {T,D}
+                      boundaries::Vector{BoundaryRegion{D}}, P::Int) where {T,D}
     byshape = Dict{Tuple{Int,NTuple{D,Int}},
                    Tuple{Vector{Int32},Vector{NTuple{D,Int8}},Vector{NTuple{D,Int32}},
                          Vector{NTuple{D,Int32}}}}()
@@ -296,8 +298,9 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
                  for k in keys_]
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings)}(
-        batches, origins, spacings)
+    nodes = element_offsets(backend, T, P)
+    return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings),
+                        typeof(nodes)}(batches, origins, spacings, nodes)
 end
 
 # What one ghost region of one block needs, as found by the neighbor
@@ -1946,7 +1949,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
-    bplan = BoundaryPlan(backend, T, forest, boundaries)
+    bplan = BoundaryPlan(backend, T, forest, boundaries, order)
 
     # Phase 1 is one stage and phase 2 one per target level. Serially
     # each stage is one of the phases above and sends nothing.

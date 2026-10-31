@@ -843,7 +843,8 @@ end
 # origin and spacing in the same order, so it reproduces `coordinates`
 # bit for bit.
 @kernel function fold_points_kernel!(partials, @Const(array), rf, init,
-                                     @Const(origins), @Const(spacings), @Const(levels),
+                                     @Const(origins), @Const(spacings), nodes,
+                                     @Const(levels),
                                      tags, firstvar::Int,
                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}, ::Val{NV},
                                      ::Val{W}) where {D,G,C,N,NV,W}
@@ -851,12 +852,11 @@ end
     b, l = divrem(g - 1, W) .+ 1
     origin, h = origins[b], spacings[b]
     lev, tag = levels[b], tags[b]
-    off = pointoffsets(h, C)
     cells = CartesianIndices(ntuple(_ -> N, Val(D)))
     acc = init
     for j in l:W:length(cells)
         I = Tuple(cells[j])
-        x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+        x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
         c = ntuple(d -> I[d] + G[d], Val(D))
         u = ntuple(v -> array[c..., firstvar + v - 1, b], Val(NV))
         acc = rf(acc, FoldPoint(u, x, h, lev, tag, I, b))
@@ -913,10 +913,11 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     W = lanes !== nothing ? Int(lanes) : backend isa CPU ? 1 : fold_lanes(R)
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
+    nodes = element_offsets(backend, T, fs.P)
     levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
     partials = allocate(backend, R, (W, n))
     launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
-                     spacings, levels, tags, first(vars), Val(D), Val(g),
+                     spacings, nodes, levels, tags, first(vars), Val(D), Val(g),
                      Val(staggers(fs)), Val(forest.N), Val(NV), Val(W); ndrange=(W * n,))
     if W == 1
         synchronize(backend)
@@ -1043,7 +1044,12 @@ independent RMS (or, for `p = Inf`, the plain maximum).
 
 Weighting matters on an adaptive mesh: refined regions contribute more
 *entries* per unit volume simply for being refined, so an unweighted
-norm silently emphasizes them. This is also the shape an adaptive
+norm silently emphasizes them. An element-centered set (M16;
+[`elementcentered`](@ref)) weights each node by its Gauss–Lobatto
+quadrature weight instead, the tensor product of `(P+1)ŵᵢ/2` over the
+dimensions times the block's `hᴰ`, so the norm is the discrete one its
+summation-by-parts property holds in, exact for `|u|^p` of degree up to
+`2P - 1` in each dimension. This is also the shape an adaptive
 integrator's `internalnorm` needs; through M3 only fixed-`dt`
 integrators are exercised, so it is used here for error measurement.
 
@@ -1091,8 +1097,28 @@ function volume_weighted_norm(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector;
     return (total / volume)^inv(R(p))
 end
 
+# The quadrature of an element-centered set (M16), per block: `Σ W f(u)`
+# over the owned points of `array` (the working array at offset `g =
+# fs.G`, or the state array at `g = 0`) and the variables `vars`, `W` the
+# tensor product of the nodes' GLL weights in units of the spacing,
+# `(P+1)ŵᵢ/2` per dimension. The block's `hᴰ` is left to the caller's
+# `combine_blocks` weight, as for a cell-centered set. A fold whose `rf`
+# carries the weights, a small array on the backend, as a closure: a
+# kernel argument is adapted to the device, closures included.
+function element_quadrature(f, ::Type{R}, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
+                            vars::UnitRange{Int}) where {R,T,D}
+    w = todevice(get_backend(array), element_tables(T, fs.P).quadrature)
+    function rf(acc, p)
+        P1 = length(w)
+        weight = prod(ntuple(d -> @inbounds(w[(p.I[d] - 1) % P1 + 1]), Val(D)))
+        return acc + weight * sum(f, p.u)
+    end
+    return _block_fold(rf, +, zero(R), array, fs, g, vars, nothing)
+end
+
 # The two sums of a finite `p`-norm over one field set: `Σ hᴰ |u|^p` over
-# its cells, and its domain volume times `nvars`.
+# its cells, or for an element set (M16) the GLL quadrature of `|u|^p`,
+# and its domain volume times `nvars`.
 function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     forest = fs.forest
     R = float(real(T))
@@ -1107,7 +1133,15 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     # returns `Any`, which cost the norm a dynamic dispatch per block
     # (found in review, measured at 2x the host time on 1.10.12).
     cellvolume(key) = spacing(float(real(T)), forest, key)^D
-    total = mesh_mapreduce(x -> abs(x)^q, +, zero(R), fs, u; weight=cellvolume)
+    total = if fs.P == 0
+        mesh_mapreduce(x -> abs(x)^q, +, zero(R), fs, u; weight=cellvolume)
+    else
+        # The nodes are not equally spaced, so each gets its quadrature
+        # weight: the norm the summation-by-parts property holds in.
+        values = element_quadrature(x -> abs(x)^q, R, statearray(u, fs), fs,
+                                    ntuple(_ -> 0, D), 1:(fs.nvars))
+        combine_blocks(+, zero(R), fs, values, cellvolume)
+    end
 
     # The domain volume as the sum of the block volumes, through the same
     # combination as everything else — so `sum`'s association from M3 is

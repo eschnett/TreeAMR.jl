@@ -946,18 +946,57 @@ function closedranges(fs::FieldSet{T,D}) where {T,D}
     return ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D)
 end
 
-# The offset from a stored index to a position, per dimension: half a
-# cell in a cell-centered dimension (the value sits at the center), a
-# whole one in a vertex-like dimension (it sits on the boundary). `one(h)
-# / 2` rather than `0.5`: a floating-point literal would be an fp64
-# operand and would drag the whole position into fp64. And rather than
-# `oftype(h, 1//2)`, which it was until M11: that folds away for a
-# hardware float, but a `Float32x2` converts a `Rational` through
-# `BigFloat`, at run time, in every kernel that forms a position — 530
-# bytes and some 15 µs per point, measured on the point interpolator.
-# Halving one is exact in any binary type, so the value is the same.
-@inline pointoffsets(h, c::NTuple{D,Int}) where {D} =
-    ntuple(d -> c[d] == 1 ? one(h) : one(h) / 2, Val(D))
+# The offset from an owned index to a position along a dimension of an
+# equally spaced set: half a cell in a cell-centered dimension (the value
+# sits at the center), a whole one in a vertex-like dimension (it sits on
+# the boundary). `one(h) / 2` rather than `0.5`: a floating-point literal
+# would be an fp64 operand and would drag the whole position into fp64.
+# And rather than `oftype(h, 1//2)`, which it was until M11: that folds
+# away for a hardware float, but a `Float32x2` converts a `Rational`
+# through `BigFloat`, at run time, in every kernel that forms a position
+# — 530 bytes and some 15 µs per point, measured on the point
+# interpolator. Halving one is exact in any binary type, so the value is
+# the same. Positions are formed through `nodeposition` only; this is
+# also what the point interpolator inverts, which refuses element sets.
+@inline uniform_shift(h, c::Integer) = c == 1 ? one(h) : one(h) / 2
+
+# The position along one dimension of owned index `I` (the stored index
+# minus `G[d]`, so `1 … N` for the owned points, `≤ 0` and `> N` for the
+# ghosts and the shared plane) of a block with lower corner `origin` and
+# spacing `h`. Every position the package forms goes through here — the
+# geometry, the coordinate and boundary kernels, the folds and the
+# flagging sweep — so that they agree bit for bit, and `nodes` makes the
+# caller say which kind of set it is: `nothing` for an equally spaced
+# set, with `c` its stagger, or the element offsets (`element_offsets`)
+# for an element set, on the kernel's backend.
+#
+# Without elements it is `origin + (I - ½)·h` or `origin + (I - 1)·h`,
+# the expression these positions were always formed by. For an element
+# set (M16) owned point `I` is node `i = (I-1) % (P+1)` of element `q =
+# (I-1) ÷ (P+1)`, at `origin + h·(q(P+1) + offsets[i+1])`, the expression
+# TreeWaveOLDG forms; `q(P+1) + offsets[i+1]` is an integer at both face
+# nodes, so the two face nodes at one position get the same bits. A ghost
+# sits at the face: `origin` below, and above, where `I = N+1` since an
+# element set has at most one ghost layer, the expression gives
+# `origin + h·N`, the last owned node's own position.
+@inline nodeposition(origin, h, I::Integer, c::Integer, ::Nothing) =
+    origin + (I - uniform_shift(h, c)) * h
+@inline function nodeposition(origin, h, I::Integer, c::Integer, nodes::AbstractVector)
+    I <= 0 && return origin
+    P1 = length(nodes)
+    q, i = divrem(I - 1, P1)
+    return origin + h * (q * P1 + @inbounds(nodes[i + 1]))
+end
+
+# The node offsets the position kernels of a set of order `P` read, in
+# `T` on `backend`, or `nothing` for a set without elements (`P = 0`).
+# A small array rather than an `NTuple`: `P` is a run-time value, and a
+# tuple of run-time length would be neither inferable nor kept in
+# registers on a device.
+element_offsets(backend::Backend, ::Type{T}, P::Int) where {T} =
+    P == 0 ? nothing : todevice(backend, element_tables(T, P).offsets)
+element_offsets(::Type{T}, P::Int) where {T} =
+    P == 0 ? nothing : element_tables(T, P).offsets
 
 """
     coordinates([S], fs::FieldSet, b::Integer, idx::NTuple{D,Integer})
@@ -970,7 +1009,9 @@ outside the block's boundary.
 
 The position depends on the field set's ghost width *and* on its
 centering — `origin + (i - G[d] - 1/2)·h` in a cell-centered dimension,
-`origin + (i - G[d] - 1)·h` in a vertex-like one — which is why this
+`origin + (i - G[d] - 1)·h` in a vertex-like one, and for an element set
+(M16; [`elementcentered`](@ref)) the Gauss–Lobatto node the index holds,
+with a ghost at the block's face — which is why this
 takes a field set and a block index rather than a forest and a key
 (replacing `cell_center`, which assumed the forest carried `G` and that
 every dimension was cell-centered).
@@ -985,8 +1026,9 @@ function coordinates(::Type{S}, fs::FieldSet{T,D}, b::Integer,
     forest = fs.forest
     origin = block_origin(S, forest, blockkey(fs, b))
     h = spacing(S, forest, blockkey(fs, b))
-    off = pointoffsets(h, staggers(fs))
-    return ntuple(d -> origin[d] + (Int(idx[d]) - fs.G[d] - off[d]) * h, D)
+    c = staggers(fs)
+    nodes = element_offsets(S, fs.P)
+    return ntuple(d -> nodeposition(origin[d], h, Int(idx[d]) - fs.G[d], c[d], nodes), D)
 end
 coordinates(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,<:Integer}) where {T,D} =
     coordinates(T, fs, b, idx)
@@ -1063,17 +1105,16 @@ function check_allvariables(vals, fs::FieldSet, what::AbstractString)
         "whole tuple."))
 end
 
-@kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings),
+@kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings), nodes,
                                      ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
     v, b = I[D + 1], I[D + 2]
     origin, h = origins[b], spacings[b]
     # The stored index of owned point i is i + G[d], so `coordinates`'
-    # (idx - G[d] - off[d]) is just (i - off[d]) — the same arithmetic,
-    # in the same order, on the same origin and spacing, so this
-    # reproduces `coordinates` bit for bit.
-    off = pointoffsets(h, C)
-    x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+    # owned index (idx - G[d]) is just i, and `nodeposition` forms the
+    # same arithmetic, in the same order, on the same origin and spacing:
+    # this reproduces `coordinates` bit for bit.
+    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
     work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, v)
 end
 
@@ -1083,13 +1124,12 @@ end
 # same origin and spacing in the same order, so the two forms fill a
 # field set with bit-for-bit the same numbers.
 @kernel function coordinates_all_kernel!(work, f, @Const(origins), @Const(spacings),
-                                         ::Val{D}, ::Val{G}, ::Val{C},
+                                         nodes, ::Val{D}, ::Val{G}, ::Val{C},
                                          ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)                     # (i1..iD, block)
     b = I[D + 1]
     origin, h = origins[b], spacings[b]
-    off = pointoffsets(h, C)
-    x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
     vals = f(x)
     idx = ntuple(d -> I[d] + G[d], Val(D))
     # Unrolled through `Val`, so every tuple index is a literal: a
@@ -1106,7 +1146,8 @@ end
 
 Set every **owned** point of every block from the callback
 `f(x, v) -> value`, where `x` is that point's position — a cell center,
-a face center, a vertex, whatever this field set's centering says (an
+a face center, a vertex, an element's Gauss–Lobatto node, whatever this
+field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
 `v` the variable index. The ghosts and the shared boundary plane are
 left untouched: they are filled by the ghost exchange (M2).
@@ -1144,7 +1185,8 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     # the upload is not worth caching.
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings,
+    nodes = element_offsets(backend, T, fs.P)
+    launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings, nodes,
                      Val(D), Val(fs.G), Val(staggers(fs));
                      ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
@@ -1160,8 +1202,9 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
+    nodes = element_offsets(backend, T, fs.P)
     launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins, spacings,
-                     Val(D), Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
+                     nodes, Val(D), Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
                      ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     synchronize(backend)
     return fs

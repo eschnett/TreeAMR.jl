@@ -236,3 +236,157 @@ end
     end
     @test_throws "cannot hold an element-centered set" RotationPair(fs, fs)
 end
+
+# A forest whose block origins and spacings are dyadic, so that the
+# positions the tests compare are exact where they must coincide.
+element_forest(T, D; roots=2, N=8) =
+    Forest{T}(ntuple(_ -> roots, D); N=N, extents=ntuple(_ -> (zero(T), one(T)), D))
+
+# Every stored index of block `b`, as tuples.
+stored_indices(fs) = CartesianIndices(size(fs.work)[1:(ndims(fs.work) - 2)])
+
+@testset "Every position of an element set is its node, bit for bit: D=$D, P=$P, G=$G, $T" for
+    (D, P, T) in ((1, 1, Float64), (1, 3, Float64), (2, 1, Float64), (2, 3, Float64),
+                  (3, 3, Float64), (2, 3, Float32), (2, 3, Float32x2)),
+    G in (0, 1)
+    # Guards a position site that still computes cell centres for an
+    # element set, or forms the node by a different expression than
+    # `coordinates` does: the initial data, the folds, the flagging sweep
+    # and the boundary hooks would then disagree with each other and with
+    # TreeWaveOLDG about where a node is.
+    forest = element_forest(T, D)
+    E = elementcentered(D)
+    fs = FieldSet(forest, D; G=G, centering=E, P=P)
+    t = TreeAMR.element_tables(T, P)
+    N, P1 = forest.N, P + 1
+    nodepos(b, I) = let o = block_origin(T, forest, blockkey(fs, b)),
+                        h = spacing(T, forest, blockkey(fs, b))
+        ntuple(d -> o[d] + h * (((I[d] - 1) ÷ P1) * P1 + t.offsets[(I[d] - 1) % P1 + 1]), D)
+    end
+    owned(b) = CartesianIndices(ntuple(_ -> 1:N, D))
+    # `coordinates` is TreeWaveOLDG's `node_position` at every owned
+    # point, and a ghost sits at the block's face.
+    for b in 1:nblocks(fs)
+        o = block_origin(T, forest, blockkey(fs, b))
+        h = spacing(T, forest, blockkey(fs, b))
+        @test all(I -> coordinates(fs, b, Tuple(I) .+ G) === nodepos(b, Tuple(I)), owned(b))
+        if G == 1
+            @test coordinates(fs, b, ntuple(_ -> 1, D)) === o
+            @test coordinates(fs, b, ntuple(_ -> N + 2, D)) === ntuple(d -> o[d] + h * N, D)
+        end
+        # Adjacent elements' face nodes coincide inside a block.
+        @test all(q -> coordinates(fs, b, ntuple(_ -> G + q * P1, D)) ===
+                       coordinates(fs, b, ntuple(_ -> G + q * P1 + 1, D)), 1:(N ÷ P1 - 1))
+    end
+    # Adjacent blocks' face nodes coincide: the last node of one is the
+    # first of its neighbour along each dimension.
+    for b in 1:nblocks(fs), c in 1:nblocks(fs), d in 1:D
+        ob = block_origin(T, forest, blockkey(fs, b))
+        oc = block_origin(T, forest, blockkey(fs, c))
+        h = spacing(T, forest, blockkey(fs, b))
+        all(e -> e == d ? oc[e] == ob[e] + h * N : oc[e] == ob[e], 1:D) || continue
+        i = ntuple(e -> G + 1, D)
+        @test coordinates(fs, b, Base.setindex(i, G + N, d))[d] === coordinates(fs, c, i)[d]
+    end
+
+    # Both forms of `fill_by_coordinates!` write the positions.
+    fill_by_coordinates!((x, v) -> x[v], fs)
+    for b in 1:nblocks(fs)
+        @test all(I -> ntuple(v -> fs.work[(Tuple(I) .+ G)..., v, b], D) ===
+                       coordinates(fs, b, Tuple(I) .+ G), owned(b))
+    end
+    gs = FieldSet(forest, D; G=G, centering=E, P=P)
+    fill_by_coordinates!(AllVariables(x -> x), gs)
+    @test gs.work == fs.work
+    # The folds and the flagging sweep hand their callbacks the same x.
+    mismatch(acc, p) = acc + (p.u === p.x ? 0 : 1)
+    @test mesh_fold(mismatch, +, 0, fs) == 0
+    # The device's lane split too, run on the CPU.
+    @test sum(TreeAMR._block_fold(mismatch, +, 0, fs.work, fs, fs.G, 1:D, nothing, 4)) == 0
+    @test sum(first, firing_boxes((w, idx, b, x) ->
+                                      x !== ntuple(d -> w[idx..., d, b], length(x)), fs)) == 0
+
+    # The boundary hooks write their x at the faces, every form of them.
+    # Same-level copies bring the neighbour's face node, which sits at
+    # the same position, so after a fill every stored value is its own
+    # position.
+    G == 0 && continue
+    ops = Operators(prolongation=2, restriction=2)
+    sched = GhostSchedule(fs, ops)
+    for hook in (CellBoundary((x, v, δ) -> x[v]), CellBoundary(AllVariables((x, δ) -> x)),
+                 CellBoundary(Relative(AllVariables(x -> x))))
+        fs.work .= T(NaN)
+        fill_by_coordinates!((x, v) -> x[v], fs)
+        fill_ghosts!(fs, sched; boundary=hook)
+        for b in 1:nblocks(fs)
+            @test all(I -> ntuple(v -> fs.work[Tuple(I)..., v, b], D) ===
+                           coordinates(fs, b, Tuple(I)), stored_indices(fs))
+        end
+    end
+    one_ = FieldSet(forest, 1; G=G, centering=E, P=P)
+    fill_by_coordinates!((x, v) -> x[1], one_)
+    fill_ghosts!(one_, GhostSchedule(one_, ops); boundary=CellBoundary(Relative(x -> x[1])))
+    for b in 1:nblocks(one_)
+        @test all(I -> one_.work[Tuple(I)..., 1, b] === coordinates(one_, b, Tuple(I))[1],
+                  stored_indices(one_))
+    end
+end
+
+@testset "Equally spaced sets keep their positions bit for bit: D=$D" for D in (1, 2, 3)
+    # Guards the position helper changing a cell or vertex position in
+    # its last bit, which every recorded number of the suite would move
+    # with: it must be the expression these positions always were.
+    for T in (Float64, Float32), C in (cellcentered(D), vertexcentered(D),
+                                       facecentered(D, 1)), G in (0, 2)
+        forest = Forest{T}(ntuple(_ -> 3, D); N=6,
+                           extents=ntuple(_ -> (T(-1) / 3, T(5) / 7), D))
+        fs = FieldSet(forest, 1; G=G, centering=C)
+        c = staggers(fs)
+        for b in (1, nblocks(fs)), I in stored_indices(fs)
+            o = block_origin(T, forest, blockkey(fs, b))
+            h = spacing(T, forest, blockkey(fs, b))
+            off = ntuple(d -> c[d] == 1 ? one(h) : one(h) / 2, D)
+            @test coordinates(fs, b, Tuple(I)) ===
+                  ntuple(d -> o[d] + (I[d] - G - off[d]) * h, D)
+        end
+    end
+end
+
+@testset "The element norm and mass are the GLL quadrature: D=$D, P=$P" for D in (1, 2),
+    P in (1, 2, 3)
+    # Guards an element set weighted as equally spaced cells, which is
+    # not the norm its summation-by-parts property holds in and is not
+    # exact for any polynomial beyond the constants on GLL nodes.
+    N = 2 * (P + 1)
+    forest = Forest(ntuple(_ -> 1, D); N=N, extents=ntuple(_ -> (0.0, 1.0), D))
+    refine!(forest, only(forest.leaves))
+    refine!(forest, first(forest.leaves))          # two levels below the root
+    balance!(forest)
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    u = statevector(fs)
+    norm1(f) = (fill_by_coordinates!((x, v) -> f(x), fs); gather!(u, fs);
+                volume_weighted_norm(fs, u; p=1))
+    # |u| of degree 2P-1 in each dimension is integrated exactly, and the
+    # volume is the domain's: the unit cube's.
+    @test norm1(x -> prod(xd -> 2 + xd^(2P - 1), x)) ≈ (2 + 1 / (2P))^D rtol = 1e-13
+    @test total_mass(fs) ≈ (2 + 1 / (2P))^D rtol = 1e-13
+    @test norm1(x -> 3.0) ≈ 3 rtol = 1e-14
+    # ... but degree 2P is not.
+    @test abs(norm1(x -> prod(xd -> 2 + xd^(2P), x)) - (2 + 1 / (2P + 1))^D) > 1e-10
+    # The 2-norm squares a polynomial of degree P-1 into one of 2P-2.
+    fill_by_coordinates!((x, v) -> prod(xd -> 1 + xd^(P - 1), x), fs)
+    gather!(u, fs)
+    exact2 = (1 + 2 / P + 1 / (2P - 1))^D
+    @test volume_weighted_norm(fs, u; p=2) ≈ sqrt(exact2) rtol = 1e-13
+    @test volume_weighted_norm((fs,), u; p=2) == volume_weighted_norm(fs, u; p=2)
+    @test volume_weighted_norm(fs, u; p=Inf) == maximum(abs, u)
+end
+
+@testset "Point interpolation refuses an element set" begin
+    # Guards interpolating Gauss–Lobatto nodes as if they were equally
+    # spaced, which would silently return wrong values.
+    forest = element_forest(Float64, 2)
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=3)
+    @test_throws "does not take an element-centered set" interpolate(fs, [(0.3, 0.4)],
+                                                                      Lagrange(2))
+end
