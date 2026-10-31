@@ -9,11 +9,26 @@
 # KernelAbstractions backend like any other, and it is exercised here on
 # every run. A device is then one more entry in `BACKENDS`.
 #
-# To add one, name it in the environment and make the package available
-# in the active project:
+# To add one, name it in the environment and run the suite from a scratch
+# environment that develops this checkout and adds the device package
+# beside the test environment's own dependencies (`test/Project.toml`).
+# The test environment itself must not gain a device package: CI has no
+# device and would install it on every run for nothing.
+# `bench/symmetry_gpu.sh` builds such an environment for CUDA; for Metal,
+# from the repository root:
 #
-#     julia --project=test -e 'using Pkg; Pkg.add("Metal")'
-#     TREEAMR_TEST_BACKEND=metal julia --project=test test/runtests.jl
+#     julia --project=<env> -e 'using Pkg; Pkg.develop(path = ".");
+#         Pkg.add(url = "https://github.com/eschnett/IMEXRungeKutta.jl", rev = "main");
+#         Pkg.add(["Metal", "KernelAbstractions", "MPI", "MultiFloats",
+#                  "OrdinaryDiffEqLowOrderRK", "OrdinaryDiffEqSSPRK", "Printf",
+#                  "Random", "SHA", "SciMLBase", "Test"])'
+#     TREEAMR_TEST_BACKEND=metal julia --project=<env> test/runtests.jl
+#
+# This file alone runs in the same environment after the helper files
+# (`oracles.jl`, `ghost_oracles.jl`, `wave.jl`, `burgers.jl`) and the
+# test files whose definitions it calls: `ghost_tests.jl` (`full_sum`,
+# `finite_fill!`), and `partition_tests.jl` before `exchange_tests.jl`
+# (the lockstep fills).
 #
 # `cuda` and `metal` are recognized. A backend that is named but not
 # functional is reported and skipped rather than failing: the point is
