@@ -192,10 +192,12 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     his = allocate(backend, NTuple{D,Int32}, (n,))
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    nodes = element_offsets(backend, T, fs.P)
-    firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
-                                  spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
-                                  Val(forest.N), Val(W); ndrange=W * n)
+    with_nodes(backend, T, fs.P) do nodes
+        firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
+                                      spacings, nodes, Val(D), Val(fs.G),
+                                      Val(staggers(fs)), Val(forest.N), Val(W);
+                                      ndrange=W * n)
+    end
     firing_fold_kernel!(backend)(counts, los, his, lcounts, llos, lhis, Val(D), Val(W);
                                  ndrange=n)
     synchronize(backend)
@@ -1348,6 +1350,6 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
                                        weight=cellvolume)
     # An element set's nodes are weighted by the GLL quadrature (M16).
     vars = _varrange(var, fs.nvars)
-    values = element_quadrature(identity, R, fs.work, fs, fs.G, vars)
+    values = element_quadrature_barrier(identity, R, fs.work, fs, fs.G, vars)
     return combine_blocks(+, zero(R), fs, values, cellvolume)
 end

@@ -1193,10 +1193,12 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
-        boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
-                                  batch.firsts, plan.origins, plan.spacings, plan.nodes,
-                                  Val(D), Val(fs.G), Val(staggers(fs));
-                                  ndrange=(blen..., fs.nvars, n))
+        with_nodes(plan.nodes) do nodes
+            boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
+                                      batch.firsts, plan.origins, plan.spacings, nodes,
+                                      Val(D), Val(fs.G), Val(staggers(fs));
+                                      ndrange=(blen..., fs.nvars, n))
+        end
     end
     synchronize(backend)
     return nothing
@@ -1235,9 +1237,11 @@ function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot
         batch.slot == slot || continue
         n = nregions(batch)
         n == 0 && continue
-        kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
-                plan.spacings, plan.nodes, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
-                ndrange=(batch.boxlen..., n))
+        with_nodes(plan.nodes) do nodes
+            kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
+                    plan.spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
+                    ndrange=(batch.boxlen..., n))
+        end
     end
     synchronize(backend)
     return nothing
@@ -1264,11 +1268,13 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
-        boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
-                                      batch.firsts, plan.origins, plan.spacings,
-                                      plan.nodes, Val(D), Val(fs.G),
-                                      Val(staggers(fs)), Val(fs.nvars);
-                                      ndrange=(blen..., n))
+        with_nodes(plan.nodes) do nodes
+            boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
+                                          batch.firsts, plan.origins, plan.spacings,
+                                          nodes, Val(D), Val(fs.G),
+                                          Val(staggers(fs)), Val(fs.nvars);
+                                          ndrange=(blen..., n))
+        end
     end
     synchronize(backend)
     return nothing

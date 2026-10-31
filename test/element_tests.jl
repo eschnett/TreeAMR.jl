@@ -278,6 +278,21 @@ end
     @test_throws "this field set has none" GhostSchedule(forest, ops; G=1)
 end
 
+@testset "A schedule's type does not depend on the element order: D=$D" for D in (1, 2, 3)
+    # Guards a schedule whose type follows `P` (its boundary plan's node
+    # offsets once did): `GhostSchedule` then returns a `Union`, and every
+    # caller of a cell or vertex set's schedule compiles both variants of
+    # what it calls, about 5% more compilation on `test/mpi_workload.jl`.
+    forest = Forest(ntuple(_ -> 2, D); N=8)
+    ops = Operators(prolongation=2, restriction=2)
+    cell = @inferred GhostSchedule(FieldSet(forest, 1; G=1), ops)
+    vertex = @inferred GhostSchedule(FieldSet(forest, 1; G=1, centering=vertexcentered(D)),
+                                     ops)
+    efs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=3)
+    element = @inferred GhostSchedule(efs, Operators(family=ElementLocal))
+    @test typeof(cell) === typeof(vertex) === typeof(element)
+end
+
 # A forest whose block origins and spacings are dyadic, so that the
 # positions the tests compare are exact where they must coincide.
 element_forest(T, D; roots=2, N=8) =

@@ -967,8 +967,8 @@ end
 # geometry, the coordinate and boundary kernels, the folds and the
 # flagging sweep — so that they agree bit for bit, and `nodes` makes the
 # caller say which kind of set it is: `nothing` for an equally spaced
-# set, with `c` its stagger, or the element offsets (`element_offsets`)
-# for an element set, on the kernel's backend.
+# set, with `c` its stagger, or the element offsets for an element set,
+# on the kernel's backend (`with_nodes`).
 #
 # Without elements it is `origin + (I - ½)·h` or `origin + (I - 1)·h`,
 # the expression these positions were always formed by. For an element
@@ -989,14 +989,48 @@ end
 end
 
 # The node offsets the position kernels of a set of order `P` read, in
-# `T` on `backend`, or `nothing` for a set without elements (`P = 0`).
+# `T`, or `nothing` for a set without elements (`P = 0`), on the host.
 # A small array rather than an `NTuple`: `P` is a run-time value, and a
 # tuple of run-time length would be neither inferable nor kept in
-# registers on a device.
-element_offsets(backend::Backend, ::Type{T}, P::Int) where {T} =
-    P == 0 ? nothing : todevice(backend, element_tables(T, P).offsets)
+# registers on a device. The tables are reached behind
+# `Base.inferencebarrier`, as everything element-only is (`with_nodes`),
+# so that a cell or vertex set compiles none of their construction.
 element_offsets(::Type{T}, P::Int) where {T} =
-    P == 0 ? nothing : element_tables(T, P).offsets
+    P == 0 ? nothing : Base.inferencebarrier(element_tables)(T, P).offsets::Vector{T}
+
+# The same on `backend`, as a vector that is empty for a set without
+# elements: one type for every `P`, so that a schedule that keeps it (the
+# `BoundaryPlan`) has one type whatever its layout.
+node_offsets(backend::Backend, ::Type{T}, P::Int) where {T} =
+    todevice(backend, P == 0 ? T[] : element_offsets(T, P))
+
+# Run `launch(nodes)` with what the position kernels take as `nodes`:
+# `nothing` for a set without elements, inferred as such, so that a cell
+# or vertex launch is the one it was before M16 and compiles nothing
+# more; and an element set's offsets behind `Base.inferencebarrier`, so
+# that a kernel's element variant is compiled when an element set first
+# reaches it rather than beside every cell launch. Passed as a
+# `Union{Nothing,Vector}`, the offsets compiled both variants at every
+# launch site, and kept in the `BoundaryPlan` they made every schedule's
+# type a `Union`, which `test/mpi_workload.jl` measured as about 5% more
+# compilation on its cell and vertex sets alone. The barrier costs an
+# element set one dynamic dispatch per launch. `launch` returns nothing.
+@inline function with_nodes(launch, backend::Backend, ::Type{T}, P::Int) where {T}
+    if P == 0
+        launch(nothing)
+    else
+        launch(Base.inferencebarrier(todevice(backend, element_offsets(T, P))))
+    end
+    return nothing
+end
+@inline function with_nodes(launch, offsets::AbstractVector)
+    if isempty(offsets)
+        launch(nothing)
+    else
+        launch(Base.inferencebarrier(offsets))
+    end
+    return nothing
+end
 
 """
     coordinates([S], fs::FieldSet, b::Integer, idx::NTuple{D,Integer})
@@ -1185,10 +1219,11 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     # the upload is not worth caching.
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    nodes = element_offsets(backend, T, fs.P)
-    launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings, nodes,
-                     Val(D), Val(fs.G), Val(staggers(fs));
-                     ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings,
+                         nodes, Val(D), Val(fs.G), Val(staggers(fs));
+                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+    end
     synchronize(backend)
     return fs
 end
@@ -1202,10 +1237,11 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    nodes = element_offsets(backend, T, fs.P)
-    launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins, spacings,
-                     nodes, Val(D), Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
-                     ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins,
+                         spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
+                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+    end
     synchronize(backend)
     return fs
 end

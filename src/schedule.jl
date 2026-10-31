@@ -251,7 +251,8 @@ BoundaryBatch{D}(boxlen, slot, blocks::VB, directions::VD, firsts::VF,
 Everything the cell-wise boundary kernel reads that is not field data:
 the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
 origin and spacing it turns a stored index into a position with, and for
-an element-centered layout (M16) the node offsets, `nothing` otherwise.
+an element-centered layout (M16) the node offsets, empty otherwise, so
+that the plan's type, and the schedule's, does not depend on the layout.
 
 The geometry is here rather than recomputed per fill for the same reason
 the exchange itself is precomputed: it depends only on the tree, which
@@ -261,7 +262,7 @@ struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector
     batches::Vector{BT}
     origins::VO
     spacings::VS
-    nodes::VN               # `element_offsets` of the layout, on the backend
+    nodes::VN               # `node_offsets` of the layout, on the backend
 end
 
 function batchtype(backend::Backend, ::Val{D}) where {D}
@@ -298,7 +299,7 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
                  for k in keys_]
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    nodes = element_offsets(backend, T, P)
+    nodes = node_offsets(backend, T, P)
     return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings),
                         typeof(nodes)}(batches, origins, spacings, nodes)
 end
@@ -988,7 +989,9 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
 # build cell-centre stencils for Gauss–Lobatto nodes without a word. For
 # `P > 0` the operators are the element's (`element_stencil`), and
 # `regrid` picks the coarsening of a regrid over the ghost fill's
-# restriction.
+# restriction. They are called behind `Base.inferencebarrier`, as the
+# element variants of the position kernels are (`with_nodes`), so that
+# building a cell or vertex set's schedule does not compile them.
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
                       P::Integer, regrid::Bool=false, low::Bool=false,
                       shift::Integer=0) where {T}
@@ -997,7 +1000,9 @@ function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
             "an element stencil asked for with stagger $c, low = $low, shift = " *
             "$shift; element sets are cell-like, with no symmetric wall and no " *
             "rotating seam, so this is a bug")
-        return element_stencil(T, N, G, kind, δd, od, Int(P), regrid)
+        S = Stencil1D{T,Vector{Int32},Matrix{T}}
+        return Base.inferencebarrier(element_stencil)(T, N, G, kind, δd, od, Int(P),
+                                                      regrid)::S
     end
     kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift)
     kind === :restrict &&

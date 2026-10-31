@@ -913,12 +913,14 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     W = lanes !== nothing ? Int(lanes) : backend isa CPU ? 1 : fold_lanes(R)
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    nodes = element_offsets(backend, T, fs.P)
     levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
     partials = allocate(backend, R, (W, n))
-    launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
-                     spacings, nodes, levels, tags, first(vars), Val(D), Val(g),
-                     Val(staggers(fs)), Val(forest.N), Val(NV), Val(W); ndrange=(W * n,))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
+                         spacings, nodes, levels, tags, first(vars), Val(D), Val(g),
+                         Val(staggers(fs)), Val(forest.N), Val(NV), Val(W);
+                         ndrange=(W * n,))
+    end
     if W == 1
         synchronize(backend)
         return tohost(vec(partials))
@@ -1116,6 +1118,13 @@ function element_quadrature(f, ::Type{R}, array, fs::FieldSet{T,D}, g::NTuple{D,
     return _block_fold(rf, +, zero(R), array, fs, g, vars, nothing)
 end
 
+# `element_quadrature` behind `Base.inferencebarrier`, for the callers
+# that branch on `fs.P` at run time: inferred, the element branch would
+# compile a second fold kernel for every cell or vertex set's norm and
+# mass (see `with_nodes`).
+element_quadrature_barrier(f, ::Type{R}, args...) where {R} =
+    Base.inferencebarrier(element_quadrature)(f, R, args...)::Vector{R}
+
 # The two sums of a finite `p`-norm over one field set: `Σ hᴰ |u|^p` over
 # its cells, or for an element set (M16) the GLL quadrature of `|u|^p`,
 # and its domain volume times `nvars`.
@@ -1138,8 +1147,8 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     else
         # The nodes are not equally spaced, so each gets its quadrature
         # weight: the norm the summation-by-parts property holds in.
-        values = element_quadrature(x -> abs(x)^q, R, statearray(u, fs), fs,
-                                    ntuple(_ -> 0, D), 1:(fs.nvars))
+        values = element_quadrature_barrier(x -> abs(x)^q, R, statearray(u, fs), fs,
+                                            ntuple(_ -> 0, D), 1:(fs.nvars))
         combine_blocks(+, zero(R), fs, values, cellvolume)
     end
 
