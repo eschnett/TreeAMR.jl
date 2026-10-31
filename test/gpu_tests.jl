@@ -678,6 +678,121 @@ end
     @test total_mass(fs) ≈ before rtol = gputol(T, 256)
 end
 
+@testset "$bname: an element set fills and regrids exactly on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
+    # M16 on the backend: the one-stage fill writes every face ghost,
+    # exact for data of degree P-1 (a coarse ghost's R loses a degree),
+    # the hook's at the outer faces included, and no edge or corner ghost;
+    # the regrid refines and coarsens data of degree P exactly, from owned
+    # points only; and the GLL mass is the polynomial's integral
+    # throughout. The node offsets go to the backend beside the origins,
+    # so every position kernel reads them there. The callbacks capture
+    # integers only, and form every constant from `x`.
+    P, N = 3, 8
+    ops = Operators(family=ElementLocal)
+    forest = Forest{T}(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (zero(T), one(T)), D))
+    for _ in 1:2
+        refine!(forest, first(forest.leaves))
+        balance!(forest)
+    end
+    poly(deg) = (x, v) -> begin
+        acc = oftype(x[1], v)
+        for d in 1:D
+            acc += (x[d] + oftype(x[1], d))^deg
+        end
+        acc
+    end
+    fs = FieldSet{T}(forest, 1; G=1, centering=elementcentered(D), P=P, backend=backend)
+    sched = GhostSchedule(fs, ops)
+    fs.work .= T(NaN)
+    f = poly(P - 1)
+    fill_by_coordinates!(f, fs)
+    fill_ghosts!(fs, sched; boundary=boundary_by_coordinates(f))
+    work = Array(fs.work)
+    worst, edges = zero(T), true
+    for b in 1:nblocks(fs), I in CartesianIndices(ntuple(_ -> N + 2, D))
+        i = Tuple(I)
+        if count(d -> !(2 <= i[d] <= N + 1), 1:D) >= 2
+            edges &= isnan(work[i..., 1, b])
+        else
+            worst = max(worst, abs(work[i..., 1, b] - f(coordinates(T, fs, b, i), 1)))
+        end
+    end
+    scale = T(1 + D * (D + 1)^(P - 1))
+    @test edges
+    @test worst < gputol(T) * scale
+
+    g = poly(P)
+    owned_error() = begin
+        w = Array(fs.work)
+        maximum(b -> maximum(I -> abs(w[(Tuple(I) .+ 1)..., 1, b] -
+                                      g(coordinates(T, fs, b, Tuple(I) .+ 1), 1)),
+                             CartesianIndices(ntuple(_ -> N, D))), 1:nblocks(fs))
+    end
+    integral = 1 + sum(d -> (big(d + 1)^(P + 1) - big(d)^(P + 1)) // (P + 1), 1:D)
+    scale = T(1 + D * (D + 1)^P)
+    fill_by_coordinates!(g, fs)
+    @test total_mass(fs) ≈ T(integral) rtol = gputol(T)
+    nb = nblocks(fs)
+    @test regrid!(forest, fs => sched; flags=fill(Refine, nb))
+    @test nblocks(fs) == 2^D * nb
+    @test owned_error() < gputol(T) * scale
+    @test total_mass(fs) ≈ T(integral) rtol = gputol(T)
+    @test regrid!(forest, fs => GhostSchedule(fs, ops); flags=fill(Coarsen, nblocks(fs)))
+    @test nblocks(fs) == nb
+    @test owned_error() < gputol(T) * scale
+    @test total_mass(fs) ≈ T(integral) rtol = gputol(T)
+end
+
+@testset "An element set's groups launch flat as they do shaped, bit for bit: D=$D" for
+        D in (2, 3)
+    # A device launches an element set's transfers flat, over the full
+    # sum; the CPU launches them shaped, and skips the taps of the unit
+    # rows of I at the faces (and the centre node of an even P). Every
+    # group of an element fill, the mirrored copies at a reflecting wall
+    # included, and of the regrid's refining and coarsening, run both
+    # ways from the same finite data, must agree in every bit, or a device
+    # and the CPU would disagree on an element set.
+    rng = Xoshiro(20261030 + D)
+    P, N = 2, 6
+    ops = Operators(family=ElementLocal)
+    forest = Forest(ntuple(_ -> 2, D); N=N, reflecting=ntuple(d -> (d == 1, false), D),
+                    extents=ntuple(_ -> (0.0, 1.0), D))
+    for _ in 1:2
+        refine!(forest, first(forest.leaves))
+        balance!(forest)
+    end
+    parity = [ntuple(d -> d == 1 ? OddParity : EvenParity, D), ntuple(_ -> EvenParity, D)]
+    fs = FieldSet(forest, 2; G=1, centering=elementcentered(D), P=P, parity=parity)
+    data = finite_fill!(rng, similar(fs.work))
+    launch(dest, group; flat) = begin
+        fill!(dest, 0)
+        TreeAMR.run_group!(dest, data, group, fs.nvars, TreeAMR.CPU(); flat=flat,
+                           factors=fs.factors, rotvars=fs.rotvars)
+        copy(reinterpret(UInt64, vec(dest)))
+    end
+    nsingle = nmirror = 0
+    groups = Any[GhostSchedule(fs, ops).phase1...]
+    old = copy(forest.leaves)
+    for flag in (Refine, Coarsen)
+        new = complete_marks(forest, fill(flag, nleaves(forest)))
+        append!(groups, TreeAMR.transfer_groups(Float64, forest, fs.G, staggers(fs), old,
+                                                new, ops, TreeAMR.CPU(); P=P))
+    end
+    @test Set(g.kind for g in groups) == Set((:copy, :prolong, :restrict))
+    for g in groups
+        dest = similar(data, size(data)[1:(D + 1)]...,
+                       max(maximum(g.targetblocks), size(data, D + 2)))
+        nsingle += any(s -> any(!iszero, s.single), g.stencils)
+        nmirror += g.factorcol != 0
+        full = launch(dest, full_sum(g); flat=false)
+        @test launch(dest, g; flat=false) == full
+        @test launch(dest, g; flat=true) == full
+    end
+    @test nsingle > 0                              # the one-tap path was taken
+    @test nmirror > 0                              # and the mirrored copies
+end
+
 @testset "$bname: the volume-weighted norm agrees with the CPU: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The device reduction folds each block over 256 lanes; the CPU one
