@@ -4223,9 +4223,9 @@ M12 was decided with Erik, after M7 and before M9b.
   and 5m36 with TreeIOHDF5's branch) pass against it unchanged
   (2026-10-31).
 
-  *Left for the release.* The release itself, 0.2.7, additive, and
-  TreeIOHDF5's with 0.2.7 appended to its `[compat]`, which are Erik's to
-  tag.
+  The version is 0.2.7, additive. `FieldSet` and `GhostSchedule` gain
+  the field `P`, which TreeIOHDF5 reads, so its release accepts `=0.2.7`
+  only.
 
 ## Downstream checks
 
@@ -4342,5 +4342,5 @@ outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
 0.2.3 (2026-10-16) raised the Julia floor to 1.13, 0.2.4 carries the
-nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), and 0.2.6 the folds over points (M15). The repository keeps no changelog; the release commit says what
+nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), 0.2.6 the folds over points (M15), and 0.2.7 the element centering (M16). The repository keeps no changelog; the release commit says what
 changed.
