@@ -4,8 +4,8 @@ TreeAMR.jl implements a tree-based (octree-style) AMR discretization for
 Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
-**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13, M14 and M15
-are done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+**Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13, M14, M15
+and M16 are done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -156,7 +156,10 @@ complement of the `x`-face. `cellcentered(D)`, `vertexcentered(D)`,
 rather than an enumeration of the `2^D` cases because of the
 tensor-product structure everything rests on: every transfer is a product
 of `D` one-dimensional stencils, and the stencil for dimension `d`
-depends on the centering *in that dimension* alone.
+depends on the centering *in that dimension* alone. A third kind,
+`:element`, holds the Gauss–Lobatto nodes of a discontinuous Galerkin
+element; it is all-or-nothing across the dimensions, and is described
+under *The element centering* at the end of this section.
 
 **Shared points and half-open ownership**. A vertex-like
 dimension's boundary points are shared — block `b`'s point `N` is the
@@ -416,6 +419,84 @@ study survives verbatim in `test/wave_cell_tests.jl` saying
   slices; the D = 1 periodic cycle also regrids and transfers, and the
   D = 2 non-periodic one exercises the boundary hook on the upper
   boundary plane that belongs to nobody.
+
+**The element centering** (`elementcentered(D)`, M16) serves
+element-local discontinuous Galerkin schemes such as Miller and
+Schnetter's operator-based local DG (OLDG, arXiv:1604.00075), which
+TreeWaveOLDG runs. Per dimension a block holds `N/(P+1)` elements of
+`P + 1` Gauss–Lobatto–Legendre (GLL) nodes each, and both face nodes of
+every element are stored, so a position on an element face carries two
+values, one per side. The order `P` is a property of the field set — the
+`FieldSet` field and keyword `P`, required for an element set, refused
+for any other, and `0` for a set without elements — because it is the
+scheme's order, which the mesh cannot know, and every position, weight
+and operator of the set follows from it. `:element` is accepted only in
+every dimension at once: an element is a tensor product of nodes, and
+its operators move whole elements between levels.
+
+- *It stores and owns as a cell-centered set does.* `staggers` gives
+  `c = 0`, so an element set has `N` owned points per dimension and no
+  shared plane, and the state layout and every named range are
+  unchanged. The price is that the arithmetic cannot tell the two apart,
+  so **`P` is passed explicitly** to everything that builds a stencil or
+  a position (`GhostSchedule(…; P)`, `kind_stencil(…; P)`,
+  `regrid_stage`, `transfer_groups`), with no default where a forgotten
+  `P` would build cell-centre stencils for Gauss–Lobatto nodes without a
+  word.
+- *Every position goes through `nodeposition(origin, h, I, c, nodes)`.*
+  `coordinates`, both `fill_by_coordinates!` kernels, the four
+  boundary-hook kernels, the flagging sweep of `firing_boxes` and the
+  fold kernel all call it, and no other function forms a position from
+  an index, so that a site which misses the element case fails rather
+  than computing cell centres. With `nodes === nothing` it is the
+  equally spaced expression, `origin + (I − ½)h` or `origin + (I − 1)h`,
+  `I` the owned index, bit for bit what these positions always were. For
+  an element set owned point `I` is node `i = (I − 1) mod (P+1)` of
+  element `q = (I − 1) ÷ (P+1)`, at `origin + h(q(P+1) + oᵢ)` with the
+  offset `oᵢ = (P+1)(1 + ξᵢ)/2`, which is how TreeWaveOLDG forms it. The
+  face offsets are `0` and `P + 1` exactly, so the two face nodes at one
+  position get the same bits, within a block and across blocks. A ghost
+  sits **at the face**, on the other side of it: `origin` below,
+  `origin + Nh` above. The offsets are a small array on the backend,
+  uploaded per call beside the origins and spacings and kept by the
+  `BoundaryPlan` for the hooks: `P` is a run-time value, and a tuple of
+  run-time length would be neither inferable nor kept in registers on a
+  device.
+- *Weights.* `volume_weighted_norm` and `total_mass` weight a node by the
+  GLL tensor product, `(P+1)ŵᵢ/2` per dimension times the block's `hᴰ`,
+  through `_block_fold` with a reduction that carries the weights,
+  combined by `combine_blocks`, which stays the only site. The norm is
+  then the one the scheme's summation-by-parts property holds in, exact
+  for integrands of degree up to `2P − 1` per dimension and not `2P`.
+- *Faces only.* The ghost fill writes the one plane across each face of a
+  block and **never an edge or corner ghost**. Along a dimension in
+  which the region's direction is nonzero, an edge or corner ghost of a
+  block beside a coarser one can land on an element face inside that
+  block, where two values are stored, and element-local schemes never
+  read one. Those ghosts keep whatever they held, so a kernel that reads
+  them, under `map_blocks!(…; stored = true)` say, reads stale data. How
+  the faces are filled is under "Element sets are filled in one stage"
+  in [Ghost filling](#ghost-filling) and in the element-local family under
+  [Operators](#operators).
+- *Refused, each with its reason:* `P < 1`, since an element stores both
+  of its face nodes; a ghost width above 1, since the ghost sits at the
+  face and a second layer would lie inside the neighbour's element,
+  where no ghost is defined; `N` not a multiple of `2(P+1)`, since a fine
+  block spans `N/2` points of its parent and must cover whole parent
+  elements; a forest with a rotating seam, quarter or half turn, and so
+  a `RotationPair`, since the seam's transfers are turned copies of the
+  cell and vertex stencils and the element operators have no turned
+  form; an `InterfaceSchedule`, since a conservative element scheme needs
+  mortar fluxes, which it does not build; and `interpolate`, inside its
+  collective checks, since Gauss–Lobatto nodes need a basis of the
+  element's polynomial (**(open)**, see [Open questions](#open-questions)).
+  The boundary hooks are supported, at the face positions: refusing them
+  would keep an element set out of every `regrid!` and
+  `adapt_to_initial_data!` call that passes a hook for its other sets.
+
+Nothing here obstructs the conforming multi-block forest: an element set
+couples across faces only, through what amounts to a mortar, which is
+how multi-block DG codes are built.
 
 ### Tree structure
 
@@ -749,6 +830,26 @@ A generic storage type alone is too weak, since fp64 is exactly what a device ma
   correct rounding on the way out, since `T(::Rational{BigInt})` divides
   through `BigFloat` instead of rounding numerator and denominator to `T`
   first.
+- **The element tables are built in `BigFloat` and rounded once.** The
+  Gauss–Lobatto nodes of the element centering are irrational from
+  `P = 3` on, so its tables (`element_tables` in `src/elements.jl`: the
+  nodes and weights, the node offsets, the per-node quadrature weights,
+  the two halves of `I`, `R` and the coarsening, see
+  [Operators](#operators)) are built in 512-bit `BigFloat` and rounded
+  once into the working type, memoised per `(P, T)` under the lock of
+  the Lagrange tables. Every type rounds from the same `BigFloat`
+  tables. The nodes come from the algorithm and the precision of
+  TreeWaveOLDG's `gll_nodes_weights`, so that the two packages place
+  every node at the same bits (checked for `P = 1 … 8` in `Float64` and
+  `Float32`). They are symmetrized, with the face nodes set to `±1` and
+  the centre node of an even `P` to `0`, and a Lagrange product at a
+  node is a product of exact factors, so the exact `0` and `1` entries
+  of `I` — its face rows, and its centre row for an even `P` — stay
+  exact, and `Stencil1D`'s `unit` and one-tap paths still apply. The
+  coarsening's Legendre moments use the `(P+1)`-point Gauss rule, exact
+  for their degree-`2P` products. `M_c R = Iᵀ M_f` holds to `1e-140` in
+  `BigFloat` and to `8 eps(T)` after rounding to `Float64`, `Float32`
+  and `Float32x2`.
 
 Two things this bought beyond portability. The conservative family's
 defining property — the two subcell weight vectors average to the unit
@@ -830,6 +931,26 @@ the coarse source block's own ghosts, which may themselves be
 prolongated from a still-coarser block (levels l−2, l−1, l side by side
 are legal under 2:1 balance). Each phase/sweep step is an embarrassingly
 parallel loop over blocks, with barriers in between.
+
+**Element sets are filled in one stage** (M16, *The element centering*
+under [Centerings](#centerings)). A cell or vertex prolongation needs
+the sweep because it reads its coarse source's ghosts. An element
+prolongation reads the coarse element's nodes, owned points only, and
+every element transfer writes only ghosts, which is phase 1's
+invariant. So an element set's prolongations run in phase 1 with its
+copies and restrictions: the fill is one stage and one message round,
+and `phase2` and `levels` are empty. `transfer_stage(key, P)` is the one
+place a transfer's stage is decided; the local groups, the messages and
+`stage_groups` all ask it. The schedule builder drops every direction
+but the `2D` faces for an element set, one filter that covers the local
+search, the transfers sent for other ranks' blocks and the hook regions.
+The hook runs after phase 1, which is now after every transfer, and the
+nearest evolved point of a relative hook's face region is the block's
+own. Reflecting and outflow faces need nothing new: with faces only a
+wall is a self-copy whose tangential stencil is the identity, its rows
+mirrored or clamped onto the face node — at a low wall `j* = 2G + 1 −
+j` takes the one ghost to the face node, so an odd variable's ghost is
+`−ψ` there and the face average vanishes.
 
 **Levels that do not depend on each other run together.** The sweep's
 order matters only where a level-`ℓ` prolongation reads a point that
@@ -1634,6 +1755,36 @@ did, plus the flag (11312 B a uniform fill against 10896). Compilation
 is 65.4 s against 63.0, within its noise, and the workload's output is
 unchanged.
 
+**Element-only code goes behind a barrier, on the CPU too.** The same
+effect made the element centering (M16) compile about 5 % more of the
+serial `test/mpi_workload.jl` on its cell and vertex sets alone, for
+two reasons: the `BoundaryPlan` held the node offsets as `nothing` or a
+vector, so `GhostSchedule(fs, ops)` inferred as a `Union` of two schedule
+types and every caller of a schedule was compiled for both; and every
+run-time branch on `P` — the offsets passed to the position kernels as
+a `Union{Nothing,Vector}`, `kind_stencil`'s `element_stencil`, the GLL
+quadrature of the norm and the mass — compiled the element variant
+beside every cell and vertex launch. Hence two rules. **A schedule's
+type does not depend on `P`**: the plan always holds a vector, empty
+without elements, and an `@inferred` test checks that the schedule's
+type is the same for every layout. **Element-only code is reached
+through `Base.inferencebarrier`**, with its result type-asserted: the
+offsets (`with_nodes`, which passes a set without elements an inferred
+`nothing`), `element_stencil`, `element_quadrature` and
+`element_tables`. An element set pays one dynamic dispatch per launch,
+on the CPU as well, and its variants compile when an element set first
+reaches them; the cell and vertex path stays type-stable and takes no
+barrier. Measured on an Apple M3 Pro under Julia 1.13 with
+`--trace-compile-timing`, serially, in three alternating rounds:
+`main`'s workload, which has no element set, compiles in 47.9, 47.4 and
+47.3 s against this package and in 47.1, 46.1 and 46.5 s against
+`main`'s, about 2 % more. The remainder is the `P` keyword of
+`kind_stencil` (304 ms → 324 ms) and small amounts of inference. The
+workload with its element section, three element sets with their fills,
+folds and regrids, compiles in 50.6–51.7 s and runs in 49.7–50.8 s
+([HISTORY.md](HISTORY.md#the-copy-kernels-on-a-device) has the numbers
+before the barriers).
+
 **What the stage groups and the one-tap nest cost to compile.** The
 serial `test/mpi_workload.jl` of 0.2.3 compiles in 82.3–82.6 s with 969
 compiled roots against that release (one EPYC 7543, Symmetry job
@@ -2140,6 +2291,66 @@ divergence-preserving prolongation that is not a tensor product; an edge
 potential `A`, transferred conservatively, gives `B = curl A`
 divergence-free by construction.
 
+**The element-local family** (`ElementLocal`, M16) is the one family of
+an element set (*The element centering* under
+[Centerings](#centerings)), and no other set takes it:
+`check_operators(N, G, centering, P, ops)` requires it exactly for
+element sets, both ways, since an equally spaced family would
+interpolate Gauss–Lobatto nodes as if they were equally spaced and the
+element family has no operators for equally spaced data. It takes no
+orders. `Operators(family = ElementLocal)` checks for the family before
+the missing-order check and refuses `prolongation`, `restriction`,
+`bounded` and `vertex_prolongation`: every operator follows from `P`,
+which is the set's, and bounding one would break the compatibility
+below. `ghost_layers_read` is 0 for it. The operators are tensor
+products of one-dimensional ones as for every family, so `Stencil1D` and
+the transfer kernel are unchanged; only the weights are new, and how
+they are built is under [Precision](#precision).
+
+- *Normal to the face*, for every kind of transfer — copy, prolongation
+  and restriction — the ghost is the neighbour's face-adjacent owned
+  plane: injection, the copy's stencil whatever the two levels. The ghost
+  sits at the face and so does that plane, on the other side; the two
+  face nodes are one point, and the ghost takes the neighbour's value
+  there.
+- *Tangentially*, a copy is the identity. A fine ghost from a coarser
+  neighbour is `I`, the coarse element's degree-`P` polynomial at the
+  fine nodes: a row of width `P + 1`, **exact to degree `P`**. A coarse
+  ghost from finer neighbours is the lumped compatible restriction
+  `R = M_c⁻¹ Iᵀ M_f`, `R[k, j] = ŵⱼ ℓₖ(ξⱼ′)/(2ŵₖ)` over the `2(P+1)`
+  nodes of the two fine elements that cover coarse element `k`'s,
+  `ξⱼ′` a fine node in the coarse element's coordinate: width `2(P+1)`,
+  conserving `Σŵu`, and **exact to degree `P − 1`, not `P`**.
+- In 1D the face is a point and all three kinds are injection, exact for
+  any data.
+- Every window lies inside the source's owned range — the operators read
+  whole elements, and `N mod 2(P+1) = 0` keeps those inside a block —
+  which is asserted when the stencil is built, and is what makes every
+  element transfer phase 1's ([Ghost filling](#ghost-filling)).
+
+*Why the coarse ghost is `R`.* An element-local summation-by-parts
+derivative is `D_d = d − ½(b − F)` per element, `F` the coupling to the
+neighbouring element's face values. The own-element part `W(d − ½b)` is
+skew by the GLL summation-by-parts property, so the energy
+`E = ½Σw(v² + Σ_d (D_d u)²)` is an exact invariant of the semi-discrete
+system when the coupling blocks across every face satisfy
+`W_c D_cf = −(W_f D_fc)ᵀ`. Across a coarse-fine face normal to `d`, with
+the face quadratures `M_c` and `M_f` (the tensor GLL weights of the
+tangential dimensions), the fine side reads the coarse values through
+`I` and the coarse side the fine ones through `R`, and the condition
+becomes `M_c R = Iᵀ M_f`: the coarse ghost is the adjoint of the fine
+one in the GLL inner products. Given `I`, that defines `R`; any other
+coarse ghost, the exact `L²` projection included, breaks the skew
+symmetry and the energy argument with it. The price is one degree
+tangentially. The same `R` serves a field's exchange and that of each
+of its gradients. The tests check the adjoint identity
+`Σ W_c c g_c = Σ W_f f g_f` across every coarse-fine face to `1e-14`
+relative. A regrid coarsens by the exact projection instead
+([Regridding](#regridding)). **(open)** Whether the coarse ghost's
+degree `P − 1` costs a scheme accuracy in `D ≥ 2` is TreeWaveOLDG's to
+measure; if it does, a degree-preserving compatible operator through a
+finer mortar is the remedy.
+
 ### Conservation at coarse-fine faces
 
 With a global timestep, conservation requires only that the flux a
@@ -2450,6 +2661,22 @@ any field; that family is verified exactly
 conservative for random data under random regrids where the point-value
 family drifts at the percent level.
 
+**Element sets** (M16) refine by `I`, the coarse element's polynomial at
+the fine nodes, and coarsen by the exact `L²` projection of the two fine
+elements' polynomials onto the coarse element's, evaluated at its nodes
+(width `2(P+1)`; `kind_stencil(…; regrid = true)`). Both are exact to
+degree `P`, the coarsening is a left inverse of the refinement, and both
+conserve the GLL `total_mass` for any data. The coarsening is
+deliberately not the ghost fill's `R` ([Operators](#operators)): `R`
+exists for the energy argument across a face, energy is not conserved
+across a regrid anyway, and `R` would lose a degree for nothing. Both
+read owned points only, so an element set is **not filled before its
+transfer** and needs no hook there. The choice is the layout's, and `P`
+is part of the layout every rank agrees on in `check_regrid_set!`, so no
+rank waits in a fill that the others skip. `adapt_to_initial_data!`
+evaluates the initial data at the nodes, so it ends with data equal to
+the initial data there bit for bit.
+
 **Initialization** iterates the same machinery: fill initial data →
 flag → regrid → *re-evaluate* the initial data on the new mesh (rather
 than prolongating it) → repeat until the hierarchy stops changing.
@@ -2646,6 +2873,12 @@ which is 0 serially (see [Distributed meshes](#distributed-meshes)).
 Over a distributed forest an outside point is found on the host before
 anything is routed, and refused on every rank there, rather than after
 the launch. A device batch goes through the host for the messages.
+
+An element set (M16) is refused in `check_interpolation`, inside the
+collective checks: the stencil above is built for a uniform, continuous
+stored index, and Gauss–Lobatto nodes need a basis that maps a position
+to its element's nodes and evaluates the element's polynomial
+(**(open)**, see [Open questions](#open-questions)).
 
 ### Folds over points
 
@@ -4818,8 +5051,12 @@ The ideas that span several files and are easy to violate:
   copy kernels on a device"). Keep the CPU launch path type-stable, and
   hide unavoidable unions behind `Base.inferencebarrier` on the device
   path only (a barrier or a closure on the CPU path raises the fill's
-  allocation). Compare `--trace-compile-timing` of `test/mpi_workload.jl`
-  against `main` for any change to a launch path.
+  allocation). The exception is element-only code, which sits behind a
+  barrier on every path so that cell and vertex sets compile none of it,
+  and for the same reason a schedule's type must not depend on `P`
+  ("Element-only code goes behind a barrier"). Compare
+  `--trace-compile-timing` of `test/mpi_workload.jl` against `main` for
+  any change to a launch path.
 - **The copy kernels launch flat on a device, shaped on the CPU**
   (see "The copy kernels on a device"). `transfer_kernel!`,
   `scatter_kernel!` and `gather_kernel!` take a `shape` first and read
@@ -4845,7 +5082,9 @@ The ideas that span several files and are easy to violate:
   stages, decided per rank by `stage_groups` from the boxes each level
   writes and reads; anything new that a phase-2 stage writes or reads
   there — a transfer kind, a hook that runs after a stage — has to be
-  among those boxes, or levels that depend on it will run together.
+  among those boxes, or levels that depend on it will run together. An
+  element set's prolongations are phase 1's, so its fill is one stage;
+  `transfer_stage` is the one place that decides.
 - **Reflecting and outflow faces are transfers, not hooks** (M10). The
   kind of each face is a property of the `Forest` (`faces`, read
   through `reflecting_faces`, `outflow_faces` and `facekind`), `parity` a
@@ -4914,7 +5153,17 @@ The ideas that span several files and are easy to violate:
   the right one follows from the application's differencing order (the
   interface-order rule: `p` must exceed it by two, for *both* operators). Do
   not add one. `check_operators` ties the orders to `N` and `G`; the
-  constraints are listed under [Blocks](#blocks).
+  constraints are listed under [Blocks](#blocks). A third family,
+  `ElementLocal`, belongs to element sets only and takes no orders
+  ([Operators](#operators)).
+- **Element sets are filled on faces only, and know their order** (M16,
+  *The element centering* under [Centerings](#centerings)). An element
+  set's edge and corner ghosts are never written, so nothing may read
+  them, and a test helper that checks every ghost after a fill must
+  skip them. An element set stores as a cell-centered one, `c = 0`, so
+  nothing but `P` tells the two apart: pass `P` explicitly to whatever
+  builds a stencil or a position, and form every position through
+  `nodeposition`, never from the index directly.
 - **Interiors-only state vector.** An RHS is `scatter!` → `fill_ghosts!` →
   `map_blocks!`, with kernels writing `du` in state layout via `statearray`.
   `u` is never mutated; the working array is scratch. There is deliberately
@@ -5131,10 +5380,15 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   keywords;
 - the fields it reads: of a `Forest`, `N`, `roots`, `periodic`,
   `extents`, `leaves` and `comm`; of a `FieldSet`,
-  `work`, `nvars`, `G`, `centering`, `walls`, `parity`, `rotation`,
-  `halfturn` and `forest` (`walls` since AMR-8, `halfturn` since M14: a
-  checkpoint saves them, and a restart rebuilds the set with them);
-  of a `MortonKey`, `root`, `level` and `coords`.
+  `work`, `nvars`, `G`, `centering`, `P`, `walls`, `parity`, `rotation`,
+  `halfturn` and `forest` (`walls` since AMR-8, `halfturn` since M14,
+  `P` since M16: a checkpoint saves them, and a restart rebuilds the set
+  with them; `centering` may then be `elementcentered(D)`, all
+  `:element`, which `FieldSet` accepts only together with `P`);
+  of a `MortonKey`, `root`, `level` and `coords`. A `GhostSchedule`
+  carries the order too, as the field `P`, which `fill_ghosts!` and
+  `regrid!` compare against the set's; its forest form takes the keyword
+  `P`, `0` (no elements) by default.
 
 Beside these it uses the validated `leaves` keyword of `Forest`, which
 is exported API. A change to any name or field above is a change to the
@@ -5144,7 +5398,8 @@ which companion releases go with it.
 ## Tests
 
 `test/runtests.jl` holds the M1 tests inline and `include`s
-`ghost_tests.jl`, `centering_tests.jl`, `reflect_tests.jl` (M10),
+`ghost_tests.jl`, `centering_tests.jl`, `element_tests.jl` (M16),
+`reflect_tests.jl` (M10),
 `outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14,
 which uses `rotate_tests.jl`'s helpers),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
@@ -5199,8 +5454,38 @@ from `threadchunks`; it also asserts that a stage limiter's correction
 never reaches the state (the drift of a conserved total is the step
 limiter's injection) and that OrdinaryDiffEq's Shu–Osher SSPRK33 is
 different there. Its names clash with OrdinaryDiffEq's (`RK4`,
-`SSPRK33`), so it uses `import IMEXRungeKutta as IRK`. Seven helper
-files are not tests:
+`SSPRK33`), so it uses `import IMEXRungeKutta as IRK`.
+
+`element_tests.jl` holds the element centering's own tests (M16): the
+tables against closed forms for `P ≤ 4`, each table's exactness and
+`M_c R = Iᵀ M_f` in `BigFloat` and after rounding; the centering, its
+refusals and the element family's; a schedule whose type is the same
+for every layout, under `@inferred`; every position at its node bit for
+bit, and every equally spaced position as before; the GLL norm and
+mass; and the fill against an oracle of its own (`element_oracle`),
+which finds the blocks across each face by `neighbor_keys` and
+evaluates the Lagrange polynomials and the GLL quadrature at the
+positions `coordinates` gives, without the package's stencils. From a
+`NaN` prefill every face ghost is its rule's value and every edge and
+corner ghost is still `NaN`; fine ghosts are exact for `Q_P` data and
+coarse ones for `Q_{P−1}` and not `Q_P`; the adjoint identity holds
+across every coarse-fine face; the regrid is exact for `Q_P` both ways
+and coarsening undoes refining for any data. The element cases in the
+other files: `exchange_tests.jl` (every transfer in the one phase-1
+stage on every rank, the lockstep fill bit for bit, the mailbox driver
+under the phase-1 tag), `regrid_exchange_tests.jl` (the regrid stage
+over 1–7 ranks, and `regrid!` beside a cell set with a hook),
+`type_tests.jl` (`Float64`, `Float32` and `Float32x2`), `gpu_tests.jl`
+(the fill and the regrid on every backend, and every element group
+flat and shaped bit for bit, the one-tap path and the mirrored copies
+included), `thread_workload.jl` (three element cycles) and
+`mpi_workload.jl` (three element sets, with a `#` line counting the
+prolongations received across ranks and the refusal of an element
+order that differs on one rank only; `mpi_tests.jl` asserts the one
+stage, the conserved mass, the received prolongations and the refusal,
+and counts 24 changing regrids).
+
+Seven helper files are not tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
   reference implementations (bit-plane Morton comparison, exact `Rational`
@@ -5261,8 +5546,8 @@ files are not tests:
   ODE package) so a subprocess starts in a couple of seconds; keep it that
   way, and keep everything it prints deterministic. Its cycles cover
   periodic and outer boxes, both centerings, reflecting walls (`…r`),
-  rotating quadrants with a `RotationPair` fill (`…q`, M12) and the
-  conservative Burgers cycle (`B…`).
+  rotating quadrants with a `RotationPair` fill (`…q`, M12), the
+  conservative Burgers cycle (`B…`) and element sets (`E…`, M16).
 - `mpi_workload.jl` — the M7 counterpart, standalone too: the argument
   `mpi` makes its forests distributed over `MPI.COMM_WORLD`, and rank 0
   prints the digests gathered in block order. `mpi_tests.jl` also runs
@@ -5610,77 +5895,25 @@ Remaining, none blocking before their milestone:
   machine at 6 threads (960 blocks of `16³`, a 63 MB state) the RHS is
   most of a step and the two integrators are within 6 %; it is the
   Symmetry run that will say what the serial passes cost there.
-- **Element-local DG stencils (proposed).** Miller and Schnetter's
-  operator-based local discontinuous Galerkin method (OLDG,
-  arXiv:1604.00075) replaces a finite-difference derivative by a DG one
-  without touching the equations. It is a stencil with non-constant
-  coefficients over elements of `P + 1` Gauss–Lobatto nodes. Both face
-  nodes of every element are stored, so each face position carries two
-  values, one per side. The derivative at a node reads its own element
-  and, at the two face nodes only, the neighbouring element's face node
-  at the same position: one ghost layer. A second derivative applies the
-  operator twice through an auxiliary first-derivative field, which
-  needs its ghosts filled in between (or `G = P + 2` and the auxiliary
-  field computed in the ghost element too). Filtering and truncation are
-  modal and element-local, and time stepping is the method of lines with
-  a global `dt ∼ h/(P+1)²`: all the application's.
-  - *What fits today.* A block holds `E = N/(P+1)` elements per
-    dimension; one element a block would break "`N` even" and cost a
-    tree node per element. The node-duplicated layout owns as a
-    cell-centered dimension does — `N` points, no shared plane, the
-    state layout `N^D` — and at `G = 1` the existing exchange already
-    delivers OLDG's outside value: a same-level copy puts the
-    neighbour's first owned node, its low face node, into ghost
-    `N + G + 1`; the reflecting mirror `j* = 2G + 1 − j` maps ghost `G`
-    onto the face node (an odd variable's ghost is then `−ψ`, so the
-    face average is zero); an outflow copy gives `ψ* = ψ`, no penalty.
-    Faces between elements inside a block need no exchange. So an
-    application can run OLDG on an *unrefined* forest now, with
-    `cellcentered(D)`, `G = 1`, operators that never run, and its own
-    node positions, since `coordinates` reports uniform ones.
-  - *What a refined forest needs.* A per-dimension Gauss–Lobatto
-    centering beside `:cell` and `:vertex` ([Centerings](#centerings)),
-    with `P` a field-set property: `coordinates`,
-    `fill_by_coordinates!` and `boundary_by_coordinates` at the nodes,
-    `volume_weighted_norm` with the quadrature weights (the norm the
-    summation-by-parts property holds in), and the invariant that a
-    fine block covers whole parent elements, `N` divisible by
-    `2(P + 1)`. An operator family local to an element
-    ([Operators](#operators)), still a tensor product of
-    one-dimensional operators: prolongation evaluates the coarse
-    element's degree-`P` polynomial at the fine nodes, exact to degree
-    `P` and reading no ghosts; restriction cannot be injection, since a
-    coarse node is not a fine one, and is the `L²` projection of the
-    two fine polynomials, which keeps `∫ψ`. The interface-order rule
-    then costs nothing: both are exact to the element's degree. At a
-    coarse-fine face the ghost is injection normal to the face and that
-    element-local interpolation or projection along it. `Stencil1D`
-    and the transfer kernel need no change — a per-target start and
-    weight column of width `P + 1` is what they carry already — but
-    the weights do: the nodes are irrational from `P = 3`, so the
-    exact rational construction ([Precision](#precision)) becomes a
-    `BigFloat` one, still rounded once. `interpolate` needs a basis
-    that maps a position to the containing element's nodes; the
-    current extension point assumes a uniform continuous stored index
-    ([Point interpolation](#point-interpolation)).
-  - *The structural change* is in the schedule builder. A point belongs
-    to the block whose half-open box contains it, and a coarse-fine
-    ghost is placed by its distance from the face. An OLDG ghost sits
-    *at* the face, on the other side of the discontinuity, so which
-    side's value it takes has to become part of how a ghost names its
-    source.
-  - *Not settled by the mesh.* The paper's summation-by-parts argument
-    assumes conforming element faces. At a coarse-fine face the
-    neighbour's value is interpolated, which is consistent but may lose
-    the energy estimate; mortar projections that satisfy the
-    summation-by-parts compatibility condition are the known remedy.
-    The ghost operators at coarse-fine faces have to be tested for
-    stability, not only for order. A conservative system would further
-    need the mortar form of the interface restriction
+- **What the element centering leaves open** (M16). The design is
+  *The element centering* under [Centerings](#centerings), the
+  element-local family under [Operators](#operators), "Element sets are
+  filled in one stage" under [Ghost filling](#ghost-filling) and the
+  element sets under [Regridding](#regridding); how it came about is in
+  [HISTORY.md](HISTORY.md#m16--element-centering).
+  - *Point interpolation of an element set.* `interpolate` refuses one:
+    its stencil assumes a uniform, continuous stored index
+    ([Point interpolation](#point-interpolation)), and an element set
+    needs a basis that maps a position to its element's nodes and
+    evaluates the element's polynomial there.
+  - *A degree-preserving compatible coarse ghost.* `R` is exact to degree
+    `P − 1` tangentially ([Operators](#operators)). If that costs an
+    element scheme accuracy in `D ≥ 2`, which TreeWaveOLDG measures, a
+    compatible operator through a finer mortar would keep degree `P`.
+  - *A conservative element scheme* would need the mortar form of the
+    interface restriction
     ([Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces));
-    BSSN-like systems do not. `P` adaptivity is out of scope (`N` is
-    the forest's). Nothing here obstructs the multi-block forest: face
-    coupling by mortars is how multi-block DG codes are built.
-  - *Next step* is the unrefined prototype in an application, to judge
-    the method on its equations before the centering and the operator
-    family are built.
+    `InterfaceSchedule` refuses element sets until one asks. BSSN-like
+    systems do not need it.
+  - `P` adaptivity is out of scope: `P` is the field set's, and `N` the
+    forest's.

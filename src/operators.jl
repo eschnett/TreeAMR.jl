@@ -78,8 +78,9 @@ Every transfer reads owned points only, so the fill is one stage. A
 [`regrid!`](@ref) refines by `I` and coarsens by the exact `L²`
 projection, exact to degree `P`, conserving [`total_mass`](@ref), and a
 left inverse of the refinement. See [`ElementTables`](@ref
-TreeAMR.ElementTables) for the tables, and "Element-local DG stencils"
-in `CODE.md`.
+TreeAMR.ElementTables) for the tables, and in `CODE.md` *The element
+centering* under "Centerings" and the element-local family under
+"Operators", which has the energy argument.
 """
 ElementLocal
 
