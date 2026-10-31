@@ -5907,9 +5907,24 @@ Remaining, none blocking before their milestone:
     needs a basis that maps a position to its element's nodes and
     evaluates the element's polynomial there.
   - *A degree-preserving compatible coarse ghost.* `R` is exact to degree
-    `P − 1` tangentially ([Operators](#operators)). If that costs an
-    element scheme accuracy in `D ≥ 2`, which TreeWaveOLDG measures, a
-    compatible operator through a finer mortar would keep degree `P`.
+    `P − 1` tangentially ([Operators](#operators)), and in `D ≥ 2` that
+    costs an element scheme accuracy. TreeWaveOLDG measures about half an
+    order of its L∞ rate in 2D, and over a full period of a standing
+    mode at `P = 3` an L2 error 45 times the uniform coarse run's
+    (its `CODE.md`, "Refined forests"). `R` stays, for the exact energy
+    invariant (Erik, 2026-10-31); if the question is revisited, the two
+    alternatives on record are:
+    - the exact `L²` projection as the coarse ghost, which TreeWaveOLDG
+      tried in a scratch copy: order `P` back, but the energy is no
+      longer invariant and *grows* (up to `3e-5` in a quarter period),
+      a stability risk for long runs;
+    - an order-preserving, norm-compatible pair through a finer
+      intermediate (glue) grid, the mortar. Almquist, Wang and Werpers,
+      "Order-preserving interpolation for summation-by-parts operators
+      at nonconforming grid interfaces" (SIAM J. Sci. Comput., 2019),
+      build such operators for SBP finite differences; whether the
+      construction carries over to Gauss–Lobatto elements is unchecked.
+      It would be a second operator choice beside `R`, so additive.
   - *A conservative element scheme* would need the mortar form of the
     interface restriction
     ([Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces));
