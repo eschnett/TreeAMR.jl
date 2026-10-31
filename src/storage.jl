@@ -46,6 +46,27 @@ or a vector potential `A_d` has this centering.
 """
 edgecentered(D::Integer, d::Integer) = staggeredalong(D, d, :cell, :vertex)
 
+"""
+    elementcentered(D)
+
+The all-`:element` centering (M16), for element-local discontinuous
+Galerkin schemes such as OLDG: per dimension a block holds `N/(P+1)`
+elements of `P + 1` Gauss–Lobatto–Legendre nodes each, `P` the field
+set's polynomial order ([`FieldSet`](@ref)'s `P`). Both face nodes of
+every element are stored, so a face position carries two values, one
+per side, and the element on each side owns its own.
+
+It stores and owns as a cell-centered set does — `N` points per
+dimension, no shared plane, [`staggers`](@ref) `0` — so the state layout
+and every range are unchanged; only the positions and the weights of the
+points differ, and the operators that move data between levels. A ghost
+of an element set sits *at* the block's face, on the other side of it,
+which is where the neighbouring element's face node is. An element is a
+tensor product of nodes in every dimension, so `:element` is accepted
+only in every dimension at once.
+"""
+elementcentered(D::Integer) = ntuple(_ -> :element, Int(D))
+
 function staggeredalong(D::Integer, d::Integer, along::Symbol, across::Symbol)
     1 <= d <= D || throw(ArgumentError(
         "the staggered dimension must be in 1:$D, got $d"))
@@ -59,15 +80,76 @@ function centerings(C::Tuple{Vararg{Symbol}}, ::Val{D}) where {D}
         "centering must have one entry per dimension: got $(length(C)) for a " *
         "$D-dimensional forest, $C. Spell it with cellcentered($D), " *
         "vertexcentered($D), facecentered($D, d) or edgecentered($D, d)."))
+    if any(s -> s === :element, C)
+        all(s -> s === :element, C) || throw(ArgumentError(
+            "the :element centering must be in every dimension or in none, got $C. " *
+            "An element is a tensor product of P+1 Gauss–Lobatto nodes in every " *
+            "dimension, and its operators move whole elements between levels, so " *
+            "a set cannot be elements along some dimensions and cells or vertices " *
+            "along others. Spell it elementcentered($D)."))
+        return ntuple(d -> C[d], D)
+    end
     all(s -> s === :cell || s === :vertex, C) || throw(ArgumentError(
-        "each centering entry must be :cell or :vertex, got $C. A dimension is " *
-        "either cell-centered (values at the half-integer positions) or " *
-        "vertex-like (values at the integer positions, with a shared boundary " *
-        "plane)."))
+        "each centering entry must be :cell or :vertex, or :element in every " *
+        "dimension, got $C. A dimension is either cell-centered (values at the " *
+        "half-integer positions) or vertex-like (values at the integer positions, " *
+        "with a shared boundary plane); elementcentered(D) puts the Gauss–Lobatto " *
+        "nodes of elements in every dimension at once."))
     return ntuple(d -> C[d], D)
 end
 centerings(C, ::Val{D}) where {D} = throw(ArgumentError(
-    "centering must be a tuple of :cell / :vertex symbols, got a $(typeof(C))"))
+    "centering must be a tuple of :cell / :vertex / :element symbols, got a " *
+    "$(typeof(C))"))
+
+# Whether a validated centering is the element centering, which is
+# all-or-nothing (see `centerings`).
+iselement(C::NTuple{D,Symbol}) where {D} = D > 0 && C[1] === :element
+
+# Validate the polynomial order of a field set or schedule (M16) against
+# its layout, returning it as an `Int`, `0` for a set that is not
+# element-centered. `P` is `nothing` when it was not given. Every
+# refusal says why: `P` is the scheme's, so it has no default, and the
+# layout must let a coarse-fine face be filled from whole elements.
+function element_order(P, centers::NTuple{D,Symbol}, N::Int, G::NTuple{D,Int},
+                       forest::Forest) where {D}
+    if !iselement(centers)
+        P === nothing || throw(ArgumentError(
+            "P = $P is the polynomial order of an element-centered set, but this " *
+            "set's centering is $centers, which has no elements: its points are " *
+            "equally spaced cell centres or vertices. Pass " *
+            "centering = elementcentered($D) for elements of P+1 Gauss–Lobatto " *
+            "nodes, or drop P."))
+        return 0
+    end
+    P === nothing && throw(ArgumentError(
+        "an element-centered set needs `P`, the polynomial order of its elements: " *
+        "each holds P+1 Gauss–Lobatto nodes per dimension. It is the scheme's " *
+        "order, which the mesh cannot know, so it has no default."))
+    P isa Integer || throw(ArgumentError(
+        "P must be an integer, the polynomial order of the elements, got a " *
+        "$(typeof(P))"))
+    P >= 1 || throw(ArgumentError(
+        "P must be at least 1, got P = $P: an element stores both of its face " *
+        "nodes, so it holds at least two, and P+1 nodes carry a polynomial of " *
+        "degree P."))
+    all(<=(1), G) || throw(ArgumentError(
+        "an element-centered set has at most one ghost layer, got G = $G: an " *
+        "element-local scheme reads only the neighbouring element's face node, " *
+        "and an element set's ghost sits at the face, so a second layer would lie " *
+        "inside the neighbour's element where no ghost is defined."))
+    N % (2 * (P + 1)) == 0 || throw(ArgumentError(
+        "N = $N is not a multiple of 2(P+1) = $(2 * (P + 1)) for elements of order " *
+        "P = $P: a fine block must cover whole parent elements, since the " *
+        "operators between levels map a coarse element onto the two fine elements " *
+        "covering it, and a fine block spans half of its parent, N/2 points. " *
+        "Choose N = 2(P+1)·k."))
+    hasrotating(forest) && throw(ArgumentError(
+        "an element-centered set cannot live on a forest with a rotating seam: the " *
+        "transfers across a seam are turned copies of the cell and vertex " *
+        "stencils, and the element operators, which fill faces only, have no " *
+        "turned form."))
+    return Int(P)
+end
 
 """
     staggers(centering::NTuple{D,Symbol})
@@ -76,9 +158,12 @@ centerings(C, ::Val{D}) where {D} = throw(ArgumentError(
 The centering as the arithmetic sees it: `c_d = 1` where dimension `d`
 is vertex-like, `0` where it is cell-centered. This is the `c_d` of
 CODE.md — the extra stored plane, the offset from a stored index to a
-position, and the length a `closed` loop adds.
+position, and the length a `closed` loop adds. An element-centered
+dimension ([`elementcentered`](@ref)) is `0`, since it stores and owns
+as a cell-centered one does.
 """
 staggers(C::NTuple{D,Symbol}) where {D} = ntuple(d -> C[d] === :vertex ? 1 : 0, D)
+# An element dimension is `0`: it stores and owns as a cell-centered one.
 
 """
     Parity
@@ -131,7 +216,10 @@ for one width per dimension; it is stored as an `NTuple{D,Int}`.
 (`:cell`) or at a cell boundary (`:vertex`), and defaults to
 [`cellcentered`](@ref)`(D)`. Spell it with [`cellcentered`](@ref),
 [`vertexcentered`](@ref), [`facecentered`](@ref) or
-[`edgecentered`](@ref). A vertex-like dimension stores one plane more —
+[`edgecentered`](@ref), or, for elements of Gauss–Lobatto nodes, with
+[`elementcentered`](@ref) and the order `P` below; an element dimension
+stores and owns as a cell-centered one does. A vertex-like dimension
+stores one plane more —
 the boundary plane the block **shares** with its high-side neighbor,
 which that neighbor owns and the exchange fills exactly as it fills a
 ghost. Three ranges per dimension have names, with `c_d = 1` in a
@@ -163,6 +251,17 @@ so this one keyword is the whole switch. A [`GhostSchedule`](@ref) used
 with this field set must be built for the same backend. On a device with
 no hardware fp64 a `Float64` field set is rejected here, with a message,
 rather than failing later inside a kernel compilation.
+
+`P` is the polynomial order of an element-centered set (M16;
+[`elementcentered`](@ref)): each element holds `P + 1` Gauss–Lobatto–
+Legendre nodes per dimension. It is **required** for such a set, since
+it is the scheme's order, and refused for any other. Refused, each with
+its reason: `P < 1`; a ghost width above 1, since an element set's ghost
+sits at the face and an element-local scheme reads only the
+neighbouring element's face node; `N` not a multiple of `2(P+1)`, since
+a fine block must cover whole parent elements; and a forest with a
+rotating seam. It is stored as the field `P`, `0` for a set that is not
+element-centered.
 
 `walls` says how a vertex-like dimension's two wall planes are filled at
 the domain's non-periodic faces (TreeGRRMHD's AMR-8). Ownership is
@@ -244,6 +343,8 @@ block slots and rebuilds the storage.
              rotation = (1, -3, 2, 4))
     FieldSet(half, 4; G = 2,            # the same, on a half-turn forest
              halfturn = (1, -2, -3, 4))
+    FieldSet(forest, 2; G = 1,          # elements of order 3, N = 8k
+             centering = elementcentered(D), P = 3)
 
 # Examples
 
@@ -268,6 +369,10 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const nvars::Int
     const G::NTuple{D,Int}
     const centering::NTuple{D,Symbol}
+    # The polynomial order of an element-centered set (M16), `0` for any
+    # other: what every position, weight and element stencil of the set
+    # is built from, so it is passed explicitly wherever those are.
+    const P::Int
     # `:half_open` or `:symmetric`: whether the fill also writes the
     # owned low wall plane of a vertex-like dimension (AMR-8).
     const walls::Symbol
@@ -306,7 +411,7 @@ end
 # for everything that is not deliberately staggered.
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
-                     centering=cellcentered(D),
+                     centering=cellcentered(D), P=nothing,
                      parity=nothing, rotation=nothing, halfturn=nothing,
                      walls::Symbol=:half_open,
                      backend::Backend=CPU()) where {T,D,R}
@@ -321,6 +426,7 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     ghosts = ghostwidths(G, Val(D))
     centers = centerings(centering, Val(D))
     stored = storedsize(forest.N, ghosts, staggers(centers))
+    order = element_order(P, centers, forest.N, ghosts, forest)
     parities = parities_of(parity, forest, Int(nvars))
     rotations = rotations_of(rotation, forest, Int(nvars), ghosts, staggers(centers),
                              parities)
@@ -347,8 +453,8 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
-    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, walls,
-                                        parities, rotations, halfturns, factors,
+    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, order,
+                                        walls, parities, rotations, halfturns, factors,
                                         rotvars, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
@@ -665,6 +771,11 @@ struct RotationPair{FA<:FieldSet,FB<:FieldSet,MF<:AbstractMatrix,MV<:AbstractMat
 end
 
 function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
+    (a.P > 0 || b.P > 0) && throw(ArgumentError(
+        "a RotationPair cannot hold an element-centered set: an element set " *
+        "cannot live on a forest with a rotating seam, whose transfers are turned " *
+        "copies of the cell and vertex stencils, and the element operators have no " *
+        "turned form"))
     a.forest === b.forest || throw(ArgumentError(
         "the two sets of a RotationPair must be over one forest: each fills its " *
         "ghosts across the seam from the other's blocks, block for block"))

@@ -168,3 +168,71 @@ end
     end
     @test_throws "at least 1" TreeAMR.element_tables(T, 0)
 end
+
+@testset "The element centering stores as cells, and P belongs to it: D=$D" for D in (1, 2, 3)
+    # Guards an element set laid out differently from a cell-centered one
+    # (the state layout and every range must be the same), and a `P`
+    # that is lost, defaulted, or carried by a set without elements.
+    @test elementcentered(D) == ntuple(_ -> :element, D)
+    @test staggers(elementcentered(D)) == ntuple(_ -> 0, D)
+    forest = Forest(ntuple(_ -> 2, D); N=8)
+    for G in (0, 1)
+        fs = FieldSet(forest, 2; G=G, centering=elementcentered(D), P=3)
+        @test fs.P == 3
+        @test fs.centering == elementcentered(D)
+        @test size(fs.work) == size(FieldSet(forest, 2; G=G).work)
+        @test TreeAMR.closedranges(fs) == TreeAMR.interiorranges(fs)
+    end
+    @test FieldSet(forest, 1; G=1, centering=elementcentered(D), P=1).P == 1
+    @test FieldSet(forest, 1; G=1).P == 0
+    @test FieldSet(forest, 1; G=1, centering=vertexcentered(D)).P == 0
+    efs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=3)
+    @test GhostSchedule(efs, Operators(prolongation=2, restriction=2)).P == 3
+    @test GhostSchedule(FieldSet(forest, 1; G=1),
+                        Operators(prolongation=2, restriction=2)).P == 0
+end
+
+@testset "An element set is refused where it cannot hold whole elements: D=$D" for D in
+    (1, 2, 3)
+    # Guards a layout the element operators cannot serve being accepted
+    # and found later as wrong data: each refusal names its reason.
+    forest = Forest(ntuple(_ -> 2, D); N=8)
+    E = elementcentered(D)
+    if D > 1
+        @test_throws "in every dimension or in none" FieldSet(
+            forest, 1; G=1, centering=Base.setindex(E, :cell, 1), P=3)
+    end
+    @test_throws "needs `P`" FieldSet(forest, 1; G=1, centering=E)
+    @test_throws "has no elements" FieldSet(forest, 1; G=1, P=3)
+    @test_throws "has no elements" FieldSet(forest, 1; G=1, centering=vertexcentered(D),
+                                            P=3)
+    @test_throws "at least 1" FieldSet(forest, 1; G=1, centering=E, P=0)
+    @test_throws "must be an integer" FieldSet(forest, 1; G=1, centering=E, P=3.0)
+    @test_throws "at most one ghost layer" FieldSet(forest, 1; G=2, centering=E, P=3)
+    @test_throws "at most one ghost layer" FieldSet(forest, 1; G=ntuple(d -> d == D ? 2 : 1, D),
+                                                    centering=E, P=3)
+    # N = 8 holds two elements of order 3, but a fine block's half of it
+    # does not hold whole parent elements for order 2 (N/2 = 4 nodes
+    # against 3) or order 4, nor any element of order 5.
+    for P in (2, 4, 5)
+        @test_throws "whole parent elements" FieldSet(forest, 1; G=1, centering=E, P=P)
+    end
+    @test FieldSet(Forest(ntuple(_ -> 1, D); N=12), 1; G=1, centering=E, P=2).P == 2
+    # The forest form of the schedule takes the same checks.
+    ops = Operators(prolongation=2, restriction=2)
+    @test_throws "needs `P`" GhostSchedule(forest, ops; G=1, centering=E)
+    @test_throws "has no elements" GhostSchedule(forest, ops; G=1, P=3)
+    @test_throws "whole parent elements" GhostSchedule(forest, ops; G=1, centering=E, P=2)
+    # A schedule for another order is refused by the fill.
+    fs = FieldSet(forest, 1; G=1, centering=E, P=3)
+    @test_throws "element order P = 3" fill_ghosts!(
+        fs, GhostSchedule(forest, ops; G=1, centering=E, P=1))
+    # No rotating seam, quarter or half turn, and so no RotationPair.
+    if D > 1
+        for seam in ((rotating=(1, 2),), (halfturn=(1, 2),))
+            rotating = Forest(ntuple(_ -> 2, D); N=8, seam...)
+            @test_throws "rotating seam" FieldSet(rotating, 1; G=1, centering=E, P=3)
+        end
+    end
+    @test_throws "cannot hold an element-centered set" RotationPair(fs, fs)
+end

@@ -603,7 +603,9 @@ it takes one (amended in M8, when `G` moved off the forest).
 [`fill_ghosts!`](@ref) refuses a field set whose layout differs from the
 one the schedule was built for. The forest form
 `GhostSchedule(forest, ops; G, centering, T, backend)` spells the four
-out instead, for a caller with no field set in hand.
+out instead, for a caller with no field set in hand, and an
+element-centered layout (M16) its order `P` as well, which is `0`, no
+elements, by default.
 
 `backend` must be the backend of every field set the schedule is
 replayed over (M6). The stencil weights and index vectors are read
@@ -629,6 +631,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     generation::Int                              # forest generation it was built for
     G::NTuple{D,Int}                             # ghost width it was built for
     centering::NTuple{D,Symbol}                  # centering it was built for
+    P::Int                                       # element order it was built for (M16)
     walls::Symbol                                # walls it was built for (AMR-8)
     operators::Operators
     backend::BK
@@ -644,9 +647,10 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
-        forest, generation, G, centering, walls, operators, backend, phase1, phase2,
+        forest, generation, G, centering, P, walls, operators, backend, phase1, phase2,
         levels, boundaries, boundaryplan, stages, stagegroups) where {T,D,R,BK,GRP,BP,ST}
-        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, walls, operators,
+        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls,
+                                       operators,
                                        backend, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
                                        group_locals(stages, stagegroups))
@@ -1821,12 +1825,13 @@ function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::Transfer
 end
 
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
-    GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, walls=fs.walls,
-                  T=T, backend=get_backend(fs.work))
+    GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
+                  walls=fs.walls, T=T, backend=get_backend(fs.work))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
-                       centering=cellcentered(D), walls::Symbol=:half_open,
+                       centering=cellcentered(D), P::Integer=0,
+                       walls::Symbol=:half_open,
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
@@ -1837,16 +1842,20 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         cs = centerings(centering, Val(D))
         ss = staggers(cs)
         storedsize(N, gs, ss)                    # the N >= 2G[d] + 2c[d] invariant
+        # `0` is the forest form's "no elements", as `FieldSet` stores it.
+        order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
         check_operators(N, gs, ss, operators)
         check_floattype(T, backend)
         check_walls(walls)
-        layout = layouthash(gs, cs, walls, Int(operators.family), operators.prolongation,
+        layout = layouthash(gs, cs, order, walls, Int(operators.family),
+                            operators.prolongation,
                             operators.restriction, operators.bounded,
                             operators.vertex_prolongation, T,
                             nameof(typeof(backend)))
-        return (gs, cs, ss), layout
+        return (gs, cs, ss, order), layout
     end
-    ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int} = checked
+    ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int}, order::Int =
+        checked
     symmetric = walls === :symmetric
     dirs = alldirections(Val(D))
     # The targets are this rank's blocks (M7), walked in global leaf
@@ -1953,8 +1962,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
-        forest, generation(forest), ghosts, centers, walls, operators, backend, phase1,
-        phase2, levels, boundaries, bplan, stages, groups)
+        forest, generation(forest), ghosts, centers, order, walls, operators, backend,
+        phase1, phase2, levels, boundaries, bplan, stages, groups)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

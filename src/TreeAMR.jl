@@ -24,6 +24,9 @@ export FieldSet, nblocks, blockkey, blockview, interiorview, closedview,
        coordinates, fill_by_coordinates!
 export cellcentered, vertexcentered, facecentered, edgecentered, staggers
 
+# Element centering (M16)
+export elementcentered
+
 # Ghost exchange and interpolation operators (M2)
 export Operators, OperatorFamily, PointValue, Conservative, check_operators,
        GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates, CellBoundary

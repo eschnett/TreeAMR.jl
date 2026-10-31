@@ -1445,6 +1445,11 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "for $(schedule.centering); the stored extent, the target ranges and the " *
         "one-dimensional operators all differ between a cell-centered and a " *
         "vertex-like dimension. Build one with `GhostSchedule(fs, operators)`."))
+    fs.P == schedule.P || throw(ArgumentError(
+        "the field set has element order P = $(fs.P) but this schedule was built " *
+        "for P = $(schedule.P) ($(schedule.P == 0 ? "no elements" : "elements")); " *
+        "every node position and element stencil in it is wrong for this layout. " *
+        "Build one with `GhostSchedule(fs, operators)`."))
     fs.walls === schedule.walls || throw(ArgumentError(
         "the field set has walls = :$(fs.walls) but this schedule was built for " *
         ":$(schedule.walls); the target ranges at a low domain face differ between " *

@@ -9,6 +9,7 @@ cellcentered
 vertexcentered
 facecentered
 edgecentered
+elementcentered
 staggers
 coordinates
 nblocks
