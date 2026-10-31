@@ -4172,7 +4172,7 @@ M12 was decided with Erik, after M7 and before M9b.
      compares every face ghost with the Lagrange polynomials and the GLL
      quadrature evaluated at `coordinates`' positions, without the
      package's stencils; a fill with the projection in place of `R`
-     fails it.
+     fails it (checked by hand while building it, not kept as a test).
   6. **The regrid**: `I` and the exact projection, no pre-fill, `P` in
      `check_regrid_set!`'s layout.
   7. **Distributed, threads, device.** Element cases in
@@ -4214,10 +4214,18 @@ M12 was decided with Erik, after M7 and before M9b.
   ghost ([Operators](#operators)); `R` as the regrid's coarsening
   ([Regridding](#regridding)).
 
-  *Left for the release.* TreeIOHDF5 saving and restoring `P`, with a
-  release of its own; the TreeIOHDF5, TreeWave and TreeHydro suites
-  against this checkout; and the release itself, 0.2.7, additive, which
-  is Erik's to tag.
+  *Companion and downstream.* TreeIOHDF5 saves an element set's
+  centering as `"element"` and its order as a `P` attribute, under a new
+  feature `elements` that a file lists only when it holds an element set,
+  so the registered 0.1.5 refuses such a file by the feature, saying why;
+  its suite, 974 tests, passes against this checkout in 2m06 at one
+  thread. TreeWave (349 tests, 1m41) and TreeHydro (12679 tests, 5m28,
+  and 5m36 with TreeIOHDF5's branch) pass against it unchanged
+  (2026-10-31).
+
+  *Left for the release.* The release itself, 0.2.7, additive, and
+  TreeIOHDF5's with 0.2.7 appended to its `[compat]`, which are Erik's to
+  tag.
 
 ## Downstream checks
 
@@ -4230,6 +4238,8 @@ checkout its suite was unchanged, 310 tests in 1m12 (2026-09-29). M7
 reached it with 0.1.5 and changed nothing serially: 310 tests in 1m22
 against the M7 checkout (2026-10-02); M12, released in 0.1.7, changed
 nothing either, 310 tests in 1m17 against the M12 checkout (2026-10-03).
+M16 changed nothing for it: 349 tests in 1m41 against the M16 checkout
+(2026-10-31).
 
 **TreeHydro.** It is **implemented, not a sketch**: sixteen files in
 `src/`, fourteen test files, two viewers in `bin/`, its own CI and
@@ -4252,7 +4262,8 @@ keywords and the run histories as plain data; its `src/checkpoint.jl`
 (`run_state`, `rotate_checkpoints!`) has since implemented it. M7
 changed nothing for it serially: 12447 tests in 5m00 against the M7
 checkout, at one thread (2026-10-02); nor did M12 (0.1.7), 12447 tests in
-5m08 against the M12 checkout (2026-10-03). Its own MPI port
+5m08 against the M12 checkout (2026-10-03); nor did M16, 12679 tests in
+5m28 against the M16 checkout (2026-10-31). Its own MPI port
 (2026-10-02) found the one TreeAMR bug so far on a rank without blocks —
 the `AllVariables` boundary hook's length check, of which it is the only
 caller — so it needs TreeAMR 0.1.6, which has the fix.
