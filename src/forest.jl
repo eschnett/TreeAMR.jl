@@ -713,8 +713,8 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
     isempty(mismatched) || throw(ArgumentError(
         "$what was called for a different layout on rank(s) " *
         "$(join(mismatched, ", ")) than on rank 0, so it is refused on every rank: " *
-        "the ghost widths, the centering, the operators and the element type must " *
-        "be the same everywhere (for regrid!, so must the field sets passed, their " *
+        "the ghost widths, the centering (and an element set's order `P`), the " *
+        "operators and the element type must be the same everywhere (for regrid!, so must the field sets passed, their " *
         "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
         "`derivs`, `vars` and `exclude`; for TreeIOHDF5's save_checkpoint and " *
         "load_checkpoint, " *

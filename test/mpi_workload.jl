@@ -34,8 +34,9 @@
 # `RotationPair` through a fill, a regrid and interpolation beyond the
 # seam; from M14 on a half plane, the wave and two sets through the same.
 # It fills a nested mesh too, whose prolongation levels every rank runs as
-# one group of stages. The checkpoints moved to TreeIOHDF5, whose own
-# workload runs them.
+# one group of stages, and from M16 on element sets, through a fill in one
+# stage, the reductions and two regrids. The checkpoints moved to
+# TreeIOHDF5, whose own workload runs them.
 
 using TreeAMR
 using MPI: MPI
@@ -312,6 +313,68 @@ function grouped_case(tag)
                                (length(largest), length(largest) > 1 ? staged : 0))
     emit("#", tag, "largest groups", join(first.(groups), " "), "with messages",
          join(last.(groups), " "))
+    return nothing
+end
+
+# --- element sets (M16) -----------------------------------------------------
+
+const OPSE = Operators(family=ElementLocal)
+
+# The prolongations a rank receives in its stages, summed over the ranks:
+# an element set's are in phase 1, with the copies and restrictions, so
+# that its fill is one round of messages. A function of the rank count.
+function received_prolongations(forest, sched)
+    n = sum(st -> st.remote === nothing ? 0 :
+                  count(e -> e.key.kind === :prolong, st.remote.recvlayout),
+            sched.stages; init=0)
+    return sum(TreeAMR.allgather(forest.comm, n))
+end
+
+# An element set of order `P` through a fill, whose prolongations every
+# rank sends and receives in the one stage of phase 1, and whose edge
+# and corner ghosts keep their data; the reductions, the norm and the
+# mass by the GLL quadrature; and two regrids, which read owned points
+# only, fill nothing first, and conserve the mass: the first refines the
+# coarsest blocks and coarsens the finest, which leaves one level, and the
+# second refines the low half of the domain along x₁ and coarsens the
+# rest.
+function element_case(tag, forest::Forest{D}; P, parity=nothing) where {D}
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    fs = FieldSet(forest, 2; G=1, centering=elementcentered(D), P=P, parity=parity)
+    f = (x, v) -> sum(d -> (d + v) * x[d]^2 - x[d], 1:D) + v
+    boundary = hasouter(forest) ? boundary_by_coordinates(f) : nothing
+    pseudorandom!(fs)
+    sched = GhostSchedule(fs, OPSE)
+    fill_ghosts!(fs, sched; boundary=boundary)
+    emit(tag, "transfers", transfers(forest, sched), "stages", length(sched.stages))
+    emit("#", tag, "prolongations received", received_prolongations(forest, sched))
+    emit(tag, "filled", digest(gathered(forest, fs.work)))
+    u = statevector(fs)
+    gather!(u, fs)
+    reductions(tag, fs, u)
+    conserved = true
+    for cycle in 1:2
+        offset = first(blockrange(forest)) - 1
+        lmax = maxlevel(forest)
+        flags = map(1:nblocks(fs)) do b
+            k = forest.leaves[offset + b]
+            cycle == 2 && return sum(block_extent(forest, k)[1]) < forest.roots[1] ?
+                                 Refine : Coarsen
+            return level(k) == 0 ? Refine : level(k) == lmax ? Coarsen : Keep
+        end
+        before = total_mass(fs, 1)
+        regridded("$tag.$cycle", forest, (fs => sched,); flags=flags, boundary=boundary)
+        after = total_mass(fs, 1)
+        conserved &= abs(after - before) <= 1e-13 * abs(before)
+        emit("$tag.$cycle", "sum mass", @sprintf("%.17g", after))
+        sched = GhostSchedule(fs, OPSE)
+        fill_ghosts!(fs, sched; boundary=boundary)
+        emit("$tag.$cycle", "filled", digest(gathered(forest, fs.work)))
+        u = statevector(fs)
+        gather!(u, fs)
+        emit("$tag.$cycle", "sum l2", @sprintf("%.17g", volume_weighted_norm(fs, u)))
+    end
+    emit(tag, "conserved", conserved)
     return nothing
 end
 
@@ -1066,6 +1129,13 @@ function refusals()
                                            (pair.a => pscheds[1], pair.b => pscheds[2]) :
                                            (pair => pscheds,); flags=fill(Keep, nb)))
     emit("# rotating regrid refused on", n, "of", NRANKS, "ranks:", msg)
+
+    # An element set of another order on rank 1 only (M16): its stencils
+    # and its fill differ, so its schedule is refused on every rank.
+    forest = Forest((2, 2); N=8, comm=COMM)
+    efs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=RANK == 1 ? 1 : 3)
+    n, msg = attempt(() -> GhostSchedule(efs, OPSE))
+    emit("# element order refused on", n, "of", NRANKS, "ranks:", msg)
     return nothing
 end
 
@@ -1237,6 +1307,16 @@ function main()
     # The nested octant, whose prolongation levels every rank runs as one
     # group of stages.
     grouped_case("N3")
+    # Element sets (M16), on three levels: order 3 over a periodic square
+    # and over a reflecting wall with outer faces and the hook, order 1
+    # over a periodic cube.
+    element_case("EL2p", forest_of((3, 3), 8; periodic=(true, true), centre=(1.4, 1.5));
+                 P=3)
+    element_case("EL2r", forest_of((3, 3), 8; reflecting=((true, false), (false, false)),
+                                   centre=(0.4, 0.5));
+                 P=3, parity=[(OddParity, EvenParity), (EvenParity, EvenParity)])
+    element_case("EL3p", forest_of((2, 2, 2), 4; periodic=(true, true, true),
+                                   centre=(0.7, 0.8, 1.2)); P=1)
     # A half plane (M14): the vertex-centered wave, whose seam slab is
     # partitioned one plane up, and two sets through a fill, a regrid and
     # interpolation beyond the seam.
