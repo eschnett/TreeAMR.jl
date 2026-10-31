@@ -351,7 +351,8 @@ end
         return TreeAMR.stage_groups([TreeAMR.PHASE1_TAG; collect(tag.(levels))], local_,
                                     sent, received,
                                     TreeAMR.BoundaryRegion{1}[boundaries...],
-                                    k -> stencils[k], nobound, 10)
+                                    k -> stencils[k], nobound,
+                                    k -> TreeAMR.transfer_stage(k, 0), 10)
     end
     apart, together = [1:1, 2:2, 3:3], [1:1, 2:3]
     # Level 2 reads block 1 at `3:5`, beside what level 1 writes there,

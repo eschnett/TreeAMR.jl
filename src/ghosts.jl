@@ -1321,6 +1321,11 @@ read nothing the levels below them write run as one such loop, and over
 a distributed forest with their messages in flight together (see
 [`GhostSchedule`](@ref)).
 
+An element-centered set (M16, [`ElementLocal`](@ref) operators) is
+filled on faces only, in one stage: its edge and corner ghosts are never
+written, by a transfer or by the hook, and are stale under
+`map_blocks!(…; stored = true)`. See [`GhostSchedule`](@ref).
+
 Periodic boundaries need nothing special; the tree wraps around, so they
 are ordinary transfers. Reflecting faces need nothing either (M10): the
 schedule fills their ghosts by mirrored transfers in the same phases,

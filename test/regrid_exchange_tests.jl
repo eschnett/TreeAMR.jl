@@ -76,7 +76,7 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
     bad = count(r -> split_regrid(rpairs[r], oldranges[r], newranges[r]) !=
                      split_regrid(pairs, oldranges[r], newranges[r]), 1:P)
     stages = [regrid_stage(T, serial.N, fs.G, staggers(fs), ops, CPU(), rpairs[r];
-                           oldrange=oldranges[r], newrange=newranges[r], nold=nold,
+                           P=fs.P, oldrange=oldranges[r], newrange=newranges[r], nold=nold,
                            nnew=nnew, oldowner=i -> equalsplit_part(nold, P, i) - 1,
                            newowner=j -> equalsplit_part(nnew, P, j) - 1)
               for r in 1:P]
@@ -156,7 +156,7 @@ end
                          for g in TreeAMR.transfer_groups(Float64, serial,
                                                           ntuple(_ -> 1, D),
                                                           ntuple(_ -> 0, D), old, new,
-                                                          XOPS4, CPU())
+                                                          XOPS4, CPU(); P=0)
                          for t in 1:ntransfers(g))
         # In 3D the two coarsened groups are leaves 1–8 and 43–50 of 50,
         # which first straddle a rank boundary at 7 ranks.

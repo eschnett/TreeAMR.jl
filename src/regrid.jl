@@ -709,9 +709,15 @@ end
 # to the next `fill_ghosts!`, as ghosts always are; in a vertex-like
 # dimension that makes coarsening halved injection from the children's
 # even points, all of which they own.
+#
+# `P` is the layout's element order, `0` for none, and is required, as
+# for `kind_stencil`. An element set (M16) refines by `I` and coarsens by
+# the exact `L²` projection, the regrid's own coarsening (`regrid`), not
+# the ghost fill's compatible restriction: across a regrid energy is not
+# conserved anyway, and the projection keeps the degree `R` loses.
 function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
                       operators::Operators, backend::Backend, pairs::TransferPairs{D};
-                      oldrange::UnitRange{Int}, newrange::UnitRange{Int},
+                      P::Integer, oldrange::UnitRange{Int}, newrange::UnitRange{Int},
                       nold::Int, nnew::Int, oldowner, newowner) where {T,D}
     # These stencils are rebuilt on every regrid — the child offsets
     # involved depend on which blocks moved — so, like the schedule's,
@@ -721,7 +727,7 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # interpolates.
     bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
     build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
-                                           operators, bounded(key)), D)
+                                           operators, bounded(key); P=P, regrid=true), D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -745,10 +751,11 @@ end
 # function of its own for the tests and `bench/gpu.jl`.
 function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
                          c::NTuple{D,Int}, oldleaves, newleaves,
-                         operators::Operators, backend::Backend) where {T,D}
+                         operators::Operators, backend::Backend;
+                         P::Integer) where {T,D}
     nold, nnew = length(oldleaves), length(newleaves)
     stage = regrid_stage(T, forest.N, G, c, operators, backend,
-                         regrid_sources(oldleaves, newleaves); oldrange=1:nold,
+                         regrid_sources(oldleaves, newleaves); P=P, oldrange=1:nold,
                          newrange=1:nnew, nold=nold, nnew=nnew, oldowner=nothing,
                          newowner=nothing)
     return stage.locals
@@ -1020,7 +1027,8 @@ function regrid!(forest::Forest{D}, pairs;
                                                              oldrange=oldrange,
                                                              newrange=newrange))
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
-                                 sched.operators, backend, sources; oldrange=oldrange,
+                                 sched.operators, backend, sources; P=fs.P,
+                                 oldrange=oldrange,
                                  newrange=newrange, nold=nold, nnew=nnew,
                                  oldowner=oldowner, newowner=newowner)
             # The transfer moves every cell in the domain, so it is

@@ -148,7 +148,7 @@ end
     newleaves = complete_marks(forest, flags)
     groups = TreeAMR.transfer_groups(Float64, forest, ntuple(_ -> 1, D),
                                      ntuple(_ -> 0, D), copy(forest.leaves), newleaves,
-                                     ops, CPU())
+                                     ops, CPU(); P=0)
     @test Set(g.kind for g in groups) == Set((:copy, :prolong, :restrict))
     @test all(g -> issorted(g.targetblocks), groups)
 end

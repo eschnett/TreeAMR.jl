@@ -164,7 +164,7 @@ function main()
     # one loop by block owner over every group, on a device one launch
     # per group, and `fresh` gets its first touch by owner as there.
     groups = TreeAMR.transfer_groups(T, forest, fs.G, staggers(fs),
-                                     oldleaves, oldleaves, OPS, BACKEND)
+                                     oldleaves, oldleaves, OPS, BACKEND; P=fs.P)
     fresh = similar(fs.work)
     TreeAMR.zerofill!(fresh, BACKEND)
     transfer!() = begin

@@ -463,7 +463,7 @@ end
     grandchildren = collect(Iterators.flatten(childkeys(c) for c in childkeys(old[1])))
     new = sort!(vcat(grandchildren, old[2:end]))
     @test_throws ArgumentError TreeAMR.transfer_groups(Float64, forest, (1,), (0,),
-                                                      old, new, OPS2, CPU())
+                                                      old, new, OPS2, CPU(); P=0)
 end
 
 @testset "Untouched blocks are copied bit-exactly: D=$D" for D in (1, 2)

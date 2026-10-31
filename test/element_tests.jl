@@ -286,6 +286,11 @@ element_forest(T, D; roots=2, N=8) =
 # Every stored index of block `b`, as tuples.
 stored_indices(fs) = CartesianIndices(size(fs.work)[1:(ndims(fs.work) - 2)])
 
+# Whether a stored index lies outside the owned range along two or more
+# dimensions: an edge or corner ghost.
+is_edge_ghost(fs, I) = count(e -> !(fs.G[e] + 1 <= I[e] <= fs.G[e] + fs.forest.N),
+                             1:length(fs.G)) >= 2
+
 @testset "Every position of an element set is its node, bit for bit: D=$D, P=$P, G=$G, $T" for
     (D, P, T) in ((1, 1, Float64), (1, 3, Float64), (2, 1, Float64), (2, 3, Float64),
                   (3, 3, Float64), (2, 3, Float32), (2, 3, Float32x2)),
@@ -349,8 +354,8 @@ stored_indices(fs) = CartesianIndices(size(fs.work)[1:(ndims(fs.work) - 2)])
 
     # The boundary hooks write their x at the faces, every form of them.
     # Same-level copies bring the neighbour's face node, which sits at
-    # the same position, so after a fill every stored value is its own
-    # position.
+    # the same position, so after a fill every face ghost is its own
+    # position; edge and corner ghosts are never written.
     G == 0 && continue
     ops = Operators(family=ElementLocal)
     sched = GhostSchedule(fs, ops)
@@ -360,7 +365,9 @@ stored_indices(fs) = CartesianIndices(size(fs.work)[1:(ndims(fs.work) - 2)])
         fill_by_coordinates!((x, v) -> x[v], fs)
         fill_ghosts!(fs, sched; boundary=hook)
         for b in 1:nblocks(fs)
-            @test all(I -> ntuple(v -> fs.work[Tuple(I)..., v, b], D) ===
+            @test all(I -> is_edge_ghost(fs, Tuple(I)) ?
+                           all(v -> isnan(fs.work[Tuple(I)..., v, b]), 1:D) :
+                           ntuple(v -> fs.work[Tuple(I)..., v, b], D) ===
                            coordinates(fs, b, Tuple(I)), stored_indices(fs))
         end
     end
@@ -368,7 +375,8 @@ stored_indices(fs) = CartesianIndices(size(fs.work)[1:(ndims(fs.work) - 2)])
     fill_by_coordinates!((x, v) -> x[1], one_)
     fill_ghosts!(one_, GhostSchedule(one_, ops); boundary=CellBoundary(Relative(x -> x[1])))
     for b in 1:nblocks(one_)
-        @test all(I -> one_.work[Tuple(I)..., 1, b] === coordinates(one_, b, Tuple(I))[1],
+        @test all(I -> is_edge_ghost(one_, Tuple(I)) ||
+                       one_.work[Tuple(I)..., 1, b] === coordinates(one_, b, Tuple(I))[1],
                   stored_indices(one_))
     end
 end
@@ -430,4 +438,320 @@ end
     fs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=3)
     @test_throws "does not take an element-centered set" interpolate(fs, [(0.3, 0.4)],
                                                                       Lagrange(2))
+end
+
+# --- The fill -----------------------------------------------------------
+#
+# The oracle below evaluates the rules of the element fill from the
+# element polynomials themselves, per face of each block: it finds the
+# blocks across the face by `neighbor_keys`, the elements by position,
+# and evaluates Lagrange polynomials through the nodes at the positions
+# `coordinates` gives, without a stencil, a table of `I` or `R`, or the
+# schedule.
+
+# Two- or three-level forests of `2^D` roots on the unit cube, refined at
+# the corner at the origin, so that fine blocks meet coarse ones across
+# interior faces and, when periodic, across the wrap, or at a reflecting
+# wall, and fine blocks are on either side of some face.
+function element_levels_forest(D, N, levels; bc=:periodic)
+    kw = bc === :periodic ? (periodic=ntuple(_ -> true, D),) :
+         bc === :reflecting ? (reflecting=ntuple(_ -> (true, true), D),) : ()
+    forest = Forest(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (0.0, 1.0), D), kw...)
+    for _ in 2:levels
+        refine!(forest, first(forest.leaves))
+        balance!(forest)
+    end
+    return forest
+end
+
+# The Lagrange basis polynomial `k` of the nodes `ξ` at `x`.
+lagrange_at(ξ, k, x) = prod(((x - ξ[m]) / (ξ[k] - ξ[m]) for m in eachindex(ξ) if m != k);
+                            init=one(x))
+
+# The face ghosts of a block on side `s` of dimension `d`: one plane,
+# across the owned range tangentially.
+face_ghosts(fs, d, s) =
+    CartesianIndices(ntuple(e -> e == d ? (s < 0 ? (1:1) : ((fs.G[d] + fs.forest.N + 1):(fs.G[d] + fs.forest.N + 1))) :
+                                 ((fs.G[e] + 1):(fs.G[e] + fs.forest.N)), length(fs.G)))
+
+
+# The value the element rules give face ghost `idx` of block `b`, on side
+# `s` of dimension `d`, variable `v`. Serial, so a leaf index is a block
+# index.
+function element_oracle(fs, b, idx, d, s, v)
+    forest, N, G, P = fs.forest, fs.forest.N, fs.G, fs.P
+    D, P1 = length(idx), fs.P + 1
+    t = TreeAMR.element_tables(Float64, P)
+    ξ, ŵ = t.nodes, t.weights
+    k = blockkey(fs, b)
+    nbrs = neighbor_keys(forest, k, ntuple(e -> e == d ? s : 0, D))
+    if isempty(nbrs)
+        # A reflecting wall: the block's own face node, with the parity's sign.
+        σ = fs.parity[v][d] === OddParity ? -1 : 1
+        return σ * fs.work[Base.setindex(idx, s > 0 ? G[d] + N : G[d] + 1, d)..., v, b]
+    end
+    tang = [e for e in 1:D if e != d]
+    plane = s > 0 ? G[d] + 1 : G[d] + N             # the source's face-adjacent plane
+    hk, ok = spacing(forest, k), block_origin(forest, k)
+    y = coordinates(fs, b, idx)
+    elem(e) = (q = (idx[e] - G[e] - 1) ÷ P1; a = ok[e] + hk * q * P1; (a, a + hk * P1))
+    if level(first(nbrs)) <= level(k)
+        # Same level or coarser: the source element containing the
+        # target's, its polynomial at the target node.
+        c = only(nbrs)
+        bc = find_leaf(forest, c)
+        hc, oc = spacing(forest, c), block_origin(forest, c)
+        firsts, basis = Int[], Vector{Float64}[]
+        for e in tang
+            a, z = elem(e)
+            E = floor(Int, ((a + z) / 2 - oc[e]) / (hc * P1))
+            A = oc[e] + hc * E * P1
+            push!(firsts, G[e] + 1 + E * P1)
+            push!(basis, [lagrange_at(ξ, n, 2 * (y[e] - A) / (hc * P1) - 1) for n in 1:P1])
+        end
+        total = 0.0
+        for n in CartesianIndices(ntuple(_ -> P1, length(tang)))
+            src = ntuple(D) do e
+                e == d && return plane
+                i = findfirst(==(e), tang)
+                return firsts[i] + n[i] - 1
+            end
+            total += prod(basis[i][n[i]] for i in eachindex(tang); init=1.0) *
+                     fs.work[src..., v, bc]
+        end
+        return total
+    end
+    # Finer: the compatible projection onto the target's element, lumped
+    # at its node, M_c g = Iᵀ M_f f: every fine node inside the element,
+    # weighted by its quadrature weight and the target node's basis
+    # polynomial there, over the target node's weight.
+    node(e) = (idx[e] - G[e] - 1) % P1 + 1
+    Wc = prod((hk * P1 * ŵ[node(e)] / 2 for e in tang); init=1.0)
+    total = 0.0
+    for c in nbrs
+        bc = find_leaf(forest, c)
+        hc, oc = spacing(forest, c), block_origin(forest, c)
+        for j in CartesianIndices(ntuple(_ -> 1:N, length(tang)))
+            src = ntuple(e -> e == d ? plane : G[e] + j[findfirst(==(e), tang)], D)
+            x = coordinates(fs, bc, src)
+            inside = all(eachindex(tang)) do i
+                e = tang[i]
+                q = (j[i] - 1) ÷ P1
+                mid = oc[e] + hc * (q + 1 / 2) * P1
+                a, z = elem(e)
+                return a < mid < z
+            end
+            inside || continue
+            L = prod((lagrange_at(ξ, node(e), 2 * (x[e] - elem(e)[1]) / (hk * P1) - 1)
+                      for e in tang); init=1.0)
+            Wf = prod((hc * P1 * ŵ[(j[i] - 1) % P1 + 1] / 2 for (i, e) in enumerate(tang));
+                      init=1.0)
+            total += Wf * L * fs.work[src..., v, bc]
+        end
+    end
+    return total / Wc
+end
+
+# The ghost widths a test runs an element set at: one layer everywhere,
+# and one only along the first and the last dimension.
+element_ghost_widths(D) =
+    unique([ntuple(_ -> 1, D), ntuple(e -> e == 1 ? 1 : 0, D), ntuple(e -> e == D ? 1 : 0, D)])
+
+# The two variables of a reflecting set: a scalar, and one odd in the
+# first dimension.
+element_parity(D) = [ntuple(_ -> EvenParity, D), ntuple(e -> e == 1 ? OddParity : EvenParity, D)]
+
+@testset "Every face ghost of an element set is its rule's value, and no other ghost is written: D=$D, P=$P" for
+    (D, P) in ((1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3), (3, 1), (3, 3))
+    # Guards a wrong element operator (cell-centre weights, the wrong
+    # half of I, R's columns off by an element, a window in the wrong
+    # frame), a ghost filled from the wrong block or plane, a wall ghost
+    # with the wrong sign, and an edge or corner ghost written at all:
+    # those are ambiguous for an element set, and must stay as they were.
+    N = 2 * (P + 1) * (P == 1 ? 2 : 1)
+    ops = Operators(family=ElementLocal)
+    rng = MersenneTwister(1600 + 10D + P)
+    for levels in (2, 3), bc in (:periodic, :reflecting), G in element_ghost_widths(D)
+        forest = element_levels_forest(D, N, levels; bc=bc)
+        fs = FieldSet(forest, 2; G=G, centering=elementcentered(D), P=P,
+                      parity=bc === :reflecting ? element_parity(D) : nothing)
+        sched = GhostSchedule(fs, ops)
+        # One stage, the prolongations in it, as phase 1.
+        @test length(sched.stages) == 1 && sched.stagegroups == [1:1]
+        @test isempty(sched.phase2) && isempty(sched.levels)
+        @test any(g -> g.kind === :prolong, sched.phase1)
+        @test occursin("over 0 level(s)", sprint(show, sched))
+        fs.work .= NaN
+        for b in 1:nblocks(fs), v in 1:2
+            interiorview(fs, b, v) .= rand(rng, ntuple(_ -> N, D)...)
+        end
+        fill_ghosts!(fs, sched)
+        bad = 0
+        for b in 1:nblocks(fs), d in 1:D, s in (-1, 1), v in 1:2
+            G[d] == 1 || continue
+            for I in face_ghosts(fs, d, s)
+                g = fs.work[Tuple(I)..., v, b]
+                isapprox(g, element_oracle(fs, b, Tuple(I), d, s, v); atol=1e-13) ||
+                    (bad += 1)
+            end
+        end
+        @test bad == 0
+        stored = CartesianIndices(size(fs.work)[1:D])
+        @test all(I -> is_edge_ghost(fs, Tuple(I)) ==
+                       all(isnan, fs.work[Tuple(I)..., :, :]), stored)
+        # Filling stage by stage is the same fill, bit for bit.
+        staged = copy(fs.work)
+        fill_stagewise!(fs, sched, [i:i for i in eachindex(sched.stages)])
+        @test isequal(fs.work, staged)
+    end
+end
+
+@testset "An element set's outer faces go to the hook, faces only: D=$D" for D in (2, 3)
+    # Guards a hook region left at an edge or corner of an element set,
+    # which would write the ambiguous ghosts the fill leaves alone.
+    P, N = 2, 6
+    forest = element_levels_forest(D, N, 2; bc=:outer)
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    sched = GhostSchedule(fs, Operators(family=ElementLocal))
+    @test all(r -> count(!=(0), r.direction) == 1, sched.boundaries)
+    fs.work .= NaN
+    fill_by_coordinates!((x, v) -> sum(x), fs)
+    fill_ghosts!(fs, sched; boundary=CellBoundary((x, v, δ) -> sum(x)))
+    stored = CartesianIndices(size(fs.work)[1:D])
+    @test all(I -> is_edge_ghost(fs, Tuple(I)) == isnan(fs.work[Tuple(I)..., 1, 1]), stored)
+    # Linear data, continuous across every face and of a degree below P,
+    # so every face ghost is the value at its position, the face.
+    @test all(b -> all(I -> is_edge_ghost(fs, Tuple(I)) ||
+                            isapprox(fs.work[Tuple(I)..., 1, b],
+                                     sum(coordinates(fs, b, Tuple(I))); atol=1e-14),
+                       stored), 1:nblocks(fs))
+end
+
+@testset "A ghost-free element set has an empty schedule: D=$D" for D in (1, 2, 3)
+    # Guards a zero-width layout given transfers or hook regions with an
+    # empty target, which a launch would have to skip.
+    forest = element_levels_forest(D, 4, 2; bc=:outer)
+    fs = FieldSet(forest, 1; G=0, centering=elementcentered(D), P=1)
+    sched = GhostSchedule(fs, Operators(family=ElementLocal))
+    @test isempty(sched.phase1) && isempty(sched.phase2) && isempty(sched.boundaries)
+    before = copy(fs.work)
+    fill_ghosts!(fs, sched)
+    @test fs.work == before
+end
+
+# Data that is one polynomial over the whole domain, of degree `deg` in
+# each dimension, and so continuous across every face: every face ghost
+# that a rule exact to `deg` fills is the polynomial at the face.
+element_poly(deg) = x -> prod(1 + sum(xd^k / (k + d) for k in 1:deg; init=0.0)
+                              for (d, xd) in enumerate(x))
+
+@testset "Fine ghosts are exact for Q_P, coarse ones for Q_(P-1) and not Q_P: D=$D, P=$P" for
+    (D, P) in ((1, 1), (1, 3), (2, 1), (2, 2), (2, 3), (3, 1), (3, 3))
+    # Guards the order of each rule: a fine ghost that does not reproduce
+    # the coarse element's polynomial, a coarse ghost that loses more
+    # than the one degree the compatible restriction must lose, or one
+    # that loses none, which could not be the adjoint of I. In 1D the
+    # face is a point and every rule is the neighbour's face value, bit
+    # for bit, for any data.
+    N = 2 * (P + 1) * (P == 1 ? 2 : 1)
+    forest = element_levels_forest(D, N, 3; bc=:outer)
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    sched = GhostSchedule(fs, Operators(family=ElementLocal))
+    # Per face ghost, whether it is filled from a coarser, a finer or a
+    # same-level block, or by the hook.
+    function errors(f)
+        fill_by_coordinates!((x, v) -> f(x), fs)
+        fill_ghosts!(fs, sched; boundary=CellBoundary((x, v, δ) -> f(x)))
+        err = Dict(k => 0.0 for k in (:fine, :coarse, :same, :hook))
+        for b in 1:nblocks(fs), d in 1:D, s in (-1, 1)
+            k = blockkey(fs, b)
+            nbrs = neighbor_keys(forest, k, ntuple(e -> e == d ? s : 0, D))
+            kind = isempty(nbrs) ? :hook : level(first(nbrs)) < level(k) ? :fine :
+                   level(first(nbrs)) > level(k) ? :coarse : :same
+            for I in face_ghosts(fs, d, s)
+                e = abs(fs.work[Tuple(I)..., 1, b] - f(coordinates(fs, b, Tuple(I))))
+                err[kind] = max(err[kind], e)
+            end
+        end
+        return err
+    end
+    exact = errors(element_poly(P))
+    @test exact[:fine] < 1e-13 && exact[:same] < 1e-13 && exact[:hook] == 0
+    @test errors(element_poly(P - 1))[:coarse] < 1e-13
+    if D == 1
+        @test exact[:coarse] < 1e-13
+        # Any data: every ghost is its neighbour's face node, bit for bit.
+        rng = MersenneTwister(1650 + P)
+        for b in 1:nblocks(fs)
+            interiorview(fs, b, 1) .= rand(rng, N)
+        end
+        fill_ghosts!(fs, sched; boundary=CellBoundary((x, v, δ) -> 0.0))
+        for b in 1:nblocks(fs), s in (-1, 1)
+            nbrs = neighbor_keys(forest, blockkey(fs, b), (s,))
+            isempty(nbrs) && continue
+            c = find_leaf(forest, only(nbrs))
+            @test fs.work[s < 0 ? 1 : N + 2, 1, b] === fs.work[s < 0 ? N + 1 : 2, 1, c]
+        end
+    else
+        @test exact[:coarse] > 1e-6
+    end
+end
+
+@testset "The coarse ghosts are the adjoint of the fine ones in the face quadrature: D=$D, P=$P" for
+    (D, P) in ((1, 2), (2, 1), (2, 2), (2, 3), (3, 1), (3, 3))
+    # Guards the property a summation-by-parts scheme's energy rests on
+    # across a coarse-fine face: Σ W_c c g_c = Σ W_f f g_f, where g_c
+    # are the coarse ghosts filled from the fine face data f and g_f the
+    # fine ghosts filled from the coarse face data c, with W the
+    # tangential Gauss–Lobatto weights including h. A restriction that is
+    # merely accurate, the exact coarsening say, breaks it.
+    N = 2 * (P + 1) * (P == 1 ? 2 : 1)
+    ŵ = TreeAMR.element_tables(Float64, P).weights
+    rng = MersenneTwister(1700 + 10D + P)
+    for bc in (:periodic, :reflecting)
+        forest = element_levels_forest(D, N, 3; bc=bc)
+        fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P,
+                      parity=bc === :reflecting ? [ntuple(_ -> EvenParity, D)] : nothing)
+        sched = GhostSchedule(fs, Operators(family=ElementLocal))
+        for b in 1:nblocks(fs)
+            interiorview(fs, b, 1) .= rand(rng, ntuple(_ -> N, D)...) .- 0.5
+        end
+        fill_ghosts!(fs, sched)
+        # The face weight of face ghost or face node `I` of block `b`.
+        W(b, I, d) = prod((spacing(forest, blockkey(fs, b)) * (P + 1) *
+                           ŵ[(I[e] - 2) % (P + 1) + 1] / 2 for e in 1:D if e != d);
+                          init=1.0)
+        nfaces = 0
+        for b in 1:nblocks(fs), d in 1:D, s in (-1, 1)
+            k = blockkey(fs, b)
+            nbrs = neighbor_keys(forest, k, ntuple(e -> e == d ? s : 0, D))
+            !isempty(nbrs) && level(first(nbrs)) > level(k) || continue
+            nfaces += 1
+            own = s > 0 ? N + 1 : 2                  # the coarse face plane
+            lhs = sum(face_ghosts(fs, d, s)) do I
+                J = Base.setindex(Tuple(I), own, d)
+                W(b, J, d) * fs.work[J..., 1, b] * fs.work[Tuple(I)..., 1, b]
+            end
+            rhs, scale = 0.0, 0.0
+            for c in nbrs
+                bc_ = find_leaf(forest, c)
+                for I in face_ghosts(fs, d, -s)
+                    J = Base.setindex(Tuple(I), s > 0 ? 2 : N + 1, d)
+                    term = W(bc_, J, d) * fs.work[J..., 1, bc_] * fs.work[Tuple(I)..., 1, bc_]
+                    rhs += term
+                    scale += abs(term)
+                end
+            end
+            @test isapprox(lhs, rhs; atol=1e-14 * scale)
+        end
+        @test nfaces > 0
+    end
+end
+
+@testset "An interface schedule refuses an element set" begin
+    # Guards a flux fixup run over Gauss–Lobatto nodes, which a
+    # conservative element scheme would need as mortar fluxes instead.
+    forest = element_levels_forest(2, 8, 2)
+    fs = FieldSet(forest, 1; G=0, centering=elementcentered(2), P=3)
+    @test_throws "mortar fluxes" InterfaceSchedule(fs)
 end
