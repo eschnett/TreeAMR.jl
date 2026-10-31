@@ -199,8 +199,8 @@ end
         same, _, bad, nc, _, _ = lockstep_regrid(serial, 3, cellcentered(2), PointValue, T)
         @test same && bad == 0 && nc > 0
         # The element set's wider windows (M16), in the same types.
-        same, _, bad, nc, _, _ = lockstep_regrid(serial, 3, elementcentered(2), ElementLocal,
-                                                 T; order=3)
+        same, _, bad, nc, _, _ = lockstep_regrid(serial, 3, elementcentered(2),
+                                                 ElementLocal, T; order=3)
         @test same && bad == 0 && nc > 0
     end
 end
