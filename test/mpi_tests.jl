@@ -17,8 +17,9 @@
 # interpolated beyond the seam, the pair's
 # merged stages sharing their tags, and a single leaf at the axis that
 # leaves every rank but one empty; a nested mesh whose prolongation
-# levels each rank runs as one group of stages; and (M14) a half plane,
-# the wave and two sets through a fill, a regrid and interpolation — and
+# levels each rank runs as one group of stages; (M14) a half plane,
+# the wave and two sets through a fill, a regrid and interpolation; and
+# (M16) element sets through a fill in one stage and two regrids — and
 # prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
@@ -112,7 +113,7 @@ end
     @test any(l -> startswith(l, "B2 conserved true"), lines)
     # The regrid cycles (step 4) changed the mesh every time, Burgers'
     # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 18
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 24
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
     @test count(l -> occursin(" unchanged false", l), lines) == 3
@@ -144,6 +145,10 @@ end
     @test all(w -> parse(Int, w) > 0, words("H2 negzero")[3:4])
     @test all(l -> split(l)[4:5] == ["257", "128"],
               filter(startswith("H2 interpolated "), lines))
+    # Element sets (M16): one stage, and the GLL mass conserved through
+    # both regrids.
+    @test all(t -> words("$t transfers")[end] == "1" && "$t conserved true" in lines,
+              ("EL2p", "EL2r", "EL3p"))
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.
@@ -181,6 +186,10 @@ end
                                            hashes)))[end]) > 0
         @test parse(Int, split(only(filter(startswith("# H2 rotated received"),
                                            hashes)))[end]) > 0
+        # An element set's prolongations crossed ranks, in its one stage.
+        @test all(t -> parse(Int, split(only(filter(startswith("# $t prolongations"),
+                                                    hashes)))[end]) > 0,
+                  ("EL2p", "EL2r", "EL3p"))
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes
         @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
@@ -204,6 +213,9 @@ end
                                             "layout on rank(s) 1")
         @test startswith(refused("partial"), "# partial refused on $n of $n ranks: " *
                                              "GhostSchedule was refused on rank(s) 1")
+        @test startswith(refused("element order"),
+                         "# element order refused on $n of $n ranks: GhostSchedule was " *
+                         "called for a different layout on rank(s) 1")
         @test "# one duplicate per communicator true" in hashes
         @test "# device-aware shares the duplicate true" in hashes
         @test "# verbs agree on every rank true" in hashes

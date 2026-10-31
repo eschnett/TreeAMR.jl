@@ -33,10 +33,14 @@ const EXCHANGE_PARITY = [EvenParity, OddParity, OddParity]
 const XOPS4 = Operators(prolongation=4, restriction=4)
 
 exchange_operators(C, family; bounded=false) =
+    family === ElementLocal ? Operators(family=ElementLocal) :
     family === Conservative ?
     Operators(prolongation=3, restriction=2, family=Conservative, bounded=bounded) :
     Operators(prolongation=4, restriction=4, bounded=bounded)
-exchange_ghosts(C, family) = ghosts_for(C, family === Conservative ? 3 : 4)
+# An element set (M16) has one ghost layer, the face's.
+exchange_ghosts(C, family) =
+    family === ElementLocal ? ntuple(_ -> 1, length(C)) :
+    ghosts_for(C, family === Conservative ? 3 : 4)
 
 # The schedule's stencils as plain values, so that two schedules' can be
 # compared by `==`.
@@ -263,12 +267,15 @@ bitwise_equal(a, b) = size(a) == size(b) && all(map(===, a, b))
 # ghosts included, equals the serial one on its blocks bit for bit; the
 # number of `−0` in the serial result; how many mirrored transfers were
 # received across a rank boundary; and the lockstep's segment mismatches.
+# An element set (M16) is `C = elementcentered(D)`, `family =
+# ElementLocal` and its element order as `order`.
 function lockstep_ghost_fill(serial::Forest{D}, P, C, family, ::Type{T};
-                             backend=CPU(), seed=1, bounded=false) where {D,T}
+                             backend=CPU(), seed=1, bounded=false,
+                             order=nothing) where {D,T}
     ops = exchange_operators(C, family; bounded=bounded)
     G = exchange_ghosts(C, family)
     nvars = length(EXCHANGE_PARITY)
-    sfs = FieldSet{T}(serial, nvars; G=G, centering=C, parity=EXCHANGE_PARITY,
+    sfs = FieldSet{T}(serial, nvars; G=G, centering=C, P=order, parity=EXCHANGE_PARITY,
                       backend=backend)
     data = exchange_data(MersenneTwister(seed), T, size(sfs.work))
     copyto!(sfs.work, data)
@@ -278,7 +285,7 @@ function lockstep_ghost_fill(serial::Forest{D}, P, C, family, ::Type{T};
     sets, scheds = [], []
     for r in 0:(P - 1)
         forest = rank_forest(serial, r, P)
-        fs = FieldSet{T}(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY,
+        fs = FieldSet{T}(forest, nvars; G=G, centering=C, P=order, parity=EXCHANGE_PARITY,
                          backend=backend)
         copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
         push!(sets, fs)
@@ -785,6 +792,118 @@ end
     @test all(r -> bitwise_equal(sets[r].work,
                                  sfs.work[ntuple(_ -> :, D + 1)...,
                                           blockrange(forests[r])]), 1:P)
+end
+
+# --- Element sets (M16) -----------------------------------------------------
+#
+# An element set is filled on faces only, in one stage: its
+# prolongations read owned points only and write only ghosts, so they
+# run in phase 1 beside the copies and the restrictions, and a fill is
+# one round of messages. The three-level forests of `faces_forest`, with
+# periodic, outer and reflecting faces, split over 1–5 ranks, put copies,
+# prolongations and restrictions on rank boundaries, and the claims are
+# the ones above: the transfers, both ends' layouts, one write per point,
+# and the values bit for bit, in lockstep and through the driver.
+
+const EOPS = Operators(family=ElementLocal)
+
+# The element layout of the tests below: order `order`, one ghost layer.
+element_exchange_set(forest::Forest{D,T}, nvars, order; parity) where {D,T} =
+    FieldSet{T}(forest, nvars; G=ntuple(_ -> 1, D), centering=elementcentered(D), P=order,
+                parity=parity)
+
+@testset "An element fill is one stage of the serial transfers, split by rank: D=$D" for
+        D in (1, 2, 3)
+    # A phase-1 prolongation filed under a later tag on one end of a
+    # message, a face transfer lost or doubled at a rank boundary, or an
+    # edge transfer that one end derives and the other does not would
+    # leave a ghost unwritten, write one twice, or leave a rank waiting
+    # for a second round its peers never post.
+    nremote = Dict(:copy => 0, :prolong => 0, :restrict => 0)
+    for kinds in EXCHANGE_KINDS[D], order in (1, 3)
+        serial = faces_forest(kinds; N=8)
+        layout(forest) = element_exchange_set(forest, 1, order; parity=[OddParity])
+        sched = GhostSchedule(layout(serial), EOPS)
+        @test [st.tag for st in sched.stages] == [PHASE1_TAG]
+        stransfers = serial_transfers(sched)
+        stored = ntuple(_ -> serial.N + 2, D)
+        scounts = stage_write_counts([sched], stored, nleaves(serial))
+        for P in 1:5
+            scheds = [GhostSchedule(layout(rank_forest(serial, r, P)), EOPS)
+                      for r in 0:(P - 1)]
+            locals, remote, unmatched, bad, nsent = distributed_transfers(scheds)
+            @test bad == 0
+            @test unmatched == 0
+            @test length(locals) + length(remote) == length(stransfers)
+            @test Set(locals) ∪ Set(remote) == stransfers
+            @test all(s -> [st.tag for st in s.stages] == [PHASE1_TAG], scheds)
+            @test layout_mismatches(scheds)[1] == 0
+            counts = stage_write_counts(scheds, stored, nleaves(serial))
+            @test counts == scounts
+            @test all(c -> maximum(c) <= 1, values(counts))
+            foreach(t -> nremote[t[2]] += 1, remote)
+        end
+    end
+    # Every kind crossed a rank boundary somewhere.
+    @test all(>(0), values(nremote))
+end
+
+@testset "Packing and unpacking an element fill reproduces the serial fill bitwise: D=$D, T=$T" for
+        (D, T) in ((1, Float64), (2, Float64), (3, Float64), (2, Float32x2))
+    # The sender evaluates an element prolongation (P+1 taps of I) and a
+    # restriction (2(P+1) taps of R) from its own owned points, and the
+    # receiver adds it in as `0 + 1·x`: every rank's array, ghosts
+    # included, must be the serial fill's on its blocks bit for bit, the
+    # hook at the outer faces included. The edge and corner ghosts, which
+    # an element fill never writes, hold random data on every rank, so a
+    # rank that wrote one would show here too.
+    for kinds in EXCHANGE_KINDS[D], order in (1, 3), P in (2, 3, 5)
+        serial = faces_forest(kinds; T=T, N=8)
+        same, _, _, bad = lockstep_ghost_fill(serial, P, elementcentered(D), ElementLocal,
+                                              T; order=order)
+        @test same
+        @test bad == 0
+    end
+end
+
+@testset "The staged driver fills an element set in one round of messages: D=$D" for
+        D in (2, 3)
+    # Through `fill_ghosts!` over the mailbox, every rank its own task: a
+    # rank that waited for a prolongation level's messages, which an
+    # element fill does not have, would deadlock, and one that sent its
+    # prolongations under another tag than its peer receives them would
+    # leave a message unconsumed.
+    kinds = D == 2 ? (:outer, :reflect_both) : (:reflect_lo, :outer, :periodic)
+    serial = faces_forest(kinds; N=8)
+    nvars = length(EXCHANGE_PARITY)
+    hook = exchange_hook()
+    sfs = element_exchange_set(serial, nvars, 3; parity=EXCHANGE_PARITY)
+    data = exchange_data(MersenneTwister(13), Float64, size(sfs.work))
+    copyto!(sfs.work, data)
+    fill_ghosts!(sfs, GhostSchedule(sfs, EOPS); boundary=hook)
+    for P in (3, 5)
+        box = Mailbox()
+        forests = [Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                          reflecting=TreeAMR.reflecting_faces(serial),
+                          outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
+                          leaves=serial.leaves, comm=MailboxCommunicator(r, P, box))
+                   for r in 0:(P - 1)]
+        sets = map(forests) do forest
+            fs = element_exchange_set(forest, nvars, 3; parity=EXCHANGE_PARITY)
+            copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+            fs
+        end
+        scheds = [GhostSchedule(fs, EOPS) for fs in sets]
+        @sync for r in 1:P
+            @async fill_ghosts!(sets[r], scheds[r]; boundary=hook)
+        end
+        @test box.nmessages > 0
+        @test all(k -> k[3] == PHASE1_TAG, keys(box.channels))   # one round
+        @test all(isempty ∘ last, box.channels)                   # all consumed
+        @test all(r -> bitwise_equal(sets[r].work,
+                                     sfs.work[ntuple(_ -> :, D + 1)...,
+                                              blockrange(forests[r])]), 1:P)
+    end
 end
 
 # --- Rotating seams (M12) ---------------------------------------------------

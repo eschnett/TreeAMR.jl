@@ -24,9 +24,13 @@ export FieldSet, nblocks, blockkey, blockview, interiorview, closedview,
        coordinates, fill_by_coordinates!
 export cellcentered, vertexcentered, facecentered, edgecentered, staggers
 
+# Element centering (M16)
+export elementcentered
+
 # Ghost exchange and interpolation operators (M2)
-export Operators, OperatorFamily, PointValue, Conservative, check_operators,
-       GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates, CellBoundary
+export Operators, OperatorFamily, PointValue, Conservative, ElementLocal,
+       check_operators, GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates,
+       CellBoundary
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
@@ -71,6 +75,7 @@ include("communicator.jl")
 include("morton.jl")
 include("forest.jl")
 include("geometry.jl")
+include("elements.jl")
 include("storage.jl")
 include("operators.jl")
 include("schedule.jl")

@@ -7,11 +7,11 @@ milestone records, the downstream checks and the release history. The
 current design, with the reasons for it, is in [CODE.md](CODE.md), and
 the plan in [PLAN.md](PLAN.md). The sections follow CODE.md's.
 
-**Step numbers.** The milestones M0–M15 are those of
+**Step numbers.** The milestones M0–M16 are those of
 [PLAN.md](PLAN.md), numbered in the order they were planned and done in
-the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14, M15. Several were built in
+the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14, M15, M16. Several were built in
 numbered steps — M8a steps 1–3 and M8b steps 4–5, M7 steps 0–9 with a
-step 6b, M12 steps 0–10, M13 steps 1–4, M14 steps 0–8 — and a reference
+step 6b, M12 steps 0–10, M13 steps 1–4, M14 steps 0–8, M16 steps 1–8 — and a reference
 such as "M7 step 6b", or "step 8" inside a milestone's record, names one
 of them. Each milestone's steps are listed in its record under
 [Milestones](#milestones).
@@ -57,6 +57,7 @@ of them. Each milestone's steps are listed in its record under
   - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
   - [M14 — Half-turn symmetry](#m14--half-turn-symmetry)
   - [M15 — Folds over points](#m15--folds-over-points)
+  - [M16 — Element centering](#m16--element-centering)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -114,6 +115,26 @@ digests still agree byte for byte. One thing the plan expected was not needed:
 
 M8a step 3 made the test wave equation vertex-centered and kept the M3 study verbatim in `test/wave_cell_tests.jl`; no cell-centered number moved.
 
+The element centering is M16, specified on 2026-10-30 and built on
+2026-10-30 and 31. It answers the open question "Element-local DG
+stencils (proposed)", recorded on 2026-10-15 (its content is in the
+[M16 record](#m16--element-centering)). On 2026-10-30 Erik decided to
+make it a centering, with `P` a property of the field set, as the
+proposal had it, rather than an operator family on cell-centered sets.
+Three choices of the build:
+
+- **`pointoffsets` was deleted, not extended.** Every position kernel
+  formed its position from it, and an element set stores as a
+  cell-centered one, so a site that kept the old expression would have
+  computed cell centres for Gauss–Lobatto nodes without a word. Its
+  replacement, `nodeposition`, takes the node offsets or `nothing`
+  explicitly, so a site that missed the change fails instead.
+- **The boundary hooks are supported, not refused.** Refusing them was
+  considered in the specification; it would have kept an element set out of every
+  `regrid!` and `adapt_to_initial_data!` call that passes a hook for its
+  other sets, so the hooks run at the face positions instead.
+- **Edges and corners are not filled** (see [Ghost filling](#ghost-filling)).
+
 ### Tree structure
 
 All-or-nothing refinement was amended from the original sketch's "up to 2^D children": leaf-only storage requires it.
@@ -150,6 +171,14 @@ may not have.
 
 The precision rule was amended in M5, when the implementation showed the original one-line rule was not enough; M5 also amended "Data layout" to point to "Precision" for what carries `T`.
 
+Through M15 every weight was built in exact `Rational` arithmetic. The
+Gauss–Lobatto nodes of M16's element centering are irrational from
+`P = 3` on, so its tables are built in 512-bit `BigFloat` and rounded
+once, as the proposal of 2026-10-15 already said; the `Rational`
+builders were left alone. The algorithm and the precision are
+TreeWaveOLDG's, so that the two packages agree on every node bit for
+bit, which step 1 checked for `P = 1 … 8` in `Float64` and `Float32`.
+
 ## Operations
 
 ### Ghost filling
@@ -167,6 +196,20 @@ Stage groups were added in M13 step 2 (2026-10-19) for a downstream report, esch
 Stage groups first ran through a driver of their own, `run_stages!` beside `run_stage!`, which handed `run_phase!` an iterator over its stages' locals (`GroupedLocals`), and the schedule build compiled `stage_groups` per element type and dimension. Measured on Symmetry on 2026-10-20 with the serial `test/mpi_workload.jl` of 0.2.3 under `--trace-compile-timing` (one EPYC 7543, three alternating runs), in a build that also held the per-class partition of M13 step 4, that branch compiled in 88.6–89.5 s with 1034 roots against 82.3–82.6 s and 969 for 0.2.3 (job 579285). The same day the drivers became one, with a group's locals concatenated at schedule build (`grouplocals`), the message steps split out of it and `sends` left unspecialized; `stage_groups` became one method per dimension; the partition's policy stopped being specialized on and its owner function inferred through; and `stencil_sum`'s generator lost a filtered comprehension. That compiled in 86.4–86.8 s with 995 roots. Along the way: without the split and with `sends` specialized, 87.1–87.3 s (job 579274); and a wrapper that did not specialize on `sends` made the fill's call into the driver dynamic, which moved its compilation into roots of its own without changing the total (86.3–86.7 s in job 579274, 86.4–86.8 in 579285). When the partition was parked the branch was rebuilt without it, and the driver commit kept everything but the partition's part. The rebuilt branch compiles the same workload in 115.4–115.8 s with 991 roots against 110.9–111.7 s and 969 for 0.2.3 (job 579510, 2026-10-20, on an EPYC 7532, cn086, three alternating runs, output identical): 4 % more, where the build with the partition was 5 % more. The one-tap nest's share, about 1 s, is in [CODE.md](CODE.md#the-copy-kernels-on-a-device).
 
 Batching by target level was amended in M5. The original keying did span levels; it was found while threading the schedule build, and no configuration could be constructed in which it actually produced wrong ghosts — but the ordering the sweep exists to guarantee was not in fact enforced, which is enough reason to fix it. The mirror state joined the group key in M10 and the orientation in M12; the M12 design had a group carry its axis map, and step 3 (2026-10-03) amended that to the orientation and plane, with `factorcol` becoming an `Int32`.
+
+Element sets are filled on faces only (M16, decided in its specification
+on 2026-10-30). Filling their edges and corners as well was rejected:
+along a dimension in which the region's direction is nonzero, an edge or
+corner ghost of a block beside a coarser one can land on an element face
+inside that block, where two values are stored, so the ghost has no one
+right value, and the element-local schemes the centering serves never
+read one. Faces only is also what lets every element transfer read owned
+points and write ghosts, and so the fill be one stage. The proposal of
+2026-10-15 had expected a structural change to the schedule builder:
+which side of the discontinuity a ghost takes its value from would have
+to become part of how a ghost names its source. Faces only, with
+injection normal to the face, made it unnecessary, since the copy's
+stencil normal to the face already reads the neighbour's face node.
 
 ### What the ghost fill costs
 
@@ -242,6 +285,36 @@ x86 returns the first operand, and LLVM commutes `fadd` at will — and
 the finite-data claim stands. The test's claim was too strict, not the
 fill: it now compares every `NaN` as one pattern.
 
+Found in M16 step 7's comparison of `--trace-compile-timing`
+on `test/mpi_workload.jl` against `main` (Apple M3 Pro, Julia 1.13):
+steps 1–6 made the existing cell and vertex paths compile about 5 %
+more. `main`'s workload, run serially against the branch's package and
+against `main`'s, printed the same bytes; its run-time compilation
+summed to 48.9 and 49.0 s against 46.3 and 46.7 s on `main`, and its
+wall time was 48.0 s against 45.2–45.9 s. The branch's own workload,
+with its element section, compiled in 52.1–52.3 s. Two causes:
+
+- the `BoundaryPlan` kept the node offsets as `nothing` or a vector, so
+  `GhostSchedule(fs, ops)` inferred as a `Union` of two schedule types,
+  and every caller of a cell set's schedule (`fill_ghosts!`, `regrid!`,
+  `adapt_to_initial_data!`, the workload's own functions) was compiled
+  for both or dispatched at run time;
+- every launch that took the offsets as a `Union{Nothing,Vector}`
+  (`fill_by_coordinates!`, `firing_boxes`, the folds, the hooks), and
+  every run-time branch on `P` (`total_mass` and the norm's GLL
+  quadrature, `kind_stencil`'s `element_stencil`, `coordinates`),
+  compiled the element variant for every cell and vertex set too.
+
+The fix (commit 60ccd8e) departs from the rule that kept
+`Base.inferencebarrier` to the device path: element-only code now sits
+behind a barrier on the CPU path too, and the schedule's type no longer
+depends on `P` ("Element-only code goes behind a barrier" in
+[CODE.md](CODE.md#the-copy-kernels-on-a-device) has the rule and the
+numbers after the fix, about 2 % over `main`). The barrier on every
+launch that 0.1.8 rejected doubled the CPU fill's allocation; this one
+costs an element set one dynamic dispatch per launch and a cell or
+vertex set nothing.
+
 ### Operators
 
 The original specification had a default order of 2; M3 showed it silently producing first-order convergence, and the default was removed. Putting physics-specific operators in application packages resolved the original sketch's open question about where hydro-specific operators belong. Per-variable operator selection through field sets was decided in the M8 design. The interface-order rule was measured in M3, and its form along a stagger in M8a step 3.
@@ -265,6 +338,19 @@ Bounded point values are TreeGRRMHD's AMR-10, requested on 2026-10-15 after Erik
 
 The conservative family on staggered sets is TreeGRRMHD's AMR-9 (2026-10-15). Its vector potential lives on edges and was transferred with the point-value family, which interpolates along each edge, so the flux through a plane drifted across levels while every rate stayed consistent to rounding. Until then the conservative family was refused along a vertex-like dimension, with order-`(p+1)` Lagrange recorded as the candidate for the operator there, since nothing needed it. The request offered a keyword or a family of its own and left the shape to TreeAMR; Erik chose the keyword, `vertex_prolongation`, with no default. The candidate width `p + 1` was not adopted as a default for the same reason no order has one. Whether `bounded = true` should be accepted with it was left to TreeAMR, since TreeGRRMHD does not need it; it is refused as not implemented rather than generalising `bounded_sum` to a mixed group.
 
+The element-local family is M16's. The proposal of 2026-10-15 had the
+coarse ghost as the `L²` projection of the two fine polynomials, exact
+to the element's degree, so that the interface-order rule would cost
+nothing, and named mortar projections that satisfy the
+summation-by-parts compatibility condition as the known remedy if a
+coarse-fine face lost the energy estimate. On 2026-10-30 Erik chose the
+energy-compatible coarse ghost, `R = M_c⁻¹ Iᵀ M_f`, so that the discrete
+energy stays an exact invariant across coarse-fine faces, at the price
+of one degree tangentially. In step 5 a fill with the projection in
+place of `R` was checked to fail the oracle test, as it should. The
+family takes no orders and refuses every option, since `P` is the
+set's.
+
 ### Conservation at coarse-fine faces
 
 The conservative right-hand side is the "two phases" of the original sketch, with the fixup named. The
@@ -281,6 +367,14 @@ Buffering was added post-M4, and amended to *box-as-source* after the first impl
 The conservation of the transfer was measured in M4. The conservative operator family landed early (pre-M5).
 
 Per-set boundary hooks in `regrid!` (`fs => (schedule, hook)`) and the several-set initial-data cycle came on 2026-10-13, as TreeGRRMHD's AMR-2 and AMR-3. AMR-2 offered an alternative — document that with `boundary = nothing` the outward ghosts keep what the caller put there, so a caller may fill each set with its own hook just before `regrid!` — which holds, but costs a fill per set per regrid; the API form was taken. In AMR-3 a set paired with `nothing`, only resized, was added for TreeGRRMHD's ghost-free flux set, which has no initial data.
+
+An element set's regrid coarsens by the exact `L²` projection (M16,
+decided in its specification on 2026-10-30). The ghost fill's `R` was
+the alternative, one table fewer; it was rejected because it loses a
+degree, and energy, the reason for `R`, is not conserved across a regrid
+anyway. The pre-transfer fill is skipped for element sets, since their
+transfer reads owned points only, which puts `P` into the layout
+`check_regrid_set!` compares across ranks.
 
 
 ### Point interpolation
@@ -509,7 +603,7 @@ over tilde bounds and over a run-time interface version.
 
 ## Open questions
 
-The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed, and taken up on 2026-10-21 as M14, when Erik asked for it. His decisions that day: a keyword of its own, `halfturn = (d1, d2)`, rather than an angle on `rotating`; a field-set keyword of its own too, `halfturn`, rather than `rotation` with a second meaning; exactly M12's refusals of periodic, reflecting and outflow faces on the plane's dimensions; and the axis on a root boundary ("the origin is at the edge of a box"), so `roots[d2]` even. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05.
+The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed, and taken up on 2026-10-21 as M14, when Erik asked for it. His decisions that day: a keyword of its own, `halfturn = (d1, d2)`, rather than an angle on `rotating`; a field-set keyword of its own too, `halfturn`, rather than `rotation` with a second meaning; exactly M12's refusals of periodic, reflecting and outflow faces on the plane's dimensions; and the axis on a root boundary ("the origin is at the edge of a box"), so `roots[d2]` even. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05. Element-local DG stencils were recorded as a proposed open question on 2026-10-15, beside TreeWaveOLDG's prototype on unrefined forests, and answered by M16 (2026-10-30 and 31); what M16 leaves open is in [CODE.md](CODE.md#open-questions).
 
 ## Milestones
 
@@ -527,7 +621,10 @@ the same day, so it comes before M9b, which follows it. So does M13,
 the nested-mesh ghost fill, added on 2026-10-19 for a downstream report
 and done on 2026-10-20, and M14, the half turn, specified and built on
 2026-10-21 beside it, on a branch of its own, which is why it took the
-next number when the two were merged.
+next number when the two were merged. M15, the folds over points, came
+on 2026-10-22 for a downstream analysis, and M16, the element centering,
+was specified on 2026-10-30 for TreeWaveOLDG's refined forests and done
+on 2026-10-31; both come before M9b too.
 
 M9b was split from M9, "I/O and visualization", on 2026-09-29, when its checkpoint half became M9a.
 
@@ -4001,6 +4098,135 @@ M12 was decided with Erik, after M7 and before M9b.
   version is 0.2.6, additive. No companion name changes, but TreeIOHDF5
   pins exact versions, so it needs `=0.2.6` appended to its `[compat]`.
 
+### M16 — Element centering
+
+- **M16 — Element centering.** *(Specified 2026-10-30. Done 2026-10-31,
+  steps 1–8.)* An `:element` centering for element-local discontinuous
+  Galerkin schemes, TreeWaveOLDG's OLDG first, whose refined forests it
+  allows: `elementcentered(D)` with the order `P` on the field set, the
+  `ElementLocal` family, a faces-only fill in one stage, and a regrid by
+  `I` and the exact projection, as designed under *The element
+  centering* in [Centerings](CODE.md#centerings) and the element-local
+  family under [Operators](CODE.md#operators). The work is branch
+  `eschnett-claude/element-centering`.
+
+  *How the design came about.* TreeWaveOLDG ran OLDG on uniform forests
+  only: its `check_layout` refused a refined forest, because the
+  coarse-fine ghosts and the regrid transfer interpolated equally spaced
+  cell centres. The proposal, "Element-local DG stencils (proposed)" in
+  CODE.md's open questions (2026-10-15), had set out what fitted already
+  and what a refined forest would need:
+  - *What fitted already.* A block holds `E = N/(P+1)` elements per
+    dimension; the node-duplicated layout owns as a cell-centered
+    dimension does, and at `G = 1` the existing exchange already gave
+    OLDG its outside value on a uniform forest: a same-level copy put
+    the neighbour's low face node into the high ghost, the reflecting
+    mirror put the face node into the low one, an outflow copy gave
+    `ψ* = ψ`. So an application could run OLDG on an unrefined forest
+    with `cellcentered(D)`, `G = 1`, operators that never ran, and node
+    positions of its own, which TreeWaveOLDG did.
+  - *What a refined forest needed.* A Gauss–Lobatto centering with `P` on
+    the field set, positions and the GLL norm at the nodes, `N`
+    divisible by `2(P+1)`, and an element-local operator family:
+    prolongation by the coarse polynomial at the fine nodes, and
+    restriction by the `L²` projection of the two fine polynomials,
+    with the weights built in `BigFloat`. Point interpolation would need
+    an element basis.
+  - *What it worried about.* A ghost placed by its distance from the
+    face would have to learn which side of the discontinuity it takes
+    its value from; the summation-by-parts argument assumes conforming
+    faces, so an interpolated neighbour might lose the energy estimate,
+    with mortar projections as the known remedy; and the ghost operators
+    would have to be tested for stability, not only order.
+
+  Erik's decisions on 2026-10-30: an element centering with `P` a
+  field-set property, as proposed, rather than an operator family on
+  cell sets; the energy-compatible coarse ghost `R`, so that the
+  discrete energy stays an exact invariant across coarse-fine faces;
+  and, for TreeWaveOLDG, static refined forests first, then adaptive
+  refinement, with its particle code still refusing refined forests.
+  The specification added the faces-only fill, which makes the fill one
+  stage and removes the structural change the proposal worried about,
+  and the regrid's exact projection.
+
+  *Steps.*
+  1. **The tables** (`src/elements.jl`): GLL nodes and weights, offsets,
+     per-node quadrature, the two halves of `I`, `R` and the exact
+     coarsening, in 512-bit `BigFloat`, rounded once, memoised per
+     `(P, T)`. Nodes, weights and offsets agree bit for bit with
+     TreeWaveOLDG's for `P = 1 … 8` in `Float64` and `Float32`. Tested
+     against closed forms for `P ≤ 4`; `M_c R = Iᵀ M_f` to 1e-140 in
+     `BigFloat` and to 8 eps in `Float64`, `Float32` and `Float32x2`.
+  2. **The centering**: `elementcentered(D)`, the `FieldSet` field and
+     keyword `P`, and the refusals; `GhostSchedule` takes `P`, keeps it
+     as a field and puts it in the layout digest.
+  3. **Positions and weights**: `pointoffsets` gone, `nodeposition` at
+     every site, bit for bit as before for equally spaced sets; the GLL
+     norm and mass through `_block_fold`; `interpolate` refuses element
+     sets. The suite passed, 152,085 tests in 11 min 19 s at one thread
+     with the docs build running beside it.
+  4. **The family**: `ElementLocal`, its refusals, and
+     `check_operators(N, G, centering, P, ops)`.
+  5. **The fill**: `element_stencil`, the faces-only filter, one
+     `transfer_stage(key, P)`, `InterfaceSchedule`'s refusal. The oracle
+     compares every face ghost with the Lagrange polynomials and the GLL
+     quadrature evaluated at `coordinates`' positions, without the
+     package's stencils; a fill with the projection in place of `R`
+     fails it (checked by hand while building it, not kept as a test).
+  6. **The regrid**: `I` and the exact projection, no pre-fill, `P` in
+     `check_regrid_set!`'s layout.
+  7. **Distributed, threads, device.** Element cases in
+     `exchange_tests.jl`, `regrid_exchange_tests.jl`, `type_tests.jl`,
+     `gpu_tests.jl` and both workloads. Serially and at three ranks
+     (MPIABI_jll, one thread a rank) the 398 compared lines of
+     `test/mpi_workload.jl` agree, every sum to 1e-12, and each element
+     set's prolongations crossed ranks: 9, 5 and 12 of them for `EL2p`,
+     `EL2r` and `EL3p`. `mpi_tests.jl` counts 24 changing regrids (18
+     before), asserts the new `#` line of received prolongations, and a
+     new refusal: an element order that differs on rank 1 only is
+     refused on every rank. `test/thread_workload.jl`'s 190 lines are
+     identical byte for byte at 1, 4 and 8 threads. All of
+     `gpu_tests.jl` passes on Metal in `Float32` on an Apple M3 Pro, 62
+     Metal testsets, run from a scratch environment that develops the
+     checkout and adds Metal. The compile-timing comparison against
+     `main` found the cell and vertex paths 5 % slower to compile, and
+     the fix put element-only code behind barriers
+     ([The copy kernels on a device](#the-copy-kernels-on-a-device)).
+     The suite passed: 157,745 tests in 10 min 48 s at one thread,
+     157,797 in 10 min 20 s at eight.
+  8. **Documents.** CODE.md describes the built design and keeps open
+     what is open; CLAUDE.md gained the rule on element sets and the
+     barrier exception; `gpu_tests.jl`'s header describes the scratch
+     environment instead of adding a device package to the test
+     environment. The suite time was measured against `main` back to back
+     at one thread on 2026-10-31, on the M3 Pro with other work on the
+     machine (load averages 4.6–11): `main` (b33f73d) 132,009 tests in
+     10 min 1 s, this branch 157,745 in 11 min 18 s. `element_tests.jl`
+     alone, after the two oracle files, runs 24,530 tests in 66.6 s,
+     most of the difference; the element cases added to the other files
+     are the rest. CLAUDE.md's figure went from about 8 min, last
+     measured on an idle machine after M7, to about 11.
+
+  *Alternatives rejected*, each where its topic is: an operator family
+  on cell sets instead of a centering, and refusing the boundary hooks
+  ([Centerings](#centerings)); filling edges and corners
+  ([Ghost filling](#ghost-filling)); the `L²` projection as the coarse
+  ghost ([Operators](#operators)); `R` as the regrid's coarsening
+  ([Regridding](#regridding)).
+
+  *Companion and downstream.* TreeIOHDF5 saves an element set's
+  centering as `"element"` and its order as a `P` attribute, under a new
+  feature `elements` that a file lists only when it holds an element set,
+  so the registered 0.1.5 refuses such a file by the feature, saying why;
+  its suite, 974 tests, passes against this checkout in 2m06 at one
+  thread. TreeWave (349 tests, 1m41) and TreeHydro (12679 tests, 5m28,
+  and 5m36 with TreeIOHDF5's branch) pass against it unchanged
+  (2026-10-31).
+
+  The version is 0.2.7, additive. `FieldSet` and `GhostSchedule` gain
+  the field `P`, which TreeIOHDF5 reads, so its release accepts `=0.2.7`
+  only.
+
 ## Downstream checks
 
 **TreeWave.** The `[sources]` pins to `main` went when 0.1.1 was
@@ -4012,6 +4238,8 @@ checkout its suite was unchanged, 310 tests in 1m12 (2026-09-29). M7
 reached it with 0.1.5 and changed nothing serially: 310 tests in 1m22
 against the M7 checkout (2026-10-02); M12, released in 0.1.7, changed
 nothing either, 310 tests in 1m17 against the M12 checkout (2026-10-03).
+M16 changed nothing for it: 349 tests in 1m41 against the M16 checkout
+(2026-10-31).
 
 **TreeHydro.** It is **implemented, not a sketch**: sixteen files in
 `src/`, fourteen test files, two viewers in `bin/`, its own CI and
@@ -4034,7 +4262,8 @@ keywords and the run histories as plain data; its `src/checkpoint.jl`
 (`run_state`, `rotate_checkpoints!`) has since implemented it. M7
 changed nothing for it serially: 12447 tests in 5m00 against the M7
 checkout, at one thread (2026-10-02); nor did M12 (0.1.7), 12447 tests in
-5m08 against the M12 checkout (2026-10-03). Its own MPI port
+5m08 against the M12 checkout (2026-10-03); nor did M16, 12679 tests in
+5m28 against the M16 checkout (2026-10-31). Its own MPI port
 (2026-10-02) found the one TreeAMR bug so far on a rank without blocks —
 the `AllVariables` boundary hook's length check, of which it is the only
 caller — so it needs TreeAMR 0.1.6, which has the fix.
@@ -4113,5 +4342,5 @@ outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
 0.2.3 (2026-10-16) raised the Julia floor to 1.13, 0.2.4 carries the
-nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), and 0.2.6 the folds over points (M15). The repository keeps no changelog; the release commit says what
+nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), 0.2.6 the folds over points (M15), and 0.2.7 the element centering (M16). The repository keeps no changelog; the release commit says what
 changed.

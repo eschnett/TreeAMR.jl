@@ -965,7 +965,7 @@ boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
 # agree bit for bit.
 @kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
                                   @Const(firsts), @Const(origins), @Const(spacings),
-                                  ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+                                  nodes, ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     v = I[D + 1]
     t = I[D + 2]
@@ -979,9 +979,8 @@ boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
     # The same expression `coordinates` forms, in the same order, from
     # the same origin and spacing, so the two agree bit for bit — half a
     # cell in a cell-centered dimension, a whole one in a vertex-like
-    # dimension.
-    poff = pointoffsets(h, C)
-    x = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
+    # dimension, the face for an element set's ghost.
+    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
     # `g` is the user's, and is deliberately *outside* the `@inbounds`
     # above: whatever it indexes is checked as it would be anywhere else.
     val = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
@@ -994,7 +993,7 @@ end
 # the two forms write bit-for-bit the same numbers.
 @kernel function boundary_all_kernel!(work, g, @Const(blocks), @Const(directions),
                                       @Const(firsts), @Const(origins),
-                                      @Const(spacings),
+                                      @Const(spacings), nodes,
                                       ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)
@@ -1006,8 +1005,7 @@ end
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
     @inbounds origin, h = origins[b], spacings[b]
-    poff = pointoffsets(h, C)
-    x = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
+    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
     vals = g(x, ntuple(d -> Int(δ[d]), Val(D)))
     # Unrolled through `Val`, as in `coordinates_all_kernel!`.
     ntuple(Val(NV)) do v
@@ -1029,7 +1027,7 @@ end
 
 @kernel function relative_kernel!(work, f, @Const(blocks), @Const(firsts),
                                   @Const(clamps), @Const(origins), @Const(spacings),
-                                  ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+                                  nodes, ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     t = I[D + 1]
     @inbounds b = blocks[t]
@@ -1038,16 +1036,15 @@ end
     idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
     r = relative_point(idx, cl, Val(D))
     @inbounds origin, h = origins[b], spacings[b]
-    poff = pointoffsets(h, C)
-    xg = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
-    xr = ntuple(d -> origin[d] + (r[d] - G[d] - poff[d]) * h, Val(D))
+    xg = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    xr = ntuple(d -> nodeposition(origin[d], h, r[d] - G[d], C[d], nodes), Val(D))
     @inbounds ur = work[r..., 1, b]
     @inbounds work[idx..., 1, b] = f(xg) + (ur - f(xr))
 end
 
 @kernel function relative_all_kernel!(work, f, @Const(blocks), @Const(firsts),
                                       @Const(clamps), @Const(origins), @Const(spacings),
-                                      ::Val{D}, ::Val{G}, ::Val{C},
+                                      nodes, ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)
     t = I[D + 1]
@@ -1057,9 +1054,8 @@ end
     idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
     r = relative_point(idx, cl, Val(D))
     @inbounds origin, h = origins[b], spacings[b]
-    poff = pointoffsets(h, C)
-    xg = ntuple(d -> origin[d] + (idx[d] - G[d] - poff[d]) * h, Val(D))
-    xr = ntuple(d -> origin[d] + (r[d] - G[d] - poff[d]) * h, Val(D))
+    xg = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    xr = ntuple(d -> nodeposition(origin[d], h, r[d] - G[d], C[d], nodes), Val(D))
     fg = f(xg)
     fr = f(xr)
     ntuple(Val(NV)) do v
@@ -1197,10 +1193,12 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
-        boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
-                                  batch.firsts, plan.origins, plan.spacings,
-                                  Val(D), Val(fs.G), Val(staggers(fs));
-                                  ndrange=(blen..., fs.nvars, n))
+        with_nodes(plan.nodes) do nodes
+            boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
+                                      batch.firsts, plan.origins, plan.spacings, nodes,
+                                      Val(D), Val(fs.G), Val(staggers(fs));
+                                      ndrange=(blen..., fs.nvars, n))
+        end
     end
     synchronize(backend)
     return nothing
@@ -1239,9 +1237,11 @@ function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot
         batch.slot == slot || continue
         n = nregions(batch)
         n == 0 && continue
-        kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
-                plan.spacings, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
-                ndrange=(batch.boxlen..., n))
+        with_nodes(plan.nodes) do nodes
+            kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
+                    plan.spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
+                    ndrange=(batch.boxlen..., n))
+        end
     end
     synchronize(backend)
     return nothing
@@ -1268,11 +1268,13 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
-        boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
-                                      batch.firsts, plan.origins, plan.spacings,
-                                      Val(D), Val(fs.G),
-                                      Val(staggers(fs)), Val(fs.nvars);
-                                      ndrange=(blen..., n))
+        with_nodes(plan.nodes) do nodes
+            boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
+                                          batch.firsts, plan.origins, plan.spacings,
+                                          nodes, Val(D), Val(fs.G),
+                                          Val(staggers(fs)), Val(fs.nvars);
+                                          ndrange=(blen..., n))
+        end
     end
     synchronize(backend)
     return nothing
@@ -1324,6 +1326,11 @@ CPU each thread fills the ghosts of the blocks it owns (see
 read nothing the levels below them write run as one such loop, and over
 a distributed forest with their messages in flight together (see
 [`GhostSchedule`](@ref)).
+
+An element-centered set (M16, [`ElementLocal`](@ref) operators) is
+filled on faces only, in one stage: its edge and corner ghosts are never
+written, by a transfer or by the hook, and are stale under
+`map_blocks!(…; stored = true)`. See [`GhostSchedule`](@ref).
 
 Periodic boundaries need nothing special; the tree wraps around, so they
 are ordinary transfers. Reflecting faces need nothing either (M10): the
@@ -1445,6 +1452,11 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "for $(schedule.centering); the stored extent, the target ranges and the " *
         "one-dimensional operators all differ between a cell-centered and a " *
         "vertex-like dimension. Build one with `GhostSchedule(fs, operators)`."))
+    fs.P == schedule.P || throw(ArgumentError(
+        "the field set has element order P = $(fs.P) but this schedule was built " *
+        "for P = $(schedule.P) ($(schedule.P == 0 ? "no elements" : "elements")); " *
+        "every node position and element stencil in it is wrong for this layout. " *
+        "Build one with `GhostSchedule(fs, operators)`."))
     fs.walls === schedule.walls || throw(ArgumentError(
         "the field set has walls = :$(fs.walls) but this schedule was built for " *
         ":$(schedule.walls); the target ranges at a low domain face differ between " *

@@ -63,7 +63,9 @@ refused here rather than silently given an empty schedule. Edge
 directions are deliberately absent: the constrained-transport
 consistency condition lives on the edges of coarse-fine **faces**,
 including their boundary lines, and a finer neighbor across an edge alone
-imposes nothing (see `CODE.md`).
+imposes nothing (see `CODE.md`). An element-centered set (M16) is
+refused too, with its own reason: a conservative element scheme needs
+mortar fluxes, which this schedule does not build.
 
 For every block, every admissible direction, and every *finer* neighbor
 across it, the block's boundary plane in `d` — its owned plane `G+1` on
@@ -150,6 +152,16 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
     backend = get_backend(fs.work)
     # Collective over a distributed forest (M7), as `GhostSchedule` is.
     faces::Vector{Int} = collective_checks(forest, "InterfaceSchedule") do
+        # Before the face test, which an element set, cell-like in every
+        # dimension, would fail with the wrong reason.
+        fs.P == 0 || throw(ArgumentError(
+            "an element-centered field set (P = $(fs.P)) has no interface " *
+            "restriction: across a coarse-fine face a conservative element scheme " *
+            "needs mortar fluxes, the coarse face's flux the integral of the fine " *
+            "faces' polynomials, not a restriction of stored values onto one plane, " *
+            "and this schedule builds none. The ghost fill's compatible restriction " *
+            "(`Operators(family = ElementLocal)`) is what keeps a summation-by-parts " *
+            "scheme's energy invariant across the face."))
         fd = filter(d -> stags[d] == 1, collect(1:D))
         isempty(fd) && throw(ArgumentError(
             "a cell-centered field set has no coarse-fine interface to restrict: the " *

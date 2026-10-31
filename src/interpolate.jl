@@ -448,7 +448,9 @@ end
 @inline function query_stencil(basis, x::NTuple{D,T}, origin, h, ::Val{G}, ::Val{C},
                                ::Val{S}) where {D,T,G,C,S}
     n = stencilwidth(basis)
-    off = pointoffsets(h, C)
+    # The inverse of `nodeposition` for an equally spaced set; an element
+    # set is refused before any query reaches here (`check_interpolation`).
+    off = ntuple(d -> uniform_shift(h, C[d]), Val(D))
     t = ntuple(d -> (x[d] - origin[d]) / h, Val(D))
     first = ntuple(d -> clamp(stencilstart(basis, t[d] + (T(G[d]) + off[d])), 1,
                               S[d] - n + 1), Val(D))
@@ -765,7 +767,10 @@ Near the edge of the stored array the stencil shifts inward rather than
 extrapolate: centered whenever `G ≥ n/2` in a cell-centered dimension and
 `G ≥ n/2 − 1` in a vertex-like one, off center otherwise, and exact on
 the same polynomials either way — which is what makes a field set with
-`G = 0` interpolable at all.
+`G = 0` interpolable at all. An element-centered set (M16;
+[`elementcentered`](@ref)) is refused: its Gauss–Lobatto nodes are not
+equally spaced, and its interpolant is the containing element's
+polynomial, which needs a basis of its own.
 
 A point is wrapped along a periodic dimension and mirrored once across a
 reflecting face; a mirrored value takes the variable's parity sign and a
@@ -862,6 +867,11 @@ end
 # Every argument check of `interpolate!`, returning the checked `derivs`.
 function check_interpolation(values, excluded, fs::FieldSet{T,D}, xs, basis, derivs,
                              vars) where {T,D}
+    fs.P == 0 || throw(ArgumentError(
+        "point interpolation does not take an element-centered set (P = $(fs.P)): " *
+        "its bases interpolate equally spaced points through a continuous stored " *
+        "index, and an element set's Gauss–Lobatto nodes need a basis built from the " *
+        "containing element's polynomial instead, which the package does not have."))
     ms = check_derivs(basis, derivs, Val(D))
     check_stencil_fits(fs, basis)
     all(v -> 1 <= v <= fs.nvars, vars) || throw(ArgumentError(

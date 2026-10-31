@@ -343,6 +343,70 @@ end
     @test total_mass(fs) ≈ before rtol = reltol(T, 4096)
 end
 
+@testset "An element set fills, regrids and folds in its own type: T=$T, D=$D" for
+        T in FLOATTYPES, D in (1, 2)
+    # The GLL tables are rounded once from BigFloat into T, and the
+    # positions, the stencils, the folds and the regrid compute in T. A
+    # table built in Float64 and converted, or a node offset or weight
+    # promoted on the way, would widen a Float32 result (the leak
+    # detector) and cost Float32x2 its low limb, which the type-relative
+    # tolerances below would catch: the fill is exact for degree P-1 at
+    # every face ghost, the regrid for degree P both ways, and the GLL
+    # mass is the polynomial's integral throughout, as in Float64.
+    P, N = 3, 8
+    ops = Operators(family=ElementLocal)
+    forest = Forest{T}(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (0, 1), D))
+    for _ in 1:2
+        refine!(forest, first(forest.leaves))
+        balance!(forest)
+    end
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    @test eltype(fs.work) === T
+    @test TreeAMR.element_tables(T, P) isa TreeAMR.ElementTables{T}
+    @test coordinates(fs, 1, ntuple(_ -> 1, D)) isa NTuple{D,T}
+    sched = GhostSchedule(fs, ops)
+    @test all(g -> all(s -> eltype(s.weights) === T, g.stencils), sched.phase1)
+    poly(deg) = (x, v) -> v + sum(d -> (x[d] + d)^deg, 1:D)
+    integral(deg) = T(1 + sum(d -> (big(d + 1)^(deg + 1) - big(d)^(deg + 1)) //
+                                   (deg + 1), 1:D))
+    scale(deg) = 1 + D * (D + 1)^deg
+
+    f = poly(P - 1)
+    fill_by_coordinates!(f, fs)
+    fill_ghosts!(fs, sched; boundary=boundary_by_coordinates(f))
+    worst = zero(T)
+    for b in 1:nblocks(fs), I in CartesianIndices(ntuple(_ -> N + 2, D))
+        i = Tuple(I)
+        count(d -> !(2 <= i[d] <= N + 1), 1:D) >= 2 && continue    # edges: unwritten
+        worst = max(worst, abs(fs.work[i..., 1, b] - f(coordinates(fs, b, i), 1)))
+    end
+    @test worst isa T
+    @test worst < reltol(T, 4096) * scale(P - 1)
+    u = statevector(fs)
+    gather!(u, fs)
+    @test u isa Vector{T}
+    @test volume_weighted_norm(fs, u) isa T
+    @test volume_weighted_norm(fs, u; p=Inf) isa T
+    @test (@inferred total_mass(fs)) isa T
+    @test total_mass(fs) ≈ integral(P - 1) rtol = reltol(T, 256)
+
+    g = poly(P)
+    owned_error() = maximum(b -> maximum(I -> abs(fs.work[(Tuple(I) .+ 1)..., 1, b] -
+                                                  g(coordinates(fs, b, Tuple(I) .+ 1), 1)),
+                                         CartesianIndices(ntuple(_ -> N, D))),
+                            1:nblocks(fs))
+    fill_by_coordinates!(g, fs)
+    nb = nblocks(fs)
+    @test regrid!(forest, fs => sched; flags=fill(Refine, nb))
+    @test nblocks(fs) == 2^D * nb
+    @test owned_error() < reltol(T, 4096) * scale(P)
+    @test total_mass(fs) ≈ integral(P) rtol = reltol(T, 256)
+    @test regrid!(forest, fs => GhostSchedule(fs, ops); flags=fill(Coarsen, nblocks(fs)))
+    @test nblocks(fs) == nb
+    @test owned_error() < reltol(T, 4096) * scale(P)
+    @test total_mass(fs) ≈ integral(P) rtol = reltol(T, 256)
+end
+
 @testset "A field set and schedule of different types say so" begin
     # They must agree exactly: the transfer accumulates in eltype(dest)
     # and reads weights straight from the stencils, so a mismatch would

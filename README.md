@@ -21,12 +21,13 @@ the mesh with a set of finer meshes.
 See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
 for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
 package got here, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M15** (after M8's every
+The package is currently at milestone **M16** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, M7's
 distribution over MPI, M12's rotating symmetry, M13's faster ghost
-fill on nested meshes, M14's half turn, and M15's folds over points). M7 is measured on a
+fill on nested meshes, M14's half turn, M15's folds over points, and
+M16's element centering). M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the
@@ -47,6 +48,11 @@ about its middle, as Cactus's RotatingSymmetry180 does.
 M15 folds every owned point of the mesh, with its position, level and
 variables, into one accumulator, so that the norms of many regions come
 from one sweep and one collective rather than one each.
+M16 adds an element centering for element-local discontinuous Galerkin
+schemes: elements of `P + 1` Gauss–Lobatto nodes on refined forests,
+filled across element faces only and in one stage, with a coarse-fine
+coupling that keeps a summation-by-parts scheme's discrete energy an
+exact invariant.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.

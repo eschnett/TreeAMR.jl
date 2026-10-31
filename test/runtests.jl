@@ -579,6 +579,7 @@ end
 
 include("ghost_tests.jl")
 include("centering_tests.jl")
+include("element_tests.jl")
 include("reflect_tests.jl")
 include("outflow_tests.jl")
 include("rotate_tests.jl")

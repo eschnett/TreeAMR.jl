@@ -80,14 +80,15 @@ pins exact TreeAMR versions (`CODE.md`, "Companion interface").
 
 ## Commands
 
-Full test suite, about 8 min at one thread and at eight; the
+Full test suite, about 11 min at one thread and at eight; the
 thread-independence test spends about 50 s of it in two subprocesses
 running `test/thread_workload.jl`. The MPI test's two `mpiexec` jobs,
 about a minute each and nearly all compilation, run *beside* the suite
 where the machine has 8+ threads and 24+ GB (`test/mpi_jobs.jl`); on a
 smaller machine, CI's runners among them, they run one after the other
 (`TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice). The
-per-file times are in `HISTORY.md` (M7 step 9, M12's steps).
+per-file times are in `HISTORY.md` (M7 step 9, M12's steps, M16 step
+8).
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
 shorten it by making the kernels faster (`CODE.md`, "Tests", has the
@@ -317,9 +318,12 @@ the one that says why.
   enough.
 - **Two time scales.** Tree queries must never appear in the
   per-evaluation path ("Ghost filling").
-- **One kernel for every transfer.** Keep the CPU launch path
-  type-stable, hide unavoidable unions behind `Base.inferencebarrier` on
-  the device path only, and compare `--trace-compile-timing` of
+- **One kernel for every transfer.** Keep the CPU launch path of cell
+  and vertex sets type-stable, and hide unavoidable unions behind
+  `Base.inferencebarrier` on the device path only. Element-only code is
+  the exception: it sits behind a barrier on every path, and a
+  schedule's type must not depend on `P`, so that cell and vertex sets
+  compile none of it. Compare `--trace-compile-timing` of
   `test/mpi_workload.jl` against `main` for any change to a launch path
   ("The copy kernels on a device").
 - **The copy kernels launch flat on a device, shaped on the CPU**; a new
@@ -331,6 +335,12 @@ the one that says why.
   what they read ("Ghost filling"). Prolongation levels run as groups
   of stages where `stage_groups` finds no conflict in the boxes they
   write and read: a new write or read in phase 2 must be among them.
+- **Element sets are filled on faces only.** Their edge and corner
+  ghosts are never written, so nothing may read them. An element set
+  stores as a cell-centered one, so only `P` tells them apart: pass `P`
+  explicitly to whatever builds a stencil or a position, and form every
+  position through `nodeposition` ("Centerings", *The element
+  centering*).
 - **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
   block at a low domain face has its own range start at `G+2` along that
   vertex-like dimension; the trim is part of `GroupKey` ("Centerings").

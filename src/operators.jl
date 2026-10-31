@@ -43,21 +43,62 @@ inter-grid operators applies:
   exact volume average; prolongation reconstructs over the coarse cell
   and takes subcell averages, so it is locally conservative by
   construction.
+- [`ElementLocal`](@ref) — the polynomials of Gauss–Lobatto elements
+  (M16), the one family of an element-centered set
+  ([`elementcentered`](@ref)).
 
 See [`Operators`](@ref).
 """
-@enum OperatorFamily PointValue Conservative
+@enum OperatorFamily PointValue Conservative ElementLocal
+
+"""
+    ElementLocal
+
+The [`OperatorFamily`](@ref) of an element-centered field set
+([`elementcentered`](@ref), M16), whose values are the nodal values of a
+degree-`P` polynomial per element. It is the only family such a set
+takes, and no other set takes it. It has no orders to choose: every
+operator follows from the element and its order `P`, which is the field
+set's, so `Operators(family = ElementLocal)` takes no `prolongation`,
+`restriction`, `bounded` or `vertex_prolongation`.
+
+The ghost fill of an element set writes **faces only**, one plane deep,
+each ghost the value the neighbour holds at the shared face:
+
+- normal to the face, for every kind of transfer, the neighbour's
+  face-adjacent owned plane, which sits at the same position;
+- tangentially across a coarse-fine face, a fine ghost is the coarse
+  element's polynomial at the fine nodes (`I`, exact to degree `P`), and
+  a coarse ghost the compatible restriction `R = M_c⁻¹ Iᵀ M_f` of the
+  two fine elements covering it, exact to degree `P - 1` and the adjoint
+  of `I` in the Gauss–Lobatto inner products, which is what keeps a
+  summation-by-parts scheme's energy an exact invariant across the face.
+
+Every transfer reads owned points only, so the fill is one stage. A
+[`regrid!`](@ref) refines by `I` and coarsens by the exact `L²`
+projection, exact to degree `P`, conserving [`total_mass`](@ref), and a
+left inverse of the refinement. See [`ElementTables`](@ref
+TreeAMR.ElementTables) for the tables, and in `CODE.md` *The element
+centering* under "Centerings" and the element-local family under
+"Operators", which has the energy argument.
+"""
+ElementLocal
 
 """
     Operators(; prolongation, restriction, family=PointValue, bounded=false,
               vertex_prolongation=nothing)
+    Operators(; family=ElementLocal)
 
 The operator family and orders a [`GhostSchedule`](@ref) is built with.
 Both orders are required — there is deliberately **no default**. The
 order is the number of source cells per dimension, and the operator is
-exact to degree `order - 1`.
+exact to degree `order - 1`. The exception is the element family
+([`ElementLocal`](@ref), M16), the one family of an element-centered
+set, which takes no orders at all: its operators follow from the
+element order `P` the field set carries.
 
-Two families ship, differing in what a stored number means:
+Two families of equally spaced data ship, differing in what a stored
+number means:
 
 - [`PointValue`](@ref OperatorFamily) (default) — finite-difference
   semantics, data are samples at cell centers. Both operators are
@@ -273,6 +314,26 @@ struct Operators
                        restriction::Union{Integer,Nothing}=nothing,
                        family::OperatorFamily=PointValue, bounded::Bool=false,
                        vertex_prolongation::Union{Integer,Nothing}=nothing)
+        # Before the missing-order check: the element family has no
+        # orders, so asking for them is the error, not omitting them.
+        if family === ElementLocal
+            for (name, p) in (("prolongation", prolongation),
+                              ("restriction", restriction),
+                              ("vertex_prolongation", vertex_prolongation))
+                p === nothing || throw(ArgumentError(
+                    "the ElementLocal family takes no $name: its operators are the " *
+                    "element's own, of the order P the element-centered field set " *
+                    "carries, so there is no order to choose here. Write " *
+                    "`Operators(family = ElementLocal)`."))
+            end
+            bounded && throw(ArgumentError(
+                "bounded = true is not available with the ElementLocal family: its " *
+                "operators are the element's polynomial interpolation and its " *
+                "compatible restriction, fixed by the order P of the field set, and " *
+                "bounding them would break the compatibility that keeps a " *
+                "summation-by-parts scheme's energy invariant across a coarse-fine face"))
+            return new(family, 0, 0, false, 0)
+        end
         for (name, p) in (("prolongation", prolongation), ("restriction", restriction))
             p === nothing && throw(ArgumentError(
                 "Operators has no default order: pass $name explicitly. The order " *
@@ -360,6 +421,7 @@ function boundedmode(ops::Operators, kind::Symbol, mirror::NTuple{D,Int8},
 end
 
 Base.show(io::IO, ops::Operators) =
+    ops.family === ElementLocal ? print(io, "Operators(family=ElementLocal)") :
     print(io, "Operators(prolongation=", ops.prolongation,
           ", restriction=", ops.restriction, ", family=", ops.family,
           ops.bounded ? ", bounded=true" : "",
@@ -377,12 +439,16 @@ vertex_order(ops::Operators) =
 
 How many of the coarse source block's own ghost layers a prolongation
 stencil reaches into — the quantity that ties the operator order to `G`.
+None for the [`ElementLocal`](@ref) family, whose transfers read owned
+points only.
 """
 ghost_layers_read(ops::Operators) =
+    ops.family === ElementLocal ? 0 :
     ops.family === Conservative ? (ops.prolongation - 1) ÷ 2 : ops.prolongation ÷ 2
 
 """
     check_operators(fs::FieldSet, ops::Operators)
+    check_operators(N, G, centering, P, ops::Operators)
 
 Verify that the forest's `N` and the *field set's* per-dimension `G` and
 centering support the requested interpolation orders, throwing an
@@ -423,12 +489,43 @@ reads only a cell's own children, so a cell-centered dimension with
 `G_d = 0` is a legal layout for `Conservative` `(1, 2)` operators — a
 ghost-free auxiliary field set carried across regrids, say. Its exchange
 in that dimension is simply empty.
+
+An element-centered set ([`elementcentered`](@ref), order `P > 0`, M16)
+takes the [`ElementLocal`](@ref) family and no other, and that family
+serves no other set: the two equally spaced families would interpolate
+Gauss–Lobatto nodes as if they were cell centres, and the element family
+has no operators for equally spaced data. It needs nothing of `G` and
+`N` beyond what the field set already checked (`G ≤ 1`, whole parent
+elements per fine block), since every element transfer reads owned
+points only.
+
+The form `check_operators(N, G, centering, P, ops)` is the one a
+schedule build calls, with the centering as symbols and the element
+order `P`, `0` for none.
 """
 check_operators(fs::FieldSet, ops::Operators) =
-    check_operators(fs.forest.N, fs.G, staggers(fs), ops)
+    check_operators(fs.forest.N, fs.G, fs.centering, fs.P, ops)
 
-function check_operators(N::Integer, G::NTuple{D,Int}, c::NTuple{D,Int},
-                         ops::Operators) where {D}
+function check_operators(N::Integer, G::NTuple{D,Int}, centering::NTuple{D,Symbol},
+                         P::Integer, ops::Operators) where {D}
+    # The element family and the element centering go together, both
+    # ways: neither has operators for the other's data.
+    if P > 0
+        ops.family === ElementLocal || throw(ArgumentError(
+            "an element-centered field set (P = $P) takes Operators(family = " *
+            "ElementLocal), not the $(ops.family) family: its values are the " *
+            "Gauss–Lobatto nodes of degree-$P polynomials, which $(ops.family) " *
+            "operators would interpolate as equally spaced points, silently wrong at " *
+            "every coarse-fine face and across every regrid"))
+        return nothing
+    end
+    ops.family === ElementLocal && throw(ArgumentError(
+        "the ElementLocal family moves the polynomials of Gauss–Lobatto elements, " *
+        "and this field set has none (centering $centering): its values are " *
+        "equally spaced. Use the PointValue or the Conservative family, or make " *
+        "the set element-centered, `centering = elementcentered($D)` with its " *
+        "order `P`"))
+    c = staggers(centering)
     pp = ops.prolongation
     pr = ops.restriction
     needed = ghost_layers_read(ops)
@@ -541,8 +638,10 @@ end
 #
 # The cached vectors are shared, so nothing may mutate one; the two
 # callers copy them into a `Stencil1D`'s element type on the way out.
+#
+# `LAGRANGE_LOCK` guards this cache and the element tables' alike, and is
+# defined in `elements.jl`, which is included first.
 const LAGRANGE_CACHE = Dict{Tuple{Int,WeightRational},Vector{WeightRational}}()
-const LAGRANGE_LOCK = ReentrantLock()
 
 """
     unit_lagrange_weights(p, ξ)

@@ -40,9 +40,11 @@ end
 # transfers as `(kind, target, source)` over all ranks, local and
 # received; the number of mismatched layout entries and segments, and of
 # ranks whose own classification kept other transfers than the whole
-# one; and the number of transfers that crossed a rank boundary.
+# one; and the number of transfers that crossed a rank boundary. An
+# element set (M16) is `C = elementcentered(D)`, `family = ElementLocal`
+# and its element order as `order`.
 function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
-                         bounded=false) where {D,T}
+                         bounded=false, order=nothing) where {D,T}
     ops = exchange_operators(C, family; bounded=bounded)
     G = exchange_ghosts(C, family)
     nvars = length(EXCHANGE_PARITY)
@@ -51,7 +53,7 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
                        outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
                        TreeAMR.seam_keywords(serial)...,
                        leaves=serial.leaves)
-    fs = FieldSet{T}(forest, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
+    fs = FieldSet{T}(forest, nvars; G=G, centering=C, P=order, parity=EXCHANGE_PARITY)
     copyto!(fs.work, exchange_data(MersenneTwister(5), T, size(fs.work)))
     hook = exchange_hook()
     fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=hook)
@@ -76,7 +78,7 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
     bad = count(r -> split_regrid(rpairs[r], oldranges[r], newranges[r]) !=
                      split_regrid(pairs, oldranges[r], newranges[r]), 1:P)
     stages = [regrid_stage(T, serial.N, fs.G, staggers(fs), ops, CPU(), rpairs[r];
-                           oldrange=oldranges[r], newrange=newranges[r], nold=nold,
+                           P=fs.P, oldrange=oldranges[r], newrange=newranges[r], nold=nold,
                            nnew=nnew, oldowner=i -> equalsplit_part(nold, P, i) - 1,
                            newowner=j -> equalsplit_part(nnew, P, j) - 1)
               for r in 1:P]
@@ -156,7 +158,7 @@ end
                          for g in TreeAMR.transfer_groups(Float64, serial,
                                                           ntuple(_ -> 1, D),
                                                           ntuple(_ -> 0, D), old, new,
-                                                          XOPS4, CPU())
+                                                          XOPS4, CPU(); P=0)
                          for t in 1:ntransfers(g))
         # In 3D the two coarsened groups are leaves 1–8 and 43–50 of 50,
         # which first straddle a rank boundary at 7 ranks.
@@ -196,7 +198,51 @@ end
         serial = faces_forest((:outer, :reflect_both); T=T, N=8)
         same, _, bad, nc, _, _ = lockstep_regrid(serial, 3, cellcentered(2), PointValue, T)
         @test same && bad == 0 && nc > 0
+        # The element set's wider windows (M16), in the same types.
+        same, _, bad, nc, _, _ = lockstep_regrid(serial, 3, elementcentered(2),
+                                                 ElementLocal, T; order=3)
+        @test same && bad == 0 && nc > 0
     end
+end
+
+@testset "The regrid stage moves an element set as the serial regrid does: D=$D" for
+        D in (1, 2, 3)
+    # An element set refines by I, reading P+1 of the parent's owned
+    # points, and coarsens by the exact projection, reading 2(P+1) of
+    # each pair of children's, with no fill before either. A window that
+    # reached a ghost would read a value the old owner never filled, and
+    # a child's share evaluated by a rank other than its old owner, or
+    # laid out differently at the two ends, would put another block's
+    # data in its place: over 1–7 simulated ranks the transfers must be
+    # the serial regrid's and the new blocks the serial ones bit for bit,
+    # coarsened blocks whose children had two owners included.
+    nstraddling = ncross = 0
+    for kinds in EXCHANGE_KINDS[D], order in (1, 3)
+        serial = faces_forest(kinds; N=8)
+        old = copy(serial.leaves)
+        new = complete_marks(serial, regrid_test_flags(serial))
+        stransfers = Set((g.kind, Int(g.targetblocks[t]), Int(g.sourceblocks[t]))
+                         for g in TreeAMR.transfer_groups(Float64, serial,
+                                                          ntuple(_ -> 1, D),
+                                                          ntuple(_ -> 0, D), old, new,
+                                                          EOPS, CPU(); P=order)
+                         for t in 1:ntransfers(g))
+        counts = D == 1 ? (1, 2, 3, 5) : D == 2 ? (2, 3, 5) : (2, 3, 7)
+        for P in counts
+            same, transfers, bad, nc, ns, _ = lockstep_regrid(serial, P, elementcentered(D),
+                                                              ElementLocal, Float64;
+                                                              order=order)
+            @test same
+            @test bad == 0
+            @test length(transfers) == length(stransfers)
+            @test Set(transfers) == stransfers
+            P == 1 && @test nc == 0
+            nstraddling += ns
+            ncross += nc
+        end
+    end
+    @test ncross > 0
+    @test nstraddling > 0
 end
 
 # --- regrid! itself, through a communicator ---------------------------------
@@ -433,6 +479,65 @@ end
             (copy(forest.leaves), all(iszero, fs.work), nblocks(fs) == length(blockrange(forest)))
         end
         @test all(res -> res[1] == reference.leaves && res[2] && res[3], results)
+    end
+end
+
+@testset "regrid! over a distributed forest moves an element set as serially: D=$D" for
+        D in (2, 3)
+    # An element set's regrid skips the fill before its transfer, a choice
+    # every rank must make alike from the layout alone, or one rank waits
+    # in a fill the others skip. Beside a cell set that needs its fill and
+    # the hook, in one call with a buffer, every rank must end with the
+    # serial leaves and the serial arrays on its new blocks bit for bit,
+    # and the GLL mass, conserved by the regrid, must be the serial one
+    # to roundoff.
+    kinds = D == 2 ? (:outer, :reflect_both) : (:reflect_lo, :outer, :periodic)
+    serial = faces_forest(kinds; N=8)
+    hook = exchange_hook()
+    sets(forest) = (element_exchange_set(forest, 2, 3; parity=EXCHANGE_PARITY[1:2]) => EOPS,
+                    FieldSet(forest, 3; G=exchange_ghosts(cellcentered(D), PointValue),
+                             parity=EXCHANGE_PARITY) => XOPS4)
+    copy_of(comm) = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                           reflecting=TreeAMR.reflecting_faces(serial),
+                           outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
+                           leaves=serial.leaves, comm=comm)
+    reference = copy_of(nothing)
+    made = sets(reference)
+    alldata = map(enumerate(made)) do (i, (fs, _))
+        copyto!(fs.work, rand(MersenneTwister(20 + i), size(fs.work)...) .- 0.5)
+        copy(fs.work)
+    end
+    efs = first(first(made))
+    mass = [total_mass(efs, v) for v in 1:2]
+    flags = regrid_test_flags(reference)
+    @test regrid!(reference, map(p -> p.first => GhostSchedule(p...), made); flags=flags,
+                  buffer=1, boundary=hook)
+    smass = [total_mass(efs, v) for v in 1:2]
+    @test smass ≈ mass rtol = 1e-14
+
+    for P in (3, 5)
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = copy_of(comms[r])
+            owned = blockrange(forest)
+            mine = sets(forest)
+            for ((fs, _), all_) in zip(mine, alldata)
+                copyto!(fs.work, all_[ntuple(_ -> :, D + 1)..., owned])
+            end
+            regrid!(forest, map(p -> p.first => GhostSchedule(p...), mine);
+                    flags=flags[owned], buffer=1, boundary=hook)
+            (copy(forest.leaves), blockrange(forest), map(p -> copy(p.first.work), mine),
+             [total_mass(first(first(mine)), v) for v in 1:2])
+        end
+        @test first(comms).mail.box.nmessages > 0       # blocks did cross ranks
+        @test all(isempty ∘ last, first(comms).mail.box.channels)   # all consumed
+        for (leaves, owned, works, m) in results
+            @test leaves == reference.leaves
+            for (w, (fs, _)) in zip(works, made)
+                @test bitwise_equal(w, fs.work[ntuple(_ -> :, D + 1)..., owned])
+            end
+            @test m ≈ smass rtol = 1e-14
+        end
     end
 end
 

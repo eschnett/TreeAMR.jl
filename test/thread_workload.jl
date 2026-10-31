@@ -272,6 +272,70 @@ workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12,
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2), halfturn=(1, 2), x0=0.3)
 
+# --- element sets (M16) ----------------------------------------------------
+#
+# No evolution — an element scheme lives downstream — but an element
+# set's fill, regrid and folds are parallel loops like any other, and
+# differently shaped ones: the fill is one stage of face transfers whose
+# tangential windows are P+1 and 2(P+1) wide, the regrid reads owned
+# points only, and the folds weigh by the GLL quadrature. The initial-
+# data cycle, then two regrids by other thresholds, one that coarsens and
+# one that refines, each printed after a fill.
+const OPSE = Operators(family=ElementLocal)
+
+function element_workload(::Val{D}; roots, N, P, periodic, reflecting=nothing,
+                          x0=0.35) where {D}
+    walls = reflecting === nothing ? ntuple(_ -> (false, false), D) : reflecting
+    forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> periodic, D),
+                    reflecting=walls, extents=ntuple(_ -> (0.0, 1.0), D))
+    parity = reflecting === nothing ? nothing :
+             [ntuple(d -> d == 1 ? OddParity : EvenParity, D) for _ in 1:2]
+    fs = FieldSet(forest, 2; G=1, centering=elementcentered(D), P=P, parity=parity)
+    initial = workload_pulse(D, 1.0, x0, 0.08, 0.0)
+    outer = !periodic && !all(w -> w[1] && w[2], walls)
+    boundary = outer ? boundary_by_coordinates(initial) : nothing
+    flag(threshold) = (b, k) -> begin
+        fired = findall(x -> abs(x) > threshold, interiorview(fs, b, 1))
+        isempty(fired) && return level(k) > 0 ? Coarsen : Keep
+        box = ntuple(d -> minimum(i -> i[d], fired):maximum(i -> i[d], fired), D)
+        return level(k) >= 2 ? (Keep, box) : (Refine, box)
+    end
+    fill_by_coordinates!(initial, fs)
+    schedule, passes, converged =
+        adapt_to_initial_data!(fs, OPSE; initial=initial, flag=flag(0.05), buffer=1,
+                               maxpasses=6, boundary=boundary)
+    tag = "E$(D)$(periodic ? "p" : "o")" * (reflecting === nothing ? "" : "r")
+    println(tag, " passes ", passes, " ", converged)
+    for (step, threshold) in enumerate((nothing, 0.5, 0.01))
+        if threshold !== nothing
+            changed = regrid!(forest, fs => schedule; flags=flag_blocks(flag(threshold),
+                                                                        forest),
+                              buffer=1, boundary=boundary)
+            println(tag, ".", step, " changed ", changed, " ", digest(vec(fs.work)))
+            changed && (schedule = GhostSchedule(fs, OPSE))
+        end
+        fill_ghosts!(fs, schedule; boundary=boundary)
+        u = statevector(fs)
+        gather!(u, fs)
+        name = "$tag.$step"
+        println(name, " leaves ", nleaves(forest), " ", maxlevel(forest), " ",
+                digest(string(forest.leaves)))
+        println(name, " schedule ", length(schedule.stages), " ",
+                length(schedule.phase1), " ", length(schedule.boundaries))
+        println(name, " work ", digest(vec(fs.work)))
+        println(name, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
+        println(name, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
+        println(name, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
+        println(name, " fold ", workload_fold(fs, u))
+    end
+    return nothing
+end
+
+element_workload(Val(2); roots=4, N=8, P=3, periodic=true)
+element_workload(Val(2); roots=4, N=8, P=3, periodic=false,
+                 reflecting=((true, false), (true, false)), x0=0.12)
+element_workload(Val(3); roots=2, N=4, P=1, periodic=true)
+
 # --- the conservative cycle (M8b) ----------------------------------------
 #
 # Burgers' equation, which brings in everything the wave cycle above does

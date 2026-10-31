@@ -250,16 +250,19 @@ BoundaryBatch{D}(boxlen, slot, blocks::VB, directions::VD, firsts::VF,
 
 Everything the cell-wise boundary kernel reads that is not field data:
 the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
-origin and spacing it turns a stored index into a position with.
+origin and spacing it turns a stored index into a position with, and for
+an element-centered layout (M16) the node offsets, empty otherwise, so
+that the plan's type, and the schedule's, does not depend on the layout.
 
 The geometry is here rather than recomputed per fill for the same reason
 the exchange itself is precomputed: it depends only on the tree, which
 is exactly what a schedule is rebuilt for.
 """
-struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector}
+struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,VN}
     batches::Vector{BT}
     origins::VO
     spacings::VS
+    nodes::VN               # `node_offsets` of the layout, on the backend
 end
 
 function batchtype(backend::Backend, ::Val{D}) where {D}
@@ -273,7 +276,7 @@ end
 # hook may run them and by shape, then move the result to wherever the
 # kernels will run.
 function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
-                      boundaries::Vector{BoundaryRegion{D}}) where {T,D}
+                      boundaries::Vector{BoundaryRegion{D}}, P::Int) where {T,D}
     byshape = Dict{Tuple{Int,NTuple{D,Int}},
                    Tuple{Vector{Int32},Vector{NTuple{D,Int8}},Vector{NTuple{D,Int32}},
                          Vector{NTuple{D,Int32}}}}()
@@ -296,8 +299,9 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
                  for k in keys_]
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings)}(
-        batches, origins, spacings)
+    nodes = node_offsets(backend, T, P)
+    return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings),
+                        typeof(nodes)}(batches, origins, spacings, nodes)
 end
 
 # What one ghost region of one block needs, as found by the neighbor
@@ -524,6 +528,17 @@ prolongation_tag(level::Integer) = 2 + Int(level)       # 2 … 2 + MAX_LEVEL
 interface_tag(d::Integer) = 40 + Int(d)                  # one per face dimension
 const REGRID_TAG = 50                                     # the regrid transfer
 
+# The stage a ghost transfer of group key `key` runs in, for a layout of
+# element order `P` (`0` for none): the prolongations onto level ℓ in
+# the stage of that level, since one may read a ghost of its coarse
+# source that a coarser level's prolongation wrote, and everything else
+# in phase 1. An element set's prolongations read owned points only and
+# write only ghosts, which is phase 1's invariant, so they run there,
+# and an element fill is one stage (M16). The one place this is decided:
+# the local groups, the messages and the stage groups all ask it.
+transfer_stage(key, P::Int) =
+    key.kind === :prolong && P == 0 ? prolongation_tag(key.level) : PHASE1_TAG
+
 """
     GhostSchedule{T,D,R}
 
@@ -534,7 +549,9 @@ The phasing follows `CODE.md`:
 
 - `phase1` holds all same-level copies and all restrictions. Each reads
   only *interior* cells of other blocks and writes only ghosts, so the
-  whole phase is race free and order independent.
+  whole phase is race free and order independent. For an
+  element-centered set (M16) it holds the prolongations too, which read
+  owned points only (see *Element sets* below).
 - `phase2` holds the prolongations, grouped by target level and ordered
   **coarsest target first**; every transfer in a group has its target at
   that group's level. The sweep is required because a
@@ -588,6 +605,19 @@ quarter turns about the centre plane of `d2`, with the seam slab of a
 vertex-like `d2` partitioned one plane up. A region whose turned image
 leaves through an outer face is the hook's.
 
+*Element sets.* An element-centered set ([`elementcentered`](@ref),
+M16), whose schedule is built with the [`ElementLocal`](@ref) family, is
+filled on **faces only**: the one ghost plane across each face of a
+block, and never an edge or corner ghost, which along a dimension
+normal to the block can land on an element face inside a coarse block,
+where two values are stored. Those ghosts are never written — no
+transfer and no hook region targets them — so they hold whatever they
+held, and a kernel that reads them, under `map_blocks!(…; stored =
+true)` say, reads stale data. Every element transfer reads owned points
+only and writes only ghosts, which is phase 1's invariant, so the
+prolongations run there too: the fill is one stage, one message round,
+and `phase2` and `levels` are empty.
+
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
@@ -603,7 +633,9 @@ it takes one (amended in M8, when `G` moved off the forest).
 [`fill_ghosts!`](@ref) refuses a field set whose layout differs from the
 one the schedule was built for. The forest form
 `GhostSchedule(forest, ops; G, centering, T, backend)` spells the four
-out instead, for a caller with no field set in hand.
+out instead, for a caller with no field set in hand, and an
+element-centered layout (M16) its order `P` as well, which is `0`, no
+elements, by default.
 
 `backend` must be the backend of every field set the schedule is
 replayed over (M6). The stencil weights and index vectors are read
@@ -629,6 +661,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     generation::Int                              # forest generation it was built for
     G::NTuple{D,Int}                             # ghost width it was built for
     centering::NTuple{D,Symbol}                  # centering it was built for
+    P::Int                                       # element order it was built for (M16)
     walls::Symbol                                # walls it was built for (AMR-8)
     operators::Operators
     backend::BK
@@ -644,9 +677,10 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
-        forest, generation, G, centering, walls, operators, backend, phase1, phase2,
+        forest, generation, G, centering, P, walls, operators, backend, phase1, phase2,
         levels, boundaries, boundaryplan, stages, stagegroups) where {T,D,R,BK,GRP,BP,ST}
-        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, walls, operators,
+        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls,
+                                       operators,
                                        backend, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
                                        group_locals(stages, stagegroups))
@@ -948,8 +982,28 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
 # multilinear weights below its own (`stack_linear`).
 # `low` trims the target range for a symmetric wall, and `shift` moves it
 # in a half turn's seam slab (see `target_range`).
+#
+# `P` is the element order of the layout, `0` for none, and is required:
+# an element set stores and owns as a cell-centered one does, so nothing
+# else here can tell the two apart, and a caller that forgot it would
+# build cell-centre stencils for Gauss–Lobatto nodes without a word. For
+# `P > 0` the operators are the element's (`element_stencil`), and
+# `regrid` picks the coarsening of a regrid over the ghost fill's
+# restriction. They are called behind `Base.inferencebarrier`, as the
+# element variants of the position kernels are (`with_nodes`), so that
+# building a cell or vertex set's schedule does not compile them.
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
-                      low::Bool=false, shift::Integer=0) where {T}
+                      P::Integer, regrid::Bool=false, low::Bool=false,
+                      shift::Integer=0) where {T}
+    if P > 0
+        c == 0 && !low && shift == 0 || error(
+            "an element stencil asked for with stagger $c, low = $low, shift = " *
+            "$shift; element sets are cell-like, with no symmetric wall and no " *
+            "rotating seam, so this is a bug")
+        S = Stencil1D{T,Vector{Int32},Matrix{T}}
+        return Base.inferencebarrier(element_stencil)(T, N, G, kind, δd, od, Int(P),
+                                                      regrid)::S
+    end
     kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift)
     kind === :restrict &&
         return restriction_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
@@ -957,11 +1011,81 @@ function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
 end
 
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators,
-                      mode::Int8; low::Bool=false, shift::Integer=0) where {T}
-    s = kind_stencil(T, N, G, c, kind, δd, od, ops; low=low, shift=shift)
+                      mode::Int8; P::Integer, regrid::Bool=false, low::Bool=false,
+                      shift::Integer=0) where {T}
+    s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid, low=low,
+                     shift=shift)
     mode == BOUNDED_POINTVALUE || return s
     return stack_linear(s, kind_stencil(T, N, G, c, kind, δd, od, LINEAR_OPERATORS;
-                                        low=low, shift=shift))
+                                        P=P, regrid=regrid, low=low, shift=shift))
+end
+
+# One dimension of a transfer of an element-centered set (M16; see
+# `ElementLocal`), in stored indices, `G ≤ 1`. Owned point `j` is node
+# `(j - G - 1) % (P+1)` of element `(j - G - 1) ÷ (P+1)`, and a block of
+# `N` points holds `N/(P+1)` whole elements, a fine block's half of its
+# parent whole parent elements (`N % 2(P+1) == 0`).
+#
+# Normal to the face (`δd ≠ 0`), for every kind, the ghost is the
+# neighbour's face-adjacent owned plane, a copy: the ghost sits at the
+# face, and so does that plane, on the other side. The two face nodes are
+# the same point, and the only ambiguity is which element's polynomial a
+# value there belongs to, which the ghost resolves as the neighbour's.
+#
+# Tangentially (`δd = 0`) the element operators of `element_tables`:
+#
+# - a copy is the identity;
+# - a prolongation, with `od` the *target*'s child offset, gives fine node
+#   `i` of fine element `qf` in the parent's frame the coarse element
+#   `qf ÷ 2`'s polynomial there: row `i` of the half `qf % 2` of `I`, over
+#   that coarse element's `P+1` nodes, in the coarse source's stored
+#   frame, which along a tangential dimension is the parent's;
+# - a restriction, with `od` the *source*'s child offset and the target
+#   range halved by it, gives coarse node `k` of coarse element `qc` row
+#   `k` of `R` over the `2(P+1)` nodes of fine elements `2qc` and `2qc+1`
+#   in the fine source's frame, or of the exact coarsening `C` when the
+#   stencil is a regrid's (`regrid`), where energy compatibility buys
+#   nothing and `C` keeps a degree `R` loses.
+#
+# Every window lies inside the source's owned range — the element
+# operators read whole elements, and `N % 2(P+1) == 0` keeps those inside
+# a block — which is what makes every element transfer phase 1's. Checked
+# here, at build time.
+function element_stencil(::Type{T}, N::Int, G::Int, kind::Symbol, δd::Int, od::Int,
+                         P::Int, regrid::Bool) where {T}
+    P1 = P + 1
+    if δd != 0 || kind === :copy
+        s = copy_stencil(T, N, G, 0, δd)
+    elseif kind === :prolong
+        t = element_tables(T, P)
+        rng = target_range(N, G, 0, 0, od, false)
+        srcstart = Vector{Int32}(undef, length(rng))
+        weights = Matrix{T}(undef, P1, length(rng))
+        for (i, j) in enumerate(rng)
+            qf, node = divrem(od * N + j - G - 1, P1)   # fine element, node
+            qc, half = divrem(qf, 2)                    # coarse element, half
+            srcstart[i] = G + 1 + qc * P1
+            weights[:, i] = view(t.interpolation[half + 1], node + 1, :)
+        end
+        s = Stencil1D{T}(first(rng), srcstart, weights)
+    else
+        t = element_tables(T, P)
+        table = regrid ? t.coarsening : t.restriction
+        rng = target_range(N, G, 0, 0, od, true)
+        srcstart = Vector{Int32}(undef, length(rng))
+        weights = Matrix{T}(undef, 2P1, length(rng))
+        for (i, j) in enumerate(rng)
+            qc, node = divrem(j - G - 1, P1)            # coarse element, node
+            srcstart[i] = G + 1 + 2qc * P1 - od * N
+            weights[:, i] = view(table, node + 1, :)
+        end
+        s = Stencil1D{T}(first(rng), srcstart, weights)
+    end
+    width = stencilorder(s)
+    all(st -> G + 1 <= st && st + width - 1 <= G + N, s.srcstart) || error(
+        "an element $kind stencil (δ = $δd, offset $od, P = $P, N = $N, G = $G) reads " *
+        "outside its source's owned range $(G + 1):$(G + N); this is a bug")
+    return s
 end
 
 # Multilinear interpolation: the point-value operators of width 2, whose
@@ -1697,10 +1821,11 @@ end
 # 1 first. `pairs` are the local transfers in local block indices; `sent`
 # and `received` the remote ones in global leaf indices, `offset` this
 # rank's first leaf less one; `boundaries` the hook regions in local
-# indices; `build(key)` a group's host stencils and `boundedof(key)` its
-# bound. Neither of the two is specialized on: their types carry the
-# element type, and the boxes they give are the same `Box{D}` for every
-# one, so the function is compiled once per dimension.
+# indices; `build(key)` a group's host stencils, `boundedof(key)` its
+# bound and `stageof(key)` its stage (`transfer_stage`). None of the
+# three is specialized on: their types carry the element type, and the
+# boxes they give are the same `Box{D}` for every one, so the function is
+# compiled once per dimension.
 #
 # Phase 1 is alone: the boundary hook runs after it. A stage joins the
 # group below it when it is the next level up, when none of its
@@ -1714,7 +1839,8 @@ end
 function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
                       sent::TransferPairs{D}, received::TransferPairs{D},
                       boundaries::Vector{BoundaryRegion{D}}, @nospecialize(build),
-                      @nospecialize(boundedof), offset::Int) where {D}
+                      @nospecialize(boundedof), @nospecialize(stageof),
+                      offset::Int) where {D}
     length(tags) <= 2 && return [i:i for i in eachindex(tags)]
     index = Dict{Int,Int}()
     access = Vector{StageAccess{D}}(undef, length(tags))
@@ -1725,9 +1851,10 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
     for (lists, shift, reads, writes) in ((pairs, 0, true, true), (sent, offset, true, false),
                                           (received, offset, false, true))
         for (key, (targets, sources)) in lists
-            key.kind === :prolong || continue
-            i = get(index, prolongation_tag(key.level), 0)
-            i == 0 && continue
+            # Phase 1 runs alone, whatever it holds: an element set's
+            # prolongations are there (`transfer_stage`).
+            i = get(index, stageof(key)::Int, 0)
+            i <= 1 && continue
             boxes = stage_boxes(build(key), boundedof(key)::Int8)::Union{Nothing,
                                                                          NTuple{2,Box{D}}}
             boxes === nothing && continue
@@ -1800,9 +1927,9 @@ end
 # so each group is built by a static call. (Built inline, M12's small
 # fields made the call box them once per group, which `bench/ghosts.jl`
 # showed as 448 bytes more per build.) `bounded(key)` is the group's
-# bound, `boundedmode`.
+# bound, `boundedmode`, and `stageof(key)` its stage, `transfer_stage`.
 function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::TransferPairs{D},
-                      build, factorcol, plane, bounded) where {GRP,T,D}
+                      build, factorcol, plane, bounded, stageof) where {GRP,T,D}
     phase1 = GRP[]
     bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
@@ -1811,22 +1938,23 @@ function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::Transfer
         group = todevice(backend, TransferGroup{T,D}(key.kind, stencils, targets, sources,
                                                      factorcol(key), key.orientation,
                                                      plane, bounded(key)::Int8))
-        if key.kind === :prolong
-            push!(get!(bylevel, key.level, GRP[]), group)
-        else
+        if stageof(key) == PHASE1_TAG
             push!(phase1, group)
+        else
+            push!(get!(bylevel, key.level, GRP[]), group)
         end
     end
     return phase1, bylevel
 end
 
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
-    GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, walls=fs.walls,
-                  T=T, backend=get_backend(fs.work))
+    GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
+                  walls=fs.walls, T=T, backend=get_backend(fs.work))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
-                       centering=cellcentered(D), walls::Symbol=:half_open,
+                       centering=cellcentered(D), P::Integer=0,
+                       walls::Symbol=:half_open,
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
@@ -1837,18 +1965,29 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         cs = centerings(centering, Val(D))
         ss = staggers(cs)
         storedsize(N, gs, ss)                    # the N >= 2G[d] + 2c[d] invariant
-        check_operators(N, gs, ss, operators)
+        # `0` is the forest form's "no elements", as `FieldSet` stores it.
+        order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
+        check_operators(N, gs, cs, order, operators)
         check_floattype(T, backend)
         check_walls(walls)
-        layout = layouthash(gs, cs, walls, Int(operators.family), operators.prolongation,
+        layout = layouthash(gs, cs, order, walls, Int(operators.family),
+                            operators.prolongation,
                             operators.restriction, operators.bounded,
                             operators.vertex_prolongation, T,
                             nameof(typeof(backend)))
-        return (gs, cs, ss), layout
+        return (gs, cs, ss, order), layout
     end
-    ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int} = checked
+    ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int}, order::Int =
+        checked
     symmetric = walls === :symmetric
+    # An element set is filled on faces only (M16): along a dimension with
+    # `δd ≠ 0` an edge or corner ghost can land on an element face inside
+    # a coarse block, where two values are stored, and the element-local
+    # schemes it serves never read one. That one filter covers the local
+    # search, the transfers sent for other ranks' blocks, and the hook
+    # regions.
     dirs = alldirections(Val(D))
+    order > 0 && filter!(δ -> count(!=(0), δ) == 1, dirs)
     # The targets are this rank's blocks (M7), walked in global leaf
     # indices, since that is what the tree answers in; `split_received!`
     # turns the local transfers into local block indices below.
@@ -1910,7 +2049,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # where the block's low wall is written.
         δs = state == 0 ? δd : 0
         s = kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
-                         low=state == 0 && low, shift=state == 0 ? shift : 0)
+                         P=order, low=state == 0 && low, shift=state == 0 ? shift : 0)
         state == 0 && return s
         state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd; low=low)
         return mirror_rows(s, N, ghosts[d], stags[d], δd)
@@ -1931,17 +2070,19 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     end
     plane = map(Int8, seam_plane(forest))
 
+    # The stage of each transfer (`transfer_stage`), one function for the
+    # local groups, the messages and the stage groups alike.
+    stageof(key) = transfer_stage(key, order)
     GRP = grouptype(backend, T, Val(D))
     phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, plane,
-                                   boundedof)
+                                   boundedof, stageof)
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
-    bplan = BoundaryPlan(backend, T, forest, boundaries)
+    bplan = BoundaryPlan(backend, T, forest, boundaries, order)
 
     # Phase 1 is one stage and phase 2 one per target level. Serially
     # each stage is one of the phases above and sends nothing.
-    stageof(key) = key.kind === :prolong ? prolongation_tag(key.level) : PHASE1_TAG
     leveltags = prolongation_tag.(levels)
     localsof(tag) = tag == PHASE1_TAG ? phase1 :
                     (i = findfirst(==(tag), leveltags); i === nothing ? GRP[] : phase2[i])
@@ -1951,20 +2092,21 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                           required=[PHASE1_TAG], plane=plane, bounded=boundedof)
     # Which of them may run together here, from the host stencils.
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
-                          build, boundedof, offset)
+                          build, boundedof, stageof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
-        forest, generation(forest), ghosts, centers, walls, operators, backend, phase1,
-        phase2, levels, boundaries, bplan, stages, groups)
+        forest, generation(forest), ghosts, centers, order, walls, operators, backend,
+        phase1, phase2, levels, boundaries, bplan, stages, groups)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
-    ncopy = sum(ntransfers, filter(g -> g.kind === :copy, s.phase1); init=0)
-    nrest = sum(ntransfers, filter(g -> g.kind === :restrict, s.phase1); init=0)
-    nprol = sum(gs -> sum(ntransfers, gs; init=0), s.phase2; init=0)
+    # By kind across both phases: an element set's prolongations are in
+    # phase 1 (M16).
+    groups = Iterators.flatten((s.phase1, Iterators.flatten(s.phase2)))
+    bykind(kind) = sum(g -> g.kind === kind ? ntransfers(g) : 0, groups; init=0)
+    ncopy, nrest, nprol = bykind(:copy), bykind(:restrict), bykind(:prolong)
     # Of all of those, the ones mirrored across a reflecting face (M10)
     # and the ones rotated across a seam (M12), each said only when there
     # are any, so a schedule without either prints as it always has.
-    groups = Iterators.flatten((s.phase1, Iterators.flatten(s.phase2)))
     nmirror = sum(g -> ismirrored(g) ? ntransfers(g) : 0, groups; init=0)
     nrot = sum(g -> g.orientation == 0 ? 0 : ntransfers(g), groups; init=0)
     print(io, "GhostSchedule{", T, ",", D, "}(", ncopy, " copies, ", nrest,

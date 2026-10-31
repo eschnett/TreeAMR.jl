@@ -46,6 +46,27 @@ or a vector potential `A_d` has this centering.
 """
 edgecentered(D::Integer, d::Integer) = staggeredalong(D, d, :cell, :vertex)
 
+"""
+    elementcentered(D)
+
+The all-`:element` centering (M16), for element-local discontinuous
+Galerkin schemes such as OLDG: per dimension a block holds `N/(P+1)`
+elements of `P + 1` Gauss–Lobatto–Legendre nodes each, `P` the field
+set's polynomial order ([`FieldSet`](@ref)'s `P`). Both face nodes of
+every element are stored, so a face position carries two values, one
+per side, and the element on each side owns its own.
+
+It stores and owns as a cell-centered set does — `N` points per
+dimension, no shared plane, [`staggers`](@ref) `0` — so the state layout
+and every range are unchanged; only the positions and the weights of the
+points differ, and the operators that move data between levels. A ghost
+of an element set sits *at* the block's face, on the other side of it,
+which is where the neighbouring element's face node is. An element is a
+tensor product of nodes in every dimension, so `:element` is accepted
+only in every dimension at once.
+"""
+elementcentered(D::Integer) = ntuple(_ -> :element, Int(D))
+
 function staggeredalong(D::Integer, d::Integer, along::Symbol, across::Symbol)
     1 <= d <= D || throw(ArgumentError(
         "the staggered dimension must be in 1:$D, got $d"))
@@ -59,15 +80,76 @@ function centerings(C::Tuple{Vararg{Symbol}}, ::Val{D}) where {D}
         "centering must have one entry per dimension: got $(length(C)) for a " *
         "$D-dimensional forest, $C. Spell it with cellcentered($D), " *
         "vertexcentered($D), facecentered($D, d) or edgecentered($D, d)."))
+    if any(s -> s === :element, C)
+        all(s -> s === :element, C) || throw(ArgumentError(
+            "the :element centering must be in every dimension or in none, got $C. " *
+            "An element is a tensor product of P+1 Gauss–Lobatto nodes in every " *
+            "dimension, and its operators move whole elements between levels, so " *
+            "a set cannot be elements along some dimensions and cells or vertices " *
+            "along others. Spell it elementcentered($D)."))
+        return ntuple(d -> C[d], D)
+    end
     all(s -> s === :cell || s === :vertex, C) || throw(ArgumentError(
-        "each centering entry must be :cell or :vertex, got $C. A dimension is " *
-        "either cell-centered (values at the half-integer positions) or " *
-        "vertex-like (values at the integer positions, with a shared boundary " *
-        "plane)."))
+        "each centering entry must be :cell or :vertex, or :element in every " *
+        "dimension, got $C. A dimension is either cell-centered (values at the " *
+        "half-integer positions) or vertex-like (values at the integer positions, " *
+        "with a shared boundary plane); elementcentered(D) puts the Gauss–Lobatto " *
+        "nodes of elements in every dimension at once."))
     return ntuple(d -> C[d], D)
 end
 centerings(C, ::Val{D}) where {D} = throw(ArgumentError(
-    "centering must be a tuple of :cell / :vertex symbols, got a $(typeof(C))"))
+    "centering must be a tuple of :cell / :vertex / :element symbols, got a " *
+    "$(typeof(C))"))
+
+# Whether a validated centering is the element centering, which is
+# all-or-nothing (see `centerings`).
+iselement(C::NTuple{D,Symbol}) where {D} = D > 0 && C[1] === :element
+
+# Validate the polynomial order of a field set or schedule (M16) against
+# its layout, returning it as an `Int`, `0` for a set that is not
+# element-centered. `P` is `nothing` when it was not given. Every
+# refusal says why: `P` is the scheme's, so it has no default, and the
+# layout must let a coarse-fine face be filled from whole elements.
+function element_order(P, centers::NTuple{D,Symbol}, N::Int, G::NTuple{D,Int},
+                       forest::Forest) where {D}
+    if !iselement(centers)
+        P === nothing || throw(ArgumentError(
+            "P = $P is the polynomial order of an element-centered set, but this " *
+            "set's centering is $centers, which has no elements: its points are " *
+            "equally spaced cell centres or vertices. Pass " *
+            "centering = elementcentered($D) for elements of P+1 Gauss–Lobatto " *
+            "nodes, or drop P."))
+        return 0
+    end
+    P === nothing && throw(ArgumentError(
+        "an element-centered set needs `P`, the polynomial order of its elements: " *
+        "each holds P+1 Gauss–Lobatto nodes per dimension. It is the scheme's " *
+        "order, which the mesh cannot know, so it has no default."))
+    P isa Integer || throw(ArgumentError(
+        "P must be an integer, the polynomial order of the elements, got a " *
+        "$(typeof(P))"))
+    P >= 1 || throw(ArgumentError(
+        "P must be at least 1, got P = $P: an element stores both of its face " *
+        "nodes, so it holds at least two, and P+1 nodes carry a polynomial of " *
+        "degree P."))
+    all(<=(1), G) || throw(ArgumentError(
+        "an element-centered set has at most one ghost layer, got G = $G: an " *
+        "element-local scheme reads only the neighbouring element's face node, " *
+        "and an element set's ghost sits at the face, so a second layer would lie " *
+        "inside the neighbour's element where no ghost is defined."))
+    N % (2 * (P + 1)) == 0 || throw(ArgumentError(
+        "N = $N is not a multiple of 2(P+1) = $(2 * (P + 1)) for elements of order " *
+        "P = $P: a fine block must cover whole parent elements, since the " *
+        "operators between levels map a coarse element onto the two fine elements " *
+        "covering it, and a fine block spans half of its parent, N/2 points. " *
+        "Choose N = 2(P+1)·k."))
+    hasrotating(forest) && throw(ArgumentError(
+        "an element-centered set cannot live on a forest with a rotating seam: the " *
+        "transfers across a seam are turned copies of the cell and vertex " *
+        "stencils, and the element operators, which fill faces only, have no " *
+        "turned form."))
+    return Int(P)
+end
 
 """
     staggers(centering::NTuple{D,Symbol})
@@ -76,9 +158,12 @@ centerings(C, ::Val{D}) where {D} = throw(ArgumentError(
 The centering as the arithmetic sees it: `c_d = 1` where dimension `d`
 is vertex-like, `0` where it is cell-centered. This is the `c_d` of
 CODE.md — the extra stored plane, the offset from a stored index to a
-position, and the length a `closed` loop adds.
+position, and the length a `closed` loop adds. An element-centered
+dimension ([`elementcentered`](@ref)) is `0`, since it stores and owns
+as a cell-centered one does.
 """
 staggers(C::NTuple{D,Symbol}) where {D} = ntuple(d -> C[d] === :vertex ? 1 : 0, D)
+# An element dimension is `0`: it stores and owns as a cell-centered one.
 
 """
     Parity
@@ -131,7 +216,10 @@ for one width per dimension; it is stored as an `NTuple{D,Int}`.
 (`:cell`) or at a cell boundary (`:vertex`), and defaults to
 [`cellcentered`](@ref)`(D)`. Spell it with [`cellcentered`](@ref),
 [`vertexcentered`](@ref), [`facecentered`](@ref) or
-[`edgecentered`](@ref). A vertex-like dimension stores one plane more —
+[`edgecentered`](@ref), or, for elements of Gauss–Lobatto nodes, with
+[`elementcentered`](@ref) and the order `P` below; an element dimension
+stores and owns as a cell-centered one does. A vertex-like dimension
+stores one plane more —
 the boundary plane the block **shares** with its high-side neighbor,
 which that neighbor owns and the exchange fills exactly as it fills a
 ghost. Three ranges per dimension have names, with `c_d = 1` in a
@@ -163,6 +251,17 @@ so this one keyword is the whole switch. A [`GhostSchedule`](@ref) used
 with this field set must be built for the same backend. On a device with
 no hardware fp64 a `Float64` field set is rejected here, with a message,
 rather than failing later inside a kernel compilation.
+
+`P` is the polynomial order of an element-centered set (M16;
+[`elementcentered`](@ref)): each element holds `P + 1` Gauss–Lobatto–
+Legendre nodes per dimension. It is **required** for such a set, since
+it is the scheme's order, and refused for any other. Refused, each with
+its reason: `P < 1`; a ghost width above 1, since an element set's ghost
+sits at the face and an element-local scheme reads only the
+neighbouring element's face node; `N` not a multiple of `2(P+1)`, since
+a fine block must cover whole parent elements; and a forest with a
+rotating seam. It is stored as the field `P`, `0` for a set that is not
+element-centered.
 
 `walls` says how a vertex-like dimension's two wall planes are filled at
 the domain's non-periodic faces (TreeGRRMHD's AMR-8). Ownership is
@@ -244,6 +343,8 @@ block slots and rebuilds the storage.
              rotation = (1, -3, 2, 4))
     FieldSet(half, 4; G = 2,            # the same, on a half-turn forest
              halfturn = (1, -2, -3, 4))
+    FieldSet(forest, 2; G = 1,          # elements of order 3, N = 8k
+             centering = elementcentered(D), P = 3)
 
 # Examples
 
@@ -268,6 +369,10 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     const nvars::Int
     const G::NTuple{D,Int}
     const centering::NTuple{D,Symbol}
+    # The polynomial order of an element-centered set (M16), `0` for any
+    # other: what every position, weight and element stencil of the set
+    # is built from, so it is passed explicitly wherever those are.
+    const P::Int
     # `:half_open` or `:symmetric`: whether the fill also writes the
     # owned low wall plane of a vertex-like dimension (AMR-8).
     const walls::Symbol
@@ -306,7 +411,7 @@ end
 # for everything that is not deliberately staggered.
 function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
-                     centering=cellcentered(D),
+                     centering=cellcentered(D), P=nothing,
                      parity=nothing, rotation=nothing, halfturn=nothing,
                      walls::Symbol=:half_open,
                      backend::Backend=CPU()) where {T,D,R}
@@ -321,6 +426,7 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     ghosts = ghostwidths(G, Val(D))
     centers = centerings(centering, Val(D))
     stored = storedsize(forest.N, ghosts, staggers(centers))
+    order = element_order(P, centers, forest.N, ghosts, forest)
     parities = parities_of(parity, forest, Int(nvars))
     rotations = rotations_of(rotation, forest, Int(nvars), ghosts, staggers(centers),
                              parities)
@@ -347,8 +453,8 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # Through the kernel rather than `fill!`, for the first-touch reason
     # in `zerofill!` below.
     zerofill!(work, backend)
-    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, walls,
-                                        parities, rotations, halfturns, factors,
+    return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, order,
+                                        walls, parities, rotations, halfturns, factors,
                                         rotvars, work)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
@@ -665,6 +771,11 @@ struct RotationPair{FA<:FieldSet,FB<:FieldSet,MF<:AbstractMatrix,MV<:AbstractMat
 end
 
 function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
+    (a.P > 0 || b.P > 0) && throw(ArgumentError(
+        "a RotationPair cannot hold an element-centered set: an element set " *
+        "cannot live on a forest with a rotating seam, whose transfers are turned " *
+        "copies of the cell and vertex stencils, and the element operators have no " *
+        "turned form"))
     a.forest === b.forest || throw(ArgumentError(
         "the two sets of a RotationPair must be over one forest: each fills its " *
         "ghosts across the seam from the other's blocks, block for block"))
@@ -835,18 +946,91 @@ function closedranges(fs::FieldSet{T,D}) where {T,D}
     return ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D)
 end
 
-# The offset from a stored index to a position, per dimension: half a
-# cell in a cell-centered dimension (the value sits at the center), a
-# whole one in a vertex-like dimension (it sits on the boundary). `one(h)
-# / 2` rather than `0.5`: a floating-point literal would be an fp64
-# operand and would drag the whole position into fp64. And rather than
-# `oftype(h, 1//2)`, which it was until M11: that folds away for a
-# hardware float, but a `Float32x2` converts a `Rational` through
-# `BigFloat`, at run time, in every kernel that forms a position — 530
-# bytes and some 15 µs per point, measured on the point interpolator.
-# Halving one is exact in any binary type, so the value is the same.
-@inline pointoffsets(h, c::NTuple{D,Int}) where {D} =
-    ntuple(d -> c[d] == 1 ? one(h) : one(h) / 2, Val(D))
+# The offset from an owned index to a position along a dimension of an
+# equally spaced set: half a cell in a cell-centered dimension (the value
+# sits at the center), a whole one in a vertex-like dimension (it sits on
+# the boundary). `one(h) / 2` rather than `0.5`: a floating-point literal
+# would be an fp64 operand and would drag the whole position into fp64.
+# And rather than `oftype(h, 1//2)`, which it was until M11: that folds
+# away for a hardware float, but a `Float32x2` converts a `Rational`
+# through `BigFloat`, at run time, in every kernel that forms a position
+# — 530 bytes and some 15 µs per point, measured on the point
+# interpolator. Halving one is exact in any binary type, so the value is
+# the same. Positions are formed through `nodeposition` only; this is
+# also what the point interpolator inverts, which refuses element sets.
+@inline uniform_shift(h, c::Integer) = c == 1 ? one(h) : one(h) / 2
+
+# The position along one dimension of owned index `I` (the stored index
+# minus `G[d]`, so `1 … N` for the owned points, `≤ 0` and `> N` for the
+# ghosts and the shared plane) of a block with lower corner `origin` and
+# spacing `h`. Every position the package forms goes through here — the
+# geometry, the coordinate and boundary kernels, the folds and the
+# flagging sweep — so that they agree bit for bit, and `nodes` makes the
+# caller say which kind of set it is: `nothing` for an equally spaced
+# set, with `c` its stagger, or the element offsets for an element set,
+# on the kernel's backend (`with_nodes`).
+#
+# Without elements it is `origin + (I - ½)·h` or `origin + (I - 1)·h`,
+# the expression these positions were always formed by. For an element
+# set (M16) owned point `I` is node `i = (I-1) % (P+1)` of element `q =
+# (I-1) ÷ (P+1)`, at `origin + h·(q(P+1) + offsets[i+1])`, the expression
+# TreeWaveOLDG forms; `q(P+1) + offsets[i+1]` is an integer at both face
+# nodes, so the two face nodes at one position get the same bits. A ghost
+# sits at the face: `origin` below, and above, where `I = N+1` since an
+# element set has at most one ghost layer, the expression gives
+# `origin + h·N`, the last owned node's own position.
+@inline nodeposition(origin, h, I::Integer, c::Integer, ::Nothing) =
+    origin + (I - uniform_shift(h, c)) * h
+@inline function nodeposition(origin, h, I::Integer, c::Integer, nodes::AbstractVector)
+    I <= 0 && return origin
+    P1 = length(nodes)
+    q, i = divrem(I - 1, P1)
+    return origin + h * (q * P1 + @inbounds(nodes[i + 1]))
+end
+
+# The node offsets the position kernels of a set of order `P` read, in
+# `T`, or `nothing` for a set without elements (`P = 0`), on the host.
+# A small array rather than an `NTuple`: `P` is a run-time value, and a
+# tuple of run-time length would be neither inferable nor kept in
+# registers on a device. The tables are reached behind
+# `Base.inferencebarrier`, as everything element-only is (`with_nodes`),
+# so that a cell or vertex set compiles none of their construction.
+element_offsets(::Type{T}, P::Int) where {T} =
+    P == 0 ? nothing : Base.inferencebarrier(element_tables)(T, P).offsets::Vector{T}
+
+# The same on `backend`, as a vector that is empty for a set without
+# elements: one type for every `P`, so that a schedule that keeps it (the
+# `BoundaryPlan`) has one type whatever its layout.
+node_offsets(backend::Backend, ::Type{T}, P::Int) where {T} =
+    todevice(backend, P == 0 ? T[] : element_offsets(T, P))
+
+# Run `launch(nodes)` with what the position kernels take as `nodes`:
+# `nothing` for a set without elements, inferred as such, so that a cell
+# or vertex launch is the one it was before M16 and compiles nothing
+# more; and an element set's offsets behind `Base.inferencebarrier`, so
+# that a kernel's element variant is compiled when an element set first
+# reaches it rather than beside every cell launch. Passed as a
+# `Union{Nothing,Vector}`, the offsets compiled both variants at every
+# launch site, and kept in the `BoundaryPlan` they made every schedule's
+# type a `Union`, which `test/mpi_workload.jl` measured as about 5% more
+# compilation on its cell and vertex sets alone. The barrier costs an
+# element set one dynamic dispatch per launch. `launch` returns nothing.
+@inline function with_nodes(launch, backend::Backend, ::Type{T}, P::Int) where {T}
+    if P == 0
+        launch(nothing)
+    else
+        launch(Base.inferencebarrier(todevice(backend, element_offsets(T, P))))
+    end
+    return nothing
+end
+@inline function with_nodes(launch, offsets::AbstractVector)
+    if isempty(offsets)
+        launch(nothing)
+    else
+        launch(Base.inferencebarrier(offsets))
+    end
+    return nothing
+end
 
 """
     coordinates([S], fs::FieldSet, b::Integer, idx::NTuple{D,Integer})
@@ -859,7 +1043,9 @@ outside the block's boundary.
 
 The position depends on the field set's ghost width *and* on its
 centering — `origin + (i - G[d] - 1/2)·h` in a cell-centered dimension,
-`origin + (i - G[d] - 1)·h` in a vertex-like one — which is why this
+`origin + (i - G[d] - 1)·h` in a vertex-like one, and for an element set
+(M16; [`elementcentered`](@ref)) the Gauss–Lobatto node the index holds,
+with a ghost at the block's face — which is why this
 takes a field set and a block index rather than a forest and a key
 (replacing `cell_center`, which assumed the forest carried `G` and that
 every dimension was cell-centered).
@@ -874,8 +1060,9 @@ function coordinates(::Type{S}, fs::FieldSet{T,D}, b::Integer,
     forest = fs.forest
     origin = block_origin(S, forest, blockkey(fs, b))
     h = spacing(S, forest, blockkey(fs, b))
-    off = pointoffsets(h, staggers(fs))
-    return ntuple(d -> origin[d] + (Int(idx[d]) - fs.G[d] - off[d]) * h, D)
+    c = staggers(fs)
+    nodes = element_offsets(S, fs.P)
+    return ntuple(d -> nodeposition(origin[d], h, Int(idx[d]) - fs.G[d], c[d], nodes), D)
 end
 coordinates(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,<:Integer}) where {T,D} =
     coordinates(T, fs, b, idx)
@@ -952,17 +1139,16 @@ function check_allvariables(vals, fs::FieldSet, what::AbstractString)
         "whole tuple."))
 end
 
-@kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings),
+@kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings), nodes,
                                      ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
     v, b = I[D + 1], I[D + 2]
     origin, h = origins[b], spacings[b]
     # The stored index of owned point i is i + G[d], so `coordinates`'
-    # (idx - G[d] - off[d]) is just (i - off[d]) — the same arithmetic,
-    # in the same order, on the same origin and spacing, so this
-    # reproduces `coordinates` bit for bit.
-    off = pointoffsets(h, C)
-    x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+    # owned index (idx - G[d]) is just i, and `nodeposition` forms the
+    # same arithmetic, in the same order, on the same origin and spacing:
+    # this reproduces `coordinates` bit for bit.
+    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
     work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, v)
 end
 
@@ -972,13 +1158,12 @@ end
 # same origin and spacing in the same order, so the two forms fill a
 # field set with bit-for-bit the same numbers.
 @kernel function coordinates_all_kernel!(work, f, @Const(origins), @Const(spacings),
-                                         ::Val{D}, ::Val{G}, ::Val{C},
+                                         nodes, ::Val{D}, ::Val{G}, ::Val{C},
                                          ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)                     # (i1..iD, block)
     b = I[D + 1]
     origin, h = origins[b], spacings[b]
-    off = pointoffsets(h, C)
-    x = ntuple(d -> origin[d] + (I[d] - off[d]) * h, Val(D))
+    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
     vals = f(x)
     idx = ntuple(d -> I[d] + G[d], Val(D))
     # Unrolled through `Val`, so every tuple index is a literal: a
@@ -995,7 +1180,8 @@ end
 
 Set every **owned** point of every block from the callback
 `f(x, v) -> value`, where `x` is that point's position — a cell center,
-a face center, a vertex, whatever this field set's centering says (an
+a face center, a vertex, an element's Gauss–Lobatto node, whatever this
+field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
 `v` the variable index. The ghosts and the shared boundary plane are
 left untouched: they are filled by the ghost exchange (M2).
@@ -1033,9 +1219,11 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     # the upload is not worth caching.
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings,
-                     Val(D), Val(fs.G), Val(staggers(fs));
-                     ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings,
+                         nodes, Val(D), Val(fs.G), Val(staggers(fs));
+                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+    end
     synchronize(backend)
     return fs
 end
@@ -1049,9 +1237,11 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins, spacings,
-                     Val(D), Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
-                     ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins,
+                         spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
+                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+    end
     synchronize(backend)
     return fs
 end

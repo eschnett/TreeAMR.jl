@@ -23,6 +23,7 @@ milestones were planned in, and the list below is in execution order.
   - [M13 — Nested-mesh ghost fill](#m13--nested-mesh-ghost-fill)
   - [M14 — Half-turn symmetry](#m14--half-turn-symmetry)
   - [M15 — Folds over points](#m15--folds-over-points)
+  - [M16 — Element centering](#m16--element-centering)
   - [M9b — Visualization export](#m9b--visualization-export)
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
 
@@ -91,6 +92,10 @@ Done, 2026-10-21 (steps 0–8). The design is under "Half turn" in "Domain and b
 ### M15 — Folds over points
 
 Done, 2026-10-22. The design is under "Folds over points" in "Operations" in [CODE.md](CODE.md#folds-over-points), and what it leaves open there; the record is in [HISTORY.md](HISTORY.md#m15--folds-over-points).
+
+### M16 — Element centering
+
+Done, 2026-10-31 (steps 1–8). The design is under *The element centering* in "Centerings", the element-local family in "Operators", and "Ghost filling" and "Regridding" in [CODE.md](CODE.md#centerings), and what it leaves open under "Open questions"; the record is in [HISTORY.md](HISTORY.md#m16--element-centering).
 
 ### M9b — Visualization export
 

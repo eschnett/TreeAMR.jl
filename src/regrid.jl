@@ -89,14 +89,12 @@ end
     ntuple(d -> max(hi[d], Int32(i[d])), Val(D))
 
 @kernel function firing_lanes_kernel!(counts, los, his, @Const(work), fires,
-                                      @Const(origins), @Const(spacings),
+                                      @Const(origins), @Const(spacings), nodes,
                                       ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
                                       ::Val{W}) where {D,G,C,N,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
     origin, h = origins[b], spacings[b]
-    # The same expression `coordinates` forms, per centering.
-    off = pointoffsets(h, C)
     cells = CartesianIndices(ntuple(_ -> N, Val(D)))
 
     n = 0
@@ -106,7 +104,8 @@ end
         c = Tuple(cells[k])
         i = ntuple(d -> c[d], Val(D))                  # owned index, 1:N
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
-        x = ntuple(d -> origin[d] + (i[d] - off[d]) * h, Val(D))
+        # The same expression `coordinates` forms, per centering.
+        x = ntuple(d -> nodeposition(origin[d], h, i[d], C[d], nodes), Val(D))
         if fires(work, idx, b, x)
             n += 1
             lo = widen_lo(lo, i)
@@ -193,9 +192,12 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     his = allocate(backend, NTuple{D,Int32}, (n,))
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
-    firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
-                                  spacings, Val(D), Val(fs.G), Val(staggers(fs)),
-                                  Val(forest.N), Val(W); ndrange=W * n)
+    with_nodes(backend, T, fs.P) do nodes
+        firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
+                                      spacings, nodes, Val(D), Val(fs.G),
+                                      Val(staggers(fs)), Val(forest.N), Val(W);
+                                      ndrange=W * n)
+    end
     firing_fold_kernel!(backend)(counts, los, his, lcounts, llos, lhis, Val(D), Val(W);
                                  ndrange=n)
     synchronize(backend)
@@ -709,9 +711,15 @@ end
 # to the next `fill_ghosts!`, as ghosts always are; in a vertex-like
 # dimension that makes coarsening halved injection from the children's
 # even points, all of which they own.
+#
+# `P` is the layout's element order, `0` for none, and is required, as
+# for `kind_stencil`. An element set (M16) refines by `I` and coarsens by
+# the exact `L²` projection, the regrid's own coarsening (`regrid`), not
+# the ghost fill's compatible restriction: across a regrid energy is not
+# conserved anyway, and the projection keeps the degree `R` loses.
 function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
                       operators::Operators, backend::Backend, pairs::TransferPairs{D};
-                      oldrange::UnitRange{Int}, newrange::UnitRange{Int},
+                      P::Integer, oldrange::UnitRange{Int}, newrange::UnitRange{Int},
                       nold::Int, nnew::Int, oldowner, newowner) where {T,D}
     # These stencils are rebuilt on every regrid — the child offsets
     # involved depend on which blocks moved — so, like the schedule's,
@@ -721,7 +729,7 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # interpolates.
     bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
     build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
-                                           operators, bounded(key)), D)
+                                           operators, bounded(key); P=P, regrid=true), D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -745,10 +753,11 @@ end
 # function of its own for the tests and `bench/gpu.jl`.
 function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
                          c::NTuple{D,Int}, oldleaves, newleaves,
-                         operators::Operators, backend::Backend) where {T,D}
+                         operators::Operators, backend::Backend;
+                         P::Integer) where {T,D}
     nold, nnew = length(oldleaves), length(newleaves)
     stage = regrid_stage(T, forest.N, G, c, operators, backend,
-                         regrid_sources(oldleaves, newleaves); oldrange=1:nold,
+                         regrid_sources(oldleaves, newleaves); P=P, oldrange=1:nold,
                          newrange=1:nnew, nold=nold, nnew=nnew, oldowner=nothing,
                          newowner=nothing)
     return stage.locals
@@ -843,7 +852,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, fs.walls, eltype(fs.work),
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, eltype(fs.work),
                    nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
@@ -857,6 +866,10 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "the field set has centering $(fs.centering) but its schedule was " *
         "built for $(sched.centering); pair each field set with its own " *
         "schedule"))
+    fs.P == sched.P || throw(ArgumentError(
+        "the field set has element order P = $(fs.P) but its schedule was built for " *
+        "P = $(sched.P); the transfer's stencils follow from the element order, so " *
+        "pair each field set with its own schedule"))
     fs.walls === sched.walls || throw(ArgumentError(
         "the field set has walls = :$(fs.walls) but its schedule was built for " *
         ":$(sched.walls); pair each field set with its own schedule"))
@@ -920,6 +933,12 @@ the centering: a fresh block's shared boundary plane and its ghosts are
 left to the next [`fill_ghosts!`](@ref), as ghosts always are. A test
 that inspects a staggered field set after a regrid has to fill ghosts
 first.
+
+An element-centered set (M16, [`ElementLocal`](@ref) operators) is
+refined by its elements' polynomials evaluated at the fine nodes and
+coarsened by the exact `L²` projection, exact to the element's degree
+and a left inverse of the refinement, and its transfer reads owned
+points only, so it is not filled first and needs no hook.
 
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
@@ -1003,7 +1022,11 @@ function regrid!(forest::Forest{D}, pairs;
         # or an operator family.
         backend = get_backend(fs.work)
         move = transfer && sched !== nothing
-        if move && fill !== nothing
+        # An element set (M16) is not filled: its transfer reads owned
+        # points only. The choice is the layout's, which every rank
+        # agrees on (`check_regrid_set!`), so no rank waits in a fill the
+        # others skip.
+        if move && fill !== nothing && fs.P == 0
             # Prolongation from a parent reaches into that parent's ghost
             # layers, so they have to hold data before anything moves.
             # Over a distributed forest this is the distributed fill, so a
@@ -1020,7 +1043,8 @@ function regrid!(forest::Forest{D}, pairs;
                                                              oldrange=oldrange,
                                                              newrange=newrange))
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
-                                 sched.operators, backend, sources; oldrange=oldrange,
+                                 sched.operators, backend, sources; P=fs.P,
+                                 oldrange=oldrange,
                                  newrange=newrange, nold=nold, nnew=nnew,
                                  oldowner=oldowner, newowner=newowner)
             # The transfer moves every cell in the domain, so it is
@@ -1289,6 +1313,8 @@ adapted_forest(sets::Tuple) = first(sets).forest
 
 The volume integral of one variable over the domain — `Σ hᴰ u` over
 every interior cell, with each block weighted by its own cell volume.
+For an element-centered set (M16) it is the Gauss–Lobatto quadrature,
+each node weighted by the tensor product of `(P+1)ŵᵢ/2` times `hᴰ`.
 
 What [`regrid!`](@ref) does to this depends on the operator family:
 
@@ -1302,6 +1328,12 @@ What [`regrid!`](@ref) does to this depends on the operator family:
   not: prolongation is not locally conservative, and at a refinement
   boundary the fine region draws on neighbor values through the parent's
   ghosts without those neighbors giving anything up.
+- With [`ElementLocal`](@ref) operators, on an element set, it is
+  preserved to roundoff for any field: refinement evaluates the coarse
+  element's polynomial at the fine nodes, and coarsening is the exact
+  `L²` projection of the fine elements' polynomials, both of which keep
+  the integral the Gauss–Lobatto quadrature takes of an element's
+  polynomial.
 """
 function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest
@@ -1313,6 +1345,11 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     # roundoff only, and the suite asserts exactly that on a device,
     # where the lanes split the cells differently.
     # `float(real(T))` inline, not the local `R`: see `volume_weighted_norm`.
-    return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
-                          weight=key -> spacing(float(real(T)), forest, key)^D)
+    cellvolume(key) = spacing(float(real(T)), forest, key)^D
+    fs.P == 0 && return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
+                                       weight=cellvolume)
+    # An element set's nodes are weighted by the GLL quadrature (M16).
+    vars = _varrange(var, fs.nvars)
+    values = element_quadrature_barrier(identity, R, fs.work, fs, fs.G, vars)
+    return combine_blocks(+, zero(R), fs, values, cellvolume)
 end
