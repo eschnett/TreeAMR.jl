@@ -755,3 +755,123 @@ end
     fs = FieldSet(forest, 1; G=0, centering=elementcentered(2), P=3)
     @test_throws "mortar fluxes" InterfaceSchedule(fs)
 end
+
+# --- The regrid ---------------------------------------------------------
+
+# Refine every block of `fs`'s forest, or coarsen every family of
+# leaves, moving `fs` with its schedule and the other `pairs`; returns
+# the new schedule of `fs`.
+function regrid_all!(fs, flag, pairs...; boundary=nothing)
+    ops = Operators(family=ElementLocal)
+    @test regrid!(fs.forest, (fs => GhostSchedule(fs, ops), pairs...);
+                  flags=fill(flag, nblocks(fs)), boundary=boundary)
+    return GhostSchedule(fs, ops)
+end
+
+# The owned values of every block, by block key, so that a regrid's
+# result can be compared with the data before it.
+owned_by_key(fs) = Dict(blockkey(fs, b) => [copy(interiorview(fs, b, v)) for v in 1:fs.nvars]
+                        for b in 1:nblocks(fs))
+
+@testset "Refining and coarsening an element set are exact for Q_P: D=$D, P=$P" for
+    (D, P) in ((1, 1), (1, 3), (2, 2), (2, 3), (3, 1))
+    # Guards a regrid that moves Gauss–Lobatto nodes as equally spaced
+    # points, reads the wrong half of I, or coarsens by the ghost fill's
+    # restriction, which loses a degree.
+    N = 2 * (P + 1)
+    forest = element_levels_forest(D, N, 2; bc=:outer)
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    f = element_poly(P)
+    err() = maximum(b -> maximum(I -> abs(fs.work[(Tuple(I) .+ 1)..., 1, b] -
+                                          f(coordinates(fs, b, Tuple(I) .+ 1))),
+                                 CartesianIndices(ntuple(_ -> N, D))), 1:nblocks(fs))
+    fill_by_coordinates!((x, v) -> f(x), fs)
+    nb = nblocks(fs)
+    regrid_all!(fs, Refine)
+    @test nblocks(fs) == 2^D * nb
+    @test err() < 1e-13
+    regrid_all!(fs, Coarsen)
+    @test nblocks(fs) == nb
+    @test err() < 1e-13
+end
+
+@testset "Coarsening undoes refining for any element data, and both conserve the GLL mass: D=$D, P=$P" for
+    (D, P) in ((1, 2), (2, 1), (2, 3), (3, 1))
+    # Guards a coarsening that is not a left inverse of the refinement
+    # (the exact projection is; R is not), and a transfer that does not
+    # conserve the quadrature integral total_mass measures.
+    N = 2 * (P + 1)
+    forest = element_levels_forest(D, N, 2; bc=:periodic)
+    # The ghosts start as NaN and are never filled: the regrid of an
+    # element set reads owned points only, so none can reach the data.
+    fs = FieldSet(forest, 2; G=1, centering=elementcentered(D), P=P)
+    fs.work .= NaN
+    rng = MersenneTwister(1800 + 10D + P)
+    for b in 1:nblocks(fs), v in 1:2
+        interiorview(fs, b, v) .= rand(rng, ntuple(_ -> N, D)...)
+    end
+    before = owned_by_key(fs)
+    mass = total_mass(fs, 2)
+    regrid_all!(fs, Refine)
+    @test !any(b -> any(isnan, interiorview(fs, b, 1)), 1:nblocks(fs))
+    @test total_mass(fs, 2) ≈ mass rtol = 1e-14
+    regrid_all!(fs, Coarsen)
+    @test total_mass(fs, 2) ≈ mass rtol = 1e-14
+    after = owned_by_key(fs)
+    @test keys(after) == keys(before)
+    @test all(k -> all(v -> isapprox(after[k][v], before[k][v]; atol=1e-14), 1:2),
+              keys(before))
+end
+
+@testset "The initial-data cycle samples an element set at its nodes: D=$D" for D in (1, 2)
+    # Guards an adaptation of an element set that does not converge, or
+    # leaves data that is not the initial data at the nodes.
+    P = 3
+    forest = Forest(ntuple(_ -> 2, D); N=8, extents=ntuple(_ -> (0.0, 1.0), D))
+    fs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    bump = (x, v) -> exp(-sum((x[d] - 0.3)^2 for d in 1:D) / (2 * 0.1^2))
+    function flag(b, k)
+        ext = block_extent(forest, k)
+        inside = all(d -> ext[d][1] <= 0.3 <= ext[d][2], 1:D)
+        want = inside ? 2 : 0
+        return level(k) < want ? Refine : level(k) > want ? Coarsen : Keep
+    end
+    hook = CellBoundary((x, v, δ) -> bump(x, v))
+    schedule, passes, converged = adapt_to_initial_data!(fs, Operators(family=ElementLocal);
+                                                         initial=bump, flag=flag,
+                                                         boundary=hook)
+    @test converged && passes > 1
+    @test maxlevel(forest) == 2
+    @test schedule.P == P
+    @test all(b -> all(I -> fs.work[(Tuple(I) .+ 1)..., 1, b] ===
+                            bump(coordinates(fs, b, Tuple(I) .+ 1), 1),
+                       CartesianIndices(ntuple(_ -> 8, D))), 1:nblocks(fs))
+end
+
+@testset "An element set regrids beside a cell set with a boundary hook: D=$D" for D in (1, 2)
+    # Guards a regrid call that fills every set before its transfer with
+    # the call's hook, or refuses mixed layouts: the cell set needs its
+    # ghosts, the element set reads none, and both move in one call.
+    P, N = 1, 8
+    forest = element_levels_forest(D, N, 2; bc=:outer)
+    efs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=P)
+    cfs = FieldSet(forest, 1; G=1)
+    f = element_poly(P)
+    fill_by_coordinates!((x, v) -> f(x), efs)
+    fill_by_coordinates!((x, v) -> sum(x), cfs)
+    hook = CellBoundary((x, v, δ) -> sum(x))
+    csched = GhostSchedule(cfs, Operators(prolongation=2, restriction=2))
+    nb = nblocks(efs)
+    esched = regrid_all!(efs, Refine, cfs => csched; boundary=hook)
+    @test nblocks(efs) == nblocks(cfs) == 2^D * nb
+    @test esched.P == P
+    for b in 1:nblocks(efs), I in CartesianIndices(ntuple(_ -> N, D))
+        J = Tuple(I) .+ 1
+        @test efs.work[J..., 1, b] ≈ f(coordinates(efs, b, J)) atol = 1e-13
+        @test cfs.work[J..., 1, b] ≈ sum(coordinates(cfs, b, J)) atol = 1e-13
+    end
+    # The two layouts' schedules are not interchangeable.
+    @test_throws "element order" regrid!(forest, efs => GhostSchedule(
+        forest, Operators(family=ElementLocal); G=1, centering=elementcentered(D), P=3);
+        flags=fill(Keep, nblocks(efs)))
+end

@@ -850,7 +850,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, fs.walls, eltype(fs.work),
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, eltype(fs.work),
                    nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
@@ -864,6 +864,10 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "the field set has centering $(fs.centering) but its schedule was " *
         "built for $(sched.centering); pair each field set with its own " *
         "schedule"))
+    fs.P == sched.P || throw(ArgumentError(
+        "the field set has element order P = $(fs.P) but its schedule was built for " *
+        "P = $(sched.P); the transfer's stencils follow from the element order, so " *
+        "pair each field set with its own schedule"))
     fs.walls === sched.walls || throw(ArgumentError(
         "the field set has walls = :$(fs.walls) but its schedule was built for " *
         ":$(sched.walls); pair each field set with its own schedule"))
@@ -927,6 +931,12 @@ the centering: a fresh block's shared boundary plane and its ghosts are
 left to the next [`fill_ghosts!`](@ref), as ghosts always are. A test
 that inspects a staggered field set after a regrid has to fill ghosts
 first.
+
+An element-centered set (M16, [`ElementLocal`](@ref) operators) is
+refined by its elements' polynomials evaluated at the fine nodes and
+coarsened by the exact `L²` projection, exact to the element's degree
+and a left inverse of the refinement, and its transfer reads owned
+points only, so it is not filled first and needs no hook.
 
 Ghosts are filled from each schedule before that set's transfer, because
 a prolongation stencil reads its parent's ghost layers; pass `boundary`
@@ -1010,7 +1020,11 @@ function regrid!(forest::Forest{D}, pairs;
         # or an operator family.
         backend = get_backend(fs.work)
         move = transfer && sched !== nothing
-        if move && fill !== nothing
+        # An element set (M16) is not filled: its transfer reads owned
+        # points only. The choice is the layout's, which every rank
+        # agrees on (`check_regrid_set!`), so no rank waits in a fill the
+        # others skip.
+        if move && fill !== nothing && fs.P == 0
             # Prolongation from a parent reaches into that parent's ghost
             # layers, so they have to hold data before anything moves.
             # Over a distributed forest this is the distributed fill, so a
@@ -1312,6 +1326,12 @@ What [`regrid!`](@ref) does to this depends on the operator family:
   not: prolongation is not locally conservative, and at a refinement
   boundary the fine region draws on neighbor values through the parent's
   ghosts without those neighbors giving anything up.
+- With [`ElementLocal`](@ref) operators, on an element set, it is
+  preserved to roundoff for any field: refinement evaluates the coarse
+  element's polynomial at the fine nodes, and coarsening is the exact
+  `L²` projection of the fine elements' polynomials, both of which keep
+  the integral the Gauss–Lobatto quadrature takes of an element's
+  polynomial.
 """
 function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     forest = fs.forest
