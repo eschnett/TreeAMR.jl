@@ -8,7 +8,7 @@ See the [design document](https://github.com/eschnett/TreeAMR.jl/blob/main/CODE.
 for the full design, and [PLAN.md](https://github.com/eschnett/TreeAMR.jl/blob/main/PLAN.md)
 for the milestone roadmap.
 
-The package has completed milestone **M15**: the tree core (Morton keys over a
+The package has completed milestone **M16**: the tree core (Morton keys over a
 brick of octree roots, neighbor finding, refinement and coarsening, 2:1
 balance, periodic wraparound, block storage), the cached ghost exchange
 with configurable interpolation operators, the state-vector coupling
@@ -82,7 +82,16 @@ M15 added folds over points: [`mesh_fold`](@ref) hands its callback every
 owned point with its variables, position, level and a per-block tag, and
 carries any `isbits` accumulator, so that an analysis computes the norms
 of many regions — spherical shells, levels, a band of blocks — in one
-sweep and one collective. Next is visualization export (M9b).
+sweep and one collective.
+
+M16 added an element centering for element-local discontinuous Galerkin
+schemes: [`elementcentered`](@ref) with the order `P` on the
+[`FieldSet`](@ref) holds elements of `P + 1` Gauss–Lobatto nodes, and
+the [`ElementLocal`](@ref) operators fill them across element faces only,
+in one stage, with a coarse-fine coupling that keeps a
+summation-by-parts scheme's discrete energy an exact invariant. A regrid
+refines and coarsens them exactly to the element's degree. Next is
+visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
