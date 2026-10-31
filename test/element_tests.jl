@@ -187,7 +187,7 @@ end
     @test FieldSet(forest, 1; G=1).P == 0
     @test FieldSet(forest, 1; G=1, centering=vertexcentered(D)).P == 0
     efs = FieldSet(forest, 1; G=1, centering=elementcentered(D), P=3)
-    @test GhostSchedule(efs, Operators(prolongation=2, restriction=2)).P == 3
+    @test GhostSchedule(efs, Operators(family=ElementLocal)).P == 3
     @test GhostSchedule(FieldSet(forest, 1; G=1),
                         Operators(prolongation=2, restriction=2)).P == 0
 end
@@ -219,7 +219,7 @@ end
     end
     @test FieldSet(Forest(ntuple(_ -> 1, D); N=12), 1; G=1, centering=E, P=2).P == 2
     # The forest form of the schedule takes the same checks.
-    ops = Operators(prolongation=2, restriction=2)
+    ops = Operators(family=ElementLocal)
     @test_throws "needs `P`" GhostSchedule(forest, ops; G=1, centering=E)
     @test_throws "has no elements" GhostSchedule(forest, ops; G=1, P=3)
     @test_throws "whole parent elements" GhostSchedule(forest, ops; G=1, centering=E, P=2)
@@ -235,6 +235,47 @@ end
         end
     end
     @test_throws "cannot hold an element-centered set" RotationPair(fs, fs)
+end
+
+@testset "The element family takes no orders, and goes with element sets only: D=$D" for D in
+    (1, 2, 3)
+    # Guards an element set filled by operators that treat its
+    # Gauss–Lobatto nodes as equally spaced points (wrong at every
+    # coarse-fine face and regrid, without an error), an equally spaced
+    # set handed the element operators, and an order asked of a family
+    # whose order is the field set's.
+    ops = Operators(family=ElementLocal)
+    @test ops.family === ElementLocal
+    @test sprint(show, ops) == "Operators(family=ElementLocal)"
+    @test TreeAMR.ghost_layers_read(ops) == 0
+    @test_throws "takes no prolongation" Operators(family=ElementLocal, prolongation=4)
+    @test_throws "takes no restriction" Operators(family=ElementLocal, restriction=2)
+    @test_throws "takes no prolongation" Operators(family=ElementLocal, prolongation=2,
+                                                   restriction=2)
+    @test_throws "takes no vertex_prolongation" Operators(family=ElementLocal,
+                                                          vertex_prolongation=2)
+    @test_throws "bounded = true is not available" Operators(family=ElementLocal,
+                                                             bounded=true)
+    # The other families still need their orders.
+    @test_throws "no default order" Operators(family=PointValue)
+    @test_throws "no default order" Operators(family=Conservative, prolongation=3)
+
+    forest = Forest(ntuple(_ -> 2, D); N=8)
+    E = elementcentered(D)
+    efs = FieldSet(forest, 1; G=1, centering=E, P=3)
+    @test check_operators(efs, ops) === nothing
+    @test check_operators(FieldSet(forest, 1; G=0, centering=E, P=3), ops) === nothing
+    for other in (Operators(prolongation=2, restriction=2),
+                  Operators(prolongation=1, restriction=2, family=Conservative))
+        @test_throws "takes Operators(family = ElementLocal)" check_operators(efs, other)
+        @test_throws "takes Operators(family = ElementLocal)" GhostSchedule(efs, other)
+    end
+    for C in (cellcentered(D), vertexcentered(D), facecentered(D, 1))
+        fs = FieldSet(forest, 1; G=1, centering=C)
+        @test_throws "this field set has none" check_operators(fs, ops)
+        @test_throws "this field set has none" GhostSchedule(fs, ops)
+    end
+    @test_throws "this field set has none" GhostSchedule(forest, ops; G=1)
 end
 
 # A forest whose block origins and spacings are dyadic, so that the
@@ -311,7 +352,7 @@ stored_indices(fs) = CartesianIndices(size(fs.work)[1:(ndims(fs.work) - 2)])
     # the same position, so after a fill every stored value is its own
     # position.
     G == 0 && continue
-    ops = Operators(prolongation=2, restriction=2)
+    ops = Operators(family=ElementLocal)
     sched = GhostSchedule(fs, ops)
     for hook in (CellBoundary((x, v, δ) -> x[v]), CellBoundary(AllVariables((x, δ) -> x)),
                  CellBoundary(Relative(AllVariables(x -> x))))

@@ -8,6 +8,7 @@ physical-boundary hook, and the flux fixup at coarse-fine faces.
 ```@docs
 Operators
 OperatorFamily
+ElementLocal
 check_operators
 GhostSchedule
 isstale

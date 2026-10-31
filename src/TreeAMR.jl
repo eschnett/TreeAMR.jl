@@ -28,8 +28,9 @@ export cellcentered, vertexcentered, facecentered, edgecentered, staggers
 export elementcentered
 
 # Ghost exchange and interpolation operators (M2)
-export Operators, OperatorFamily, PointValue, Conservative, check_operators,
-       GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates, CellBoundary
+export Operators, OperatorFamily, PointValue, Conservative, ElementLocal,
+       check_operators, GhostSchedule, isstale, fill_ghosts!, boundary_by_coordinates,
+       CellBoundary
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,

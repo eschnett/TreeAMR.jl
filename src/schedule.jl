@@ -1847,7 +1847,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         storedsize(N, gs, ss)                    # the N >= 2G[d] + 2c[d] invariant
         # `0` is the forest form's "no elements", as `FieldSet` stores it.
         order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
-        check_operators(N, gs, ss, operators)
+        check_operators(N, gs, cs, order, operators)
         check_floattype(T, backend)
         check_walls(walls)
         layout = layouthash(gs, cs, order, walls, Int(operators.family),
