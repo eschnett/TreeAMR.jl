@@ -541,8 +541,10 @@ end
 #
 # The cached vectors are shared, so nothing may mutate one; the two
 # callers copy them into a `Stencil1D`'s element type on the way out.
+#
+# `LAGRANGE_LOCK` guards this cache and the element tables' alike, and is
+# defined in `elements.jl`, which is included first.
 const LAGRANGE_CACHE = Dict{Tuple{Int,WeightRational},Vector{WeightRational}}()
-const LAGRANGE_LOCK = ReentrantLock()
 
 """
     unit_lagrange_weights(p, ξ)

@@ -11,6 +11,8 @@ TreeAMR.BoundaryBatch
 TreeAMR.BoundaryPlan
 TreeAMR.lagrange_weights
 TreeAMR.unit_lagrange_weights
+TreeAMR.ElementTables
+TreeAMR.element_tables
 TreeAMR.ghost_layers_read
 ```
 
