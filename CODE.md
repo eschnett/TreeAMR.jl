@@ -4954,7 +4954,8 @@ before it is built):
   levels below — which is the second, wider exchange that "The
   exchange: the sender computes" avoids.
 
-**The multi-block check** (the standing instruction). Nothing here obstructs a conforming multi-block forest.
+**The multi-block check** (the standing instruction). Nothing here obstructs a conforming multi-block forest. What building one would cost, and the shape decided for it, is under
+[Open questions](#open-questions).
 
 - Ownership is by curve index, whatever the roots' connectivity.
 - Candidate peers come from `neighbor_keys`, in `forest.jl`, which is
@@ -5932,3 +5933,83 @@ Remaining, none blocking before their milestone:
     systems do not need it.
   - `P` adaptivity is out of scope: `P` is the field set's, and `N` the
     forest's.
+- **A multi-patch forest** **(proposed)**. TreeWaveOLDG asks for the
+  scalar wave on a curvilinear multi-patch domain — an annulus, a cubed
+  sphere — with uniform meshes, which is the conforming multi-block
+  forest "The multi-block check" under
+  [Distributed meshes](#distributed-meshes) watches for. The milestone
+  is [PLAN.md](PLAN.md#m17--multi-patch-forests-uniform); the shape,
+  decided with Erik:
+  - *Bricks glued at faces.* The forest holds several root bricks —
+    **patches** — each with its own `roots` and its own logical
+    `extents`, and a **glue table** carrying a face of one patch onto a
+    face of another with a signed axis permutation. Inside a patch,
+    neighbor finding stays the index arithmetic of `neighbor_anchor`;
+    only a step that leaves a patch consults the table, so the common
+    case pays nothing. A cubed sphere is six or seven bricks. The
+    alternatives on record are a flat list of roots with a per-face
+    table, p4est's connectivity exactly, which makes every root-level
+    query a lookup and empties `root_position` and `root_index` of
+    meaning; and gluing the outer faces of one brick to each other,
+    which is the smallest change but forces every patch to the same
+    size and an awkward packing.
+  - *The coordinates stay logical.* The map from a patch's logical box
+    to physical space is the application's, with its Jacobian, its
+    metric, its physical CFL and its `√g`-weighted norms, which an
+    application forms through `block_fold`
+    ([Folds over points](#folds-over-points)); `volume_weighted_norm`
+    keeps weighting by logical volume. TreeAMR gains only `patch` and
+    `block_patches`, beside `block_spacings` and `block_origins`, so
+    that a kernel can tell which map a block is under, and the cube
+    check of [Domain and boundaries](#domain-and-boundaries) applies per
+    patch, in logical space, where it is free. A forest that carried the
+    maps would make `coordinates`, `fill_by_coordinates!`, the norms and
+    `interpolate` physical — convenient downstream, but it puts geometry
+    that is physics in the mesh layer, it has to be device-transportable,
+    and it turns `interpolate` into a root-finding problem.
+  - *Uniform meshes first.* No coarse-fine face may cross a glued face,
+    refused with a reason as the seam refuses nonconformity. That leaves
+    out oriented prolongation and restriction, the oriented interface
+    restriction, and 2:1 balance across the table — M12's hardest parts
+    generalised — none of which an application asks for yet.
+  - *The seams stay as they are.* `rotating` and `halfturn` are not
+    re-expressed as glue entries: the connectivity is a second mechanism
+    beside them that reuses the same pieces, and the seams' own rules —
+    conformity, the shifted seam slab, `RotationPair` — do not obviously
+    fall out of a general table. Whether they collapse into it is to be
+    judged from the finished code. A forest with both is refused for now.
+  - *What it reuses.* The kernel's oriented read is already general:
+    `RotatedSource` takes `perm`, `flip`, `len` and a variable column,
+    and only `axismap` is specialised to quarter turns in one plane.
+    `GroupKey` already carries an orientation, and the pack, the unpack,
+    the MPI path and the interface restriction all go through it. What is
+    new is in `forest.jl` — the patch list and the glue table, a field of
+    `Forest` and so part of its digest, `neighbor_anchor`,
+    `oriented_neighbors` returning a general axis map rather than a
+    number of quarter turns, `wall_direction` and the balance checks — in
+    `schedule.jl`, where the axis map comes from the table instead of
+    from `axismap`, and in TreeIOHDF5, which stores the new forest state
+    ([Companion interface](#companion-interface)).
+  - *An oriented transfer with no variable map.* An oriented group
+    demands `rotvars` today, because a quarter turn exchanges Cartesian
+    components. Across a patch glue an application that stores *physical*
+    components needs the identity instead: the ghost is a single-valued
+    physical field at a point both patches own a name for. So the
+    identity map must be allowed. An application that stores
+    *patch-local* components would need a signed permutation per
+    interface, across field sets whose ghost geometry differs — the
+    gradient sets of an element scheme, `G = e_d` each, are the example —
+    which neither the field set nor `RotationPair` can express; refused,
+    with the reason, until one asks. The way around it is the
+    application's: store Cartesian components in one set with faces-only
+    ghosts, and contract with the Jacobian in the kernel.
+  - *Why an element scheme is the first application.* An element set is
+    filled on faces only and its edge and corner ghosts are never written
+    or read (*The element centering* under [Centerings](#centerings)).
+    Patch edges and corners — where three or more patches of a cubed
+    sphere meet, and where a multi-patch ghost fill is hardest — are
+    therefore never reached, so the first multi-patch forest needs no
+    answer for them. A finite-difference application would.
+  - Out of scope: nonconforming or overlapping patches, whose interfaces
+    are donor interpolation rather than a copy, and `P` or `N` differing
+    across a glued face.
