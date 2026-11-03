@@ -281,11 +281,26 @@ struct PointGeometry{D,T}
     L::Int
 end
 
-PointGeometry(::Type{T}, forest::Forest{D}) where {T,D} =
-    PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]), T(forest.extents[d][2])), D),
-                       forest.roots, forest.periodic, reflecting_faces(forest),
-                       hasrotating(forest) ? seam_plane(forest) : (0, 0),
-                       ishalfturn(forest), maxlevel(forest))
+# Point location is refused on a forest of patches (M17), here, where
+# every path to it builds its geometry: `locate_point`, and `interpolate`
+# serially and across ranks. Every rank holds the same forest, so every
+# rank refuses together.
+function PointGeometry(::Type{T}, forest::Forest{D}) where {T,D}
+    ispatched(forest) && throw(ArgumentError(
+        "point location — locate_point, and interpolate, which locates its points — " *
+        "is not defined on a forest of patches: its coordinates are logical, patch by " *
+        "patch, and the patches' boxes may overlap or coincide, so a position does not " *
+        "name one point. A physical position does, through the application's maps " *
+        "from each patch's box to space, and locating it is a root-finding problem on " *
+        "those maps, which the forest does not carry (CODE.md, \"A multi-patch " *
+        "forest\"). What would lift this is a location handed the maps, or the patch " *
+        "of each point; neither is built."))
+    return PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]),
+                                           T(forest.extents[d][2])), D),
+                              forest.roots, forest.periodic, reflecting_faces(forest),
+                              hasrotating(forest) ? seam_plane(forest) : (0, 0),
+                              ishalfturn(forest), maxlevel(forest))
+end
 
 # One coordinate brought into the domain: wrapped along a periodic
 # dimension, mirrored once across a reflecting face it lies beyond.

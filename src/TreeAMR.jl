@@ -53,7 +53,7 @@ export firing_boxes
 export InterfaceSchedule, restrict_interfaces!
 
 # The all-variables form of the coordinate callbacks (for TreeHydro)
-export AllVariables, Relative
+export AllVariables, WithPatch, Relative
 
 # Reflecting boundaries (M10)
 export Parity, EvenParity, OddParity, NoParity

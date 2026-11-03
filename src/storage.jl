@@ -1147,6 +1147,51 @@ function check_allvariables(vals, fs::FieldSet, what::AbstractString)
         "whole tuple."))
 end
 
+"""
+    WithPatch(f)
+
+Wraps a coordinate callback so that it is also handed the **patch** of
+the point (M17; see [`patch`](@ref)), as an `Int` right after the
+position: `f(x, p, v)` for [`fill_by_coordinates!`](@ref),
+[`boundary_by_coordinates`](@ref) and [`adapt_to_initial_data!`](@ref)'s
+`initial`, which hands it on, and `g(x, p, v, δ)` for
+[`CellBoundary`](@ref). Around [`AllVariables`](@ref) it hands the patch
+to the once-per-point form in the same place: `WithPatch(AllVariables(f))`
+with `f(x, p) -> vals`, and `CellBoundary(WithPatch(AllVariables(g)))`
+with `g(x, p, δ) -> vals`. `WithPatch` goes outside, since it adds an
+argument to whatever form it wraps. The forms without it are unchanged.
+
+The reason is that a position does not say which patch it is in. The
+coordinates of a forest of patches are logical, patch by patch, and the
+patches' boxes may overlap or coincide — the six faces of a cubed sphere
+are all naturally `[-1, 1]² × [r₀, r₁]` — so the application, whose map
+from each patch's box to space it is, needs the patch to place a point.
+The kernel gets it from [`block_patches`](@ref), as it gets the position
+from [`block_origins`](@ref): a number per block, not a range of
+coordinates to test. On a forest of one brick `p` is always 1.
+
+A single field, so `WithPatch(f)` is `isbits` whenever `f` is and can be
+a kernel argument like the bare callback: the forms run on every
+backend. [`Relative`](@ref) does not take it.
+
+    fill_by_coordinates!(WithPatch((x, p, v) -> p * sum(x)), fs)
+"""
+struct WithPatch{F}
+    f::F
+end
+
+# `WithPatch` is not a callback itself, so a form that calls it as one
+# was nested the wrong way round; the host-side checks of the
+# all-variables forms reach this before any launch.
+(w::WithPatch)(args...) = throw(ArgumentError(
+    "a WithPatch was called as a callback: it hands the patch to the form it wraps, " *
+    "so it goes outside — WithPatch(AllVariables(f)) with f(x, p) -> vals, not " *
+    "AllVariables(WithPatch(f)) — and Relative does not take it"))
+
+# The patch of the point the host-side length check of an all-variables
+# form evaluates at, the first owned point of block 1.
+allvariables_sample_patch(fs::FieldSet) = patch(fs.forest, blockkey(fs, 1))
+
 @kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings), nodes,
                                      ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
@@ -1182,9 +1227,41 @@ end
     end
 end
 
+# The forms with the patch (M17): the kernels above, handed the block's
+# patch from `block_patches` beside its origin and spacing, and passing it
+# to the callback after the position. The position is formed by the same
+# expression, so a callback that ignores the patch fills bit for bit what
+# the form without it does.
+@kernel function coordinates_patch_kernel!(work, f, @Const(origins), @Const(spacings),
+                                           @Const(patches), nodes, ::Val{D}, ::Val{G},
+                                           ::Val{C}) where {D,G,C}
+    I = @index(Global, NTuple)                     # (i1..iD, var, block)
+    v, b = I[D + 1], I[D + 2]
+    origin, h, p = origins[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+    work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, p, v)
+end
+
+@kernel function coordinates_patch_all_kernel!(work, f, @Const(origins), @Const(spacings),
+                                               @Const(patches), nodes, ::Val{D}, ::Val{G},
+                                               ::Val{C}, ::Val{NV}) where {D,G,C,NV}
+    I = @index(Global, NTuple)                     # (i1..iD, block)
+    b = I[D + 1]
+    origin, h, p = origins[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+    vals = f(x, p)
+    idx = ntuple(d -> I[d] + G[d], Val(D))
+    ntuple(Val(NV)) do v
+        work[idx..., v, b] = vals[v]
+        nothing
+    end
+end
+
 """
     fill_by_coordinates!(f, fs::FieldSet)
     fill_by_coordinates!(AllVariables(f), fs::FieldSet)
+    fill_by_coordinates!(WithPatch(f), fs::FieldSet)
+    fill_by_coordinates!(WithPatch(AllVariables(f)), fs::FieldSet)
 
 Set every **owned** point of every block from the callback
 `f(x, v) -> value`, where `x` is that point's position — a cell center,
@@ -1209,6 +1286,11 @@ expression, on the same origin and spacing, in the same order — so
 switching between them is not a numerical change. The tuple's length is
 checked once on the host, at the first owned point of block 1, before
 anything is launched.
+
+Wrapping either in [`WithPatch`](@ref) hands the callback the point's
+patch (M17) after the position, `f(x, p, v)` or `f(x, p) -> vals`, which
+a forest of patches with overlapping boxes needs to tell the
+application's maps apart.
 
 !!! note "Callbacks on a device"
     The callback becomes a kernel argument, so everything it closes over
@@ -1248,6 +1330,40 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins,
                          spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
+                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+    end
+    synchronize(backend)
+    return fs
+end
+
+function fill_by_coordinates!(w::WithPatch, fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    patches = todevice(backend, block_patches(forest))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(coordinates_patch_kernel!, backend, fs.work, w.f, origins,
+                         spacings, patches, nodes, Val(D), Val(fs.G), Val(staggers(fs));
+                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+    end
+    synchronize(backend)
+    return fs
+end
+
+function fill_by_coordinates!(w::WithPatch{<:AllVariables}, fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    nblocks(fs) == 0 && return fs
+    f = w.f.f
+    check_allvariables(f(allvariables_sample(fs), allvariables_sample_patch(fs)), fs,
+                       "fill callback")
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    patches = todevice(backend, block_patches(forest))
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(coordinates_patch_all_kernel!, backend, fs.work, f, origins,
+                         spacings, patches, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)

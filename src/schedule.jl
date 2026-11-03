@@ -274,18 +274,22 @@ BoundaryBatch{D}(boxlen, slot, blocks::VB, directions::VD, firsts::VF,
 
 Everything the cell-wise boundary kernel reads that is not field data:
 the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
-origin and spacing it turns a stored index into a position with, and for
-an element-centered layout (M16) the node offsets, empty otherwise, so
-that the plan's type, and the schedule's, does not depend on the layout.
+origin and spacing it turns a stored index into a position with, the
+per-block patch (M17, [`block_patches`](@ref)) that a
+[`WithPatch`](@ref) hook is handed, and for an element-centered layout
+(M16) the node offsets, empty otherwise, so that the plan's type, and
+the schedule's, does not depend on the layout.
 
 The geometry is here rather than recomputed per fill for the same reason
 the exchange itself is precomputed: it depends only on the tree, which
 is exactly what a schedule is rebuilt for.
 """
-struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,VN}
+struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,
+                    VP<:AbstractVector,VN}
     batches::Vector{BT}
     origins::VO
     spacings::VS
+    patches::VP             # `block_patches`, all ones on a brick
     nodes::VN               # `node_offsets` of the layout, on the backend
 end
 
@@ -323,9 +327,11 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
                  for k in keys_]
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
+    patches = todevice(backend, block_patches(forest))
     nodes = node_offsets(backend, T, P)
     return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings),
-                        typeof(nodes)}(batches, origins, spacings, nodes)
+                        typeof(patches),typeof(nodes)}(batches, origins, spacings,
+                                                       patches, nodes)
 end
 
 # What one ghost region of one block needs, as found by the neighbor

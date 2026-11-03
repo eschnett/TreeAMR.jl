@@ -19,6 +19,7 @@ interiorview
 closedview
 fill_by_coordinates!
 AllVariables
+WithPatch
 Parity
 RotationPair
 KernelAbstractions.get_backend(::FieldSet)

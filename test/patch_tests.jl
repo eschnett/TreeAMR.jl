@@ -1,7 +1,8 @@
 # M17: a forest of patches — several bricks of roots glued at their faces by
 # signed axis permutations. This file holds the forest (step 1), the
 # neighbor search across the glue (step 2), the ghost fill across it
-# (step 3), and conformity at the glue (step 4).
+# (step 3), conformity at the glue (step 4), and the patch handed to the
+# coordinate callbacks, with the refusals of point location (step 5).
 #
 # Every claim about where a step lands is stated against a continuous map
 # written out independently of the glue table: by hand for the small
@@ -922,4 +923,176 @@ end
     balance!(broken)
     fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
     @test InterfaceSchedule(fx) isa InterfaceSchedule
+end
+
+# --- The patch as a number (step 5) -------------------------------------------
+
+# A brick of `(4, 2, …)` roots cut in two at `x = 2`, both halves on the same
+# logical box `[0, 2] × [0, 2] × …`, glued with the identity, and `place` the
+# map from a patch's root units to the brick's: the second patch is the
+# brick's upper half, two roots on.
+function same_box(::Val{D}) where {D}
+    half = ntuple(d -> 2, D)
+    forest = Forest([(roots=half,), (roots=half,)]; N=4,
+                    glue=patch_glue_both((1, 1, 2), (2, 1, 1), ntuple(identity, D)))
+    place(p, x) = p == 1 ? x : Base.setindex(x, x[1] + 2, 1)
+    return forest, place
+end
+
+@testset "Patches with identical extents fill and exchange correctly: D=$D" for D in (1, 2,
+                                                                                    3)
+    # Two patches on one logical box: a position alone does not say which
+    # of them a point is in, so a callback handed the position only would
+    # give them the same data. Handed the patch through WithPatch, each
+    # patch is filled through its own map, initial data and boundary values
+    # alike, and after the exchange every stored point must be the brick's
+    # at the point that map carries it to — across the glue too, where the
+    # ghosts come from the other patch's data. The all-variables form must
+    # write bit for bit what the per-variable one does.
+    roots = ntuple(d -> d == 1 ? 4 : 2, D)
+    f = makepoly(D, 2)
+    fp(x, p, v) = f(p == 1 ? x : Base.setindex(x, x[1] + 2, 1), v)
+    all2(x, p) = ntuple(v -> fp(x, p, v), 2)
+    for refined in (false, true), C in patch_centerings(Val(D))
+        refined && first(C) === :element && continue
+        patched, place = same_box(Val(D))
+        @test patched.extents == ntuple(_ -> (0.0, 2.0), D)
+        refined && patch_refine_one!(patched, place)
+        brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
+        fsp, fsa = patch_fieldset(patched, C), patch_fieldset(patched, C)
+        fsb = patch_fieldset(brick, C)
+        fill_by_coordinates!(WithPatch(fp), fsp)
+        fill_by_coordinates!(WithPatch(AllVariables(all2)), fsa)
+        fill_by_coordinates!(f, fsb)
+        # The two patches hold different data at the same logical position
+        # (refined, a 1D pair has no two such blocks at one level).
+        ps, origins = block_patches(patched), block_origins(patched)
+        twins = [(a, b) for a in 1:nblocks(fsp), b in 1:nblocks(fsp)
+                 if ps[a] == 1 && ps[b] == 2 && origins[a] == origins[b] &&
+                    level(blockkey(fsp, a)) == level(blockkey(fsp, b))]
+        @test refined || !isempty(twins)
+        @test all(((a, b),) -> blockview(fsp, a, 1) != blockview(fsp, b, 1), twins)
+        sched = GhostSchedule(fsp, patch_ops(fsp))
+        fill_ghosts!(fsp, sched; boundary=boundary_by_coordinates(WithPatch(fp)))
+        fill_ghosts!(fsa, sched;
+                     boundary=boundary_by_coordinates(WithPatch(AllVariables(all2))))
+        fill_ghosts!(fsb, GhostSchedule(fsb, patch_ops(fsb));
+                     boundary=boundary_by_coordinates(f))
+        @test fsa.work == fsp.work
+        result = compare_through_layout(fsp, fsb, place)
+        @test result !== nothing
+        result === nothing && continue
+        worst, npoints = result
+        # Dyadic positions are exact, shifted or not; an element set's
+        # Gauss–Lobatto nodes are not, so there the two maps round apart.
+        @test worst <= (first(C) === :element ? 1e-13 : 0.0)
+        @test npoints > 0
+    end
+end
+
+@testset "WithPatch hands each outer ghost its block's patch, on every form" begin
+    # The annulus' four patches share one logical box, and its radial faces
+    # are outer: a boundary hook must be handed, at every point of every
+    # region it fills, that point's position, the variable, the region's
+    # direction and the patch of the block, which the position alone does
+    # not determine; boundary_by_coordinates must hand the same as
+    # fill_by_coordinates!; and the all-variables forms the same values.
+    ring = patch_ring(4, (2, 1))
+    refine!(ring, ring.leaves[2])
+    balance!(ring)
+    @test all(==(ring.extents), patch_keywords(ring).patches .|> (q -> q.extents))
+    code(x, p, v, δ) = 1000 * p + 100 * v + 10 * δ[2] + δ[1] + x[1] / 4 + x[2] / 64
+    ps = block_patches(ring)
+    for C in patch_centerings(Val(2))
+        fs = patch_fieldset(ring, C)
+        sched = GhostSchedule(fs, patch_ops(fs))
+        hooks = (CellBoundary(WithPatch((x, p, v, δ) -> oftype(x[1], code(x, p, v, δ)))),
+                 CellBoundary(WithPatch(AllVariables(
+                     (x, p, δ) -> ntuple(v -> oftype(x[1], code(x, p, v, δ)), 2)))),
+                 boundary_by_coordinates(WithPatch(
+                     (x, p, v) -> oftype(x[1], code(x, p, v, (0, 0))))),
+                 boundary_by_coordinates(WithPatch(AllVariables(
+                     (x, p) -> ntuple(v -> oftype(x[1], code(x, p, v, (0, 0))), 2)))))
+        works = map(enumerate(hooks)) do (h, hook)
+            fill!(fs.work, NaN)
+            fill_by_coordinates!(WithPatch((x, p, v) -> oftype(x[1], p)), fs)
+            fill_ghosts!(fs, sched; boundary=hook)
+            mismatches = points = 0
+            seen = Set{Int}()
+            for r in sched.boundaries, idx in r.region, v in 1:fs.nvars
+                δ = h <= 2 ? r.direction : (0, 0)
+                x = coordinates(fs, r.block, Tuple(idx))
+                points += 1
+                push!(seen, ps[r.block])
+                mismatches += fs.work[Tuple(idx)..., v, r.block] != code(x, ps[r.block], v, δ)
+            end
+            @test points > 0
+            @test mismatches == 0
+            @test seen == Set(1:4)
+            return copy(fs.work)
+        end
+        @test isequal(works[1], works[2])
+        @test isequal(works[3], works[4])
+    end
+end
+
+@testset "On a brick WithPatch hands patch 1, and fills as the form without it" begin
+    # Every forest has patches, a brick one: so a callback written for a
+    # forest of patches runs on a brick, handed `p = 1`, and writes bit for
+    # bit what the same callback without the patch does.
+    brick = Forest((2, 2); N=4)
+    refine!(brick, brick.leaves[1])
+    balance!(brick)
+    f = makepoly(2, 2)
+    fp(x, p, v) = p == 1 ? f(x, v) : NaN
+    a, b = FieldSet(brick, 2; G=1), FieldSet(brick, 2; G=1)
+    fill_by_coordinates!(f, a)
+    fill_by_coordinates!(WithPatch(fp), b)
+    @test b.work == a.work
+    fill_ghosts!(a, GhostSchedule(a, PATCH_OPS); boundary=boundary_by_coordinates(f))
+    fill_ghosts!(b, GhostSchedule(b, PATCH_OPS);
+                 boundary=boundary_by_coordinates(WithPatch(fp)))
+    @test b.work == a.work
+end
+
+@testset "WithPatch is refused where it cannot go, with the reason" begin
+    # A wrapper nested the wrong way round, or handed to the relative hook,
+    # which is called by position alone, must say so on the host, before a
+    # kernel calls the wrapper itself; an all-variables WithPatch callback
+    # is held to one value per variable as the form without it is; and the
+    # wrapper is `isbits` when its callback is, so a device can take it.
+    ring = patch_ring(4, (2, 1))
+    fs = patch_fieldset(ring, cellcentered(2))
+    sched = GhostSchedule(fs, PATCH_OPS)
+    @test_throws "it goes outside" fill_by_coordinates!(
+        AllVariables(WithPatch((x, p) -> (1.0, 2.0))), fs)
+    @test_throws "it goes outside" fill_ghosts!(
+        fs, sched; boundary=CellBoundary(AllVariables(WithPatch((x, p, δ) -> (1.0, 2.0)))))
+    @test_throws "returned 1" fill_by_coordinates!(
+        WithPatch(AllVariables((x, p) -> (1.0,))), fs)
+    @test_throws "returned 3" fill_ghosts!(
+        fs, sched; boundary=boundary_by_coordinates(WithPatch(AllVariables(
+            (x, p) -> (1.0, 2.0, 3.0)))))
+    one_var = patch_fieldset(ring, cellcentered(2); nvars=1)
+    @test_throws "is not handed the patch" fill_ghosts!(
+        one_var, GhostSchedule(one_var, PATCH_OPS);
+        boundary=CellBoundary(Relative(WithPatch((x, p) -> 0.0))))
+    @test isbits(WithPatch((x, p, v) -> sum(x) + p + v))
+    @test isbits(WithPatch(AllVariables((x, p) -> (sum(x), p))))
+end
+
+@testset "Point location is refused on a forest of patches, naming what would lift it" begin
+    # A position names no one point when patch boxes coincide, so locating
+    # it — locate_point, and interpolate, serially or across ranks — must be
+    # refused with the reason and the way out, not answered from patch 1.
+    ring = patch_ring(4, (2, 1))
+    @test_throws "not defined on a forest of patches" locate_point(ring, (0.5, 0.5))
+    @test_throws "root-finding problem" locate_point(ring, (0.5, 0.5))
+    @test_throws "the patch of each point" TreeAMR.PointGeometry(Float64, ring)
+    fs = patch_fieldset(ring, cellcentered(2))
+    @test_throws "not defined on a forest of patches" interpolate(fs, [(0.5, 0.5)],
+                                                                    Lagrange(2))
+    # One patch is a forest of patches too: there is no brick to fall back on.
+    one = Forest([(roots=(2, 2),)]; N=4)
+    @test_throws "not defined on a forest of patches" locate_point(one, (0.5, 0.5))
 end
