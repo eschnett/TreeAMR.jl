@@ -144,14 +144,9 @@ TreeIOHDF5's side, which saves a forest of patches under a new feature
 `patches` with no format-version bump, is on its branch of the same
 name. What remains, in order:
 
-1. **The last checks on Symmetry**: the full suite at one thread for
-   the final head, and `bench/ghosts.jl`'s schedule-build allocation
-   with the boundary plan's `patches`. The suite at eight threads,
-   TreeIOHDF5's suite and the compile-timing comparison have passed
-   there ([HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform)).
-2. **TreeWaveOLDG's acceptance**: its scalar wave on the four-patch
+1. **TreeWaveOLDG's acceptance**: its scalar wave on the four-patch
    annulus, uniform, against this checkout.
-3. **The releases.** TreeWave's and TreeHydro's suites against the
+2. **The releases.** TreeWave's and TreeHydro's suites against the
    checkout, then a TreeAMR release; then TreeIOHDF5's 0.1.6 (element
    sets, pending), and a release of its own for the feature `patches`,
    with `[compat] TreeAMR` the new version alone, since its save calls

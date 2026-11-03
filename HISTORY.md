@@ -4457,9 +4457,16 @@ M12 was decided with Erik, after M7 and before M9b.
   the boundary plan's type parameter costs nothing measurable. A first
   run on cn090 (job 588437) gave 135.5–138.2 s against 137.9–141.3 s,
   but its baseline alone spread over 2.6 s, so it is not the number.
-  *Not yet measured*, because the tunnel went down again: the suite at
-  one thread, and the schedule build's allocation with the boundary
-  plan's `patches`, one `Int32` per local block.
+  The suite at one thread passes too, 161,775 tests in 21 min 9 s (job
+  588486, cn107, EPYC 7543; the count differs from eight threads' by
+  the thread-dependent cases). `bench/ghosts.jl` at one thread, both
+  trees in one job on cn079 (EPYC 7532, job 588487), two rounds: the
+  schedule build at `D = 3` +1120 bytes uniform (383,488 → 384,608)
+  and about +21.5 kB two-level (4,623,544–4,623,960 →
+  4,644,776–4,645,880, +0.5 %); at `D = 2` +640 uniform (47,808 →
+  48,448) and about −8.5 kB two-level (409,240–411,608 →
+  401,704–401,800). The fill's allocations are identical (12,560,
+  112,480, 3,536 and 17,440 bytes) and its times equal within noise.
 
   *Companion and downstream.* TreeIOHDF5's branch takes TreeAMR from
   the checkout beside it through `[sources]` path entries, with
