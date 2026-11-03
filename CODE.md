@@ -3482,10 +3482,11 @@ their tuple's length on the host as before, at the first owned point of
 block 1 with that block's patch. On a brick `p` is 1 everywhere.
 The relative hook does not take it: `CellBoundary(Relative(WithPatch(f)))`
 is refused, saying that the relative hook calls `f` by position alone.
-**(open)** Building it would be two more kernels, and nothing in M17
+It stays refused until a downstream asks for it: building it is two
+more kernels, compiled only for whoever uses them, and nothing in M17
 asks for it; a cubed sphere's outer radial faces with a relative
-condition stated in physical coordinates would. Whether to build it is
-Erik's call.
+condition stated in physical coordinates would. Zero-gradient outflow,
+`f ≡ 0`, needs no patch and is `Relative(f)` as it is.
 
 Two surfaces that carry a position do not get the patch. `block_fold`'s
 `FoldPoint` needs none for a `√g`-weighted norm: `map_blocks!` passes
@@ -6419,10 +6420,8 @@ Remaining, none blocking before their milestone:
   [Application interface](#application-interface-sketch) and the
   refusal under [Point interpolation](#point-interpolation); how it came
   about is in [HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform).
-  Three decisions there are Erik's to make, each marked **(open)** where
+  Two decisions there are Erik's to make, each marked **(open)** where
   it lives:
-  - `CellBoundary(Relative(WithPatch(f)))`, refused rather than built
-    (Application interface);
   - point location on a forest of one patch built through the `patches`
     form, refused with every forest of patches (Point interpolation);
   - whether the seams collapse into the glue table (Domain and
@@ -6435,7 +6434,8 @@ Remaining, none blocking before their milestone:
   code on a cubed sphere would need, and with them a reversed
   vertex-like axis across a glue (Centerings), and point interpolation on a forest
   of patches, both refused with their reasons; a per-interface variable
-  map, for patch-local components; and the patch in `block_fold`'s
+  map, for patch-local components; `CellBoundary(Relative(WithPatch(f)))`
+  (Application interface); and the patch in `block_fold`'s
   `FoldPoint` and in the regrid criterion.
   Nonconforming or overlapping patches, whose interfaces are donor
   interpolation rather than a copy, are out of scope. The glue table's
