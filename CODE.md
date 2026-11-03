@@ -3191,13 +3191,23 @@ maps, which the forest does not carry ("A multi-patch forest" under
 [Domain and boundaries](#domain-and-boundaries)); the refusal says that
 a location handed the maps, or the patch of each point, would lift it.
 This is the only coordinate-to-block path in `src/`, and so the only
-thing disjoint patch extents would have served. **(open)** The refusal
-covers a forest of one patch built through the `patches` form as well
-— a self-glued wrap among them, whose wrap `PointGeometry` would not
-see — which is conservative: such a forest names one point by a
-position, and could be located once the wrap through its glue is
-folded. Whether to allow it is Erik's call; the brick form is
-unaffected.
+thing disjoint patch extents would have served. The refusal covers a
+forest of one patch built through the `patches` form as well — a
+self-glued wrap among them, whose wrap `PointGeometry` would not see.
+Such a forest names one point by a position, but nothing needs it
+located: one patch without glue, or wrapped onto its opposite face by
+the identity, is a brick the brick form builds and locates in, and a
+twisted wrap has no user. The brick form is unaffected.
+
+**(proposed)** Point location on a forest of patches comes with a
+mechanism that maps a global coordinate to a `(patch, local
+coordinates)` tuple, which a later milestone will need. Point location
+then takes such a tuple as its input. Folding — periodicity, wraps —
+happens on the global coordinate, before the patch lookup, so the
+location within a patch never folds, and the refusal narrows to a
+forest with patch boundaries that would need a fold in local
+coordinates; a forest with no patch boundaries, or none that need
+folding, is located.
 
 ### Folds over points
 
@@ -6420,12 +6430,11 @@ Remaining, none blocking before their milestone:
   [Application interface](#application-interface-sketch) and the
   refusal under [Point interpolation](#point-interpolation); how it came
   about is in [HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform).
-  Two decisions there are Erik's to make, each marked **(open)** where
-  it lives:
-  - point location on a forest of one patch built through the `patches`
-    form, refused with every forest of patches (Point interpolation);
-  - whether the seams collapse into the glue table (Domain and
-    boundaries).
+  One decision there is Erik's to make, marked **(open)** where it
+  lives: whether the seams collapse into the glue table (Domain and
+  boundaries). Point location on a forest of patches waits for a map
+  from a global coordinate to a `(patch, local coordinates)` tuple, as
+  proposed under [Point interpolation](#point-interpolation).
 
   Not in M17, until an application asks: refinement across a glued face
   (the oriented prolongation, restriction and interface restriction, and
