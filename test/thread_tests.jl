@@ -229,7 +229,9 @@ end
     # workload in subprocesses; `test/thread_workload.jl` prints a
     # digest of the state vector, the leaf array, the schedule shape,
     # and the reductions after a full adapt/evolve/regrid/evolve cycle
-    # in D = 1, 2, 3, periodic and not.
+    # in D = 1, 2, 3, periodic and not; and (M17) the fill across glued
+    # faces, on the annulus, a pair of patches with swapped and reversed
+    # axes, and a cubed-sphere shell.
     script = joinpath(@__DIR__, "thread_workload.jl")
     # The *active* environment, not `test/`: under `Pkg.test` the tests
     # run in a sandbox, and `test/` may have no manifest at all.
@@ -240,6 +242,15 @@ end
     serial = run_with(1)
     @test occursin("state", serial)
     @test count(==('\n'), serial) >= 4
+    # The forests of patches ran, and the glue turned what it should: the
+    # annulus' identity glue nothing, the laid-out pair's transfers in both
+    # phases, the sphere's in its one.
+    lines = split(serial, '\n')
+    turned(tag) = parse.(Int, split(only(filter(startswith("$tag schedule "),
+                                                lines)))[(end - 1):end])
+    @test all(t -> turned(t) == [0, 0], ("PR2c", "PR2v", "PR2e"))
+    @test all(>(0), turned("PL2c"))
+    @test turned("PS3e")[1] > 0
 
     @test run_with(max(2, min(4, Sys.CPU_THREADS))) == serial
 end
