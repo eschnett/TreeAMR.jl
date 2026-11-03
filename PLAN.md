@@ -133,60 +133,32 @@ three downstreams resolve them.
 
 ### M17 — Multi-patch forests (uniform)
 
-*(Proposed, not designed in detail.)* A conforming multi-patch forest on
-uniform meshes, so that an application can solve on an annulus or a
-cubed sphere. The design is the open question of that name in
-[CODE.md](CODE.md#open-questions), whose four decisions — bricks glued
-at faces, logical coordinates with the map left to the application,
-uniform meshes only, and the rotating seams left as they are — are
-settled; everything below follows from them. Asked for by TreeWaveOLDG,
-whose element sets are filled on faces only and so never read a patch
-edge or corner.
+Implemented on 2026-11-02 (steps 1–8), on the branch
+`eschnett-claude/multi-patch`, and not yet done. The design is under "A
+multi-patch forest" in "Domain and boundaries", "Glued faces" in "Ghost
+filling" and the passages they cite in [CODE.md](CODE.md#domain-and-boundaries),
+and what it leaves open under "Open questions" there; the record, steps
+and measurements are in
+[HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform), and
+TreeIOHDF5's side, which saves a forest of patches under a new feature
+`patches` with no format-version bump, is on its branch of the same
+name. What remains, in order:
 
-Steps, in order:
+1. **The checks on Symmetry**, which were unreachable when the steps
+   were built: the full suite at one and at eight threads for the final
+   head, and `--trace-compile-timing` of `test/mpi_workload.jl` against
+   `main` for it, since the boundary plan's new type parameter is in
+   every `GhostSchedule`'s type and the interim comparison covered steps
+   1–3 only.
+2. **TreeWaveOLDG's acceptance**: its scalar wave on the four-patch
+   annulus, uniform, against this checkout.
+3. **The releases.** TreeWave's and TreeHydro's suites against the
+   checkout, then a TreeAMR release; then TreeIOHDF5's 0.1.6 (element
+   sets, pending), and a release of its own for the feature `patches`,
+   with `[compat] TreeAMR` the new version alone, since its save calls
+   `patch_keywords`, and its `[sources]` path entries removed
+   ("Companion interface" in [CODE.md](CODE.md#companion-interface)).
 
-1. **The connectivity.** Several root bricks (patches), each with its
-   own `roots` and `extents`, and a glue table carrying a patch face
-   onto another patch's face with a signed axis permutation. The
-   keywords, the refusals and the field of `Forest` that holds it, with
-   `ForestDigest` covering it so that the collective checks see it. A
-   one-patch forest is today's forest, bit for bit.
-2. **Neighbor finding.** `neighbor_anchor` consults the table when a
-   step leaves its patch; `oriented_neighbors` returns a general axis
-   map `(perm, flip)` rather than a number of quarter turns;
-   `wall_direction` treats a glued face as neither outer nor a wall. A
-   glued face is refused as reflecting, outflow or periodic, and a
-   forest with both glue and a rotating seam is refused.
-3. **The schedule.** `GroupKey` carries the general axis map, and
-   `rotated_source` takes it from the table instead of from `axismap`.
-   The kernel, the pack, the unpack and the MPI path are unchanged. An
-   oriented group with the identity variable map is allowed, for an
-   application that stores physical components; a per-interface variable
-   map is refused with its reason.
-4. **Conformity.** A coarse-fine face across a glued face is refused, in
-   `balance!`, in `isbalanced` and in the leaf list `Forest` accepts, as
-   nonconformity at a seam is.
-5. **Geometry.** `patch(forest, k)` and `block_patches(forest)`, beside
-   `block_spacings` and `block_origins`; the cube check per patch.
-6. **The checkpoint.** TreeIOHDF5 stores and restores the patch list and
-   the glue table — a format version and a release of its own, with the
-   new TreeAMR version appended to its `[compat]` list ("Companion
-   interface" in [CODE.md](CODE.md#companion-interface)).
-7. **Tests.** A four-patch 2D annulus, uniform, periodic around the
-   ring, in `test/`: every ghost across a glue holds the value its donor
-   owns at the same physical point, to roundoff, for a field set of each
-   centering, the element centering included; the fill is bit-identical
-   across thread counts; and `mpi_workload.jl` gains the annulus, so that
-   one rank and three agree line for line.
-
-*Done when* the annulus test passes serially, threaded and at three
-ranks; a checkpoint of a multi-patch forest round-trips through
-TreeIOHDF5; and TreeWaveOLDG's scalar wave converges at the expected
-order on the annulus, with its discrete energy conserved across the
-glued faces.
-
-*Not in this milestone*, each refused with its reason: refinement across
-a glued face (oriented prolongation and restriction, the oriented
-interface restriction, 2:1 balance through the table); nonconforming or
-overlapping patches; `N` or `P` differing across a glue; and point
-interpolation across a glue.
+*Done when* TreeWaveOLDG's scalar wave converges at the expected order on
+the annulus, with its discrete energy conserved across the glued faces,
+and TreeAMR and TreeIOHDF5 are released with it.
