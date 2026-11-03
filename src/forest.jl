@@ -28,7 +28,7 @@ end
 # is several bricks glued at their faces (`Patches`): inside a patch the
 # arithmetic is the same, and only a step that leaves one consults the
 # glue table, so the common case pays one type test for it (CODE.md, "A
-# multi-patch forest" under "Open questions").
+# multi-patch forest" under "Domain and boundaries").
 #
 # Abstract-typed in the forest, as `comm` is, so that `Forest{D,T}` keeps
 # its two parameters and no signature downstream changes.

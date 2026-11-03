@@ -5,7 +5,9 @@ Julia. It provides the mesh, the storage, and the inter-grid operations —
 no physics.
 
 **Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13, M14, M15
-and M16 are done; next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+and M16 are done. M17, multi-patch forests on uniform meshes, is
+implemented and awaits its downstream acceptance and its release; next
+is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -231,6 +233,31 @@ tie-breaking. Consequences:
   centered sets are symmetric to rounding there). **(open)** Whether
   that half-open asymmetry at coarse-fine faces matters to an application
   is not settled; nothing has asked.
+- **Across a glued face** (M17, "A multi-patch forest" under
+  [Domain and boundaries](#domain-and-boundaries)) a reversed axis does
+  not keep half-open ownership in a vertex-like dimension, as a half
+  turn's flip of `d2` does not (*Half turns* under "Rotating seams" in
+  [Ghost filling](#ghost-filling)). A cell-like dimension's stored range
+  is symmetric, and reversed it maps owned points onto owned points. A
+  vertex-like one is not: a block owns its low plane and not its high
+  one. Reversed along a tangent of the face, a ghost region's last plane
+  reads the shared high plane of the block across, a ghost of that
+  block's own, written in the same phase (the `NaN`-prefill test shows
+  it read unfilled). Reversed along the normal, a high face glued to a
+  high face leaves the plane on the face to neither block. A low face
+  glued to a low face owns the plane on both sides, as a quarter turn's
+  seam does, and evolves both copies from same-level ghosts that are
+  each other's images. So `GhostSchedule` refuses a layout that holds a
+  reversed axis of a glue vertex-like, except the normal of a low face
+  glued to a low face, saying why. **(open)** Lifting it for tangents
+  would be M14's `seam_shift` generalised to a glue — the target's
+  partition one plane up along every reversed vertex-like tangent, so
+  that each region is the image of one real block's owned points — with
+  its cases for the hook's clamped regions and for symmetric walls; for
+  a high face glued to a high face it would need one block named owner
+  of the shared plane. Neither mesh M17 is for needs it: the annulus is
+  glued by the identity, and the cubed sphere's sets are element sets,
+  which store as cell-centered ones. Whether to lift it is Erik's call.
 
 **Stored layout.** Per dimension `d`, with `c_d = 1` for `:vertex` and
 `0` for `:cell`, a field set with ghost width `G_d` stores `N + 2G_d +
@@ -494,9 +521,10 @@ its operators move whole elements between levels.
   would keep an element set out of every `regrid!` and
   `adapt_to_initial_data!` call that passes a hook for its other sets.
 
-Nothing here obstructs the conforming multi-block forest: an element set
-couples across faces only, through what amounts to a mortar, which is
-how multi-block DG codes are built.
+An element set couples across faces only, through what amounts to a
+mortar, which is how multi-block DG codes are built, and why it is the
+one set a cubed sphere's patch corners leave fillable (see "A
+multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 
 ### Tree structure
 
@@ -504,7 +532,8 @@ The domain is a **forest**: a brick of `M_1 × ... × M_D` root blocks,
 each the root of an octree (a single root, all `M_i = 1`, is the
 simplest case). This admits non-cubic rectangular domains. Morton keys
 carry the root index; neighbor finding across root boundaries is
-arithmetic on the brick. Refinement is
+arithmetic on the brick. A forest may instead be several such bricks,
+**patches**, glued at their faces (M17, below). Refinement is
 **all-or-nothing**: a block is either a leaf or is fully refined into
 exactly `2^D` children of half the spacing.
 
@@ -539,6 +568,39 @@ direction. Under periodicity two blocks can additionally be adjacent in
 several directions at once (a single periodic root abuts both of its own
 faces). Ghost filling must therefore be formulated as each block asking
 for its own ghost sources — never as reversing a neighbor lookup.
+
+**Across a glued face** (M17, "A multi-patch forest" under
+[Domain and boundaries](#domain-and-boundaries)). A forest of patches
+numbers its roots flat and ascending, through patch 1, then patch 2, and
+so on, each patch's roots as a brick's are, so the curve, the leaf
+array, `check_leaves`' walk and the partition run over all of them
+unchanged, and `patch(forest, k)` is a `searchsortedlast` on the
+patches' first roots. `neighbor_anchor` takes one type test on the
+connectivity: a brick goes on through `stepped_node`, the seam's
+arithmetic and the periodic wrap exactly as before, and a forest of
+patches through `glued_anchor`. That takes the step in the patch's own
+level coordinates. A step that stays in the patch lands where it lands;
+one that leaves it through exactly one face, and that face is glued,
+crosses by the glue entry's affine map (`GlueEntry`: axis `a` there is
+axis `perm[a]` here, reversed where `flip[a]`, shifted by `offset[a]`
+roots, scaled to the level) and is checked against the bounds of the
+patch across, since a tangential component may leave that one too. A
+step out through an unglued face, or through two faces or more at once,
+finds nothing: the same "no neighbor" an outer face gives on a brick,
+so nothing downstream of the search meets a new case, and a **patch
+corner** — where three or more patches meet and no one block lies
+across — is told from an outer face where it matters, at schedule build
+("Glued faces" under [Ghost filling](#ghost-filling)). The search returns a
+`Crossing` with the keys, two `Int8`s: `turns`, a seam's quarter turns
+(the `r` of "Rotating seams"), and `glue`, the index of the glued face
+in the forest's table, 0 off a glue. An index, not the axis map,
+because two patches glued by the identity still differ from one brick:
+conformity holds across the glue. The callers that need the map look it
+up (`glue_axes`), and `real_direction` and `virtual_offset` have forms
+taking it, so the finer search across a glue and a restriction's child
+offset go through the virtual frame as across a seam. The asymmetry
+above holds across a glue as anywhere: each block asks for its own
+sources.
 
 ### Domain and boundaries
 
@@ -756,8 +818,152 @@ declared up front:
   either, `rotating_dims` and `halfturn_dims` give the keyword's pair or
   `nothing`, and `seam_keywords` both, as the keywords that rebuild the
   forest.
-- **Physical** (per face, neither periodic, reflecting, outflow nor a
-  rotating seam): ghost cells are filled by a user-supplied boundary
+- **A multi-patch forest** (M17): several root bricks, **patches**, glued
+  at their faces, for a domain no one brick covers — an annulus of four
+  patches around a ring, a cubed sphere of six. TreeWaveOLDG asked for
+  it, for the scalar wave on curvilinear multi-patch domains with
+  uniform meshes; it is the conforming multi-block forest that "The
+  multi-block check" under [Distributed meshes](#distributed-meshes)
+  watched for. It is declared by a second form of the constructor,
+
+      Forest(patches; N, glue, reflecting, outflow, leaves, comm)
+      Forest{T}(patches; …)
+
+  with `patches` a vector, or a nonempty tuple, of
+  `(roots = (…), extents = (…))`, each patch's extents defaulting to
+  `(0, roots[d])` as a brick's do, and `glue` a vector of
+  `(from = (p, d, side), to = (q, d′, side′), map = σ)`, side 1 for the
+  low face and 2 for the high one. `σ` is a signed permutation of the
+  axes in *scatter* form, `σ[e] = ±a` sending axis `e` of patch `p` to
+  axis `a` of patch `q`, reversed for a minus, as in `(2, −1, 3)`. Both
+  directions of every gluing are listed, and checked to be each other's
+  inverse, so that a step from either side finds its neighbor by the
+  same table. Without `T` the geometry type is promoted over every
+  patch's extents. The brick form `Forest(roots; …)` is what it was,
+  bit for bit. The shape is Erik's (the alternatives are in
+  [HISTORY.md](HISTORY.md#domain-and-boundaries)):
+  - *Bricks glued at faces.* Each patch has its own `roots` and its own
+    logical `extents`. Inside a patch neighbor finding stays a brick's
+    index arithmetic, and only a step that leaves a patch consults the
+    glue table (see "Across a glued face" under
+    [Tree structure](#tree-structure)), so the common case pays one type
+    test.
+  - *The coordinates stay logical.* The map from a patch's box to
+    physical space is the application's, with its Jacobian, its metric,
+    its physical CFL and its `√g`-weighted norms, which it forms through
+    `block_fold` ([Folds over points](#folds-over-points)), handing
+    `block_patches` to `map_blocks!` as an argument where a kernel needs
+    the patch; `volume_weighted_norm` keeps weighting by logical volume.
+    So patch extents need not be distinct, nor disjoint: a cubed
+    sphere's six patches may all be `[−1, 1]² × [r₀, r₁]`, their natural
+    box. Nothing in the package maps a coordinate back to a block except
+    point location, which refuses a forest of patches
+    ([Point interpolation](#point-interpolation)); everything else that
+    carries a position gets it from a block. So the patch reaches a
+    callback as a **number**: `patch(forest, k)` and `patch(forest,
+    root)`, and `block_patches(forest)`, one `Int32` per local block in
+    the shape of `block_origins` and `block_spacings`, all ones on a
+    brick, which `WithPatch` hands to the coordinate callbacks ("The
+    patch of a point" under
+    [Application interface](#application-interface-sketch)). The patches
+    still tile the domain, each logical point belonging to one patch's
+    mesh; overlapping patches in the overset sense are out of scope.
+    The cube check applies per patch, in logical space, and every patch
+    has the one cell size of each level (`root_spacing` reads patch 1's,
+    which is every patch's), so a glued face meets the face across it
+    cell for cell.
+  - *Uniform meshes only.* No coarse-fine face crosses a glued face
+    (**conformity at the glue**, as at a seam): `balance!` refines a
+    leaf across a glued face that is coarser by any amount, and
+    `isbalanced` and the checked `leaves` path enforce the same rule, the
+    latter with a message naming both faces. So the interface
+    restriction never crosses a glue, and `InterfaceSchedule` treats a
+    coarse-fine face across one as a bug. Edges and corners across a
+    glue keep ordinary 2:1 balance and may meet a difference of one
+    level; their transfers are prolongations and restrictions through
+    the axis map, which the virtual frame builds like any other.
+    Refinement across a glued face itself — oriented prolongation,
+    restriction and interface restriction there — is not in the design.
+  - *The seams stay as they are.* `rotating` and `halfturn` are not
+    re-expressed as glue entries: the connectivity is a second mechanism
+    beside them that reuses the same pieces, and a forest of patches
+    takes no seam. **(open)** Whether the seams collapse into the glue
+    table, now that both exist, is Erik's call; their own rules — the
+    shifted seam slab, `RotationPair`, a vertex-like set's two owned seam
+    planes — do not fall out of the table as built.
+
+  The forest refuses, each time saying why:
+
+  - `rotating` or `halfturn` with the patches form: one mechanism of
+    gluing faces at a time;
+  - any `true` in `periodic`, glue or not: a wrap is a patch glued to its
+    own opposite face, `(from = (p, d, 2), to = (p, d, 1), map =
+    (1, 2, …))` and its reverse, which the tests check against a
+    periodic brick;
+  - the `extents` keyword: a patch's extents are its own;
+  - patches that differ in cell size;
+  - a glued face pair whose root counts along the face disagree under
+    the map;
+  - a map that is not a tuple of integers, has the wrong length, is not
+    a signed permutation, or sends two axes onto one; and a map that
+    does not carry the face's normal onto the normal of the face across
+    with the sign that makes a step out of the one a step into the other
+    (`σ[d] = +d′` for a high face glued to a low one or a low face to a
+    high one, `−d′` for two low or two high faces);
+  - a reverse entry that is missing or not the inverse, and a face glued
+    twice;
+  - a glued face that is reflecting or outflow. The face kinds are per
+    `(dim, side)` and apply to the unglued faces of every patch at once,
+    so they cannot be set where some patch is glued;
+  - more than 127 patch faces, `2D × npatches` (21 patches in 3D, 31 in
+    2D; see the glue table below);
+  - and the shapes: an empty list, a patch that is not a named tuple of
+    `roots` and `extents`, roots of different lengths or not positive,
+    extents of the wrong shape, a face that is not three integers in
+    range.
+
+  There is no refusal of overlapping extents.
+
+  The forest holds the connectivity in a tenth field, `conn`,
+  abstract-typed (`Connectivity{D}`) as `comm` is, so that `Forest{D,T}`
+  keeps its two parameters and no signature downstream changes:
+  `OneBrick()`, a singleton, for a forest built from `roots`, and a
+  `Patches{D,T}` for one built from `patches`. It is immutable and
+  covered by the forest's digest, which is why it is a field and not
+  part of `ForestState`; what the field costs is under "The buffer
+  pool" in [Distributed meshes](#distributed-meshes). `Patches` holds
+  each patch's `roots` and `extents`, its first root (patch `p` owns the
+  flat roots `firstroot[p] .+ (0 : prod(roots[p]) − 1)`), the glue
+  table, and `corners`: whether some patch is glued along two different
+  dimensions, so that some step leaves it through two glued faces at
+  once. That is a property of the table alone, computed once at
+  construction, and the schedule's patch-corner refusal reads it. The
+  glue table is **dense**: one `GlueEntry` per patch face, at
+  `glue_slot(p, d, side, D)`, `patch = 0` for a face that is not glued,
+  holding the map in *gather* form — axis `a` across is axis `perm[a]`
+  here, reversed where `flip[a]`, offset by `offset[a]` roots — which is
+  the form `RotatedSource` reads a turned source by. Dense, so that a
+  step finds its face's entry by arithmetic, and so that the index is
+  canonical whatever order the caller listed the glue in: the same on
+  every rank, which `GroupKey` and so the message layouts rely on. The
+  price is the 127-face limit, since the index travels as an `Int8` in
+  `Crossing` and in `GroupKey`; lifting it means widening both. A cubed
+  sphere has 36 faces.
+
+  On a forest of patches `forest.roots` and `forest.extents` are patch
+  1's, and everything that needs a patch goes through the accessors
+  (`patch_roots`, `patch_extents`, `patch_firstroot`, `npatches`,
+  `nroots`, `ispatched`). `root_position(forest, root)` is the position
+  within the root's own patch; `root_index(forest, pos)` refuses on more
+  than one patch, where a position names a root in each of them, and
+  `root_index(forest, p, pos)` names the patch; `block_origin` reads its
+  block's patch. The digest's brick term covers the patches and the
+  glue table, and a brick's hashes as it did. `patch_keywords(forest)`
+  gives the arguments of the patches form back, the glue in its
+  canonical order, and `nothing` on a brick, as `seam_keywords` gives a
+  seam's; TreeIOHDF5 and the tests rebuild a forest through it.
+- **Physical** (per face, neither periodic, reflecting, outflow, a
+  rotating seam nor glued): ghost cells are filled by a user-supplied boundary
   condition hook. For a vertex-like dimension the domain's upper boundary plane
   is the first plane of an outward-facing region and is filled by the
   hook too, and under symmetric walls the owned lower one the last plane
@@ -982,9 +1188,9 @@ one pass over the transfers and the hook regions (`stage_groups`):
 - a level joins the group below it when it is the next level up on this
   rank, when it conflicts with no level of the group — no point one of
   them writes is read or written by the other — and when none of its
-  prolongations is rotated: a rotated window is in the virtual frame,
-  which the axis map turns into the real source's only at the launch,
-  and an odd orientation of a `RotationPair` reads the partner's array,
+  prolongations is rotated or across a glue: such a window is in the
+  virtual frame, which the axis map turns into the real source's only
+  at the launch, and an odd orientation of a `RotationPair` reads the partner's array,
   which a rank's boxes do not describe. Phase 1 is always alone, since
   the hook runs after it.
 
@@ -1515,6 +1721,97 @@ of the torus, and reflecting or outflow faces of `d2` or the high face
 of `d1` with it; they are refused, and open (see
 [Open questions](#open-questions)).
 
+**Glued faces** (M17; the forest is "A multi-patch forest" under
+[Domain and boundaries](#domain-and-boundaries)). A glued face is a seam
+in general position: the source of a ghost lies in another patch, at the
+same level across the face, which conformity keeps so, and possibly at
+another level across an edge or a corner, with its axes permuted and
+reversed by the glue's map. The machinery of the rotating seams serves
+it unchanged — the virtual frame, the stencils built there, the
+kernel's oriented read through `RotatedSource`, the phases and the MPI
+path, where the pack applies the axis map on the sender and the unpack
+is the plain copy it always is. What is new:
+
+- *The axis map comes from the table, and travels by value.* `GroupKey`
+  carries `glue`, an `Int8`: the slot in the forest's glue table of the
+  face the source lies across, 0 otherwise, ordered after `orientation`
+  in `keyorder`, so both ends of a message derive one layout. The slot
+  is canonical by construction — the table is dense and covered by the
+  digest — so nothing is deduplicated during the schedule build, which
+  would have obliged every rank to do it in the same order.
+  `TransferGroup` carries the axis map itself, `perm::NTuple{D,Int8}`,
+  `flip::NTuple{D,Bool}` and `turned::Bool`, computed on the host when
+  the group is built (`group_axes`): `axismap` of the orientation across
+  a seam, the glue entry's own map across a glue, the identity
+  otherwise. `rotated_source` reads them and `run_group!` dispatches on
+  `turned`, not on `orientation ≠ 0`: a glued group has orientation 0
+  and may still be turned, and one glued by the identity is not turned
+  and runs as an ordinary copy. `RotatedSource`'s type and the kernel
+  are unchanged, so the device path compiles what it compiled before.
+- *No variable map.* Across a glue an application that stores physical,
+  Cartesian components needs the identity: the ghost is a single-valued
+  field at a point both patches have a name for. So every field set over
+  a forest of patches has a one-column identity `rotvars`, the oriented
+  read takes column 1, and `factors` is the parity table if the forest
+  has reflecting faces and `nothing` otherwise; `factorcol` stays 0 for
+  a glued transfer that is not also mirrored. There is no per-interface
+  variable map, for an application that stores patch-local components:
+  across field sets whose ghost geometry differs — an element scheme's
+  gradient sets, `G = e_d` each — neither the field set nor a pair could
+  express one. The way around it is the application's: store Cartesian
+  components in one set with faces-only ghosts, and contract with the
+  Jacobian in the kernel.
+- *A patch corner is refused where it would be read.* A ghost region
+  beyond two glued faces at once has no one block across it, and the
+  search finds nothing there, which `block_sources!` would hand to the
+  hook as though it lay beyond an outer face. So `GhostSchedule` refuses
+  it, among its collective checks and before any search, from the
+  connectivity's `corners` flag and the layout (`check_patch_corners`):
+  for every patch glued at faces of two dimensions, a set whose target
+  range beyond both faces is nonempty. An element set never reaches one:
+  it is filled on faces only, and the faces-only filter removes every
+  edge and corner direction before the search. So on a cubed sphere an
+  element set fills and a cell- or vertex-centered set is refused,
+  except one whose ghost widths leave the corner region empty — a cell
+  set with `G = 0` along one of the two dimensions. A vertex-like
+  dimension with `G = 0` still has its shared high plane beyond a high
+  face, and is refused there. Patch corners for cell and vertex sets
+  are not in the design.
+- *The layout must survive the map* (`check_glue_layout`, also among
+  the collective checks). A turned source is read with the target's own
+  stored size and offsets through the axis map, so along axis `a` of the
+  patch across a layout must hold its points as along `perm[a]` here:
+  the same ghost width and the same centering, as `symmetric_layout`
+  asks of a set that turns into itself across a seam. Unlike a seam's,
+  a glue has no partner set for a layout that does not; it is refused,
+  saying why. And a reversed vertex-like axis is refused except as the
+  normal of a low face glued to a low face, because half-open ownership
+  does not survive the reversal (see "Across a glued face" under
+  [Centerings](#centerings)).
+- *Phase 1 stays race free*, by the seam's argument: a copy or a
+  restriction across a glue reads the real source's owned points nearest
+  the face, and the layout refusals above are what keep that true along
+  a reversed axis. A prolongation across a glue edge or corner reads its
+  coarse source's ghosts, filled in phase 1 or an earlier step of the
+  sweep. `stage_groups` lets no level with a prolongation across a glue
+  join a group, turned or not: conservative, since only edges and
+  corners can be coarse-fine across a glue, and correct for the seam's
+  reason.
+- *The hook sees outer faces only.* A glued face has a block across it
+  — `wall_direction` keeps the component of a step through it, and the
+  search finds the patch across — so its ghosts are transfers, and the
+  hook's regions are those beyond the unglued faces. The hook can be
+  handed the patch of its block ("The patch of a point" under
+  [Application interface](#application-interface-sketch)): the boundary
+  plan holds `block_patches`, uploaded at schedule build, so a hook does
+  no tree query per fill.
+
+`show` of a schedule says how many of its transfers are turned across a
+glue. The tests compare a brick cut into patches glued as it was, and
+patches laid out with their axes swapped and reversed, against the brick
+over every stored point, uniform and refined beside the glue (see
+[Tests](#tests)).
+
 Edge and corner ghost regions are always filled — some stencils don't
 need them, but filling unconditionally is simpler, and cross-derivative
 stencils do. Application kernels are strictly block-local: neighbor data
@@ -1523,14 +1820,15 @@ is visible only through ghost cells.
 Transfers are **batched by stencil**: everything sharing a kind, a
 direction, a child offset, a mirror state per dimension — none,
 mirrored rows, the vertex-like upper wall row, or clamped rows — and an
-orientation shares one set of one-dimensional stencils and so one
-kernel launch. The orientation joins `keyorder` as well, so both ends
-of an MPI message still derive one layout. A group carries its
-orientation and the seam's plane
-`(d1, d2)`, two `Int8`s and a pair of them, and `run_group!` derives the
-axis map at the launch, the identity for an ordinary group; `factorcol` is an `Int32`, so the three
-share the eight bytes it had alone and a group is no larger than
-it would be without them. Prolongations are
+orientation and a glued face shares one set of one-dimensional stencils
+and so one kernel launch. The orientation and the glue join `keyorder`
+as well, so both ends of an MPI message still derive one layout. A group
+carries its orientation, an `Int8`, and its axis map by value, computed
+when the group is built — the identity for an ordinary group — and
+`factorcol` is an `Int32`. The axis map takes `2D + 1` bytes, so a group
+is larger than it would be without it (160 bytes at `D = 3`); that does
+not matter, since a schedule holds groups by the hundred, not by the
+block, and a group never reaches a kernel whole. Prolongations are
 additionally batched by *target level*: the batch is
 the unit the phase-2 sweep
 schedules, so a batch spanning two levels would be filed under one of
@@ -2880,6 +3178,25 @@ stored index, and Gauss–Lobatto nodes need a basis that maps a position
 to its element's nodes and evaluates the element's polynomial
 (**(open)**, see [Open questions](#open-questions)).
 
+A forest of patches (M17) is refused by `PointGeometry`, which every
+path to point location builds — `locate_point`, `interpolate` serially,
+and `interpolate` across ranks, before anything is gathered, so that
+every rank refuses together. Its coordinates are logical, patch by
+patch, and the patches' boxes may overlap or coincide, so a position
+names no one point. A physical position does, through the
+application's maps, and locating one is a root-finding problem on those
+maps, which the forest does not carry ("A multi-patch forest" under
+[Domain and boundaries](#domain-and-boundaries)); the refusal says that
+a location handed the maps, or the patch of each point, would lift it.
+This is the only coordinate-to-block path in `src/`, and so the only
+thing disjoint patch extents would have served. **(open)** The refusal
+covers a forest of one patch built through the `patches` form as well
+— a self-glued wrap among them, whose wrap `PointGeometry` would not
+see — which is conservative: such a forest names one point by a
+position, and could be located once the wrap through its glue is
+folded. Whether to allow it is Erik's call; the brick form is
+unaffected.
+
 ### Folds over points
 
 `block_mapreduce` hands its `f` one value at a time. It never sees
@@ -3003,8 +3320,14 @@ Checkpoint and restart are the companion package
 [TreeIOHDF5](https://github.com/eschnett/TreeIOHDF5.jl) (since TreeAMR
 0.2); its `CODE.md` has the file format, the design over MPI and the
 reasons for both. What TreeAMR provides for it is the validated
-`leaves` path of `Forest` (a list that does not tile the brick, or is
-not balanced, is refused) and the [companion interface](#companion-interface).
+`leaves` path of `Forest` (a list that does not tile the brick or the
+patches, or is not balanced, or not conforming at a seam or a glued
+face, is refused) and the [companion interface](#companion-interface).
+A forest of patches (M17) is saved as the arguments of the patches
+form, which `patch_keywords` gives back, under a feature of its own,
+`patches`, in place of `brick`, so that a reader from before M17
+refuses such a file by the feature rather than misreading it; a brick's
+file is what it was, and the format version did not change.
 
 ## Application interface (sketch)
 
@@ -3122,6 +3445,51 @@ That is a narrow gap and it is documented rather than worked around:
 such a callback uses the per-variable form, which has no host call.
 Silently skipping the check instead would trade a named error for a
 wrong number of variables written into the storage.
+
+**The patch of a point** (M17). On a forest of patches a position does
+not say which patch it is in — the patches' logical boxes may overlap
+or coincide ("A multi-patch forest" under
+[Domain and boundaries](#domain-and-boundaries)) — so a coordinate
+callback that places a point through the application's map of each
+patch needs the patch. `WithPatch(f)` wraps a callback, as
+`AllVariables` does, and inserts the patch, an `Int`, right after the
+position of whatever form it wraps:
+
+    fill_by_coordinates!(WithPatch(f), fs)                # f(x, p, v)
+    fill_by_coordinates!(WithPatch(AllVariables(f)), fs)  # f(x, p) -> NTuple{nvars}
+    CellBoundary(WithPatch(g))                            # g(x, p, v, δ)
+    CellBoundary(WithPatch(AllVariables(g)))              # g(x, p, δ) -> NTuple{nvars}
+    boundary_by_coordinates(WithPatch(f))                 # f(x, p, v)
+    boundary_by_coordinates(WithPatch(AllVariables(f)))   # f(x, p)
+    adapt_to_initial_data!(fs, ops; initial = WithPatch(f), …)
+
+`boundary_by_coordinates` takes the fill's signature with the patch, as
+it does without, so that one callback serves the initial data and the
+boundary values. `WithPatch` goes outside, since it adds an argument to
+the form it wraps; nested the other way, `AllVariables(WithPatch(f))`,
+it is called as a callback, and says so, on the host, before any launch.
+It combines with `AllVariables` for the reason `AllVariables` exists: a
+curvilinear map evaluated per point is one more conversion that should
+not run `nvars` times. A wrapper and not a new signature, so that no
+current caller's moves; one field, so `isbits` whenever the callback is.
+Each form is a kernel of its own beside the plain one, which reads
+`p = patches[b]` from `block_patches` as it reads the origin and the
+spacing; the plain kernels and their launch sites are untouched, so no
+current caller compiles anything new. The all-variables forms check
+their tuple's length on the host as before, at the first owned point of
+block 1 with that block's patch. On a brick `p` is 1 everywhere.
+The relative hook does not take it: `CellBoundary(Relative(WithPatch(f)))`
+is refused, saying that the relative hook calls `f` by position alone.
+**(open)** Building it would be two more kernels, and nothing in M17
+asks for it; a cubed sphere's outer radial faces with a relative
+condition stated in physical coordinates would. Whether to build it is
+Erik's call.
+
+Two surfaces that carry a position do not get the patch. `block_fold`'s
+`FoldPoint` needs none for a `√g`-weighted norm: `map_blocks!` passes
+the caller's own arguments, so an application hands it `block_patches`,
+writes the weight into a variable once, and folds a plain product. The
+regrid criterion's `fires` is not exercised by a uniform forest.
 
 The region form of the boundary hook is untouched: `AllVariables` is
 about how many values a *cell-wise* callback returns, not about which
@@ -4570,6 +4938,20 @@ of a 2.5 ms fill on four H200s.
     and a seam check that read the forest inside `GhostSchedule`'s
     argument closure added 240 bytes, twice `sizeof(Forest{3,Float64})`,
     until it read the pair taken outside it.
+    The tenth field, the connectivity `conn` (M17, "A multi-patch
+    forest" under [Domain and boundaries](#domain-and-boundaries)), fits
+    in no padding: abstract-typed, it is a pointer, and
+    `sizeof(Forest{D,Float64})` grows from 88 to 96 bytes at `D = 2` and
+    from 120 to 128 at `D = 3`. It is a field all the same, and not part
+    of `ForestState`, because it is immutable and the digest must cover
+    it, while `ForestState` is the mutable box. Measured with
+    `bench/ghosts.jl` at one thread, where the schedule build's
+    allocation is deterministic (Apple M3, against the commit before
+    it), it adds 128 and 4864 bytes to the uniform and two-level builds
+    at `D = 3`, and 112 and 560 at `D = 2` — about what the 8-byte ninth
+    field had cost — and it was accepted. `Profile.Allocs` puts the
+    difference in the `Forest` copies that closures in the build box
+    (`collect_touching_leaves!`'s), an existing boxing, not a new one.
   - *What it hands out.* A *lease* of at least the length asked for, as
     an object of exactly that length over pooled memory, keyed by role
     (buffer or mirror), array type and backend type. A host vector — a
@@ -4954,40 +5336,44 @@ before it is built):
   levels below — which is the second, wider exchange that "The
   exchange: the sender computes" avoids.
 
-**The multi-block check** (the standing instruction). Nothing here obstructs a conforming multi-block forest. What building one would cost, and the shape decided for it, is under
-[Open questions](#open-questions).
+**The multi-block check** (the standing instruction). The conforming
+multi-block forest is built, on uniform meshes (M17, "A multi-patch
+forest" under [Domain and boundaries](#domain-and-boundaries)), and what
+let it in without a change here still holds; the check now watches for
+what M17 leaves out — refinement across a glued face, and patch corners
+for cell and vertex sets:
 
-- Ownership is by curve index, whatever the roots' connectivity.
+- Ownership is by curve index, whatever the roots' connectivity: a
+  forest of patches numbers its roots flat across the patches, so the
+  partition, `blockrange` and the curve walks did not change.
 - Candidate peers come from `neighbor_keys`, in `forest.jl`, which is
-  where a multi-block connectivity would live.
-- A remote transfer is still a stencil built in `schedule.jl` and
-  evaluated by the one kernel, so an oriented root face would change
-  only the stencils. The pack evaluates them, and the unpack is a copy
-  into a target box whatever the orientation.
+  where the connectivity lives (`glued_anchor`).
+- A remote transfer is still a stencil built in `schedule.jl`, in the
+  virtual frame, and evaluated by the one kernel: the pack reads the
+  source through the axis map, and the unpack is a copy into a target
+  box whatever the orientation, carrying a sign as it carries a parity.
+  The glue's index in `GroupKey` is canonical on every rank, so the
+  layouts agree without a message.
 - Face-resident quantities cross ranks through the interface
-  restriction's path.
+  restriction's path, which conformity keeps away from a glued face.
 - The checkpoint stores no partition.
 
-M12's rotating seam is a
-step toward a multi-block forest, not an obstacle to one: it removes
-the assumption that a source's axes line up with its target's. An
-oriented neighbor search, which returns the real leaves with the
-quarter turns that carry them to where the asking block sees them, and
-an axis-permuting source map in the kernel's load are the p4est
-orientation mechanism in miniature, for the one gluing of two root
-faces that a quadrant needs. It also corrects the third bullet above
-in one respect: an oriented face does not change the stencils, which
-are built in the virtual frame as for an aligned neighbor, but the
-source index map, a permutation and a flip per dimension. The unpack
-is still a copy into a target box whatever the orientation, carrying
-the sign as it carries a parity. The one new ownership rule, both seam
-planes of a vertex-like set owned, is about ownership only and assumes
-nothing about aligned axes; it is recorded as a choice under "Rotating
-seams" in [Ghost filling](#ghost-filling). Conformity at the seam is
-the seam's own rule and not something a multi-block forest inherits:
-there a glued face would be 2:1 balanced like any other, and the
-interface restriction would have to cross it with an orientation,
-which the seam avoids.
+M12's rotating seam was the step toward it: it removed the assumption
+that a source's axes line up with its target's. An oriented neighbor
+search, which returns the real leaves with how they are carried to
+where the asking block sees them, and an axis-permuting source map in
+the kernel's load are the p4est orientation mechanism, which M12 built
+in miniature for the one gluing of two root faces a quadrant needs, and
+M17 for any table of glued faces. An oriented face does not change the
+stencils, which are built in the virtual frame as for an aligned
+neighbor, but the source index map, a permutation and a flip per
+dimension. The one ownership rule a seam added, both seam planes of a
+vertex-like set owned, assumes nothing about aligned axes, and M17 uses
+it for a low face glued to a low face. Conformity, the seam's own rule,
+is M17's too, which is what keeps the interface restriction from having
+to cross a glued face with an orientation; refinement across a glued
+face would have to give it up, and build that oriented restriction, the
+oriented prolongation and 2:1 balance through the table.
 
 ## Code structure
 
@@ -4999,8 +5385,8 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 | threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
 | communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
-| tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter; neighbor finding (oriented across a rotating seam), `refine!`/`coarsen!`, `balance!` (conformity at the seam) |
-| geometry | `geometry.jl` | key + stored cell index → physical coordinates |
+| tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter + connectivity (one brick, or patches and their glue table, M17); neighbor finding (oriented across a rotating seam or a glued face), `refine!`/`coarsen!`, `balance!` (conformity at a seam and a glued face) |
+| geometry | `geometry.jl` | key + stored cell index → physical coordinates (logical, patch by patch, on a forest of patches); `block_origins`, `block_spacings` and `block_patches` |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest, and so do `parity`, `rotation` and their tables; `RotationPair` |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
@@ -5123,13 +5509,13 @@ The ideas that span several files and are easy to violate:
   transfer's stencils are built in the *virtual frame*, as if the
   source sat at its turned position (`virtual_offset`, `seam_offset`),
   so the stencil builders are unchanged; `GroupKey` carries the
-  orientation (last in `keyorder`) and `TransferGroup` the orientation
-  and the plane, and the kernel reads the source through the accessor
-  `RotatedSource` (`(src, perm, flip, len, vars, col)`: the axis map
-  from virtual to real stored index, a run-time `perm` read through
-  `tuplepick`, and the variable from `fs.rotvars`, `nvars × 4`), built
-  by `run_group!` only for `orientation ≠ 0` so an ordinary launch is
-  unchanged. The sign goes through `fs.factors`, grown to `3^D·4`
+  orientation (in `keyorder`) and `TransferGroup` the orientation and
+  the axis map by value (`perm`, `flip`, `turned`), and the kernel reads
+  the source through the accessor `RotatedSource` (`(src, perm, flip,
+  len, vars, col)`: the axis map from virtual to real stored index, a
+  run-time `perm` read through `tuplepick`, and the variable from
+  `fs.rotvars`, `nvars × 4`), built by `run_group!` only for a `turned`
+  group so an ordinary launch is unchanged. The sign goes through `fs.factors`, grown to `3^D·4`
   columns, column `mirror + 3^D·r` (`r = 0` is M10's table): a 90°
   turn of any Cartesian component is a signed permutation, so it is
   the permutation on the load and the sign on the target, and nothing
@@ -5143,6 +5529,24 @@ The ideas that span several files and are easy to violate:
   back and turns its value and gradient. A vertex-like set
   owns both seam planes (the same points under the turn) and evolves
   them at one level.
+- **Glued faces are oriented transfers too** (M17, "A multi-patch
+  forest" under "Domain and boundaries" and "Glued faces" under "Ghost
+  filling"). The connectivity is the `Forest`'s tenth field, `conn`,
+  `OneBrick()` or a `Patches` with a dense glue table, immutable and in
+  the digest. On a forest of patches `forest.roots` and
+  `forest.extents` are patch 1's: anything that needs a patch reads it
+  through `patch_roots`, `patch_extents` and `patch_firstroot`, and a
+  block's patch through `patch` or, in a kernel, `block_patches`.
+  `neighbor_anchor` dispatches to `glued_anchor` on the connectivity and
+  leaves `stepped_node`, the seam's arithmetic, alone; a step through two
+  glued faces at once finds nothing. `Crossing` carries the seam's turns
+  or the glue's slot, never both, and `GroupKey.glue` the slot, so
+  `keyorder` keeps the layouts agreed; the `TransferGroup` carries the
+  glue's axis map by value, and `turned`, not the orientation, decides
+  the kernel's form. Every set over a forest of patches has the identity
+  `rotvars`. `GhostSchedule` refuses a patch corner a set would read and
+  a layout the glue's map does not keep (`check_patch_corners`,
+  `check_glue_layout`), and conformity holds at every glued face.
 - **Neighbor finding is asymmetric across levels** (see "Neighbor
   asymmetry"). Ghost filling is formulated as each block asking for its own
   sources, never as reversing a neighbor lookup.
@@ -5248,7 +5652,8 @@ The ideas that span several files and are easy to violate:
   `allgather` of a
   `ForestDigest` (generation, `nleaves`, a fold of `hash(key, h)` over
   every leaf — not `hash(leaves)`, which samples a long vector — the
-  brick, a layout hash and a refusal flag), so a diverged forest, a
+  brick, or the patches and their glue table, a layout hash and a
+  refusal flag), so a diverged forest, a
   layout that differs, or an `ArgumentError` on some ranks is refused on
   all of them together. `fill_ghosts!`'s checks stay rank-local on
   purpose (a collective per fill would sit on the per-evaluation path);
@@ -5281,7 +5686,9 @@ The ideas that span several files and are easy to violate:
   memory. Do not add a field to `Forest`: put mutable state in
   `ForestState` (a ninth field made the schedule build allocate more;
   M12's `rotating` is one only because two `Int8`s fit in padding, and
-  `bench/ghosts.jl` measured it at zero bytes).
+  `bench/ghosts.jl` measured it at zero bytes; M17's `conn` is a tenth,
+  immutable and covered by the digest, which `ForestState` is not, and
+  its measured cost is under "The buffer pool").
   MPI is called from the calling task only, never in a threaded loop or
   kernel, and needs `THREAD_SERIALIZED`.
 - **Reductions are an allgather of per-rank partials**, folded in rank
@@ -5373,6 +5780,11 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   `layouthash` (`forest.jl`);
 - the rotating seam: `hasrotating`, `rotating_dims`, `ishalfturn`,
   `halfturn_dims` and `seam_keywords` (`forest.jl`);
+- the patches (M17): `patch_keywords` (`forest.jl`), the arguments of
+  the patches form of `Forest`, `(patches, glue)` with the glue in its
+  canonical order, or `nothing` for a brick. TreeIOHDF5 saves them
+  under its feature `patches` and rebuilds the forest through that form,
+  which validates them; it reads no field of the connectivity;
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
@@ -5380,7 +5792,9 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   each a `(lo, hi)` pair per dimension, in the shape of the `Forest`
   keywords;
 - the fields it reads: of a `Forest`, `N`, `roots`, `periodic`,
-  `extents`, `leaves` and `comm`; of a `FieldSet`,
+  `extents`, `leaves` and `comm` (`roots`, `periodic` and `extents` for
+  a brick only: on a forest of patches they are patch 1's, and
+  `patch_keywords` replaces them); of a `FieldSet`,
   `work`, `nvars`, `G`, `centering`, `P`, `walls`, `parity`, `rotation`,
   `halfturn` and `forest` (`walls` since AMR-8, `halfturn` since M14,
   `P` since M16: a checkpoint saves them, and a restart rebuilds the set
@@ -5402,7 +5816,7 @@ which companion releases go with it.
 `ghost_tests.jl`, `centering_tests.jl`, `element_tests.jl` (M16),
 `reflect_tests.jl` (M10),
 `outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14,
-which uses `rotate_tests.jl`'s helpers),
+which uses `rotate_tests.jl`'s helpers), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -5486,6 +5900,46 @@ order that differs on one rank only; `mpi_tests.jl` asserts the one
 stage, the conserved mass, the received prolongations and the refusal,
 and counts 24 changing regrids).
 
+`patch_tests.jl` holds the multi-patch forest's own tests (M17), each
+claim stated against a forest with no glue, as M12's are against the
+full plane. Every refusal of the patches form by its reason. A
+one-patch forest against the brick in `D = 1, 2, 3` — leaves after a
+refinement and balance, neighbors, walls, geometry, patches, roots — and
+a brick's digest against the formula from before M17. Neighbor finding
+across a glue against an independent continuous oracle (the
+`…_across` maps, which fold a point over a glued face, a cube edge
+included): a 1D loop with reversed glues, the 2D ring, a 2D pair with
+swapped and reversed axes, and a 3D cubed sphere whose glue is derived
+from the cube faces' frames, at one and two levels, keys, crossing slot
+and the virtual offsets of finer neighbors. A patch glued to its own
+opposite face is a periodic brick; conformity at the glue, by
+`balance!`, `isbalanced`, the checked `leaves` path and the interface
+schedule's bug check. The fill: a brick cut into patches glued as it
+was, every centering, uniform and refined beside the glue, equal to the
+brick over every stored point (`compare_matching_blocks`); cut at a
+patch corner, an element set and a cell set with `G = 0` along one of
+the two dimensions equal to the brick, every other layout refused;
+seven layouts laid out with swapped, reversed and cycled axes, every
+centering refused or filled with no undefined ghost and equal to the
+brick through the layout map (to 1e-14 where refined beside the glue,
+whose sums run in another order); the annulus, every 2D centering and
+the element one, each ghost what the patch across owns; the cubed
+sphere, every cell and vertex set refused and an element set exact.
+`WithPatch`: two patches on one logical box filled through it, so that
+they hold different data at the same position, in `D = 1, 2, 3`, equal
+to the brick through the layout; every boundary form handed each outer
+ghost its block's patch on the ring; on a brick the forms with and
+without it bit for bit; its refusals; and the refusal of point
+location, on a forest of one patch too. The M17 oracles are at the end
+of `ghost_oracles.jl` (below). Elsewhere: `exchange_tests.jl` fills the
+cubed sphere's element set, a swapped and reversed 2D pair refined at
+the glue, and a 3D cyclic layout over 2, 3 and 5 simulated ranks, bit
+for bit with the serial fill and with turned packs present; `rotate_tests.jl`
+and the seam oracles read the `Crossing`; `gpu_tests.jl` runs the four
+`WithPatch` kernels on every backend; `thread_workload.jl` and
+`mpi_workload.jl` have the annulus, the laid-out pair and the sphere
+(below).
+
 Seven helper files are not tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
@@ -5526,6 +5980,14 @@ Seven helper files are not tests:
   `halfturn_regrid_vs_doubled`, exact against the full plane where `d2`
   is cell-like and to the measured interpolation bound where it is
   vertex-like (see *Half turns*).
+  For M17, at the end: `fill_patch_arbitrary!` and
+  `patch_arbitrary_hook` (data and boundary values from `place(p, x)`, a
+  meaning given to a patch's exact positions apart from the glue table:
+  the brick's own position for a brick cut or laid out, by the exact
+  affine map), `compare_through_layout` (every written point against the
+  brick, through that map), `patch_ghost_mismatches` (each ghost against
+  what the donor owns where an independent `across` folds it) and
+  `undefined_patch_ghosts` (the `NaN`-prefill check).
 - `wave.jl` — the scalar wave equation as an application of the mesh
   (`WaveProblem`, `wave_rhs!`, `wave_errors`, `track_pulse`,
   `uniform_pulse`). It lives in the tests because the package has no physics.
@@ -5548,10 +6010,24 @@ Seven helper files are not tests:
   way, and keep everything it prints deterministic. Its cycles cover
   periodic and outer boxes, both centerings, reflecting walls (`…r`),
   rotating quadrants with a `RotationPair` fill (`…q`, M12), the
-  conservative Burgers cycle (`B…`) and element sets (`E…`, M16).
+  conservative Burgers cycle (`B…`), element sets (`E…`, M16) and
+  forests of patches (`P…`, M17): the annulus refined once in every 2D
+  centering, the wave evolved on the cell and vertex sets; a brick cut
+  in two with its second half's axes swapped and both reversed, refined
+  beside the glue so that both phases hold turned transfers; and the
+  cubed sphere's element set. Their data come through `WithPatch` from
+  one callable type, so the cases share their kernels, and
+  `thread_tests.jl` asserts their turned-transfer counts, so that a case
+  cannot silently stop crossing the glue.
 - `mpi_workload.jl` — the M7 counterpart, standalone too: the argument
   `mpi` makes its forests distributed over `MPI.COMM_WORLD`, and rank 0
-  prints the digests gathered in block order. `mpi_tests.jl` also runs
+  prints the digests gathered in block order. Its forests of patches
+  (M17, `patch_case`) are the annulus with 16 roots, so that blocks on
+  either side of a glued face have different owners, in every centering,
+  and the cubed sphere's element set, each filled and hooked through
+  `WithPatch`; a `#` line counts the transfers each rank receives across
+  a glue, and the refusals include a forest glued otherwise on one rank
+  only, which only the digest's glue term tells apart. `mpi_tests.jl` also runs
   it in process, in a module of its own, printing into the `IOBuffer`
   it defines as `WORKLOAD_IO`.
 - `mpi_jobs.jl` — the launcher of those `mpiexec` jobs
@@ -5933,83 +6409,35 @@ Remaining, none blocking before their milestone:
     systems do not need it.
   - `P` adaptivity is out of scope: `P` is the field set's, and `N` the
     forest's.
-- **A multi-patch forest** **(proposed)**. TreeWaveOLDG asks for the
-  scalar wave on a curvilinear multi-patch domain — an annulus, a cubed
-  sphere — with uniform meshes, which is the conforming multi-block
-  forest "The multi-block check" under
-  [Distributed meshes](#distributed-meshes) watches for. The milestone
-  is [PLAN.md](PLAN.md#m17--multi-patch-forests-uniform); the shape,
-  decided with Erik:
-  - *Bricks glued at faces.* The forest holds several root bricks —
-    **patches** — each with its own `roots` and its own logical
-    `extents`, and a **glue table** carrying a face of one patch onto a
-    face of another with a signed axis permutation. Inside a patch,
-    neighbor finding stays the index arithmetic of `neighbor_anchor`;
-    only a step that leaves a patch consults the table, so the common
-    case pays nothing. A cubed sphere is six or seven bricks. The
-    alternatives on record are a flat list of roots with a per-face
-    table, p4est's connectivity exactly, which makes every root-level
-    query a lookup and empties `root_position` and `root_index` of
-    meaning; and gluing the outer faces of one brick to each other,
-    which is the smallest change but forces every patch to the same
-    size and an awkward packing.
-  - *The coordinates stay logical.* The map from a patch's logical box
-    to physical space is the application's, with its Jacobian, its
-    metric, its physical CFL and its `√g`-weighted norms, which an
-    application forms through `block_fold`
-    ([Folds over points](#folds-over-points)); `volume_weighted_norm`
-    keeps weighting by logical volume. TreeAMR gains only `patch` and
-    `block_patches`, beside `block_spacings` and `block_origins`, so
-    that a kernel can tell which map a block is under, and the cube
-    check of [Domain and boundaries](#domain-and-boundaries) applies per
-    patch, in logical space, where it is free. A forest that carried the
-    maps would make `coordinates`, `fill_by_coordinates!`, the norms and
-    `interpolate` physical — convenient downstream, but it puts geometry
-    that is physics in the mesh layer, it has to be device-transportable,
-    and it turns `interpolate` into a root-finding problem.
-  - *Uniform meshes first.* No coarse-fine face may cross a glued face,
-    refused with a reason as the seam refuses nonconformity. That leaves
-    out oriented prolongation and restriction, the oriented interface
-    restriction, and 2:1 balance across the table — M12's hardest parts
-    generalised — none of which an application asks for yet.
-  - *The seams stay as they are.* `rotating` and `halfturn` are not
-    re-expressed as glue entries: the connectivity is a second mechanism
-    beside them that reuses the same pieces, and the seams' own rules —
-    conformity, the shifted seam slab, `RotationPair` — do not obviously
-    fall out of a general table. Whether they collapse into it is to be
-    judged from the finished code. A forest with both is refused for now.
-  - *What it reuses.* The kernel's oriented read is already general:
-    `RotatedSource` takes `perm`, `flip`, `len` and a variable column,
-    and only `axismap` is specialised to quarter turns in one plane.
-    `GroupKey` already carries an orientation, and the pack, the unpack,
-    the MPI path and the interface restriction all go through it. What is
-    new is in `forest.jl` — the patch list and the glue table, a field of
-    `Forest` and so part of its digest, `neighbor_anchor`,
-    `oriented_neighbors` returning a general axis map rather than a
-    number of quarter turns, `wall_direction` and the balance checks — in
-    `schedule.jl`, where the axis map comes from the table instead of
-    from `axismap`, and in TreeIOHDF5, which stores the new forest state
-    ([Companion interface](#companion-interface)).
-  - *An oriented transfer with no variable map.* An oriented group
-    demands `rotvars` today, because a quarter turn exchanges Cartesian
-    components. Across a patch glue an application that stores *physical*
-    components needs the identity instead: the ghost is a single-valued
-    physical field at a point both patches own a name for. So the
-    identity map must be allowed. An application that stores
-    *patch-local* components would need a signed permutation per
-    interface, across field sets whose ghost geometry differs — the
-    gradient sets of an element scheme, `G = e_d` each, are the example —
-    which neither the field set nor `RotationPair` can express; refused,
-    with the reason, until one asks. The way around it is the
-    application's: store Cartesian components in one set with faces-only
-    ghosts, and contract with the Jacobian in the kernel.
-  - *Why an element scheme is the first application.* An element set is
-    filled on faces only and its edge and corner ghosts are never written
-    or read (*The element centering* under [Centerings](#centerings)).
-    Patch edges and corners — where three or more patches of a cubed
-    sphere meet, and where a multi-patch ghost fill is hardest — are
-    therefore never reached, so the first multi-patch forest needs no
-    answer for them. A finite-difference application would.
-  - Out of scope: nonconforming or overlapping patches, whose interfaces
-    are donor interpolation rather than a copy, and `P` or `N` differing
-    across a glued face.
+- **What the multi-patch forest leaves open** (M17). The design is "A
+  multi-patch forest" under [Domain and boundaries](#domain-and-boundaries),
+  "Across a glued face" under [Tree structure](#tree-structure) and
+  [Centerings](#centerings), "Glued faces" under
+  [Ghost filling](#ghost-filling), "The patch of a point" under
+  [Application interface](#application-interface-sketch) and the
+  refusal under [Point interpolation](#point-interpolation); how it came
+  about is in [HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform).
+  Four decisions there are Erik's to make, each marked **(open)** where
+  it lives:
+  - a reversed vertex-like axis across a glue, refused except as the
+    normal of a low face glued to a low face, which lifting would need
+    M14's `seam_shift` generalised to a glue (Centerings);
+  - `CellBoundary(Relative(WithPatch(f)))`, refused rather than built
+    (Application interface);
+  - point location on a forest of one patch built through the `patches`
+    form, refused with every forest of patches (Point interpolation);
+  - whether the seams collapse into the glue table (Domain and
+    boundaries).
+
+  Not in M17, until an application asks: refinement across a glued face
+  (the oriented prolongation, restriction and interface restriction, and
+  2:1 balance through the table), which conformity keeps out; patch
+  corners for cell- and vertex-centered sets, which a finite-difference
+  code on a cubed sphere would need, and point interpolation on a forest
+  of patches, both refused with their reasons; a per-interface variable
+  map, for patch-local components; and the patch in `block_fold`'s
+  `FoldPoint` and in the regrid criterion.
+  Nonconforming or overlapping patches, whose interfaces are donor
+  interpolation rather than a copy, are out of scope. The glue table's
+  127 faces are a limit of the `Int8` that carries a face's index, not
+  of the design.
