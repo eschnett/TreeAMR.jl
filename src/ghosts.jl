@@ -180,17 +180,19 @@ end
 @inline kernelarg(a, dims) = a
 @inline kernelarg(p::PackedSlots, dims) = (buf=p.buf, offsets=p.offsets, dims=dims)
 
-# The real source of a rotated transfer (M12), as a kernel sees it.
+# The real source of a turned transfer — across a rotating seam (M12) or
+# a glued face (M17) — as a kernel sees it.
 #
-# A rotated transfer's stencils are built in the virtual frame, as though
-# its source sat where the target sees it across the seam; what is left
-# is to read the virtual source's points out of the real array, which
-# this accessor does in the load, beside the packed buffer's ("Rotating
-# seams" in CODE.md). `src` is the real working array — the set's own,
-# or for an odd orientation in a pair its partner's — `perm` and `flip`
-# the axis map of the orientation (see `axismap`), `len` the real array's
-# stored size, `vars` the field set's variable table and `col` the
-# orientation's column of it. Virtual stored index `k` reads the real
+# A turned transfer's stencils are built in the virtual frame, as though
+# its source sat where the target sees it across the seam or the glue;
+# what is left is to read the virtual source's points out of the real
+# array, which this accessor does in the load, beside the packed buffer's
+# ("Rotating seams" in CODE.md). `src` is the real working array — the
+# set's own, or for an odd orientation in a pair its partner's — `perm`
+# and `flip` the group's axis map (`axismap` of a seam's orientation, a
+# glue entry's own), `len` the real array's stored size, `vars` the field
+# set's variable table and `col` the orientation's column of it, the
+# first, the identity, across a glue. Virtual stored index `k` reads the real
 # point whose index along `e` is `k[perm[e]]`, or `len[e] + 1 − k[perm[e]]`
 # where `flip[e]`, and variable `vars[v, col]`. A `NamedTuple` of an
 # array, isbits tuples and an `Int32` table, so KernelAbstractions adapts
@@ -232,10 +234,12 @@ function axismap(r::Integer, (d1, d2)::NTuple{2,Integer}, ::Val{D}) where {D}
     return perm, flip
 end
 
-# The accessor of a rotated group's real source `src`.
+# The accessor of a turned group's real source `src`. The axis map was
+# computed when the group was built (`group_axes`); `perm` goes to the
+# kernel as `Int`s, which `tuplepick` compares against a dimension.
 function rotated_source(group::TransferGroup{T,D}, src, rotvars) where {T,D}
-    perm, flip = axismap(group.orientation, group.plane, Val(D))
-    return (src=src, perm=perm, flip=flip, len=ntuple(d -> size(src, d), Val(D)),
+    perm = ntuple(e -> Int(group.perm[e]), Val(D))
+    return (src=src, perm=perm, flip=group.flip, len=ntuple(d -> size(src, d), Val(D)),
             vars=rotvars, col=Int(group.orientation) + 1)
 end
 
@@ -398,11 +402,13 @@ end
 # a nest of parallel loops.
 #
 # `factors` is the field set's factor table, or `nothing`; only a
-# mirrored or rotated group reads it (see `scaled`). A rotated group
-# (M12) reads its real source through `rotated_source`, from `src` for an
-# even orientation and from `altsrc` for an odd one — the partner's
-# working array in a `RotationPair`, the set's own otherwise — with the
-# variable table `rotvars`; an ordinary group launches exactly as before.
+# mirrored or rotated group reads it (see `scaled`). A turned group —
+# rotated across a seam (M12), or across a glued face whose axis map is
+# not the identity (M17) — reads its real source through
+# `rotated_source`, from `src` for an even orientation and from `altsrc`
+# for an odd one — the partner's working array in a `RotationPair`, the
+# set's own otherwise — with the variable table `rotvars`; an ordinary
+# group, and one glued with the identity, launches exactly as before.
 # `flat` is the launch's form, flat on a device and shaped on the CPU
 # unless a test asks otherwise (see `launch_shape`).
 function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backend;
@@ -416,10 +422,10 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
         "a rotating seam, but the field set has no factor table to do it with. " *
         "Build the field set over the same forest as the schedule, with `parity` " *
         "or `rotation`."))
-    group.orientation == 0 || rotvars !== nothing || throw(ArgumentError(
-        "this schedule turns ghosts across a rotating seam, but the field set has " *
-        "no variable table to turn them with. Build the field set over the same " *
-        "forest as the schedule, with `rotation`."))
+    !group.turned || rotvars !== nothing || throw(ArgumentError(
+        "this schedule turns ghosts across a rotating seam or a glued face, but the " *
+        "field set has no variable table to turn them with. Build the field set over " *
+        "the same forest as the schedule, with `rotation` for a seam."))
     gfactors = group.factorcol == 0 ? nothing : factors
     blen = boxsize(group)
     prod(blen) == 0 && return nothing
@@ -471,7 +477,7 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # where a launch costs microseconds — while the CPU's shaped launch
     # stays type-stable and allocates no more than it did.
     extents = (blen..., Int(nvars), n)
-    if group.orientation != 0
+    if group.turned
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
         launch_transfer!(backend, flat, extents, single, kdest, rsrc, group.targetblocks,
                          group.sourceblocks, srcstarts, weights, singles, unit, tfirst,
@@ -1352,6 +1358,10 @@ schedules — each set's own — merged stage by stage, each set's phase 1,
 then both hooks, then each prolongation level of one set and of the
 other, so that a prolongation may read its partner's coarser ghosts.
 Its `boundary` is one hook for both sets, or a tuple of two.
+
+A glued face of a forest of patches (M17) needs nothing either: its
+ghosts are copies from the patch across, read through the glue's axis
+map, each variable onto itself.
 
 `boundary` is called once per ghost region facing outside the domain
 through an *outer* face — neither periodic nor reflecting — as

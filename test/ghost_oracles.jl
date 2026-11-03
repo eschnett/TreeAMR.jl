@@ -1890,3 +1890,155 @@ function halfturn_regrid_vs_doubled(::Val{D}; plane, other=:periodic, N=8, p=4,
     end
     return results
 end
+
+# --- M17: ghosts across glued faces -----------------------------------------------
+#
+# A forest of patches is checked against a meaning given to its points apart
+# from the glue table: `place(p, x)`, a function of a patch and an exact
+# position in its root units that names the same point wherever two patches
+# do. For a brick cut into patches it is the brick's own position, by the
+# exact affine map that laid the patch out; where the patches make no brick,
+# as on a ring or a cubed sphere, it is the patch and the position, and the
+# ghosts are compared with what the donor owns where an independent `across`
+# folds them — the continuous maps of `test/patch_tests.jl`.
+
+"""
+Fill every owned point of every block of `fs` with [`arbitrary_value`](@ref) of
+`place(p, x)`, `p` the block's patch and `x` the point's exact position there
+([`exact_point`](@ref)). Without `WithPatch` (M17 step 5) this is how two
+patches over one logical box are given different data.
+"""
+function fill_patch_arbitrary!(fs::FieldSet{T,D}, place) where {T,D}
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D))
+    for b in 1:nblocks(fs)
+        p = patch(fs.forest, blockkey(fs, b))
+        for v in 1:fs.nvars, idx in owned
+            fs.work[Tuple(idx)..., v, b] =
+                arbitrary_value(T, place(p, exact_point(fs, b, Tuple(idx))), v)
+        end
+    end
+    return fs
+end
+
+"""A boundary hook writing the same into every point of its region."""
+patch_arbitrary_hook(place) =
+    function (fs::FieldSet{T}, b, key, δ, region) where {T}
+        p = patch(fs.forest, key)
+        for idx in region, v in 1:fs.nvars
+            fs.work[Tuple(idx)..., v, b] =
+                arbitrary_value(T, place(p, exact_point(fs, b, Tuple(idx))), v)
+        end
+        return nothing
+    end
+
+"""
+Compare every stored point of every block of `fsp`, over a forest of patches
+laid out in a brick by `place`, with the point of `fsb`, over that brick,
+that `place` carries it to: in the brick's block at the same level whose box
+is the image of the patch block's, at the stored index of the image point.
+An element set's edge and corner ghosts, which are never written, are
+skipped. Returns `(worst, npoints)` as [`compare_matching_blocks`](@ref)
+does, or `nothing` if some block or point has no image there, which means
+the layout and the two forests disagree.
+"""
+function compare_through_layout(fsp::FieldSet{T,D}, fsb::FieldSet{T,D}, place) where {T,D}
+    index = Dict((level(blockkey(fsb, b)), leafbox(fsb.forest, blockkey(fsb, b))[1]) => b
+                 for b in 1:nblocks(fsb))
+    c = staggers(fsp)
+    worst = 0.0
+    npoints = 0
+    for b in 1:nblocks(fsp)
+        k = blockkey(fsp, b)
+        p = patch(fsp.forest, k)
+        lo, hi = leafbox(fsp.forest, k)
+        a, z = place(p, lo), place(p, hi)
+        bb = get(index, (level(k), min.(a, z)), nothing)
+        bb === nothing && return nothing
+        blo = leafbox(fsb.forest, blockkey(fsb, bb))[1]
+        n = fsp.forest.N * (1 << level(k))
+        for idx in CartesianIndices(size(fsp.work)[1:D])
+            fsp.P > 0 && count(d -> !(fsp.G[d] < idx[d] <= fsp.G[d] + fsp.forest.N),
+                               1:D) > 1 && continue
+            X = place(p, exact_point(fsp, b, Tuple(idx)))
+            jdx = ntuple(d -> (X[d] - blo[d]) * n + fsp.G[d] + (c[d] == 1 ? 1 : 1 // 2), D)
+            all(j -> isinteger(j), jdx) || return nothing
+            jdx = Int.(jdx)
+            checkbounds(Bool, fsb.work, jdx..., 1, bb) || return nothing
+            for v in 1:fsp.nvars
+                x, y = fsp.work[Tuple(idx)..., v, b], fsb.work[jdx..., v, bb]
+                worst = x == y ? worst : max(worst, Float64(abs(x - y)))
+                npoints += 1
+            end
+        end
+    end
+    return worst, npoints
+end
+
+"""
+Compare every ghost of `fs` over a forest of patches with what its donor owns
+at the same point, by the oracle `across(p, x, d, s)` of `test/patch_tests.jl`
+(the point of patch `p` at `x`, beyond its face `(d, s)`, as `(q, y)`, or
+`nothing` for a face that is not glued). A stored point that lies inside its
+own patch is compared with the block of that patch that owns it, one beyond
+a single glued face with the owner of its image, and one beyond an unglued
+face or several faces at once is the hook's and skipped. An element set's
+edge and corner ghosts are never written and are skipped too. Returns
+`(mismatches, seen)`, `seen` counting the points compared `:inside` and
+`:glued`.
+"""
+function patch_ghost_mismatches(fs::FieldSet{T,D}, across) where {T,D}
+    forest = fs.forest
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N), D))
+    owners = Dict{Tuple{Int,NTuple{D,Rational{Int}}},Vector{T}}()
+    for b in 1:nblocks(fs), idx in owned
+        p = patch(forest, blockkey(fs, b))
+        owners[(p, exact_point(fs, b, Tuple(idx)))] =
+            T[fs.work[Tuple(idx)..., v, b] for v in 1:fs.nvars]
+    end
+    mismatches = 0
+    seen = Dict(:inside => 0, :glued => 0)
+    for b in 1:nblocks(fs)
+        k = blockkey(fs, b)
+        p = patch(forest, k)
+        roots = TreeAMR.patch_roots(forest, p)
+        for idx in CartesianIndices(size(fs.work)[1:D])
+            idx in owned && continue
+            outside = count(d -> !(idx[d] in owned.indices[d]), 1:D)
+            fs.P > 0 && outside > 1 && continue
+            x = exact_point(fs, b, Tuple(idx))
+            exits = [(d, x[d] < 0 ? 1 : 2) for d in 1:D if !(0 <= x[d] < roots[d])]
+            length(exits) > 1 && continue
+            where_ = isempty(exits) ? (p, x) : across(p, x, only(exits)...)
+            where_ === nothing && continue
+            q, y = where_
+            value = get(owners, (q, Tuple(Rational{Int}.(y))), nothing)
+            ok = value !== nothing &&
+                 all(v -> fs.work[Tuple(idx)..., v, b] == value[v], 1:fs.nvars)
+            mismatches += !ok
+            seen[isempty(exits) ? :inside : :glued] += 1
+        end
+    end
+    return mismatches, seen
+end
+
+"""
+`NaN`-prefill `fs`, fill it with [`fill_patch_arbitrary!`](@ref), exchange
+once with the hook writing the same data, and count the stored values still
+`NaN` that a fill must write — every one, but an element set's edge and
+corner ghosts, which are never written. As for
+[`undefined_rotated_ghosts`](@ref), a ghost never written stays `NaN` and one
+written from an unwritten one becomes `NaN`. Returns `(nnan, schedule)`.
+"""
+function undefined_patch_ghosts(fs::FieldSet{T,D}, ops, place) where {T,D}
+    fill!(fs.work, T(NaN))
+    fill_patch_arbitrary!(fs, place)
+    schedule = GhostSchedule(fs, ops)
+    fill_ghosts!(fs, schedule; boundary=patch_arbitrary_hook(place))
+    owned = ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D)
+    nnan = 0
+    for b in 1:nblocks(fs), idx in CartesianIndices(size(fs.work)[1:D])
+        fs.P > 0 && count(d -> !(idx[d] in owned[d]), 1:D) > 1 && continue
+        nnan += count(v -> isnan(fs.work[Tuple(idx)..., v, b]), 1:fs.nvars)
+    end
+    return nnan, schedule
+end

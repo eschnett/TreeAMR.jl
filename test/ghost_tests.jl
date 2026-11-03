@@ -504,7 +504,7 @@ function weighted(g::TreeAMR.TransferGroup{T,D}) where {T,D}
                                              s.single),
                    g.stencils)
     return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
-                                      g.factorcol, g.orientation, g.plane)
+                                      g.factorcol, g.orientation, (g.perm, g.flip))
 end
 
 # Every value a copy could meet that an arithmetic shortcut could change:
@@ -525,7 +525,8 @@ function full_sum(g::TreeAMR.TransferGroup{T,D}) where {T,D}
                                              zero(s.single)),
                    g.stencils)
     return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
-                                      g.factorcol, g.orientation, g.plane, g.bounded)
+                                      g.factorcol, g.orientation, (g.perm, g.flip),
+                                      g.bounded)
 end
 
 @testset "The flat launch and the copy path fill bit for bit: D=$D" for D in (1, 2, 3)

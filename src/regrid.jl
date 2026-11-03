@@ -738,7 +738,8 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
                              split_regrid(pairs, oldrange, newrange)
     GRP = grouptype(backend, T, Val(D))
     locals = GRP[todevice(backend, TransferGroup{T,D}(key.kind, stencils(key), targets,
-                                                      sources, 0, 0, (0, 0), bounded(key)))
+                                                      sources, 0, 0, identity_axes(Val(D)),
+                                                      bounded(key)))
                  for (key, (targets, sources)) in local_]
     ST = stagetype(backend, T, Val(D))
     remote = serial ? nothing :

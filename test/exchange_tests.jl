@@ -1298,6 +1298,84 @@ halfturn_set(forest, (_, nvars, G, C, parity, map_), ::Type{T}=Float64) where {T
     @test nrot > 0
 end
 
+# M17: a forest of patches split between ranks. The sender computes, so a
+# transfer across a glued face is packed through the glue's axis map on the
+# rank that owns its source, from that rank's own glue table, and the two
+# ends lay a message out by keys that carry the glued face. A pack read
+# through the wrong map, or a layout that two faces' transfers share, would
+# misplace values that the serial fill puts right.
+
+# The forest of patches `serial` as rank `r` of `P` holds it, through the
+# validated `leaves` path.
+function rank_patch_forest(serial::Forest{D,T}, r, P) where {D,T}
+    kw = patch_keywords(serial)
+    return Forest{T}(kw.patches; N=serial.N, glue=kw.glue,
+                     reflecting=TreeAMR.reflecting_faces(serial),
+                     outflow=TreeAMR.outflow_faces(serial), leaves=serial.leaves,
+                     comm=PartitionCommunicator(r, P))
+end
+
+# The transfers turned across a glue that the ranks pack for each other.
+nturned_remote(scheds) =
+    sum(scheds) do sched
+        sum(st -> st.remote === nothing ? 0 :
+                  sum(g -> g.turned ? ntransfers(g) : 0, st.remote.packs; init=0),
+            sched.stages; init=0)
+    end
+
+const GLUED_CASES = [
+    ("cubed sphere, elements", cubed_sphere, elementcentered(3)),
+    ("2D swapped, both reversed, refined at the glue",
+     () -> patch_refine_one!(laid_out((4, 3), ((1, 2), (-2, -1)))...), cellcentered(2)),
+    ("3D cyclic, two reversed", () -> first(laid_out((4, 2, 3), ((1, 2, 3), (-2, 3, -1)))),
+     cellcentered(3))]
+
+@testset "Across a glued face the ranks fill as serially, bitwise: $name" for (name, make,
+                                                                               C) in
+                                                                              GLUED_CASES
+    # Over 2, 3 and 5 ranks the transfers of all ranks are the serial ones,
+    # both ends of every message derive one layout, every point is written
+    # once per stage, and every rank's working array, ghosts included,
+    # equals the serial fill on its blocks bit for bit, the hook between the
+    # stages included; and some of the messages are turned across a glue.
+    serial = make()
+    D = length(serial.roots)
+    sfs = patch_fieldset(serial, C; nvars=3)
+    ops = patch_ops(sfs)
+    hook = exchange_hook()
+    colons = ntuple(_ -> :, D + 1)
+    sched = GhostSchedule(sfs, ops)
+    stransfers = serial_transfers(sched)
+    stored = size(sfs.work)[1:D]
+    scounts = stage_write_counts([sched], stored, nleaves(serial))
+    data = exchange_data(MersenneTwister(23), Float64, size(sfs.work))
+    copyto!(sfs.work, data)
+    fill_ghosts!(sfs, sched; boundary=hook)
+    reference = Array(sfs.work)
+    nturned = 0
+    for P in (2, 3, 5)
+        sets = map(0:(P - 1)) do r
+            fs = patch_fieldset(rank_patch_forest(serial, r, P), C; nvars=3)
+            copyto!(fs.work, data[colons..., blockrange(fs.forest)])
+            fs
+        end
+        scheds = [GhostSchedule(fs, ops) for fs in sets]
+        locals, remote, unmatched, bad, nsent = distributed_transfers(scheds)
+        @test bad == 0
+        @test unmatched == 0
+        @test Set(locals) ∪ Set(remote) == stransfers
+        @test layout_mismatches(scheds)[1] == 0
+        @test stage_write_counts(scheds, stored, nleaves(serial)) == scounts
+        @test lockstep!(sets, scheds, CPU();
+                        between=r -> apply_boundary!(sets[r], hook, scheds[r], CPU())) == 0
+        @test all(r -> bitwise_equal(sets[r].work,
+                                     reference[colons..., blockrange(sets[r].forest)]),
+                  1:P)
+        nturned += nturned_remote(scheds)
+    end
+    @test nturned > 0
+end
+
 @testset "A serial schedule's stages are its phases, and send nothing" begin
     # The serial path must stay what it was: one stage per phase, the
     # phase's own groups, no messages and no buffers, so a serial fill

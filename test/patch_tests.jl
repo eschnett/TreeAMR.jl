@@ -1,6 +1,7 @@
 # M17: a forest of patches — several bricks of roots glued at their faces by
-# signed axis permutations. This file holds the forest (step 1) and the
-# neighbor search across the glue (step 2).
+# signed axis permutations. This file holds the forest (step 1), the
+# neighbor search across the glue (step 2), and the ghost fill across it
+# (step 3).
 #
 # Every claim about where a step lands is stated against a continuous map
 # written out independently of the glue table: by hand for the small
@@ -33,6 +34,11 @@ patch_ring(n, roots; kw...) =
            glue=reduce(vcat, [patch_glue_both((p, 1, 2), (mod1(p + 1, n), 1, 1),
                                               ntuple(identity, length(roots)))
                               for p in 1:n]), kw...)
+
+# The ring of four patches of `(2, 1)` roots, by hand: a point beyond the
+# high face of dimension 1 is in the next patch, two roots back.
+patch_ring_across(p, x, d, s) =
+    d == 1 ? (mod1(p + (s == 2 ? 1 : -1), 4), (x[1] + (s == 2 ? -2 : 2), x[2])) : nothing
 
 # Two 2D patches glued at two faces, with their axes swapped and one of them
 # reversed: the high face of dimension 1 of patch 1 onto the low face of
@@ -416,9 +422,7 @@ end
                                                                                    make,
                                                                                    across) in
     (("1D loop", patch_loop, patch_loop_across),
-     ("2D ring", () -> patch_ring(4, (2, 1)), (p, x, d, s) ->
-         d == 1 ? (mod1(p + (s == 2 ? 1 : -1), 4), (x[1] + (s == 2 ? -2 : 2), x[2])) :
-         nothing),
+     ("2D ring", () -> patch_ring(4, (2, 1)), patch_ring_across),
      ("2D swapped and reversed", patch_pair, patch_pair_across),
      ("3D cubed sphere", cubed_sphere, cubed_sphere_across))
     # The neighbor search must carry a step out of a patch onto the node
@@ -500,4 +504,334 @@ end
     @test isbalanced(ring)
     @test nleaves(ring) == 8 + 3 + 3
     @test all(k -> level(k) == (k.root in (1, 2) ? 1 : 0), ring.leaves)
+end
+
+# --- The ghost fill across the glue (step 3) ----------------------------------
+
+const PATCH_OPS = Operators(prolongation=2, restriction=2)
+const PATCH_ELEMENT_OPS = Operators(family=ElementLocal)
+
+# A field set of `centering` over `forest` with one ghost layer, of order
+# `P = 1` if it is an element set, and the operators that fill it.
+patch_fieldset(forest, centering; nvars=2, G=1) =
+    FieldSet(forest, nvars; G=G, centering=centering,
+             P=first(centering) === :element ? 1 : nothing)
+patch_ops(fs) = fs.P > 0 ? PATCH_ELEMENT_OPS : PATCH_OPS
+
+# Every centering of one kind per dimension, and the element one.
+patch_centerings(::Val{D}) where {D} = [vec(allcenterings(Val(D))); [elementcentered(D)]]
+
+# A brick of `roots` cut at the root planes `cuts[d]` along each dimension
+# `d` into patches glued face to face with the identity, each over the
+# brick's own extents there, so that its blocks lie where the brick's do,
+# and `place` the exact map from a patch's root units to the brick's. Cut
+# along two dimensions, every patch has a patch corner.
+function brick_cut(roots::NTuple{D,Int}, cuts; N=4) where {D}
+    bounds = ntuple(d -> [0; collect(d <= length(cuts) ? cuts[d] : ()); roots[d]], D)
+    shape = map(b -> length(b) - 1, bounds)
+    cells = vec(CartesianIndices(shape))
+    number(I) = LinearIndices(shape)[I]
+    patches = [(roots=ntuple(d -> bounds[d][I[d] + 1] - bounds[d][I[d]], D),
+                extents=ntuple(d -> (Float64(bounds[d][I[d]]),
+                                     Float64(bounds[d][I[d] + 1])), D))
+               for I in cells]
+    glue = []
+    for I in cells, d in 1:D
+        I[d] < shape[d] || continue
+        J = I + CartesianIndex(ntuple(e -> e == d ? 1 : 0, D))
+        append!(glue, patch_glue_both((number(I), d, 2), (number(J), d, 1),
+                                      ntuple(identity, D)))
+    end
+    lows = [ntuple(d -> bounds[d][I[d]], D) for I in cells]
+    place(p, x) = x .+ lows[p]
+    return Forest(patches; N=N, glue=glue), place
+end
+
+# A brick of `roots` cut at `cut` along dimension 1 into two patches whose
+# axes are laid out by the signed permutations `σs`: axis `a` of patch `p`
+# is the brick's axis `|σs[p][a]|`, reversed where it is negative. The glue
+# of the cut follows from the two layouts; `place` is the exact affine map
+# from a patch's root units to the brick's, written out from the layouts
+# alone.
+function laid_out(roots::NTuple{D,Int}, σs; cut=2, N=4) where {D}
+    zero = ntuple(_ -> 0, D)
+    boxes = [(zero, Base.setindex(roots, cut, 1)), (Base.setindex(zero, cut, 1), roots)]
+    brickaxis(σ, b) = findfirst(a -> abs(σ[a]) == b, 1:D)::Int
+    patchroots = [ntuple(a -> hi[abs(σ[a])] - lo[abs(σ[a])], D)
+                  for ((lo, hi), σ) in zip(boxes, σs)]
+    function place(p, x)
+        local (lo, hi), τ = boxes[p], σs[p]
+        return ntuple(D) do b
+            a = brickaxis(τ, b)
+            return τ[a] > 0 ? lo[b] + x[a] : hi[b] - x[a]
+        end
+    end
+    # The cut is a high face of patch 1 where its axis runs along the brick's
+    # and a low face of patch 2 where its does; a step along axis `e` of
+    # patch 1 is a step along its brick axis, and so along that axis' image
+    # in patch 2.
+    a1, a2 = brickaxis(σs[1], 1), brickaxis(σs[2], 1)
+    from = (1, a1, σs[1][a1] > 0 ? 2 : 1)
+    to = (2, a2, σs[2][a2] > 0 ? 1 : 2)
+    gluemap = ntuple(D) do e
+        a = brickaxis(σs[2], abs(σs[1][e]))
+        return sign(σs[1][e]) * sign(σs[2][a]) * a
+    end
+    forest = Forest([(roots=r,) for r in patchroots]; N=N,
+                    glue=patch_glue_both(from, to, gluemap))
+    return forest, place
+end
+
+# The brick's leaves that are the images of a forest of patches' under
+# `place`, in curve order.
+function laid_out_leaves(forest, place, roots)
+    keys = map(forest.leaves) do k
+        lo, hi = patch_leafbox(forest, k)
+        p = patch(forest, k)
+        a, b = place(p, lo), place(p, hi)
+        return box_key(roots, (min.(a, b), max.(a, b)))
+    end
+    return sort!(keys)
+end
+
+# Refine the leaf of patch 2 at the cut, `x = 2` in the brick, lowest in the
+# brick's other dimensions, and balance: the leaf across the glue is refined
+# with it, and the glue has coarse-fine edges beside them.
+function patch_refine_one!(forest, place)
+    images = map(forest.leaves) do k
+        lo, hi = patch_leafbox(forest, k)
+        p = patch(forest, k)
+        return min.(place(p, lo), place(p, hi))
+    end
+    atcut = filter(i -> patch(forest, forest.leaves[i]) == 2 && images[i][1] == 2,
+                   eachindex(images))
+    refine!(forest, forest.leaves[argmin(i -> reverse(images[i]), atcut)])
+    balance!(forest)
+    return forest
+end
+
+@testset "A brick cut into patches glued as it was fills as the brick: D=$D" for D in (1, 2,
+                                                                                       3)
+    # A glued face with the identity map is the brick's own face under
+    # another name: every stored point of every block, ghosts included, must
+    # come back bit for bit as the brick's, for every centering, refined
+    # beside the glue too, so that the edges across it are coarse-fine. A
+    # wrong source, a wrong offset, a glued transfer missing or turned when
+    # it should not be all show.
+    roots = ntuple(d -> d == 1 ? 4 : 2, D)
+    f = makepoly(D, 2)
+    for refined in (false, true), C in patch_centerings(Val(D))
+        refined && first(C) === :element && continue
+        patched, place = brick_cut(roots, ((2,),))
+        refined && patch_refine_one!(patched, place)
+        brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
+        fsp, fsb = patch_fieldset(patched, C), patch_fieldset(brick, C)
+        for fs in (fsp, fsb)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, patch_ops(fs));
+                         boundary=boundary_by_coordinates(f))
+        end
+        result = compare_matching_blocks(fsp, fsb)
+        @test result !== nothing
+        result === nothing && continue
+        worst, npoints = result
+        @test worst == 0
+        @test npoints == length(fsp.work)
+    end
+end
+
+@testset "Cut at a patch corner, an element set fills as the brick: D=$D" for D in (2, 3)
+    # Cut along two dimensions, every patch has a patch corner. An element
+    # set is filled on faces only and never reaches one, so it must come
+    # back as the brick's; so must a set whose ghost widths leave the corner
+    # region empty. Any other is refused at schedule build, with its reason,
+    # rather than handed to the boundary hook as though the corner were an
+    # outer face.
+    roots = ntuple(d -> d == 1 ? 4 : 2, D)
+    patched, place = brick_cut(roots, ((2,), (1,)))
+    @test patched.conn.corners
+    brick = Forest(roots; N=4)
+    f = makepoly(D, 2)
+    # No ghosts along dimension 1 takes the conservative family's order 1.
+    cons1 = Operators(prolongation=1, restriction=2, family=Conservative)
+    for (C, G, ops) in ((elementcentered(D), 1, PATCH_ELEMENT_OPS),
+                        (cellcentered(D), ntuple(d -> Int(d != 1), D), cons1))
+        fsp, fsb = patch_fieldset(patched, C; G=G), patch_fieldset(brick, C; G=G)
+        for fs in (fsp, fsb)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+        end
+        result = compare_matching_blocks(fsp, fsb)
+        @test result !== nothing && result[1] == 0
+    end
+    for C in allcenterings(Val(D))
+        @test_throws "a patch corner" GhostSchedule(patch_fieldset(patched, C), PATCH_OPS)
+    end
+    # The low side of a vertex-like dimension with no ghosts has no region,
+    # but its high side has the shared plane.
+    vertex = ntuple(d -> d == 1 ? :vertex : :cell, D)
+    @test_throws "a patch corner" GhostSchedule(
+        patch_fieldset(patched, vertex; G=ntuple(d -> Int(d != 1), D)), PATCH_OPS)
+end
+
+# The layouts of the test below: a name, the brick, the two patches' axes, the
+# brick axes the glue reverses, and whether the reversal of the normal is a
+# low face glued to a low face, which a vertex-like normal allows.
+const PATCH_LAYOUTS = [
+    ("2D swapped", (4, 3), ((1, 2), (2, 1)), (), false),
+    ("2D low face to low face", (4, 3), ((-1, 2), (1, 2)), (1,), true),
+    ("2D the tangent reversed", (4, 3), ((1, 2), (1, -2)), (2,), false),
+    ("2D swapped, the tangent reversed", (4, 3), ((1, 2), (-2, 1)), (2,), false),
+    ("2D high face to high face", (4, 3), ((1, 2), (-1, 2)), (1,), false),
+    ("2D swapped, both reversed", (4, 3), ((1, 2), (-2, -1)), (1, 2), false),
+    ("3D cyclic", (4, 2, 3), ((1, 2, 3), (2, 3, 1)), (), false),
+    ("3D cyclic, two reversed", (4, 2, 3), ((1, 2, 3), (-2, 3, -1)), (1, 2), false)]
+
+@testset "Patches with swapped and reversed axes fill as the brick: $name" for (name, roots,
+                                                                                σs, reversed,
+                                                                                lowlow) in
+                                                                               PATCH_LAYOUTS
+    # The end-to-end test of the axis map: a brick cut in two, the second
+    # half laid out with its axes permuted and reversed, glued back. Filled
+    # with data that is a function of the brick's point alone, every stored
+    # point must be the brick's at the point the layout map carries it to,
+    # bit for bit, and no `NaN` may reach a ghost the fill writes. Refined
+    # beside the glue, the turned prolongations and restrictions across its
+    # edges must agree with the brick's to rounding (their sums run in the
+    # patch's order of dimensions). A layout the axis map does not keep, and
+    # a vertex-like dimension the glue reverses, are refused with their
+    # reasons: the first would read with the wrong ghost widths, the second
+    # a plane the block across does not own.
+    D = length(roots)
+    swapped = any(σ -> map(abs, σ) != ntuple(identity, D), σs)
+    for refined in (false, true), C in patch_centerings(Val(D))
+        refined && C != cellcentered(D) && continue
+        patched, place = laid_out(roots, σs)
+        refined && patch_refine_one!(patched, place)
+        fsp = patch_fieldset(patched, C)
+        if swapped && !all(==(C[1]), C)
+            @test_throws "hold their points alike" GhostSchedule(fsp, patch_ops(fsp))
+            continue
+        end
+        if any(b -> C[b] === :vertex && !(b == 1 && lowlow), reversed)
+            @test_throws "vertex-like" GhostSchedule(fsp, patch_ops(fsp))
+            continue
+        end
+        brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
+        fsb = patch_fieldset(brick, C)
+        nnan, schedule = undefined_patch_ghosts(fsp, patch_ops(fsp), place)
+        @test nnan == 0
+        @test occursin("turned across a glue", sprint(show, schedule))
+        fill_patch_arbitrary!(fsb, (p, x) -> x)
+        fill_ghosts!(fsb, GhostSchedule(fsb, patch_ops(fsb));
+                     boundary=patch_arbitrary_hook((p, x) -> x))
+        result = compare_through_layout(fsp, fsb, place)
+        @test result !== nothing
+        result === nothing && continue
+        worst, npoints = result
+        @test refined ? worst < 1e-14 : worst == 0
+        @test npoints > 0
+        refined && @test any(g -> g.turned, Iterators.flatten(schedule.phase2))
+    end
+end
+
+const PATCH_CENTERINGS_2D = patch_centerings(Val(2))
+@testset "The annulus fills every ghost across its glue from the patch across: $C" for C in
+                                                                                         PATCH_CENTERINGS_2D
+    # The milestone's acceptance mesh: a ring of patches over one logical box
+    # each, glued end to end, with no patch corner, so every centering runs.
+    # Given different data on every patch, every ghost across a glued face
+    # must hold what the donor the ring's own map names owns at that point,
+    # every ghost inside a patch what its neighbor owns, and no `NaN` may
+    # reach a ghost the fill writes. The glue is the identity, so its
+    # transfers are ordinary copies, turned by nothing.
+    forest = patch_ring(4, (2, 1))
+    patch_refine_all!(forest)
+    fs = patch_fieldset(forest, C)
+    nnan, schedule = undefined_patch_ghosts(fs, patch_ops(fs), (p, x) -> (p, x))
+    @test nnan == 0
+    mismatches, seen = patch_ghost_mismatches(fs, patch_ring_across)
+    @test mismatches == 0
+    @test seen[:glued] > 0 && seen[:inside] > 0
+    @test !occursin("turned", sprint(show, schedule))
+    @test fs.rotvars == reshape(Int32[1, 2], :, 1)
+end
+
+@testset "A cubed sphere refuses its patch corners and fills an element set exactly" begin
+    # Six patches over one logical box each, glued along both tangential
+    # dimensions with swapped and reversed axes: a block in the corner of a
+    # face has a ghost region beyond two glued faces at once, which a cell-
+    # or vertex-centered set would read and the fill cannot fill, so its
+    # schedule is refused with the reason. An element set is filled on faces
+    # only, and must build its schedule, exchange, and hold in every face
+    # ghost what the face across owns at the point the cube's own geometry
+    # folds it onto, with no `NaN` left in a ghost the fill writes.
+    for refine in (false, true)
+        sphere = cubed_sphere()
+        refine && patch_refine_all!(sphere)
+        @test sphere.conn.corners
+        for C in allcenterings(Val(3))
+            @test_throws "a patch corner" GhostSchedule(patch_fieldset(sphere, C),
+                                                        PATCH_OPS)
+        end
+        fs = patch_fieldset(sphere, elementcentered(3))
+        nnan, schedule = undefined_patch_ghosts(fs, PATCH_ELEMENT_OPS, (p, x) -> (p, x))
+        @test nnan == 0
+        mismatches, seen = patch_ghost_mismatches(fs, cubed_sphere_across)
+        @test mismatches == 0
+        @test seen[:glued] > 0
+        @test occursin("turned across a glue", sprint(show, schedule))
+        @test isempty(schedule.phase2)
+    end
+    # So on the 2D pair with swapped and reversed axes, whose first patch is
+    # glued along both dimensions.
+    pair = patch_pair()
+    @test_throws "a patch corner" GhostSchedule(patch_fieldset(pair, cellcentered(2)),
+                                                PATCH_OPS)
+    fs = patch_fieldset(pair, elementcentered(2))
+    nnan, _ = undefined_patch_ghosts(fs, PATCH_ELEMENT_OPS, (p, x) -> (p, x))
+    @test nnan == 0
+    mismatches, seen = patch_ghost_mismatches(fs, patch_pair_across)
+    @test mismatches == 0 && seen[:glued] > 0
+end
+
+@testset "A glue refuses a layout its axis map does not carry, with the reason" begin
+    # A turned ghost is read with the target block's own layout through the
+    # axis map, so a dimension glued onto another must hold its points as
+    # that one does, and a vertex-like dimension may not be reversed, except
+    # the normal of a low face glued to a low face: the error says which, and
+    # why, rather than the fill reading the wrong points.
+    swapped, _ = laid_out((4, 3), ((1, 2), (2, 1)))
+    @test_throws "hold their points alike" GhostSchedule(
+        patch_fieldset(swapped, cellcentered(2); G=(1, 2)), PATCH_OPS)
+    @test_throws "hold their points alike" GhostSchedule(
+        patch_fieldset(swapped, (:cell, :vertex)), PATCH_OPS)
+    tangent, _ = laid_out((4, 3), ((1, 2), (1, -2)))
+    @test_throws "with axis 2 of patch 1 reversed" GhostSchedule(
+        patch_fieldset(tangent, vertexcentered(2)), PATCH_OPS)
+    highhigh, _ = laid_out((4, 3), ((1, 2), (-1, 2)))
+    @test_throws "a high face to a high face" GhostSchedule(
+        patch_fieldset(highhigh, (:vertex, :cell)), PATCH_OPS)
+    # What is not refused: the same with the reversed dimension cell-like,
+    # and a low face glued to a low face, vertex-like along its normal.
+    @test GhostSchedule(patch_fieldset(tangent, (:vertex, :cell)), PATCH_OPS) isa
+          GhostSchedule
+    @test GhostSchedule(patch_fieldset(highhigh, (:cell, :vertex)), PATCH_OPS) isa
+          GhostSchedule
+    lowlow, _ = laid_out((4, 3), ((-1, 2), (1, 2)))
+    @test GhostSchedule(patch_fieldset(lowlow, vertexcentered(2)), PATCH_OPS) isa
+          GhostSchedule
+end
+
+@testset "Groups across different glued faces are told apart, in one order" begin
+    # Two ranks lay a message out by sorting its transfers' keys, so a key
+    # must carry the glued face its source lies across — the axis map the
+    # kernel reads by — and order by it, or two faces' transfers would share
+    # one group, or two ranks disagree on where a transfer's slot is.
+    z = (Int8(0), Int8(0))
+    key(g) = TreeAMR.GroupKey{2}(:copy, (1, 0), (0, 0), 0, z, Int8(0), Int8(g),
+                                 (false, false), z)
+    @test key(1) != key(2)
+    @test isless(key(1), key(2)) && !isless(key(2), key(1))
+    @test isless(key(0), key(1))
 end

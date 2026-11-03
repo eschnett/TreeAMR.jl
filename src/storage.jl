@@ -396,7 +396,10 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # The variable a rotated transfer reads for each target variable,
     # `rotvars[v, r + 1]` (M12; see `seamtables`), as `Int32` on the
     # storage's backend; `nothing` over a forest without a seam. Over a
-    # half-turn forest only `r = 2` is read (M14).
+    # half-turn forest only `r = 2` is read (M14). Over a forest of patches
+    # (M17) it is the one column of the identity: a glued face turns where
+    # a ghost is read from but not the variables, so a turned transfer
+    # across it reads `col = 1` through the same kernel path as a seam's.
     const rotvars::Union{Nothing,AbstractMatrix{Int32}}
     # Replaced wholesale by regridding, which compacts the block slots
     # into a freshly sized array. Mutable so that references an
@@ -444,6 +447,11 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                 (rotations, rotations, rotations) : nothing
         f, v = seamtables(T, parities, steps, Int(nvars), Val(D))
         todevice(backend, f), todevice(backend, v)
+    elseif ispatched(forest)
+        # A glued face carries each variable onto itself (M17).
+        f = hasreflecting(forest) ? todevice(backend, parityfactors(T, parities, Val(D))) :
+            nothing
+        f, todevice(backend, reshape(collect(Int32(1):Int32(nvars)), Int(nvars), 1))
     elseif hasreflecting(forest)
         todevice(backend, parityfactors(T, parities, Val(D))), nothing
     else
