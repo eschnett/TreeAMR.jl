@@ -89,6 +89,11 @@ end
 @inline glue_slot(p::Integer, d::Integer, side::Integer, D::Integer) =
     ((Int(p) - 1) * D + (Int(d) - 1)) * 2 + Int(side)
 
+# The face `(patch, dim, side)` of the entry at `slot`, the inverse of
+# `glue_slot`, for a refusal that names the face a step crossed.
+@inline glue_face(slot::Integer, D::Integer) =
+    (fld(Int(slot) - 1, 2D) + 1, mod(fld(Int(slot) - 1, 2), D) + 1, mod(Int(slot) - 1, 2) + 1)
+
 """
     Forest{D,T}
 
@@ -155,7 +160,9 @@ leaf-only linear octree.
   periodic, reflecting nor outflow; a wrap is a patch glued to its own
   opposite face, so `periodic` is refused, and so is a seam. A step
   that leaves a patch through two glued faces at once, at a patch
-  corner, finds no neighbor. The root indices count through patch 1,
+  corner, finds no neighbor. No coarse-fine face crosses a glued face:
+  [`balance!`](@ref) keeps the leaves on either side of one at one level
+  (*conformity*), as across a seam. The root indices count through patch 1,
   then patch 2, and so on, and `forest.roots` and `forest.extents` are
   patch 1's. See "A multi-patch forest" in `CODE.md`.
 - `N` is the per-block interior size, and it is even: cells are the
@@ -194,7 +201,7 @@ package such as TreeIOHDF5 restores a forest. Everything
 built over a forest trusts its leaves, so the list is refused unless
 every key lies in the brick, the keys strictly increase, they tile the
 brick exactly — no gap, no overlap — and they are 2:1 balanced and, on a
-forest with a seam, conforming at it (see [`balance!`](@ref)).
+forest with a seam or glued faces, conforming there (see [`balance!`](@ref)).
 
 `comm` is the communicator the forest is distributed over (M7), as
 [`communicator`](@ref) converts it; `nothing`, the default, is a serial
@@ -853,8 +860,9 @@ seam_keywords(forest::Forest) =
 # what lets them be built once per tree change — so a list read from a
 # file, or received from another rank, is checked here instead: every
 # key in the brick, strictly increasing in curve order, tiling the brick
-# exactly, 2:1 balanced and (M12) conforming at a rotating seam. Each
-# refusal names the first leaf at which the list goes wrong.
+# exactly, 2:1 balanced and conforming at a rotating seam (M12) and at
+# a glued face (M17). Each refusal names the first leaf at which the list
+# goes wrong.
 function check_leaves(forest::Forest{D}) where {D}
     leaves = forest.leaves
     total = nroots(forest)
@@ -926,15 +934,19 @@ function check_leaves(forest::Forest{D}) where {D}
     for (i, k) in enumerate(leaves), δ in dirs
         crossing, nbrs = oriented_neighbors(forest, k, δ)
         for nb in nbrs
-            balance_slack(crossing, δ) == 0 && level(nb) != level(k) && throw(ArgumentError(
-                "the leaves are not conforming at the rotating seam: leaf $i, $k, " *
-                "touches $nb across the seam's face in direction $δ, and their levels " *
-                "differ. On a rotating forest a leaf on the seam and its image " *
-                "across it — on the low face of the other dimension of the plane " *
-                "for a quarter turn, on the same face for a half turn — are at one " *
-                "level, so that no coarse-fine face crosses the seam (CODE.md, " *
-                "\"Rotating seams\"); balance! keeps a forest so, so this list was " *
-                "damaged, made by hand, or written for a forest without the seam"))
+            if balance_slack(crossing, δ) == 0 && level(nb) != level(k)
+                crossing.glue != 0 &&
+                    throw(ArgumentError(glue_conformity(forest, i, k, nb, δ, crossing)))
+                throw(ArgumentError(
+                    "the leaves are not conforming at the rotating seam: leaf $i, $k, " *
+                    "touches $nb across the seam's face in direction $δ, and their levels " *
+                    "differ. On a rotating forest a leaf on the seam and its image " *
+                    "across it — on the low face of the other dimension of the plane " *
+                    "for a quarter turn, on the same face for a half turn — are at one " *
+                    "level, so that no coarse-fine face crosses the seam (CODE.md, " *
+                    "\"Rotating seams\"); balance! keeps a forest so, so this list was " *
+                    "damaged, made by hand, or written for a forest without the seam"))
+            end
             abs(level(nb) - level(k)) > 1 || continue
             throw(ArgumentError(
                 "the leaves are not 2:1 balanced: leaf $i, $k, touches $nb, and their " *
@@ -946,6 +958,24 @@ function check_leaves(forest::Forest{D}) where {D}
         end
     end
     return nothing
+end
+
+# The conformity refusal of `check_leaves` at a glued face (M17), naming
+# the face leaf `i`, `k`, crosses to touch `nb`, and the face across it.
+function glue_conformity(forest::Forest{D}, i::Int, k::MortonKey{D}, nb::MortonKey{D},
+                         δ::NTuple{D,Int}, crossing) where {D}
+    p, d, s = glue_face(crossing.glue, D)
+    entry = (forest.conn::Patches{D}).glue[crossing.glue]
+    side(s) = s == 1 ? "low" : "high"
+    return "the leaves are not conforming at a glued face: leaf $i, $k, in patch $p, " *
+           "touches $nb across the $(side(s)) face of dimension $d of patch $p, glued " *
+           "to the $(side(entry.face[2])) face of dimension $(entry.face[1]) of patch " *
+           "$(entry.patch), in direction $δ, and their levels differ. A forest of " *
+           "patches is conforming at its glue, a leaf and the one across a glued face " *
+           "at one level, as at a rotating seam, so that no coarse-fine face crosses " *
+           "the glue and the interface restriction never has to be turned across it " *
+           "(CODE.md, \"A multi-patch forest\"); balance! keeps a forest so, so this " *
+           "list was damaged, made by hand, or written for a forest without the glue"
 end
 
 # Whether leaf `k` begins where node `e` begins, as `e` itself or one of
@@ -1777,7 +1807,10 @@ until the refinement stops rippling outward. On a forest with a rotating
 seam (M12) it also enforces **conformity** there: a leaf across a seam
 *face* that is coarser by any amount is refined, so the leaves on the low
 face of `d1` and their images on the low face of `d2` end at one level —
-or, across a half-turn seam (M14), their images on the same face.
+or, across a half-turn seam (M14), their images on the same face. On a
+forest of patches (M17) it enforces conformity at every glued face in
+the same way, so no coarse-fine face crosses the glue; an edge or corner
+across a glue keeps the 2:1 rule.
 
 Afterwards every ghost region of every block touches at most one level
 up or down, which is what bounds the ghost-filling cases and the
@@ -1835,8 +1868,8 @@ end
     isbalanced(forest)
 
 Whether `forest` satisfies 2:1 balance across all faces, edges, and
-corners, and conformity at a rotating seam (M12, M14) — the postcondition of
-[`balance!`](@ref).
+corners, and conformity at a rotating seam (M12, M14) and at a glued face
+(M17) — the postcondition of [`balance!`](@ref).
 """
 function isbalanced(forest::Forest{D}) where {D}
     dirs = alldirections(Val(D))

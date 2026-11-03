@@ -92,7 +92,8 @@ conforming there (see [`balance!`](@ref)), so nothing is restricted
 across it: the two sides of a seam face compute the same flux, each the
 other's image, as long as the application's flux is covariant under the
 quarter turn, which a flux in Cartesian components is. A flux set over
-such a forest, with `G = 0`, needs no partner.
+such a forest, with `G = 0`, needs no partner. Nor is a glued face of a
+forest of patches (M17), which is conforming in the same way.
 
 Unlike a [`GhostSchedule`](@ref) this takes no [`Operators`](@ref). The
 transfer is not interpolation: it is injection and the exact two-cell
@@ -130,13 +131,17 @@ function interface_sources!(pairs::TransferPairs{D}, forest::Forest{D},
         δ = ntuple(e -> e == d ? s : 0, D)
         crossing, nbrs = oriented_neighbors(forest, k, δ)
         (isempty(nbrs) || level(first(nbrs)) <= level(k)) && continue
+        crossing.glue != 0 && error(
+            "the interface schedule found a finer neighbor of $k across the glued face " *
+            "$(glue_face(crossing.glue, D)) (patch, dimension, side), direction $δ, " *
+            "but a forest of patches is conforming at its glue: a coarse-fine face is " *
+            "not across a glue. The forest is not balanced as `balance!` leaves it; " *
+            "this is a bug.")
         iscrossing(crossing) && error(
-            "the interface schedule found a finer neighbor of $k across " *
-            (crossing.glue == 0 ? "the rotating seam (orientation $(crossing.turns)" :
-                                  "a glued face (glue entry $(crossing.glue)") *
-            ", direction $δ), but the leaves there are conforming, so every face " *
-            "across it is a same-level face. The forest is not balanced as " *
-            "`balance!` leaves it; this is a bug.")
+            "the interface schedule found a finer neighbor of $k across the rotating " *
+            "seam (orientation $(crossing.turns), direction $δ), but the seam is " *
+            "conforming, so every face across it is a same-level face. The forest is " *
+            "not balanced as `balance!` leaves it; this is a bug.")
         for nbr in nbrs
             push!.(get!(pairs, GroupKey{D}(:restrict, δ, childoffset(nbr), 0),
                         (Int32[], Int32[])),

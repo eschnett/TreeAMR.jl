@@ -1,7 +1,7 @@
 # M17: a forest of patches — several bricks of roots glued at their faces by
 # signed axis permutations. This file holds the forest (step 1), the
-# neighbor search across the glue (step 2), and the ghost fill across it
-# (step 3).
+# neighbor search across the glue (step 2), the ghost fill across it
+# (step 3), and conformity at the glue (step 4).
 #
 # Every claim about where a step lands is stated against a continuous map
 # written out independently of the glue table: by hand for the small
@@ -834,4 +834,92 @@ end
     @test key(1) != key(2)
     @test isless(key(1), key(2)) && !isless(key(2), key(1))
     @test isless(key(0), key(1))
+end
+
+# --- Conformity at the glue (step 4) ------------------------------------------
+
+@testset "A leaf list that is coarse-fine across a glued face is refused, naming the face" begin
+    # A list that puts a coarse-fine face across the glue — damaged, made by
+    # hand, or written for another forest — must be refused by the checked
+    # leaves path with the glue's own reason, not the seam's, and naming the
+    # face, rather than trusted by a schedule that has no turned restriction.
+    ring = patch_ring(4, (2, 1))
+    refine!(ring, ring.leaves[2])
+    @test !isbalanced(ring)
+    kw = patch_keywords(ring)
+    err = try
+        Forest(kw.patches; N=4, glue=kw.glue, leaves=ring.leaves)
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("not conforming at a glued face", err.msg)
+    @test occursin("the high face of dimension 1 of patch 1, glued to the low face of " *
+                   "dimension 1 of patch 2", err.msg)
+    @test !occursin("not conforming at the rotating seam", err.msg)
+    # The same through a swapped and reversed glue: the leaf across the high
+    # face of dimension 1 of patch 1 is on the low face of dimension 2 of
+    # patch 2, and balance! refines it there.
+    pair = patch_pair()
+    k = only(filter(k -> patch(pair, k) == 1 && patch_leafbox(pair, k)[1] == (1, 2),
+                    pair.leaves))
+    refine!(pair, k)
+    @test !isbalanced(pair)
+    kw = patch_keywords(pair)
+    @test_throws "of patch 1, glued to the low face of dimension 2 of patch 2" Forest(
+        kw.patches; N=4, glue=kw.glue, leaves=pair.leaves)
+    balance!(pair)
+    @test isbalanced(pair)
+    @test Forest(kw.patches; N=4, glue=kw.glue, leaves=pair.leaves).leaves == pair.leaves
+    for k in pair.leaves, δ in alldirections(Val(2))
+        count(!=(0), δ) == 1 || continue
+        crossing, nbrs = oriented_neighbors(pair, k, δ)
+        crossing.glue == 0 && continue
+        @test all(nb -> level(nb) == level(k), nbrs)
+    end
+end
+
+@testset "Refined beside the glue, a forest keeps 2:1 across its edges and is accepted" begin
+    # Conformity is a rule for glued faces only: an edge or corner across the
+    # glue keeps the ordinary 2:1 rule, as across a seam. The meshes the
+    # ghost-fill tests refine beside the glue must be balanced, accepted by
+    # the checked leaves path, conforming at every glued face, and still
+    # coarse-fine across an edge of the glue, or those tests would not
+    # exercise the turned prolongations they claim to.
+    for (forest, place) in (brick_cut((4, 2), ((2,),)), brick_cut((4, 2, 2), ((2,),)),
+                            laid_out((4, 3), ((1, 2), (-2, -1))))
+        patch_refine_one!(forest, place)
+        @test isbalanced(forest)
+        kw = patch_keywords(forest)
+        @test Forest(kw.patches; N=4, glue=kw.glue, leaves=forest.leaves).leaves ==
+              forest.leaves
+        D = length(forest.roots)
+        faces = edges = 0
+        for k in forest.leaves, δ in alldirections(Val(D))
+            crossing, nbrs = oriented_neighbors(forest, k, δ)
+            crossing.glue == 0 && continue
+            if count(!=(0), δ) == 1
+                faces += all(nb -> level(nb) == level(k), nbrs) ? 0 : 1
+            else
+                edges += any(nb -> level(nb) != level(k), nbrs)
+            end
+        end
+        @test faces == 0
+        @test edges > 0
+    end
+end
+
+@testset "The interface schedule reports a coarse-fine face across a glue as a bug" begin
+    # A finer neighbor across a glued face can only mean a forest that is not
+    # conforming, which no checked path produces: the interface schedule
+    # says so, rather than skip the restriction, or restrict untransformed.
+    broken = patch_ring(4, (2, 1))
+    refine!(broken, broken.leaves[3])
+    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
+    @test_throws "not across a glue" InterfaceSchedule(fx)
+    @test_throws "this is a bug" InterfaceSchedule(fx)
+    # Balanced, the same forest has coarse-fine faces inside its patches only.
+    balance!(broken)
+    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
+    @test InterfaceSchedule(fx) isa InterfaceSchedule
 end
