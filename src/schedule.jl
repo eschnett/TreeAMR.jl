@@ -1278,11 +1278,12 @@ function block_sources!(pairs::TransferPairs{D},
                             shift)
             continue
         end
-        r, nbrs = oriented_neighbors(forest, k, δ)
+        crossing, nbrs = oriented_neighbors(forest, k, δ)
         if isempty(nbrs)
             push!(boundaries, boundary_region(forest, k, b, δ, region, G, low, shift))
             continue
         end
+        r = crossing.turns
         nblevel = level(first(nbrs))
         if nblevel == level(k)
             record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), r)
@@ -1296,8 +1297,8 @@ function block_sources!(pairs::TransferPairs{D},
             # ghost region, selected by its offset within its parent —
             # its virtual parent, where this block sees it.
             for nbr in nbrs
-                record!(:restrict, seam_offset(forest, nbr, r), 0, find_leaf(forest, nbr),
-                        r)
+                record!(:restrict, seam_offset(forest, nbr, crossing), 0,
+                        find_leaf(forest, nbr), r)
             end
         end
     end
@@ -1386,10 +1387,12 @@ end
 
 # The child offset of a finer source as the target sees it: its own
 # offset off the seam, and across it in orientation `r` the offset turned
-# into the virtual frame (M12).
-seam_offset(forest::Forest, nbr::MortonKey, r::Integer) =
-    r == 0 ? childoffset(nbr) :
-    virtual_offset(childoffset(nbr), r, seam_plane(forest)...)
+# into the virtual frame (M12); across a glued face (M17), turned by the
+# glue's axis map.
+seam_offset(forest::Forest, nbr::MortonKey, c::Crossing) =
+    c.turns != 0 ? virtual_offset(childoffset(nbr), c.turns, seam_plane(forest)...) :
+    c.glue != 0 ? virtual_offset(childoffset(nbr), glue_axes(forest, c)...) :
+    childoffset(nbr)
 
 # The sources of a ghost region that crosses a reflecting or an outflow
 # face (M10; see "Ghost filling" in CODE.md). Mirrored (or clamped)
@@ -1439,11 +1442,12 @@ function mirror_sources!(pairs::TransferPairs{D},
     end
     # `δ′` may still cross a rotating seam (M12), the mirror being outside
     # its plane: the two compose, the source turned and then mirrored.
-    r, nbrs = oriented_neighbors(forest, k, δ′)
+    crossing, nbrs = oriented_neighbors(forest, k, δ′)
     if isempty(nbrs)
         push!(boundaries, boundary_region(forest, k, b, δ, region, G, low, shift))
         return nothing
     end
+    r = crossing.turns
     nblevel = level(first(nbrs))
     if nblevel == level(k)
         record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), r)
@@ -1456,7 +1460,7 @@ function mirror_sources!(pairs::TransferPairs{D},
         # one, where the target sees the child.
         wallside = ntuple(d -> δ[d] < 0 ? 0 : 1, D)
         for nbr in nbrs
-            o = seam_offset(forest, nbr, r)
+            o = seam_offset(forest, nbr, crossing)
             all(d -> !mask[d] || o[d] == wallside[d], 1:D) || continue
             record!(:restrict, o, 0, find_leaf(forest, nbr), r)
         end

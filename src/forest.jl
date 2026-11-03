@@ -20,6 +20,75 @@ end
 # periodic dimension's faces are `OuterFace` and never asked about.
 @enum FaceKind::Int8 OuterFace ReflectingFace OutflowFace
 
+# --- The connectivity (M17) ------------------------------------------------
+#
+# How the forest's roots fit together. A forest built from `roots` is one
+# brick, and every step between its roots is index arithmetic on it, its
+# periodic wraps and its seam (`OneBrick`). A forest built from `patches`
+# is several bricks glued at their faces (`Patches`): inside a patch the
+# arithmetic is the same, and only a step that leaves one consults the
+# glue table, so the common case pays one type test for it (CODE.md, "A
+# multi-patch forest" under "Open questions").
+#
+# Abstract-typed in the forest, as `comm` is, so that `Forest{D,T}` keeps
+# its two parameters and no signature downstream changes.
+abstract type Connectivity{D} end
+
+# One brick of `forest.roots`, no glue: today's forest, and what
+# `Forest(roots; …)` builds.
+struct OneBrick{D} <: Connectivity{D} end
+
+# One face of a patch as the glue sees it: `patch` is the patch across it
+# (0 for a face that is not glued) and `face` the `(dim, side)` of the face
+# there. The rest is the affine map from this patch's *level* coordinates
+# to that patch's, in gather form: axis `a` over there is axis `perm[a]`
+# here, reversed where `flip[a]`, and shifted by `offset[a]` roots. So the
+# cell at `g` here, at level `l`, is the cell at
+#
+#     y[a] = g[perm[a]] + (offset[a] << l)          (no flip)
+#     y[a] = (offset[a] << l) - 1 - g[perm[a]]      (flip)
+#
+# there, the `-1` being a cell's width as in the seam's tables below. In
+# root units, not level ones, because the offset scales with the level,
+# as the seam's `n2` does. The gather form is the one `RotatedSource`
+# reads a turned source by, so the schedule can take `perm` and `flip`
+# from here as they are.
+struct GlueEntry{D}
+    patch::Int
+    face::NTuple{2,Int}
+    perm::NTuple{D,Int8}
+    flip::NTuple{D,Bool}
+    offset::NTuple{D,Int}
+end
+GlueEntry{D}() where {D} =
+    GlueEntry{D}(0, (0, 0), ntuple(e -> Int8(e), D), ntuple(_ -> false, D),
+                 ntuple(_ -> 0, D))
+
+# Several bricks of roots — patches — glued at faces. Patch `p` owns the
+# flat roots `firstroot[p] .+ (0:prod(roots[p]) - 1)`, numbered within it
+# as a brick's are, so root numbering stays flat and ascending across the
+# patches and the curve walks over all of them unchanged. `glue` has one
+# entry per patch face, at `glue_slot(p, d, side, D)`: dense, so that a
+# step finds its face's entry by arithmetic, and canonically ordered
+# whatever order the caller listed the glue in, so that an index into it
+# is the same on every rank. `corners` says whether some patch has glued
+# faces along two different dimensions, so that some step leaves it
+# through two glued faces at once: a patch corner, which the neighbor
+# search answers with no neighbor and the schedule refuses where a field
+# set would read it. A property of the table alone, so computed here,
+# once.
+struct Patches{D,T} <: Connectivity{D}
+    roots::Vector{NTuple{D,Int}}
+    extents::Vector{NTuple{D,Tuple{T,T}}}
+    firstroot::Vector{Int}
+    glue::Vector{GlueEntry{D}}
+    corners::Bool
+end
+
+# The entry of face `side` (1 low, 2 high) of dimension `d` of patch `p`.
+@inline glue_slot(p::Integer, d::Integer, side::Integer, D::Integer) =
+    ((Int(p) - 1) * D + (Int(d) - 1)) * 2 + Int(side)
+
 """
     Forest{D,T}
 
@@ -72,6 +141,23 @@ leaf-only linear octree.
   level. `roots[d2]` must be even, so that the axis lies on a root
   boundary, and `d1` and `d2` must be neither periodic, reflecting nor
   outflow. A forest has one seam at most. See "Half turn" in `CODE.md`.
+- A forest may instead be several bricks — **patches** — glued at their
+  faces (M17; the second form below), each with its own `roots` and its
+  own logical `extents`. `glue` lists, for each glued face, the face
+  across it and the signed axis permutation `map` that carries this
+  patch's axes onto that patch's: `map[e] = ±a` sends axis `e` here to
+  axis `a` there, reversed for a minus. Both directions of every gluing
+  are listed, mutually inverse. The coordinates stay logical, patch by
+  patch — the map from a patch's box to physical space is the
+  application's — so patch extents may overlap or coincide, and
+  [`patch`](@ref) and [`block_patches`](@ref) say which patch a block is
+  in. Every patch has one cell size, and a glued face is neither
+  periodic, reflecting nor outflow; a wrap is a patch glued to its own
+  opposite face, so `periodic` is refused, and so is a seam. A step
+  that leaves a patch through two glued faces at once, at a patch
+  corner, finds no neighbor. The root indices count through patch 1,
+  then patch 2, and so on, and `forest.roots` and `forest.extents` are
+  patch 1's. See "A multi-patch forest" in `CODE.md`.
 - `N` is the per-block interior size, and it is even: cells are the
   tree's geometry, so `N` belongs here. The ghost width `G` does **not**
   — it says how far a stencil reaches into a neighbor's data, which is a
@@ -90,6 +176,15 @@ see [`root_position`](@ref) and [`root_index`](@ref).
            rotating=nothing, halfturn=nothing, extents=one unit per root,
            leaves=nothing, comm=nothing)
     Forest{T}(roots; ...)                      # geometry in `T`
+    Forest(patches; N, glue, reflecting=all false, outflow=all false,
+           leaves=nothing, comm=nothing)
+    Forest{T}(patches; ...)
+
+`patches` is a vector (or tuple) of `(roots = (…), extents = (…))`, the
+extents defaulting as above, and `glue` a vector of
+`(from = (patch, dim, side), to = (patch, dim, side), map = (…))`, with
+`side` 1 for the low face and 2 for the high one. `reflecting` and
+`outflow` apply to the faces of every patch that are not glued.
 
 Without `leaves` the forest starts as its unrefined roots. With it, it
 starts from that leaf list instead — keys in curve order, as
@@ -126,6 +221,16 @@ julia> star = Forest((1, 1, 1); N = 8, reflecting = ntuple(_ -> (true, false), 3
                      outflow = ntuple(_ -> (false, true), 3));
 
 julia> half = Forest((1, 2); N = 8, halfturn = (1, 2), extents = ((0, 1), (-1, 1)));
+
+julia> next(p) = mod1(p + 1, 4);
+
+julia> ring = Forest([(roots = (2, 1),) for p in 1:4]; N = 8,
+                     glue = [g for p in 1:4 for g in
+                             ((from = (p, 1, 2), to = (next(p), 1, 1), map = (1, 2)),
+                              (from = (next(p), 1, 1), to = (p, 1, 2), map = (1, 2)))]);
+
+julia> nleaves(ring), patch(ring, ring.leaves[end])
+(8, 4)
 ```
 """
 struct Forest{D,T}
@@ -168,6 +273,14 @@ struct Forest{D,T}
     # a dynamic dispatch per verb, a few per ghost fill and none in a
     # kernel ("Distributed meshes" in CODE.md).
     comm::Communicator
+    # How the roots fit together (M17): `OneBrick()` for a forest built
+    # from `roots`, `Patches` for one built from `patches`. Abstract-typed
+    # as `comm` is, and for the same reason; immutable, and covered by the
+    # digest, which is why it is a field and not part of `state`. Unlike
+    # `rotating` it does not fit in padding: the struct grows by its eight
+    # bytes, and the schedule build's allocation by about what a ninth
+    # field's would have (CODE.md, "The buffer pool").
+    conn::Connectivity{D}
 end
 
 
@@ -200,8 +313,29 @@ function Forest{T}(roots::NTuple{D,Integer};
                    comm=nothing, G=nothing) where {T,D}
     G === nothing || throw(no_forest_ghosts)
     all(>(0), roots) || throw(ArgumentError("roots must all be positive, got $roots"))
-    N > 0 || throw(ArgumentError("N must be positive, got $N"))
-    iseven(N) || throw(ArgumentError("N must be even, got $N"))
+    check_N(N)
+    faces = face_kinds(periodic, reflecting, outflow)
+    rot = halfturn === nothing ?
+          check_rotating(rotating, roots, periodic, reflecting, outflow) :
+          check_halfturn(halfturn, rotating, roots, periodic, reflecting, outflow)
+    ext = check_brick(T, roots, extents)
+
+    rootsI = map(Int, roots)
+    list = leaf_list(Val(D), prod(rootsI), leaves)
+    forest = Forest{D,T}(rootsI, periodic, faces, rot, ext, Int(N), list,
+                         ForestState(), communicator(comm), OneBrick{D}())
+    leaves === nothing || check_leaves(forest)
+    return forest
+end
+
+check_N(N) = (N > 0 || throw(ArgumentError("N must be positive, got $N"));
+              iseven(N) || throw(ArgumentError("N must be even, got $N"));
+              nothing)
+
+# The kinds of the faces, `(lo, hi)` per dimension, from the keywords that
+# select them, refusing a face that would be two kinds at once.
+function face_kinds(periodic::NTuple{D,Bool}, reflecting::NTuple{D,Tuple{Bool,Bool}},
+                    outflow::NTuple{D,Tuple{Bool,Bool}}) where {D}
     for d in 1:D
         periodic[d] && any(reflecting[d]) && throw(ArgumentError(
             "dimension $d is both periodic and reflecting, got reflecting[$d] = " *
@@ -220,15 +354,18 @@ function Forest{T}(roots::NTuple{D,Integer};
                 "the interior or a copy of the nearest interior cell, not both"))
         end
     end
-    rot = halfturn === nothing ?
-          check_rotating(rotating, roots, periodic, reflecting, outflow) :
-          check_halfturn(halfturn, rotating, roots, periodic, reflecting, outflow)
-    faces = ntuple(d -> ntuple(s -> reflecting[d][s] ? ReflectingFace :
-                                    outflow[d][s] ? OutflowFace : OuterFace, 2), D)
+    return ntuple(d -> ntuple(s -> reflecting[d][s] ? ReflectingFace :
+                                   outflow[d][s] ? OutflowFace : OuterFace, 2), D)
+end
 
+# The extents of one brick of `roots`, in `T`, checked: nonempty and
+# increasing, and blocks that are cubes. `what` names the brick in a
+# refusal.
+function check_brick(::Type{T}, roots::NTuple{D,Integer}, extents,
+                     what::AbstractString="") where {T,D}
     ext = ntuple(d -> (T(extents[d][1]), T(extents[d][2])), D)
     all(d -> ext[d][2] > ext[d][1], 1:D) ||
-        throw(ArgumentError("each extent must be nonempty and increasing, got $ext"))
+        throw(ArgumentError("each extent$what must be nonempty and increasing, got $ext"))
     # Blocks are cubes, so the root spacing must be the same in every
     # dimension.
     h = ntuple(d -> (ext[d][2] - ext[d][1]) / roots[d], D)
@@ -238,23 +375,17 @@ function Forest{T}(roots::NTuple{D,Integer};
     # and one division, so the slack is enormous either way; what matters
     # is that it tracks the type rather than sitting below eps(Float32).
     all(d -> isapprox(h[d], h[1]; rtol=4096 * eps(T)), 1:D) ||
-        throw(ArgumentError("blocks must be cubes: extents $ext over roots $roots give " *
-                            "anisotropic root spacings $h"))
-
-    rootsI = map(Int, roots)
-    if leaves === nothing
-        list = [MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(prod(rootsI) - 1)]
-        sort!(list)
-    else
-        # Always a copy: `refine!` and friends rewrite the forest's leaf
-        # array in place, which must never reach the caller's vector.
-        list = collect(MortonKey{D}, leaves)
-    end
-    forest = Forest{D,T}(rootsI, periodic, faces, rot, ext, Int(N), list,
-                         ForestState(), communicator(comm))
-    leaves === nothing || check_leaves(forest)
-    return forest
+        throw(ArgumentError("blocks must be cubes: extents $ext over roots $roots$what " *
+                            "give anisotropic root spacings $h"))
+    return ext
 end
+
+# The forest's leaf list: its unrefined roots, or a copy of the caller's.
+# Always a copy: `refine!` and friends rewrite the forest's leaf array in
+# place, which must never reach the caller's vector.
+leaf_list(::Val{D}, nroots::Int, ::Nothing) where {D} =
+    sort!([MortonKey{D}(r, 0, ntuple(_ -> 0, D)) for r in 0:(nroots - 1)])
+leaf_list(::Val{D}, nroots::Int, leaves) where {D} = collect(MortonKey{D}, leaves)
 
 # Without an explicit `T`, the geometry type follows the extents the
 # caller supplied; with no extents either, it is `Float64`. Both branches
@@ -281,6 +412,315 @@ function Forest(roots::NTuple{D,Integer};
                      outflow=outflow, rotating=rotating, halfturn=halfturn,
                      extents=extents, leaves=leaves, comm=comm)
 end
+
+# --- The patches form (M17) --------------------------------------------------
+#
+# A forest of several bricks glued at their faces. Every refusal says why
+# the patches cannot be glued that way (CODE.md, "A multi-patch forest").
+
+# A list of patches: a vector, or a nonempty tuple, of named tuples. The
+# tuple is nonempty so that `()` stays the brick form's, as it was.
+const PatchList = Union{AbstractVector,Tuple{NamedTuple,Vararg{NamedTuple}}}
+
+# The keywords the brick form takes and this one refuses, with its reason,
+# are accepted only to be refused: a bare `MethodError` on an unknown
+# keyword would not say what to write instead.
+function Forest{T}(patches::PatchList; N::Integer, glue=(), periodic=nothing,
+                   reflecting=nothing, outflow=nothing, rotating=nothing,
+                   halfturn=nothing, extents=nothing,
+                   leaves::Union{Nothing,AbstractVector{<:MortonKey}}=nothing,
+                   comm=nothing, G=nothing) where {T}
+    G === nothing || throw(no_forest_ghosts)
+    D = patch_dimension(patches)
+    return patch_forest(Val(D), T, patches, glue, N, periodic, reflecting, outflow,
+                        rotating, halfturn, extents, leaves, comm)
+end
+
+# Without an explicit `T`, the geometry type follows the patches' extents,
+# promoted over all of them; with none, it is `Float64`. Not inferable,
+# since the dimension is a length; a forest is built once.
+function Forest(patches::PatchList; kwargs...)
+    patch_dimension(patches)
+    types = [typeof(x) for p in patches if haskey(p, :extents) for e in p.extents
+             for x in e]
+    T = isempty(types) ? Float64 : float(promote_type(types...))
+    return Forest{T}(patches; kwargs...)
+end
+
+# The dimension of a list of patches, checking the shape of each.
+function patch_dimension(patches)
+    isempty(patches) && throw(ArgumentError(
+        "the list of patches is empty: a forest of patches has at least one, each a " *
+        "brick of roots"))
+    for (p, patch) in enumerate(patches)
+        patch isa NamedTuple && haskey(patch, :roots) &&
+            patch.roots isa Tuple{Integer,Vararg{Integer}} || throw(ArgumentError(
+            "patch $p, $(repr(patch)), is not a named tuple `(roots = (…), extents = " *
+            "(…))` whose roots are a tuple of integers: each patch is a brick of " *
+            "roots, with its own logical extents"))
+        extra = [n for n in keys(patch) if !(n in (:roots, :extents))]
+        isempty(extra) || throw(ArgumentError(
+            "patch $p, $(repr(patch)), has the field(s) $(join(extra, ", ")), and a " *
+            "patch has only `roots` and `extents`: the glue between patches is the " *
+            "forest's `glue` keyword, and the faces' kinds its `reflecting` and " *
+            "`outflow`"))
+    end
+    D = length(first(patches).roots)
+    all(p -> length(p.roots) == D, patches) || throw(ArgumentError(
+        "the patches have roots of different lengths, " *
+        "$(join((p.roots for p in patches), ", ")): every patch is a brick of the " *
+        "forest's dimension"))
+    return D
+end
+
+function patch_forest(::Val{D}, ::Type{T}, patches, glue, N, periodic, reflecting,
+                      outflow, rotating, halfturn, extents, leaves, comm) where {D,T}
+    (rotating === nothing && halfturn === nothing) || throw(ArgumentError(
+        "a forest of patches takes no seam, got rotating = $(repr(rotating)) and " *
+        "halfturn = $(repr(halfturn)): its patches are glued by the `glue` table, and " *
+        "a seam is the brick form's other way of gluing faces, by a quarter or a half " *
+        "turn. The two mechanisms are not combined. A turn between patches is a glue " *
+        "entry whose map turns the axes; a seam on one brick is " *
+        "`Forest(roots; rotating = …)` or `halfturn = …`."))
+    periodic === nothing || !any(periodic) || throw(ArgumentError(
+        "a forest of patches is not periodic, got periodic = $periodic: a wrap is a " *
+        "patch glued to its own opposite face, which the glue table says directly — " *
+        "for dimension d of patch p, `(from = (p, d, 2), to = (p, d, 1), map = " *
+        "(1, 2, …))` and its reverse — so the two ways of saying it are not " *
+        "combined"))
+    extents === nothing || throw(ArgumentError(
+        "a forest of patches takes its extents patch by patch, as `(roots = (…), " *
+        "extents = (…))`, not as a keyword: each patch has its own logical box"))
+    check_N(N)
+    faces = face_kinds(ntuple(_ -> false, D),
+                       something(reflecting, ntuple(_ -> (false, false), D)),
+                       something(outflow, ntuple(_ -> (false, false), D)))
+    conn = patch_connectivity(Val(D), T, patches, glue, faces)
+    list = leaf_list(Val(D), last(conn.firstroot) + prod(last(conn.roots)), leaves)
+    forest = Forest{D,T}(conn.roots[1], ntuple(_ -> false, D), faces, (Int8(0), Int8(0)),
+                         conn.extents[1], Int(N), list, ForestState(),
+                         communicator(comm), conn)
+    leaves === nothing || check_leaves(forest)
+    return forest
+end
+
+# The patches and the glue table, checked, as the forest stores them.
+function patch_connectivity(::Val{D}, ::Type{T}, patches, glue,
+                            faces::NTuple{D,NTuple{2,FaceKind}}) where {D,T}
+    np = length(patches)
+    roots = NTuple{D,Int}[]
+    extents = NTuple{D,Tuple{T,T}}[]
+    for (p, patch) in enumerate(patches)
+        r = patch.roots
+        all(>(0), r) || throw(ArgumentError(
+            "patch $p has roots $r: roots must all be positive"))
+        ext = haskey(patch, :extents) ? patch.extents : ntuple(d -> (zero(T), T(r[d])), D)
+        ext isa NTuple{D,Tuple{Real,Real}} || throw(ArgumentError(
+            "patch $p has extents $(repr(ext)), which are not $D pairs `(lo, hi)`: a " *
+            "patch's extents are its logical box, one interval per dimension"))
+        push!(roots, map(Int, r))
+        push!(extents, check_brick(T, r, ext, " of patch $p"))
+    end
+    # One cell size for every patch, so that `root_spacing` and the cell
+    # size of each level stay the forest's, and a glued face, whose root
+    # counts agree, is conforming by construction.
+    h = [(e[1][2] - e[1][1]) / r[1] for (r, e) in zip(roots, extents)]
+    for p in 2:np
+        isapprox(h[p], h[1]; rtol=4096 * eps(T)) || throw(ArgumentError(
+            "patch $p has roots of width $(h[p]), and patch 1 roots of width $(h[1]): " *
+            "the patches differ in cell size, and every patch of a forest has the one " *
+            "cell size of each level, in logical units — `root_spacing` is the " *
+            "forest's — so that a glued face meets the face across it cell for cell. " *
+            "Give the patches extents in proportion to their roots"))
+    end
+    firstroot = zeros(Int, np)
+    for p in 2:np
+        firstroot[p] = firstroot[p - 1] + prod(roots[p - 1])
+    end
+    nslots = 2D * np
+    nslots <= typemax(Int8) || throw(ArgumentError(
+        "$np patches in $D dimensions have $nslots faces, and a forest of patches has " *
+        "at most $(typemax(Int8)): a step across a glued face is identified by its " *
+        "face's index, and the ghost schedule carries that in one byte"))
+
+    table = fill(GlueEntry{D}(), nslots)
+    maps = fill(ntuple(identity, D), nslots)
+    for (i, item) in enumerate(glue)
+        item isa NamedTuple && all(n -> haskey(item, n), (:from, :to, :map)) ||
+            throw(ArgumentError(
+                "glue entry $i, $(repr(item)), is not a named tuple `(from = (patch, " *
+                "dim, side), to = (patch, dim, side), map = (…))`: each entry glues one " *
+                "face of a patch to a face of another, or of the same one"))
+        p, d, s = from = check_face(item.from, :from, i, np, D)
+        q, d2, s2 = to = check_face(item.to, :to, i, np, D)
+        σ = check_axis_map(item.map, i, D)
+        slot = glue_slot(p, d, s, D)
+        table[slot].patch == 0 || throw(ArgumentError(
+            "face $from is glued twice, by glue entry $i and an earlier one: a face is " *
+            "glued to one face only, so it is the `from` of one entry"))
+        faces[d][s] == OuterFace || throw(ArgumentError(
+            "glue entry $i glues face $from, and the $(s == 1 ? "low" : "high") face of " *
+            "dimension $d is $(faces[d][s] == ReflectingFace ? "reflecting" : "outflow"): " *
+            "a glued face has a neighbor across it, the face it is glued to, so it is " *
+            "not a wall. `reflecting` and `outflow` select a face of every patch at " *
+            "once, so they cannot be set where some patch is glued"))
+        outward, inward = s == 2 ? 1 : -1, s2 == 1 ? 1 : -1
+        abs(σ[d]) == d2 && sign(σ[d]) * outward == inward || throw(ArgumentError(
+            "glue entry $i has map = $σ, which sends the normal of face $from, axis " *
+            "$d, to $(σ[d] < 0 ? "-" : "+")$(abs(σ[d])), and a step out of face $from " *
+            "must be a step into face $to, along $(inward * outward > 0 ? "+" : "-")$d2: " *
+            "map[$d] = $(inward * outward * d2)"))
+        for e in 1:D
+            e == d && continue
+            a = abs(σ[e])
+            roots[p][e] == roots[q][a] || throw(ArgumentError(
+                "glue entry $i glues face $from to face $to, and its map = $σ sends axis " *
+                "$e of patch $p, $(roots[p][e]) roots long, onto axis $a of patch $q, " *
+                "$(roots[q][a]) roots long: a glued face meets the face across it root " *
+                "for root, so the root counts along it agree under the map"))
+        end
+        # The map in gather form (see `GlueEntry`): axis `a` there is axis
+        # `src[a]` here. Along the normal the offset carries this face onto
+        # that one; along a reversed tangential axis it is that axis'
+        # length, `x ↦ n - x`.
+        src = ntuple(a -> findfirst(e -> abs(σ[e]) == a, 1:D)::Int, D)
+        flip = ntuple(a -> σ[src[a]] < 0, D)
+        here, there = s == 2 ? roots[p][d] : 0, s2 == 2 ? roots[q][d2] : 0
+        offset = ntuple(D) do a
+            src[a] == d && return there - sign(σ[d]) * here
+            return flip[a] ? roots[q][a] : 0
+        end
+        table[slot] = GlueEntry{D}(q, (d2, s2), map(Int8, src), flip, offset)
+        maps[slot] = σ
+    end
+    # Both directions listed, each the other's inverse: then a step from
+    # either side finds its neighbor by the same table, and the two sides
+    # agree on what they share.
+    for p in 1:np, d in 1:D, s in 1:2
+        slot = glue_slot(p, d, s, D)
+        entry = table[slot]
+        entry.patch == 0 && continue
+        to = (entry.patch, entry.face...)
+        back = table[glue_slot(to..., D)]
+        σ = maps[slot]
+        inverse = ntuple(a -> sign(σ[entry.perm[a]]) * Int(entry.perm[a]), D)
+        back.patch == 0 && throw(ArgumentError(
+            "face $((p, d, s)) is glued to face $to, but face $to is not glued back: " *
+            "both directions of every gluing are listed, each the inverse of the other, " *
+            "so here `(from = $to, to = $((p, d, s)), map = $inverse)`"))
+        (back.patch, back.face) == (p, (d, s)) && maps[glue_slot(to..., D)] == inverse ||
+            throw(ArgumentError(
+                "face $((p, d, s)) is glued to face $to by map = $σ, but face $to is " *
+                "glued back to face $((back.patch, back.face...)) by map = " *
+                "$(maps[glue_slot(to..., D)]): both directions of every gluing are " *
+                "listed, each the inverse of the other, so face $to is glued to " *
+                "$((p, d, s)) by map = $inverse"))
+    end
+    corners = any(1:np) do p
+        count(d -> any(s -> table[glue_slot(p, d, s, D)].patch != 0, 1:2), 1:D) >= 2
+    end
+    return Patches{D,T}(roots, extents, firstroot, table, corners)
+end
+
+# A face `(patch, dim, side)` of a glue entry, checked.
+function check_face(face, which::Symbol, i::Int, np::Int, D::Int)
+    face isa Tuple{Integer,Integer,Integer} || throw(ArgumentError(
+        "glue entry $i has $which = $(repr(face)), which is not a face `(patch, dim, " *
+        "side)` of three integers"))
+    p, d, s = map(Int, face)
+    1 <= p <= np || throw(ArgumentError(
+        "glue entry $i has $which = $face, naming patch $p, and the forest has patches " *
+        "1:$np"))
+    1 <= d <= D || throw(ArgumentError(
+        "glue entry $i has $which = $face, naming dimension $d outside 1:$D"))
+    s in (1, 2) || throw(ArgumentError(
+        "glue entry $i has $which = $face, on side $s: a side is 1 for the low face of " *
+        "a dimension and 2 for the high one"))
+    return (p, d, s)
+end
+
+# The `map` of a glue entry, checked: a signed permutation of the axes.
+# Not `signed_map`, which checks a map of *variables* and says so.
+function check_axis_map(m, i::Int, D::Int)
+    m isa Tuple{Vararg{Integer}} || throw(ArgumentError(
+        "glue entry $i has map = $(repr(m)), which is not a tuple of integers: the " *
+        "map is a signed permutation of the axes, such as (2, -1, 3), carrying axis e " *
+        "of the patch to axis abs(map[e]) of the patch across, reversed where " *
+        "map[e] < 0"))
+    length(m) == D || throw(ArgumentError(
+        "glue entry $i has map = $m, with $(length(m)) entries, and the forest has $D " *
+        "dimensions: the map has one signed axis per axis of the patch, the one it is " *
+        "carried to across the face"))
+    σ = ntuple(e -> Int(m[e]), D)
+    all(e -> 1 <= abs(σ[e]) <= D, 1:D) || throw(ArgumentError(
+        "glue entry $i has map = $m, which is not a signed permutation: each entry is " *
+        "a signed axis of the patch across, ±1 through ±$D"))
+    allunique(map(abs, σ)) || throw(ArgumentError(
+        "glue entry $i has map = $m, which is not a signed permutation: it sends two " *
+        "axes onto one, and a face carried onto a face sends each axis to a different " *
+        "one"))
+    return σ
+end
+
+# The patches form's arguments, `(; patches, glue)`, for a forest rebuilt
+# from another one's parameters (`Forest(kw.patches; glue = kw.glue, …)`),
+# with the glue in canonical order; `nothing` for a forest of one brick,
+# which is rebuilt from `forest.roots` and `seam_keywords`, as before M17.
+function patch_keywords(forest::Forest{D,T}) where {D,T}
+    forest.conn isa OneBrick && return nothing
+    conn = forest.conn::Patches{D,T}
+    patches = [(roots=conn.roots[p], extents=conn.extents[p])
+               for p in eachindex(conn.roots)]
+    glue = NamedTuple{(:from, :to, :map),
+                      Tuple{NTuple{3,Int},NTuple{3,Int},NTuple{D,Int}}}[]
+    for p in eachindex(conn.roots), d in 1:D, s in 1:2
+        entry = conn.glue[glue_slot(p, d, s, D)]
+        entry.patch == 0 && continue
+        σ = ntuple(D) do e
+            a = findfirst(==(e), entry.perm)::Int
+            return entry.flip[a] ? -a : a
+        end
+        push!(glue, (from=(p, d, s), to=(entry.patch, entry.face...), map=σ))
+    end
+    return (patches=patches, glue=glue)
+end
+
+# Whether the forest is made of patches (M17), and how many it has.
+ispatched(forest::Forest) = forest.conn isa Patches
+npatches(forest::Forest) = forest.conn isa Patches ? length(forest.conn.roots) : 1
+
+# The total number of roots, over every patch.
+nroots(forest::Forest{D}) where {D} =
+    forest.conn isa Patches ?
+    (conn = forest.conn::Patches{D}; last(conn.firstroot) + prod(last(conn.roots))) :
+    prod(forest.roots)
+
+"""
+    patch(forest, k::MortonKey)
+    patch(forest, root::Integer)
+
+The patch (M17) that leaf `k`, or flat root index `root`, lies in: 1 on a
+forest of one brick, and otherwise the index into the list of patches the
+forest was built from. Patch extents may overlap or coincide, since the
+coordinates are logical patch by patch, so it is the patch number, not a
+position, that says which of the application's maps a block is under; see
+[`block_patches`](@ref) for every block at once.
+"""
+patch(forest::Forest{D}, root::Integer) where {D} =
+    forest.conn isa Patches ?
+    searchsortedlast((forest.conn::Patches{D}).firstroot, Int(root)) : 1
+patch(forest::Forest{D}, k::MortonKey{D}) where {D} = patch(forest, k.root)
+
+# The roots and extents of patch `p`: the forest's own on a forest of one
+# brick.
+patch_roots(forest::Forest{D}, p::Integer) where {D} =
+    forest.conn isa Patches ? (forest.conn::Patches{D}).roots[p] : forest.roots
+patch_extents(forest::Forest{D,T}, p::Integer) where {D,T} =
+    forest.conn isa Patches ? (forest.conn::Patches{D,T}).extents[p] : forest.extents
+
+# The first flat root index of patch `p`.
+patch_firstroot(forest::Forest{D}, p::Integer) where {D} =
+    forest.conn isa Patches ? (forest.conn::Patches{D}).firstroot[p] : 0
 
 # The `rotating` keyword, checked, as the forest stores it: `(0, 0)` for
 # none. Each refusal says why the seam cannot be glued that way (CODE.md,
@@ -417,17 +857,21 @@ seam_keywords(forest::Forest) =
 # refusal names the first leaf at which the list goes wrong.
 function check_leaves(forest::Forest{D}) where {D}
     leaves = forest.leaves
-    nroots = prod(forest.roots)
+    total = nroots(forest)
+    # What the leaves tile, as a refusal names it.
+    brick = ispatched(forest) ? "the $(npatches(forest)) patches" :
+                                "the brick $(forest.roots)"
     isempty(leaves) && throw(ArgumentError(
         "the leaf list is empty: the leaves tile the brick, so there is at least one " *
-        "per root, and the brick $(forest.roots) has $nroots roots"))
+        "per root, and $brick $(ispatched(forest) ? "have" : "has") $total roots"))
     # The key constructor checks the level and the coordinates, but it
     # cannot check the root, which is an index into a brick it never sees.
     for (i, k) in enumerate(leaves)
-        k.root < nroots || throw(ArgumentError(
-            "leaf $i, $k, is in root $(k.root), but the brick $(forest.roots) has " *
-            "roots 0:$(nroots - 1): a root index counts through the brick, dimension " *
-            "1 fastest, so this key belongs to a larger one"))
+        k.root < total || throw(ArgumentError(
+            "leaf $i, $k, is in root $(k.root), but $brick " *
+            "$(ispatched(forest) ? "have" : "has") roots 0:$(total - 1): a root index " *
+            "counts through the brick, dimension 1 fastest, so this key belongs to a " *
+            "larger one"))
     end
     for i in 2:length(leaves)
         a, b = leaves[i - 1], leaves[i]
@@ -467,12 +911,12 @@ function check_leaves(forest::Forest{D}) where {D}
                 "is where $place. The leaves tile the brick exactly, and a region " *
                 "without a leaf has no block to hold its data"))
         end
-        next = curve_successor(k, nroots)
+        next = curve_successor(k, total)
     end
     next === nothing || throw(ArgumentError(
         "the leaves leave a gap at the end of the brick: the last leaf, " *
         "$(length(leaves)), $(leaves[end]), ends where $next begins, and no leaf " *
-        "covers anything from there through the last root, $(nroots - 1). The leaves " *
+        "covers anything from there through the last root, $(total - 1). The leaves " *
         "tile the brick exactly, and a region without a leaf has no block to hold " *
         "its data"))
     # Balance is the threaded check; the serial search that names the
@@ -480,9 +924,9 @@ function check_leaves(forest::Forest{D}) where {D}
     isbalanced(forest) && return nothing
     dirs = alldirections(Val(D))
     for (i, k) in enumerate(leaves), δ in dirs
-        r, nbrs = oriented_neighbors(forest, k, δ)
+        crossing, nbrs = oriented_neighbors(forest, k, δ)
         for nb in nbrs
-            balance_slack(r, δ) == 0 && level(nb) != level(k) && throw(ArgumentError(
+            balance_slack(crossing, δ) == 0 && level(nb) != level(k) && throw(ArgumentError(
                 "the leaves are not conforming at the rotating seam: leaf $i, $k, " *
                 "touches $nb across the seam's face in direction $δ, and their levels " *
                 "differ. On a rotating forest a leaf on the seam and its image " *
@@ -632,7 +1076,7 @@ isdistributed(forest::Forest) = commsize(forest.comm) > 1
 # in CODE.md). The digest is the generation, the leaf count, a fold of
 # every leaf's hash — not `hash(forest.leaves)`, which for a long
 # vector samples only some of the elements — and the brick, the
-# rotating seam (M12) included. Beside it
+# rotating seam (M12) and the patches and their glue (M17) included. Beside it
 # goes a hash of the layout the build is for, since a rank that built
 # its stencils from other operators would deliver wrong ghosts as
 # silently, and a flag saying whether this rank's own argument checks
@@ -652,9 +1096,21 @@ function ForestDigest(forest::Forest, layout::UInt, refused::Bool)
     for k in forest.leaves
         h = hash(k, h)
     end
-    brick = hash(string((forest.roots, forest.N, forest.periodic, forest.faces,
-                         Int.(forest.rotating), forest.extents)))
+    shape = (forest.roots, forest.N, forest.periodic, forest.faces,
+             Int.(forest.rotating), forest.extents)
+    # The patches and the glue table (M17), on a forest that has them only,
+    # so that a brick's digest is what it was.
+    brick = hash(string(ispatched(forest) ? (shape..., connectivity_digest(forest)) :
+                        shape))
     return ForestDigest(generation(forest), nleaves(forest), h, brick, layout, refused)
+end
+
+# The patches and the glue table as integers and strings, which hash the
+# same in every process.
+function connectivity_digest(forest::Forest{D,T}) where {D,T}
+    conn = forest.conn::Patches{D,T}
+    return (conn.roots, conn.extents,
+            [(e.patch, e.face, Int.(e.perm), e.flip, e.offset) for e in conn.glue])
 end
 
 sameforest(a::ForestDigest, b::ForestDigest) =
@@ -759,6 +1215,8 @@ maxlevel(forest::Forest) = maximum(level, forest.leaves)
 
 The 0-based `D`-dimensional brick position of root index `root` (as
 carried in a [`MortonKey`](@ref)); the inverse of [`root_index`](@ref).
+On a forest of patches (M17) it is the position within the root's own
+patch, which the flat index determines (see [`patch`](@ref)).
 """
 function root_position(roots::NTuple{D,Int}, root::Integer) where {D}
     pos = ntuple(_ -> 0, D)
@@ -769,13 +1227,20 @@ function root_position(roots::NTuple{D,Int}, root::Integer) where {D}
     end
     return pos
 end
-root_position(forest::Forest, root::Integer) = root_position(forest.roots, root)
+function root_position(forest::Forest, root::Integer)
+    ispatched(forest) || return root_position(forest.roots, root)
+    p = patch(forest, root)
+    return root_position(patch_roots(forest, p), Int(root) - patch_firstroot(forest, p))
+end
 
 """
     root_index(roots_or_forest, pos::NTuple)
+    root_index(forest, p::Integer, pos::NTuple)
 
 The linearized 0-based root index of 0-based brick position `pos`; the
-inverse of [`root_position`](@ref).
+inverse of [`root_position`](@ref). On a forest of several patches (M17)
+a position names a root in each of them, so the two-argument form refuses
+there, and the second form takes the patch `p` the position is in.
 """
 function root_index(roots::NTuple{D,Int}, pos::NTuple{D,<:Integer}) where {D}
     idx = 0
@@ -786,7 +1251,18 @@ function root_index(roots::NTuple{D,Int}, pos::NTuple{D,<:Integer}) where {D}
     end
     return idx
 end
-root_index(forest::Forest{D}, pos::NTuple{D,<:Integer}) where {D} = root_index(forest.roots, pos)
+function root_index(forest::Forest{D}, pos::NTuple{D,<:Integer}) where {D}
+    npatches(forest) == 1 || throw(ArgumentError(
+        "root_index(forest, $pos) is ambiguous on a forest of $(npatches(forest)) " *
+        "patches: a position is within a patch, and names a root in each of them. " *
+        "Name the patch, `root_index(forest, p, $pos)`"))
+    return root_index(patch_roots(forest, 1), pos)
+end
+function root_index(forest::Forest{D}, p::Integer, pos::NTuple{D,<:Integer}) where {D}
+    1 <= p <= npatches(forest) || throw(ArgumentError(
+        "patch $p is not a patch of the forest, whose patches are 1:$(npatches(forest))"))
+    return patch_firstroot(forest, p) + root_index(patch_roots(forest, p), pos)
+end
 
 """
     alldirections(::Val{D})
@@ -852,6 +1328,32 @@ isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) 
 # quarter turn's `r = 2` is the same map with `n2 = 0`, which is how
 # `unrotate_node` takes both.
 
+# How a step reached the node it lands on: across a rotating seam, by
+# `turns` quarter turns (M12, M14; the `r` of the tables above, which
+# indexes a field set's `rotvars` and `factors`), or across a glued face
+# (M17), whose index into the forest's glue table is `glue`. Both are 0
+# for a step that crosses neither, and a forest has seams or glue, never
+# both. The glue is an index and not its axis map because two patches
+# glued with the identity map still differ from one brick: a coarse-fine
+# face may not cross the glue (conformity, `balance_slack`). The few
+# callers that need the map itself look it up, through `glue_axes`.
+struct Crossing
+    turns::Int8
+    glue::Int8
+end
+Crossing() = Crossing(0, 0)
+
+# Whether a step crosses a seam or a glued face.
+iscrossing(c::Crossing) = c.turns != 0 || c.glue != 0
+
+# The axis map of a step across a glued face, as `(perm, flip)` in the
+# gather form of `GlueEntry`: axis `a` beyond the glue is axis `perm[a]`
+# of the asking block, reversed where `flip[a]`.
+function glue_axes(forest::Forest{D}, c::Crossing) where {D}
+    entry = (forest.conn::Patches{D}).glue[c.glue]
+    return entry.perm, entry.flip
+end
+
 # The orientation of the naive node at global coordinates `g`: 0 off the
 # seam, or with no seam at all.
 @inline function seam_orientation(forest::Forest{D}, g::NTuple{D,Int}) where {D}
@@ -885,6 +1387,13 @@ end
     return Base.setindex(Base.setindex(δ, r1, d1), r2, d2)
 end
 
+# The same, across a glued face (M17), from its axis map in gather form:
+# the step `δ` of the asking block, as the patch across sees it. Along axis
+# `a` there it is the step along `perm[a]` here, reversed where `flip[a]`.
+@inline real_direction(δ::NTuple{D,Int}, perm::NTuple{D,Integer},
+                       flip::NTuple{D,Bool}) where {D} =
+    ntuple(a -> flip[a] ? -δ[Int(perm[a])] : δ[Int(perm[a])], D)
+
 # The child offset `o ∈ {0,1}^D` of a real leaf across a rotating seam in
 # orientation `r`, taken into the *virtual* frame, where the asking block
 # sees that leaf (M12): its offset within its virtual parent, which is
@@ -902,6 +1411,18 @@ end
     return Base.setindex(Base.setindex(o, v1, d1), v2, d2)
 end
 
+# The same, across a glued face (M17), from its axis map in gather form:
+# a leaf's offset along axis `a` of the patch across is its offset along
+# `perm[a]` in the asking block's frame, turned about its parent's centre,
+# `1 - o`, where `flip[a]`.
+function virtual_offset(o::NTuple{D,Int}, perm::NTuple{D,Integer},
+                        flip::NTuple{D,Bool}) where {D}
+    return ntuple(D) do e
+        a = findfirst(==(e), perm)::Int
+        return flip[a] ? 1 - o[a] : o[a]
+    end
+end
+
 # The real node one step from `k` in direction `δ`, in global level
 # coordinates, and its orientation: the step taken naively, then mapped
 # back across a rotating seam it crosses. Periodic dimensions are not yet
@@ -909,7 +1430,7 @@ end
 @inline function stepped_node(forest::Forest{D}, k::MortonKey{D},
                               δ::NTuple{D,Int}) where {D}
     lvl = level(k)
-    rootpos = root_position(forest, k.root)
+    rootpos = root_position(forest.roots, k.root)
     g = ntuple(d -> (rootpos[d] << lvl) + Int(k.coords[d]) + δ[d], D)
     r = seam_orientation(forest, g)
     r == 0 && return g, 0
@@ -919,16 +1440,18 @@ end
 end
 
 # The same-level anchor node reached by stepping one cell from `k` in
-# direction `δ`, as `(root, coords, r)`: crossing root boundaries,
+# direction `δ`, as `(root, coords, crossing)`: crossing root boundaries,
 # wrapping periodic ones, and crossing a rotating seam (M12) into the
-# real node, with `r` the orientation (0 off the seam). `nothing` when the
-# step leaves a non-periodic face that is not the seam, or crosses the
-# seam to a node that lies beyond a high face — a region beyond an outer
-# face either way, and the hook's. Since |δ[d]| <= 1, a step crosses at
-# most one root boundary per dimension. This is the single source of
-# truth for where a step lands: the neighbor search, `balance!` and,
-# through them, everything else go through it.
+# real node, with `crossing.turns` the orientation (0 off the seam).
+# `nothing` when the step leaves a non-periodic face that is not the seam,
+# or crosses the seam to a node that lies beyond a high face — a region
+# beyond an outer face either way, and the hook's. Since |δ[d]| <= 1, a
+# step crosses at most one root boundary per dimension. This is the single
+# source of truth for where a step lands: the neighbor search, `balance!`
+# and, through them, everything else go through it. On a forest of
+# patches (M17) the step is `glued_anchor`'s instead.
 function neighbor_anchor(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D}
+    forest.conn isa Patches && return glued_anchor(forest.conn::Patches{D}, k, δ)
     lvl = level(k)
     g, r = stepped_node(forest, k, δ)
     for d in 1:D
@@ -938,7 +1461,60 @@ function neighbor_anchor(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) 
     wrapped = ntuple(d -> mod(g[d], forest.roots[d] << lvl), D)
     mask = (1 << lvl) - 1
     rootpos = ntuple(d -> wrapped[d] >> lvl, D)
-    return (root_index(forest, rootpos), ntuple(d -> wrapped[d] & mask, D), r)
+    return (root_index(forest.roots, rootpos), ntuple(d -> wrapped[d] & mask, D),
+            Crossing(r, 0))
+end
+
+# `neighbor_anchor` on a forest of patches (M17). The step is taken in the
+# patch's own level coordinates, as on a brick; a step that stays in the
+# patch lands where it lands. One that leaves it through exactly one face
+# crosses that face's glue, by its affine map (see `GlueEntry`), into the
+# patch across, and is checked against that patch's bounds again, since
+# only a step out through one face is a step in through another. A step
+# out through an unglued face is beyond an outer face, and one out through
+# two faces or more at once is beyond a patch corner — if both are glued,
+# the region where three or more patches meet, which has no one node to
+# land on. Both are `nothing`: the same "no neighbor" a step through an
+# outer face gives on a brick, so that nothing downstream of the search
+# meets a new case. The schedule tells a corner from an outer face by the
+# connectivity's `corners` flag and the field set's centering, and refuses
+# it where it would be read. There is no periodic wrap here: a wrap is a
+# patch glued to itself.
+function glued_anchor(conn::Patches{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D}
+    lvl = level(k)
+    p = searchsortedlast(conn.firstroot, Int(k.root))
+    n = conn.roots[p]
+    rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
+    g = ntuple(d -> (rootpos[d] << lvl) + Int(k.coords[d]) + δ[d], D)
+    exits, d = 0, 0
+    for e in 1:D
+        if g[e] < 0 || g[e] >= n[e] << lvl
+            exits += 1
+            d = e
+        end
+    end
+    exits == 0 && return glued_node(conn, p, g, lvl, Crossing())
+    exits == 1 || return nothing
+    slot = glue_slot(p, d, g[d] < 0 ? 1 : 2, D)
+    entry = conn.glue[slot]
+    entry.patch == 0 && return nothing
+    there = ntuple(D) do a
+        x = g[Int(entry.perm[a])]
+        return entry.flip[a] ? (entry.offset[a] << lvl) - 1 - x :
+                               x + (entry.offset[a] << lvl)
+    end
+    m = conn.roots[entry.patch]
+    any(e -> there[e] < 0 || there[e] >= m[e] << lvl, 1:D) && return nothing
+    return glued_node(conn, entry.patch, there, lvl, Crossing(0, slot))
+end
+
+# The anchor `(root, coords, crossing)` of the node at level coordinates
+# `g` of patch `p`, inside it.
+@inline function glued_node(conn::Patches{D}, p::Int, g::NTuple{D,Int}, lvl::Int,
+                            crossing::Crossing) where {D}
+    mask = (1 << lvl) - 1
+    root = conn.firstroot[p] + root_index(conn.roots[p], ntuple(e -> g[e] >> lvl, D))
+    return (root, ntuple(e -> g[e] & mask, D), crossing)
 end
 
 # The kind of face `side` (1 low, 2 high) of dimension `d`, and the
@@ -986,17 +1562,21 @@ hasreflecting(forest::Forest) = any(f -> ReflectingFace in f, forest.faces)
 # which faces are the domain's, and of what kind. A rotating seam (M12)
 # is never a wall: the constructor refuses a reflecting or outflow face
 # in either dimension of its plane, and the tree finds the leaves across
-# the seam, so a `δ` through it is ordinary here.
+# the seam, so a `δ` through it is ordinary here. Nor is a glued face
+# (M17), for the same two reasons: the faces of a patch are its own, and
+# the kind of each glued one is refused as anything but `OuterFace`, so a
+# step through it keeps its component and finds the patch across.
 function wall_direction(forest::Forest{D}, k::MortonKey{D},
                         δ::NTuple{D,Int}) where {D}
     n = 1 << level(k)
     rootpos = root_position(forest, k.root)
+    roots = patch_roots(forest, patch(forest, k))
     walls = ntuple(D) do d
         δ[d] == 0 && return OuterFace
         forest.periodic[d] && return OuterFace
         stepped = Int(k.coords[d]) + δ[d]
         exits = δ[d] < 0 ? (stepped < 0 && rootpos[d] == 0) :
-                           (stepped >= n && rootpos[d] == forest.roots[d] - 1)
+                           (stepped >= n && rootpos[d] == roots[d] - 1)
         return exits ? forest.faces[d][δ[d] < 0 ? 1 : 2] : OuterFace
     end
     return ntuple(d -> walls[d] == OuterFace ? δ[d] : 0, D), walls
@@ -1076,29 +1656,38 @@ the opposite direction.
 neighbor_keys(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}) where {D} =
     last(oriented_neighbors(forest, k, δ))
 
-# `neighbor_keys` with the orientation (M12): `(r, keys)`, where the
-# keys are the real leaves and `R^r` carries them to where `k` sees them
-# in direction `δ`. All the neighbors of one block in one direction share
-# one `r`, since the seam lies on a root boundary at every level. `r` is
-# 0 off the seam; it is the region's orientation even when `keys` is
-# empty, which across the seam means the real image lies beyond a high
-# face. The search for finer leaves runs in the real frame, in the
-# direction `R^{-r} δ` from them back to `k`'s image.
+# `neighbor_keys` with the crossing (M12, M17): `(crossing, keys)`, where
+# the keys are the real leaves and the crossing carries them to where `k`
+# sees them in direction `δ` — `R^r` for `r = crossing.turns` across a
+# seam, the glue's axis map across a glued face. All the neighbors of one
+# block in one direction share one crossing, since a seam and a glued
+# face lie on root boundaries at every level. Across a seam `turns` is
+# the region's orientation even when `keys` is empty, which there means
+# the real image lies beyond a high face; on a forest of patches an empty
+# `keys` has no crossing, whether the region lies beyond an outer face or
+# a patch corner (see `glued_anchor`). The search for finer leaves runs
+# in the real frame, in the direction from them back to `k`'s image.
 function oriented_neighbors(forest::Forest{D}, k::MortonKey{D},
                             δ::NTuple{D,Int}) where {D}
     δ != ntuple(_ -> 0, D) || throw(ArgumentError("direction must be nonzero"))
     all(d -> -1 <= δ[d] <= 1, 1:D) ||
         throw(ArgumentError("direction components must be in -1:1, got $δ"))
     anchor = neighbor_anchor(forest, k, δ)
-    anchor === nothing && return last(stepped_node(forest, k, δ)), MortonKey{D}[]
-    nbroot, nbcoords, r = anchor
+    if anchor === nothing
+        crossing = ispatched(forest) ? Crossing() :
+                   Crossing(last(stepped_node(forest, k, δ)), 0)
+        return crossing, MortonKey{D}[]
+    end
+    nbroot, nbcoords, crossing = anchor
 
     i = find_covering_leaf(forest, nbroot, level(k), nbcoords)
-    i !== nothing && return r, [forest.leaves[i]]
+    i !== nothing && return crossing, [forest.leaves[i]]
 
-    δreal = r == 0 ? δ : real_direction(δ, r, seam_plane(forest)...)
-    return r, collect_touching_leaves!(MortonKey{D}[], forest, nbroot, level(k), nbcoords,
-                                       δreal)
+    δreal = crossing.turns != 0 ?
+            real_direction(δ, crossing.turns, seam_plane(forest)...) :
+            crossing.glue != 0 ? real_direction(δ, glue_axes(forest, crossing)...) : δ
+    return crossing, collect_touching_leaves!(MortonKey{D}[], forest, nbroot, level(k),
+                                              nbcoords, δreal)
 end
 
 # Rebuild `forest.leaves` by walking it in order and replacing selected
@@ -1196,7 +1785,8 @@ prolongation stencils.
 """
 function balance!(forest::Forest{D}) where {D}
     dirs = alldirections(Val(D))
-    seam = hasrotating(forest)
+    # Conformity is kept across a seam and across a glued face (M17).
+    seam = hasrotating(forest) || ispatched(forest)
     while true
         # The scan is threaded over leaves, each task collecting into its
         # own buffer; the buffers are concatenated in leaf order (M5).
@@ -1210,14 +1800,14 @@ function balance!(forest::Forest{D}) where {D}
             for δ in dirs
                 anchor = neighbor_anchor(forest, k, δ)
                 anchor === nothing && continue
-                nbroot, nbcoords, r = anchor
+                nbroot, nbcoords, crossing = anchor
                 # Looking only for a *coarser* neighbor, so the covering
                 # leaf suffices — no need to descend into finer ones,
                 # which get checked from their own side.
                 i = find_covering_leaf(forest, nbroot, level(k), nbcoords)
                 i === nothing && continue
                 nb = forest.leaves[i]
-                level(nb) < level(k) - balance_slack(r, δ) && push!(hits, nb)
+                level(nb) < level(k) - balance_slack(crossing, δ) && push!(hits, nb)
             end
         end
 
@@ -1229,14 +1819,17 @@ function balance!(forest::Forest{D}) where {D}
 end
 
 # How many levels two adjacent leaves may differ by: one, but none across
-# a rotating seam's *face* (M12, conformity; CODE.md "Rotating seams").
+# a rotating seam's *face* (M12, conformity; CODE.md "Rotating seams"),
+# nor across a glued face (M17), which no coarse-fine face may cross.
 # An edge or corner across the seam keeps the ordinary 2:1 rule. A seam
 # face is a direction with one nonzero component and a nonzero
 # orientation: 1 or 3 for a quarter turn, whose orientation 2 needs two
 # components and is a corner, and 2 for a half turn (M14), whose only
-# face across the seam is the low face of `d1`, glued to itself.
-@inline balance_slack(r::Int, δ::NTuple{D,Int}) where {D} =
-    r != 0 && count(!=(0), δ) == 1 ? 0 : 1
+# face across the seam is the low face of `d1`, glued to itself. A glued
+# face is likewise a direction with one nonzero component that crosses
+# the glue; an edge across it keeps the 2:1 rule.
+@inline balance_slack(c::Crossing, δ::NTuple{D,Int}) where {D} =
+    iscrossing(c) && count(!=(0), δ) == 1 ? 0 : 1
 
 """
     isbalanced(forest)
@@ -1251,9 +1844,9 @@ function isbalanced(forest::Forest{D}) where {D}
     threaded_foreach(nleaves(forest)) do b
         k = forest.leaves[b]
         for δ in dirs
-            r, nbrs = oriented_neighbors(forest, k, δ)
+            crossing, nbrs = oriented_neighbors(forest, k, δ)
             for nb in nbrs
-                if abs(level(nb) - level(k)) > balance_slack(r, δ)
+                if abs(level(nb) - level(k)) > balance_slack(crossing, δ)
                     ok[b] = false
                     return
                 end

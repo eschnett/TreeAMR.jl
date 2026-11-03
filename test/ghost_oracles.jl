@@ -917,7 +917,8 @@ function seam_neighbor_mismatches(quad::Forest{D}) where {D}
     mismatches = 0
     seen = Dict{Tuple{Int,Symbol},Int}()
     for k in quad.leaves, δ in alldirections(Val(D))
-        r, keys = TreeAMR.oriented_neighbors(quad, k, δ)
+        crossing, keys = TreeAMR.oriented_neighbors(quad, k, δ)
+        r = Int(crossing.turns)
         unfolded = neighbor_keys(full, image(k, 0), δ)
         expected = map(back, unfolded)
         ok = if isempty(expected)
@@ -1562,7 +1563,8 @@ function halfturn_neighbor_mismatches(half::Forest{D}) where {D}
     mismatches = 0
     seen = Dict{Tuple{Int,Symbol},Int}()
     for k in half.leaves, δ in alldirections(Val(D))
-        r, keys = TreeAMR.oriented_neighbors(half, k, δ)
+        crossing, keys = TreeAMR.oriented_neighbors(half, k, δ)
+        r = Int(crossing.turns)
         unfolded = neighbor_keys(full, image(k, 0), δ)
         expected = map(back, unfolded)
         ok = if isempty(expected)

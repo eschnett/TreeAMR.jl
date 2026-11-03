@@ -116,25 +116,27 @@ isstale(s::InterfaceSchedule) = generation(s.forest) != s.generation
 # nothing — that face is the coarser block's target — and a face at the
 # domain boundary carries whatever flux the application computed there.
 #
-# A rotating seam (M12) is never a coarse-fine face: `balance!` keeps the
-# leaves on its two sides at one level (conformity), so the search across
-# it finds a same-level neighbor and records nothing. A finer neighbor
-# with a nonzero orientation would need a turned restriction, which this
-# schedule does not build; it can only mean a forest that is not
-# conforming, which the checked paths refuse, so it is a bug, not an
-# argument error.
+# A rotating seam (M12), or a glued face (M17), is never a coarse-fine
+# face: `balance!` keeps the leaves on its two sides at one level
+# (conformity), so the search across it finds a same-level neighbor and
+# records nothing. A finer neighbor across either would need a turned
+# restriction, which this schedule does not build; it can only mean a
+# forest that is not conforming, which the checked paths refuse, so it is
+# a bug, not an argument error.
 function interface_sources!(pairs::TransferPairs{D}, forest::Forest{D},
                             faces::Vector{Int}, b::Int) where {D}
     k = forest.leaves[b]
     for d in faces, s in (-1, 1)
         δ = ntuple(e -> e == d ? s : 0, D)
-        r, nbrs = oriented_neighbors(forest, k, δ)
+        crossing, nbrs = oriented_neighbors(forest, k, δ)
         (isempty(nbrs) || level(first(nbrs)) <= level(k)) && continue
-        r == 0 || error(
-            "the interface schedule found a finer neighbor of $k across the rotating " *
-            "seam (orientation $r, direction $δ), but the seam is conforming, so " *
-            "every face across it is a same-level face. The forest is not balanced " *
-            "as `balance!` leaves it; this is a bug.")
+        iscrossing(crossing) && error(
+            "the interface schedule found a finer neighbor of $k across " *
+            (crossing.glue == 0 ? "the rotating seam (orientation $(crossing.turns)" :
+                                  "a glued face (glue entry $(crossing.glue)") *
+            ", direction $δ), but the leaves there are conforming, so every face " *
+            "across it is a same-level face. The forest is not balanced as " *
+            "`balance!` leaves it; this is a bug.")
         for nbr in nbrs
             push!.(get!(pairs, GroupKey{D}(:restrict, δ, childoffset(nbr), 0),
                         (Int32[], Int32[])),

@@ -529,7 +529,7 @@ function completed_leaves(forest::Forest{D}, marks::Vector{RegridFlag}) where {D
     # exchanged anything.
     scratch = typeof(forest)(forest.roots, forest.periodic, forest.faces,
                              forest.rotating, forest.extents, forest.N, candidate,
-                             ForestState(), forest.comm)
+                             ForestState(), forest.comm, forest.conn)
     balance!(scratch)
     return scratch.leaves
 end
