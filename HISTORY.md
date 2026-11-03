@@ -4364,11 +4364,11 @@ M12 was decided with Erik, after M7 and before M9b.
      helpers and `Crossing(::Int, ::Int)`, and step 3's
      `identity_axes` and `isturned` closures and an `Int8.` broadcast
      in the `TransferGroup` constructor, which the cleanup then
-     removed. The comparison of the cleaned-up step (job 588235) and
-     the suite after it (job 588236) ran on Symmetry, but the tunnel to
-     it went down before either was read, and 588236 ran a test helper
-     that raced (under [Ghost filling](#ghost-filling)); **no final
-     compile-timing number exists yet**. `bench/ghosts.jl` on the
+     removed. The cleaned-up step (job 588235, same node and setup):
+     71827cc 102.50–103.14 s with 1288 roots, step 3 103.65–104.36 s
+     with 1293, +0.8 s; the suite after it (job 588236) ran a test
+     helper that raced (under [Ghost filling](#ghost-filling)) and is
+     superseded by the final head's run below. `bench/ghosts.jl` on the
      laptop at one thread against step 2: the schedule build
      +416 and +25040 bytes (0.55 %) at `D = 3`, uniform and two-level,
      +400 and +512 at `D = 2`, the `TransferGroup` grown from 152 to 160
@@ -4445,11 +4445,21 @@ M12 was decided with Erik, after M7 and before M9b.
   cut from its element-centering branch, with a feature rather than a
   format version ([Checkpoint and restart](#checkpoint-and-restart)).
 
-  *Not yet measured*, all on Symmetry, which was unreachable from step 3
-  on: the suite for steps 3 to 8 there, `--trace-compile-timing` of
-  `test/mpi_workload.jl` for the final head against `main`, and the
-  schedule build's allocation with the boundary plan's `patches`, one
-  `Int32` per local block.
+  *The final head on Symmetry* (3d6aaf0, 2026-11-03, after the tunnel
+  came back): the suite at eight threads passes, 161,827 tests in
+  26 min 41 s (job 588436, cn082, EPYC 7532), and TreeIOHDF5's
+  branch passes its suite against it, 1088 tests in 5 min 15 s at one
+  thread (job 588437). `--trace-compile-timing` of 71827cc's
+  `test/mpi_workload.jl` against 71827cc, in the setup of step 3, on
+  cn080 (EPYC 7532, job 588468), outputs identical byte for byte:
+  71827cc 137.39–137.77 s with 1288 roots, the final head
+  137.43–139.53 s with 1294; best of three 137.39 against 137.43 s, so
+  the boundary plan's type parameter costs nothing measurable. A first
+  run on cn090 (job 588437) gave 135.5–138.2 s against 137.9–141.3 s,
+  but its baseline alone spread over 2.6 s, so it is not the number.
+  *Not yet measured*, because the tunnel went down again: the suite at
+  one thread, and the schedule build's allocation with the boundary
+  plan's `patches`, one `Int32` per local block.
 
   *Companion and downstream.* TreeIOHDF5's branch takes TreeAMR from
   the checkout beside it through `[sources]` path entries, with
