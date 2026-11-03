@@ -146,8 +146,8 @@ name. What remains, in order:
 
 1. **TreeWaveOLDG's acceptance**: its scalar wave on the four-patch
    annulus, uniform, against this checkout.
-2. **The releases.** TreeWave's and TreeHydro's suites against the
-   checkout, then a TreeAMR release; then TreeIOHDF5's 0.1.6 (element
+2. **The releases.** A TreeAMR release (TreeWave's and TreeHydro's
+   suites pass against the checkout); then TreeIOHDF5's 0.1.6 (element
    sets, pending), and a release of its own for the feature `patches`,
    with `[compat] TreeAMR` the new version alone, since its save calls
    `patch_keywords`, and its `[sources]` path entries removed

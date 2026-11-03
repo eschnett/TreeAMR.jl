@@ -4474,9 +4474,9 @@ M12 was decided with Erik, after M7 and before M9b.
   satisfies; its release for M17 lists the new TreeAMR version alone,
   since its save calls `patch_keywords`, which 0.2.7 does not have, and
   comes after its 0.1.6, whose element sets M17's checkpoints use.
-  TreeWave's and TreeHydro's suites have not been run against the
-  checkout, and TreeWaveOLDG's annulus, the acceptance test, has not
-  been run.
+  TreeWave's and TreeHydro's suites pass against the checkout
+  ([Downstream checks](#downstream-checks)); TreeWaveOLDG's annulus,
+  the acceptance test, has not been run.
 
 ## Downstream checks
 
@@ -4490,7 +4490,9 @@ reached it with 0.1.5 and changed nothing serially: 310 tests in 1m22
 against the M7 checkout (2026-10-02); M12, released in 0.1.7, changed
 nothing either, 310 tests in 1m17 against the M12 checkout (2026-10-03).
 M16 changed nothing for it: 349 tests in 1m41 against the M16 checkout
-(2026-10-31).
+(2026-10-31). Nor did M17: 349 tests in 3m19 against the M17 checkout
+(777a3b4, 2026-11-03), on Symmetry (job 588617, cn080, EPYC 7532), where
+the suite runs slower than on the laptop.
 
 **TreeHydro.** It is **implemented, not a sketch**: sixteen files in
 `src/`, fourteen test files, two viewers in `bin/`, its own CI and
@@ -4514,7 +4516,10 @@ keywords and the run histories as plain data; its `src/checkpoint.jl`
 changed nothing for it serially: 12447 tests in 5m00 against the M7
 checkout, at one thread (2026-10-02); nor did M12 (0.1.7), 12447 tests in
 5m08 against the M12 checkout (2026-10-03); nor did M16, 12679 tests in
-5m28 against the M16 checkout (2026-10-31). Its own MPI port
+5m28 against the M16 checkout (2026-10-31); nor did M17, 12679 tests in
+13m42 against the M17 checkout (777a3b4, 2026-11-03) on Symmetry (job
+588624, cn082, EPYC 7532), with TreeIOHDF5 taken from its M17 branch
+(787c3a9), since no registered TreeIOHDF5 accepts TreeAMR 0.2.7. Its own MPI port
 (2026-10-02) found the one TreeAMR bug so far on a rank without blocks —
 the `AllVariables` boundary hook's length check, of which it is the only
 caller — so it needs TreeAMR 0.1.6, which has the fix.
