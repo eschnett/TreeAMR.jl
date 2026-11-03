@@ -249,15 +249,17 @@ tie-breaking. Consequences:
   seam does, and evolves both copies from same-level ghosts that are
   each other's images. So `GhostSchedule` refuses a layout that holds a
   reversed axis of a glue vertex-like, except the normal of a low face
-  glued to a low face, saying why. **(open)** Lifting it for tangents
-  would be M14's `seam_shift` generalised to a glue — the target's
+  glued to a low face, saying why. It stays refused until the milestone
+  that lifts the patch-corner refusal for cell- and vertex-centered
+  sets, the first whose meshes need it, and is lifted with it. For
+  tangents that is M14's `seam_shift` generalised to a glue — the target's
   partition one plane up along every reversed vertex-like tangent, so
   that each region is the image of one real block's owned points — with
   its cases for the hook's clamped regions and for symmetric walls; for
   a high face glued to a high face it would need one block named owner
   of the shared plane. Neither mesh M17 is for needs it: the annulus is
   glued by the identity, and the cubed sphere's sets are element sets,
-  which store as cell-centered ones. Whether to lift it is Erik's call.
+  which store as cell-centered ones.
 
 **Stored layout.** Per dimension `d`, with `c_d = 1` for `:vertex` and
 `0` for `:cell`, a field set with ghost width `G_d` stores `N + 2G_d +
@@ -6417,11 +6419,8 @@ Remaining, none blocking before their milestone:
   [Application interface](#application-interface-sketch) and the
   refusal under [Point interpolation](#point-interpolation); how it came
   about is in [HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform).
-  Four decisions there are Erik's to make, each marked **(open)** where
+  Three decisions there are Erik's to make, each marked **(open)** where
   it lives:
-  - a reversed vertex-like axis across a glue, refused except as the
-    normal of a low face glued to a low face, which lifting would need
-    M14's `seam_shift` generalised to a glue (Centerings);
   - `CellBoundary(Relative(WithPatch(f)))`, refused rather than built
     (Application interface);
   - point location on a forest of one patch built through the `patches`
@@ -6433,7 +6432,8 @@ Remaining, none blocking before their milestone:
   (the oriented prolongation, restriction and interface restriction, and
   2:1 balance through the table), which conformity keeps out; patch
   corners for cell- and vertex-centered sets, which a finite-difference
-  code on a cubed sphere would need, and point interpolation on a forest
+  code on a cubed sphere would need, and with them a reversed
+  vertex-like axis across a glue (Centerings), and point interpolation on a forest
   of patches, both refused with their reasons; a per-interface variable
   map, for patch-local components; and the patch in `block_fold`'s
   `FoldPoint` and in the regrid criterion.
