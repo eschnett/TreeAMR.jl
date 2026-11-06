@@ -6,8 +6,9 @@
 # and is compilation-bound: some 55 s of wall clock a job, against a few
 # seconds of arithmetic (measured in M7 step 9, "Suite cost" in HISTORY.md).
 # Where the machine has room for both jobs beside the suite, they start
-# here, at the start of the suite, and compile on otherwise idle cores
-# while the rest of it runs. The jobs are independent of each other and
+# at the start of the process that runs `mpi_tests.jl` (the whole suite,
+# or one group of it) and compile on otherwise idle cores while the rest
+# of it runs. The jobs are independent of each other and
 # of the serial reference. Elsewhere — a CI runner — nothing starts here,
 # and `mpi_tests.jl` runs the serial reference, the three-rank job and
 # the two-rank job one after the other, for the memory.
@@ -19,9 +20,11 @@ const MPI_WORKLOAD = joinpath(@__DIR__, "mpi_workload.jl")
 # Whether the two jobs may run at once and beside the suite: five
 # single-threaded ranks, each compiling the workload, which measured
 # about 2 GB resident a rank (2026-10-02), beside this process and the
-# thread-independence test's subprocesses. A CI runner (3–4 cores, 7–16
-# GB) does not qualify; `TREEAMR_TEST_MPI_CONCURRENT=0` or `1` decides
-# it by hand.
+# thread-independence test's subprocesses — and, where the suite runs in
+# groups, beside the other groups' processes, which `test_group_count`
+# allows only on a machine that passes this same test. A CI runner (3–4
+# cores, 7–16 GB) does not qualify; `TREEAMR_TEST_MPI_CONCURRENT=0` or `1`
+# decides it by hand.
 function concurrent_launches()
     choice = get(ENV, "TREEAMR_TEST_MPI_CONCURRENT", "")
     choice == "1" && return true

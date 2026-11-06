@@ -4332,6 +4332,50 @@ checks together. Considered and left for later: splitting the suite into
 groups that run in parallel (worth it first in TreeGeneralizedHarmonic),
 and running the full suite on Symmetry before a release.
 
+**Parallel groups** (2026-11-05 and 06). With CI on pull requests reduced
+to Linux, the local full suite became the gate, at 11m26 (686 s) at one
+thread. A SLURM script on Symmetry that only called `Pkg.test` was
+proposed and dropped: CI's Linux cells already are the x86-64 run, and
+the H200 suite runs exist in `bench/`. What would shorten the gate is
+running the suite's compilation in parallel, measured on the laptop at
+one thread before any change:
+
+| how the files ran | wall |
+|---|---|
+| one process (the suite then) | 686 s |
+| one process per file, run one after another | 1889 s summed |
+| one process per file, 4 / 6 at once | 630 / 501 s |
+| the include list in 3 / 5 groups | 330 / 269 s |
+
+One process per file loses because every process recompiles what the
+files share. Groups keep most of the sharing, and they need no package:
+the parent process only starts `runtests.jl` once per group.
+
+At first the groups had to respect 13 files' calls into other test
+files, and a file a group needed ran twice. Erik pointed out that the
+test files are definitions followed by tests and can be split, so the
+definitions of the ten files others call moved verbatim to
+`test/helpers/`, by a script that split each file at its top-level
+expressions. The inline M1 tests moved to `tree_tests.jl`. Every file
+then ran alone, all 30 passing at the first try, and a group packing
+became free of constraints.
+
+Measured with `Pkg.test` after the change (M3 Pro, two rounds of one
+run each, 157745 tests in every configuration; in the second round
+FortiTray, WindowServer and Spotlight took 40–80 % of a core each):
+
+| threads | serial | 3 groups | 4 groups | 5 groups |
+|---|---|---|---|---|
+| 1, first round | 640 s | 312 s | 345 s | 242 s |
+| 1, second round | | 511 s | 364 s | 349 s |
+| 8 | 724 s | | | 358 s |
+
+At five groups the groups' own times were 195–231 s. A first 4-group run
+took 1436 s because the laptop slept through 22 minutes of it, on
+battery; it was discarded. A deliberately failing test in one group
+failed `Pkg.test`, and a grouped `Pkg.test(coverage=true)` passed in
+415 s with `.cov` files from every child.
+
 **Suite timings after M12** (as CLAUDE.md recorded them): the
 thread-independence test's two subprocesses running
 `test/thread_workload.jl` take ~26 s each since M12's rotating cycles,

@@ -24,11 +24,9 @@
 #                  "Random", "SHA", "SciMLBase", "Test"])'
 #     TREEAMR_TEST_BACKEND=metal julia --project=<env> test/runtests.jl
 #
-# This file alone runs in the same environment after the helper files
-# (`oracles.jl`, `ghost_oracles.jl`, `wave.jl`, `burgers.jl`) and the
-# test files whose definitions it calls: `ghost_tests.jl` (`full_sum`,
-# `finite_fill!`), and `partition_tests.jl` before `exchange_tests.jl`
-# (the lockstep fills).
+# This file alone runs in the same environment as
+#
+#     TREEAMR_TEST_BACKEND=metal julia --project=<env> test/runtests.jl gpu_tests
 #
 # `cuda` and `metal` are recognized. A backend that is named but not
 # functional is reported and skipped rather than failing: the point is
