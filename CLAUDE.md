@@ -159,7 +159,7 @@ TreeAMR the same way:
 julia --project=test -e 'using Pkg; Pkg.instantiate()'
 ```
 
-Coverage, the way CI's single-threaded cells measure it (`CODE.md`,
+Coverage, the way CI's macOS single-threaded cell measures it (`CODE.md`,
 "Tests", says what CI covers and what instrumentation costs). The `.cov`
 files scattered through `src/` are gitignored; delete them before the
 next run, because counts from separate runs accumulate:
@@ -444,9 +444,13 @@ the one that says why.
   file says why. All three downstreams bound TreeAMR by `[compat]` over
   the `0.1` series, so a `0.1.x` release lands on their next resolve, and
   an API break has to go to `0.2`.
-- CI (`.github/workflows/CI.yml`) tests on Julia **1.13** only, on Linux
-  and macOS (arm64). `Project.toml` says `julia = "1.13"`, the floor of
-  every Tree* package, so 1.13 features are fine and no 1.14 ones.
+- CI (`.github/workflows/CI.yml`) tests on Julia **1.13** only. `Project.toml`
+  says `julia = "1.13"`, the floor of every Tree* package, so 1.13
+  features are fine and no 1.14 ones. A pull request runs only the Linux
+  cells, without coverage; macOS (arm64) and coverage run on `main`,
+  weekly and on dispatch, and Markdown-only changes run nothing
+  (`CODE.md`, "Tests"). So **run the full suite locally before opening a
+  pull request**: that is the macOS run the pull request does not get.
 - The `[sources]` entries in `test/Project.toml` and `docs/Project.toml`
   are committed and meant to be. Do not `Pkg.develop` TreeAMR into
   either any more: that is what they replace. IMEXRungeKutta is taken

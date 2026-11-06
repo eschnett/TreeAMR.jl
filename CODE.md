@@ -5565,10 +5565,22 @@ noise; the same treatment of `test/thread_workload.jl` moved its 18.8 s
 by 2 %. CI gains nothing from such a change in any case, since
 `check_bounds: yes` overrides `@inbounds` package-wide.
 
-**CI and coverage.** `julia-actions/julia-runtest` defaults `coverage`
-to `true`; CI.yml ties coverage to `threads == 1`, which keeps
-it on the two cheap cells (both operating systems, merged by Codecov)
-and drops it from the expensive threaded ones. Instrumentation cost
+**CI and coverage.** CI runs in two tiers, the same in every Tree*
+repository. A pull request runs the two Linux cells (one and four
+threads) uninstrumented: the full suite has run on the author's macOS
+machine before the pull request is opened, so what CI adds is x86-64
+Linux, a clean environment and `check_bounds: yes`. A push to `main`,
+the weekly schedule and a manual dispatch add the two macOS cells, and
+coverage. Changes to Markdown and `docs/` run no CI at all, and tags
+are not tested, since TagBot tags a commit that has passed on `main`.
+The measurements behind this are in [HISTORY.md](HISTORY.md#development-environment-and-ci).
+
+`julia-actions/julia-runtest` defaults `coverage` to `true`; CI.yml
+instruments exactly one cell, macOS at one thread, off pull requests.
+Not a threaded cell, which is the expensive one, and not a Linux cell:
+`--code-coverage` with `--check-bounds=yes` miscompiles on GitHub's
+AVX-512 Zen 4/5 runners under Julia 1.13 (TreeGeneralizedHarmonic's
+CI.yml has the probes). Instrumentation cost
 **2.61x** locally (measured: 3m23.6s → 8m51.8s, 88819 tests, 4 threads both times) —
 though that is not the CI factor, because the action also defaults
 `check_bounds` to `yes` and a plain `Pkg.test` no longer does.

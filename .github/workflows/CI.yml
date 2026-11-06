@@ -1,10 +1,25 @@
 name: CI
 
+# Two tiers, the same in every Tree* repository. A pull request runs the
+# Linux cells only, uninstrumented: the full suite has already run on the
+# author's machine (macOS, arm64), so what CI adds there is x86-64 Linux,
+# a clean environment and bounds checks. A push to `main`, the weekly
+# schedule and a manual dispatch run the whole matrix, macOS and coverage
+# included. Markdown and `docs/` changes run nothing: no test reads them,
+# and the doctests run in Documentation.yml. Tags are not tested: TagBot
+# tags a commit that has already passed on `main`.
 on:
   push:
     branches: [main]
-    tags: ["*"]
+    paths-ignore: ["**.md", "docs/**"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**"]
+  # Weekly, for what changes without a push here: the registry, and the
+  # dependencies taken from `main` through `[sources]`. The Tree*
+  # repositories are staggered by 20 minutes so that their macOS cells do
+  # not queue behind each other (five run at once per account).
+  schedule:
+    - cron: "0 5 * * 1"
   workflow_dispatch:
 
 concurrency:
@@ -25,18 +40,24 @@ jobs:
       fail-fast: false
       matrix:
         version: ["1.13"]
-        os: [ubuntu-latest, macOS-latest]
+        # macOS only off pull requests (see `on:` above).
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macOS-latest"]') }}
         # The suite must pass threaded as well as serial. The
         # thread-independence test and the MPI test spawn their own
         # subprocesses either way (the MPI ranks at one thread each,
         # whatever this says); this is what runs the rest of the suite
         # on threads.
         threads: [1, 4]
-    # Coverage exactly on the single-threaded cells. Turning coverage
-    # off on the `threads: 4` cells makes CI faster, because those are
-    # the expensive ones -- a 4-vCPU runner is oversubscribed by
-    # `--threads=4` plus the subprocesses the thread-independence test
-    # spawns.
+    # Coverage on one cell, macOS at one thread, and never on a pull
+    # request. Instrumentation costs 2.6x here (CODE.md, "Tests"), so it
+    # is bought once per push to `main`, where the badge reads it. Not a
+    # Linux cell: `--code-coverage` together with `--check-bounds=yes`
+    # miscompiles on GitHub's AVX-512 Zen 4/5 runners under Julia 1.13
+    # (TreeGeneralizedHarmonic's CI.yml has the probes). Not a threaded
+    # cell: a 4-vCPU runner is oversubscribed by `--threads=4` plus the
+    # subprocesses the thread-independence test spawns.
+    env:
+      COVERAGE: ${{ matrix.os == 'macOS-latest' && matrix.threads == 1 && github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -53,13 +74,13 @@ jobs:
       - uses: julia-actions/julia-runtest@v1
         with:
           check_bounds: 'yes'
-          coverage: ${{ matrix.threads == 1 }}
+          coverage: ${{ env.COVERAGE }}
         env:
           JULIA_NUM_THREADS: ${{ matrix.threads }}
       - uses: julia-actions/julia-processcoverage@v1
-        if: matrix.threads == 1
+        if: env.COVERAGE == 'true'
       - uses: codecov/codecov-action@v7
-        if: matrix.threads == 1
+        if: env.COVERAGE == 'true'
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
