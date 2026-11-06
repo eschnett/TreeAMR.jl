@@ -80,15 +80,18 @@ pins exact TreeAMR versions (`CODE.md`, "Companion interface").
 
 ## Commands
 
-Full test suite, about 11 min at one thread and at eight; the
-thread-independence test spends about 50 s of it in two subprocesses
-running `test/thread_workload.jl`. The MPI test's two `mpiexec` jobs,
-about a minute each and nearly all compilation, run *beside* the suite
-where the machine has 8+ threads and 24+ GB (`test/mpi_jobs.jl`); on a
-smaller machine, CI's runners among them, they run one after the other
+Full test suite, about 4 min at one thread and 6 at eight. Where the
+machine has 8+ threads and 24+ GB, `test/runtests.jl` runs the files in
+up to five processes at once; in one process, the way CI's runners run
+it, it takes about 11 min and 12 (`TREEAMR_TEST_GROUPS=n` sets the
+count, `1` gives the single process; `CODE.md`, "Tests", *Parallel
+groups*). The thread-independence test spends about 50 s in two
+subprocesses running `test/thread_workload.jl`. The MPI test's two
+`mpiexec` jobs, about a minute each and nearly all compilation, run
+*beside* the rest on the same large machines (`test/mpi_jobs.jl`); on a
+smaller machine they run one after the other
 (`TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice). The
-per-file times are in `HISTORY.md` (M7 step 9, M12's steps, M16 step
-8).
+per-file weights are in `test/test_groups.jl`.
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
 shorten it by making the kernels faster (`CODE.md`, "Tests", has the
@@ -107,13 +110,15 @@ subprocesses either way):
 julia --project=. -e 'using Pkg; Pkg.test(; julia_args = ["--threads=8"])'
 ```
 
-A single test file. The `test/*_tests.jl` files are `include`d by
-`runtests.jl` and rely on the helper files, so include those first.
-`test/Project.toml` locates TreeAMR (`..`) and the unregistered
-IMEXRungeKutta (GitHub `main`) through `[sources]`:
+A single test file, or several: `runtests.jl` runs the files it is
+given, in its own process, after the helper files. Every test file runs
+on its own, so a definition that another test file calls belongs in
+`test/helpers/` (`CODE.md`, "Tests"). `test/Project.toml` locates
+TreeAMR (`..`) and the unregistered IMEXRungeKutta (GitHub `main`)
+through `[sources]`:
 
 ```bash
-julia --project=test -e 'using Test, Random, TreeAMR; include("test/oracles.jl"); include("test/ghost_oracles.jl"); include("test/wave.jl"); include("test/regrid_tests.jl")'
+julia --project=test test/runtests.jl regrid_tests
 ```
 
 The MPI tests (M7) are part of `Pkg.test`: `test/mpi_tests.jl` launches
@@ -122,12 +127,12 @@ binary MPIPreferences selects for the load path: MPICH_jll by default
 (CI), MPIABI_jll here, which a `LocalPreferences.toml` in the global
 v1.13 environment selects — with
 `setenv(cmd, mpiexec().env)`, since interpolating `mpiexec()` into a
-larger command drops its library paths. On its own (it needs no helper
-file; about 2 min here, where both jobs start beside the serial
-reference, and about 4 on CI's one-after-the-other path):
+larger command drops its library paths. On its own (about 2 min here,
+where both jobs start beside the serial reference, and about 4 on CI's
+one-after-the-other path):
 
 ```bash
-julia --project=test -e 'using Test, TreeAMR; @testset "mpi" begin include("test/mpi_tests.jl") end'
+julia --project=test test/runtests.jl mpi_tests
 ```
 
 The workload by hand, serially and at three ranks; every line but the
@@ -425,6 +430,10 @@ the one that says why.
   "coarsening test"), and each opens with a comment naming the failure mode it
   guards. Convergence rates and conservation are asserted as numbers with
   tolerances; when a measured number changes, `CODE.md` is updated too.
+- Every test file runs on its own after the helper files, since the
+  suite splits them over processes: a definition that a second test
+  file calls goes in `test/helpers/`, and a new test file goes in
+  `TEST_FILES` in `test/test_groups.jl` (`CODE.md`, "Tests").
 - Keep `thread_workload.jl` and `mpi_workload.jl` self-contained, and
   everything they print deterministic (`CODE.md`, "Tests").
 - Documenter is strict: every docstring in the module must appear in a
