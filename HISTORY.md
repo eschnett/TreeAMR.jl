@@ -4308,7 +4308,29 @@ the 1.11 procedure left `CLAUDE.md`.
 **Coverage.** `julia-actions/julia-runtest` defaults `coverage` to
 `true`, so until the Codecov upload was added *every* CI cell was paying
 for coverage and discarding it; CI.yml then tied coverage to
-`threads == 1`.
+`threads == 1`, on both operating systems and on every pull request.
+
+**Two CI tiers** (2026-11-05, Erik, for all eight Tree* repositories at
+once). CI had become the slow part of every change: in the runs of
+late October, TreeAMR's four cells took 22–53 min, the instrumented
+ubuntu cell the slowest (0.2.7: 90 s of precompilation, then a 50m21
+test summary, against about 11 min for the uninstrumented suite on the
+laptop), and TreeGeneralizedHarmonic's 65–90 min. Three things were
+paying for nothing. About two thirds of the commits on `main` touch only
+Markdown or `docs/` (54 of TreeAMR's last 80, 52–61 of 80 in the larger
+downstreams), and each ran the whole matrix. Every release ran it again
+on the tag, for a commit `main` had already passed (52 min for 0.2.7).
+And pull requests waited on macOS cells, which the account runs at most
+five at once across all the repositories, while the author's own run
+before the pull request is already a macOS one. So pull requests now run
+the Linux cells only, uninstrumented; `main`, a weekly schedule and
+manual dispatch run everything; Markdown and `docs/` changes and tags
+run nothing. Coverage moved to the macOS one-thread cell alone, off pull
+requests, which TreeGeneralizedHarmonic, TreeGRRMHD and TreeHydro had
+already chosen because Linux runners miscompile under coverage and bounds
+checks together. Considered and left for later: splitting the suite into
+groups that run in parallel (worth it first in TreeGeneralizedHarmonic),
+and running the full suite on Symmetry before a release.
 
 **Suite timings after M12** (as CLAUDE.md recorded them): the
 thread-independence test's two subprocesses running
