@@ -58,7 +58,7 @@ function weighted(g::TreeAMR.TransferGroup{TT,DD}) where {TT,DD}
                                               s.single),
                    g.stencils)
     return TreeAMR.TransferGroup{TT,DD}(g.kind, stencils, g.targetblocks, g.sourceblocks,
-                                        g.factorcol, g.orientation, g.plane)
+                                        g.factorcol, g.orientation, (g.perm, g.flip))
 end
 
 function main()

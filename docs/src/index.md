@@ -90,8 +90,12 @@ schemes: [`elementcentered`](@ref) with the order `P` on the
 the [`ElementLocal`](@ref) operators fill them across element faces only,
 in one stage, with a coarse-fine coupling that keeps a
 summation-by-parts scheme's discrete energy an exact invariant. A regrid
-refines and coarsens them exactly to the element's degree. Next is
-visualization export (M9b).
+refines and coarsens them exactly to the element's degree.
+
+M17, implemented and awaiting its downstream acceptance and its
+release, glues several bricks of roots, *patches*, at their faces, for
+an annulus or a cubed sphere on uniform meshes (see
+[Forests of patches](@ref)). Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -260,7 +264,9 @@ julia> fill_by_coordinates!(AllVariables(x -> (x[1], 2 * x[1])), state);
 
 The two forms write bit-for-bit the same numbers, and
 [`CellBoundary`](@ref), [`boundary_by_coordinates`](@ref) and
-[`adapt_to_initial_data!`](@ref)'s `initial` take the wrapper too.
+[`adapt_to_initial_data!`](@ref)'s `initial` take the wrapper too. On a forest of patches, [`WithPatch`](@ref)
+wrapped around either form hands the callback its point's patch as well
+(see [Forests of patches](@ref)).
 
 Under 2:1 balance there are only three cases — a same-level copy, a
 restriction from finer neighbors, and a prolongation from a coarser one
@@ -459,6 +465,62 @@ julia> hs.work[1, 2, :, 1]            # ρ = xy and v = x, turned from (0.125, 0
 
 See "Half turn" under "Domain and boundaries" and *Half turns* under
 "Rotating seams" in the design document.
+
+## Forests of patches
+
+A forest may also be several bricks of roots, **patches**, glued at
+their faces (M17), for a domain that no one brick covers: an annulus, a
+cubed sphere. Each patch has its own `roots` and its own logical
+`extents`, and `glue` lists, for each glued face `(patch, dim, side)`,
+the face across it and the signed axis permutation `map` that carries
+this patch's axes onto that patch's, both directions of every gluing.
+The coordinates stay logical, patch by patch: the map from a patch's box
+to space is the application's, and the boxes may coincide, so a
+callback is told the patch of its point by wrapping it in
+[`WithPatch`](@ref). Four patches with one box, glued around a ring by
+the identity, make an annulus when patch `p` covers the angles
+`(p − 1 + x₁) π/2`:
+
+```jldoctest patches
+julia> using TreeAMR
+
+julia> next(p) = mod1(p + 1, 4);
+
+julia> ring = Forest([(roots = (2, 1), extents = ((0, 1), (1, 1.5))) for p in 1:4]; N = 4,
+                     glue = [g for p in 1:4 for g in
+                             ((from = (p, 1, 2), to = (next(p), 1, 1), map = (1, 2)),
+                              (from = (next(p), 1, 1), to = (p, 1, 2), map = (1, 2)))]);
+
+julia> block_patches(ring) == [1, 1, 2, 2, 3, 3, 4, 4]
+true
+
+julia> xphys(x, p) = (φ = (p - 1 + x[1]) * π / 2; (x[2] * cos(φ), x[2] * sin(φ)));
+
+julia> fs = FieldSet(ring, 1; G = 1);
+
+julia> f = WithPatch((x, p, v) -> xphys(x, p)[1]);      # the physical x
+
+julia> fill_by_coordinates!(f, fs);
+
+julia> fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation = 2, restriction = 2));
+                    boundary = boundary_by_coordinates(f));
+
+julia> coordinates(fs, 2, (6, 3))     # a ghost of patch 1 beyond its glued high face
+(1.0625, 1.1875)
+
+julia> fs.work[6, 3, 1, 2] == xphys((1.0625, 1.1875), 1)[1]    # patch 2's point there
+true
+```
+
+The meshes are uniform across a glued face: [`balance!`](@ref) keeps
+the leaves on either side of one at the same level. A ghost region
+beyond two glued faces at once, at a patch corner where three or more
+patches meet, is refused by the schedule for cell- and vertex-centered
+sets; element sets are filled on faces only and never reach one, so a
+cubed sphere runs them. Point location, and so [`interpolate`](@ref),
+refuses a forest of patches, since a logical position names a point in
+each patch. See "A multi-patch forest" under "Domain and boundaries"
+and "Glued faces" under "Ghost filling" in the design document.
 
 ## Conservation at coarse-fine faces
 

@@ -7,11 +7,13 @@ milestone records, the downstream checks and the release history. The
 current design, with the reasons for it, is in [CODE.md](CODE.md), and
 the plan in [PLAN.md](PLAN.md). The sections follow CODE.md's.
 
-**Step numbers.** The milestones M0–M16 are those of
+**Step numbers.** The milestones M0–M17 are those of
 [PLAN.md](PLAN.md), numbered in the order they were planned and done in
-the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14, M15, M16. Several were built in
+the order M0–M6, M8, M10, M11, M9a, M7, M12, M13, M14, M15, M16; M17 is
+implemented and not yet done. Several were built in
 numbered steps — M8a steps 1–3 and M8b steps 4–5, M7 steps 0–9 with a
-step 6b, M12 steps 0–10, M13 steps 1–4, M14 steps 0–8, M16 steps 1–8 — and a reference
+step 6b, M12 steps 0–10, M13 steps 1–4, M14 steps 0–8, M16 steps 1–8,
+M17 steps 1–8 — and a reference
 such as "M7 step 6b", or "step 8" inside a milestone's record, names one
 of them. Each milestone's steps are listed in its record under
 [Milestones](#milestones).
@@ -58,6 +60,7 @@ of them. Each milestone's steps are listed in its record under
   - [M14 — Half-turn symmetry](#m14--half-turn-symmetry)
   - [M15 — Folds over points](#m15--folds-over-points)
   - [M16 — Element centering](#m16--element-centering)
+  - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -145,6 +148,15 @@ counts).
 
 The neighbor asymmetry was recorded from M1.
 
+Neighbor finding across a glued face (M17 step 2, 2026-11-02). The plan
+had `stepped_node`, the seam's arithmetic, generalised to step across a
+glue; the step left it exactly as it was and added `glued_anchor` beside
+it, which `neighbor_anchor` dispatches to on the connectivity, so that
+the brick path costs one type test and the seam's tables stay the
+special case they are. The plan's `Crossing`, two `Int8`s with no `{D}`
+parameter and no axis map, replaced `oriented_neighbors`' bare `r`, as
+planned: of its nine call sites three need the map, and look it up.
+
 ### Domain and boundaries
 
 Reflecting faces came with M10, which decided that `NoParity` is refused in a dimension with a reflecting face. Until M10 the boundary hook was also the only way to express a reflection, which it could not do correctly at every edge and corner (see [Ghost filling](CODE.md#ghost-filling)).
@@ -160,6 +172,18 @@ Erik also decided how the forest stores it: one field of face kinds, `faces`, an
 The relative boundary hook is TreeGRRMHD's AMR-7, first asked for in its step 6 and revised on 2026-10-15. The first draft had the callback return the difference `Δ` between a ghost and its nearest owned point, `(xg, xr, v, δ) -> Δ`; TreeGRRMHD replaced it with the reference field itself, `f(x)`, from which TreeAMR forms the difference, so that the caller supplies a function of position only and nothing in the interface refers to the mesh. Erik asked whether a fresh hook per fill, the time captured in `f`, is efficient on a device; it is, since the closure keeps its type, and a test checks that the second fill compiles nothing. The formula is evaluated as `f(x_g) + (u(r) − f(x_r))`, which returns `f(x_g)` bit for bit when the data equal `f`, where the other association does not. The per-variable form, with no variable index, is accepted on a one-variable set only — TreeGRRMHD's potentials are one each — which TreeAMR decided and reported back. The request's corner rule — take `x_r` across a block face — came from TreeGRRMHD's step 8, which measured what clamping cost; it suggested running those rows after all the prolongations, which the exploration found would starve a finer block that prolongates from the coarse block's corner, so each region instead waits for the stage that fills what it reads. A negative control, every region after phase 1, leaves 12 and 2718 ghosts undefined in the 2D and 3D fixed-point tests.
 
 Symmetric walls are TreeGRRMHD's AMR-8 (2026-10-15; Erik chose its "option 1", a per-set opt-in, the same day). TreeGRRMHD measured the half-open asymmetry in its closed boxes — 1.3e−4 in a 16³ blast after three steps (its step 7), 1.0e−1 of a variable's scale at `t = 1/4` (its step 8) — and worked around it with a kernel of its own prescribing the potentials' low walls inside its limiters. The design kept ownership, and with it the uniform state layout, and changed what the fill writes. The first sketch only widened the low region to `1 : G+1`; the exploration before any code found that the tangential regions of the other directions cover `G+1` too, so two regions would write it in one phase and a phase-1 copy would read it while it was being written. Trimming the block's own range to `G+2 : G+N`, the mirror of the high side, removed both, at the price of a key field (`low`), since the trimmed stencils differ from an interior block's with the same direction and offset. A domain face is decided by an empty neighbour search rather than by the face kind, so that a rotating seam, whose faces have neighbours, is excluded without a case of its own. While writing the tests, a refined vertex-centered box was found to be mirror-asymmetric by 4.7e−5 under either kind of wall: half-open ownership at coarse-fine faces, not at the domain's, recorded as open in [CODE.md](CODE.md#centerings).
+
+The multi-patch forest was raised on 2026-11-02, when Erik asked what TreeAMR would have to gain for a scalar wave on a multi-patch domain with uniform meshes in TreeWaveOLDG. Its four shape decisions were his the same day:
+- several root bricks glued at their faces, because inside a patch the neighbor arithmetic then stays what it is. The alternatives were a flat list of roots with a per-face table, p4est's connectivity exactly, which makes every root-level query a lookup and empties `root_position` and `root_index` of meaning; and the outer faces of one brick glued to each other, the smallest change, which forces every patch to one size and an awkward packing;
+- the coordinates left logical, with the curvilinear map, its Jacobian and its norms the application's. A forest that carried the maps would make `coordinates`, `fill_by_coordinates!`, the norms and `interpolate` physical, which is convenient downstream, but puts geometry that is physics in the mesh layer, has to be device-transportable, and turns `interpolate` into a root-finding problem;
+- uniform meshes only in the first milestone, which leaves out the oriented prolongation, restriction and balance that refinement across a glued face would need;
+- the quarter- and half-turn seams left exactly as they are, a second mechanism beside the connectivity, with whether they collapse into it judged from the finished code.
+
+It was specified as an open question of CODE.md and planned as M17 the same day (71827cc), and built the same day from an implementation plan, step by step, by Claude agents; the record is the M17 entry under [Milestones](#milestones).
+
+One decision of the specification was reversed by the implementation plan, before any code: patch extents were to have been pairwise disjoint, so that a logical position still named one point. That was dropped because nothing consumes the uniqueness once `locate_point` refuses a forest of patches — every kernel that carries a position gets its geometry from per-block arrays, and `coordinates` takes a block index — because it would have forced a cubed sphere's six natural `[−1, 1]²` boxes apart, and because it would have encoded the patch into floats for a device kernel to range-test back out. `block_patches` carries the patch as an integer instead, and `WithPatch` hands it to the callbacks.
+
+The construction (M17 step 1) departed from the plan in three places. The plan refused `periodic` together with glue; the forest refuses any `true` in `periodic` on the patches form, glue or not, since a wrap is a patch glued to its own opposite face and the two ways of saying it would otherwise both be accepted for one forest. It refuses a map that does not carry a face's normal onto the normal of the face across with the sign that makes a step out of the one a step into the other, which the plan did not list and which a map must satisfy for the affine map to be a gluing at all. And the glue table is dense, one entry per patch face at an index computed from `(patch, dim, side)`, rather than one entry per listed gluing: a step then finds its face's entry by arithmetic, and the index is canonical whatever order the caller listed the glue in, where the plan had taken the caller's order, the same on every rank because the call is collective. So two forests glued alike are one forest, digest and checkpoint included, however their glue was listed. Its cost is a limit of 127 faces, 21 patches in 3D, since the index travels as an `Int8` in `Crossing` and `GroupKey`; a cubed sphere has 36. `root_index(forest, pos)` refuses a forest of several patches and gains `root_index(forest, p, pos)`, as planned; both behave as before on one patch.
 
 ### Precision
 
@@ -210,6 +234,15 @@ which side of the discontinuity a ghost takes its value from would have
 to become part of how a ghost names its source. Faces only, with
 injection normal to the face, made it unnecessary, since the copy's
 stencil normal to the face already reads the neighbour's face node.
+
+The fill across a glued face is M17 step 3 (2026-11-02). The axis map went back into the group: M12's design had a group carry its axis map, its step 3 had made that the orientation and the seam's plane, from which `run_group!` derived the map at the launch, and M17 replaced the plane by the map itself, `perm`, `flip` and a `turned` flag, computed when the group is built, since a glue's map is not one of four quarter turns in a plane. That broke the struct-size claim of the docstring — the small fields had shared the eight bytes `factorcol` had alone — which the docstring now says, and why it does not matter. Three things the plan did not have:
+- *The patch-corner refusal is exact.* The plan refused on the pair (centering, `corners`) alone, on the argument that a non-element set's corner region is nonempty whenever its ghost widths are. The built check refuses only where the region beyond both glued faces is nonempty along both dimensions, so a cell set with `G = 0` along one of them is accepted, and is tested against the brick bit for bit. A vertex-like dimension with `G = 0` still has its shared high plane, and is refused on its high side.
+- *The layout check is new* (`check_glue_layout`). A turned read takes the target's own stored size and offsets, so a dimension and the one it is glued onto must hold their points alike, as a seam's `symmetric_layout` asks; without the check the turned read would have used the wrong ghost widths. Its second half refuses a reversed vertex-like axis except the normal of a low face glued to a low face, because half-open ownership does not survive the reversal; the `NaN`-prefill test shows the read it prevents, of a ghost of the block across, unfilled, through a reversed tangent. Lifting it for tangents would be M14's `seam_shift` generalised to a glue; neither mesh of the milestone needs it (the annulus is glued by the identity, the sphere's sets are element sets), so it was left for Erik to decide. He decided (2026-11-03) to keep refusing it, and to lift it with the patch-corner refusal for cell- and vertex-centered sets, the first milestone whose meshes need it ([CODE.md](CODE.md#centerings)).
+- *Every glued prolongation keeps its level alone* in `stage_groups`, turned or not, which the plan had asked for turned groups only: conservative, and only edges and corners can be coarse-fine across a glue.
+
+A test helper raced, not the package: a closure the concurrent boundary hooks called assigned a name that was also a local of its enclosing function, so the hooks shared one boxed variable. A closure that a hook calls must not assign a name of its enclosing scope.
+
+The boundary plan gained a field, `patches`, `block_patches` uploaded at schedule build (M17 step 5), so that a hook handed the patch queries no tree per fill. Its type is a parameter of the plan, so it is in every `GhostSchedule`'s type, which is why the compile-timing comparison of the final head is among M17's remaining checks.
 
 ### What the ghost fill costs
 
@@ -385,6 +418,8 @@ Folding through a rotating seam was designed for M12 on 2026-10-03 and implement
 
 Derivatives were first order until 2026-10-03, when the second order was added.
 
+Point location refuses a forest of patches (M17 step 5, 2026-11-02), as the plan decided, in `PointGeometry`, which every path to it builds, so that the distributed interpolation refuses on every rank before anything is gathered. The step made the refusal cover a forest of one patch built through the `patches` form as well, a self-glued wrap among them, whose wrap `PointGeometry` would not see: the conservative choice, left open for Erik. He decided (2026-11-03) to keep it: the brick form builds and locates in every one-patch forest that matters. He also set the direction for lifting the refusal: a mechanism that maps a global coordinate to a `(patch, local coordinates)` tuple, which point location will then take as its input, with folding done on the global coordinate before the patch lookup, so that only patch boundaries needing a fold in local coordinates stay refused ([CODE.md](CODE.md#point-interpolation)).
+
 Under M7 the routing was "the one place this design will change". It was designed on 2026-10-01 under "Distributed meshes" and implemented in M7's step 5, with the kernel unchanged except for the block offset. The serial path measured the same before and after.
 
 ### Folds over points
@@ -463,9 +498,13 @@ shared-file checkpoint that M7 step 6's record cites. The milestone
 records, M9a and M7 steps 6 and 6b, stay under [Milestones](#milestones)
 here.
 
+The checkpoint of a forest of patches (M17 step 6, 2026-11-02) is a feature of TreeIOHDF5, `patches`, in place of `brick`, with no format-version bump. PLAN.md's M17 had said "a format version and a release of its own", and the implementation plan no bump; the step settled it for the feature, on the precedent of M12's `rotating`, M14's `halfturn`, the outflow faces, AMR-8's symmetric walls and M16's `elements`, all features without a bump, and of TreeIOHDF5's own CODE.md, which named a multi-block connectivity as the example of a feature. A bump would have made every file the new version writes, bricks included, unreadable to the 0.1 readers for nothing they misread. Checked: a brick's `forest/` group is identical, as `h5dump` prints it, between TreeIOHDF5 0.1.6 with TreeAMR 0.2.7 and the branch, the whole files differing only in the save id, the time and the environment texts; 0.1.6 reads the branch's brick file and refuses its patches file by the feature. The file stores exactly `patch_keywords`, nothing the forest derives. TreeIOHDF5's branch was cut from its element-centering branch (1d46124), not from its `main`, which was still 0.1.5 without element sets; M17's element-set checkpoints need those. Its design and record are in TreeIOHDF5's `CODE.md` ("Forests of patches", "Versioning") and `HISTORY.md`.
+
 ## Application interface
 
 The interface sketch was updated for the M8 design; through M6 `G` was a forest keyword and `regrid!` took bare field sets; `reflecting` and `parity` are M10's. The third launch range of `map_blocks!` was amended for TreeHydro.
+
+`WithPatch` is M17 step 5 (2026-11-02), the way the plan asked for it: a wrapper as `AllVariables` is, so that no current caller's signature moves. Two of its choices were the step's. `WithPatch(AllVariables(f))` was built, not left out, because the reason for `AllVariables` — not redoing a per-point conversion `nvars` times — applies even more to a curvilinear map evaluated per point, and the nesting rule, the patch inserted right after the position of whatever form it wraps, made it one method per surface; that order rather than the reverse, which reaches a `WithPatch` called as a callback and says so. `Relative(WithPatch(f))` was refused rather than built: two more kernels, and nothing in the milestone asks for it, though a cubed sphere's outer radial faces with a relative condition in physical coordinates would; it was left to Erik, who decided (2026-11-03) to keep it refused until a downstream asks for it ([CODE.md](CODE.md#application-interface-sketch)). Each form is a kernel of its own beside the old one rather than a `patches`-or-`nothing` argument threaded through the old kernels, so that no launch path any current caller takes changed, which would have needed a compile-timing comparison that could not be run.
 
 ## Time integration
 
@@ -575,7 +614,7 @@ should therefore run one thread each.
 
 "Performance work left for later" was recorded on 2026-10-02 after the buffer pool; none of it blocked M7. Its item on compression where the data are was added in step 6b.
 
-The multi-block check was made on 2026-10-01 and amended by the M12 design on 2026-10-03.
+The multi-block check was made on 2026-10-01 and amended by the M12 design on 2026-10-03, and again by M17 on 2026-11-02, when the forest it watched for was built: it now watches for what M17 leaves out.
 
 ## Code structure
 
@@ -603,7 +642,7 @@ over tilde bounds and over a run-time interface version.
 
 ## Open questions
 
-The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed, and taken up on 2026-10-21 as M14, when Erik asked for it. His decisions that day: a keyword of its own, `halfturn = (d1, d2)`, rather than an angle on `rotating`; a field-set keyword of its own too, `halfturn`, rather than `rotation` with a second meaning; exactly M12's refusals of periodic, reflecting and outflow faces on the plane's dimensions; and the axis on a root boundary ("the origin is at the edge of a box"), so `roots[d2]` even. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05. Element-local DG stencils were recorded as a proposed open question on 2026-10-15, beside TreeWaveOLDG's prototype on unrefined forests, and answered by M16 (2026-10-30 and 31); what M16 leaves open is in [CODE.md](CODE.md#open-questions).
+The 180° rotation was deferred on 2026-10-03 with Erik, when M12 was designed, and taken up on 2026-10-21 as M14, when Erik asked for it. His decisions that day: a keyword of its own, `halfturn = (d1, d2)`, rather than an angle on `rotating`; a field-set keyword of its own too, `halfturn`, rather than `rotation` with a second meaning; exactly M12's refusals of periodic, reflecting and outflow faces on the plane's dimensions; and the axis on a root boundary ("the origin is at the edge of a box"), so `roots[d2]` even. The integrator's own passes were raised by TreeGeneralizedHarmonic on 2026-09-25, after it adopted the ownership policy; Erik decided the same day not to optimise the OrdinaryDiffEq path further, Polyester included. The working array's layout and the state that lives in the working array were raised on 2026-10-05. Element-local DG stencils were recorded as a proposed open question on 2026-10-15, beside TreeWaveOLDG's prototype on unrefined forests, and answered by M16 (2026-10-30 and 31); what M16 leaves open is in [CODE.md](CODE.md#open-questions). The multi-patch forest was recorded as an open question on 2026-11-02 and built as M17 the same day; Erik's decisions on its shape are under [Domain and boundaries](#domain-and-boundaries), and what it leaves open is in [CODE.md](CODE.md#open-questions).
 
 ## Milestones
 
@@ -624,7 +663,10 @@ and done on 2026-10-20, and M14, the half turn, specified and built on
 next number when the two were merged. M15, the folds over points, came
 on 2026-10-22 for a downstream analysis, and M16, the element centering,
 was specified on 2026-10-30 for TreeWaveOLDG's refined forests and done
-on 2026-10-31; both come before M9b too.
+on 2026-10-31; both come before M9b too. So does M17, the multi-patch
+forest, specified and implemented on 2026-11-02 for TreeWaveOLDG's
+curvilinear domains, and not done until its downstream acceptance and
+its release.
 
 M9b was split from M9, "I/O and visualization", on 2026-09-29, when its checkpoint half became M9a.
 
@@ -4227,6 +4269,215 @@ M12 was decided with Erik, after M7 and before M9b.
   the field `P`, which TreeIOHDF5 reads, so its release accepts `=0.2.7`
   only.
 
+### M17 — Multi-patch forests (uniform)
+
+- **M17 — Multi-patch forests (uniform).** *(Specified 2026-11-02.
+  Implemented the same day, steps 1–8; not done — the checks on
+  Symmetry, TreeWaveOLDG's acceptance and the releases remain, as
+  [PLAN.md](PLAN.md#m17--multi-patch-forests-uniform) lists.)* Several
+  root bricks, patches, glued at their faces by signed axis
+  permutations, on uniform meshes, so that an application can solve on
+  an annulus or a cubed sphere: the patches form of `Forest`, the
+  connectivity as its tenth field, neighbor finding across a glue, the
+  ghost fill across it on every backend and across ranks, conformity at
+  every glued face, `patch`, `block_patches` and `WithPatch`, and the
+  refusals of patch corners and of point location, as designed under "A
+  multi-patch forest" in [Domain and boundaries](CODE.md#domain-and-boundaries)
+  and "Glued faces" in [Ghost filling](CODE.md#ghost-filling). The work
+  is branch `eschnett-claude/multi-patch`, in TreeAMR and in TreeIOHDF5.
+
+  *How it came about.* Erik's four decisions on the shape, and the
+  alternatives they were chosen over, are under
+  [Domain and boundaries](#domain-and-boundaries); the specification
+  went into CODE.md's open questions and PLAN.md the same day (71827cc).
+  An implementation plan then fixed the rest as decisions not to be
+  revisited — patch corners refused, an element set never reaching one;
+  orientation a signed permutation, both directions of every gluing
+  listed and checked inverse; `periodic` refused, a wrap being a patch
+  glued to itself; `locate_point` and `interpolate` refused; the
+  connectivity a tenth field, abstract-typed as `comm` is, with a
+  singleton for one brick — and reversed one decision of the
+  specification, disjoint patch extents (under
+  [Domain and boundaries](#domain-and-boundaries)). Claude agents built
+  it from that plan one step after another in one checkout, each step
+  committed when its tests passed, each keeping notes from which this
+  record and CODE.md were written.
+
+  *Steps.*
+  1. **The connectivity** and 2. **neighbor finding** (8d7fd90, one
+     commit). `Connectivity{D}`, `OneBrick`, `Patches` with its dense
+     glue table of `GlueEntry`s and its `corners` flag; the patches
+     form of `Forest` and its refusals; the brick form refactored into
+     helpers both forms share (`check_N`, `face_kinds`, `check_brick`,
+     `leaf_list`), every message unchanged; `patch`, `block_patches`,
+     the patch-local `root_position`, `root_index`'s refusal and its
+     patch form, `block_origin` per patch; `patch_keywords`; the digest
+     over the patches and the glue, a brick's hash unchanged and tested
+     against the formula from before; the regrid's positional rebuild
+     threading the field. `Crossing` in place of the bare `r`,
+     `glued_anchor`, `real_direction` and `virtual_offset` taking a
+     glue's map, `wall_direction` per patch, and `balance_slack` zero
+     across a glued face, which already made `balance!` and
+     `isbalanced` keep the glue conforming. Neighbors across a glue
+     were tested against an independent continuous oracle on a 1D loop
+     with reversed glues, the 2D ring, a swapped and reversed 2D pair
+     and a 3D cubed sphere; dropping `flip` in `glued_anchor` fails
+     them. The tenth field: `sizeof(Forest{2,Float64})` 88 → 96 bytes.
+     `bench/ghosts.jl`'s schedule-build allocation against 71827cc
+     beside it in the same job: on Symmetry (cn080, EPYC 7532) at one
+     thread, job 588200, `D = 3` uniform 383488/383520 → 383616/383648
+     bytes, two levels 4623528/4623544 → 4628520/4628840, `D = 2`
+     uniform 47808 → 47920, two levels 399848/399928 → 412152/412328;
+     the last, +12.4 kB, was run-to-run noise, since `Profile.Allocs` of
+     the same build at one thread (job 588216) gave 402744 → 403032,
+     +288, in the `Forest` copies `collect_touching_leaves!` boxes. At
+     eight threads (job 588192, three alternating repetitions) `D = 3`
+     uniform +256 (0.05 %), two levels about +80 kB (1.6 %, but that
+     figure moves by about 0.2 MB between jobs and nodes: job 588191 on
+     cn106 gave 4870512 bytes for the new code, below the baseline's
+     4989664–5015952 in 588192), `D = 2` +240 and about +600. On the laptop at one thread, deterministic, `D = 3`
+     +128 and +4864, `D = 2` +112 and +560, which is what CODE.md
+     keeps. Accepted, as the plan allowed, and not moved into
+     `ForestState`, which the plan ruled out. The suite passed on
+     Symmetry at eight threads, 161,020 tests in 25 min (job 588200).
+  3. **The schedule and the kernel** (00dee24). `GroupKey.glue`;
+     `TransferGroup` with `perm`, `flip` and `turned` in place of the
+     plane, and `group_axes`; `run_group!` dispatching on `turned`; the
+     identity `rotvars` over a forest of patches; `stage_groups`'
+     conservative flag; `show` counting the transfers turned across a
+     glue; `check_patch_corners` and the new `check_glue_layout`, both
+     methods on the connectivity, empty on a brick. Tested on a brick
+     cut into patches (every centering, `D = 1, 2, 3`, uniform and
+     refined beside the glue, every stored point equal to the brick's),
+     a brick cut at a patch corner, seven laid-out layouts with
+     swapped, reversed and cycled axes, the annulus and the cubed
+     sphere, and over 2, 3 and 5 simulated ranks. Reading through the
+     inverse permutation fails the 3D cyclic layout (a 2D swap is its
+     own inverse), dispatching on the orientation fails the swapped
+     pair, and dropping `flip` the low-to-low one. *Compile time,
+     interim*: `--trace-compile-timing` of 71827cc's
+     `test/mpi_workload.jl`, serial, one thread, NUMA domain 0, three
+     alternating rounds, outputs identical byte for byte (job 588228,
+     cn097, EPYC 7543), 71827cc 102.96–103.17 s with 1288 roots, the
+     tree at step 3 before its last cleanup 103.99–104.30 s with 1307
+     roots: +1.0 s (1 %), +19 roots, most of them steps 1–2's brick
+     helpers and `Crossing(::Int, ::Int)`, and step 3's
+     `identity_axes` and `isturned` closures and an `Int8.` broadcast
+     in the `TransferGroup` constructor, which the cleanup then
+     removed. The cleaned-up step (job 588235, same node and setup):
+     71827cc 102.50–103.14 s with 1288 roots, step 3 103.65–104.36 s
+     with 1293, +0.8 s; the suite after it (job 588236) ran a test
+     helper that raced (under [Ghost filling](#ghost-filling)) and is
+     superseded by the final head's run below. `bench/ghosts.jl` on the
+     laptop at one thread against step 2: the schedule build
+     +416 and +25040 bytes (0.55 %) at `D = 3`, uniform and two-level,
+     +400 and +512 at `D = 2`, the `TransferGroup` grown from 152 to 160
+     bytes at `D = 3`; the fill's allocations identical (12560, 112480,
+     3536 and 17440 bytes) and its times equal within noise. The suite
+     passed on the laptop at eight threads, 161,453 tests in 11 min 4 s.
+  4. **Conformity** (908c2bf). Nothing new to enforce, since step 2's
+     `balance_slack` already did; the wording: the checked `leaves`
+     path names both glued faces, with a reason of its own beside the
+     seam's, which is back to its words from before M17, byte for byte,
+     and `InterfaceSchedule` calls a coarse-fine face across a glue a
+     bug in its own words; `glue_face`, the inverse of `glue_slot`. A
+     forest refined beside the glue keeps its glued faces conforming
+     and only its edges across the glue coarse-fine, which the step's
+     tests assert.
+  5. **The patch as a number, and the refusals** (098bc27). `WithPatch`
+     and its four kernels beside the plain ones; the boundary plan's
+     `patches`; the refusals of `Relative(WithPatch(f))`, of a
+     misnested `AllVariables(WithPatch(f))`, and of point location
+     through `PointGeometry`. Two patches on one logical box, filled
+     through `WithPatch` so that they hold different data at one
+     position, equal the brick through the layout in `D = 1, 2, 3` (to
+     1e-13 for element sets, whose Gauss–Lobatto positions round
+     differently when shifted); every boundary form hands each outer
+     ghost its block's patch; `p = 1` in either new kernel fails the
+     identical-extents test. With the tunnel down the suite was not run
+     for steps 4 and 5; the test files each touches passed on the
+     laptop at four threads (8.5 min for step 5's).
+  6. **The checkpoint** (TreeIOHDF5 2666f4d and 787c3a9). The feature
+     `patches`, no format bump (under
+     [Checkpoint and restart](#checkpoint-and-restart)), the five
+     datasets of `patch_keywords`, the refusals of a damaged file, and
+     round trips of the annulus (cell, vertex and element sets), a
+     swapped and reversed pair over `Float32x2` extents and the cubed
+     sphere's element set through a fill and a regrid, bit for bit, and
+     at 1, 2 and 3 ranks in its MPI workload. Its suite passed against
+     098bc27 on the laptop at one thread, 1,088 tests in 2 min 45 s.
+     This settles PLAN.md's step 6, which had read "a format version
+     and a release of its own": a feature, and a release of its own.
+  7. **Tests**, grown through the steps; their last two bullets
+     (9d92e93) are thread and rank independence. `thread_workload.jl`
+     gained the `P…` cycles and `mpi_workload.jl` `patch_case` and the
+     glue-diverged refusal ([Tests](CODE.md#tests)); no `src/` change and
+     no bug. Across ranks blocks on either side of a glue have
+     different owners: the transfers received across a glue are 20, 20
+     and 10 for the annulus's cell, vertex and element sets and 48 for
+     the sphere at three ranks, 16, 16, 8 and 32 at two. Serially and
+     at two and three ranks every compared line agrees;
+     `mpi_tests.jl` on its own passes, 106 tests in 1 min 27 s, and no
+     exact line count changed; `thread_tests.jl` at four threads passes,
+     2,465 tests, the workload byte-identical at one and four threads.
+     The cost, on the laptop at one thread, two alternating rounds:
+     `thread_workload.jl` 34.0 and 34.8 s before, 38.4 and 37.6 s after,
+     about 3.6 s a subprocess and so about 7 s of the suite, nearly all
+     compilation; `mpi_workload.jl` serially 52.4 and 52.1 s before,
+     55.7 and 55.6 s after, about 3.4 s, which each rank pays too.
+  8. **Documents.** CODE.md describes the built design and marks open
+     what is Erik's to decide; PLAN.md's M17 keeps what remains;
+     README.md and the guide say M17 is implemented. The docs build,
+     doctests included, passes locally.
+
+  *Deviations from the plan*, each where its topic is: `glued_anchor`
+  beside `stepped_node` rather than a generalised `stepped_node`
+  ([Tree structure](#tree-structure)); the dense glue table, `periodic`
+  refused on every forest of patches, and the normal-sign refusal
+  ([Domain and boundaries](#domain-and-boundaries)); the exact
+  patch-corner check, `check_glue_layout`, every glued prolongation
+  alone in `stage_groups`, and the boundary plan's `patches`
+  ([Ghost filling](#ghost-filling)); `WithPatch(AllVariables(f))`
+  built and `Relative(WithPatch(f))` refused
+  ([Application interface](#application-interface)); point location
+  refused on a forest of one patch too
+  ([Point interpolation](#point-interpolation)); and TreeIOHDF5's branch
+  cut from its element-centering branch, with a feature rather than a
+  format version ([Checkpoint and restart](#checkpoint-and-restart)).
+
+  *The final head on Symmetry* (3d6aaf0, 2026-11-03, after the tunnel
+  came back): the suite at eight threads passes, 161,827 tests in
+  26 min 41 s (job 588436, cn082, EPYC 7532), and TreeIOHDF5's
+  branch passes its suite against it, 1088 tests in 5 min 15 s at one
+  thread (job 588437). `--trace-compile-timing` of 71827cc's
+  `test/mpi_workload.jl` against 71827cc, in the setup of step 3, on
+  cn080 (EPYC 7532, job 588468), outputs identical byte for byte:
+  71827cc 137.39–137.77 s with 1288 roots, the final head
+  137.43–139.53 s with 1294; best of three 137.39 against 137.43 s, so
+  the boundary plan's type parameter costs nothing measurable. A first
+  run on cn090 (job 588437) gave 135.5–138.2 s against 137.9–141.3 s,
+  but its baseline alone spread over 2.6 s, so it is not the number.
+  The suite at one thread passes too, 161,775 tests in 21 min 9 s (job
+  588486, cn107, EPYC 7543; the count differs from eight threads' by
+  the thread-dependent cases). `bench/ghosts.jl` at one thread, both
+  trees in one job on cn079 (EPYC 7532, job 588487), two rounds: the
+  schedule build at `D = 3` +1120 bytes uniform (383,488 → 384,608)
+  and about +21.5 kB two-level (4,623,544–4,623,960 →
+  4,644,776–4,645,880, +0.5 %); at `D = 2` +640 uniform (47,808 →
+  48,448) and about −8.5 kB two-level (409,240–411,608 →
+  401,704–401,800). The fill's allocations are identical (12,560,
+  112,480, 3,536 and 17,440 bytes) and its times equal within noise.
+
+  *Companion and downstream.* TreeIOHDF5's branch takes TreeAMR from
+  the checkout beside it through `[sources]` path entries, with
+  `[compat] TreeAMR = "=0.2.7"` unchanged, which the checkout's version
+  satisfies; its release for M17 lists the new TreeAMR version alone,
+  since its save calls `patch_keywords`, which 0.2.7 does not have, and
+  comes after its 0.1.6, whose element sets M17's checkpoints use.
+  TreeWave's and TreeHydro's suites pass against the checkout
+  ([Downstream checks](#downstream-checks)); TreeWaveOLDG's annulus,
+  the acceptance test, has not been run.
+
 ## Downstream checks
 
 **TreeWave.** The `[sources]` pins to `main` went when 0.1.1 was
@@ -4239,7 +4490,9 @@ reached it with 0.1.5 and changed nothing serially: 310 tests in 1m22
 against the M7 checkout (2026-10-02); M12, released in 0.1.7, changed
 nothing either, 310 tests in 1m17 against the M12 checkout (2026-10-03).
 M16 changed nothing for it: 349 tests in 1m41 against the M16 checkout
-(2026-10-31).
+(2026-10-31). Nor did M17: 349 tests in 3m19 against the M17 checkout
+(777a3b4, 2026-11-03), on Symmetry (job 588617, cn080, EPYC 7532), where
+the suite runs slower than on the laptop.
 
 **TreeHydro.** It is **implemented, not a sketch**: sixteen files in
 `src/`, fourteen test files, two viewers in `bin/`, its own CI and
@@ -4263,7 +4516,10 @@ keywords and the run histories as plain data; its `src/checkpoint.jl`
 changed nothing for it serially: 12447 tests in 5m00 against the M7
 checkout, at one thread (2026-10-02); nor did M12 (0.1.7), 12447 tests in
 5m08 against the M12 checkout (2026-10-03); nor did M16, 12679 tests in
-5m28 against the M16 checkout (2026-10-31). Its own MPI port
+5m28 against the M16 checkout (2026-10-31); nor did M17, 12679 tests in
+13m42 against the M17 checkout (777a3b4, 2026-11-03) on Symmetry (job
+588624, cn082, EPYC 7532), with TreeIOHDF5 taken from its M17 branch
+(787c3a9), since no registered TreeIOHDF5 accepts TreeAMR 0.2.7. Its own MPI port
 (2026-10-02) found the one TreeAMR bug so far on a rank without blocks —
 the `AllVariables` boundary hook's length check, of which it is the only
 caller — so it needs TreeAMR 0.1.6, which has the fix.

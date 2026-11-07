@@ -180,17 +180,19 @@ end
 @inline kernelarg(a, dims) = a
 @inline kernelarg(p::PackedSlots, dims) = (buf=p.buf, offsets=p.offsets, dims=dims)
 
-# The real source of a rotated transfer (M12), as a kernel sees it.
+# The real source of a turned transfer — across a rotating seam (M12) or
+# a glued face (M17) — as a kernel sees it.
 #
-# A rotated transfer's stencils are built in the virtual frame, as though
-# its source sat where the target sees it across the seam; what is left
-# is to read the virtual source's points out of the real array, which
-# this accessor does in the load, beside the packed buffer's ("Rotating
-# seams" in CODE.md). `src` is the real working array — the set's own,
-# or for an odd orientation in a pair its partner's — `perm` and `flip`
-# the axis map of the orientation (see `axismap`), `len` the real array's
-# stored size, `vars` the field set's variable table and `col` the
-# orientation's column of it. Virtual stored index `k` reads the real
+# A turned transfer's stencils are built in the virtual frame, as though
+# its source sat where the target sees it across the seam or the glue;
+# what is left is to read the virtual source's points out of the real
+# array, which this accessor does in the load, beside the packed buffer's
+# ("Rotating seams" in CODE.md). `src` is the real working array — the
+# set's own, or for an odd orientation in a pair its partner's — `perm`
+# and `flip` the group's axis map (`axismap` of a seam's orientation, a
+# glue entry's own), `len` the real array's stored size, `vars` the field
+# set's variable table and `col` the orientation's column of it, the
+# first, the identity, across a glue. Virtual stored index `k` reads the real
 # point whose index along `e` is `k[perm[e]]`, or `len[e] + 1 − k[perm[e]]`
 # where `flip[e]`, and variable `vars[v, col]`. A `NamedTuple` of an
 # array, isbits tuples and an `Int32` table, so KernelAbstractions adapts
@@ -232,10 +234,12 @@ function axismap(r::Integer, (d1, d2)::NTuple{2,Integer}, ::Val{D}) where {D}
     return perm, flip
 end
 
-# The accessor of a rotated group's real source `src`.
+# The accessor of a turned group's real source `src`. The axis map was
+# computed when the group was built (`group_axes`); `perm` goes to the
+# kernel as `Int`s, which `tuplepick` compares against a dimension.
 function rotated_source(group::TransferGroup{T,D}, src, rotvars) where {T,D}
-    perm, flip = axismap(group.orientation, group.plane, Val(D))
-    return (src=src, perm=perm, flip=flip, len=ntuple(d -> size(src, d), Val(D)),
+    perm = ntuple(e -> Int(group.perm[e]), Val(D))
+    return (src=src, perm=perm, flip=group.flip, len=ntuple(d -> size(src, d), Val(D)),
             vars=rotvars, col=Int(group.orientation) + 1)
 end
 
@@ -398,11 +402,13 @@ end
 # a nest of parallel loops.
 #
 # `factors` is the field set's factor table, or `nothing`; only a
-# mirrored or rotated group reads it (see `scaled`). A rotated group
-# (M12) reads its real source through `rotated_source`, from `src` for an
-# even orientation and from `altsrc` for an odd one — the partner's
-# working array in a `RotationPair`, the set's own otherwise — with the
-# variable table `rotvars`; an ordinary group launches exactly as before.
+# mirrored or rotated group reads it (see `scaled`). A turned group —
+# rotated across a seam (M12), or across a glued face whose axis map is
+# not the identity (M17) — reads its real source through
+# `rotated_source`, from `src` for an even orientation and from `altsrc`
+# for an odd one — the partner's working array in a `RotationPair`, the
+# set's own otherwise — with the variable table `rotvars`; an ordinary
+# group, and one glued with the identity, launches exactly as before.
 # `flat` is the launch's form, flat on a device and shaped on the CPU
 # unless a test asks otherwise (see `launch_shape`).
 function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backend;
@@ -416,10 +422,10 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
         "a rotating seam, but the field set has no factor table to do it with. " *
         "Build the field set over the same forest as the schedule, with `parity` " *
         "or `rotation`."))
-    group.orientation == 0 || rotvars !== nothing || throw(ArgumentError(
-        "this schedule turns ghosts across a rotating seam, but the field set has " *
-        "no variable table to turn them with. Build the field set over the same " *
-        "forest as the schedule, with `rotation`."))
+    !group.turned || rotvars !== nothing || throw(ArgumentError(
+        "this schedule turns ghosts across a rotating seam or a glued face, but the " *
+        "field set has no variable table to turn them with. Build the field set over " *
+        "the same forest as the schedule, with `rotation` for a seam."))
     gfactors = group.factorcol == 0 ? nothing : factors
     blen = boxsize(group)
     prod(blen) == 0 && return nothing
@@ -471,7 +477,7 @@ function run_group!(dest, src, group::TransferGroup{T,D}, nvars::Integer, backen
     # where a launch costs microseconds — while the CPU's shaped launch
     # stays type-stable and allocates no more than it did.
     extents = (blen..., Int(nvars), n)
-    if group.orientation != 0
+    if group.turned
         rsrc = rotated_source(group, isodd(group.orientation) ? altsrc : src, rotvars)
         launch_transfer!(backend, flat, extents, single, kdest, rsrc, group.targetblocks,
                          group.sourceblocks, srcstarts, weights, singles, unit, tfirst,
@@ -1064,9 +1070,51 @@ end
     end
 end
 
+# The forms with the patch (M17), `WithPatch`: the two kernels above,
+# handed the region's block's patch from the plan beside its origin and
+# spacing, and passing it to the callback after the position.
+@kernel function boundary_patch_kernel!(work, g, @Const(blocks), @Const(directions),
+                                        @Const(firsts), @Const(origins), @Const(spacings),
+                                        @Const(patches), nodes, ::Val{D}, ::Val{G},
+                                        ::Val{C}) where {D,G,C}
+    I = @index(Global, NTuple)
+    v = I[D + 1]
+    t = I[D + 2]
+    @inbounds b = blocks[t]
+    @inbounds δ = directions[t]
+    @inbounds f = firsts[t]
+    idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
+    @inbounds origin, h, p = origins[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    val = g(x, p, v, ntuple(d -> Int(δ[d]), Val(D)))
+    @inbounds work[idx..., v, b] = val
+end
+
+@kernel function boundary_patch_all_kernel!(work, g, @Const(blocks), @Const(directions),
+                                            @Const(firsts), @Const(origins),
+                                            @Const(spacings), @Const(patches), nodes,
+                                            ::Val{D}, ::Val{G}, ::Val{C},
+                                            ::Val{NV}) where {D,G,C,NV}
+    I = @index(Global, NTuple)
+    t = I[D + 1]
+    @inbounds b = blocks[t]
+    @inbounds δ = directions[t]
+    @inbounds f = firsts[t]
+    idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
+    @inbounds origin, h, p = origins[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    vals = g(x, p, ntuple(d -> Int(δ[d]), Val(D)))
+    ntuple(Val(NV)) do v
+        @inbounds work[idx..., v, b] = vals[v]
+        nothing
+    end
+end
+
 """
     CellBoundary(g)
     CellBoundary(AllVariables(g))
+    CellBoundary(WithPatch(g))
+    CellBoundary(WithPatch(AllVariables(g)))
     CellBoundary(Relative(f))
     CellBoundary(Relative(AllVariables(f)))
 
@@ -1106,6 +1154,12 @@ bit-for-bit the same numbers. The tuple's length is checked on the host
 before each launch, at the first owned point of block 1 with the sample
 direction `δ = (-1, 0, …, 0)`; any outward direction would do, since
 what is checked is how many values come back.
+
+Wrapping either in [`WithPatch`](@ref) hands `g` the patch of the ghost's
+block (M17) after the position, `g(x, p, v, δ)` or `g(x, p, δ) -> vals`,
+which an outer face of a forest of patches with overlapping boxes needs
+to tell the application's maps apart. The relative form does not take
+it.
 
     fill_ghosts!(fs, schedule; boundary = CellBoundary((x, v, δ) -> zero(eltype(x))))
     fill_ghosts!(fs, schedule;                         # nvars == 2
@@ -1280,6 +1334,61 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
     return nothing
 end
 
+# The forms with the patch (M17). As above, but for the patch the plan
+# holds per block; the all-variables check hands the sample point's.
+function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch},
+                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+    plan = schedule.boundaryplan
+    for batch in plan.batches
+        n = nregions(batch)
+        n == 0 && continue
+        with_nodes(plan.nodes) do nodes
+            boundary_patch_kernel!(backend)(fs.work, hook.g.f, batch.blocks,
+                                            batch.directions, batch.firsts, plan.origins,
+                                            plan.spacings, plan.patches, nodes, Val(D),
+                                            Val(fs.G), Val(staggers(fs));
+                                            ndrange=(batch.boxlen..., fs.nvars, n))
+        end
+    end
+    synchronize(backend)
+    return nothing
+end
+
+function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch{<:AllVariables}},
+                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+    nblocks(fs) == 0 && return nothing
+    g = hook.g.f.f
+    δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
+    check_allvariables(g(allvariables_sample(fs), allvariables_sample_patch(fs), δ), fs,
+                       "boundary hook")
+    plan = schedule.boundaryplan
+    for batch in plan.batches
+        n = nregions(batch)
+        n == 0 && continue
+        with_nodes(plan.nodes) do nodes
+            boundary_patch_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
+                                                batch.firsts, plan.origins, plan.spacings,
+                                                plan.patches, nodes, Val(D), Val(fs.G),
+                                                Val(staggers(fs)), Val(fs.nvars);
+                                                ndrange=(batch.boxlen..., n))
+        end
+    end
+    synchronize(backend)
+    return nothing
+end
+
+# The relative form takes a function of position alone, and has no form
+# with the patch: say so here, on the host, rather than call the wrapper
+# inside a kernel.
+cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative{<:WithPatch}},
+               schedule::GhostSchedule{T,D}, backend; slot::Int=PHASE1_TAG) where {T,D} =
+    throw(ArgumentError(
+        "CellBoundary(Relative(WithPatch(f))) is not a form the package has: the " *
+        "relative hook calls `f` at the ghost and at the nearest evolved point, by " *
+        "position alone, and is not handed the patch. WithPatch takes the hooks that " *
+        "set a ghost outright, CellBoundary(WithPatch((x, p, v, δ) -> …)) and " *
+        "boundary_by_coordinates(WithPatch((x, p, v) -> …))"))
+
 # The region form. It may do anything to the region it is handed, which
 # is exactly why it cannot be run on a device on the caller's behalf: a
 # hook that scalar-indexes would fail deep inside a task, with no hint
@@ -1352,6 +1461,10 @@ schedules — each set's own — merged stage by stage, each set's phase 1,
 then both hooks, then each prolongation level of one set and of the
 other, so that a prolongation may read its partner's coarser ghosts.
 Its `boundary` is one hook for both sets, or a tuple of two.
+
+A glued face of a forest of patches (M17) needs nothing either: its
+ghosts are copies from the patch across, read through the glue's axis
+map, each variable onto itself.
 
 `boundary` is called once per ghost region facing outside the domain
 through an *outer* face — neither periodic nor reflecting — as
@@ -1540,6 +1653,8 @@ end
 """
     boundary_by_coordinates(f)
     boundary_by_coordinates(AllVariables(f))
+    boundary_by_coordinates(WithPatch(f))
+    boundary_by_coordinates(WithPatch(AllVariables(f)))
 
 A boundary hook that sets each outer ghost cell from `f(x, v)`, with `x`
 the cell center and `v` the variable index — the same signature
@@ -1554,6 +1669,13 @@ backend. Wrapped in [`AllVariables`](@ref) it is
 `CellBoundary(AllVariables((x, δ) -> f(x)))`: the same hook built from a
 once-per-cell `f(x) -> vals`, which is the shape of a Dirichlet
 condition set from initial data that is itself stated all at once.
+Wrapped in [`WithPatch`](@ref), `f(x, p, v)` or `f(x, p) -> vals` is also
+handed the patch of the ghost's block (M17), as
+[`fill_by_coordinates!`](@ref) hands it, so that the same callback sets
+the initial data and the boundary values of a forest of patches.
 """
 boundary_by_coordinates(f) = CellBoundary((x, v, δ) -> f(x, v))
 boundary_by_coordinates(w::AllVariables) = CellBoundary(AllVariables((x, δ) -> w.f(x)))
+boundary_by_coordinates(w::WithPatch) = CellBoundary(WithPatch((x, p, v, δ) -> w.f(x, p, v)))
+boundary_by_coordinates(w::WithPatch{<:AllVariables}) =
+    CellBoundary(WithPatch(AllVariables((x, p, δ) -> w.f.f(x, p))))

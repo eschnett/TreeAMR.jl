@@ -26,6 +26,7 @@ milestones were planned in, and the list below is in execution order.
   - [M16 — Element centering](#m16--element-centering)
   - [M9b — Visualization export](#m9b--visualization-export)
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
+  - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
 
 ## Milestones
 
@@ -130,3 +131,28 @@ already). In order, each step Erik's to take:
 *Done when* TreeAMR 0.2.0 and TreeIOHDF5 0.1.0 are registered and the
 three downstreams resolve them.
 
+### M17 — Multi-patch forests (uniform)
+
+Implemented on 2026-11-02 (steps 1–8), on the branch
+`eschnett-claude/multi-patch`, and not yet done. The design is under "A
+multi-patch forest" in "Domain and boundaries", "Glued faces" in "Ghost
+filling" and the passages they cite in [CODE.md](CODE.md#domain-and-boundaries),
+and what it leaves open under "Open questions" there; the record, steps
+and measurements are in
+[HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform), and
+TreeIOHDF5's side, which saves a forest of patches under a new feature
+`patches` with no format-version bump, is on its branch of the same
+name. What remains, in order:
+
+1. **TreeWaveOLDG's acceptance**: its scalar wave on the four-patch
+   annulus, uniform, against this checkout.
+2. **The releases.** A TreeAMR release (TreeWave's and TreeHydro's
+   suites pass against the checkout); then TreeIOHDF5's 0.1.6 (element
+   sets, pending), and a release of its own for the feature `patches`,
+   with `[compat] TreeAMR` the new version alone, since its save calls
+   `patch_keywords`, and its `[sources]` path entries removed
+   ("Companion interface" in [CODE.md](CODE.md#companion-interface)).
+
+*Done when* TreeWaveOLDG's scalar wave converges at the expected order on
+the annulus, with its discrete energy conserved across the glued faces,
+and TreeAMR and TreeIOHDF5 are released with it.

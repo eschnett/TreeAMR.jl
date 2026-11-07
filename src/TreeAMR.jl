@@ -20,6 +20,9 @@ export Forest, nleaves, maxlevel, root_position, root_index, alldirections, floa
 export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
 export root_spacing, spacing, minimum_spacing, block_origin, block_extent,
        block_spacings, block_origins
+
+# Multi-patch forests (M17)
+export patch, block_patches
 export FieldSet, nblocks, blockkey, blockview, interiorview, closedview,
        coordinates, fill_by_coordinates!
 export cellcentered, vertexcentered, facecentered, edgecentered, staggers
@@ -50,7 +53,7 @@ export firing_boxes
 export InterfaceSchedule, restrict_interfaces!
 
 # The all-variables form of the coordinate callbacks (for TreeHydro)
-export AllVariables, Relative
+export AllVariables, WithPatch, Relative
 
 # Reflecting boundaries (M10)
 export Parity, EvenParity, OddParity, NoParity

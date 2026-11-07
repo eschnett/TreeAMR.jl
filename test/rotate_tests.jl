@@ -134,14 +134,15 @@ end
     # periodic root sees itself.
     forest = Forest((1, 1); N=4, rotating=(1, 2))
     k = only(forest.leaves)
-    @test oriented_neighbors(forest, k, (-1, 0)) == (1, [k])
-    @test oriented_neighbors(forest, k, (0, -1)) == (3, [k])
-    @test oriented_neighbors(forest, k, (-1, -1)) == (2, [k])
+    turned(r) = TreeAMR.Crossing(r, 0)
+    @test oriented_neighbors(forest, k, (-1, 0)) == (turned(1), [k])
+    @test oriented_neighbors(forest, k, (0, -1)) == (turned(3), [k])
+    @test oriented_neighbors(forest, k, (-1, -1)) == (turned(2), [k])
     # Beyond the seam and the high face at once: nothing, but the
     # orientation of the region stepped into.
-    @test oriented_neighbors(forest, k, (-1, 1)) == (1, MortonKey{2}[])
-    @test oriented_neighbors(forest, k, (1, -1)) == (3, MortonKey{2}[])
-    @test oriented_neighbors(forest, k, (1, 0)) == (0, MortonKey{2}[])
+    @test oriented_neighbors(forest, k, (-1, 1)) == (turned(1), MortonKey{2}[])
+    @test oriented_neighbors(forest, k, (1, -1)) == (turned(3), MortonKey{2}[])
+    @test oriented_neighbors(forest, k, (1, 0)) == (turned(0), MortonKey{2}[])
     @test neighbor_keys(forest, k, (-1, 0)) == [k]
 
     # The seam is not a reflecting face: wall_direction finds only the
@@ -151,7 +152,7 @@ end
     k = only(octant.leaves)
     @test TreeAMR.wall_direction(octant, k, (-1, 0, -1)) ==
           ((-1, 0, 0), (TreeAMR.OuterFace, TreeAMR.OuterFace, TreeAMR.ReflectingFace))
-    @test oriented_neighbors(octant, k, (-1, 0, 0)) == (1, [k])
+    @test oriented_neighbors(octant, k, (-1, 0, 0)) == (turned(1), [k])
 end
 
 @testset "Balance makes the seam conforming, and the leaf path refuses it otherwise" begin

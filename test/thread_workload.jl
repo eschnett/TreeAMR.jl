@@ -336,6 +336,148 @@ element_workload(Val(2); roots=4, N=8, P=3, periodic=false,
                  reflecting=((true, false), (true, false)), x0=0.12)
 element_workload(Val(3); roots=2, N=4, P=1, periodic=true)
 
+# --- forests of patches (M17) ----------------------------------------------
+#
+# A glued face is filled by the same `run_phase!` over the same kind of
+# groups, but a glued group reads its source through the glue's axis map,
+# and the boundary hook is handed each block's patch. Three forests: the
+# annulus, four patches of one logical box each around a ring, glued with
+# the identity, every centering, the wave evolved on the two that carry
+# it; a brick cut in two with its second half laid out with the axes
+# swapped and both reversed, refined beside the glue, so that phase 2
+# holds turned prolongations across the glue's edges; and a cubed-sphere
+# shell, six faces glued along both tangents with swapped and reversed
+# axes, whose patch corners leave the element set as the one it fills.
+# Initial data and boundary values come from one callable type through
+# `WithPatch`, a function of the point each patch's map places, so that
+# every case shares its kernels.
+struct PatchData
+    layout::Int
+end
+
+# The faces of the cube `[-1, 1]³`, each a patch `(ξ, η, r)` placed at
+# `r (n + ξ u + η v) / |n + ξ u + η v|` by its frame `(n, u, v)`.
+const CUBE_FRAMES = (((1, 0, 0), (0, 1, 0), (0, 0, 1)), ((-1, 0, 0), (0, 0, 1), (0, 1, 0)),
+                     ((0, 1, 0), (0, 0, 1), (1, 0, 0)), ((0, -1, 0), (-1, 0, 0), (0, 0, 1)),
+                     ((0, 0, 1), (1, 0, 0), (0, 1, 0)), ((0, 0, -1), (0, 1, 0), (-1, 0, 0)))
+
+# Around the annulus (layout 1) the angle runs along x₁ and the radius
+# along x₂; in the cut brick (layout 2) the laid-out half's axes are
+# undone.
+function patch_point(layout, x::NTuple{2}, p)
+    layout == 1 || return p == 1 ? x : (4 - x[2], 3 - x[1])
+    θ = (p - 1 + x[1] / 2) * (π / 2)
+    r = 1 + x[2] / 2
+    return (r * cos(θ), r * sin(θ))
+end
+function patch_point(layout, x::NTuple{3}, p)
+    n, u, v = CUBE_FRAMES[p]
+    c = n .+ x[1] .* u .+ x[2] .* v
+    return c .* (x[3] / sqrt(sum(abs2, c)))
+end
+
+function (f::PatchData)(x, p, v)
+    y = patch_point(f.layout, x, p)
+    return v + sin(2 * y[1]) * cos(y[2]) + sum(y) / 3
+end
+
+# Both directions of a glue: `map` sends axis `e` of `from`'s patch to
+# axis `|map[e]|` of `to`'s, reversed where negative, and the reverse is
+# its inverse.
+function glued(from, to, map)
+    D = length(map)
+    inverse = ntuple(a -> (e = findfirst(e -> abs(map[e]) == a, 1:D); sign(map[e]) * e),
+                     D)
+    return [(from=from, to=to, map=map), (from=to, to=from, map=inverse)]
+end
+
+annulus() = Forest([(roots=(2, 2),) for _ in 1:4]; N=8,
+                   glue=reduce(vcat, [glued((p, 1, 2), (mod1(p + 1, 4), 1, 1), (1, 2))
+                                      for p in 1:4]))
+
+# A brick of `(4, 3)` roots cut at `x₁ = 2`: the upper half's axis 1 is
+# the brick's axis 2 reversed, and its axis 2 the brick's axis 1 reversed,
+# so its roots are `(3, 2)` and the cut is its high face of dimension 2.
+function laid_out()
+    forest = Forest([(roots=(2, 3),), (roots=(3, 2),)]; N=8,
+                    glue=glued((1, 1, 2), (2, 2, 2), (-2, -1)))
+    refine!(forest, filter(k -> patch(forest, k) == 1 &&
+                                block_extent(forest, k)[1][2] == 2 &&
+                                block_extent(forest, k)[2][1] == 0, forest.leaves))
+    balance!(forest)
+    return forest
+end
+
+# The glue of the cubed sphere, derived from the frames: face `(d, s)` of
+# patch `p` is the edge at `±a_d`, shared with the patch whose `n` that
+# is, where it is the face at `n_p`. Out of the one face is into the
+# other, the tangent along the edge is parallel in both frames, and the
+# radius is the radius. Every face is a `from` once.
+function cube_glue()
+    glue = []
+    for (p, (n, u, v)) in enumerate(CUBE_FRAMES), d in 1:2, s in 1:2
+        a = (u, v)
+        q = findfirst(f -> f[1] == (s == 2 ? 1 : -1) .* a[d], CUBE_FRAMES)
+        aq = CUBE_FRAMES[q][2:3]
+        d2, s2 = only((d2, s2) for d2 in 1:2 for s2 in 1:2
+                      if (s2 == 2 ? 1 : -1) .* aq[d2] == n)
+        t, t2 = 3 - d, 3 - d2
+        σ = Base.setindex(Base.setindex((0, 0, 3),
+                                        (s2 == 1 ? 1 : -1) * (s == 2 ? 1 : -1) * d2, d),
+                          (a[t] == aq[t2] ? 1 : -1) * t2, t)
+        push!(glue, (from=(p, d, s), to=(q, d2, s2), map=σ))
+    end
+    return glue
+end
+
+cubed_sphere() = Forest([(roots=(2, 2, 1), extents=((-1, 1), (-1, 1), (1, 2)))
+                         for _ in 1:6]; N=4, glue=cube_glue())
+
+function patch_workload(tag, forest::Forest{D}, centering; G, ops, layout, steps,
+                        P=nothing) where {D}
+    fs = FieldSet(forest, 2; G=G, centering=centering, P=P)
+    data = WithPatch(PatchData(layout))
+    boundary = boundary_by_coordinates(data)
+    fill_by_coordinates!(data, fs)
+    schedule = GhostSchedule(fs, ops)
+    fill_ghosts!(fs, schedule; boundary=boundary)
+    turned(groups) = sum(g -> g.turned ? TreeAMR.ntransfers(g) : 0, groups; init=0)
+    println(tag, " leaves ", nleaves(forest), " ", maxlevel(forest), " ",
+            digest(string(forest.leaves)))
+    println(tag, " schedule ", length(schedule.stages), " ", length(schedule.phase1), " ",
+            schedule.levels, " ", length(schedule.boundaries), " turned ",
+            turned(schedule.phase1), " ", turned(Iterators.flatten(schedule.phase2)))
+    println(tag, " filled ", digest(vec(fs.work)))
+    u = statevector(fs)
+    gather!(u, fs)
+    if steps > 0
+        rk4!(u, fs, schedule, 0.25 * minimum_spacing(forest), steps, Val(D), Val(fs.G),
+             boundary)
+        scatter!(fs, u)
+        fill_ghosts!(fs, schedule; boundary=boundary)
+        println(tag, " state ", digest(u))
+        println(tag, " work ", digest(vec(fs.work)))
+    end
+    println(tag, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
+    println(tag, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
+    println(tag, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
+    println(tag, " fold ", workload_fold(fs, u))
+    return nothing
+end
+
+let ring = annulus()
+    refine!(ring, copy(ring.leaves))
+    patch_workload("PR2c", ring, cellcentered(2); G=2, ops=OPS4, layout=1, steps=8)
+    patch_workload("PR2v", ring, vertexcentered(2); G=1, ops=OPS4, layout=1, steps=8)
+    patch_workload("PR2e", ring, elementcentered(2); G=1, P=3, ops=OPSE, layout=1, steps=0)
+end
+patch_workload("PL2c", laid_out(), cellcentered(2); G=2, ops=OPS4, layout=2, steps=8)
+let sphere = cubed_sphere()
+    refine!(sphere, copy(sphere.leaves))
+    patch_workload("PS3e", sphere, elementcentered(3); G=1, P=1, ops=OPSE, layout=3,
+                   steps=0)
+end
+
 # --- the conservative cycle (M8b) ----------------------------------------
 #
 # Burgers' equation, which brings in everything the wave cycle above does

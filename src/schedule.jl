@@ -114,14 +114,24 @@ result by. Zero means an ordinary transfer, which the kernel leaves
 unscaled.
 
 `orientation` is the number of quarter turns `r` that carry a rotated
-transfer's real source to where the target sees it, across the seam of
-the forest's `plane`, `(d1, d2)` (M12; see "Rotating seams" in
-`CODE.md`); a half-turn seam (M14) has orientation 2 only, and `plane`
-is its pair as positive dimensions. Its stencils are built in that virtual frame, and the kernel
-reads the real source through the axis map of `r` (see `axismap`) and the
-field set's variable table. Zero means an ordinary source, read as it
-is. The three small fields share the eight bytes `factorcol` had alone,
-so a group is no larger than before M12.
+transfer's real source to where the target sees it, across a rotating
+seam (M12; see "Rotating seams" in `CODE.md`); a half-turn seam (M14) has
+orientation 2 only. It picks the field set's variable table column and,
+odd, the partner's array in a [`RotationPair`](@ref). Zero off a seam,
+across a glued face (M17) too.
+
+`perm` and `flip` are the axis map the kernel reads a turned source by,
+in the gather form of `RotatedSource`: virtual stored index `k` reads the
+real point whose index along `e` is `k[perm[e]]`, reversed where
+`flip[e]`. A seam's is `axismap` of its orientation, a glued face's the
+glue entry's own (see `GlueEntry`), and both are computed on the host
+when the group is built and carried by value, since the group is what
+`run_group!` has in hand and it never crosses a rank. Its stencils are
+built in the virtual frame, as though the source sat where the target
+sees it. `turned` says the map is not the identity, so that the kernel's
+dispatch is one test: a glued group has orientation 0 and may still be
+turned, and one glued with the identity is not, and runs as an ordinary
+copy.
 
 `bounded` is `UNBOUNDED` for every group but one built from bounded
 operators whose operator can make a new extremum (`boundedmode`). A
@@ -129,7 +139,14 @@ conservative prolongation (`BOUNDED_CONSERVATIVE`) then bounds the
 reconstruction instead of summing the stencil; a point-value group
 (`BOUNDED_POINTVALUE`) sums it and clamps the result into the range of
 the target's bracket (see "Bounded prolongation" and "Bounded point
-values" in `CODE.md`). It is the fourth small field in those eight bytes.
+values" in `CODE.md`).
+
+Before M17 the small fields — `orientation`, the seam's plane as two
+bytes, and `bounded` — shared the eight bytes `factorcol` had alone. The
+axis map takes `2D + 1` bytes in the plane's place, so a group is larger
+than it was. It does not matter: a schedule holds groups by the hundred,
+not by the block, and the struct never reaches a kernel whole (see
+`todevice`).
 """
 struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     kind::Symbol                      # :copy, :restrict, or :prolong
@@ -137,19 +154,26 @@ struct TransferGroup{T,D,S<:Stencil1D{T},VB<:AbstractVector{Int32}}
     targetblocks::VB
     sourceblocks::VB
     factorcol::Int32                  # 0, or the factor-table column
-    orientation::Int8                 # 0, or the quarter turns of the source
-    plane::NTuple{2,Int8}             # the seam's (d1, d2), or (0, 0)
+    orientation::Int8                 # 0, or the seam's quarter turns of the source
+    perm::NTuple{D,Int8}              # the axis map of a turned source,
+    flip::NTuple{D,Bool}              # the identity for any other
+    turned::Bool                      # the map is not the identity
     bounded::Int8                     # UNBOUNDED, or how the kernel bounds
 end
 
+# `axes` is `(perm, flip)`, as `group_axes` gives it.
 TransferGroup{T,D}(kind::Symbol, stencils::NTuple{D,S},
                    targetblocks::VB, sourceblocks::VB, factorcol::Integer=0,
                    orientation::Integer=0,
-                   plane::NTuple{2,Integer}=(0, 0),
+                   axes::Tuple{NTuple{D,Int8},NTuple{D,Bool}}=identity_axes(Val(D)),
                    bounded::Integer=UNBOUNDED) where {T,D,S,VB} =
     TransferGroup{T,D,S,VB}(kind, stencils, targetblocks, sourceblocks,
-                            Int32(factorcol), Int8(orientation), Int8.(plane),
-                            Int8(bounded))
+                            Int32(factorcol), Int8(orientation), axes[1], axes[2],
+                            axes != identity_axes(Val(D)), Int8(bounded))
+
+# The identity axis map.
+identity_axes(::Val{D}) where {D} =
+    (ntuple(e -> Int8(e), Val(D)), ntuple(_ -> false, Val(D)))
 
 boxsize(g::TransferGroup{T,D}) where {T,D} = ntuple(d -> ntarget(g.stencils[d]), D)
 ntransfers(g::TransferGroup) = length(g.targetblocks)
@@ -162,7 +186,7 @@ todevice(backend::Backend, g::TransferGroup{T,D}) where {T,D} =
     TransferGroup{T,D}(g.kind, ntuple(d -> todevice(backend, g.stencils[d]), D),
                        todevice(backend, g.targetblocks),
                        todevice(backend, g.sourceblocks), g.factorcol, g.orientation,
-                       g.plane, g.bounded)
+                       (g.perm, g.flip), g.bounded)
 # The concrete group type on a given backend, so that a schedule's
 # `phase1`/`phase2` are concretely typed even when they are empty (a
 # uniform single-root forest has no restrictions and no prolongations).
@@ -250,18 +274,22 @@ BoundaryBatch{D}(boxlen, slot, blocks::VB, directions::VD, firsts::VF,
 
 Everything the cell-wise boundary kernel reads that is not field data:
 the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
-origin and spacing it turns a stored index into a position with, and for
-an element-centered layout (M16) the node offsets, empty otherwise, so
-that the plan's type, and the schedule's, does not depend on the layout.
+origin and spacing it turns a stored index into a position with, the
+per-block patch (M17, [`block_patches`](@ref)) that a
+[`WithPatch`](@ref) hook is handed, and for an element-centered layout
+(M16) the node offsets, empty otherwise, so that the plan's type, and
+the schedule's, does not depend on the layout.
 
 The geometry is here rather than recomputed per fill for the same reason
 the exchange itself is precomputed: it depends only on the tree, which
 is exactly what a schedule is rebuilt for.
 """
-struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,VN}
+struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,
+                    VP<:AbstractVector,VN}
     batches::Vector{BT}
     origins::VO
     spacings::VS
+    patches::VP             # `block_patches`, all ones on a brick
     nodes::VN               # `node_offsets` of the layout, on the backend
 end
 
@@ -299,9 +327,11 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
                  for k in keys_]
     origins = todevice(backend, block_origins(forest, T))
     spacings = todevice(backend, block_spacings(forest, T))
+    patches = todevice(backend, block_patches(forest))
     nodes = node_offsets(backend, T, P)
     return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings),
-                        typeof(nodes)}(batches, origins, spacings, nodes)
+                        typeof(patches),typeof(nodes)}(batches, origins, spacings,
+                                                       patches, nodes)
 end
 
 # What one ghost region of one block needs, as found by the neighbor
@@ -333,6 +363,15 @@ end
 # key too. The direction and the offset are the *virtual* ones, as the
 # target sees them, since those fix the stencils. Zero off the seam.
 #
+# `glue` is the index into the forest's glue table of the glued face the
+# source lies across (M17; `Crossing.glue`), 0 for none. It fixes the axis
+# map the kernel reads the source by, so it is part of the key, and the
+# group takes the map from the table at construction (`group_axes`). An
+# index rather than a table of maps collected during the build: the
+# forest's table is canonically ordered and covered by `ForestDigest`, so
+# the index is the same on every rank by construction, and `keyorder`
+# stays a function of the keys alone.
+#
 # `low` marks, per dimension, a target whose owned low wall plane the
 # fill writes (a set with `walls = :symmetric`, a vertex-like dimension,
 # a block at a low domain face; AMR-8): there the low region is one plane
@@ -356,6 +395,7 @@ struct GroupKey{D}
     level::Int
     mirror::NTuple{D,Int8}
     orientation::Int8
+    glue::Int8
     low::NTuple{D,Bool}
     shift::NTuple{D,Int8}
 end
@@ -368,13 +408,8 @@ GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
     GroupKey{D}(kind, direction, offset, level, mirror, Int8(0))
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int, mirror::NTuple{D,Int8}, orientation::Integer) where {D} =
-    GroupKey{D}(kind, direction, offset, level, mirror, Int8(orientation),
-                ntuple(_ -> false, D))
-GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
-            level::Int, mirror::NTuple{D,Int8}, orientation::Integer,
-            low::NTuple{D,Bool}) where {D} =
-    GroupKey{D}(kind, direction, offset, level, mirror, Int8(orientation), low,
-                ntuple(_ -> Int8(0), D))
+    GroupKey{D}(kind, direction, offset, level, mirror, Int8(orientation), Int8(0),
+                ntuple(_ -> false, D), ntuple(_ -> Int8(0), D))
 
 # A total order over group keys (M7). Within a single rank the order in
 # which groups run does not matter, and phase 1's come out of a `Dict`.
@@ -387,8 +422,8 @@ kindrank(kind::Symbol) =
     kind === :copy ? 1 : kind === :restrict ? 2 : kind === :prolong ? 3 :
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
-    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.low,
-     k.shift)
+    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
+     k.low, k.shift)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -603,7 +638,15 @@ it and read through the quarter turns between the two, which `show`
 reports as rotated transfers. A half-turn seam (M14) is the same, two
 quarter turns about the centre plane of `d2`, with the seam slab of a
 vertex-like `d2` partitioned one plane up. A region whose turned image
-leaves through an outer face is the hook's.
+leaves through an outer face is the hook's. Across a glued face of a
+forest of patches (M17) the transfers are the same, read through the
+glue's signed axis permutation and carrying each variable onto itself.
+A layout that would have a ghost region beyond a patch corner — beyond
+two glued faces at once, where no one block lies across — is refused
+here: a cell- or vertex-centered set wherever some patch is glued along
+two dimensions, never an element set, which is filled on faces only. So
+is one that the axis map does not carry onto itself, or that reverses a
+vertex-like dimension (see `check_glue_layout`).
 
 *Element sets.* An element-centered set ([`elementcentered`](@ref),
 M16), whose schedule is built with the [`ElementLocal`](@ref) family, is
@@ -1242,8 +1285,12 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 # their orientation `r`, and a transfer is recorded as the target sees
 # it, in the *virtual* frame: a finer source's child offset is turned
 # into its virtual one, and `r` goes into the key, which the kernel reads
-# the real source by. A region whose image leaves through an outer face
-# is the hook's, as any other such region is.
+# the real source by. Across a glued face (M17) the same, with the glue's
+# index in the key in place of `r`. A region whose image leaves through
+# an outer face is the hook's, as any other such region is; one that
+# crosses two glued faces at once, a patch corner, finds no neighbor
+# either, and `check_patch_corners` has refused every layout that has
+# one before the search begins.
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
@@ -1257,9 +1304,9 @@ function block_sources!(pairs::TransferPairs{D},
         # dimension that does not step up.
         low = ntuple(d -> walls[d] && δ[d] != 1, D)
         shift = seam_shift(forest, k, c, δ, symmetric)
-        record!(kind, offset, lvl, s, r) =
+        record!(kind, offset, lvl, s, via::Crossing) =
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
-                                           Int8(r), low, shift),
+                                           via.turns, via.glue, low, shift),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false;
@@ -1278,26 +1325,27 @@ function block_sources!(pairs::TransferPairs{D},
                             shift)
             continue
         end
-        r, nbrs = oriented_neighbors(forest, k, δ)
+        crossing, nbrs = oriented_neighbors(forest, k, δ)
         if isempty(nbrs)
             push!(boundaries, boundary_region(forest, k, b, δ, region, G, low, shift))
             continue
         end
         nblevel = level(first(nbrs))
         if nblevel == level(k)
-            record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), r)
+            record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), crossing)
         elseif nblevel < level(k)
             # Coarser neighbor: this block's ghosts are prolongated. The
             # stencil geometry depends on where this block sits inside
             # its own parent.
-            record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)), r)
+            record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)),
+                    crossing)
         else
             # Finer neighbors: each supplies one part of this block's
             # ghost region, selected by its offset within its parent —
             # its virtual parent, where this block sees it.
             for nbr in nbrs
-                record!(:restrict, seam_offset(forest, nbr, r), 0, find_leaf(forest, nbr),
-                        r)
+                record!(:restrict, seam_offset(forest, nbr, crossing), 0,
+                        find_leaf(forest, nbr), crossing)
             end
         end
     end
@@ -1386,10 +1434,12 @@ end
 
 # The child offset of a finer source as the target sees it: its own
 # offset off the seam, and across it in orientation `r` the offset turned
-# into the virtual frame (M12).
-seam_offset(forest::Forest, nbr::MortonKey, r::Integer) =
-    r == 0 ? childoffset(nbr) :
-    virtual_offset(childoffset(nbr), r, seam_plane(forest)...)
+# into the virtual frame (M12); across a glued face (M17), turned by the
+# glue's axis map.
+seam_offset(forest::Forest, nbr::MortonKey, c::Crossing) =
+    c.turns != 0 ? virtual_offset(childoffset(nbr), c.turns, seam_plane(forest)...) :
+    c.glue != 0 ? virtual_offset(childoffset(nbr), glue_axes(forest, c)...) :
+    childoffset(nbr)
 
 # The sources of a ghost region that crosses a reflecting or an outflow
 # face (M10; see "Ghost filling" in CODE.md). Mirrored (or clamped)
@@ -1425,30 +1475,32 @@ function mirror_sources!(pairs::TransferPairs{D},
         return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
     end
     states = vec(collect(Iterators.product(choices...)))
-    record!(kind, offset, lvl, s, r) =
+    record!(kind, offset, lvl, s, via::Crossing) =
         for state in states
-            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, Int8(r), low,
-                                           shift),
+            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns,
+                                           via.glue, low, shift),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         end
 
     if δ′ == zerooffset
-        record!(:copy, zerooffset, 0, b, 0)
+        record!(:copy, zerooffset, 0, b, Crossing())
         return nothing
     end
     # `δ′` may still cross a rotating seam (M12), the mirror being outside
-    # its plane: the two compose, the source turned and then mirrored.
-    r, nbrs = oriented_neighbors(forest, k, δ′)
+    # its plane, or a glued face (M17): the two compose, the source turned
+    # and then mirrored.
+    crossing, nbrs = oriented_neighbors(forest, k, δ′)
     if isempty(nbrs)
         push!(boundaries, boundary_region(forest, k, b, δ, region, G, low, shift))
         return nothing
     end
     nblevel = level(first(nbrs))
     if nblevel == level(k)
-        record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), r)
+        record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), crossing)
     elseif nblevel < level(k)
-        record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)), r)
+        record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)),
+                crossing)
     else
         # Only the children on the wall side along every masked dimension
         # cover the mirror image; the others supply the half of the
@@ -1456,9 +1508,9 @@ function mirror_sources!(pairs::TransferPairs{D},
         # one, where the target sees the child.
         wallside = ntuple(d -> δ[d] < 0 ? 0 : 1, D)
         for nbr in nbrs
-            o = seam_offset(forest, nbr, r)
+            o = seam_offset(forest, nbr, crossing)
             all(d -> !mask[d] || o[d] == wallside[d], 1:D) || continue
-            record!(:restrict, o, 0, find_leaf(forest, nbr), r)
+            record!(:restrict, o, 0, find_leaf(forest, nbr), crossing)
         end
     end
     return nothing
@@ -1600,18 +1652,32 @@ end
 #
 # `stencils(key)` builds a group's host stencils and `factorcol(key)`
 # its parity column, exactly as the builder does for its local groups,
-# so a pack evaluates the serial transfer. `plane` is the forest's
-# rotating seam (M12): a rotated pack reads its source through the axis
-# map and the variable table, as the serial group does, and computes the
-# unscaled sum; its unpack applies the sign through the factor column, as
-# it applies a parity. `targetowner(t)` and
-# `sourceowner(s)` are the ranks of a global target and source, and
+# so a pack evaluates the serial transfer. `axesof(key)` is its axis map
+# (`group_axes`; the identity off a seam and a glue): a turned pack (M12,
+# M17) reads its source through the axis map and the variable table, as
+# the serial group does, and computes the unscaled sum; its unpack applies
+# the sign through the factor column, as it applies a parity.
+# `targetowner(t)` and `sourceowner(s)` are the ranks of a global target and source, and
 # `targetrange` / `sourcerange` this rank's own leaves in the partitions
 # the targets and the sources are local to. For the ghost and interface
 # exchanges both are `blockrange(forest)`; the regrid transfer (`regrid_stage`)
 # has its targets in the new partition and its sources in the old.
 # The bound of a group with no bound to apply (see `boundedmode`).
 nobound(key) = UNBOUNDED
+
+# The axis map a group of `key` reads its source by, as `TransferGroup`'s
+# `(perm, flip)`: a seam's is `axismap` of the orientation, a glued face's
+# the glue entry's own, and anything else the identity (`noaxes`, the
+# default of a builder whose transfers are neither, as the regrid's).
+function group_axes(forest::Forest{D}, key::GroupKey{D}) where {D}
+    if key.orientation != 0
+        perm, flip = axismap(key.orientation, seam_plane(forest), Val(D))
+        return map(Int8, perm), flip
+    end
+    key.glue != 0 && return glue_axes(forest, Crossing(0, key.glue))
+    return identity_axes(Val(D))
+end
+noaxes(key::GroupKey{D}) where {D} = identity_axes(Val(D))
 
 # `bounded(key)` is the bound of a pack's group (`boundedmode`): the
 # sender computes, so it is the pack that bounds, and the unpack stays a
@@ -1620,8 +1686,7 @@ nobound(key) = UNBOUNDED
 function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
                       sent::TransferPairs{D}, received::TransferPairs{D}, stencils,
                       factorcol; targetowner, sourceowner, targetrange::UnitRange{Int},
-                      sourcerange::UnitRange{Int},
-                      plane::NTuple{2,Int8}=(Int8(0), Int8(0)),
+                      sourcerange::UnitRange{Int}, @nospecialize(axesof=noaxes),
                       @nospecialize(bounded=nobound)) where {RS<:RemoteStage,T,D}
     isempty(sent) && isempty(received) && return nothing
     built = Dict{GroupKey{D},Any}()
@@ -1647,7 +1712,8 @@ function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
                  host(key))
         push!(packs, todevice(backend, TransferGroup{T,D}(
             key.kind, st, Int32[o[2] for o in order], Int32[o[1] for o in order], 0,
-            key.orientation, plane, bounded(key)::Int8)))
+            key.orientation, axesof(key)::Tuple{NTuple{D,Int8},NTuple{D,Bool}},
+            bounded(key)::Int8)))
     end
     # An unpack is a width-1, weight-1 transfer from a slot into the
     # target box the serial group writes, carrying its parity column.
@@ -1682,8 +1748,7 @@ remotetype(::Type{ExchangeStage{GRP,RS}}) where {GRP,RS} = RS
 function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, localsof,
                       sentby::Dict{Int,TransferPairs{D}},
                       receivedby::Dict{Int,TransferPairs{D}}, stencils, factorcol,
-                      forest::Forest{D}; required=Int[],
-                      plane::NTuple{2,Int8}=(Int8(0), Int8(0)),
+                      forest::Forest{D}; required=Int[], @nospecialize(axesof=noaxes),
                       @nospecialize(bounded=nobound)) where {ST,T,D}
     owned = blockrange(forest)
     owner(i) = leafowner(forest, i)
@@ -1694,7 +1759,7 @@ function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, locals
                  remote_stage(remotetype(ST), T, backend, get(sentby, tag, nopairs),
                               get(receivedby, tag, nopairs), stencils, factorcol;
                               targetowner=owner, sourceowner=owner, targetrange=owned,
-                              sourcerange=owned, plane=plane, bounded=bounded))
+                              sourcerange=owned, axesof=axesof, bounded=bounded))
               for tag in tags]
 end
 
@@ -1722,7 +1787,10 @@ end
 # rotated prolongation never joins: its source windows are in the
 # virtual frame, which the axis map turns into the real source's only at
 # the launch, and an odd orientation of a `RotationPair` reads the
-# partner's array, which this rank's boxes do not describe. The cost is
+# partner's array, which this rank's boxes do not describe. So does a
+# level with a prolongation across a glued face (M17), turned or not:
+# conservative, for the same reason, and only an edge or a corner can
+# be coarse-fine across a glue. The cost is
 # one pass over the transfers and one over the hook regions, with a few
 # boxes per block.
 
@@ -1859,7 +1927,7 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
                                                                          NTuple{2,Box{D}}}
             boxes === nothing && continue
             a = access[i]
-            key.orientation == 0 || (a.rotated[] = true)
+            key.orientation == 0 && key.glue == 0 || (a.rotated[] = true)
             reads && record_boxes!(a.reads, sources, shift, boxes[2])
             writes && record_boxes!(a.writes, targets, shift, boxes[1])
         end
@@ -1929,7 +1997,7 @@ end
 # showed as 448 bytes more per build.) `bounded(key)` is the group's
 # bound, `boundedmode`, and `stageof(key)` its stage, `transfer_stage`.
 function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::TransferPairs{D},
-                      build, factorcol, plane, bounded, stageof) where {GRP,T,D}
+                      build, factorcol, axesof, bounded, stageof) where {GRP,T,D}
     phase1 = GRP[]
     bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
@@ -1937,7 +2005,7 @@ function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::Transfer
         stencils = build(key)::NTuple{D,Stencil1D{T,Vector{Int32},Matrix{T}}}
         group = todevice(backend, TransferGroup{T,D}(key.kind, stencils, targets, sources,
                                                      factorcol(key), key.orientation,
-                                                     plane, bounded(key)::Int8))
+                                                     axesof(key), bounded(key)::Int8))
         if stageof(key) == PHASE1_TAG
             push!(phase1, group)
         else
@@ -1945,6 +2013,92 @@ function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::Transfer
         end
     end
     return phase1, bylevel
+end
+
+# A ghost region that crosses two glued faces at once lies beyond a patch
+# corner (M17), where three or more patches meet and no one block lies
+# across: the neighbor search finds nothing there (`glued_anchor`), which
+# `block_sources!` would hand to the boundary hook as though it were an
+# outer face. So it is refused here, once, from the connectivity and the
+# layout, before any search. An element set never reaches one: it is
+# filled on faces only, and `GhostSchedule`'s filter removes every edge
+# and corner direction before the search. Any other set has such a region
+# at the blocks in a corner of every patch glued along two dimensions,
+# unless its ghost widths leave it empty: the region is nonempty exactly
+# when its range along each of the two dimensions is (`target_range`).
+check_patch_corners(::OneBrick, N::Int, G, c, order::Int) = nothing
+function check_patch_corners(conn::Patches{D}, N::Int, G::NTuple{D,Int},
+                             c::NTuple{D,Int}, order::Int) where {D}
+    (order > 0 || !conn.corners) && return nothing
+    for p in eachindex(conn.roots), d in 1:D, e in (d + 1):D, sd in 1:2, se in 1:2
+        conn.glue[glue_slot(p, d, sd, D)].patch != 0 || continue
+        conn.glue[glue_slot(p, e, se, D)].patch != 0 || continue
+        isempty(target_range(N, G[d], c[d], sd == 2 ? 1 : -1, 0, false)) && continue
+        isempty(target_range(N, G[e], c[e], se == 2 ? 1 : -1, 0, false)) && continue
+        throw(ArgumentError(
+            "patch $p is glued at its $(sidename(sd)) face of dimension $d and at its " *
+            "$(sidename(se)) face of dimension $e, so a block in the corner between " *
+            "them has a ghost region beyond both faces at once: a patch corner, where " *
+            "three or more patches meet and no one block lies across, which the ghost " *
+            "fill does not fill. An element-centered set is filled on faces only and " *
+            "never reaches one; a cell- or vertex-centered set does unless its ghost " *
+            "widths leave that region empty."))
+    end
+    return nothing
+end
+sidename(s::Integer) = s == 1 ? "low" : "high"
+
+# The layouts a glued face can carry (M17). A turned source is read with
+# the target's own stored size and offsets, through the axis map, so a
+# dimension must hold its points as the one it reads from does: the same
+# ghost width and centering along axis `a` across the glue as along
+# `perm[a]` here, as a seam asks of a set it turns into itself
+# (`symmetric_layout`). And a reversal must carry owned points onto owned
+# points. It does along a cell-like dimension, whose stored range is
+# symmetric, but not along a vertex-like one, where a block owns its low
+# wall plane and not its high one: reversed along a tangent, a ghost
+# region's last plane would read the shared high plane of the block
+# across, a ghost of its own, and reversed along the normal, a high face
+# glued to a high face leaves the plane on it to neither block. A low face
+# glued to a low face owns it on both sides, as a rotating seam does, and
+# is allowed.
+check_glue_layout(::OneBrick, G, centering, c) = nothing
+function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple{D,Symbol},
+                           c::NTuple{D,Int}) where {D}
+    for p in eachindex(conn.roots), d in 1:D, s in 1:2
+        entry = conn.glue[glue_slot(p, d, s, D)]
+        entry.patch == 0 && continue
+        face, there = (p, d, s), (entry.patch, entry.face...)
+        for a in 1:D
+            e = Int(entry.perm[a])
+            G[a] == G[e] && centering[a] == centering[e] || throw(ArgumentError(
+                "face $face is glued to face $there with axis $e of patch $p onto axis " *
+                "$a of patch $(entry.patch), and this layout holds the two differently " *
+                "(G = $G, centering $centering): a ghost across a glued face is read " *
+                "with the block's own layout through the glue's axis map, so a " *
+                "dimension and the one it is glued onto hold their points alike"))
+        end
+        for a in 1:D
+            e = Int(entry.perm[a])
+            entry.flip[a] && c[e] == 1 || continue
+            e == d && s == 1 && continue
+            throw(ArgumentError(e == d ?
+                "face $face is glued to face $there, a high face to a high face, and " *
+                "this layout holds dimension $d vertex-like: a block owns the low wall " *
+                "plane of a vertex-like dimension and not the high one, so the plane on " *
+                "a high face glued to a high face belongs to neither block, and nothing " *
+                "fills it. Glue a high face to a low one, or hold dimension $d " *
+                "cell-centered." :
+                "face $face is glued to face $there with axis $e of patch $p reversed, " *
+                "and this layout holds dimension $e vertex-like: a block owns the low " *
+                "wall plane of a vertex-like dimension and not the high one, so a ghost " *
+                "region turned across the glue would read the high plane of the block " *
+                "across, a ghost of that block's own and not yet filled when it is " *
+                "read. Glue the patches without reversing it, or hold dimension $e " *
+                "cell-centered."))
+        end
+    end
+    return nothing
 end
 
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
@@ -1968,6 +2122,11 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # `0` is the forest form's "no elements", as `FieldSet` stores it.
         order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
         check_operators(N, gs, cs, order, operators)
+        # What a forest of patches (M17) cannot fill: a region beyond a
+        # patch corner, which an element set's faces-only filter below
+        # never asks for, and a layout the glue's axis map does not keep.
+        check_patch_corners(forest.conn, N, gs, ss, order)
+        check_glue_layout(forest.conn, gs, cs, ss)
         check_floattype(T, backend)
         check_walls(walls)
         layout = layouthash(gs, cs, order, walls, Int(operators.family),
@@ -1985,7 +2144,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # a coarse block, where two values are stored, and the element-local
     # schemes it serves never read one. That one filter covers the local
     # search, the transfers sent for other ranks' blocks, and the hook
-    # regions.
+    # regions — and is why an element set never meets a patch corner (M17),
+    # which `check_patch_corners` has refused for every other layout.
     dirs = alldirections(Val(D))
     order > 0 && filter!(δ -> count(!=(0), δ) == 1, dirs)
     # The targets are this rank's blocks (M7), walked in global leaf
@@ -2062,19 +2222,21 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # (M12): `mirror column + 3^D·r`, so an ordinary transfer keeps 0 and
     # a mirrored one off the seam the column it had. A clamped dimension
     # takes no sign, so it counts as unmirrored, and a transfer clamped
-    # only is an ordinary one to the kernel.
+    # only is an ordinary one to the kernel. A glued face (M17) has no
+    # orientation and takes no sign, however its axes turn: a glued
+    # transfer keeps 0 unless it is also mirrored.
     function factorcol(key)
         parity = map(m -> m == 3 ? Int8(0) : m, key.mirror)
         return any(!iszero, parity) || key.orientation != 0 ?
                mirrorcolumn(parity) + 3^D * Int(key.orientation) : 0
     end
-    plane = map(Int8, seam_plane(forest))
+    axesof(key) = group_axes(forest, key)
 
     # The stage of each transfer (`transfer_stage`), one function for the
     # local groups, the messages and the stage groups alike.
     stageof(key) = transfer_stage(key, order)
     GRP = grouptype(backend, T, Val(D))
-    phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, plane,
+    phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, axesof,
                                    boundedof, stageof)
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
@@ -2089,7 +2251,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     ST = stagetype(backend, T, Val(D))
     stages = build_stages(ST, T, backend, leveltags, localsof, bystage(stageof, sent),
                           bystage(stageof, received), build, factorcol, forest;
-                          required=[PHASE1_TAG], plane=plane, bounded=boundedof)
+                          required=[PHASE1_TAG], axesof=axesof, bounded=boundedof)
     # Which of them may run together here, from the host stencils.
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)
@@ -2109,10 +2271,13 @@ function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
     # are any, so a schedule without either prints as it always has.
     nmirror = sum(g -> ismirrored(g) ? ntransfers(g) : 0, groups; init=0)
     nrot = sum(g -> g.orientation == 0 ? 0 : ntransfers(g), groups; init=0)
+    # The ones turned across a glued face (M17) likewise.
+    nturn = sum(g -> g.turned && g.orientation == 0 ? ntransfers(g) : 0, groups; init=0)
     print(io, "GhostSchedule{", T, ",", D, "}(", ncopy, " copies, ", nrest,
           " restrictions, ", nprol, " prolongations over ", length(s.phase2),
           " level(s), ", nmirror == 0 ? "" : "$nmirror mirrored transfers, ",
           nrot == 0 ? "" : "$nrot rotated transfers, ",
+          nturn == 0 ? "" : "$nturn transfers turned across a glue, ",
           length(s.boundaries), " boundary regions", groups_summary(s),
           messages_summary(s.stages), ")")
 end

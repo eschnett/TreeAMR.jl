@@ -64,14 +64,17 @@ localleaves(forest::Forest) = view(forest.leaves, blockrange(forest))
     block_origin([T], forest, k::MortonKey)
 
 The physical position of the lower corner of block `k`'s interior (the
-outer corner of its first interior cell, not that cell's center).
+outer corner of its first interior cell, not that cell's center). On a
+forest of patches (M17) it is in the logical coordinates of `k`'s patch.
 """
 function block_origin(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D}
     rootpos = root_position(forest, k.root)
+    p = patch(forest, k)
+    roots, extents = patch_roots(forest, p), patch_extents(forest, p)
     scale = 1 << level(k)
     return ntuple(D) do d
-        lo, hi = T(forest.extents[d][1]), T(forest.extents[d][2])
-        rootwidth = (hi - lo) / forest.roots[d]
+        lo, hi = T(extents[d][1]), T(extents[d][2])
+        rootwidth = (hi - lo) / roots[d]
         lo + (rootpos[d] + T(k.coords[d]) / T(scale)) * rootwidth
     end
 end
@@ -91,6 +94,18 @@ sees: plain `isbits` arrays indexed by block, no keys and no forest.
 """
 block_origins(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
     NTuple{D,T}[block_origin(T, forest, k) for k in localleaves(forest)]
+
+"""
+    block_patches(forest)
+
+The patch (M17; see [`patch`](@ref)) of every block this rank stores, as
+`Int32`, indexed by local block — the companion of
+[`block_origins`](@ref) and [`block_spacings`](@ref) for a forest of
+patches, whose extents may overlap or coincide: a block's origin then
+does not say which patch it is in, and so which of the application's
+maps it is under, and this does. All ones on a forest of one brick.
+"""
+block_patches(forest::Forest) = Int32[patch(forest, k) for k in localleaves(forest)]
 
 """
     block_extent([T], forest, k::MortonKey)

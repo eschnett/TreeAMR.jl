@@ -11,7 +11,7 @@ const TEST_HELPERS = ["oracles.jl", "ghost_oracles.jl", "wave.jl", "burgers.jl",
                       "helpers/rotate.jl", "helpers/interpolate.jl",
                       "helpers/partition.jl", "helpers/exchange.jl",
                       "helpers/regrid_exchange.jl", "helpers/state.jl",
-                      "helpers/walls.jl"]
+                      "helpers/walls.jl", "helpers/patch.jl"]
 
 # Every test file in the order the serial suite runs them, with its
 # seconds in that suite at one thread (an M3 Pro, 2026-11-05). The weights
@@ -24,7 +24,8 @@ const TEST_HELPERS = ["oracles.jl", "ghost_oracles.jl", "wave.jl", "burgers.jl",
 const TEST_FILES = ["tree_tests" => 14, "ghost_tests" => 56, "centering_tests" => 32,
                     "element_tests" => 57, "reflect_tests" => 30,
                     "outflow_tests" => 11, "rotate_tests" => 50,
-                    "halfturn_tests" => 35, "interpolate_tests" => 22,
+                    "halfturn_tests" => 35, "patch_tests" => 40,
+                    "interpolate_tests" => 22,
                     "interface_tests" => 4, "partition_tests" => 6,
                     "exchange_tests" => 43, "regrid_exchange_tests" => 36,
                     "interpolate_exchange_tests" => 17, "allvariables_tests" => 6,

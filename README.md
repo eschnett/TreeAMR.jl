@@ -21,13 +21,14 @@ the mesh with a set of finer meshes.
 See [CODE.md](CODE.md) for the full design document, [PLAN.md](PLAN.md)
 for the milestone roadmap and [HISTORY.md](HISTORY.md) for how the
 package got here, or the [documentation](https://eschnett.github.io/TreeAMR.jl/dev).
-The package is currently at milestone **M16** (after M8's every
+The package has completed milestone **M16** (after M8's every
 centering, per-field-set ghost widths and conservation at coarse-fine
 faces, M10's reflecting boundaries as a property of the domain, M11's
 interpolation to arbitrary points, M9a's checkpoint and restart, M7's
 distribution over MPI, M12's rotating symmetry, M13's faster ghost
 fill on nested meshes, M14's half turn, M15's folds over points, and
-M16's element centering). M7 is measured on a
+M16's element centering), and M17's multi-patch forests are
+implemented, pending their downstream acceptance. M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the
@@ -53,6 +54,11 @@ schemes: elements of `P + 1` Gauss–Lobatto nodes on refined forests,
 filled across element faces only and in one stage, with a coarse-fine
 coupling that keeps a summation-by-parts scheme's discrete energy an
 exact invariant.
+M17 glues several bricks of roots, patches, at their faces, their axes
+permuted and reversed as each glue says, for an annulus or a cubed
+sphere on uniform meshes; the coordinates stay logical, patch by patch,
+and the application's map places each patch's points. It is
+implemented and awaits its acceptance by TreeWaveOLDG and its release.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.

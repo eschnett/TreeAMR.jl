@@ -19,8 +19,10 @@
 # leaves every rank but one empty; a nested mesh whose prolongation
 # levels each rank runs as one group of stages; (M14) a half plane,
 # the wave and two sets through a fill, a regrid and interpolation; and
-# (M16) element sets through a fill in one stage and two regrids — and
-# prints
+# (M16) element sets through a fill in one stage and two regrids; and
+# (M17) forests of patches, the annulus in every centering and the cubed
+# sphere's element set, through a fill across their glued faces, and a
+# glue that differs on one rank — and prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
 # reductions and the floating-point sums. Run serially in this
@@ -128,7 +130,8 @@ end
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p") &&
                                                     !startswith(l, "E2") &&
-                                                    !startswith(l, "N3"), lines))
+                                                    !startswith(l, "N3") &&
+                                                    !startswith(l, "P"), lines))
     @test words("N3 leaves")[3:4] == ["232", "3"]
     @test "# N3 largest groups 3 with messages 0" in lines
     # The ranks without blocks (E2): everything ran, and both initial-data
@@ -149,6 +152,13 @@ end
     # both regrids.
     @test all(t -> words("$t transfers")[end] == "1" && "$t conserved true" in lines,
               ("EL2p", "EL2r", "EL3p"))
+    # Forests of patches (M17), uniform: the annulus' 16 roots and the
+    # sphere's 24, each set's fill printed.
+    @test words("PR2 leaves")[3:4] == ["16", "0"]
+    @test words("PS3 leaves")[3:4] == ["24", "0"]
+    @test all(t -> length(filter(startswith(t), lines)) == 1,
+              ("PR2 cell filled", "PR2 vertex filled", "PR2 element filled",
+               "PS3 element filled"))
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.
@@ -190,6 +200,11 @@ end
         @test all(t -> parse(Int, split(only(filter(startswith("# $t prolongations"),
                                                     hashes)))[end]) > 0,
                   ("EL2p", "EL2r", "EL3p"))
+        # Transfers across a glued face crossed ranks, in every set: blocks
+        # on either side of a glue had different owners.
+        @test all(t -> parse(Int, split(only(filter(startswith("# $t glued received"),
+                                                    hashes)))[end]) > 0,
+                  ("PR2 cell", "PR2 vertex", "PR2 element", "PS3 element"))
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes
         @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
@@ -216,6 +231,12 @@ end
         @test startswith(refused("element order"),
                          "# element order refused on $n of $n ranks: GhostSchedule was " *
                          "called for a different layout on rank(s) 1")
+        # M17: the glue is in the forest's digest, so a forest glued
+        # otherwise on rank 1, with the same leaves, is refused everywhere.
+        @test startswith(refused("glue diverged"),
+                         "# glue diverged refused on $n of $n ranks: the forest differs " *
+                         "between ranks")
+        @test occursin("rank(s) 1 hold a different one", refused("glue diverged"))
         @test "# one duplicate per communicator true" in hashes
         @test "# device-aware shares the duplicate true" in hashes
         @test "# verbs agree on every rank true" in hashes

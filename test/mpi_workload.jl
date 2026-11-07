@@ -35,7 +35,9 @@
 # seam; from M14 on a half plane, the wave and two sets through the same.
 # It fills a nested mesh too, whose prolongation levels every rank runs as
 # one group of stages, and from M16 on element sets, through a fill in one
-# stage, the reductions and two regrids. The checkpoints moved to
+# stage, the reductions and two regrids; from M17 on forests of patches,
+# the annulus and the cubed sphere, through a fill across their glued
+# faces with the patch handed to the callbacks. The checkpoints moved to
 # TreeIOHDF5, whose own workload runs them.
 
 using TreeAMR
@@ -1031,6 +1033,111 @@ function halfturn_case(tag)
     return nothing
 end
 
+# --- forests of patches (M17) ----------------------------------------------
+
+# The annulus, four patches of `(2, 2)` roots on one logical box each,
+# glued around a ring with the identity, and a cubed-sphere shell, six
+# faces of `(2, 2, 1)` roots glued along both tangents with swapped and
+# reversed axes, whose patch corners leave the element set as the one it
+# fills. Each set is given its data and its boundary values through
+# `WithPatch` by one function of the point each patch's map places, and
+# goes through one fill, digested with its ghosts, and
+# the reductions. The annulus has more roots than there are ranks, so
+# that the blocks on either side of a glued face have different owners:
+# the `#` lines count the transfers each rank receives across a glue.
+# The faces of the cube `[-1, 1]³`, each a patch `(ξ, η, r)` placed at
+# `r (n + ξ u + η v) / |n + ξ u + η v|` by its frame `(n, u, v)`.
+const CUBE_FRAMES = (((1, 0, 0), (0, 1, 0), (0, 0, 1)), ((-1, 0, 0), (0, 0, 1), (0, 1, 0)),
+                     ((0, 1, 0), (0, 0, 1), (1, 0, 0)), ((0, -1, 0), (-1, 0, 0), (0, 0, 1)),
+                     ((0, 0, 1), (1, 0, 0), (0, 1, 0)), ((0, 0, -1), (0, 1, 0), (-1, 0, 0)))
+
+# Around the annulus the angle runs along x₁ and the radius along x₂.
+function patch_point(x::NTuple{2}, p)
+    θ = (p - 1 + x[1] / 2) * (π / 2)
+    r = 1 + x[2] / 2
+    return (r * cos(θ), r * sin(θ))
+end
+function patch_point(x::NTuple{3}, p)
+    n, u, v = CUBE_FRAMES[p]
+    c = n .+ x[1] .* u .+ x[2] .* v
+    return c .* (x[3] / sqrt(sum(abs2, c)))
+end
+
+function patch_data(x, p, v)
+    y = patch_point(x, p)
+    return v + sin(2 * y[1]) * cos(y[2]) + sum(y) / 3
+end
+
+# Both directions of a glue: `map` sends axis `e` of `from`'s patch to
+# axis `|map[e]|` of `to`'s, reversed where negative, and the reverse is
+# its inverse.
+function glued(from, to, map)
+    D = length(map)
+    inverse = ntuple(a -> (e = findfirst(e -> abs(map[e]) == a, 1:D); sign(map[e]) * e),
+                     D)
+    return [(from=from, to=to, map=map), (from=to, to=from, map=inverse)]
+end
+
+# The ring, its last glue by `last`: `(1, -2)` reverses the radius there,
+# which makes a Möbius strip of it.
+annulus_of(N; last=(1, 2)) =
+    Forest([(roots=(2, 2),) for _ in 1:4]; N=N, comm=COMM,
+           glue=reduce(vcat, [glued((p, 1, 2), (mod1(p + 1, 4), 1, 1),
+                                    p == 4 ? last : (1, 2)) for p in 1:4]))
+
+# The glue of the cubed sphere, derived from the frames: face `(d, s)` of
+# patch `p` is the edge at `±a_d`, shared with the patch whose `n` that
+# is, where it is the face at `n_p`. Out of the one face is into the
+# other, the tangent along the edge is parallel in both frames, and the
+# radius is the radius. Every face is a `from` once.
+function cube_glue()
+    glue = []
+    for (p, (n, u, v)) in enumerate(CUBE_FRAMES), d in 1:2, s in 1:2
+        a = (u, v)
+        q = findfirst(f -> f[1] == (s == 2 ? 1 : -1) .* a[d], CUBE_FRAMES)
+        aq = CUBE_FRAMES[q][2:3]
+        d2, s2 = only((d2, s2) for d2 in 1:2 for s2 in 1:2
+                      if (s2 == 2 ? 1 : -1) .* aq[d2] == n)
+        t, t2 = 3 - d, 3 - d2
+        σ = Base.setindex(Base.setindex((0, 0, 3),
+                                        (s2 == 1 ? 1 : -1) * (s == 2 ? 1 : -1) * d2, d),
+                          (a[t] == aq[t2] ? 1 : -1) * t2, t)
+        push!(glue, (from=(p, d, s), to=(q, d2, s2), map=σ))
+    end
+    return glue
+end
+
+cubed_sphere_of(N) = Forest([(roots=(2, 2, 1), extents=((-1, 1), (-1, 1), (1, 2)))
+                             for _ in 1:6]; N=N, glue=cube_glue(), comm=COMM)
+
+# The transfers this rank receives from another across a glued face,
+# summed over the ranks: none serially.
+function glued_received(forest, sched)
+    n = sum(st -> st.remote === nothing ? 0 :
+                  count(e -> e.key.glue != 0, st.remote.recvlayout),
+            sched.stages; init=0)
+    return sum(TreeAMR.allgather(forest.comm, n))
+end
+
+function patch_case(tag, forest::Forest{D}, sets) where {D}
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    data = WithPatch(patch_data)
+    boundary = boundary_by_coordinates(data)
+    for (name, C, G, P, ops) in sets
+        fs = FieldSet(forest, 2; G=G, centering=C, P=P)
+        fill_by_coordinates!(data, fs)
+        sched = GhostSchedule(fs, ops)
+        fill_ghosts!(fs, sched; boundary=boundary)
+        emit(tag, name, "transfers", transfers(forest, sched))
+        emit(tag, name, "filled", digest(gathered(forest, fs.work)))
+        emit("#", tag, name, "glued received", glued_received(forest, sched))
+        u = statevector(fs)
+        gather!(u, fs)
+        reductions("$tag.$name", fs, u)
+    end
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -1136,6 +1243,14 @@ function refusals()
     efs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=RANK == 1 ? 1 : 3)
     n, msg = attempt(() -> GhostSchedule(efs, OPSE))
     emit("# element order refused on", n, "of", NRANKS, "ranks:", msg)
+
+    # A forest of patches glued otherwise on rank 1 only (M17), a Möbius
+    # strip there and a ring elsewhere: the leaves are the same, so only
+    # the glue in the forest's digest tells them apart, and the schedule
+    # is refused on every rank.
+    forest = annulus_of(8; last=RANK == 1 ? (1, -2) : (1, 2))
+    n, msg = attempt(() -> GhostSchedule(FieldSet(forest, 1; G=2), ops4))
+    emit("# glue diverged refused on", n, "of", NRANKS, "ranks:", msg)
     return nothing
 end
 
@@ -1323,6 +1438,13 @@ function main()
     wave_case("H2v", forest_of((2, 4), 8; halfturn=(1, 2), centre=(0.4, 2.9)); G=1,
               centering=vertexcentered(2), ops=OPS4, steps=6, halfturn=(1, 2))
     halfturn_case("H2")
+    # Forests of patches (M17): the annulus in every centering, and the
+    # cubed sphere's element set, whose glue turns what it sends.
+    patch_case("PR2", annulus_of(8),
+               (("cell", cellcentered(2), 2, nothing, OPS4),
+                ("vertex", vertexcentered(2), 1, nothing, OPS4),
+                ("element", elementcentered(2), 1, 3, OPSE)))
+    patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     refusals()
     verbs()
     return nothing

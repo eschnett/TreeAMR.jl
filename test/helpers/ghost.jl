@@ -9,7 +9,7 @@ function weighted(g::TreeAMR.TransferGroup{T,D}) where {T,D}
                                              s.single),
                    g.stencils)
     return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
-                                      g.factorcol, g.orientation, g.plane)
+                                      g.factorcol, g.orientation, (g.perm, g.flip))
 end
 
 # Every value a copy could meet that an arithmetic shortcut could change:
@@ -30,7 +30,8 @@ function full_sum(g::TreeAMR.TransferGroup{T,D}) where {T,D}
                                              zero(s.single)),
                    g.stencils)
     return TreeAMR.TransferGroup{T,D}(g.kind, stencils, g.targetblocks, g.sourceblocks,
-                                      g.factorcol, g.orientation, g.plane, g.bounded)
+                                      g.factorcol, g.orientation, (g.perm, g.flip),
+                                      g.bounded)
 end
 
 # Finite data with what a dropped `±0` term could still change: signed

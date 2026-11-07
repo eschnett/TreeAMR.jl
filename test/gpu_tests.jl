@@ -611,6 +611,46 @@ end
     @test_throws "nvars = 3" fill_by_coordinates!(whole, short)
 end
 
+@testset "$bname: the WithPatch callbacks are handed the patch: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
+    # `WithPatch` (M17) is a third and fourth kernel for each coordinate
+    # callback, reading the block's patch from an uploaded `Int32` array.
+    # Over two patches on one logical box, a callback that ignores the
+    # patch must fill bit for bit what the form without it does, and one
+    # that uses it must see 1 and 2 where the two patches are, per variable
+    # and all at once alike, initial data and boundary values.
+    ops = Operators(prolongation=2, restriction=2)
+    half = ntuple(_ -> 2, D)
+    box = ntuple(_ -> (zero(T), T(2)), D)
+    forest = Forest{T}([(roots=half, extents=box), (roots=half, extents=box)]; N=4,
+                       glue=[(from=(1, 1, 2), to=(2, 1, 1), map=ntuple(identity, D)),
+                             (from=(2, 1, 1), to=(1, 1, 2), map=ntuple(identity, D))])
+    per = (x, v) -> sum(x) * oftype(x[1], v) + one(x[1])
+    blind = WithPatch((x, p, v) -> per(x, v))
+    seen = WithPatch((x, p, v) -> oftype(x[1], 16p + v))
+    whole = WithPatch(AllVariables((x, p) -> ntuple(v -> oftype(x[1], 16p + v), Val(2))))
+    a, b, c, d = (FieldSet{T}(forest, 2; G=1, backend=backend) for _ in 1:4)
+    fill_by_coordinates!(per, a)
+    fill_by_coordinates!(blind, b)
+    fill_by_coordinates!(seen, c)
+    fill_by_coordinates!(whole, d)
+    @test Array(b.work) == Array(a.work)
+    @test Array(d.work) == Array(c.work)
+    ps = block_patches(forest)
+    @test sort(unique(ps)) == [1, 2]
+    owned = ntuple(_ -> 2:5, D)
+    @test all(Array(c.work)[owned..., v, k] == fill(T(16ps[k] + v), ntuple(_ -> 4, D))
+              for v in 1:2, k in eachindex(ps))
+    sched = GhostSchedule(a, ops)
+    fill_ghosts!(a, sched; boundary=boundary_by_coordinates((x, v) -> per(x, v)))
+    fill_ghosts!(b, sched; boundary=boundary_by_coordinates(blind))
+    fill_ghosts!(c, sched; boundary=boundary_by_coordinates(seen))
+    fill_ghosts!(d, sched; boundary=CellBoundary(WithPatch(AllVariables(
+        (x, p, δ) -> ntuple(v -> oftype(x[1], 16p + v), Val(2))))))
+    @test Array(b.work) == Array(a.work)
+    @test Array(d.work) == Array(c.work)
+end
+
 @testset "$bname: the region hook is refused on a device, with a way out" for
         (bname, backend, types) in BACKENDS
     bname == "CPU" && continue
