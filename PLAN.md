@@ -27,6 +27,7 @@ milestones were planned in, and the list below is in execution order.
   - [M9b — Visualization export](#m9b--visualization-export)
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
+  - [M18 — KernelAbstractions 0.10](#m18--kernelabstractions-010)
 
 ## Milestones
 
@@ -156,3 +157,27 @@ name. What remains, in order:
 *Done when* TreeWaveOLDG's scalar wave converges at the expected order on
 the annulus, with its discrete energy conserved across the glued faces,
 and TreeAMR and TreeIOHDF5 are released with it.
+
+### M18 — KernelAbstractions 0.10
+
+*(Not designed.)* `[compat]` allows KernelAbstractions 0.9 only, here
+and in every Tree* package. In 0.10, `KernelAbstractions.CPU` is the
+POCL (OpenCL) backend, and the native CPU backend is gone, with its
+`static` option: `launch_by_owner!` calls `CPU(; static=true)`, so the
+suite fails almost throughout on 0.10.5 (932 of 966 failures on
+2026-11-07 are that call). Moving to 0.10 is therefore a port of the
+CPU path, not a compat bump. It has to keep what the CPU backend
+carries now: every block on its owner's thread and the first-touch
+placement that follows ("What one process loses" in
+[CODE.md](CODE.md#parallelism)), results bit-identical across thread
+counts, the shaped CPU launch of the copy kernels, and the CPU
+cross-check of the device folds. The candidates for the owner launch
+are POCL's own threading, if it can be pinned to blocks, or a host
+loop through `threaded_chunks` with one launch per block. The device
+backends need releases that work with 0.10 (Metal 1.12 does; CUDA is
+not checked).
+
+*Done when* the suite passes on 0.10, thread scaling and the compile
+times of `test/mpi_workload.jl` are no worse than on 0.9, and TreeAMR,
+TreeIOHDF5 and the downstreams are released with `"0.10"` in their
+`[compat]`.
