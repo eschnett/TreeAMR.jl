@@ -5825,19 +5825,19 @@ which companion releases go with it.
 
 ## Tests
 
-`test/runtests.jl` holds the M1 tests inline and `include`s
-`ghost_tests.jl`, `centering_tests.jl`, `element_tests.jl` (M16),
-`reflect_tests.jl` (M10),
-`outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14,
-which uses `rotate_tests.jl`'s helpers), `patch_tests.jl` (M17),
+`test/runtests.jl` runs the test files, which are, in its order,
+`tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
+`element_tests.jl` (M16), `reflect_tests.jl` (M10), `outflow_tests.jl`,
+`rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
-`allvariables_tests.jl`, `state_tests.jl`, `fold_tests.jl` (M15, which
-uses `state_tests.jl`'s `poisoned_fieldset`), `regrid_tests.jl`,
-`bounded_tests.jl` (the bounded prolongation), `wave_tests.jl`,
-`wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`, `type_tests.jl`,
-`thread_tests.jl`, `mpi_tests.jl` (M7) and
+`allvariables_tests.jl`, `state_tests.jl`, `fold_tests.jl` (M15),
+`regrid_tests.jl`, `bounded_tests.jl` (the bounded prolongation),
+`staggered_conservative_tests.jl`, `walls_tests.jl` (symmetric walls),
+`relative_tests.jl` (the relative boundary hook), `wave_tests.jl`,
+`wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`,
+`type_tests.jl`, `thread_tests.jl`, `mpi_tests.jl` (M7) and
 `gpu_tests.jl` (M2–M8).
 
 The M7 tests come in two kinds. **In process**, simulated ranks over
@@ -5953,7 +5953,7 @@ and the seam oracles read the `Crossing`; `gpu_tests.jl` runs the four
 `mpi_workload.jl` have the annulus, the laid-out pair and the sphere
 (below).
 
-Seven helper files are not tests:
+These files are not tests:
 
 - `oracles.jl`, `ghost_oracles.jl` — deliberately naive, independent
   reference implementations (bit-plane Morton comparison, exact `Rational`
@@ -6046,7 +6046,17 @@ Seven helper files are not tests:
 - `mpi_jobs.jl` — the launcher of those `mpiexec` jobs
   (`launch_workload`, `finish_workload`, `concurrent_launches`), which
   `runtests.jl` includes before the first test so that the jobs can
-  start early.
+  start early, in the process that runs `mpi_tests.jl`.
+- `helpers/` — the definitions of eleven test files (`ghost`, `centering`,
+  `reflect`, `rotate`, `interpolate`, `partition`, `exchange`,
+  `regrid_exchange`, `state`, `walls`, `patch`), split off from their tests so
+  that every test file runs on its own: the simulated communicators,
+  the lockstep fills, the rotating-wave problem, the interpolation
+  polynomials and the rest. A file keeps its tests and says where its
+  definitions went. A definition that a second test file calls goes
+  here, with the definitions of the file it came from.
+- `test_groups.jl` — the list of test files with their weights, and the
+  split of the suite into groups (see *Parallel groups* below).
 
 **The suite is compilation-bound, not kernel-bound.** Measured: annotating the test
 applications' kernels `@inbounds` made `wave_rhs_kernel!` 6.8x faster
@@ -6055,10 +6065,64 @@ noise; the same treatment of `test/thread_workload.jl` moved its 18.8 s
 by 2 %. CI gains nothing from such a change in any case, since
 `check_bounds: yes` overrides `@inbounds` package-wide.
 
-**CI and coverage.** `julia-actions/julia-runtest` defaults `coverage`
-to `true`; CI.yml ties coverage to `threads == 1`, which keeps
-it on the two cheap cells (both operating systems, merged by Codecov)
-and drops it from the expensive threaded ones. Instrumentation cost
+**Parallel groups.** Compilation within one process is serial, so the
+suite splits it over processes. `test/runtests.jl` with no arguments
+asks `test_group_count` how many. Where the machine has 8+ threads and
+24+ GB (the rule `concurrent_launches` applies to the MPI jobs), the
+answer is `min(5, Sys.CPU_THREADS ÷ 2)`; anywhere smaller, CI's runners
+among them, it is 1, the serial suite in one process.
+`TREEAMR_TEST_GROUPS` overrides it. `pack_groups` splits the files of
+`test_groups.jl`'s list by their weights, heaviest first into the
+lightest group, and the parent starts one `runtests.jl <files…>` child
+per group. Each child gets the parent's thread counts and project, and
+through `Base.julia_cmd()` its `--check-bounds` and `--code-coverage`.
+The parent prints each group's output when it ends and fails a group
+whose process fails. The MPI test carries the weight of its two
+`mpiexec` jobs, so that it and the thread-independence test, both heavy
+with subprocesses, land in different groups.
+
+What makes any split correct is that **every test file runs on its
+own**, after the helper files. A definition that another test file
+calls therefore lives in `test/helpers/`, never in a test file;
+`runtests.jl <file>` running each file alone checks it.
+
+Grouping is the cheap form of parallelism here, and the only one that
+pays: a group shares its compilation among its files. One process per
+file pays the shared compilation once per file, 1889 s summed against
+686 s in one process, and was barely faster (630 s at four at once).
+Measured with `Pkg.test` on an M3 Pro (6 performance and 6 efficiency
+cores, 36 GB):
+
+| threads | serial | 3 groups | 4 groups | 5 groups |
+|---|---|---|---|---|
+| 1, first round | 640 s | 312 s | 345 s | 242 s |
+| 1, second round | | 511 s | 364 s | 349 s |
+| 8 | 724 s | | | 358 s |
+
+The second round ran under other load on the laptop, which slowed every
+configuration; within a round five groups were the fastest, and at five
+groups the groups' own times were 195–231 s, so the balance costs
+little. Laptop timings are noisy: compare configurations within one
+round.
+[HISTORY.md](HISTORY.md#development-environment-and-ci) has the
+measurements that led here.
+
+**CI and coverage.** CI runs in two tiers, the same in every Tree*
+repository. A pull request runs the two Linux cells (one and four
+threads) uninstrumented: the full suite has run on the author's macOS
+machine before the pull request is opened, so what CI adds is x86-64
+Linux, a clean environment and `check_bounds: yes`. A push to `main`,
+the weekly schedule and a manual dispatch add the two macOS cells, and
+coverage. Changes to Markdown and `docs/` run no CI at all, and tags
+are not tested, since TagBot tags a commit that has passed on `main`.
+The measurements behind this are in [HISTORY.md](HISTORY.md#development-environment-and-ci).
+
+`julia-actions/julia-runtest` defaults `coverage` to `true`; CI.yml
+instruments exactly one cell, macOS at one thread, off pull requests.
+Not a threaded cell, which is the expensive one, and not a Linux cell:
+`--code-coverage` with `--check-bounds=yes` miscompiles on GitHub's
+AVX-512 Zen 4/5 runners under Julia 1.13 (TreeGeneralizedHarmonic's
+CI.yml has the probes). Instrumentation cost
 **2.61x** locally (measured: 3m23.6s → 8m51.8s, 88819 tests, 4 threads both times) —
 though that is not the CI factor, because the action also defaults
 `check_bounds` to `yes` and a plain `Pkg.test` no longer does.
