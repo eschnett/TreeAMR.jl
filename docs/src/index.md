@@ -92,7 +92,7 @@ in one stage, with a coarse-fine coupling that keeps a
 summation-by-parts scheme's discrete energy an exact invariant. A regrid
 refines and coarsens them exactly to the element's degree.
 
-M17, implemented and awaiting its downstream acceptance and its
+M17, implemented, accepted by TreeWaveOLDG and awaiting its
 release, glues several bricks of roots, *patches*, at their faces, for
 an annulus or a cubed sphere on uniform meshes (see
 [Forests of patches](@ref)). Next is visualization export (M9b).

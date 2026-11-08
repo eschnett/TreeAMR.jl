@@ -6,7 +6,7 @@ no physics.
 
 **Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13, M14, M15
 and M16 are done. M17, multi-patch forests on uniform meshes, is
-implemented and awaits its downstream acceptance and its release; next
+implemented and accepted by TreeWaveOLDG, and awaits its release; next
 is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
