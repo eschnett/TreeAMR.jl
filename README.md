@@ -28,7 +28,7 @@ interpolation to arbitrary points, M9a's checkpoint and restart, M7's
 distribution over MPI, M12's rotating symmetry, M13's faster ghost
 fill on nested meshes, M14's half turn, M15's folds over points, and
 M16's element centering), and M17's multi-patch forests are
-implemented, pending their downstream acceptance. M7 is measured on a
+implemented and accepted downstream, pending their release. M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the
@@ -58,7 +58,8 @@ M17 glues several bricks of roots, patches, at their faces, their axes
 permuted and reversed as each glue says, for an annulus or a cubed
 sphere on uniform meshes; the coordinates stay logical, patch by patch,
 and the application's map places each patch's points. It is
-implemented and awaits its acceptance by TreeWaveOLDG and its release.
+implemented and accepted by TreeWaveOLDG, whose scalar wave converges
+at order `P` on a four-patch annulus, and awaits its release.
 Next is visualization output (M9b).
 
 This package is still under development. It is ready for experimental use.

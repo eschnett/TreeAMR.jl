@@ -4272,8 +4272,8 @@ M12 was decided with Erik, after M7 and before M9b.
 ### M17 — Multi-patch forests (uniform)
 
 - **M17 — Multi-patch forests (uniform).** *(Specified 2026-11-02.
-  Implemented the same day, steps 1–8; not done — the checks on
-  Symmetry, TreeWaveOLDG's acceptance and the releases remain, as
+  Implemented the same day, steps 1–8; accepted by TreeWaveOLDG on
+  2026-11-07; not done — the releases remain, as
   [PLAN.md](PLAN.md#m17--multi-patch-forests-uniform) lists.)* Several
   root bricks, patches, glued at their faces by signed axis
   permutations, on uniform meshes, so that an application can solve on
@@ -4475,8 +4475,33 @@ M12 was decided with Erik, after M7 and before M9b.
   since its save calls `patch_keywords`, which 0.2.7 does not have, and
   comes after its 0.1.6, whose element sets M17's checkpoints use.
   TreeWave's and TreeHydro's suites pass against the checkout
-  ([Downstream checks](#downstream-checks)); TreeWaveOLDG's annulus,
-  the acceptance test, has not been run.
+  ([Downstream checks](#downstream-checks)).
+
+  *Acceptance: TreeWaveOLDG's annulus* (2026-11-07). TreeWaveOLDG's
+  scalar wave runs on the four-patch annulus against
+  `eschnett-claude/multi-patch` (adc7edb): the `patch_ring` layout
+  (four patches, identity glue), reflecting radial faces, element sets
+  with `P = 2…5`, uniform. TreeWaveOLDG supplies the polar map through
+  `WithPatch(AllVariables(…))` and passes the patch to `mesh_fold` as a
+  block tag.
+
+  - *Convergence.* The rotating Neumann Bessel mode, run a quarter
+    turn across every glued face, converges at order `P`: `L²` rates
+    1.93, 3.01, 3.82 and 4.88 for `P = 2…5` (Symmetry job 593191).
+  - *Energy.* Exactly invariant across the glued faces: `dE/dt` is
+    zero to `1e-13` of its terms, and a run loses only RK4's `dt⁵`.
+  - *Glue.* Without a metric the ring's right-hand side equals the
+    equivalent brick's — four times the roots along the angle,
+    periodic there, reflecting radially — bit for bit, for `u` and
+    both gradient sets with their parities.
+  - *No TreeAMR change was needed.* `check_glue_layout` accepted the
+    element sets with their face-only ghosts, and the reflecting
+    parities on unglued faces behaved as on a brick. Precompilation,
+    four threads and `--check-bounds=yes` are all clean.
+
+  TreeWaveOLDG's own limits are the identity glue only — its
+  per-dimension gradient sets cannot take a cubed sphere's axis swaps —
+  and diagonal metrics only.
 
 ## Downstream checks
 
