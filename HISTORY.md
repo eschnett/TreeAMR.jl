@@ -4607,6 +4607,12 @@ M12 was decided with Erik, after M7 and before M9b.
     excluded region off that line flagged nothing; `L2` takes the second
     coordinate from the plastic number instead. M11's `I2` case uses the
     same sequence and is left as it is.
+  - *Compile time.* `--trace-compile-timing` of a serial
+    `test/mpi_workload.jl` against `main` (laptop): the M11
+    `interpolate_kernel!` specializations take 0.68 s against 0.64 s,
+    within the spread between runs, and the whole workload 79.1 s against
+    72.5 s, the difference being the new `L2` case (2.7 s of it the new
+    locate, evaluation, chain-rule and lattice kernels).
 
 ## Downstream checks
 
