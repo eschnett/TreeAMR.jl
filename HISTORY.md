@@ -4550,6 +4550,18 @@ M12 was decided with Erik, after M7 and before M9b.
     deprecation. `Lagrange` is bit for bit M11's: the `interp` digests
     of `test/thread_workload.jl`, eleven configurations over every
     centering, wall, seam and half turn, equal `main`'s.
+  - *Step 3, `ElementPolynomial` and the state-vector form
+    (2026-11-09).* As designed. One finding changed the test, not the
+    design: "a query at a node reproduces the node's value" holds for a
+    node off the block's upper face only, since a point on that face
+    belongs to the block above, whose element interpolates it to its
+    own accuracy where the levels differ (an error of `5e-3` at `P = 2`
+    in 2D, far above roundoff); inside a block an element face is read
+    from the upper element, which holds the same value. Measured rates
+    on `sin(2x+v)cos(3y−½)`, `N = 2(P+1)` against `4(P+1)`, three
+    levels: value 1.88, 2.92, 3.90, 5.02 for `P = 1…4`; `∂ₓ` 0.94, 1.98,
+    3.00, 4.13; `∂ᵧ` 0.87, 2.04, 2.98, 4.03; `∂ₓ²` 1.05, 2.08, 2.94 and
+    `∂ᵧ²` 0.98, 1.97, 3.03 for `P = 2…4`; `∂ₓ∂ᵧ` 0.89, 2.17, 2.86, 4.07.
 
 ## Downstream checks
 

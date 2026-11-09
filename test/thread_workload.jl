@@ -334,6 +334,16 @@ function element_workload(::Val{D}; roots, N, P, periodic, reflecting=nothing,
         println(name, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
         println(name, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
         println(name, " fold ", workload_fold(fs, u))
+        # The element's polynomial at a fixed low-discrepancy set (M19),
+        # value and gradient, from the state vector, reaching across a low
+        # wall in x where there is one so that the mirror runs too.
+        below = walls[1][1] ? 0.2 : 0.0
+        xs = [ntuple(d -> mod(0.6180339887498949 * j * (d + 1) + 0.1d, 1.0) *
+                          (1 + (d == 1 ? below : 0.0)) - (d == 1 ? below : 0.0), D)
+              for j in 1:257]
+        derivs = (ntuple(_ -> 0, D), ntuple(a -> ntuple(d -> Int(d == a), D), D)...)
+        r = interpolate(fs, u, xs, ElementPolynomial(); derivs=derivs)
+        println(name, " interp ", digest(vec(r.values)))
     end
     return nothing
 end

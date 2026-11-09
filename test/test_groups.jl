@@ -25,7 +25,7 @@ const TEST_FILES = ["tree_tests" => 14, "ghost_tests" => 56, "centering_tests" =
                     "element_tests" => 57, "reflect_tests" => 30,
                     "outflow_tests" => 11, "rotate_tests" => 50,
                     "halfturn_tests" => 35, "patch_tests" => 40,
-                    "interpolate_tests" => 22,
+                    "interpolate_tests" => 22, "element_interpolate_tests" => 20,
                     "interface_tests" => 4, "partition_tests" => 6,
                     "exchange_tests" => 43, "regrid_exchange_tests" => 36,
                     "interpolate_exchange_tests" => 17, "allvariables_tests" => 6,

@@ -206,7 +206,8 @@ says it is done:
 2. **The basis interface by position** *(implemented 2026-11-09)*, `t` in spacings from the block's
    origin in place of the continuous stored index. *Done when*
    `Lagrange` is bit for bit what it was.
-3. **`ElementPolynomial` and the state-vector form.** *Done when*:
+3. **`ElementPolynomial` and the state-vector form.** *(Implemented
+   2026-11-09.)* *Done when*:
    - it is exact on `Q_P` at random points, to a few eps;
    - a query at a node reproduces the node's value to rounding;
    - derivatives are exact on `Q_P`;

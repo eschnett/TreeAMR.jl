@@ -446,13 +446,16 @@ end
     @test volume_weighted_norm(fs, u; p=Inf) == maximum(abs, u)
 end
 
-@testset "Point interpolation refuses an element set" begin
+@testset "Point interpolation takes an element set through its own basis only" begin
     # Guards interpolating Gauss–Lobatto nodes as if they were equally
-    # spaced, which would silently return wrong values.
+    # spaced, which would silently return wrong values; the element basis
+    # itself is tested in `element_interpolate_tests.jl`.
     forest = element_forest(Float64, 2)
     fs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=3)
     @test_throws "does not take an element-centered set" interpolate(fs, [(0.3, 0.4)],
                                                                       Lagrange(2))
+    fill_by_coordinates!((x, v) -> 2.0, fs)
+    @test interpolate(fs, [(0.3, 0.4)], ElementPolynomial()).values[1] ≈ 2
 end
 
 # --- The fill -----------------------------------------------------------

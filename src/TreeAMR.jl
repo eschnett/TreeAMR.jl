@@ -63,7 +63,7 @@ export RotationPair
 
 # Point interpolation
 export locate_point, locate, LocatedPoints, interpolate, interpolate!,
-       InterpolationBasis, Lagrange,
+       InterpolationBasis, Lagrange, ElementPolynomial,
        Region, Ellipsoid
 
 # Distributed meshes (M7)

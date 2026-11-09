@@ -13,6 +13,7 @@ LocatedPoints
 locate_point
 InterpolationBasis
 Lagrange
+ElementPolynomial
 Region
 Ellipsoid
 ```

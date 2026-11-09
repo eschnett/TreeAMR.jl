@@ -3179,11 +3179,10 @@ Over a distributed forest an outside point is found on the host before
 anything is routed, and refused on every rank there, rather than after
 the launch. A device batch goes through the host for the messages.
 
-An element set (M16) is refused in `check_interpolation`, inside the
-collective checks: the stencil above is built for a uniform, continuous
-stored index, and Gauss–Lobatto nodes need a basis that maps a position
-to its element's nodes and evaluates the element's polynomial
-(**(proposed)**, see [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
+An element set (M16) takes `ElementPolynomial()`, whose stencil is the
+element's own nodes, and `check_interpolation`, inside the collective
+checks, refuses `Lagrange` on it and `ElementPolynomial` on any other
+set (see [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
 
 A forest of patches (M17) is refused by `PointGeometry`, which every
 path to point location builds — `locate_point`, `interpolate` serially,
@@ -3337,22 +3336,38 @@ multi_indices(Val(D), maxorder)
   separable test.
 - **`ElementPolynomial()`** evaluates the degree-`P` tensor polynomial
   of the element containing the point through its `(P+1)ᴰ` owned nodes.
-  `P` is the field set's: at the call the basis is specialized to an
-  isbits one with `P` a type parameter, carrying the node offsets and
-  barycentric weights, built in `BigFloat` and rounded once
-  ([Precision](#precision)). The offsets are `nodeposition`'s, so a
-  query at a node has the node's bits. The element is
-  `q = ⌊t/(P+1)⌋`, with `t` the position in spacings from the block's
-  origin, clamped to the block's elements, so a point on an element face
-  takes the upper element. The weights `ℓᵢ(t) = λᵢ ∏_{j≠i}(t − oⱼ)` are
-  M11's truncated Taylor products with the Gauss–Lobatto offsets in
-  place of integers, never dividing by `t − oⱼ`. It is exact on `Q_P`,
-  the value converges as `O(h^{P+1})` and a derivative as
-  `O(h^{P+1−maxₐ mₐ})`; an order above `P` is refused, and a total order
-  above 2 as in M11.
+  `P` is the field set's: at the call the basis is specialized
+  (`specialize_basis`) to an isbits `ElementBasis{P+1,T}` carrying the
+  node offsets and barycentric weights, built in `BigFloat` and rounded
+  once ([Precision](#precision); `element_barycentric` memoises the
+  weights beside the element tables). The offsets are `nodeposition`'s,
+  so a query at a node evaluates the polynomial where it interpolates
+  the node, and reproduces it to a few roundings — for a node not on
+  the block's upper face, which belongs to the block above, as every
+  face point does, and is interpolated there to that block's accuracy
+  where the levels differ. The element is `q = ⌊t/(P+1)⌋`, with `t` the
+  position in spacings from the block's origin, clamped to the block's
+  elements, so a point on an element face takes the upper element. The
+  weights `ℓᵢ(t) = λᵢ ∏_{j≠i}(t − oⱼ)` are M11's truncated Taylor
+  products with the Gauss–Lobatto offsets in place of integers, never
+  dividing by `t − oⱼ`. It is exact on `Q_P` (to `1e-13` for the value
+  through `D = 3`, `P = 4`), the value converges as `O(h^{P+1})` and a
+  derivative as `O(h^{P+1−maxₐ mₐ})`; an order above `P` is refused, and
+  a total order above 2 as in M11. Measured on `sin(2x+v)cos(3y−½)`
+  over three levels, `N = 2(P+1)` against `4(P+1)`: the value at 1.88,
+  2.92, 3.90 and 5.02 for `P = 1…4`; `∂ₓ` at 0.94, 1.98, 3.00 and 4.13;
+  `∂ₓ²` at 1.05, 2.08 and 2.94 for `P = 2…4`; `∂ₓ∂ᵧ` at 0.89, 2.17,
+  2.86 and 4.07. The `exclude` test reads the nodes' positions through
+  `ElementStencil`, `nodeposition`'s expression.
 - **It reads no ghosts,** so it needs no `fill_ghosts!`, reads a state
   vector as well as the working array, and picks up none of the
-  exchange's error at a coarse-fine face. It is discontinuous across
+  exchange's error at a coarse-fine face. The state-vector form,
+  `interpolate(fs, u, xs, basis)`, runs the same kernel over
+  `statearray(u, fs)`, the owned points laid out as a working array
+  without ghosts, with `G = 0` and the stored size `N` handed to the
+  basis; an element stencil starts at `G + q(P+1) + 1`, so both sources
+  give the same nodes and the same bits. A basis that reads ghosts
+  (`readsghosts`) is refused with a state vector. It is discontinuous across
   element faces: the value jumps by the solution's own `O(h^{P+1})`, the
   derivatives by `O(h^P)`, which a horizon finder flows through and a
   viewer shows as part of the data.
@@ -6053,7 +6068,8 @@ which companion releases go with it.
 `tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
 `element_tests.jl` (M16), `reflect_tests.jl` (M10), `outflow_tests.jl`,
 `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
-`interpolate_tests.jl` (M11), `interface_tests.jl`, the four in-process
+`interpolate_tests.jl` (M11), `element_interpolate_tests.jl` (M19),
+`interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `fold_tests.jl` (M15),
@@ -6122,8 +6138,15 @@ positions `coordinates` gives, without the package's stencils. From a
 corner ghost is still `NaN`; fine ghosts are exact for `Q_P` data and
 coarse ones for `Q_{P−1}` and not `Q_P`; the adjoint identity holds
 across every coarse-fine face; the regrid is exact for `Q_P` both ways
-and coarsening undoes refining for any data. The element cases in the
-other files: `exchange_tests.jl` (every transfer in the one phase-1
+and coarsening undoes refining for any data.
+`element_interpolate_tests.jl` holds point interpolation on element
+sets (M19): exactness on `Q_P` with every derivative the element has,
+for `D = 1, 2, 3`, `P ≤ 4` and `G = 0, 1`; a node's value at its node,
+for every node not on a block's upper face; the measured rates; `NaN`
+ghosts changing nothing, and the state vector giving the working
+array's bits; the mirror across a reflecting wall bit for bit; the
+`exclude` test at the Gauss–Lobatto positions; and the refusals. The
+element cases in the other files: `exchange_tests.jl` (every transfer in the one phase-1
 stage on every rank, the lockstep fill bit for bit, the mailbox driver
 under the phase-1 tag), `regrid_exchange_tests.jl` (the regrid stage
 over 1–7 ranks, and `regrid!` beside a cell set with a hook),

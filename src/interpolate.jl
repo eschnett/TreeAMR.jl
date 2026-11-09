@@ -118,6 +118,7 @@ end
 # A derivative the basis cannot produce, with the reason; `nothing` when
 # it can. Lagrange's `m`-th derivative through `n` points is identically
 # zero from `m = n` on, which is never what a caller meant.
+check_derivative(::InterpolationBasis, m::Int) = nothing
 function check_derivative(::Lagrange{n}, m::Int) where {n}
     m < n && return nothing
     return "a derivative of order $m through Lagrange($n) is identically zero: " *
@@ -165,6 +166,124 @@ end
 # The derivatives `m!·cₘ` of the series, divided by the denominator.
 @inline series_derivatives(c::NTuple{L,T}, den::T) where {L,T} =
     ntuple(m -> T(factorial(m - 1)) * c[m] / den, Val(L))
+
+"""
+    ElementPolynomial()
+
+The interpolant of an element-centered set (M16; [`elementcentered`](@ref)):
+the degree-`P` tensor polynomial of the element containing the point,
+through its `(P+1)ᴰ` Gauss–Lobatto nodes, with `P` the field set's. It is
+exact on `Q_P`, the value converges as `O(h^{P+1})` and a derivative as
+`O(h^{P+1−maxₐ mₐ})`; a derivative of order above `P` along a dimension
+is identically zero and refused.
+
+It reads the element's own nodes and no ghosts, so it needs no
+[`fill_ghosts!`](@ref), reads a state vector as well as the working
+array (`interpolate(fs, u, xs, basis)`), and picks up none of the
+exchange's error at a coarse-fine face. It is discontinuous across
+element faces: the value jumps there by the solution's own
+`O(h^{P+1})`, a first derivative by `O(h^P)`. A point on an element face
+takes the upper element, as a point on a block face takes the upper
+block.
+
+A set without elements takes [`Lagrange`](@ref) instead, and an element
+set takes this basis only. See "Interpolation on element sets and
+patches" in `CODE.md`.
+"""
+struct ElementPolynomial <: InterpolationBasis end
+
+# `ElementPolynomial` specialized to a field set's order and type, as the
+# kernel takes it: `n = P + 1` nodes per dimension, their offsets in
+# spacings from the element's low face (`nodeposition`'s, so a query at a
+# node is at the node's bits) and their barycentric weights, both rounded
+# once from `BigFloat` (`element_barycentric`; "Precision" in CODE.md).
+struct ElementBasis{n,T} <: InterpolationBasis
+    offsets::NTuple{n,T}
+    λ::NTuple{n,T}
+end
+
+function ElementBasis(::Type{T}, P::Int) where {T}
+    o = element_tables(T, P).offsets
+    λ = element_barycentric(T, P)
+    return ElementBasis{P + 1,T}(ntuple(i -> o[i], P + 1), ntuple(i -> λ[i], P + 1))
+end
+
+Base.show(io::IO, ::ElementPolynomial) = print(io, "ElementPolynomial()")
+Base.show(io::IO, ::ElementBasis{n}) where {n} =
+    print(io, "ElementPolynomial() of order P = ", n - 1)
+
+# The basis a call evaluates `fs` with: `ElementPolynomial` takes the set's
+# order and type; every other basis is its own. A set without elements
+# leaves `ElementPolynomial` as it is, for `check_interpolation` to refuse
+# where the ranks of a distributed forest agree on refusals.
+specialize_basis(basis::InterpolationBasis, fs) = basis
+specialize_basis(::ElementPolynomial, fs) =
+    fs.P == 0 ? ElementPolynomial() : ElementBasis(eltype(fs.work), fs.P)
+
+# Whether a basis reads ghost points, which a state vector does not hold.
+readsghosts(::InterpolationBasis) = true
+readsghosts(::ElementPolynomial) = false
+readsghosts(::ElementBasis) = false
+
+@inline stencilwidth(::ElementBasis{n}) where {n} = n
+
+# The element containing the point, `q = ⌊t/n⌋` clamped to the block's
+# `E = (S − 2G)/n` elements, so that a point on an element face takes the
+# upper element and one on the block's upper face the last; its first
+# owned node, and the point's offset from the element's low face.
+@inline function stencilstart(::ElementBasis{n}, t::T, G::Int, c::Int,
+                              S::Int) where {n,T}
+    E = (S - 2G) ÷ n
+    q = clamp(floorindex(t / T(n)), 0, E - 1)
+    return G + q * n + 1, t - T(q * n)
+end
+
+function check_derivative(::ElementBasis{n}, m::Int) where {n}
+    m < n && return nothing
+    return "a derivative of order $m of an element set of order P = $(n - 1) is " *
+           "identically zero: the element's interpolant is a polynomial of degree " *
+           "$(n - 1) in each dimension."
+end
+
+# `ℓₖ(ξ) = λₖ ∏_{j≠k}(ξ − oⱼ)` and its first `M` derivatives, by the same
+# truncated Taylor products as Lagrange's (`lagrange_series`), with the
+# Gauss–Lobatto offsets in place of the integer nodes and the barycentric
+# weight in place of the integer denominator. Nothing divides by `ξ − oⱼ`.
+@inline function basisweights(b::ElementBasis{n,T}, ξ::T, ::Val{M}) where {n,T,M}
+    w = ntuple(k -> element_series(b, k, ξ, Val(M)), Val(n))
+    return ntuple(m -> ntuple(k -> w[k][m], Val(n)), Val(M + 1))
+end
+
+@inline function element_series(b::ElementBasis{n,T}, k::Int, ξ::T,
+                                ::Val{M}) where {n,T,M}
+    c = ntuple(m -> m == 1 ? one(T) : zero(T), Val(M + 1))
+    for j in 1:n
+        j == k && continue
+        c = series_times(c, ξ - b.offsets[j])
+    end
+    λ = b.λ[k]
+    return ntuple(m -> T(factorial(m - 1)) * c[m] * λ, Val(M + 1))
+end
+
+# The positions of an element stencil's nodes: node `k` (from 0) of
+# element `q` along `d` at `origin + h·(q·n + o_k)`, `nodeposition`'s
+# expression, so that an `exclude` region flags a node exactly when its
+# `coordinates` are inside.
+struct ElementStencil{D,T,n}
+    origin::NTuple{D,T}
+    h::T
+    q::NTuple{D,Int}
+    offsets::NTuple{n,T}
+end
+
+@inline stencil_position(s::ElementStencil{D,T,n}, d, k) where {D,T,n} =
+    s.origin[d] + s.h * (s.q[d] * n + s.offsets[k + 1])
+
+@inline function stencil_place(b::ElementBasis{n}, origin::NTuple{D,T}, h, first,
+                               ::Val{G}, ::Val{C}) where {n,D,T,G,C}
+    return ElementStencil{D,T,n}(origin, h, ntuple(d -> (first[d] - G[d] - 1) ÷ n, Val(D)),
+                                 b.offsets)
+end
 
 # `floor(s)` as an `Int`, for the bounded arguments this file gives it (a
 # stored index, a root position). A hardware float truncates directly.
@@ -800,13 +919,14 @@ function domain_error(forest::Forest, x, j)
 end
 
 """
-    interpolate(fs, xs, basis; derivs = (value,), vars = 1:fs.nvars,
+    interpolate(fs, [u,] xs, basis; derivs = (value,), vars = 1:fs.nvars,
                 exclude = nothing, outside = :error,
                 fill = T(NaN)) -> (; values, excluded, inside)
 
 The variables `vars` of `fs`, and the derivatives `derivs` of them, at every
-point of `xs`, by tensor-product interpolation in `basis` — today
-[`Lagrange`](@ref)`(n)`.
+point of `xs`, by tensor-product interpolation in `basis` —
+[`Lagrange`](@ref)`(n)`, or [`ElementPolynomial`](@ref)`()` for an
+element set.
 
 - `xs` is an array of points — anything indexable as `x[d]`, an
   `NTuple{D}` or an `SVector` — on the field set's backend, of any shape.
@@ -842,9 +962,11 @@ extrapolate: centered whenever `G ≥ n/2` in a cell-centered dimension and
 `G ≥ n/2 − 1` in a vertex-like one, off center otherwise, and exact on
 the same polynomials either way — which is what makes a field set with
 `G = 0` interpolable at all. An element-centered set (M16;
-[`elementcentered`](@ref)) is refused: its Gauss–Lobatto nodes are not
-equally spaced, and its interpolant is the containing element's
-polynomial, which needs a basis of its own.
+[`elementcentered`](@ref)) takes [`ElementPolynomial`](@ref)`()`
+instead, whose stencil is the containing element's own nodes; it reads
+no ghosts, and so can read a state vector `u` as well, in the form
+`interpolate(fs, u, xs, basis)`, which a basis that reads ghosts
+refuses.
 
 A point is wrapped along a periodic dimension and mirrored once across a
 reflecting face; a mirrored value takes the variable's parity sign and a
@@ -883,14 +1005,23 @@ differing between ranks. A device backend's points and results go
 through the host for the messages (see "Distributed meshes" in
 `CODE.md`).
 """
-function interpolate(fs::FieldSet{T,D}, xs::AbstractArray, basis::InterpolationBasis;
-                     derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
-                     outside::Symbol=:error, fill=T(NaN)) where {T,D}
+interpolate(fs::FieldSet, xs::AbstractArray, basis::InterpolationBasis; kwargs...) =
+    interpolate_points(fs, nothing, xs, basis; kwargs...)
+interpolate(fs::FieldSet, u::AbstractVector, xs::AbstractArray, basis::InterpolationBasis;
+            kwargs...) = interpolate_points(fs, u, xs, basis; kwargs...)
+
+# Both forms over an array of points: from the working array (`u ===
+# nothing`) or from a state vector.
+function interpolate_points(fs::FieldSet{T,D}, u, xs::AbstractArray, basis;
+                            derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
+                            outside::Symbol=:error, fill=T(NaN)) where {T,D}
     # Points outside the domain kept, marked and filled: through a location
     # of their own, which records which points are inside.
     outside === :error ||
-        return interpolate(fs, locate(T, fs.forest, xs; outside=outside), basis;
-                           derivs=derivs, vars=vars, exclude=exclude, fill=fill)
+        return interpolate_located(fs, u, locate(T, fs.forest, xs; outside=outside),
+                                   basis; derivs=derivs, vars=vars, exclude=exclude,
+                                   fill=fill)
+    basis = specialize_basis(basis, fs)
     backend = get_backend(fs.work)
     ms = if isdistributed(fs.forest)
         # Over a distributed forest a refusal must reach `interpolate!`,
@@ -907,7 +1038,8 @@ function interpolate(fs::FieldSet{T,D}, xs::AbstractArray, basis::InterpolationB
     end
     values = allocate(backend, T, (length(vars), length(ms), length(xs)))
     excluded = allocate(backend, Bool, length(xs))
-    interpolate!(values, excluded, fs, xs, basis; derivs=ms, vars=vars, exclude=exclude)
+    interpolate_points!(values, excluded, fs, u, xs, basis; derivs=ms, vars=vars,
+                        exclude=exclude)
     # Every point is inside: one outside is refused.
     inside = allocate(backend, Bool, length(xs))
     fill!(inside, true)
@@ -915,25 +1047,32 @@ function interpolate(fs::FieldSet{T,D}, xs::AbstractArray, basis::InterpolationB
 end
 
 """
-    interpolate!(values, excluded, fs, xs, basis; derivs, vars, exclude)
+    interpolate!(values, excluded, fs, [u,] xs, basis; derivs, vars, exclude)
 
 [`interpolate`](@ref) into caller-supplied outputs: `values` of size
 `(length(vars), length(derivs), length(xs))` and `excluded` of length
 `length(xs)`, both on the field set's backend. Collective over a
 distributed forest, as `interpolate` is.
 """
-function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet{T,D},
-                      xs::AbstractArray, basis::InterpolationBasis;
-                      derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
-                      exclude=nothing) where {T,D}
+interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet,
+             xs::AbstractArray, basis::InterpolationBasis; kwargs...) =
+    interpolate_points!(values, excluded, fs, nothing, xs, basis; kwargs...)
+interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet,
+             u::AbstractVector, xs::AbstractArray, basis::InterpolationBasis; kwargs...) =
+    interpolate_points!(values, excluded, fs, u, xs, basis; kwargs...)
+
+function interpolate_points!(values, excluded, fs::FieldSet{T,D}, u, xs::AbstractArray,
+                             basis; derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
+                             exclude=nothing) where {T,D}
+    basis = specialize_basis(basis, fs)
     isdistributed(fs.forest) &&
-        return interpolate_distributed!(values, excluded, fs, xs, basis, derivs, vars,
+        return interpolate_distributed!(values, excluded, fs, u, xs, basis, derivs, vars,
                                         exclude)
-    ms = check_interpolation(values, excluded, fs, xs, basis, derivs, vars)
+    ms = check_interpolation(values, excluded, fs, u, xs, basis, derivs, vars)
     npts = length(xs)
     npts == 0 && return values, excluded
-    blocks = launch_interpolation!(values, excluded, fs, xs, PointGeometry(T, fs.forest),
-                                   basis, ms, vars, exclude, 0)
+    blocks = launch_interpolation!(values, excluded, fs, u, xs,
+                                   PointGeometry(T, fs.forest), basis, ms, vars, exclude, 0)
 
     # Reduced where the indices are, so that a device batch copies back one
     # flag rather than an index per point; only a batch that has an
@@ -947,13 +1086,30 @@ function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldS
 end
 
 # Every argument check of `interpolate!`, returning the checked `derivs`.
-function check_interpolation(values, excluded, fs::FieldSet{T,D}, xs, basis, derivs,
+function check_interpolation(values, excluded, fs::FieldSet{T,D}, u, xs, basis, derivs,
                              vars) where {T,D}
-    fs.P == 0 || throw(ArgumentError(
-        "point interpolation does not take an element-centered set (P = $(fs.P)): " *
-        "its bases interpolate equally spaced points through a continuous stored " *
-        "index, and an element set's Gauss–Lobatto nodes need a basis built from the " *
-        "containing element's polynomial instead, which the package does not have."))
+    basis isa ElementPolynomial && throw(ArgumentError(
+        "ElementPolynomial() interpolates the polynomial of the element containing a " *
+        "point, and this field set has no elements (centering $(fs.centering)): its " *
+        "points are equally spaced, which Lagrange(n) interpolates."))
+    fs.P == 0 || basis isa ElementBasis || throw(ArgumentError(
+        "$basis does not take an element-centered set (P = $(fs.P)): it interpolates " *
+        "equally spaced points through the stored array, ghosts included, and an " *
+        "element set's Gauss–Lobatto nodes are not equally spaced. Its interpolant is " *
+        "the containing element's polynomial: use ElementPolynomial()."))
+    if u !== nothing
+        readsghosts(basis) && throw(ArgumentError(
+            "$basis reads ghost points, and a state vector holds only the owned ones: " *
+            "interpolate from the field set's working array, with its ghosts filled, " *
+            "or use a basis that reads none, as ElementPolynomial() on an element set."))
+        length(u) == statelength(fs) || throw(ArgumentError(
+            "the state vector must have the field set's length $(statelength(fs)), got " *
+            "$(length(u))"))
+        samebackend(get_backend(u), get_backend(fs.work)) || throw(ArgumentError(
+            "the state vector lives on $(nameof(typeof(get_backend(u)))) but the field " *
+            "set on $(nameof(typeof(get_backend(fs.work)))): the interpolation is one " *
+            "launch where the data is."))
+    end
     ms = check_derivs(basis, derivs, Val(D))
     check_stencil_fits(fs, basis)
     all(v -> 1 <= v <= fs.nvars, vars) || throw(ArgumentError(
@@ -984,7 +1140,7 @@ end
 # The one launch over the points `xs`, on the field set's backend, with
 # the block offset of this rank (zero serially). Returns the global leaf
 # index each point was located in, `0` for a point outside the domain.
-function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, xs, g, basis, ms,
+function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, u, xs, g, basis, ms,
                                vars, exclude, boffset::Int) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
@@ -998,7 +1154,7 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, xs, g, basis
     blocks = allocate(backend, Int32, npts)
     region = convertregion(T, exclude)
     M = maximum(m -> maximum(m), ms)
-    S = size(fs.work)[1:D]
+    src, G, S = stencil_source(fs, u)
     # One launch over the points. They are not blocks, so this is not a
     # by-owner launch; on the CPU the workgroup is sized to give every
     # thread a share, since a batch is a few hundred points and one
@@ -1012,12 +1168,22 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, xs, g, basis
               interpolate_kernel!(backend)
     rotvars = seam_rotvars(fs)
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
-    kernel!(values, excluded, blocks, xs, leaves, origins, spacings, fs.work,
+    kernel!(values, excluded, blocks, xs, leaves, origins, spacings, src,
             fs.factors, rotvars, vs, region, basis, g, Val(ms), Val(swapped), Val(M),
-            Val(fs.G), Val(staggers(fs)), Val(S), boffset; ndrange=npts)
+            Val(G), Val(staggers(fs)), Val(S), boffset; ndrange=npts)
     synchronize(backend)
     return blocks
 end
+
+# The array a stencil reads, with its ghost width and stored size per
+# dimension: the working array, or a state vector's owned points, which
+# are laid out as a working array without ghosts (`statearray`), so that
+# a basis reading no ghosts finds the same nodes in both, and the same
+# kernel reads either.
+stencil_source(fs::FieldSet{T,D}, ::Nothing) where {T,D} =
+    fs.work, fs.G, size(fs.work)[1:D]
+stencil_source(fs::FieldSet{T,D}, u) where {T,D} =
+    statearray(u, fs), ntuple(_ -> 0, D), ntuple(_ -> fs.forest.N, D)
 
 # The variable table the kernel turns a point beyond a rotating seam with
 # (M12): the set's own, or `nothing` where no point is turned — over a
@@ -1229,15 +1395,22 @@ domain — kept by `locate(…; outside = :mark)` — has every value and
 derivative set to `fill`, which a heatmap draws transparent as `NaN`,
 and `excluded` false.
 """
-function interpolate(fs::FieldSet{T,D}, pts::LocatedPoints, basis::InterpolationBasis;
-                     derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
-                     fill=T(NaN)) where {T,D}
+interpolate(fs::FieldSet, pts::LocatedPoints, basis::InterpolationBasis; kwargs...) =
+    interpolate_located(fs, nothing, pts, basis; kwargs...)
+interpolate(fs::FieldSet, u::AbstractVector, pts::LocatedPoints,
+            basis::InterpolationBasis; kwargs...) =
+    interpolate_located(fs, u, pts, basis; kwargs...)
+
+function interpolate_located(fs::FieldSet{T,D}, u, pts::LocatedPoints, basis;
+                             derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
+                             fill=T(NaN)) where {T,D}
+    basis = specialize_basis(basis, fs)
     backend = get_backend(fs.work)
     ms = check_derivs(basis, derivs, Val(D))
     values = allocate(backend, T, (length(vars), length(ms), length(pts)))
     excluded = allocate(backend, Bool, length(pts))
-    interpolate!(values, excluded, fs, pts, basis; derivs=ms, vars=vars, exclude=exclude,
-                 fill=fill)
+    interpolate_located!(values, excluded, fs, u, pts, basis; derivs=ms, vars=vars,
+                         exclude=exclude, fill=fill)
     return (; values, excluded, inside=pts.inside)
 end
 
@@ -1248,14 +1421,21 @@ end
 [`interpolate`](@ref) at located points into caller-supplied outputs, as
 `interpolate!` over an array of points.
 """
-function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet{T,D},
-                      pts::LocatedPoints, basis::InterpolationBasis;
-                      derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
-                      fill=T(NaN)) where {T,D}
+interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet,
+             pts::LocatedPoints, basis::InterpolationBasis; kwargs...) =
+    interpolate_located!(values, excluded, fs, nothing, pts, basis; kwargs...)
+interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet,
+             u::AbstractVector, pts::LocatedPoints, basis::InterpolationBasis; kwargs...) =
+    interpolate_located!(values, excluded, fs, u, pts, basis; kwargs...)
+
+function interpolate_located!(values, excluded, fs::FieldSet{T,D}, u, pts::LocatedPoints,
+                              basis; derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
+                              exclude=nothing, fill=T(NaN)) where {T,D}
+    basis = specialize_basis(basis, fs)
     check_located(fs, pts)
-    ms = check_interpolation(values, excluded, fs, pts, basis, derivs, vars)
+    ms = check_interpolation(values, excluded, fs, u, pts, basis, derivs, vars)
     length(pts) == 0 && return values, excluded
-    status = launch_evaluation!(values, excluded, fs, pts, PointGeometry(T, fs.forest),
+    status = launch_evaluation!(values, excluded, fs, u, pts, PointGeometry(T, fs.forest),
                                 basis, ms, vars, exclude, 0, T(fill))
     # A point beyond a rotating seam of a set that cannot turn it, marked
     # where the kernel found it and refused as the fused path refuses it.
@@ -1307,8 +1487,9 @@ end
 
 # The launch over located points, as `launch_interpolation!` launches over
 # points, with the leaves already found. Returns the status per point.
-function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, pts::LocatedPoints, g,
-                            basis, ms, vars, exclude, boffset::Int, fillvalue::T) where {T,D}
+function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::LocatedPoints,
+                            g, basis, ms, vars, exclude, boffset::Int,
+                            fillvalue::T) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
     npts = length(pts)
@@ -1318,13 +1499,13 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, pts::LocatedPoi
     status = allocate(backend, Int8, npts)
     region = convertregion(T, exclude)
     M = maximum(m -> maximum(m), ms)
-    S = size(fs.work)[1:D]
+    src, G, S = stencil_source(fs, u)
     rotvars = seam_rotvars(fs)
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
     pointkernel(evaluate_kernel!, backend, npts)(
         values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, origins,
-        spacings, fs.work, fs.factors, rotvars, vs, region, basis, g, Val(ms),
-        Val(swapped), Val(M), Val(fs.G), Val(staggers(fs)), Val(S), boffset, fillvalue;
+        spacings, src, fs.factors, rotvars, vs, region, basis, g, Val(ms),
+        Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset, fillvalue;
         ndrange=npts)
     synchronize(backend)
     return status
@@ -1403,7 +1584,7 @@ function outside_verdict(fs::FieldSet, gathered, rank::Integer, own)
         outside_error(fs, x, j).msg))
 end
 
-function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, xs, basis,
+function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, u, xs, basis,
                                   derivs, vars, exclude) where {T,D}
     forest = fs.forest
     comm = forest.comm
@@ -1413,10 +1594,10 @@ function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, xs, basis
     ms, layout, refusal = nothing, UInt(0), nothing
     pts, leafof = NTuple{D,T}[], Int[]
     try
-        ms = check_interpolation(values, excluded, fs, xs, basis, derivs, vars)
+        ms = check_interpolation(values, excluded, fs, u, xs, basis, derivs, vars)
         # What every rank must pass alike, since an owner evaluates the
         # points it receives with its own arguments.
-        layout = layouthash(string(basis), ms, collect(Int, vars),
+        layout = layouthash(string(basis), u === nothing, ms, collect(Int, vars),
                             string(convertregion(T, exclude)), fs.nvars, fs.G,
                             fs.centering, T, nameof(typeof(get_backend(fs.work))))
         pts, leafof = locate_on_host(forest, g, tohost(xs),
@@ -1462,8 +1643,9 @@ function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, xs, basis
     rvalues = allocate(backend, T, (nv, K, nrecv))
     rexcluded = allocate(backend, Bool, nrecv)
     if nrecv > 0
-        blocks = launch_interpolation!(rvalues, rexcluded, fs, todevice(backend, received),
-                                       g, basis, ms, vars, exclude, first(owned) - 1)
+        blocks = launch_interpolation!(rvalues, rexcluded, fs, u,
+                                       todevice(backend, received), g, basis, ms, vars,
+                                       exclude, first(owned) - 1)
         all(b -> b in owned, tohost(blocks)) || error(
             "rank $rank received a point that it locates outside its own blocks " *
             "$owned: the ranks' forests differ, which every collective mutation is " *
