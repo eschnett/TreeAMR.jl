@@ -316,7 +316,7 @@ end
 # --- M19: located batches over a distributed forest ---------------------------
 
 # The forest `serial` as rank `r` holds it over `comms`, brick or patches.
-function rank_forest(serial::Forest{D,T}, comms, r) where {D,T}
+function located_rank_forest(serial::Forest{D,T}, comms, r) where {D,T}
     kw = TreeAMR.patch_keywords(serial)
     kw === nothing && return Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
                                        reflecting=TreeAMR.reflecting_faces(serial),
@@ -375,7 +375,7 @@ end
         parts = uneven_parts(length(xs), P)
         comms = gather_ranks(P)
         results = on_ranks(P) do r
-            forest = rank_forest(serial, comms, r)
+            forest = located_rank_forest(serial, comms, r)
             fs = make(forest)
             copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
             pts = locate(forest, xs[parts[r]]; atlas=atlas, outside=:mark)
@@ -407,7 +407,7 @@ end
     comms = gather_ranks(P)
     per = (serial.N ÷ 3 * 2)^2
     results = on_ranks(P) do r
-        forest = rank_forest(serial, comms, r)
+        forest = located_rank_forest(serial, comms, r)
         fs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=2)
         copyto!(fs.work, data[:, :, :, blockrange(forest)])
         (interpolate(fs, element_lattice(fs, 2), ElementPolynomial();
@@ -429,7 +429,7 @@ end
     function attempt(make)
         comms = gather_ranks(P)
         return on_ranks(P) do r
-            forest = rank_forest(serial, comms, r)
+            forest = located_rank_forest(serial, comms, r)
             try
                 make(forest, r)
                 ""
