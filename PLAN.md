@@ -28,6 +28,7 @@ milestones were planned in, and the list below is in execution order.
   - [Release 0.2.0 with TreeIOHDF5](#release-020-with-treeiohdf5)
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M18 — KernelAbstractions 0.10](#m18--kernelabstractions-010)
+  - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
 
 ## Milestones
 
@@ -182,3 +183,58 @@ not checked).
 times of `test/mpi_workload.jl` are no worse than on 0.9, and TreeAMR,
 TreeIOHDF5 and the downstreams are released with `"0.10"` in their
 `[compat]`.
+
+### M19 — Interpolation on element sets and patches
+
+*(Designed, not started.)* Point interpolation on the two things M11's
+`interpolate` refuses, element sets (M16) and forests of patches (M17),
+for TreeWaveOLDG's annulus and seven-patch ball: a horizon finder that
+needs the metric and its first derivatives at physical points, and a
+viewer that samples regular grids. The design is "Interpolation on
+element sets and patches" in [CODE.md](CODE.md#interpolation-on-element-sets-and-patches);
+the decisions taken in it are under "Point interpolation" in
+[HISTORY.md](HISTORY.md#point-interpolation). Each step has the test that
+says it is done:
+
+1. **Location split from evaluation.** `LocatedPoints`, `locate`, and
+   `interpolate(fs, pts, basis)`. *Done when* M11's tests pass unchanged,
+   the split path reproduces the fused one bit for bit, and the
+   thread-independence line still holds.
+2. **The basis interface by position**, `t` in spacings from the block's
+   origin in place of the continuous stored index. *Done when*
+   `Lagrange` is bit for bit what it was.
+3. **`ElementPolynomial` and the state-vector form.** *Done when*:
+   - it is exact on `Q_P` at random points, to a few eps;
+   - a query at a node reproduces the node's value to rounding;
+   - derivatives are exact on `Q_P`;
+   - the measured rates on a smooth field over a refined forest are
+     `P + 1` for the value and `P + 1 − maxₐ mₐ` for a derivative;
+   - filling the ghosts with NaN leaves every result unchanged.
+4. **`PatchPoint` on a forest of patches.** *Done when* logical points
+   on a four-patch annulus agree bit for bit with the brick of four times
+   the roots, a point on a glued face is located in the patch it names,
+   and `Lagrange` is refused there.
+5. **The atlas, the chain rule, and `outside = :mark`.** *Done when* a
+   test atlas on a brick, one affine map and one nonlinear map, matches
+   analytic derivatives up to second order, a missing method is refused
+   on the host naming it, and outside points are marked and filled with
+   NaN.
+6. **Grids and `element_lattice`.** *Done when* a `UniformGrid` and an
+   `AffineGrid` give the values of the same points passed as an array,
+   bit for bit, and `element_lattice` places its points where
+   `positions` says.
+7. **Distributed.** *Done when*, with an atlas, `LocatedPoints`' routing
+   gives the serial values bit for bit at 1 and 3 ranks (a line of
+   `test/mpi_workload.jl`).
+8. **TreeWaveOLDG's acceptance.** The annulus's rotating mode and the
+   seven-patch ball's plane wave, at random physical points that include
+   glued faces and patch corners. *Done when* the value converges at
+   `P + 1` and the gradient through the chain rule at `P`, and its
+   annulus viewer draws a `UniformGrid` image.
+9. **A horizon finder end to end**, as a script in TreeWaveOLDG's
+   `bin/`, not in either suite. Kerr–Schild `γ` and `K` are filled at the
+   nodes of a seven-patch ball, and ApparentHorizonFinder's
+   `find_horizon` runs through a batched callback. *Done when* the
+   horizon agrees with the analytic one at the element order.
+
+*Done when* steps 1–9 pass, and TreeAMR is released with it.
