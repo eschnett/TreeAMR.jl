@@ -3191,8 +3191,8 @@ across ranks, before anything is gathered, so that every rank refuses
 together. Its coordinates are logical, patch by patch, and the patches'
 boxes may overlap or coincide, so a position names no one point. A
 point there is a `PatchPoint(ξ, p)`, a logical position in a named
-patch, or **(proposed)** a physical position, which the application's
-atlas maps to one ([Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
+patch, or a physical position, which the application's atlas maps to
+one ([Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
 This is the only coordinate-to-block path in `src/`, and so the only
 thing disjoint patch extents would have served. The refusal covers a
 forest of one patch built through the `patches` form as well — a
@@ -3291,8 +3291,9 @@ multi_indices(Val(D), maxorder)
   annulus, logical points give the values of the brick of four times
   the roots bit for bit (`patch_tests.jl`). The fused kernel takes plain
   positions on a brick only; `PatchPoint`s, and every point of a forest
-  of patches, go through `locate`. **(proposed)** With an atlas, on
-  either, a physical position, which `chart_locate` turns into `(ξ, p)`.
+  of patches, go through `locate`. With an atlas, on either, a physical
+  position, which `chart_locate` turns into `(ξ, p)` in the locate
+  kernel, and which is then located as that `PatchPoint` is.
 - **The atlas folds, TreeAMR does not.** The atlas handles the global
   topology, wrapping an angle or choosing a ball's patch, and returns a
   `ξ` in patch `p`'s closed box; a `ξ` outside it is refused as a
@@ -3316,8 +3317,14 @@ multi_indices(Val(D), maxorder)
   Before a launch the host checks with `hasmethod` that the atlas has
   every method the call needs, `ξ` passed as an `NTuple{D,T}` and `p`
   as an `Int`, so that a missing one is an error naming it rather than a
-  failure inside a kernel's compilation; `chart_hessian` is needed only
-  for second derivatives. The methods run on the host when a distributed
+  failure inside a kernel's compilation (`check_chart`): `chart_locate`
+  for `locate`, `chart_jacobian` for any derivative, `chart_hessian`
+  only for second derivatives, and `chart_map` for an `exclude` region.
+  A value alone needs `chart_locate` only. In the locate kernel a result
+  of `nothing` is an outside point, and a `p` that is not a patch or a
+  `ξ` outside its closed box after the folds is marked with leaf `-2`
+  and refused by the host as a broken contract (`broken_chart`), naming
+  the atlas and what it returned. The methods run on the host when a distributed
   batch is located and inside a kernel otherwise, so they must be isbits
   and compile on a device. The position comes before the patch, as
   `WithPatch` hands them to a callback ("The patch of a point" under
@@ -3327,18 +3334,27 @@ multi_indices(Val(D), maxorder)
   the patch system, which also knows which patch to start from.
 - **Derivatives are physical with an atlas,** logical without one. The
   kernel evaluates every logical derivative up to the highest order
-  asked for, and the calling rank maps them,
+  asked for, `multi_indices(Val(D), order)`, each of which the basis
+  must have (so a physical second derivative of an element set needs
+  `P ≥ 2`), and the calling rank maps them in a second launch over the
+  points (`chain_kernel!`),
   `∂ᵢu = Kᵃᵢ ∂ₐũ` and
   `∂ᵢ∂ⱼu = Kᵃᵢ Kᵇⱼ ∂ₐ∂ᵦũ − (Kᵃₖ Hᵏ_bc Kᵇᵢ Kᶜⱼ) ∂ₐũ` with `K = J⁻¹`
-  inverted in `T`. The map is exact, so the rates are the logical ones. A
+  inverted in `T` in closed form for `D ≤ 3`. The map is exact, so the
+  rates are the logical ones: on Q₃ data through affine maps in 2D and
+  3D, `xᵢ = sinh ξᵢ` and a shear `x₂ = ξ₂ + cξ₁²`, against the inverse
+  map differentiated by hand, the value agrees to `1e-15`, the first
+  derivatives to `2e-14` and the second to `1e-12` (`atlas_tests.jl`). A
   fold's signs apply to the logical derivatives first, and `J` and `H`
-  are evaluated at the atlas's `ξ`. Each variable is taken as a scalar,
+  are evaluated at the atlas's `ξ`, the one `LocatedPoints` keeps; the
+  identity atlas gives the values without one exactly, beyond a
+  reflecting wall too. Each variable is taken as a scalar,
   right for a Cartesian component; a component in a patch's logical
   basis is the application's to transform, from `chart_jacobian` at the
   located `ξ`. With an atlas an `exclude` region is physical, and every
-  stencil point is mapped through `chart_map` and tested, `nᴰ`
-  evaluations per query, since a curved chart breaks the ellipsoid's
-  separable test.
+  stencil point is mapped through `chart_map` and tested
+  (`MappedRegion`), `nᴰ` evaluations per query, since a curved chart
+  breaks the ellipsoid's separable test.
 - **`ElementPolynomial()`** evaluates the degree-`P` tensor polynomial
   of the element containing the point through its `(P+1)ᴰ` owned nodes.
   `P` is the field set's: at the call the basis is specialized
@@ -6073,7 +6089,8 @@ which companion releases go with it.
 `tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
 `element_tests.jl` (M16), `reflect_tests.jl` (M10), `outflow_tests.jl`,
 `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
-`interpolate_tests.jl` (M11), `element_interpolate_tests.jl` (M19),
+`interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
+`atlas_tests.jl` (M19),
 `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -6150,8 +6167,15 @@ for `D = 1, 2, 3`, `P ≤ 4` and `G = 0, 1`; a node's value at its node,
 for every node not on a block's upper face; the measured rates; `NaN`
 ghosts changing nothing, and the state vector giving the working
 array's bits; the mirror across a reflecting wall bit for bit; the
-`exclude` test at the Gauss–Lobatto positions; and the refusals. The
-element cases in the other files: `exchange_tests.jl` (every transfer in the one phase-1
+`exclude` test at the Gauss–Lobatto positions; and the refusals.
+`atlas_tests.jl` holds the atlas (M19): physical derivatives to second
+order against inverse maps differentiated by hand (`inverse_derivs` in
+`helpers/interpolate.jl`), for affine, `sinh` and shear maps;
+`multi_indices`' order; the identity atlas bit for bit with none,
+across a reflecting wall; the annulus's polar atlas choosing each
+point's patch and marking its hole; a physical `exclude` region against
+the mapped nodes; and the refusals of a missing method and a broken
+contract. The element cases in the other files: `exchange_tests.jl` (every transfer in the one phase-1
 stage on every rank, the lockstep fill bit for bit, the mailbox driver
 under the phase-1 tag), `regrid_exchange_tests.jl` (the regrid stage
 over 1–7 ranks, and `regrid!` beside a cell set with a hook),

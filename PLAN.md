@@ -219,7 +219,8 @@ says it is done:
    on a four-patch annulus agree bit for bit with the brick of four times
    the roots, a point on a glued face is located in the patch it names,
    and `Lagrange` is refused there.
-5. **The atlas, the chain rule, and `outside = :mark`.** *Done when* a
+5. **The atlas, the chain rule, and `outside = :mark`.** *(Implemented
+   2026-11-09.)* *Done when* a
    test atlas on a brick, one affine map and one nonlinear map, matches
    analytic derivatives up to second order, a missing method is refused
    on the host naming it, and outside points are marked and filled with

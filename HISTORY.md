@@ -4573,6 +4573,18 @@ M12 was decided with Erik, after M7 and before M9b.
     brick's data copied in, equals the brick of eight roots bit for bit,
     value and first and mixed derivatives; a point on a glued face goes
     to the last leaf of the patch it names.
+  - *Step 5, the atlas, the chain rule and `outside = :mark`
+    (2026-11-09).* `:mark` had come with step 1. The atlas's methods are
+    declared in TreeAMR and checked with `hasmethod` before a launch;
+    `chart_locate` runs in the locate kernel, the chain rule in a second
+    launch after the evaluation, on the backend, with `J⁻¹` in closed
+    form; an `exclude` region is physical through `MappedRegion`. Q₃ data
+    on three levels, against the inverse maps differentiated by hand:
+    affine (2D, 3D), `sinh` (2D, 3D) and shear maps agree to `7e-16` for
+    the value, `2e-14` for the first derivatives and `8e-13` for the
+    second. The identity atlas is bit for bit the call without one,
+    across a reflecting wall, but for the sign of a zero, which the chain
+    rule's sum from zero turns positive.
 
 ## Downstream checks
 

@@ -1014,7 +1014,7 @@ end
 
 """
     interpolate(fs, [u,] xs, basis; derivs = (value,), vars = 1:fs.nvars,
-                exclude = nothing, outside = :error,
+                exclude = nothing, atlas = nothing, outside = :error,
                 fill = T(NaN)) -> (; values, excluded, inside)
 
 The variables `vars` of `fs`, and the derivatives `derivs` of them, at every
@@ -1041,6 +1041,16 @@ element set.
   :mark` keeps it, with `inside[j] == false` and every value and
   derivative of it set to `fill`. Under `:error` every `inside[j]` is
   `true`.
+- `atlas` is the application's map between physical space and the
+  forest's logical coordinates (M19; [`TreeAMR.chart_locate`](@ref) and
+  its three companions). With one, `xs` are physical positions, which
+  the atlas maps to a patch and a position there; `derivs` are physical
+  derivatives, which the chain rule forms from every logical one up to
+  their order through the atlas's Jacobian and Hessian; and `exclude`
+  is a physical region, tested at the image of every stencil point.
+  Without one, positions and derivatives are the forest's logical ones;
+  on a forest of patches (M17) a point is then a
+  [`PatchPoint`](@ref).
 
 The points can be located once and evaluated many times: this call is
 `interpolate(fs, locate(T, fs.forest, xs), basis; …)`, bit for bit, in
@@ -1104,18 +1114,26 @@ interpolate(fs::FieldSet, xs::AbstractArray, basis::InterpolationBasis; kwargs..
 interpolate(fs::FieldSet, u::AbstractVector, xs::AbstractArray, basis::InterpolationBasis;
             kwargs...) = interpolate_points(fs, u, xs, basis; kwargs...)
 
+# Whether a batch goes through the fused kernel, which takes plain
+# positions on a brick, refused there (or routed as M11 routes them over a
+# distributed forest); everything else is located first.
+fused_points(fs::FieldSet, xs, atlas, outside) =
+    outside === :error && atlas === nothing && !(eltype(xs) <: PatchPoint) &&
+    !ispatched(fs.forest)
+
 # Both forms over an array of points: from the working array (`u ===
 # nothing`) or from a state vector.
 function interpolate_points(fs::FieldSet{T,D}, u, xs::AbstractArray, basis;
                             derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
-                            outside::Symbol=:error, fill=T(NaN)) where {T,D}
+                            atlas=nothing, outside::Symbol=:error,
+                            fill=T(NaN)) where {T,D}
     # Points outside the domain kept, marked and filled: through a location
     # of their own, which records which points are inside.
     # So are the points of a forest of patches, and `PatchPoint`s: the
     # fused kernel takes plain positions on a brick only.
-    (outside !== :error || eltype(xs) <: PatchPoint ||
-     ispatched(fs.forest) && !isdistributed(fs.forest)) &&
-        return interpolate_located(fs, u, locate(T, fs.forest, xs; outside=outside),
+    fused_points(fs, xs, atlas, outside) ||
+        return interpolate_located(fs, u,
+                                   locate(T, fs.forest, xs; atlas=atlas, outside=outside),
                                    basis; derivs=derivs, vars=vars, exclude=exclude,
                                    fill=fill)
     basis = specialize_basis(basis, fs)
@@ -1160,16 +1178,19 @@ interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet,
 
 function interpolate_points!(values, excluded, fs::FieldSet{T,D}, u, xs::AbstractArray,
                              basis; derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
-                             exclude=nothing) where {T,D}
+                             exclude=nothing, atlas=nothing, outside::Symbol=:error,
+                             fill=T(NaN)) where {T,D}
     basis = specialize_basis(basis, fs)
+    # The fused kernel takes plain positions on a brick; everything else
+    # is located first.
+    fused_points(fs, xs, atlas, outside) ||
+        return interpolate_located!(values, excluded, fs, u,
+                                    locate(T, fs.forest, xs; atlas=atlas, outside=outside),
+                                    basis; derivs=derivs, vars=vars, exclude=exclude,
+                                    fill=fill)
     isdistributed(fs.forest) &&
         return interpolate_distributed!(values, excluded, fs, u, xs, basis, derivs, vars,
                                         exclude)
-    # The fused kernel takes plain positions on a brick; everything else
-    # is located first.
-    (eltype(xs) <: PatchPoint || ispatched(fs.forest)) &&
-        return interpolate_located!(values, excluded, fs, u, locate(T, fs.forest, xs),
-                                    basis; derivs=derivs, vars=vars, exclude=exclude)
     ms = check_interpolation(values, excluded, fs, u, xs, basis, derivs, vars)
     npts = length(xs)
     npts == 0 && return values, excluded
@@ -1385,7 +1406,7 @@ end
 # patch the forest does not have is marked with leaf `-1`, for the host
 # to refuse.
 @inline function locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves,
-                             g::PointGeometry{D,T}, table, j) where {D,T}
+                             g::PointGeometry{D,T}, table, ::Nothing, j) where {D,T}
     gp, x, p, known = point_geometry(g, table, xs[j])
     ξs[j] = x
     patch[j] = Int32(p)
@@ -1398,10 +1419,42 @@ end
     return nothing
 end
 
+# A physical point through the application's atlas (M19): `chart_locate`
+# names its patch and logical position, which is then located as a
+# `PatchPoint` is. A point the atlas puts in no patch is outside; one it
+# puts outside its patch's box, past every fold, is a broken contract,
+# marked with leaf `-2` for the host to refuse, naming the atlas.
+@inline function locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves,
+                             g::PointGeometry{D,T}, table, atlas, j) where {D,T}
+    x = ntuple(d -> T(xs[j][d]), Val(D))
+    c = chart_locate(atlas, x)
+    if c === nothing
+        ξs[j] = x
+        patch[j] = Int32(0)
+        ys[j] = x
+        codes[j] = 0x00
+        inside[j] = false
+        leaf[j] = Int32(0)
+        return nothing
+    end
+    ξa, pa = c
+    pp = PatchPoint{D,T}(ntuple(d -> T(ξa[d]), Val(D)), Int(pa))
+    gp, ξ, p, known = point_geometry(g, table, pp)
+    ξs[j] = ξ
+    patch[j] = p % Int32
+    y, fold, r, ok = fold_point(gp, ξ)
+    ok &= known
+    ys[j] = y
+    codes[j] = foldcode(fold, r)
+    inside[j] = ok
+    leaf[j] = ok ? Int32(locate_leaf(leaves, gp, y)) : Int32(-2)
+    return nothing
+end
+
 @kernel function locate_kernel!(leaf, patch, ξs, ys, codes, inside, @Const(xs),
-                                @Const(leaves), g, table)
+                                @Const(leaves), g, table, atlas)
     j = @index(Global, Linear)
-    locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves, g, table, j)
+    locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves, g, table, atlas, j)
 end
 
 # The kernel of a launch over `npts` points on `backend`, with the CPU's
@@ -1412,7 +1465,7 @@ pointkernel(kernel, backend, npts) =
     kernel(backend)
 
 """
-    locate([T,] forest, xs; outside = :error) -> LocatedPoints
+    locate([T,] forest, xs; atlas = nothing, outside = :error) -> LocatedPoints
 
 The points `xs` located in `forest`, once, for any number of
 [`interpolate`](@ref) calls over field sets on it. Each point is folded
@@ -1428,10 +1481,20 @@ type only, since the conversion decides which leaf a point on a face
 goes to: `interpolate(fs, xs, basis)` is `interpolate(fs, locate(T,
 fs.forest, xs), basis)` for a set of type `T`, bit for bit.
 
-`outside` says what a point outside the domain does: `:error` refuses
-the batch, naming the first such point; `:mark` keeps it, with
-`pts.inside[j] == false`, and `interpolate` fills its values with its
-`fill`.
+On a forest of patches a point is a [`PatchPoint`](@ref), and with an
+`atlas` on either a physical position: the application's atlas maps it
+to a patch and a logical position there through
+[`chart_locate`](@ref TreeAMR.chart_locate), which runs for every point
+in the launch, and `interpolate` then returns physical derivatives
+through the chain rule. The atlas folds the global topology and
+returns a position inside its patch's closed box; one outside it, but
+past a reflecting face, which TreeAMR mirrors, is refused as a broken
+contract, naming the atlas.
+
+`outside` says what a point outside the domain, or in no patch, does:
+`:error` refuses the batch, naming the first such point; `:mark` keeps
+it, with `pts.inside[j] == false`, and `interpolate` fills its values
+with its `fill`.
 
 The points live on the backend of `xs`, and so does the result. The
 location is one launch there; a regrid makes it stale.
@@ -1439,7 +1502,7 @@ location is one launch there; a regrid makes it stale.
 locate(forest::Forest{D,R}, xs::AbstractArray; kwargs...) where {D,R} =
     locate(R, forest, xs; kwargs...)
 
-function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray;
+function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray; atlas=nothing,
                 outside::Symbol=:error) where {T,D}
     outside in (:error, :mark) || throw(ArgumentError(
         "outside must be :error, which refuses a batch with a point outside the " *
@@ -1456,7 +1519,13 @@ function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray;
             "$(pointdims(first(xs)))"))
     end
     patched = eltype(xs) <: PatchPoint
-    g = patched ? PointGeometry(T, forest) : plain_geometry(T, forest)
+    if atlas !== nothing
+        patched && throw(ArgumentError(
+            "with an atlas a point is a physical position, which the atlas maps to a " *
+            "patch: a PatchPoint names its patch already, and is located without one."))
+        check_chart(chart_locate, atlas, T, Val(D), "locate with an atlas")
+    end
+    g = patched || atlas !== nothing ? PointGeometry(T, forest) : plain_geometry(T, forest)
     backend = get_backend(xs)
     leaf = allocate(backend, Int32, npts)
     patch = allocate(backend, Int32, npts)
@@ -1466,22 +1535,25 @@ function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray;
     inside = allocate(backend, Bool, npts)
     if npts > 0
         leaves = todevice(backend, forest.leaves)
-        table = patched ? patch_table(T, forest) : nothing
+        table = patched || atlas !== nothing ? patch_table(T, forest) : nothing
         table === nothing || (table = todevice(backend, table))
         pointkernel(locate_kernel!, backend, npts)(leaf, patch, ξ, y, code, inside, xs,
-                                                   leaves, g, table; ndrange=npts)
+                                                   leaves, g, table, atlas; ndrange=npts)
         synchronize(backend)
         if any(<(0), leaf)
             j = findfirst(<(0), tohost(leaf))
-            throw(unknown_patch(forest, tohost(xs)[j], j))
+            throw(atlas === nothing ? unknown_patch(forest, tohost(xs)[j], j) :
+                  broken_chart(forest, atlas, tohost(xs)[j], tohost(ξ)[j],
+                               Int(tohost(patch)[j]), j))
         end
         if outside === :error && !all(inside)
             j = findfirst(!, tohost(inside))
-            throw(domain_error(forest, tohost(xs)[j], j))
+            throw(atlas === nothing ? domain_error(forest, tohost(xs)[j], j) :
+                  atlas_outside(atlas, tohost(xs)[j], j))
         end
     end
     return LocatedPoints{D,T}(forest, generation(forest), leaf, patch, ξ, y, code, inside,
-                              nothing, outside)
+                              atlas, outside)
 end
 
 # What makes a located batch readable for `fs`: the same forest, not
@@ -1554,26 +1626,48 @@ function interpolate_located!(values, excluded, fs::FieldSet{T,D}, u, pts::Locat
     basis = specialize_basis(basis, fs)
     check_located(fs, pts)
     ms = check_interpolation(values, excluded, fs, u, pts, basis, derivs, vars)
+    atlas = pts.atlas
+    # With an atlas the derivatives asked for are physical: the kernel
+    # evaluates every logical one up to their highest order, and the chain
+    # rule maps them at each point's position in its patch.
+    lms = atlas === nothing ? ms : logical_derivs(basis, ms, Val(D))
+    atlas === nothing || check_atlas_interpolation(atlas, T, Val(D), ms, exclude)
     length(pts) == 0 && return values, excluded
-    status = launch_evaluation!(values, excluded, fs, u, pts, PointGeometry(T, fs.forest),
-                                basis, ms, vars, exclude, 0, T(fill))
+    logical = atlas === nothing ? values :
+              allocate(get_backend(fs.work), T, (length(vars), length(lms), length(pts)))
+    status = launch_evaluation!(logical, excluded, fs, u, pts, PointGeometry(T, fs.forest),
+                                basis, lms, vars, exclude, 0, T(fill))
     # A point beyond a rotating seam of a set that cannot turn it, marked
     # where the kernel found it and refused as the fused path refuses it.
     if any(!=(0), status)
         j = findfirst(!=(0), tohost(status))
         throw(outside_error(fs, tohost(pts.ξ)[j], j))
     end
+    atlas === nothing || launch_chain!(values, logical, pts, atlas, ms, T(fill))
     return values, excluded
+end
+
+# The logical derivatives the chain rule needs for the physical ones `ms`:
+# every one up to their highest order, each of which the basis must have.
+function logical_derivs(basis, ms, ::Val{D}) where {D}
+    lms = multi_indices(Val(D), maximum(sum, ms))
+    for m in lms, c in m
+        why = check_derivative(basis, c)
+        why === nothing || throw(ArgumentError(
+            "with an atlas a physical derivative of total order $(sum(m)) mixes every " *
+            "logical one of that order, and " * why))
+    end
+    return lms
 end
 
 # One located point evaluated into slot `j`, or filled when it is outside;
 # `status[j]` is 1 for a point beyond a rotating seam that `rotvars` cannot
 # turn, 0 otherwise.
 @inline function evaluate_located!(values, excluded, status, leaf, ys, codes, inside,
-                                   origins, spacings, work, factors, rotvars, vars, region,
-                                   basis, g::PointGeometry{D,T}, derivs, swapped, ::Val{M},
-                                   ::Val{G}, ::Val{C}, ::Val{S}, boffset, fillvalue,
-                                   j) where {D,T,M,G,C,S}
+                                   patches, atlas, origins, spacings, work, factors,
+                                   rotvars, vars, region, basis, g::PointGeometry{D,T},
+                                   derivs, swapped, ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
+                                   boffset, fillvalue, j) where {D,T,M,G,C,S}
     status[j] = Int8(0)
     if !inside[j]
         for k in 1:size(values, 2), iv in 1:size(values, 1)
@@ -1588,21 +1682,22 @@ end
         return nothing
     end
     evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
-                    region, basis, g, derivs, swapped, Val(M), Val(G), Val(C), Val(S),
-                    Int(leaf[j]) - boffset, ys[j], fold, r, j)
+                    mapped_region(region, atlas, patches[j]), basis, g, derivs, swapped,
+                    Val(M), Val(G), Val(C), Val(S), Int(leaf[j]) - boffset, ys[j], fold, r,
+                    j)
     return nothing
 end
 
 @kernel function evaluate_kernel!(values, excluded, status, @Const(leaf), @Const(ys),
-                                  @Const(codes), @Const(inside), @Const(origins),
-                                  @Const(spacings), @Const(work), factors, rotvars,
-                                  @Const(vars), region, basis, g, ::Val{DV}, ::Val{DS},
-                                  ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S}, boffset,
-                                  fillvalue) where {DV,DS,M,G,C,S}
+                                  @Const(codes), @Const(inside), @Const(patches), atlas,
+                                  @Const(origins), @Const(spacings), @Const(work), factors,
+                                  rotvars, @Const(vars), region, basis, g, ::Val{DV},
+                                  ::Val{DS}, ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
+                                  boffset, fillvalue) where {DV,DS,M,G,C,S}
     j = @index(Global, Linear)
-    evaluate_located!(values, excluded, status, leaf, ys, codes, inside, origins, spacings,
-                      work, factors, rotvars, vars, region, basis, g, DV, DS, Val(M),
-                      Val(G), Val(C), Val(S), boffset, fillvalue, j)
+    evaluate_located!(values, excluded, status, leaf, ys, codes, inside, patches, atlas,
+                      origins, spacings, work, factors, rotvars, vars, region, basis, g,
+                      DV, DS, Val(M), Val(G), Val(C), Val(S), boffset, fillvalue, j)
 end
 
 # The launch over located points, as `launch_interpolation!` launches over
@@ -1623,8 +1718,8 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::Located
     rotvars = seam_rotvars(fs)
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
     pointkernel(evaluate_kernel!, backend, npts)(
-        values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, origins,
-        spacings, src, fs.factors, rotvars, vs, region, basis, g, Val(ms),
+        values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, pts.patch,
+        pts.atlas, origins, spacings, src, fs.factors, rotvars, vs, region, basis, g, Val(ms),
         Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset, fillvalue;
         ndrange=npts)
     synchronize(backend)

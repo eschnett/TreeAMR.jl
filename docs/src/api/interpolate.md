@@ -17,4 +17,17 @@ Lagrange
 ElementPolynomial
 Region
 Ellipsoid
+multi_indices
+```
+
+## The atlas
+
+An application's maps between physical space and its patches' logical
+coordinates, recognised by these methods alone.
+
+```@docs
+TreeAMR.chart_locate
+TreeAMR.chart_map
+TreeAMR.chart_jacobian
+TreeAMR.chart_hessian
 ```

@@ -64,7 +64,8 @@ export RotationPair
 # Point interpolation
 export locate_point, locate, LocatedPoints, interpolate, interpolate!,
        PatchPoint, InterpolationBasis, Lagrange, ElementPolynomial,
-       Region, Ellipsoid
+       Region, Ellipsoid, multi_indices
+public chart_locate, chart_map, chart_jacobian, chart_hessian
 
 # Distributed meshes (M7)
 export communicator, blockrange
@@ -88,5 +89,6 @@ include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
 include("interpolate.jl")
+include("atlas.jl")
 
 end
