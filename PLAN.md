@@ -186,7 +186,10 @@ TreeIOHDF5 and the downstreams are released with `"0.10"` in their
 
 ### M19 — Interpolation on element sets and patches
 
-*(Designed, not started.)* Point interpolation on the two things M11's
+*(Designed; TreeAMR's steps in progress on the branch
+`eschnett-claude/m19-implementation-40c9c9`, their record in
+[HISTORY.md](HISTORY.md#m19--interpolation-on-element-sets-and-patches).)*
+Point interpolation on the two things M11's
 `interpolate` refuses, element sets (M16) and forests of patches (M17),
 for TreeWaveOLDG's annulus and seven-patch ball: a horizon finder that
 needs the metric and its first derivatives at physical points, and a
@@ -196,8 +199,8 @@ the decisions taken in it are under "Point interpolation" in
 [HISTORY.md](HISTORY.md#point-interpolation). Each step has the test that
 says it is done:
 
-1. **Location split from evaluation.** `LocatedPoints`, `locate`, and
-   `interpolate(fs, pts, basis)`. *Done when* M11's tests pass unchanged,
+1. **Location split from evaluation.** *(Implemented 2026-11-09.)*
+   `LocatedPoints`, `locate`, and `interpolate(fs, pts, basis)`. *Done when* M11's tests pass unchanged,
    the split path reproduces the fused one bit for bit, and the
    thread-independence line still holds.
 2. **The basis interface by position**, `t` in spacings from the block's

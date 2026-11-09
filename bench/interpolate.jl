@@ -20,7 +20,9 @@
 # host-side check of the block indices included, since that is what a
 # caller pays. `bytes/batch` is what `@allocated` sees on the host; on a
 # device it counts only the host side. One line more times
-# `locate_point` alone, on the host.
+# `locate_point` alone, on the host, and a comment line per batch times
+# the split path of M19: `locate` alone, and `interpolate!` at the
+# located points.
 #
 #     TREEAMR_BENCH_N        cells per block edge (default 16)
 #     TREEAMR_BENCH_ROOTS    roots per edge (default 4)
@@ -117,6 +119,14 @@ function main()
         t = minimum(@elapsed(run()) for _ in 1:REPS)
         @printf("%s\t%d\t%s\t%d\t%.6e\t%.1f\t%d\n", BNAME, Threads.nthreads(), T, npts,
                 t, t / npts * 1e9, bytes)
+        # The split path (M19): the location alone, and the evaluation at
+        # the located points, which a second field set reuses.
+        pts = locate(T, forest, xs)
+        tloc = minimum(@elapsed(locate(T, forest, xs)) for _ in 1:REPS)
+        again() = interpolate!(vals, exc, fs, pts, basis; derivs=derivs, exclude=ball)
+        again()
+        tev = minimum(@elapsed(again()) for _ in 1:REPS)
+        @printf("# split, %d points: locate %.6e s, evaluate %.6e s\n", npts, tloc, tev)
     end
     hs = shell(first(NPTS), L)
     foreach(x -> locate_point(forest, x), hs)

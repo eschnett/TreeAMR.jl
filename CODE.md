@@ -3208,8 +3208,9 @@ on the global coordinate before the patch lookup; see
 
 ### Interpolation on element sets and patches
 
-**(proposed)** M19 in [PLAN.md](PLAN.md#m19--interpolation-on-element-sets-and-patches);
-nothing here is built yet. It extends [Point interpolation](#point-interpolation)
+M19 in [PLAN.md](PLAN.md#m19--interpolation-on-element-sets-and-patches).
+What is built is in the present tense; what is not yet is marked
+**(proposed)**. It extends [Point interpolation](#point-interpolation)
 to the two things that refuses, element sets and forests of patches,
 for two uses on TreeWaveOLDG's annulus and seven-patch ball:
 
@@ -3223,7 +3224,7 @@ for two uses on TreeWaveOLDG's annulus and seven-patch ball:
 The API, beside M11's, whose calls keep working:
 
 ```julia
-pts = locate(forest, xs; atlas = nothing, outside = :error)   # ::LocatedPoints
+pts = locate([T,] forest, xs; atlas = nothing, outside = :error)   # ::LocatedPoints
 r = interpolate(fs, pts, basis; derivs, vars, exclude, fill = T(NaN))  # (; values, excluded, inside)
 r = interpolate(fs, u, pts, basis; …)        # from a state vector, for a basis that reads no ghosts
 interpolate!(values, excluded, fs, [u,] pts, basis; …)
@@ -3245,16 +3246,38 @@ multi_indices(Val(D), maxorder)
 ```
 
 - **Location is split from evaluation.** `LocatedPoints` holds, per
-  point, the global leaf (0 if outside), the patch, the logical position
-  after any fold, the fold, and an inside flag; with them the forest and
-  its `generation(forest)`, so that `interpolate` refuses points a
-  regrid has made stale, the atlas, and over a distributed forest the
-  routing. A horizon finder reads `γ` with its gradient and `K` without
-  from one location, and a viewer locates its grid once per regrid
-  rather than once per frame. The leaf and logical position do not
-  depend on the field set and the stencil does, so `LocatedPoints` is
-  the boundary between the two; the split costs one more launch and
-  `O(D)` numbers per point.
+  point and on the points' backend, the global leaf (0 if outside), the
+  patch, the position as given and after any fold, the fold (one byte:
+  a mirror bit per dimension and the quarter turns above them), and an
+  inside flag; with them the forest and its `generation(forest)`, so
+  that `interpolate` refuses points from another forest or a regrid has
+  made stale, the atlas, and **(proposed)** over a distributed forest
+  the routing. A horizon finder reads `γ` with its gradient and `K`
+  without from one location, and a viewer locates its grid once per
+  regrid rather than once per frame. The leaf and folded position do
+  not depend on the field set and the stencil does, so `LocatedPoints`
+  is the boundary between the two; the split costs one more launch and
+  `O(D)` numbers per point. Whether a point beyond a rotating seam can
+  be answered does depend on the set (a set that turns into its
+  partner cannot), so `locate` records the turn and the evaluation
+  refuses it, as the fused path does.
+- **The location has a type.** `locate(T, forest, xs)` converts each
+  point to `T` before folding it and keeps its positions in `T`; `T`
+  defaults to the forest's geometry type, and `interpolate` takes a
+  batch located in the field set's own element type only. The
+  conversion decides which leaf a point on a face goes to, so a batch
+  located in `Float64` and read by a `Float32` set would not be what
+  M11's path gives that set, which converts first; refusing the mismatch
+  keeps `interpolate(fs, xs, basis)` and `interpolate(fs, locate(T,
+  fs.forest, xs), basis)` the same bit for bit (Erik's choice over
+  converting at the evaluation).
+- **One launch without an atlas.** The form that takes the points
+  themselves, serially and under `outside = :error`, stays M11's one
+  fused launch, which runs the same inlined functions as the split
+  path — `fold_point` and `locate_leaf`, then `evaluate_point!` — so the
+  two agree by construction, and the tests check it for every centering,
+  fold and turn. With `outside = :mark` it is `locate` then
+  `interpolate`.
 - **What a point can be.** On a brick without an atlas, a position as
   today, folded as today. On a forest of patches without an atlas, a
   `PatchPoint(ξ, p)`, located in patch `p` alone: its roots are
@@ -3276,8 +3299,11 @@ multi_indices(Val(D), maxorder)
   goes to the upper one, as M11's half-open ownership has it, and on the
   patch's own upper face to its last leaf there, not across the glue.
 - **Outside points.** `outside = :error` is M11's refusal after the
-  launch. `outside = :mark` sets `inside[j] = false` and fills the
-  values with `fill`, which a heatmap draws transparent as NaN.
+  launch, raised by `locate` for a located batch. `outside = :mark`
+  sets `inside[j] = false` and fills the values and derivatives with
+  `fill`, which a heatmap draws transparent as NaN, and the `excluded`
+  flag with `false`. Every form returns `inside`, all `true` under
+  `:error`.
 - **An atlas is recognised by its methods alone,** with no supertype.
   Before a launch the host checks with `hasmethod` that the atlas has
   every method the call needs, `ξ` passed as an `NTuple{D,T}` and `p`

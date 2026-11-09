@@ -61,6 +61,7 @@ of them. Each milestone's steps are listed in its record under
   - [M15 — Folds over points](#m15--folds-over-points)
   - [M16 — Element centering](#m16--element-centering)
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
+  - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -421,6 +422,8 @@ Derivatives were first order until 2026-10-03, when the second order was added.
 Point location refuses a forest of patches (M17 step 5, 2026-11-02), as the plan decided, in `PointGeometry`, which every path to it builds, so that the distributed interpolation refuses on every rank before anything is gathered. The step made the refusal cover a forest of one patch built through the `patches` form as well, a self-glued wrap among them, whose wrap `PointGeometry` would not see: the conservative choice, left open for Erik. He decided (2026-11-03) to keep it: the brick form builds and locates in every one-patch forest that matters. He also set the direction for lifting the refusal: a mechanism that maps a global coordinate to a `(patch, local coordinates)` tuple, which point location will then take as its input, with folding done on the global coordinate before the patch lookup, so that only patch boundaries needing a fold in local coordinates stay refused ([CODE.md](CODE.md#point-interpolation)).
 
 Interpolation on element sets and patches (M19) was designed with Erik on 2026-11-08, for TreeWaveOLDG's annulus and seven-patch ball, an apparent horizon finder and a viewer ([CODE.md](CODE.md#interpolation-on-element-sets-and-patches)). It follows the direction of 2026-11-03 above: the application's atlas is the map from a global coordinate to a `(local coordinates, patch)` pair, and a `PatchPoint` is that pair as an input. The one fold it keeps in local coordinates is the mirror at a reflecting face, for the parity. Erik decided: to extend `interpolate` rather than give the API a new name; that the atlas returns a `ξ` inside its patch's box, rather than TreeAMR following a glue for one just outside it; that the chain rule runs on the calling rank, not on the block's owner; that the grids and `element_lattice` belong to the interpolator, not to visualization export (M9b); and that an atlas is recognised by its methods alone. An abstract type `Atlas`, like TreeAMR's other extension points, was recommended and declined. He dropped a Newton helper for inverting the map (not needed now, and a problem for the package that owns the patch system), left a per-variable rank table for later, and decided that on a forest of patches no stencil reads ghosts for now: no stencil clamped to owned points next to a glue, perhaps later as an opt-in, and `Lagrange` there only once inter-patch ghosts are filled by interpolation. Averaging over shared nodes was first taken as an opt-in of `ElementPolynomial`, then dropped the same day as more complicated than anticipated: face ghosts do not reach the sharers across a block's edges and corners, and the seven-patch ball has three elements around each cube edge.
+
+The type a batch is located in was settled on 2026-11-09, planning M19's implementation: `locate(T, forest, xs)` with `T` defaulting to the forest's geometry type, and `interpolate` refusing a batch of another type than the field set's, rather than converting its positions, which would not be bit for bit M11's path at a face for a `Float32` set (Erik's choice of the two offered).
 
 Under M7 the routing was "the one place this design will change". It was designed on 2026-10-01 under "Distributed meshes" and implemented in M7's step 5, with the kernel unchanged except for the block offset. The serial path measured the same before and after.
 
@@ -4504,6 +4507,39 @@ M12 was decided with Erik, after M7 and before M9b.
   TreeWaveOLDG's own limits are the identity glue only — its
   per-dimension gradient sets cannot take a cubed sphere's axis swaps —
   and diagonal metrics only.
+
+### M19 — Interpolation on element sets and patches
+
+- **M19 — Interpolation on element sets and patches.** *(Designed with
+  Erik on 2026-11-08; steps 1–7, TreeAMR's, implemented from 2026-11-09
+  on the branch `eschnett-claude/m19-implementation-40c9c9`; steps 8–9
+  are TreeWaveOLDG's.)* Point interpolation on element sets and forests
+  of patches, as designed in
+  [CODE.md](CODE.md#interpolation-on-element-sets-and-patches); the
+  design's decisions are under [Point interpolation](#point-interpolation).
+  The steps, each with what it measured:
+
+  - *Step 1, location split from evaluation (2026-11-09).* `locate`,
+    `LocatedPoints`, and `interpolate` at located points, with
+    `outside = :mark` and `fill`, which the plan had under step 5 but
+    which the inside flag made a few lines here. The per-point code of
+    M11's kernel was cut into the location (`fold_point`, `locate_leaf`)
+    and the evaluation (`evaluate_point!`), which the fused kernel calls
+    in turn and the split one in two launches, so that the two agree by
+    construction; the tests check it for every centering, fold and turn
+    of M11's suite, and `thread_workload.jl` prints the split digest
+    beside the fused one. A planning question, settled by Erik: the
+    location converts the points to a type of its own,
+    `locate(T, forest, xs)`, and `interpolate` refuses a batch of
+    another type rather than converting it, so that the split stays bit
+    for bit the fused path for a `Float32` set over a `Float64` forest.
+    `bench/interpolate.jl` (laptop, 4 threads, best of 50, the horizon
+    finder's 496 points and 20 variables) measured the fused path at
+    0.112–0.115 ms on `main` over three runs and 0.115 ms after the
+    cut, which is within that spread; the split path's `locate` takes
+    0.015 ms and its evaluation 0.106 ms, so a second field set read at
+    one location costs 0.106 ms rather than 0.115. At 49,600 points the
+    location is 7 % of the fused time (0.76 ms of 10.8).
 
 ## Downstream checks
 

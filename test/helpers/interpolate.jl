@@ -114,3 +114,12 @@ function lagrange_derivative_weights(nodes, ξ, m)
         sum(c[i] * ξ^(i - 1) for i in eachindex(c); init=zero(ξ))
     end
 end
+
+# Whether the split path — `locate` in the field set's type, then
+# `interpolate` at the located points — gives the fused path's values and
+# flags bit for bit (M19). `isequal`, so that the same NaN agrees too.
+function split_matches(fs, xs, basis; kwargs...)
+    a = interpolate(fs, xs, basis; kwargs...)
+    b = interpolate(fs, locate(eltype(fs.work), fs.forest, xs), basis; kwargs...)
+    return isequal(a.values, b.values) && a.excluded == b.excluded && all(b.inside)
+end

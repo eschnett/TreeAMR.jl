@@ -194,6 +194,13 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     r = interpolate(fs, xs, Lagrange(4); derivs=derivs,
                     exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
     println(tag, " interp ", digest(vec(r.values)), " ", count(r.excluded))
+    # Located once, then evaluated (M19): two launches, each point's slots
+    # its own, so the same digest at any thread count.
+    pts = locate(eltype(fs.work), forest, xs)
+    s = interpolate(fs, pts, Lagrange(4); derivs=derivs,
+                    exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
+    println(tag, " interp-split ", digest(vec(s.values)), " ", count(s.excluded),
+            " ", isequal(s.values, r.values))
     rotating === nothing || rotating_pair(forest, tag, rotating, ops)
     return nothing
 end

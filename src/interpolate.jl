@@ -513,7 +513,21 @@ end
     end
     b = locate_leaf(leaves, g, x)
     blocks[j] = b
-    b -= boffset
+    evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
+                    region, basis, g, derivs, swapped, Val(M), Val(G), Val(C), Val(S),
+                    b - boffset, x, fold, r, j)
+    return nothing
+end
+
+# The evaluation of one located query, written into slot `j`: the stencil
+# in local block `b` around the folded point `x`, mirrored along `fold`
+# and turned by `r` quarter turns, contracted with the basis's weights.
+# Both the fused path above and the split one (`evaluate_kernel!`, which
+# reads what `locate` stored) call this, so the two agree bit for bit.
+@inline function evaluate_point!(values, excluded, origins, spacings, work, factors,
+                                 rotvars, vars, region, basis, g::PointGeometry{D,T},
+                                 derivs::NTuple{K}, swapped, ::Val{M}, ::Val{G}, ::Val{C},
+                                 ::Val{S}, b, x, fold, r, j) where {D,T,K,M,G,C,S}
     origin = origins[b]
     h = spacings[b]
     n = stencilwidth(basis)
@@ -731,6 +745,14 @@ function outside_error(fs::FieldSet, x, j)
             "partner at the turned point instead, or ask for points inside the " *
             "quadrant.")
     end
+    return domain_error(forest, x, j)
+end
+
+# The refusal of point `j`, `x`, outside the domain after every fold:
+# what `locate` raises, which knows the forest only.
+function domain_error(forest::Forest, x, j)
+    seam = rotating_dims(forest)
+    half = halfturn_dims(forest)
     facename(k) = k == ReflectingFace ? "reflecting" :
                   k == OutflowFace ? "outflow" : "outer"
     kinds = ntuple(length(forest.extents)) do d
@@ -751,7 +773,8 @@ end
 
 """
     interpolate(fs, xs, basis; derivs = (value,), vars = 1:fs.nvars,
-                exclude = nothing) -> (; values, excluded)
+                exclude = nothing, outside = :error,
+                fill = T(NaN)) -> (; values, excluded, inside)
 
 The variables `vars` of `fs`, and the derivatives `derivs` of them, at every
 point of `xs`, by tensor-product interpolation in `basis` — today
@@ -772,6 +795,14 @@ point of `xs`, by tensor-product interpolation in `basis` — today
   whether any point of query `j`'s stencil lies inside it. The value is
   computed either way; what to do with a flagged one is the caller's
   decision. Without a region every entry is `false`.
+- `outside = :error` refuses a point outside the domain; `outside =
+  :mark` keeps it, with `inside[j] == false` and every value and
+  derivative of it set to `fill`. Under `:error` every `inside[j]` is
+  `true`.
+
+The points can be located once and evaluated many times: this call is
+`interpolate(fs, locate(T, fs.forest, xs), basis; …)`, bit for bit, in
+one launch rather than two (see [`locate`](@ref)).
 
 The **stencil** of a query is the `n^D` stored points of one block the
 interpolant reads: the block containing the point ([`locate_point`](@ref)),
@@ -825,8 +856,13 @@ through the host for the messages (see "Distributed meshes" in
 `CODE.md`).
 """
 function interpolate(fs::FieldSet{T,D}, xs::AbstractArray, basis::InterpolationBasis;
-                     derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
-                     exclude=nothing) where {T,D}
+                     derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
+                     outside::Symbol=:error, fill=T(NaN)) where {T,D}
+    # Points outside the domain kept, marked and filled: through a location
+    # of their own, which records which points are inside.
+    outside === :error ||
+        return interpolate(fs, locate(T, fs.forest, xs; outside=outside), basis;
+                           derivs=derivs, vars=vars, exclude=exclude, fill=fill)
     backend = get_backend(fs.work)
     ms = if isdistributed(fs.forest)
         # Over a distributed forest a refusal must reach `interpolate!`,
@@ -844,7 +880,10 @@ function interpolate(fs::FieldSet{T,D}, xs::AbstractArray, basis::InterpolationB
     values = allocate(backend, T, (length(vars), length(ms), length(xs)))
     excluded = allocate(backend, Bool, length(xs))
     interpolate!(values, excluded, fs, xs, basis; derivs=ms, vars=vars, exclude=exclude)
-    return (; values, excluded)
+    # Every point is inside: one outside is refused.
+    inside = allocate(backend, Bool, length(xs))
+    fill!(inside, true)
+    return (; values, excluded, inside)
 end
 
 """
@@ -967,6 +1006,300 @@ seam_turns(fs::FieldSet) = hasrotating(fs.forest) && symmetric_layout(fs)
 function swapped_derivs(forest::Forest, ms)
     d1, d2 = seam_plane(forest)
     return map(m -> ntuple(d -> d == d1 ? m[d2] : d == d2 ? m[d1] : m[d], length(m)), ms)
+end
+
+# --- located points (M19) ----------------------------------------------------
+#
+# Location split from evaluation: `locate` folds and searches once, and
+# `interpolate` evaluates any number of field sets at what it found. The
+# leaf and the folded position do not depend on the field set, the
+# stencil does, so this is the boundary between the two ("Interpolation
+# on element sets and patches" in CODE.md). The fused path above and the
+# split one run the same inlined functions, `fold_point` and
+# `locate_leaf`, then `evaluate_point!`, and so agree bit for bit.
+
+"""
+    LocatedPoints
+
+A batch of points located in a forest by [`locate`](@ref), for
+[`interpolate`](@ref) to evaluate field sets at without searching again:
+a horizon finder reads the metric with its gradient and the extrinsic
+curvature without it from one location, and a viewer locates its grid
+once per regrid rather than once per frame.
+
+It holds, per point and on the points' backend, the global leaf the
+point lies in (`0` for a point outside the domain), its patch, the
+position as given and as folded into the domain, the fold, and whether
+the point is inside; and with them the forest and its
+[`generation`](@ref TreeAMR.generation), so that a batch a regrid has
+made stale is refused rather than read from the wrong blocks.
+`length(pts)` is the number of points, and `pts.inside` the flags.
+"""
+struct LocatedPoints{D,T,F<:Forest,VL,VP,VX,VC,VB,A}
+    forest::F
+    generation::Int
+    leaf::VL
+    patch::VP
+    ξ::VX
+    y::VX
+    code::VC
+    inside::VB
+    atlas::A
+    outside::Symbol
+    function LocatedPoints{D,T}(forest::F, generation, leaf::VL, patch::VP, ξ::VX, y::VX,
+                                code::VC, inside::VB, atlas::A,
+                                outside) where {D,T,F,VL,VP,VX,VC,VB,A}
+        return new{D,T,F,VL,VP,VX,VC,VB,A}(forest, generation, leaf, patch, ξ, y, code,
+                                           inside, atlas, outside)
+    end
+end
+
+Base.length(pts::LocatedPoints) = length(pts.leaf)
+KernelAbstractions.get_backend(pts::LocatedPoints) = get_backend(pts.leaf)
+numbertype(::LocatedPoints{D,T}) where {D,T} = T
+
+function Base.show(io::IO, pts::LocatedPoints{D,T}) where {D,T}
+    print(io, "LocatedPoints{", D, ",", T, "}(", length(pts), " points, generation ",
+          pts.generation, ")")
+end
+
+# The fold of a point packed into one byte: bit `d − 1` says it was
+# mirrored along `d`, and the bits from `D` up hold the quarter turns `r`.
+@inline function foldcode(fold::NTuple{D,Bool}, r::Int) where {D}
+    c = r << D
+    for d in 1:D
+        fold[d] && (c |= 1 << (d - 1))
+    end
+    return UInt8(c)
+end
+
+@inline unfoldcode(c::UInt8, ::Val{D}) where {D} =
+    (ntuple(d -> (c >> (d - 1)) & 0x01 == 0x01, Val(D)), Int(c >> D))
+
+# One point located: converted to `T` as the fused path converts it,
+# folded, and searched for.
+@inline function locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves,
+                             g::PointGeometry{D,T}, j) where {D,T}
+    x = ntuple(d -> T(xs[j][d]), Val(D))
+    ξs[j] = x
+    patch[j] = Int32(1)
+    y, fold, r, ok = fold_point(g, x)
+    ys[j] = y
+    codes[j] = foldcode(fold, r)
+    inside[j] = ok
+    leaf[j] = ok ? Int32(locate_leaf(leaves, g, y)) : Int32(0)
+    return nothing
+end
+
+@kernel function locate_kernel!(leaf, patch, ξs, ys, codes, inside, @Const(xs),
+                                @Const(leaves), g)
+    j = @index(Global, Linear)
+    locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves, g, j)
+end
+
+# The kernel of a launch over `npts` points on `backend`, with the CPU's
+# workgroup sized as `launch_interpolation!` explains.
+pointkernel(kernel, backend, npts) =
+    backend isa CPU ? kernel(backend, max(MIN_POINTS_PER_TASK,
+                                          cld(npts, Threads.nthreads()))) :
+    kernel(backend)
+
+"""
+    locate([T,] forest, xs; outside = :error) -> LocatedPoints
+
+The points `xs` located in `forest`, once, for any number of
+[`interpolate`](@ref) calls over field sets on it. Each point is folded
+into the domain as `interpolate` folds it — wrapped along a periodic
+dimension, mirrored once across a reflecting face, turned back across a
+rotating seam — and the leaf containing it found by one binary search
+([`locate_point`](@ref)).
+
+`T` is the type the points are converted to before they are folded and
+which their positions are kept in; it defaults to the forest's geometry
+type. `interpolate` takes a batch located in the field set's own element
+type only, since the conversion decides which leaf a point on a face
+goes to: `interpolate(fs, xs, basis)` is `interpolate(fs, locate(T,
+fs.forest, xs), basis)` for a set of type `T`, bit for bit.
+
+`outside` says what a point outside the domain does: `:error` refuses
+the batch, naming the first such point; `:mark` keeps it, with
+`pts.inside[j] == false`, and `interpolate` fills its values with its
+`fill`.
+
+The points live on the backend of `xs`, and so does the result. The
+location is one launch there; a regrid makes it stale.
+"""
+locate(forest::Forest{D,R}, xs::AbstractArray; kwargs...) where {D,R} =
+    locate(R, forest, xs; kwargs...)
+
+function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray;
+                outside::Symbol=:error) where {T,D}
+    outside in (:error, :mark) || throw(ArgumentError(
+        "outside must be :error, which refuses a batch with a point outside the " *
+        "domain, or :mark, which keeps it with its inside flag false; got " *
+        "$(repr(outside))"))
+    isdistributed(forest) && throw(ArgumentError(
+        "locate is not yet implemented over a distributed forest: the routing of " *
+        "located points to the owners of their blocks is M19's step 7. The form " *
+        "interpolate(fs, xs, basis), which routes as it goes, works there."))
+    npts = length(xs)
+    if xs isa Array && npts > 0
+        length(first(xs)) == D || throw(ArgumentError(
+            "a point in a $D-dimensional forest has $D coordinates, got " *
+            "$(length(first(xs)))"))
+    end
+    g = PointGeometry(T, forest)
+    backend = get_backend(xs)
+    leaf = allocate(backend, Int32, npts)
+    patch = allocate(backend, Int32, npts)
+    ξ = allocate(backend, NTuple{D,T}, npts)
+    y = allocate(backend, NTuple{D,T}, npts)
+    code = allocate(backend, UInt8, npts)
+    inside = allocate(backend, Bool, npts)
+    if npts > 0
+        leaves = todevice(backend, forest.leaves)
+        pointkernel(locate_kernel!, backend, npts)(leaf, patch, ξ, y, code, inside, xs,
+                                                   leaves, g; ndrange=npts)
+        synchronize(backend)
+        if outside === :error && !all(inside)
+            j = findfirst(!, tohost(inside))
+            throw(domain_error(forest, tohost(xs)[j], j))
+        end
+    end
+    return LocatedPoints{D,T}(forest, generation(forest), leaf, patch, ξ, y, code, inside,
+                              nothing, outside)
+end
+
+# What makes a located batch readable for `fs`: the same forest, not
+# regridded since, and the same number type.
+function check_located(fs::FieldSet{T}, pts::LocatedPoints) where {T}
+    pts.forest === fs.forest || throw(ArgumentError(
+        "these points were located in another forest than the field set's: a leaf " *
+        "index names a block of the forest it was found in only. Locate them in " *
+        "fs.forest."))
+    pts.generation == generation(fs.forest) || throw(ArgumentError(
+        "these points were located at generation $(pts.generation) of the forest, " *
+        "which is now at generation $(generation(fs.forest)): a regrid has changed " *
+        "the leaves since, so the leaf each point was found in may no longer exist. " *
+        "Locate them again."))
+    numbertype(pts) === T || throw(ArgumentError(
+        "these points were located in $(numbertype(pts)), but the field set's element " *
+        "type is $T: the conversion of a point decides which leaf a point on a face " *
+        "goes to, so a batch is evaluated only in the type it was located in. Use " *
+        "locate($T, forest, xs)."))
+    return nothing
+end
+
+"""
+    interpolate(fs, pts::LocatedPoints, basis; derivs, vars, exclude,
+                fill = T(NaN)) -> (; values, excluded, inside)
+
+[`interpolate`](@ref) at points [`locate`](@ref) found, without searching
+again: the same values and flags, bit for bit, as the form that takes the
+points themselves. `inside` is `pts.inside`, and a point outside the
+domain — kept by `locate(…; outside = :mark)` — has every value and
+derivative set to `fill`, which a heatmap draws transparent as `NaN`,
+and `excluded` false.
+"""
+function interpolate(fs::FieldSet{T,D}, pts::LocatedPoints, basis::InterpolationBasis;
+                     derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
+                     fill=T(NaN)) where {T,D}
+    backend = get_backend(fs.work)
+    ms = check_derivs(basis, derivs, Val(D))
+    values = allocate(backend, T, (length(vars), length(ms), length(pts)))
+    excluded = allocate(backend, Bool, length(pts))
+    interpolate!(values, excluded, fs, pts, basis; derivs=ms, vars=vars, exclude=exclude,
+                 fill=fill)
+    return (; values, excluded, inside=pts.inside)
+end
+
+"""
+    interpolate!(values, excluded, fs, pts::LocatedPoints, basis; derivs, vars,
+                 exclude, fill)
+
+[`interpolate`](@ref) at located points into caller-supplied outputs, as
+`interpolate!` over an array of points.
+"""
+function interpolate!(values::AbstractArray, excluded::AbstractArray, fs::FieldSet{T,D},
+                      pts::LocatedPoints, basis::InterpolationBasis;
+                      derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars, exclude=nothing,
+                      fill=T(NaN)) where {T,D}
+    check_located(fs, pts)
+    ms = check_interpolation(values, excluded, fs, pts, basis, derivs, vars)
+    length(pts) == 0 && return values, excluded
+    status = launch_evaluation!(values, excluded, fs, pts, PointGeometry(T, fs.forest),
+                                basis, ms, vars, exclude, 0, T(fill))
+    # A point beyond a rotating seam of a set that cannot turn it, marked
+    # where the kernel found it and refused as the fused path refuses it.
+    if any(!=(0), status)
+        j = findfirst(!=(0), tohost(status))
+        throw(outside_error(fs, tohost(pts.ξ)[j], j))
+    end
+    return values, excluded
+end
+
+# One located point evaluated into slot `j`, or filled when it is outside;
+# `status[j]` is 1 for a point beyond a rotating seam that `rotvars` cannot
+# turn, 0 otherwise.
+@inline function evaluate_located!(values, excluded, status, leaf, ys, codes, inside,
+                                   origins, spacings, work, factors, rotvars, vars, region,
+                                   basis, g::PointGeometry{D,T}, derivs, swapped, ::Val{M},
+                                   ::Val{G}, ::Val{C}, ::Val{S}, boffset, fillvalue,
+                                   j) where {D,T,M,G,C,S}
+    status[j] = Int8(0)
+    if !inside[j]
+        for k in 1:size(values, 2), iv in 1:size(values, 1)
+            values[iv, k, j] = fillvalue
+        end
+        excluded[j] = false
+        return nothing
+    end
+    fold, r = unfoldcode(codes[j], Val(D))
+    if r != 0 && rotvars === nothing
+        status[j] = Int8(1)
+        return nothing
+    end
+    evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
+                    region, basis, g, derivs, swapped, Val(M), Val(G), Val(C), Val(S),
+                    Int(leaf[j]) - boffset, ys[j], fold, r, j)
+    return nothing
+end
+
+@kernel function evaluate_kernel!(values, excluded, status, @Const(leaf), @Const(ys),
+                                  @Const(codes), @Const(inside), @Const(origins),
+                                  @Const(spacings), @Const(work), factors, rotvars,
+                                  @Const(vars), region, basis, g, ::Val{DV}, ::Val{DS},
+                                  ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S}, boffset,
+                                  fillvalue) where {DV,DS,M,G,C,S}
+    j = @index(Global, Linear)
+    evaluate_located!(values, excluded, status, leaf, ys, codes, inside, origins, spacings,
+                      work, factors, rotvars, vars, region, basis, g, DV, DS, Val(M),
+                      Val(G), Val(C), Val(S), boffset, fillvalue, j)
+end
+
+# The launch over located points, as `launch_interpolation!` launches over
+# points, with the leaves already found. Returns the status per point.
+function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, pts::LocatedPoints, g,
+                            basis, ms, vars, exclude, boffset::Int, fillvalue::T) where {T,D}
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    npts = length(pts)
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    vs = todevice(backend, Int32[v for v in vars])
+    status = allocate(backend, Int8, npts)
+    region = convertregion(T, exclude)
+    M = maximum(m -> maximum(m), ms)
+    S = size(fs.work)[1:D]
+    rotvars = seam_rotvars(fs)
+    swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
+    pointkernel(evaluate_kernel!, backend, npts)(
+        values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, origins,
+        spacings, fs.work, fs.factors, rotvars, vs, region, basis, g, Val(ms),
+        Val(swapped), Val(M), Val(fs.G), Val(staggers(fs)), Val(S), boffset, fillvalue;
+        ndrange=npts)
+    synchronize(backend)
+    return status
 end
 
 # --- over a distributed forest (M7) ------------------------------------------

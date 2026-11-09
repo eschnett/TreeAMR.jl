@@ -80,6 +80,7 @@ end
     showerrors() && @info "exactness" D n C worst = Tuple(worst)
     @test worst[1] < 1e-11 && worst[2] < 1e-11
     @test worst[3] < 1e-9
+    @test split_matches(fs, xs, Lagrange(n); derivs=derivs)
 end
 
 @testset "A stencil shifts inward and stays exact where ghosts are narrow: C=$C" for
@@ -189,6 +190,7 @@ end
     b = interpolate(fs, shifted, Lagrange(4); derivs=derivs).values
     @test maximum(abs, a[:, 1:(D + 1), :] - b[:, 1:(D + 1), :]) < 1e-11
     @test maximum(abs, a - b) < 1e-9
+    @test split_matches(fs, shifted, Lagrange(4); derivs=derivs)
     # And it is the function, to the interpolation error.
     @test maximum(abs(a[v, 1, j] - g(xs[j], v)) for j in eachindex(xs), v in 1:2) < 1e-3
 end
@@ -238,6 +240,7 @@ end
     @test worst[1] < 1e-11
     @test worst[2] < 1e-10
     @test worst[3] < 1e-9
+    @test split_matches(fs, xs, Lagrange(4); derivs=derivs)
     # A point beyond the wall by more than the domain is still outside.
     far = ntuple(d -> single(kinds[d]) ? (walls[d] > 0 ? 3roots + 0.5 : -2roots - 0.5) :
                                          0.5, D)
@@ -294,6 +297,7 @@ end
     end
     @test r.excluded == expected
     @test 0 < count(r.excluded) < length(xs)
+    @test split_matches(fs, xs, Lagrange(4); exclude=ball)
     @test_throws "semiaxes must be positive" Ellipsoid((0, 0), (1, 0))
     @test_throws "one semiaxis per dimension" Ellipsoid((0, 0), (1, 1, 1))
 end
@@ -332,6 +336,82 @@ end
         end
         @test worst < 1e-12
     end
+end
+
+@testset "One location serves every field set over the forest, bit for bit" begin
+    # The point of splitting location from evaluation (M19): a horizon
+    # finder reads several sets at one batch of points. If the stored
+    # location carried anything of the set it was first used with, a
+    # second set of another centering or ghost width would read the wrong
+    # stencil; and a Float32 set must see the leaf its own conversion of
+    # the point gives, which is why the type is the location's.
+    f, _ = tensorpoly(2, 2)
+    forest = interp_forest(2)
+    cell = interp_fieldset(forest, f, cellcentered(2), 4)
+    vert = interp_fieldset(forest, f, vertexcentered(2), 4; G=1)
+    xs = probe_points(Xoshiro(31), cell)
+    pts = locate(forest, xs)
+    @test pts isa LocatedPoints{2,Float64}
+    @test length(pts) == length(xs)
+    derivs = (gradient_derivs(2)..., hessian_derivs(2)...)
+    for fs in (cell, vert)
+        a = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+        b = interpolate(fs, pts, Lagrange(4); derivs=derivs, vars=[2, 1])
+        @test isequal(a.values[[2, 1], :, :], b.values)
+        @test all(b.inside) && all(a.inside)
+        v = similar(b.values)
+        e = zeros(Bool, length(xs))
+        interpolate!(v, e, fs, pts, Lagrange(4); derivs=derivs, vars=[2, 1])
+        @test isequal(v, b.values)
+    end
+    f32 = FieldSet{Float32}(forest, 2; G=2)
+    fill_by_coordinates!(f, f32)
+    fill_ghosts!(f32, GhostSchedule(f32, Operators(prolongation=4, restriction=4));
+                 boundary=boundary_by_coordinates(f))
+    @test split_matches(f32, xs, Lagrange(4); derivs=derivs)
+    @test_throws "locate(Float32, forest, xs)" interpolate(f32, pts, Lagrange(4))
+end
+
+@testset "Outside points are marked and filled, or refused at locate" begin
+    # A viewer's grid has many points outside an annulus's hole or a
+    # ball's bounding box, and each must come back marked, with a value
+    # that draws transparent, without disturbing the others; under the
+    # default the batch is refused at location, naming the point.
+    f, _ = tensorpoly(2, 2)
+    fs = interp_fieldset(interp_forest(2), f, cellcentered(2), 4)
+    xs = [(0.1, 0.2), (1.5, 0.0), (-0.3, 0.4), (NaN, 0.0)]
+    @test_throws "point 2, (1.5, 0.0), is outside the domain" locate(fs.forest, xs)
+    pts = locate(fs.forest, xs; outside=:mark)
+    @test pts.inside == [true, false, true, false]
+    derivs = gradient_derivs(2)
+    r = interpolate(fs, pts, Lagrange(4); derivs=derivs, exclude=Ellipsoid((0.0, 0.0),
+                                                                            (5.0, 5.0)))
+    @test r.inside == pts.inside
+    @test all(isnan, r.values[:, :, [2, 4]])
+    @test r.excluded == [true, false, true, false]
+    inner = interpolate(fs, xs[[1, 3]], Lagrange(4); derivs=derivs).values
+    @test isequal(r.values[:, :, [1, 3]], inner)
+    z = interpolate(fs, pts, Lagrange(4); fill=0.0).values
+    @test all(iszero, z[:, :, [2, 4]])
+    m = interpolate(fs, xs, Lagrange(4); derivs=derivs, outside=:mark)
+    @test isequal(m.values, r.values) && m.inside == pts.inside
+    @test_throws "outside must be :error" locate(fs.forest, xs; outside=:clamp)
+    @test_throws "has 2 coordinates" locate(fs.forest, [(0.1,)])
+    @test length(locate(fs.forest, NTuple{2,Float64}[])) == 0
+end
+
+@testset "Located points are refused by another forest and after a regrid" begin
+    # A leaf index names a block of one forest at one generation; read
+    # from another forest, or after a regrid moved the leaves, it is a
+    # wrong block and a silently wrong value.
+    f, _ = tensorpoly(2, 2)
+    forest = interp_forest(2)
+    fs = interp_fieldset(forest, f, cellcentered(2), 4)
+    other = interp_fieldset(interp_forest(2), f, cellcentered(2), 4)
+    pts = locate(forest, [(0.1, 0.2)])
+    @test_throws "located in another forest" interpolate(other, pts, Lagrange(4))
+    refine!(forest, [forest.leaves[end]])
+    @test_throws "Locate them again" interpolate(fs, pts, Lagrange(4))
 end
 
 @testset "interpolate refuses what it cannot answer, and says why" begin

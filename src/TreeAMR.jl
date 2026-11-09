@@ -62,7 +62,8 @@ export Parity, EvenParity, OddParity, NoParity
 export RotationPair
 
 # Point interpolation
-export locate_point, interpolate, interpolate!, InterpolationBasis, Lagrange,
+export locate_point, locate, LocatedPoints, interpolate, interpolate!,
+       InterpolationBasis, Lagrange,
        Region, Ellipsoid
 
 # Distributed meshes (M7)
