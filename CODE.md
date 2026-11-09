@@ -3411,8 +3411,13 @@ multi_indices(Val(D), maxorder)
   `basisweights` is unchanged. The positions an `exclude` region is
   tested at come from the basis too, `stencil_place`, whose default is
   the equally spaced `UniformStencil` and which an element basis
-  overrides; the `Ellipsoid`'s separable test reads them through
-  `stencil_position` and so holds for unequal spacings as well.
+  overrides (`ElementStencil`). An equally spaced stencil is tested by
+  M11's six-argument `stencil_hits(region, origin, h, base, off,
+  Val(n))`, unchanged, because that is the method a `Region` overrides —
+  TreeGeneralizedHarmonic's horizon guard does — and an element stencil
+  by `stencil_hits(region, place, Val(n))`, the `Ellipsoid`'s separable
+  test included, which reads the nodes through `stencil_position(place,
+  d, k)` and so holds for unequal spacings as well.
 - **Grids are computed from the index.** `UniformGrid` and `AffineGrid`
   are isbits `AbstractArray`s (`AbstractPointGrid`), `origin + Σₖ (iₖ −
   1) axes[k]` with `K ≤ D` axes, or `lo + (i_d − 1)·step_d` with the step

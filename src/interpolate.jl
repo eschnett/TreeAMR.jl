@@ -312,10 +312,14 @@ point inside it. [`Ellipsoid`](@ref) is the one implemented.
 A new region is an `isbits` subtype implementing `TreeAMR.inside(region,
 x)` for a point `x::NTuple{D,T}`, and `TreeAMR.convertregion(T, region)`
 if its parameters must be brought to the field set's type. It may also
-override `TreeAMR.stencil_hits(region, place, Val(n))` with something
-cheaper than the default, which tests all `n^D` stencil points, each at
-`TreeAMR.stencil_position(place, d, k)` along dimension `d` for the
-`k`-th point from 0.
+override `TreeAMR.stencil_hits(region, origin, h, base, off, Val(n))`
+with something cheaper than the default, which tests all `n^D` stencil
+points of an equally spaced set, point `k` (from 0) along dimension `d`
+at `TreeAMR.stencil_position(origin, h, base, off, d, k)`. An element
+set's stencil (M19), whose nodes are not equally spaced, is tested by
+`TreeAMR.stencil_hits(region, place, Val(n))` at
+`TreeAMR.stencil_position(place, d, k)`, whose default tests every
+point.
 """
 abstract type Region end
 
@@ -378,7 +382,7 @@ struct UniformStencil{D,T}
 end
 
 @inline stencil_position(s::UniformStencil, d, k) =
-    s.origin[d] + ((s.base[d] + k) - s.off[d]) * s.h
+    stencil_position(s.origin, s.h, s.base, s.off, d, k)
 
 # The places of a basis's stencil; equally spaced unless the basis says
 # otherwise.
@@ -388,9 +392,51 @@ end
                                ntuple(d -> uniform_shift(h, C[d]), Val(D)))
 end
 
-# Whether any point of the stencil at `place` lies in the region.
+# Whether any point of the stencil at `place` lies in the region. An
+# equally spaced stencil goes to M11's six-argument form, which is the one
+# a `Region` overrides (TreeGeneralizedHarmonic's horizon guard does), so
+# that such an override keeps being called; an element stencil (M19) and
+# a region seen through an atlas take the place itself.
 @inline stencil_hits(::Nothing, place, ::Val{n}) where {n} = false
+@inline stencil_hits(region::Region, s::UniformStencil, v::Val) =
+    stencil_hits(region, s.origin, s.h, s.base, s.off, v)
 
+# M11's forms: stencil point `k` (from 0) along `d` at `origin + ((base +
+# k) − off)·h`, with `base = first − G`.
+@inline stencil_hits(::Nothing, origin, h, base, off, ::Val{n}) where {n} = false
+
+@inline stencil_position(origin, h, base, off, d, k) =
+    origin[d] + ((base[d] + k) - off[d]) * h
+
+@inline function stencil_hits(region::Region, origin::NTuple{D}, h, base, off,
+                              ::Val{n}) where {D,n}
+    for J in CartesianIndices(ntuple(_ -> n, Val(D)))
+        x = ntuple(d -> stencil_position(origin, h, base, off, d, J[d] - 1), Val(D))
+        inside(region, x) && return true
+    end
+    return false
+end
+
+# The separable test. The brute-force sum at the nearest point adds the
+# same per-dimension terms in the same order, and floating-point addition
+# is monotone, so this agrees with the default method bit for bit.
+@inline function stencil_hits(e::Ellipsoid{D,T}, origin::NTuple{D}, h, base, off,
+                              ::Val{n}) where {D,T,n}
+    r² = zero(T)
+    for d in 1:D
+        best = zero(T)
+        for k in 0:(n - 1)
+            y = (stencil_position(origin, h, base, off, d, k) - e.center[d]) /
+                e.semiaxes[d]
+            best = k == 0 ? y * y : min(best, y * y)
+        end
+        r² += best
+    end
+    return r² < one(T)
+end
+
+# The same two tests over a stencil whose points are not equally spaced,
+# read through `stencil_position(place, d, k)`.
 @inline function stencil_hits(region::Region, place, ::Val{n}) where {n}
     D = length(place.origin)
     for J in CartesianIndices(ntuple(_ -> n, Val(D)))
@@ -400,10 +446,8 @@ end
     return false
 end
 
-# The separable test. The brute-force sum at the nearest point adds the
-# same per-dimension terms in the same order, and floating-point addition
-# is monotone, so this agrees with the default method bit for bit.
-@inline function stencil_hits(e::Ellipsoid{D,T}, place, ::Val{n}) where {D,T,n}
+@inline function stencil_hits(e::Ellipsoid{D,T}, place::ElementStencil,
+                              ::Val{n}) where {D,T,n}
     r² = zero(T)
     for d in 1:D
         best = zero(T)

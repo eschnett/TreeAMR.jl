@@ -253,8 +253,7 @@ end
     # separable ellipsoid test is compared against enumerating every
     # stencil point with the region's own `inside`, bit for bit.
     rng = Xoshiro(99)
-    sig = Tuple{Region,Any,Val{4}}
-    place(origin, h, base, off) = TreeAMR.UniformStencil{3,Float64}(origin, h, base, off)
+    sig = Tuple{Region,NTuple{3,Float64},Any,Any,Any,Val{4}}
     mismatches, hits = 0, 0
     for _ in 1:2000
         e = Ellipsoid(ntuple(_ -> 2rand(rng) - 1, 3), ntuple(_ -> 0.05 + 0.5rand(rng), 3))
@@ -263,8 +262,8 @@ end
         origin = ntuple(d -> e.center[d] - 4h + 2h * rand(rng) - 0.3rand(rng), 3)
         base = ntuple(_ -> rand(rng, -3:3), 3)
         off = ntuple(_ -> rand(rng, (0.5, 1.0)), 3)
-        fast = stencil_hits(e, place(origin, h, base, off), Val(4))
-        slow = invoke(stencil_hits, sig, e, place(origin, h, base, off), Val(4))
+        fast = stencil_hits(e, origin, h, base, off, Val(4))
+        slow = invoke(stencil_hits, sig, e, origin, h, base, off, Val(4))
         mismatches += fast != slow
         hits += fast
     end
@@ -273,10 +272,8 @@ end
     # And one of each by construction: a stencil point at the center, and
     # a stencil whose nearest point is just outside along one axis.
     e = Ellipsoid((0.0, 0.0, 0.0), (0.5, 0.3, 0.2))
-    @test stencil_hits(e, place((-0.1, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0)),
-                       Val(4))
-    @test !stencil_hits(e, place((0.5, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0)),
-                        Val(4))
+    @test stencil_hits(e, (-0.1, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0), Val(4))
+    @test !stencil_hits(e, (0.5, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0), Val(4))
 
     # Through `interpolate`: the flag is the oracle's, the values are not
     # changed by asking, and a query far from the region is not flagged.
@@ -339,6 +336,29 @@ end
         end
         @test worst < 1e-12
     end
+end
+
+# A region whose cheap test is its own override of the six-argument form,
+# as TreeGeneralizedHarmonic's horizon guard is: it flags every stencil,
+# and its `inside` none, so a flag says which method was called.
+struct OverridingRegion <: Region end
+TreeAMR.inside(::OverridingRegion, x) = false
+TreeAMR.stencil_hits(::OverridingRegion, origin::NTuple, h, base, off, ::Val{n}) where {n} =
+    true
+
+@testset "A Region's override of the six-argument stencil_hits is the one called" begin
+    # The documented extension point of `Region`: a downstream guard
+    # overrides `stencil_hits(region, origin, h, base, off, Val(n))`, and a
+    # change of the kernel's internal call would silently drop it for the
+    # default, which tests every point through `inside`.
+    f, _ = tensorpoly(2, 2)
+    fs = interp_fieldset(interp_forest(2), f, cellcentered(2), 4)
+    xs = [(0.1, 0.2), (-0.3, 0.4)]
+    @test all(interpolate(fs, xs, Lagrange(4); exclude=OverridingRegion()).excluded)
+    @test all(interpolate(fs, locate(fs.forest, xs), Lagrange(4);
+                          exclude=OverridingRegion()).excluded)
+    @test TreeAMR.stencil_position((1.0, 2.0), 0.5, (1, 2), (0.5, 1.0), 2, 3) ==
+          2.0 + ((2 + 3) - 1.0) * 0.5
 end
 
 @testset "One location serves every field set over the forest, bit for bit" begin

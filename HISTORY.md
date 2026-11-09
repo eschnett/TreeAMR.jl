@@ -4547,7 +4547,14 @@ M12 was decided with Erik, after M7 and before M9b.
     `exclude` test, which before assumed equal spacing in its signature.
     No downstream package defines a basis (only `locate_point` is used
     outside TreeAMR), so the internal signature changed without a
-    deprecation. `Lagrange` is bit for bit M11's: the `interp` digests
+    deprecation. The step first moved `stencil_hits` to the stencil's
+    places as well, and TreeGeneralizedHarmonic's suite, run against the
+    finished milestone, caught what that broke: its horizon guard
+    overrides the six-argument `stencil_hits` that `Region`'s docstring
+    invites, and the kernel no longer called it. The equally spaced
+    stencil goes to that form again, unchanged, and only element
+    stencils and atlas-mapped regions take places; a test now holds a
+    `Region`'s override to being the method called. `Lagrange` is bit for bit M11's: the `interp` digests
     of `test/thread_workload.jl`, eleven configurations over every
     centering, wall, seam and half turn, equal `main`'s.
   - *Step 3, `ElementPolynomial` and the state-vector form
