@@ -33,6 +33,7 @@ tried, measurements that later ones replaced, and the milestone records
   - [Conservation at coarse-fine faces](#conservation-at-coarse-fine-faces)
   - [Regridding](#regridding)
   - [Point interpolation](#point-interpolation)
+  - [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)
   - [Folds over points](#folds-over-points)
   - [Checkpoint and restart](#checkpoint-and-restart)
 - [Application interface (sketch)](#application-interface-sketch)
@@ -3178,7 +3179,7 @@ An element set (M16) is refused in `check_interpolation`, inside the
 collective checks: the stencil above is built for a uniform, continuous
 stored index, and Gauss–Lobatto nodes need a basis that maps a position
 to its element's nodes and evaluates the element's polynomial
-(**(open)**, see [Open questions](#open-questions)).
+(**(proposed)**, see [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
 
 A forest of patches (M17) is refused by `PointGeometry`, which every
 path to point location builds — `locate_point`, `interpolate` serially,
@@ -3199,15 +3200,201 @@ located: one patch without glue, or wrapped onto its opposite face by
 the identity, is a brick the brick form builds and locates in, and a
 twisted wrap has no user. The brick form is unaffected.
 
-**(proposed)** Point location on a forest of patches comes with a
-mechanism that maps a global coordinate to a `(patch, local
-coordinates)` tuple, which a later milestone will need. Point location
-then takes such a tuple as its input. Folding — periodicity, wraps —
-happens on the global coordinate, before the patch lookup, so the
-location within a patch never folds, and the refusal narrows to a
-forest with patch boundaries that would need a fold in local
-coordinates; a forest with no patch boundaries, or none that need
-folding, is located.
+**(proposed)** Point location on a forest of patches takes a
+`(local coordinates, patch)` pair as its input, a `PatchPoint`, or a
+global coordinate that the application's atlas maps to one, folding
+on the global coordinate before the patch lookup; see
+[Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches).
+
+### Interpolation on element sets and patches
+
+**(proposed)** M19 in [PLAN.md](PLAN.md#m19--interpolation-on-element-sets-and-patches);
+nothing here is built yet. It extends [Point interpolation](#point-interpolation)
+to the two things that refuses, element sets and forests of patches,
+for two uses on TreeWaveOLDG's annulus and seven-patch ball:
+
+| | horizon finder | viewer |
+|---|---|---|
+| points | about 500 on a trial surface, new on each of about 55 iterations per find | 10⁵–10⁶ on a line, plane or box; the same at every output while the mesh is unchanged |
+| coordinates | physical | physical |
+| what | `γ_ij` with its first derivatives, and `K_ij` | one or a few variables, values only |
+| outside points | rare (an overshooting surface); detected, not fatal | many (an annulus's hole, the corners of a ball's bounding box); expected |
+
+The API, beside M11's, whose calls keep working:
+
+```julia
+pts = locate(forest, xs; atlas = nothing, outside = :error)   # ::LocatedPoints
+r = interpolate(fs, pts, basis; derivs, vars, exclude, fill = T(NaN))  # (; values, excluded, inside)
+r = interpolate(fs, u, pts, basis; …)        # from a state vector, for a basis that reads no ghosts
+interpolate!(values, excluded, fs, [u,] pts, basis; …)
+r = interpolate(fs, [u,] xs, basis; atlas, outside, derivs, vars, exclude, fill)
+
+PatchPoint(ξ, p)                  # a logical position in patch p
+UniformGrid(lo, hi, dims)         # isbits AbstractArrays of points, computed from the index
+AffineGrid(origin, axes, dims)
+PatchGrid(grid, p)
+element_lattice(fs, k)            # LocatedPoints: kᴰ points in every element, without a search
+positions(pts)
+ElementPolynomial()               # element sets: the containing element's polynomial
+
+TreeAMR.chart_locate(atlas, x)      -> (ξ, p) or nothing     # the application's methods
+TreeAMR.chart_map(atlas, ξ, p)      -> x
+TreeAMR.chart_jacobian(atlas, ξ, p) -> J,  J[i][a] = ∂xⁱ/∂ξᵃ
+TreeAMR.chart_hessian(atlas, ξ, p)  -> H,  H[i][a][b] = ∂²xⁱ/∂ξᵃ∂ξᵇ
+multi_indices(Val(D), maxorder)
+```
+
+- **Location is split from evaluation.** `LocatedPoints` holds, per
+  point, the global leaf (0 if outside), the patch, the logical position
+  after any fold, the fold, and an inside flag; with them the forest and
+  its `generation(forest)`, so that `interpolate` refuses points a
+  regrid has made stale, the atlas, and over a distributed forest the
+  routing. A horizon finder reads `γ` with its gradient and `K` without
+  from one location, and a viewer locates its grid once per regrid
+  rather than once per frame. The leaf and logical position do not
+  depend on the field set and the stencil does, so `LocatedPoints` is
+  the boundary between the two; the split costs one more launch and
+  `O(D)` numbers per point.
+- **What a point can be.** On a brick without an atlas, a position as
+  today, folded as today. On a forest of patches without an atlas, a
+  `PatchPoint(ξ, p)`, located in patch `p` alone: its roots are
+  contiguous flat roots and the curve order sorts by flat root first, so
+  M11's binary search runs unchanged from the root `ξ` lies in. A plain
+  position there stays refused. With an atlas, on either, a physical
+  position, which `chart_locate` turns into `(ξ, p)`.
+- **The atlas folds, TreeAMR does not.** The atlas handles the global
+  topology, wrapping an angle or choosing a ball's patch, and returns a
+  `ξ` in patch `p`'s closed box; a `ξ` outside it is refused as a
+  broken contract, naming the atlas, not taken as an outside point.
+  TreeAMR follows no glue for a `ξ` just outside the box: that would be
+  a second fold mechanism in logical coordinates, with corners where two
+  glues apply, while clamping inside the atlas is one line. The one fold
+  TreeAMR keeps on a patch is the mirror at a reflecting face, because
+  it carries the variable's parity, which the atlas does not know; on a
+  brick the brick's own folds apply to a `ξ` from an atlas as to a
+  position without one. A `ξ` on a face between two leaves of the patch
+  goes to the upper one, as M11's half-open ownership has it, and on the
+  patch's own upper face to its last leaf there, not across the glue.
+- **Outside points.** `outside = :error` is M11's refusal after the
+  launch. `outside = :mark` sets `inside[j] = false` and fills the
+  values with `fill`, which a heatmap draws transparent as NaN.
+- **An atlas is recognised by its methods alone,** with no supertype.
+  Before a launch the host checks with `hasmethod` that the atlas has
+  every method the call needs, `ξ` passed as an `NTuple{D,T}` and `p`
+  as an `Int`, so that a missing one is an error naming it rather than a
+  failure inside a kernel's compilation; `chart_hessian` is needed only
+  for second derivatives. The methods run on the host when a distributed
+  batch is located and inside a kernel otherwise, so they must be isbits
+  and compile on a device. The position comes before the patch, as
+  `WithPatch` hands them to a callback ("The patch of a point" under
+  [Application interface](#application-interface-sketch)). Inverting the
+  map is the atlas's job: TreeAMR offers no Newton helper, since a map
+  without a closed-form inverse is a problem for the package that owns
+  the patch system, which also knows which patch to start from.
+- **Derivatives are physical with an atlas,** logical without one. The
+  kernel evaluates every logical derivative up to the highest order
+  asked for, and the calling rank maps them,
+  `∂ᵢu = Kᵃᵢ ∂ₐũ` and
+  `∂ᵢ∂ⱼu = Kᵃᵢ Kᵇⱼ ∂ₐ∂ᵦũ − (Kᵃₖ Hᵏ_bc Kᵇᵢ Kᶜⱼ) ∂ₐũ` with `K = J⁻¹`
+  inverted in `T`. The map is exact, so the rates are the logical ones. A
+  fold's signs apply to the logical derivatives first, and `J` and `H`
+  are evaluated at the atlas's `ξ`. Each variable is taken as a scalar,
+  right for a Cartesian component; a component in a patch's logical
+  basis is the application's to transform, from `chart_jacobian` at the
+  located `ξ`. With an atlas an `exclude` region is physical, and every
+  stencil point is mapped through `chart_map` and tested, `nᴰ`
+  evaluations per query, since a curved chart breaks the ellipsoid's
+  separable test.
+- **`ElementPolynomial()`** evaluates the degree-`P` tensor polynomial
+  of the element containing the point through its `(P+1)ᴰ` owned nodes.
+  `P` is the field set's: at the call the basis is specialized to an
+  isbits one with `P` a type parameter, carrying the node offsets and
+  barycentric weights, built in `BigFloat` and rounded once
+  ([Precision](#precision)). The offsets are `nodeposition`'s, so a
+  query at a node has the node's bits. The element is
+  `q = ⌊t/(P+1)⌋`, with `t` the position in spacings from the block's
+  origin, clamped to the block's elements, so a point on an element face
+  takes the upper element. The weights `ℓᵢ(t) = λᵢ ∏_{j≠i}(t − oⱼ)` are
+  M11's truncated Taylor products with the Gauss–Lobatto offsets in
+  place of integers, never dividing by `t − oⱼ`. It is exact on `Q_P`,
+  the value converges as `O(h^{P+1})` and a derivative as
+  `O(h^{P+1−maxₐ mₐ})`; an order above `P` is refused, and a total order
+  above 2 as in M11.
+- **It reads no ghosts,** so it needs no `fill_ghosts!`, reads a state
+  vector as well as the working array, and picks up none of the
+  exchange's error at a coarse-fine face. It is discontinuous across
+  element faces: the value jumps by the solution's own `O(h^{P+1})`, the
+  derivatives by `O(h^P)`, which a horizon finder flows through and a
+  viewer shows as part of the data.
+- **On a forest of patches no stencil reads ghosts,** so `Lagrange` is
+  refused there. Across a glued face the ghosts hold the neighbour
+  patch's own points, which lie on this patch's chart grid only where
+  the charts continue each other smoothly, as the annulus's do and a
+  cubed sphere's quarter turns do not. Refusing only the points whose
+  stencil reaches a glue would keep `Lagrange` inside each patch, but a
+  grid would then fail at scattered points along every glue.
+- **The basis interface takes a position.** An element set's stored
+  index is not linear in position, so the kernel gives a basis `t`, with
+  the set's ghost width and stagger, instead of M11's continuous stored
+  index, and asks for the first stored index and the offset within the
+  stencil; `Lagrange`'s method is M11's two lines, and `basisweights` is
+  unchanged.
+- **Grids are computed from the index.** `UniformGrid` and `AffineGrid`
+  are isbits `AbstractArray`s, `origin + Σₖ (iₖ − 1) axes[k]` with
+  `K ≤ D` axes, so a line, plane or box at any orientation reaches a
+  device kernel without an array of points, and the values come out in
+  the grid's order. Their points are located like any others, through
+  the atlas and then M11's binary search in the patch: a path in which
+  each leaf claims the grid points in its box would cost
+  `O(nleaves + npoints)` on a brick against about 15 comparisons per
+  point at 30,000 leaves, and through a curved chart a leaf's image is
+  not a box. `element_lattice(fs, k)` places the `kᴰ` centres of a
+  `k`-fold subdivision of every local element (of every cell, for a set
+  without elements), so no point is on a face and no search is needed;
+  `positions` gives them, physical through `chart_map` with an atlas.
+  These are point sets for `interpolate`; visualization export (M9b)
+  writes what they sample.
+- **Distributed.** `locate` is collective: each rank locates its points
+  on the host, against the replicated leaves and with the atlas, and
+  sends each point's block, `ξ` and fold to the block's owner, which
+  keeps them, as both sides keep the routing. Each `interpolate` is then
+  one `alltoallv` back, of logical derivatives from the serial kernel,
+  and the chain rule runs on the calling rank, where the atlas already
+  ran, so the values are the serial ones bit for bit at any rank count.
+  Under `:error` an outside point is refused on every rank at `locate`;
+  under `:mark` it is sent nowhere. `element_lattice` needs no routing.
+- **Refused**, each with its reason: `Lagrange` on an element set and
+  `ElementPolynomial` on any other set, naming the basis to use;
+  `Lagrange` on a forest of patches; a plain position on a forest of
+  patches without an atlas; a `chart_locate` result whose `p` is not a
+  patch or whose `ξ` is outside its box, except past a reflecting face;
+  a `LocatedPoints` from another forest or an earlier generation; a
+  state vector with a basis that reads ghosts; an atlas without a method
+  the call needs; and M11's own refusals.
+
+Not part of it, until an application asks:
+
+- a per-variable rank table, so that TreeAMR transforms a component in
+  a patch's logical basis, as the per-interface variable map M17 leaves
+  open would let the glue do;
+- `Lagrange` on a forest of patches, once inter-patch ghosts, corners
+  included, are filled by interpolation onto each patch's grid for
+  finite-difference stencils; then a stencil may read them;
+- a stencil clamped to the owned points next to a glued face, as an
+  opt-in;
+- averaging over shared nodes, which makes an element set's value, not
+  its derivatives, continuous across faces (TreeWaveOLDG's "The
+  averaging"). Face ghosts do not suffice: a node on a block's edge or
+  corner is shared with an element across that edge or corner, which
+  element sets never hold, and at `E = 4` elements per block side half
+  the elements in 3D have one. Averaging one dimension at a time needs a
+  ghost fill between passes and assumes four elements around every edge
+  and axes that continue across faces, which the seven-patch ball's
+  cube edges, three elements around each, and its axis-swapping glues
+  break. The sharers would have to be found by walking across faces and
+  read from their owners, which leaves coarse-fine faces, where no
+  nodes are shared, and distributed forests, where the owners of a
+  point's sharers depend on `P`, which `locate` does not know.
 
 ### Folds over points
 
@@ -6459,7 +6646,8 @@ Remaining, none blocking before their milestone:
     its stencil assumes a uniform, continuous stored index
     ([Point interpolation](#point-interpolation)), and an element set
     needs a basis that maps a position to its element's nodes and
-    evaluates the element's polynomial there.
+    evaluates the element's polynomial there, which is proposed under
+    [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches).
   - *A degree-preserving compatible coarse ghost.* `R` is exact to degree
     `P − 1` tangentially ([Operators](#operators)), and in `D ≥ 2` that
     costs an element scheme accuracy. TreeWaveOLDG measures about half an
@@ -6496,9 +6684,8 @@ Remaining, none blocking before their milestone:
   about is in [HISTORY.md](HISTORY.md#m17--multi-patch-forests-uniform).
   One decision there is Erik's to make, marked **(open)** where it
   lives: whether the seams collapse into the glue table (Domain and
-  boundaries). Point location on a forest of patches waits for a map
-  from a global coordinate to a `(patch, local coordinates)` tuple, as
-  proposed under [Point interpolation](#point-interpolation).
+  boundaries). Point location on a forest of patches is proposed under
+  [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches).
 
   Not in M17, until an application asks: refinement across a glued face
   (the oriented prolongation, restriction and interface restriction, and
