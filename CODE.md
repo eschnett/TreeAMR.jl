@@ -3206,9 +3206,9 @@ twisted wrap has no user. The brick form is unaffected.
 
 ### Interpolation on element sets and patches
 
-M19 in [PLAN.md](PLAN.md#m19--interpolation-on-element-sets-and-patches).
-What is built is in the present tense; what is not yet is marked
-**(proposed)**. It extends [Point interpolation](#point-interpolation)
+M19 in [PLAN.md](PLAN.md#m19--interpolation-on-element-sets-and-patches),
+built in TreeAMR (its steps 1–7); TreeWaveOLDG's acceptance remains. It
+extends [Point interpolation](#point-interpolation)
 to the two things that refuses, element sets and forests of patches,
 for two uses on TreeWaveOLDG's annulus and seven-patch ball:
 
