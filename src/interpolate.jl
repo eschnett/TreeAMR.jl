@@ -39,15 +39,22 @@ internal functions, which are everything the kernel asks of it:
 
 - `TreeAMR.stencilwidth(basis)`: the number `n` of consecutive stored
   points per dimension it reads, a compile-time constant of the type;
-- `TreeAMR.stencilstart(basis, s)`: the first of them, given the query's
-  position `s` as a continuous stored index (stored point `i` sits at
-  `s = i`); the caller clamps the result into the stored array;
+- `TreeAMR.stencilstart(basis, t, G, c, S)`: the first of them and the
+  query's offset `ξ` from it, as `(first, ξ)`, given the query's position
+  `t` in spacings from the block's origin, and along that dimension the
+  set's ghost width `G`, its stagger `c` (1 for vertex-like, 0
+  otherwise) and the stored size `S`; `first` must lie in `1 : S − n + 1`,
+  so that the stencil is inside the block's stored array;
 - `TreeAMR.basisweights(basis, ξ, Val(M))`: the `n` weights and their
-  first `M` derivatives at `ξ = s - first`, in node units, as an
-  `(M+1)`-tuple of `n`-tuples.
+  first `M` derivatives at `ξ`, in spacings, as an `(M+1)`-tuple of
+  `n`-tuples;
 
 and `TreeAMR.check_derivative(basis, m)` if it cannot produce every
-derivative order below `n`.
+derivative order below `n`, and `TreeAMR.stencil_place(basis, origin, h,
+first, Val(G), Val(C))` if its stencil points are not the stored points
+of an equally spaced set — the positions an `exclude` region is tested
+at. The position, rather than a stored index, is what the kernel hands
+a basis because an element set's stored index is not linear in it.
 """
 abstract type InterpolationBasis end
 
@@ -95,7 +102,18 @@ Base.show(io::IO, ::Lagrange{n}) where {n} = print(io, "Lagrange(", n, ")")
 # continuous. `floor(s − (n−1)/2)` would be the naive centering, and for
 # even `n` it switches at the midpoints between nodes, where two stencils
 # give different values.
-@inline stencilstart(::Lagrange{n}, s) where {n} = floorindex(s) - (n - 1) ÷ 2
+#
+# The position `t` in spacings becomes the continuous stored index `s = t
+# + G + off`, the inverse of `nodeposition` for an equally spaced set,
+# and the start is clamped into the stored array `1 : S − n + 1`.
+# Clamping moves the stencil toward the point, so it never extrapolates —
+# near the array's edge it shifts off center, as restriction shifts near
+# an interface. `ξ` is the query's offset from the first stencil point.
+@inline function stencilstart(::Lagrange{n}, t::T, G::Int, c::Int, S::Int) where {n,T}
+    off = uniform_shift(t, c)
+    first = clamp(floorindex(t + (T(G) + off)) - (n - 1) ÷ 2, 1, S - n + 1)
+    return first, t - (T(first - G) - off)
+end
 
 # A derivative the basis cannot produce, with the reason; `nothing` when
 # it can. Lagrange's `m`-th derivative through `n` points is identically
@@ -175,8 +193,10 @@ point inside it. [`Ellipsoid`](@ref) is the one implemented.
 A new region is an `isbits` subtype implementing `TreeAMR.inside(region,
 x)` for a point `x::NTuple{D,T}`, and `TreeAMR.convertregion(T, region)`
 if its parameters must be brought to the field set's type. It may also
-override `TreeAMR.stencil_hits` with something cheaper than the default,
-which tests all `n^D` stencil points.
+override `TreeAMR.stencil_hits(region, place, Val(n))` with something
+cheaper than the default, which tests all `n^D` stencil points, each at
+`TreeAMR.stencil_position(place, d, k)` along dimension `d` for the
+`k`-th point from 0.
 """
 abstract type Region end
 
@@ -226,19 +246,36 @@ convertregion(::Type{T}, e::Ellipsoid{D}) where {T,D} = Ellipsoid{D,T}(e.center,
     return r² < one(T)
 end
 
-# Whether any stencil point lies in the region. Stencil point `k` (from
-# 0) along `d` sits at `origin + ((base + k) − off)·h`, with `base =
-# first − G` — the expression `coordinates` evaluates, in the same order,
-# so a stencil point is flagged exactly when its `coordinates` are inside.
-@inline stencil_hits(::Nothing, origin, h, base, off, ::Val{n}) where {n} = false
+# The positions of a stencil's points, which an `exclude` region is
+# tested at: for an equally spaced set, stencil point `k` (from 0) along
+# `d` sits at `origin + ((base + k) − off)·h`, with `base = first − G` —
+# the expression `coordinates` evaluates, in the same order, so a stencil
+# point is flagged exactly when its `coordinates` are inside.
+struct UniformStencil{D,T}
+    origin::NTuple{D,T}
+    h::T
+    base::NTuple{D,Int}
+    off::NTuple{D,T}
+end
 
-@inline stencil_position(origin, h, base, off, d, k) =
-    origin[d] + ((base[d] + k) - off[d]) * h
+@inline stencil_position(s::UniformStencil, d, k) =
+    s.origin[d] + ((s.base[d] + k) - s.off[d]) * s.h
 
-@inline function stencil_hits(region::Region, origin::NTuple{D}, h, base, off,
-                              ::Val{n}) where {D,n}
+# The places of a basis's stencil; equally spaced unless the basis says
+# otherwise.
+@inline function stencil_place(basis, origin::NTuple{D,T}, h, first, ::Val{G},
+                               ::Val{C}) where {D,T,G,C}
+    return UniformStencil{D,T}(origin, h, ntuple(d -> first[d] - G[d], Val(D)),
+                               ntuple(d -> uniform_shift(h, C[d]), Val(D)))
+end
+
+# Whether any point of the stencil at `place` lies in the region.
+@inline stencil_hits(::Nothing, place, ::Val{n}) where {n} = false
+
+@inline function stencil_hits(region::Region, place, ::Val{n}) where {n}
+    D = length(place.origin)
     for J in CartesianIndices(ntuple(_ -> n, Val(D)))
-        x = ntuple(d -> stencil_position(origin, h, base, off, d, J[d] - 1), Val(D))
+        x = ntuple(d -> stencil_position(place, d, J[d] - 1), Val(D))
         inside(region, x) && return true
     end
     return false
@@ -247,14 +284,12 @@ end
 # The separable test. The brute-force sum at the nearest point adds the
 # same per-dimension terms in the same order, and floating-point addition
 # is monotone, so this agrees with the default method bit for bit.
-@inline function stencil_hits(e::Ellipsoid{D,T}, origin::NTuple{D}, h, base, off,
-                              ::Val{n}) where {D,T,n}
+@inline function stencil_hits(e::Ellipsoid{D,T}, place, ::Val{n}) where {D,T,n}
     r² = zero(T)
     for d in 1:D
         best = zero(T)
         for k in 0:(n - 1)
-            y = (stencil_position(origin, h, base, off, d, k) - e.center[d]) /
-                e.semiaxes[d]
+            y = (stencil_position(place, d, k) - e.center[d]) / e.semiaxes[d]
             best = k == 0 ? y * y : min(best, y * y)
         end
         r² += best
@@ -454,24 +489,17 @@ end
 # --- the stencil -------------------------------------------------------------
 
 # The stencil of an in-domain query in block `b`: its first stored index
-# per dimension, and the query's offset `ξ` from it in node units. The
-# continuous stored index is the inverse of `coordinates`, `s = G + off +
-# (x − origin)/h`; the start is the basis's, clamped into the stored
-# array `1 : S − n + 1`. Clamping moves the stencil toward the point, so
-# it never extrapolates — near the array's edge it shifts off center, as
-# restriction shifts near an interface.
+# per dimension, the query's offset `ξ` from it in spacings, and the
+# places of its points. The position in spacings from the block's origin
+# is what the basis is handed (`stencilstart`), since an element set's
+# stored index is not linear in it.
 @inline function query_stencil(basis, x::NTuple{D,T}, origin, h, ::Val{G}, ::Val{C},
                                ::Val{S}) where {D,T,G,C,S}
-    n = stencilwidth(basis)
-    # The inverse of `nodeposition` for an equally spaced set; an element
-    # set is refused before any query reaches here (`check_interpolation`).
-    off = ntuple(d -> uniform_shift(h, C[d]), Val(D))
     t = ntuple(d -> (x[d] - origin[d]) / h, Val(D))
-    first = ntuple(d -> clamp(stencilstart(basis, t[d] + (T(G[d]) + off[d])), 1,
-                              S[d] - n + 1), Val(D))
-    base = ntuple(d -> first[d] - G[d], Val(D))
-    ξ = ntuple(d -> t[d] - (T(base[d]) - off[d]), Val(D))
-    return first, base, off, ξ
+    fξ = ntuple(d -> stencilstart(basis, t[d], G[d], C[d], S[d]), Val(D))
+    first = ntuple(d -> fξ[d][1], Val(D))
+    ξ = ntuple(d -> fξ[d][2], Val(D))
+    return first, ξ, stencil_place(basis, origin, h, first, Val(G), Val(C))
 end
 
 # The whole of one query, written into slot `j` of the outputs.
@@ -531,8 +559,8 @@ end
     origin = origins[b]
     h = spacings[b]
     n = stencilwidth(basis)
-    first, base, off, ξ = query_stencil(basis, x, origin, h, Val(G), Val(C), Val(S))
-    excluded[j] = stencil_hits(region, origin, h, base, off, Val(n))
+    first, ξ, place = query_stencil(basis, x, origin, h, Val(G), Val(C), Val(S))
+    excluded[j] = stencil_hits(region, place, Val(n))
     W = ntuple(d -> basisweights(basis, ξ[d], Val(M)), Val(D))
 
     # Physical units, and the sign a derivative picks up across each wall

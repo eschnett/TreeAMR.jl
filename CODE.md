@@ -3085,12 +3085,16 @@ first step on its own.
   shared plane on a block's high one — while the quadrant is covariant
   by construction. The test therefore compares with the full plane at
   the preimage, turned; the numbers are under step 5 of M12 in [HISTORY.md](HISTORY.md#m12--rotating-symmetry).
-- **The basis is the extension point.** `Lagrange(n)` is the one
-  implemented. The kernel knows a basis only through `stencilwidth`,
-  `stencilstart` (which `n` points, from the query's continuous stored
-  index) and `basisweights` (the weights and their first `M` derivatives
-  at the offset `ξ`), so a smooth basis built from the same nodal data —
-  Lagrange interpolation is only `C⁰` — is a new type and three methods.
+- **The basis is the extension point.** `Lagrange(n)` is one of them.
+  The kernel knows a basis only through `stencilwidth`, `stencilstart`
+  (which `n` points and the query's offset `ξ` from the first, from its
+  position in spacings from the block's origin; see
+  [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches))
+  and `basisweights` (the weights and their first `M` derivatives at
+  `ξ`), so a smooth basis built from the same nodal data — Lagrange
+  interpolation is only `C⁰` — is a new type and three methods.
+  `stencil_place` gives the positions of the stencil's points for the
+  `exclude` test, equally spaced unless the basis says otherwise.
 - **Lagrange's stencil changes only at stored points.** It starts at
   `floor(s) − floor((n−1)/2)`: centered for even `n`, half a point off for
   odd `n`. The naive centering `floor(s − (n−1)/2)` switches between
@@ -3361,10 +3365,17 @@ multi_indices(Val(D), maxorder)
   grid would then fail at scattered points along every glue.
 - **The basis interface takes a position.** An element set's stored
   index is not linear in position, so the kernel gives a basis `t`, with
-  the set's ghost width and stagger, instead of M11's continuous stored
-  index, and asks for the first stored index and the offset within the
-  stencil; `Lagrange`'s method is M11's two lines, and `basisweights` is
-  unchanged.
+  the set's ghost width, stagger and stored size along the dimension,
+  `stencilstart(basis, t, G, c, S)`, instead of M11's continuous stored
+  index, and asks for the first stored index, already clamped into the
+  array, and the offset within the stencil. `Lagrange`'s method is M11's
+  expressions in M11's order, so its values are bit for bit what they
+  were (the thread workload's digests match `main`'s), and
+  `basisweights` is unchanged. The positions an `exclude` region is
+  tested at come from the basis too, `stencil_place`, whose default is
+  the equally spaced `UniformStencil` and which an element basis
+  overrides; the `Ellipsoid`'s separable test reads them through
+  `stencil_position` and so holds for unequal spacings as well.
 - **Grids are computed from the index.** `UniformGrid` and `AffineGrid`
   are isbits `AbstractArray`s, `origin + Σₖ (iₖ − 1) axes[k]` with
   `K ≤ D` axes, so a line, plane or box at any orientation reaches a

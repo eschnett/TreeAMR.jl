@@ -203,7 +203,7 @@ says it is done:
    `LocatedPoints`, `locate`, and `interpolate(fs, pts, basis)`. *Done when* M11's tests pass unchanged,
    the split path reproduces the fused one bit for bit, and the
    thread-independence line still holds.
-2. **The basis interface by position**, `t` in spacings from the block's
+2. **The basis interface by position** *(implemented 2026-11-09)*, `t` in spacings from the block's
    origin in place of the continuous stored index. *Done when*
    `Lagrange` is bit for bit what it was.
 3. **`ElementPolynomial` and the state-vector form.** *Done when*:

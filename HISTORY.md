@@ -4540,6 +4540,16 @@ M12 was decided with Erik, after M7 and before M9b.
     0.015 ms and its evaluation 0.106 ms, so a second field set read at
     one location costs 0.106 ms rather than 0.115. At 49,600 points the
     location is 7 % of the fused time (0.76 ms of 10.8).
+  - *Step 2, the basis interface by position (2026-11-09).*
+    `stencilstart(basis, t, G, c, S)` returns the clamped first index and
+    the offset from it, given the position in spacings; `stencil_place`
+    and `stencil_position` carry the stencil's point positions to the
+    `exclude` test, which before assumed equal spacing in its signature.
+    No downstream package defines a basis (only `locate_point` is used
+    outside TreeAMR), so the internal signature changed without a
+    deprecation. `Lagrange` is bit for bit M11's: the `interp` digests
+    of `test/thread_workload.jl`, eleven configurations over every
+    centering, wall, seam and half turn, equal `main`'s.
 
 ## Downstream checks
 

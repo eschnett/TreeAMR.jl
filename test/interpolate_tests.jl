@@ -253,7 +253,8 @@ end
     # separable ellipsoid test is compared against enumerating every
     # stencil point with the region's own `inside`, bit for bit.
     rng = Xoshiro(99)
-    sig = Tuple{Region,NTuple{3,Float64},Any,Any,Any,Val{4}}
+    sig = Tuple{Region,Any,Val{4}}
+    place(origin, h, base, off) = TreeAMR.UniformStencil{3,Float64}(origin, h, base, off)
     mismatches, hits = 0, 0
     for _ in 1:2000
         e = Ellipsoid(ntuple(_ -> 2rand(rng) - 1, 3), ntuple(_ -> 0.05 + 0.5rand(rng), 3))
@@ -262,8 +263,8 @@ end
         origin = ntuple(d -> e.center[d] - 4h + 2h * rand(rng) - 0.3rand(rng), 3)
         base = ntuple(_ -> rand(rng, -3:3), 3)
         off = ntuple(_ -> rand(rng, (0.5, 1.0)), 3)
-        fast = stencil_hits(e, origin, h, base, off, Val(4))
-        slow = invoke(stencil_hits, sig, e, origin, h, base, off, Val(4))
+        fast = stencil_hits(e, place(origin, h, base, off), Val(4))
+        slow = invoke(stencil_hits, sig, e, place(origin, h, base, off), Val(4))
         mismatches += fast != slow
         hits += fast
     end
@@ -272,8 +273,10 @@ end
     # And one of each by construction: a stencil point at the center, and
     # a stencil whose nearest point is just outside along one axis.
     e = Ellipsoid((0.0, 0.0, 0.0), (0.5, 0.3, 0.2))
-    @test stencil_hits(e, (-0.1, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0), Val(4))
-    @test !stencil_hits(e, (0.5, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0), Val(4))
+    @test stencil_hits(e, place((-0.1, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0)),
+                       Val(4))
+    @test !stencil_hits(e, place((0.5, -0.1, -0.1), 0.1, (0, 0, 0), (0.0, 0.0, 0.0)),
+                        Val(4))
 
     # Through `interpolate`: the flag is the oracle's, the values are not
     # changed by asking, and a query far from the region is not flagged.
@@ -289,9 +292,9 @@ end
     expected = map(xs) do x
         b = locate_point(fs.forest, x)
         k = blockkey(fs, b)
-        first, _, _, _ = query_stencil(Lagrange(4), x, block_origin(fs.forest, k),
-                                       spacing(fs.forest, k), Val(fs.G),
-                                       Val(staggers(fs)), Val(size(fs.work)[1:3]))
+        first, _, _ = query_stencil(Lagrange(4), x, block_origin(fs.forest, k),
+                                    spacing(fs.forest, k), Val(fs.G),
+                                    Val(staggers(fs)), Val(size(fs.work)[1:3]))
         any(TreeAMR.inside(ball, coordinates(fs, b, Tuple(first) .+ Tuple(J) .- 1))
             for J in CartesianIndices((4, 4, 4)))
     end
@@ -321,9 +324,9 @@ end
             b = locate_point(forest, x)
             k = blockkey(fs, b)
             h = spacing(forest, k)
-            first, _, _, ξ = query_stencil(Lagrange(n), x, block_origin(forest, k), h,
-                                           Val(fs.G), Val(staggers(fs)),
-                                           Val(size(fs.work)[1:2]))
+            first, ξ, _ = query_stencil(Lagrange(n), x, block_origin(forest, k), h,
+                                        Val(fs.G), Val(staggers(fs)),
+                                        Val(size(fs.work)[1:2]))
             w = [[lagrange_derivative_weights(nodes, Rational{BigInt}(ξ[d]), o)
                   for o in 0:2] for d in 1:2]
             @test w[1][1] == lagrange_weights(nodes, Rational{BigInt}(ξ[1]))
