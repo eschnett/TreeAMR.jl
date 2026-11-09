@@ -205,3 +205,48 @@ end
                                                       ElementPolynomial())
     @test sprint(show, ElementPolynomial()) == "ElementPolynomial()"
 end
+
+@testset "element_lattice places its points where positions says, inside elements: D=$D" for
+        D in (1, 2, 3)
+    # The lattice is located without a search, so if it named the wrong
+    # block or put a point on an element face, its values would not be
+    # those of the same points located by search; and `positions` must
+    # say where they are, so that a viewer draws them there.
+    P, k = 2, 3
+    g(x, v) = prod(cos(1.3x[d] + v) for d in 1:D)
+    fs = element_interp_set(D, P, g)
+    lat = element_lattice(fs, k)
+    E = fs.forest.N ÷ (P + 1)
+    @test length(lat) == nblocks(fs) * (E * k)^D
+    xs = Array(positions(lat))
+    @test xs == Array(lat.ξ)
+    leaf = Array(lat.leaf)
+    for j in eachindex(xs)
+        b = leaf[j]
+        ext = block_extent(fs.forest, fs.forest.leaves[b])
+        @test all(d -> ext[d][1] < xs[j][d] < ext[d][2], 1:D)
+    end
+    @test leaf == [locate_point(fs.forest, x) for x in xs]
+    derivs = gradient_derivs(D)
+    @test isequal(interpolate(fs, lat, ElementPolynomial(); derivs=derivs).values,
+                  interpolate(fs, xs, ElementPolynomial(); derivs=derivs).values)
+    # Of every cell, for a set without elements.
+    cs = FieldSet(fs.forest, 1; G=2)
+    cl = element_lattice(cs, 2)
+    @test length(cl) == nblocks(cs) * (2fs.forest.N)^D
+    @test Array(cl.leaf) == [locate_point(fs.forest, x) for x in Array(positions(cl))]
+    @test_throws "at least 1" element_lattice(fs, 0)
+end
+
+@testset "positions with an atlas are physical" begin
+    # A viewer draws in physical space: with an atlas the located points'
+    # positions are their images (an outside point keeps the position it
+    # was given, `atlas_tests.jl`).
+    f, _ = tensorpoly(2, 2)
+    fs = element_interp_set(2, 2, f)
+    atlas = SinhAtlas{2}()
+    lat = element_lattice(fs, 2; atlas=atlas)
+    @test Array(positions(lat)) == [TreeAMR.chart_map(atlas, ξ, 1) for ξ in Array(lat.ξ)]
+    pts = locate(fs.forest, [(0.3, -0.2)]; atlas=atlas)
+    @test all(Array(positions(pts))[1] .≈ (0.3, -0.2))
+end

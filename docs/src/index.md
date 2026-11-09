@@ -95,7 +95,11 @@ refines and coarsens them exactly to the element's degree.
 M17, implemented, accepted by TreeWaveOLDG and awaiting its
 release, glues several bricks of roots, *patches*, at their faces, for
 an annulus or a cubed sphere on uniform meshes (see
-[Forests of patches](@ref)). Next is visualization export (M9b).
+[Forests of patches](@ref)). M19, implemented and awaiting
+TreeWaveOLDG's acceptance, interpolates element sets through the
+element's own polynomial and forests of patches at logical points or,
+through the application's atlas, physical ones ([`locate`](@ref),
+[`ElementPolynomial`](@ref)). Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -712,6 +716,50 @@ julia> interpolate(fs, [(0.3, 0.7), (0.6, 0.6)], Lagrange(4);
  0
  1
 ```
+
+### Element sets, patches and atlases
+
+An element set (M16) takes [`ElementPolynomial`](@ref)`()`, the
+degree-`P` polynomial of the element containing the point, which reads
+the element's own nodes and no ghosts — so it needs no ghost fill, and
+reads a state vector as well. [`locate`](@ref) finds a batch of points
+once, for any number of field sets; with `outside = :mark` a point
+outside the domain is kept, marked, and filled with `NaN`, which a
+heatmap draws transparent:
+
+```jldoctest interpolate
+julia> es = FieldSet(forest, 1; G = 1, centering = elementcentered(2), P = 3);
+
+julia> fill_by_coordinates!(f, es);
+
+julia> pts = locate(forest, [(0.3, 0.7), (2.0, 0.5)]; outside = :mark);
+
+julia> r = interpolate(es, pts, ElementPolynomial(); derivs = ((0, 0), (1, 0)));
+
+julia> round.(r.values[1, :, 1]; digits = 10)    # f, ∂ₓf at (0.3, 0.7)
+2-element Vector{Float64}:
+ 1.453
+ 1.51
+
+julia> r.inside
+2-element Vector{Bool}:
+ 1
+ 0
+```
+
+On a forest of patches a position names a point in every patch whose box
+holds it, so a point is a [`PatchPoint`](@ref)`(ξ, p)`, a logical
+position in patch `p`; `Lagrange` is refused there, since across a glue
+the ghosts hold another chart's points. An application that owns the
+maps from its patches to physical space passes them as an `atlas`, any
+value with the methods [`TreeAMR.chart_locate`](@ref) and
+[`TreeAMR.chart_map`](@ref), and for derivatives
+[`TreeAMR.chart_jacobian`](@ref) and [`TreeAMR.chart_hessian`](@ref):
+then the points are physical, the atlas choosing each one's patch, and
+the derivatives physical, through the chain rule. A viewer samples a
+[`UniformGrid`](@ref) or an [`AffineGrid`](@ref), computed from the
+index, or [`element_lattice`](@ref), points inside every element located
+without a search.
 
 ## Threading
 

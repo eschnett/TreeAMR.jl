@@ -776,6 +776,23 @@ end
                               derivs=derivs).values, b.values)
 end
 
+@testset "A PatchGrid is its PatchPoints, in the grid's order" begin
+    # A viewer samples each patch on a logical grid; the grid must locate
+    # in the patch it names, point for point as the array of PatchPoints.
+    ring = patch_ring(4, (2, 1))
+    fs = FieldSet(ring, 1; G=1, centering=elementcentered(2), P=1)
+    fill_by_coordinates!(WithPatch((ξ, p, v) -> sin(ξ[1] + p) * ξ[2]), fs)
+    for p in 1:4
+        grid = PatchGrid(UniformGrid((0, 0), (2, 1), (9, 5)), p)
+        @test isbits(grid) && size(grid) == (9, 5)
+        qs = collect(grid)
+        @test all(q -> q.p == p, qs)
+        @test isequal(interpolate(fs, grid, ElementPolynomial()).values,
+                      interpolate(fs, qs, ElementPolynomial()).values)
+        @test Array(locate(ring, grid).patch) == fill(p, length(grid))
+    end
+end
+
 @testset "A PatchPoint on a glued face is located in the patch it names" begin
     # TreeAMR follows no glue: the high face of patch p is patch p's, its
     # last leaf there, even though the same physical point is the low face

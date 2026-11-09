@@ -6,8 +6,10 @@ no physics.
 
 **Status.** Milestones M0–M8, M10, M11, M9a, M7, M12, M13, M14, M15
 and M16 are done. M17, multi-patch forests on uniform meshes, is
-implemented and accepted by TreeWaveOLDG, and awaits its release; next
-is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+implemented and accepted by TreeWaveOLDG, and awaits its release. M19,
+interpolation on element sets and forests of patches, has TreeAMR's
+steps 1–7 implemented; TreeWaveOLDG's acceptance remains. Next is
+visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -3247,8 +3249,7 @@ multi_indices(Val(D), maxorder)
   a mirror bit per dimension and the quarter turns above them), and an
   inside flag; with them the forest and its `generation(forest)`, so
   that `interpolate` refuses points from another forest or a regrid has
-  made stale, the atlas, and **(proposed)** over a distributed forest
-  the routing. A horizon finder reads `γ` with its gradient and `K`
+  made stale, the atlas, and over a distributed forest the routing. A horizon finder reads `γ` with its gradient and `K`
   without from one location, and a viewer locates its grid once per
   regrid rather than once per frame. The leaf and folded position do
   not depend on the field set and the stencil does, so `LocatedPoints`
@@ -3413,29 +3414,58 @@ multi_indices(Val(D), maxorder)
   overrides; the `Ellipsoid`'s separable test reads them through
   `stencil_position` and so holds for unequal spacings as well.
 - **Grids are computed from the index.** `UniformGrid` and `AffineGrid`
-  are isbits `AbstractArray`s, `origin + Σₖ (iₖ − 1) axes[k]` with
-  `K ≤ D` axes, so a line, plane or box at any orientation reaches a
-  device kernel without an array of points, and the values come out in
-  the grid's order. Their points are located like any others, through
+  are isbits `AbstractArray`s (`AbstractPointGrid`), `origin + Σₖ (iₖ −
+  1) axes[k]` with `K ≤ D` axes, or `lo + (i_d − 1)·step_d` with the step
+  `(hi − lo)/(n − 1)` formed once, so a line, plane or box at any
+  orientation reaches a device kernel without an array of points, and
+  the values come out in the grid's order. They are `IndexLinear`, the
+  subscripts formed by division (`grid_subscripts`), so a kernel's
+  linear index needs no `CartesianIndices`; `PatchGrid(grid, p)` gives
+  the same points as `PatchPoint`s. A grid is located on any backend:
+  `locate` takes it on `backend`, the CPU unless given, and
+  `interpolate` on the field set's. Their points are located like any others, through
   the atlas and then M11's binary search in the patch: a path in which
   each leaf claims the grid points in its box would cost
   `O(nleaves + npoints)` on a brick against about 15 comparisons per
   point at 30,000 leaves, and through a curved chart a leaf's image is
   not a box. `element_lattice(fs, k)` places the `kᴰ` centres of a
   `k`-fold subdivision of every local element (of every cell, for a set
-  without elements), so no point is on a face and no search is needed;
-  `positions` gives them, physical through `chart_map` with an atlas.
+  without elements), so no point is on a face and no search is needed:
+  a kernel writes each point's block, its position `origin + h·W(2s −
+  1)/(2k)` with `W` the element's width in spacings, and no fold.
+  `positions` gives the located positions of any batch, physical through
+  `chart_map` with an atlas, and an outside point's as it was given; the
+  lattice's leaves are the ones the search finds for its positions, and
+  its values those at the positions passed as an array.
   These are point sets for `interpolate`; visualization export (M9b)
   writes what they sample.
 - **Distributed.** `locate` is collective: each rank locates its points
-  on the host, against the replicated leaves and with the atlas, and
-  sends each point's block, `ξ` and fold to the block's owner, which
-  keeps them, as both sides keep the routing. Each `interpolate` is then
-  one `alltoallv` back, of logical derivatives from the serial kernel,
-  and the chain rule runs on the calling rank, where the atlas already
-  ran, so the values are the serial ones bit for bit at any rank count.
-  Under `:error` an outside point is refused on every rank at `locate`;
-  under `:mark` it is sent nowhere. `element_lattice` needs no routing.
+  on the host, against the replicated leaves and with the atlas, by the
+  serial location kernel on the CPU, agrees with the other ranks on
+  every refusal in one `allgather` of a `ForestDigest` and a flag, and
+  sends each inside point's block, patch, folded position and fold to
+  the block's owner (a stable counting sort by owner, one `alltoallv`),
+  which keeps them, as the caller keeps the routing (`Routing`: `perm`
+  and the counts both ways). Each `interpolate` at the batch is then one
+  `allgather` of its checks — the arguments hashed as M11's, and a point
+  beyond a rotating seam of a set that cannot turn it, which the caller
+  finds from the folds it kept — and one `alltoallv` back, two with an
+  `exclude` region, of logical derivatives from the serial kernel; the
+  chain rule runs on the calling rank, where the atlas ran, so the
+  values are the serial ones bit for bit at any rank count, and a batch
+  is evaluated any number of times without locating again. Under
+  `:error` an outside point, an unknown patch or a broken atlas contract
+  is refused on every rank at `locate`: the rank that has it raises the
+  serial error, the others name it; under `:mark` an outside point is
+  sent nowhere. `element_lattice` needs no routing: its batch
+  (`LocalBatch`) names this rank's blocks by global leaf, evaluated with
+  the block offset and no message. The form that takes plain positions
+  without an atlas keeps M11's routing, one `allgather` and two
+  `alltoallv`s per call, and its refusals word for word; everything else
+  goes through `locate`. `test/mpi_workload.jl`'s `L2` lines — the
+  annulus through a polar atlas, with physical gradients, an excluded
+  region and outside points, then `PatchPoint`s and the element
+  lattice — are the serial ones at 3 ranks.
 - **Refused**, each with its reason: `Lagrange` on an element set and
   `ElementPolynomial` on any other set, naming the basis to use;
   `Lagrange` on a forest of patches; a plain position on a forest of
@@ -6168,6 +6198,10 @@ for every node not on a block's upper face; the measured rates; `NaN`
 ghosts changing nothing, and the state vector giving the working
 array's bits; the mirror across a reflecting wall bit for bit; the
 `exclude` test at the Gauss–Lobatto positions; and the refusals.
+`interpolate_tests.jl` also holds the grids (M19): their values those of
+`collect(grid)` bit for bit, a line and a plane in 3D included, and
+their points those their constructors describe; `element_interpolate_tests.jl`
+the element lattice; `patch_tests.jl` the `PatchGrid`.
 `atlas_tests.jl` holds the atlas (M19): physical derivatives to second
 order against inverse maps differentiated by hand (`inverse_derivs` in
 `helpers/interpolate.jl`), for affine, `sinh` and shear maps;
@@ -6175,7 +6209,13 @@ order against inverse maps differentiated by hand (`inverse_derivs` in
 across a reflecting wall; the annulus's polar atlas choosing each
 point's patch and marking its hole; a physical `exclude` region against
 the mapped nodes; and the refusals of a missing method and a broken
-contract. The element cases in the other files: `exchange_tests.jl` (every transfer in the one phase-1
+contract. `interpolate_exchange_tests.jl` holds the located batches over
+simulated ranks (M19): element sets across a wall with `:mark`,
+`Lagrange` through `locate`, `PatchPoint`s and two atlases bit for bit
+the serial values at uneven splits, a batch evaluated twice, the
+distributed element lattice, and the refusals of `locate` and of the
+evaluation on every rank; `mpi_workload.jl`'s `L2` case is the same
+through MPI. The element cases in the other files: `exchange_tests.jl` (every transfer in the one phase-1
 stage on every rank, the lockstep fill bit for bit, the mailbox driver
 under the phase-1 tag), `regrid_exchange_tests.jl` (the regrid stage
 over 1–7 ranks, and `regrid!` beside a cell set with a hook),

@@ -1203,7 +1203,8 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "operators and the element type must be the same everywhere (for " *
         "regrid!, so must the field sets passed, their " *
         "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
-        "`derivs`, `vars` and `exclude`; for TreeIOHDF5's save_checkpoint and " *
+        "`derivs`, `vars` and `exclude`; for locate, the type, the atlas and " *
+        "`outside`; for TreeIOHDF5's save_checkpoint and " *
         "load_checkpoint, " *
         "the path and every keyword but `data`, and for write_plain the item's " *
         "name), since a rank computes the data it sends with its own stencils and " *

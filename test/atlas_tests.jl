@@ -74,16 +74,6 @@ end
     @test_throws "up to the second order" multi_indices(Val(2), 3)
 end
 
-# The identity map, through every method, so that the chain rule
-# multiplies by exact ones and zeros.
-struct IdentityAtlas{D} end
-TreeAMR.chart_locate(::IdentityAtlas, x) = (x, 1)
-TreeAMR.chart_map(::IdentityAtlas, ξ, p) = ξ
-TreeAMR.chart_jacobian(::IdentityAtlas{D}, ξ, p) where {D} =
-    ntuple(i -> ntuple(a -> a == i ? 1.0 : 0.0, D), D)
-TreeAMR.chart_hessian(::IdentityAtlas{D}, ξ, p) where {D} =
-    ntuple(_ -> ntuple(_ -> ntuple(_ -> 0.0, D), D), D)
-
 @testset "The identity atlas changes nothing, across a reflecting wall too" begin
     # The fold's signs apply to the logical derivatives before the chain
     # rule, and the chain rule through the identity multiplies by exact
@@ -106,22 +96,6 @@ TreeAMR.chart_hessian(::IdentityAtlas{D}, ξ, p) where {D} =
     @test any(x -> x[1] < 0, xs)
 end
 
-# A polar atlas on the four-patch ring: patch `p` covers the angles
-# `[(p − 1)π/2, pπ/2]`, its `ξ₁ ∈ [0, 2]`, and `ξ₂ ∈ [0, 1]` is `r − 1`. A
-# point in the hole or beyond the rim is in no patch.
-struct PolarAtlas end
-function TreeAMR.chart_locate(::PolarAtlas, x)
-    r = hypot(x[1], x[2])
-    1 <= r <= 2 || return nothing
-    s = 4 * mod(atan(x[2], x[1]), 2π) / π
-    p = clamp(floor(Int, s / 2) + 1, 1, 4)
-    return ((clamp(s - 2(p - 1), 0.0, 2.0), r - 1), p)
-end
-function TreeAMR.chart_map(::PolarAtlas, ξ, p)
-    θ = π / 4 * (2(p - 1) + ξ[1])
-    return ((1 + ξ[2]) * cos(θ), (1 + ξ[2]) * sin(θ))
-end
-
 @testset "On the annulus the atlas chooses each point's patch" begin
     # The atlas folds the angle and picks the patch; TreeAMR then locates
     # the logical position there, as for the PatchPoint it amounts to. A
@@ -142,6 +116,9 @@ end
     hole = [(0.2, 0.1), (1.5, 0.0), (3.0, 0.0)]
     m = interpolate(fs, hole, ElementPolynomial(); atlas=PolarAtlas(), outside=:mark)
     @test m.inside == [false, true, false]
+    hp = locate(ring, hole; atlas=PolarAtlas(), outside=:mark)
+    @test Array(positions(hp))[[1, 3]] == hole[[1, 3]]
+    @test all(Array(positions(hp))[2] .≈ hole[2])
     @test isnan(m.values[1, 1, 1]) && !isnan(m.values[1, 1, 2])
     @test_throws "is in no patch" interpolate(fs, hole, ElementPolynomial();
                                               atlas=PolarAtlas())
@@ -172,15 +149,14 @@ end
     @test 0 < count(r.excluded) < length(xs)
 end
 
-# An atlas with nothing but the location; and one that returns a position
-# outside its patch's box.
+# An atlas with nothing but the location, one without the Hessian, and
+# one that names a patch the brick does not have (`OverreachingAtlas` is
+# in `helpers/interpolate.jl`).
 struct LocateOnlyAtlas end
 TreeAMR.chart_locate(::LocateOnlyAtlas, x) = (x, 1)
 struct NoHessianAtlas end
 TreeAMR.chart_locate(::NoHessianAtlas, x) = (x, 1)
 TreeAMR.chart_jacobian(::NoHessianAtlas, ξ, p) = ((1.0, 0.0), (0.0, 1.0))
-struct OverreachingAtlas end
-TreeAMR.chart_locate(::OverreachingAtlas, x) = ((x[1] + 3, x[2]), 1)
 struct WrongPatchAtlas end
 TreeAMR.chart_locate(::WrongPatchAtlas, x) = (x, 2)
 

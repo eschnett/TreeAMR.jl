@@ -131,7 +131,14 @@ end
                                                     !startswith(l, "W1p") &&
                                                     !startswith(l, "E2") &&
                                                     !startswith(l, "N3") &&
-                                                    !startswith(l, "P"), lines))
+                                                    !startswith(l, "P") &&
+                                                    !startswith(l, "L2"), lines))
+    # Located batches on the uniform annulus (M19): some of the 211
+    # physical points inside the ring and some outside, some flagged by
+    # the region, and the lattice of 16 blocks of (2 elements · 2)² points.
+    @test 0 < parse(Int, words("L2 inside")[3]) < 211
+    @test 0 < parse(Int, words("L2 excluded")[3])
+    @test words("L2 lattice")[3] == "256"
     @test words("N3 leaves")[3:4] == ["232", "3"]
     @test "# N3 largest groups 3 with messages 0" in lines
     # The ranks without blocks (E2): everything ran, and both initial-data

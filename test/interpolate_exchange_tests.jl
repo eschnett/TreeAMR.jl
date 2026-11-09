@@ -312,3 +312,150 @@ end
         end
     end
 end
+
+# --- M19: located batches over a distributed forest ---------------------------
+
+# The forest `serial` as rank `r` holds it over `comms`, brick or patches.
+function rank_forest(serial::Forest{D,T}, comms, r) where {D,T}
+    kw = TreeAMR.patch_keywords(serial)
+    kw === nothing && return Forest{T}(serial.roots; N=serial.N, periodic=serial.periodic,
+                                       reflecting=TreeAMR.reflecting_faces(serial),
+                                       outflow=TreeAMR.outflow_faces(serial),
+                                       extents=serial.extents, leaves=serial.leaves,
+                                       comm=comms[r])
+    return Forest{T}(kw.patches; N=serial.N, glue=kw.glue,
+                     reflecting=TreeAMR.reflecting_faces(serial),
+                     outflow=TreeAMR.outflow_faces(serial), leaves=serial.leaves,
+                     comm=comms[r])
+end
+
+@testset "A distributed located batch is the serial one, point for point: $name" for
+        (name, serial, make, points, atlas, basis, Ps) in (
+            ("element set, a wall, :mark", faces_forest((:reflect_lo, :outer); N=6),
+             f -> FieldSet(f, 2; G=1, centering=elementcentered(2), P=2,
+                           parity=[(EvenParity, NoParity), (OddParity, NoParity)]),
+             rng -> [[(-1 + 3.5rand(rng), 2rand(rng)) for _ in 1:150]; [(9.0, 0.5)]],
+             nothing, ElementPolynomial(), (2, 3)),
+            ("Lagrange through locate", interp_forest(2),
+             f -> FieldSet(f, 2; G=2),
+             rng -> [(2rand(rng) - 1, 2rand(rng) - 1) for _ in 1:150],
+             nothing, Lagrange(4), (3, 5)),
+            ("PatchPoints on the annulus", patch_ring(4, (2, 1)),
+             f -> FieldSet(f, 2; G=1, centering=elementcentered(2), P=1),
+             rng -> [PatchPoint((2rand(rng), rand(rng)), rand(rng, 1:4)) for _ in 1:150],
+             nothing, ElementPolynomial(), (3,)),
+            ("an atlas on the annulus", patch_ring(4, (2, 1)),
+             f -> FieldSet(f, 2; G=1, centering=elementcentered(2), P=1),
+             rng -> [[TreeAMR.chart_map(PolarAtlas(), (2rand(rng), rand(rng)),
+                                        rand(rng, 1:4)) for _ in 1:150]; [(0.1, 0.1)]],
+             PolarAtlas(), ElementPolynomial(), (2, 3)),
+            ("a sinh atlas, second derivatives", interp_forest(2; N=6),
+             f -> FieldSet(f, 2; G=1, centering=elementcentered(2), P=2),
+             rng -> [TreeAMR.chart_map(SinhAtlas{2}(), (2rand(rng) - 1, 2rand(rng) - 1), 1)
+                     for _ in 1:150],
+             SinhAtlas{2}(), ElementPolynomial(), (3,)))
+    # A point routed to the wrong rank, evaluated on the wrong local block,
+    # put back in the wrong slot, or mapped through the chain rule on the
+    # wrong rank gives a wrong value; one evaluated from other inputs than
+    # the serial kernel's differs in the last bit. Random data, so no
+    # smooth field hides either.
+    sfs = make(serial)
+    data = rand(MersenneTwister(7), size(sfs.work)...) .- 0.5
+    copyto!(sfs.work, data)
+    xs = points(Xoshiro(41))
+    D = length(serial.roots)
+    derivs = TreeAMR.ispatched(serial) ? gradient_derivs(D) : multi_indices(Val(D), 2)
+    # In the ring, not its hole, for the polar atlas, whose region is physical.
+    mid = atlas isa PolarAtlas ? (1.3, 0.4) : ntuple(d -> 0.2, D)
+    region = Ellipsoid(mid, ntuple(_ -> 0.4, D))
+    kw = (; derivs=derivs, exclude=region)
+    full = interpolate(sfs, locate(serial, xs; atlas=atlas, outside=:mark), basis; kw...)
+    @test 0 < count(full.excluded) < length(xs)
+    for P in Ps
+        parts = uneven_parts(length(xs), P)
+        comms = gather_ranks(P)
+        results = on_ranks(P) do r
+            forest = rank_forest(serial, comms, r)
+            fs = make(forest)
+            copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+            pts = locate(forest, xs[parts[r]]; atlas=atlas, outside=:mark)
+            a = interpolate(fs, pts, basis; kw...)
+            # Again at the same location, a value alone: the routing is kept.
+            b = interpolate(fs, pts, basis; vars=[2])
+            (a, b, Array(positions(pts)))
+        end
+        for (r, (a, b, xp)) in enumerate(results)
+            js = parts[r]
+            @test bitwise_equal(a.values, full.values[:, :, js])
+            @test a.excluded == full.excluded[js]
+            @test a.inside == full.inside[js]
+            @test bitwise_equal(b.values, full.values[[2], 1:1, js])
+        end
+    end
+end
+
+@testset "A distributed element lattice is each rank's own blocks', with no messages" begin
+    # The lattice names this rank's blocks by global leaf; evaluated with
+    # the wrong block offset it would read another block, or out of range.
+    serial = faces_forest((:outer, :outer); N=6)
+    sfs = FieldSet(serial, 1; G=1, centering=elementcentered(2), P=2)
+    data = rand(MersenneTwister(9), size(sfs.work)...)
+    copyto!(sfs.work, data)
+    full = interpolate(sfs, element_lattice(sfs, 2), ElementPolynomial();
+                       derivs=gradient_derivs(2))
+    P = 3
+    comms = gather_ranks(P)
+    per = (serial.N ÷ 3 * 2)^2
+    results = on_ranks(P) do r
+        forest = rank_forest(serial, comms, r)
+        fs = FieldSet(forest, 1; G=1, centering=elementcentered(2), P=2)
+        copyto!(fs.work, data[:, :, :, blockrange(forest)])
+        (interpolate(fs, element_lattice(fs, 2), ElementPolynomial();
+                     derivs=gradient_derivs(2)), blockrange(forest))
+    end
+    for (a, range) in results
+        js = ((first(range) - 1) * per + 1):(last(range) * per)
+        @test bitwise_equal(a.values, full.values[:, :, js])
+    end
+end
+
+@testset "A distributed locate refuses on every rank what any rank refuses" begin
+    # A rank that threw while the others went on would leave them waiting
+    # in the routing: an outside point, a broken atlas, an argument that
+    # differs between ranks must each be refused everywhere, before
+    # anything is sent.
+    serial = interp_forest(2)
+    P = 3
+    function attempt(make)
+        comms = gather_ranks(P)
+        return on_ranks(P) do r
+            forest = rank_forest(serial, comms, r)
+            try
+                make(forest, r)
+                ""
+            catch err
+                err isa ArgumentError || rethrow()
+                err.msg
+            end
+        end
+    end
+    msgs = attempt((f, r) -> locate(f, r == 2 ? [(0.1, 0.1), (5.0, 0.0)] : [(0.1, 0.2)]))
+    @test occursin("point 2, (5.0, 0.0), is outside the domain", msgs[2])
+    @test occursin("refused on every rank", msgs[2])
+    @test all(m -> occursin("since rank(s) 1 of 3 refused a point", m), msgs[[1, 3]])
+    msgs = attempt((f, r) -> locate(f, r == 3 ? [(5.0, 0.2)] : [(0.1, 0.2)];
+                                    atlas=IdentityAtlas{2}()))
+    @test occursin("broke its contract", msgs[3])
+    @test all(m -> occursin("since rank(s) 2 of 3", m), msgs[1:2])
+    msgs = attempt((f, r) -> locate(f, [(0.1, 0.2)]; outside=r == 1 ? :error : :mark))
+    @test all(m -> occursin("locate was called for a different layout", m), msgs)
+    msgs = attempt((f, r) -> locate(f, [(0.1, 0.2)]; outside=r == 1 ? :clamp : :mark))
+    @test occursin("outside must be :error", msgs[1])
+    @test all(m -> occursin("locate was refused on rank(s) 0", m), msgs[2:3])
+    # And the evaluation refuses together too: a basis on one rank only.
+    msgs = attempt() do f, r
+        fs = FieldSet(f, 2; G=2)
+        interpolate(fs, locate(f, [(0.1, 0.2)]), r == 2 ? Lagrange(2) : Lagrange(4))
+    end
+    @test all(m -> occursin("interpolate was called for a different layout", m), msgs)
+end

@@ -1133,7 +1133,8 @@ function interpolate_points(fs::FieldSet{T,D}, u, xs::AbstractArray, basis;
     # fused kernel takes plain positions on a brick only.
     fused_points(fs, xs, atlas, outside) ||
         return interpolate_located(fs, u,
-                                   locate(T, fs.forest, xs; atlas=atlas, outside=outside),
+                                   locate(T, fs.forest, xs; atlas=atlas, outside=outside,
+                                          backend=get_backend(fs.work)),
                                    basis; derivs=derivs, vars=vars, exclude=exclude,
                                    fill=fill)
     basis = specialize_basis(basis, fs)
@@ -1185,7 +1186,8 @@ function interpolate_points!(values, excluded, fs::FieldSet{T,D}, u, xs::Abstrac
     # is located first.
     fused_points(fs, xs, atlas, outside) ||
         return interpolate_located!(values, excluded, fs, u,
-                                    locate(T, fs.forest, xs; atlas=atlas, outside=outside),
+                                    locate(T, fs.forest, xs; atlas=atlas, outside=outside,
+                                           backend=get_backend(fs.work)),
                                     basis; derivs=derivs, vars=vars, exclude=exclude,
                                     fill=fill)
     isdistributed(fs.forest) &&
@@ -1255,6 +1257,7 @@ function check_interpolation(values, excluded, fs::FieldSet{T,D}, u, xs, basis, 
         "excluded must have one entry per point, $npts, got $(length(excluded))"))
     backend = get_backend(fs.work)
     for (name, a) in (("values", values), ("excluded", excluded), ("xs", xs))
+        name == "xs" && isgrid(a) && continue
         samebackend(get_backend(a), backend) || throw(ArgumentError(
             "$name lives on $(nameof(typeof(get_backend(a)))) but the field set on " *
             "$(nameof(typeof(backend))): the interpolation is one launch where the " *
@@ -1360,7 +1363,7 @@ the point is inside; and with them the forest and its
 made stale is refused rather than read from the wrong blocks.
 `length(pts)` is the number of points, and `pts.inside` the flags.
 """
-struct LocatedPoints{D,T,F<:Forest,VL,VP,VX,VC,VB,A}
+struct LocatedPoints{D,T,F<:Forest,VL,VP,VX,VC,VB,A,R}
     forest::F
     generation::Int
     leaf::VL
@@ -1371,13 +1374,36 @@ struct LocatedPoints{D,T,F<:Forest,VL,VP,VX,VC,VB,A}
     inside::VB
     atlas::A
     outside::Symbol
+    # `nothing` serially; over a distributed forest the `Routing` both
+    # sides keep, or `LocalBatch()` for points of this rank's own blocks.
+    routing::R
     function LocatedPoints{D,T}(forest::F, generation, leaf::VL, patch::VP, ξ::VX, y::VX,
-                                code::VC, inside::VB, atlas::A,
-                                outside) where {D,T,F,VL,VP,VX,VC,VB,A}
-        return new{D,T,F,VL,VP,VX,VC,VB,A}(forest, generation, leaf, patch, ξ, y, code,
-                                           inside, atlas, outside)
+                                code::VC, inside::VB, atlas::A, outside,
+                                routing::R=nothing) where {D,T,F,VL,VP,VX,VC,VB,A,R}
+        return new{D,T,F,VL,VP,VX,VC,VB,A,R}(forest, generation, leaf, patch, ξ, y, code,
+                                             inside, atlas, outside, routing)
     end
 end
+
+# The routing of a located batch over a distributed forest (M19), which
+# `locate` sets up and every `interpolate` at the batch reuses: on the
+# calling side, the routed points in owner order (`perm`, indices into
+# this rank's points) and how many went to each rank; on the owning
+# side, how many arrived from each rank and the located points
+# themselves, on the backend, for the evaluation.
+struct Routing{VL,VP,VX,VC}
+    perm::Vector{Int}
+    counts::Vector{Int}
+    rcounts::Vector{Int}
+    leaf::VL
+    patch::VP
+    y::VX
+    code::VC
+end
+
+# A batch of this rank's own blocks' points (`element_lattice`), which
+# needs no routing.
+struct LocalBatch end
 
 Base.length(pts::LocatedPoints) = length(pts.leaf)
 KernelAbstractions.get_backend(pts::LocatedPoints) = get_backend(pts.leaf)
@@ -1465,7 +1491,8 @@ pointkernel(kernel, backend, npts) =
     kernel(backend)
 
 """
-    locate([T,] forest, xs; atlas = nothing, outside = :error) -> LocatedPoints
+    locate([T,] forest, xs; atlas = nothing, outside = :error,
+           backend) -> LocatedPoints
 
 The points `xs` located in `forest`, once, for any number of
 [`interpolate`](@ref) calls over field sets on it. Each point is folded
@@ -1496,27 +1523,43 @@ contract, naming the atlas.
 it, with `pts.inside[j] == false`, and `interpolate` fills its values
 with its `fill`.
 
-The points live on the backend of `xs`, and so does the result. The
-location is one launch there; a regrid makes it stale.
+The points live on the backend of `xs`, and so does the result; a grid
+([`UniformGrid`](@ref), [`AffineGrid`](@ref), [`PatchGrid`](@ref)),
+which is computed from the index, is located on `backend`, the CPU
+unless given. The location is one launch there; a regrid makes it
+stale.
 """
 locate(forest::Forest{D,R}, xs::AbstractArray; kwargs...) where {D,R} =
     locate(R, forest, xs; kwargs...)
 
 function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray; atlas=nothing,
-                outside::Symbol=:error) where {T,D}
+                outside::Symbol=:error,
+                backend=isgrid(xs) ? CPU() : get_backend(xs)) where {T,D}
+    isdistributed(forest) &&
+        return locate_distributed(T, forest, xs, atlas, outside, backend)
+    g, table = check_locate(T, forest, xs, atlas, outside, backend)
+    leaf, patch, ξ, y, code, inside = launch_location(T, forest, xs, g, table, atlas, backend)
+    why = location_refusal(forest, xs, leaf, patch, ξ, inside, atlas, outside)
+    why === nothing || throw(why)
+    return LocatedPoints{D,T}(forest, generation(forest), leaf, patch, ξ, y, code, inside,
+                              atlas, outside)
+end
+
+# Every argument check of `locate`, returning the geometry the points are
+# located with and the patch table (`nothing` on a brick without patch
+# points or an atlas).
+function check_locate(::Type{T}, forest::Forest{D}, xs, atlas, outside,
+                      backend) where {T,D}
     outside in (:error, :mark) || throw(ArgumentError(
         "outside must be :error, which refuses a batch with a point outside the " *
         "domain, or :mark, which keeps it with its inside flag false; got " *
         "$(repr(outside))"))
-    isdistributed(forest) && throw(ArgumentError(
-        "locate is not yet implemented over a distributed forest: the routing of " *
-        "located points to the owners of their blocks is M19's step 7. The form " *
-        "interpolate(fs, xs, basis), which routes as it goes, works there."))
-    npts = length(xs)
-    if xs isa Array && npts > 0
-        pointdims(first(xs)) == D || throw(ArgumentError(
-            "a point in a $D-dimensional forest has $D coordinates, got " *
-            "$(pointdims(first(xs)))"))
+    if xs isa Array
+        for j in eachindex(xs)
+            pointdims(xs[j]) == D || throw(ArgumentError(
+                "a point in a $D-dimensional forest has $D coordinates, got " *
+                "$(pointdims(xs[j])) (point $j)"))
+        end
     end
     patched = eltype(xs) <: PatchPoint
     if atlas !== nothing
@@ -1526,7 +1569,20 @@ function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray; atlas=nothing,
         check_chart(chart_locate, atlas, T, Val(D), "locate with an atlas")
     end
     g = patched || atlas !== nothing ? PointGeometry(T, forest) : plain_geometry(T, forest)
-    backend = get_backend(xs)
+    isgrid(xs) || samebackend(get_backend(xs), backend) || throw(ArgumentError(
+        "the points live on $(nameof(typeof(get_backend(xs)))) but backend is " *
+        "$(nameof(typeof(backend))): the location is one launch where the points are. " *
+        "A grid, which is computed from the index, is located on any backend."))
+    table = patched || atlas !== nothing ? patch_table(T, forest) : nothing
+    return g, table
+end
+
+# The location kernel over `xs` on `backend`: per point the leaf (`0`
+# outside, `-1` an unknown patch, `-2` a broken atlas contract), the patch,
+# the position as given and as folded, the fold and the inside flag.
+function launch_location(::Type{T}, forest::Forest{D}, xs, g, table, atlas,
+                         backend) where {T,D}
+    npts = length(xs)
     leaf = allocate(backend, Int32, npts)
     patch = allocate(backend, Int32, npts)
     ξ = allocate(backend, NTuple{D,T}, npts)
@@ -1535,25 +1591,32 @@ function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray; atlas=nothing,
     inside = allocate(backend, Bool, npts)
     if npts > 0
         leaves = todevice(backend, forest.leaves)
-        table = patched || atlas !== nothing ? patch_table(T, forest) : nothing
         table === nothing || (table = todevice(backend, table))
         pointkernel(locate_kernel!, backend, npts)(leaf, patch, ξ, y, code, inside, xs,
                                                    leaves, g, table, atlas; ndrange=npts)
         synchronize(backend)
-        if any(<(0), leaf)
-            j = findfirst(<(0), tohost(leaf))
-            throw(atlas === nothing ? unknown_patch(forest, tohost(xs)[j], j) :
-                  broken_chart(forest, atlas, tohost(xs)[j], tohost(ξ)[j],
-                               Int(tohost(patch)[j]), j))
-        end
-        if outside === :error && !all(inside)
-            j = findfirst(!, tohost(inside))
-            throw(atlas === nothing ? domain_error(forest, tohost(xs)[j], j) :
-                  atlas_outside(atlas, tohost(xs)[j], j))
-        end
     end
-    return LocatedPoints{D,T}(forest, generation(forest), leaf, patch, ξ, y, code, inside,
-                              atlas, outside)
+    return leaf, patch, ξ, y, code, inside
+end
+
+# The refusal a location calls for, or `nothing`: the first point naming
+# an unknown patch or breaking the atlas's contract, then under `:error`
+# the first point outside.
+function location_refusal(forest, xs, leaf, patch, ξ, inside, atlas, outside)
+    length(leaf) == 0 && return nothing
+    hostpoint(j) = isgrid(xs) ? xs[j] : tohost(xs)[j]
+    if any(<(0), leaf)
+        j = findfirst(<(0), tohost(leaf))
+        return atlas === nothing ? unknown_patch(forest, hostpoint(j), j) :
+               broken_chart(forest, atlas, hostpoint(j), tohost(ξ)[j],
+                            Int(tohost(patch)[j]), j)
+    end
+    if outside === :error && !all(inside)
+        j = findfirst(!, tohost(inside))
+        return atlas === nothing ? domain_error(forest, hostpoint(j), j) :
+               atlas_outside(atlas, hostpoint(j), j)
+    end
+    return nothing
 end
 
 # What makes a located batch readable for `fs`: the same forest, not
@@ -1624,6 +1687,9 @@ function interpolate_located!(values, excluded, fs::FieldSet{T,D}, u, pts::Locat
                               basis; derivs=(ntuple(_ -> 0, D),), vars=1:fs.nvars,
                               exclude=nothing, fill=T(NaN)) where {T,D}
     basis = specialize_basis(basis, fs)
+    pts.routing isa Routing &&
+        return interpolate_routed!(values, excluded, fs, u, pts, basis, derivs, vars,
+                                   exclude, T(fill))
     check_located(fs, pts)
     ms = check_interpolation(values, excluded, fs, u, pts, basis, derivs, vars)
     atlas = pts.atlas
@@ -1635,8 +1701,10 @@ function interpolate_located!(values, excluded, fs::FieldSet{T,D}, u, pts::Locat
     length(pts) == 0 && return values, excluded
     logical = atlas === nothing ? values :
               allocate(get_backend(fs.work), T, (length(vars), length(lms), length(pts)))
+    # A batch of this rank's own blocks names them by global leaf.
+    boffset = first(blockrange(fs.forest)) - 1
     status = launch_evaluation!(logical, excluded, fs, u, pts, PointGeometry(T, fs.forest),
-                                basis, lms, vars, exclude, 0, T(fill))
+                                basis, lms, vars, exclude, boffset, T(fill))
     # A point beyond a rotating seam of a set that cannot turn it, marked
     # where the kernel found it and refused as the fused path refuses it.
     if any(!=(0), status)
@@ -1810,9 +1878,6 @@ function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, u, xs, ba
     pts, leafof = NTuple{D,T}[], Int[]
     try
         ms = check_interpolation(values, excluded, fs, u, xs, basis, derivs, vars)
-        eltype(xs) <: PatchPoint && throw(ArgumentError(
-            "PatchPoints are not yet routed over a distributed forest: the routing of " *
-            "located points to the owners of their blocks is M19's step 7."))
         # What every rank must pass alike, since an owner evaluates the
         # points it receives with its own arguments.
         layout = layouthash(string(basis), u === nothing, ms, collect(Int, vars),
@@ -1888,6 +1953,175 @@ function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, u, xs, ba
             ex[j] = flags[i]
         end
         copyto!(excluded, ex)
+    end
+    return values, excluded
+end
+
+# --- located points over a distributed forest (M19) ----------------------------
+#
+# `locate` is collective: each rank locates its own points on the host,
+# against the replicated leaves and with the atlas, agrees with the other
+# ranks on every refusal in one `allgather`, and sends each inside point's
+# block, patch, folded position and fold to the block's owner, which keeps
+# them, as the caller keeps the routing. Each `interpolate` at the batch
+# is then one `allgather` of its checks and one `alltoallv` back — two
+# with an `exclude` region — of logical derivatives from the serial
+# kernel; the chain rule runs on the calling rank, where the atlas ran, so
+# the values are the serial ones bit for bit at any rank count. An outside
+# point under `:mark` is sent nowhere. ("Interpolation on element sets
+# and patches" in CODE.md.)
+
+# The agreed verdict on per-point refusals: a rank that has one raises
+# it, and every other rank names the first rank that did, so that all of
+# them throw together.
+function point_verdict(what, flags, rank::Integer, own)
+    bad = [r - 1 for r in eachindex(flags) if flags[r]]
+    isempty(bad) && return nothing
+    which = "rank(s) $(join(bad, ", ")) of $(length(flags))"
+    own === nothing || throw(ArgumentError(
+        own.msg * " The call is collective, and $which refused a point, so it is " *
+        "refused on every rank."))
+    throw(ArgumentError(
+        "$what is refused on every rank, this one (rank $rank) included, since $which " *
+        "refused a point; the error on rank $(first(bad)) names it."))
+end
+
+function locate_distributed(::Type{T}, forest::Forest{D}, xs, atlas, outside,
+                            backend) where {T,D}
+    comm = forest.comm
+    rank, P = commrank(comm), commsize(comm)
+    refusal, layout, own = nothing, UInt(0), nothing
+    leaf, patch = Int32[], Int32[]
+    ξ, y = NTuple{D,T}[], NTuple{D,T}[]
+    code, inside = UInt8[], Bool[]
+    try
+        g, table = check_locate(T, forest, xs, atlas, outside, backend)
+        # What every rank must pass alike, since an owner evaluates what it
+        # receives as the caller located it.
+        layout = layouthash("locate", T, string(typeof(atlas)), outside)
+        xh = isgrid(xs) ? xs : tohost(xs)
+        leaf, patch, ξ, y, code, inside = launch_location(T, forest, xh, g, table, atlas,
+                                                          CPU())
+        own = location_refusal(forest, xh, leaf, patch, ξ, inside, atlas, outside)
+    catch err
+        err isa ArgumentError || rethrow()
+        refusal = err
+    end
+    digest = ForestDigest(generation(forest), nleaves(forest), UInt(0), UInt(0), layout,
+                          refusal !== nothing)
+    gathered = allgather(comm, (digest, own !== nothing))
+    digest_verdict(map(first, gathered), "locate", rank, refusal)
+    point_verdict("locate", map(last, gathered), rank, own)
+
+    # Route each inside point to the owner of its block, a stable counting
+    # sort by owner, so that an owner receives a caller's points in the
+    # caller's order.
+    nl = nleaves(forest)
+    npts = length(leaf)
+    counts = zeros(Int, P)
+    owners = zeros(Int, npts)
+    for j in 1:npts
+        inside[j] || continue
+        o = equalsplit_part(nl, P, Int(leaf[j]))
+        owners[j] = o
+        counts[o] += 1
+    end
+    next = cumsum([1; counts[1:(end - 1)]])
+    perm = Vector{Int}(undef, sum(counts))
+    for j in 1:npts
+        o = owners[j]
+        o == 0 && continue
+        perm[next[o]] = j
+        next[o] += 1
+    end
+    sent = Tuple{Int32,Int32,NTuple{D,T},UInt8}[(leaf[j], patch[j], y[j], code[j])
+                                               for j in perm]
+    received, rcounts = alltoallv(comm, sent, counts)
+    routing = Routing(perm, counts, rcounts,
+                      todevice(backend, Int32[q[1] for q in received]),
+                      todevice(backend, Int32[q[2] for q in received]),
+                      todevice(backend, NTuple{D,T}[q[3] for q in received]),
+                      todevice(backend, UInt8[q[4] for q in received]))
+    return LocatedPoints{D,T}(forest, generation(forest), todevice(backend, leaf),
+                              todevice(backend, patch), todevice(backend, ξ),
+                              todevice(backend, y), todevice(backend, code),
+                              todevice(backend, inside), atlas, outside, routing)
+end
+
+function interpolate_routed!(values, excluded, fs::FieldSet{T,D}, u, pts::LocatedPoints,
+                             basis, derivs, vars, exclude, fillvalue::T) where {T,D}
+    forest = fs.forest
+    comm = forest.comm
+    rank = commrank(comm)
+    atlas = pts.atlas
+    r = pts.routing
+    npts = length(pts)
+    refusal, layout, seam = nothing, UInt(0), nothing
+    ms, lms = (), ()
+    try
+        check_located(fs, pts)
+        ms = check_interpolation(values, excluded, fs, u, pts, basis, derivs, vars)
+        lms = atlas === nothing ? ms : logical_derivs(basis, ms, Val(D))
+        atlas === nothing || check_atlas_interpolation(atlas, T, Val(D), ms, exclude)
+        # What every rank must pass alike, since an owner evaluates the
+        # points it received with its own arguments.
+        layout = layouthash(string(basis), u === nothing, ms, collect(Int, vars),
+                            string(convertregion(T, exclude)), fs.nvars, fs.G,
+                            fs.centering, T, nameof(typeof(get_backend(fs.work))),
+                            string(typeof(atlas)))
+        # A point beyond a rotating seam of a set that cannot turn it, found
+        # from the folds this rank kept, before anything is sent.
+        if hasrotating(forest) && !seam_turns(fs) && npts > 0
+            codes, ins = tohost(pts.code), tohost(pts.inside)
+            j = findfirst(k -> ins[k] && unfoldcode(codes[k], Val(D))[2] != 0, 1:npts)
+            j === nothing || (seam = outside_error(fs, tohost(pts.ξ)[j], j))
+        end
+    catch err
+        err isa ArgumentError || rethrow()
+        refusal = err
+    end
+    digest = ForestDigest(generation(forest), nleaves(forest), UInt(0), UInt(0), layout,
+                          refusal !== nothing)
+    gathered = allgather(comm, (digest, seam !== nothing))
+    digest_verdict(map(first, gathered), "interpolate", rank, refusal)
+    point_verdict("interpolate", map(last, gathered), rank, seam)
+
+    # Evaluate what this rank received, over its own blocks.
+    backend = get_backend(fs.work)
+    nv, K, nrecv = length(vars), length(lms), length(r.leaf)
+    rlogical = allocate(backend, T, (nv, K, nrecv))
+    rexcluded = allocate(backend, Bool, nrecv)
+    if nrecv > 0
+        rinside = allocate(backend, Bool, nrecv)
+        fill!(rinside, true)
+        recv = LocatedPoints{D,T}(forest, pts.generation, r.leaf, r.patch, r.y, r.y, r.code,
+                                  rinside, atlas, :error)
+        launch_evaluation!(rlogical, rexcluded, fs, u, recv, PointGeometry(T, forest),
+                           basis, lms, vars, exclude, first(blockrange(forest)) - 1,
+                           fillvalue)
+    end
+
+    # Answer: each owner's segment goes back to the rank that asked, in
+    # the order of `perm`; an outside point keeps `fill`.
+    back, _ = alltoallv(comm, vec(tohost(rlogical)), r.rcounts .* (nv * K))
+    answers = reshape(back, nv, K, length(r.perm))
+    full = Array{T}(undef, nv, K, npts)
+    fill!(full, fillvalue)
+    for (i, j) in enumerate(r.perm), k in 1:K, iv in 1:nv
+        full[iv, k, j] = answers[iv, k, i]
+    end
+    ex = zeros(Bool, npts)
+    if exclude !== nothing
+        flags, _ = alltoallv(comm, tohost(rexcluded), r.rcounts)
+        for (i, j) in enumerate(r.perm)
+            ex[j] = flags[i]
+        end
+    end
+    copyto!(excluded, ex)
+    if atlas === nothing
+        copyto!(values, full)
+    else
+        launch_chain!(values, todevice(backend, full), pts, atlas, ms, fillvalue)
     end
     return values, excluded
 end

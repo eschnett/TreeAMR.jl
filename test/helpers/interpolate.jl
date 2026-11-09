@@ -199,3 +199,38 @@ function physical_oracle(atlas, dm, x, v, m)
     return sum(dm(ξ, v, e(a) .+ e(b)) * K[a][i] * K[b][j] for a in 1:D, b in 1:D) +
            sum(dm(ξ, v, e(a)) * S[a][i][j] for a in 1:D)
 end
+
+# The identity map, through every method, so that the chain rule
+# multiplies by exact ones and zeros.
+struct IdentityAtlas{D} end
+TreeAMR.chart_locate(::IdentityAtlas, x) = (x, 1)
+TreeAMR.chart_map(::IdentityAtlas, ξ, p) = ξ
+TreeAMR.chart_jacobian(::IdentityAtlas{D}, ξ, p) where {D} =
+    ntuple(i -> ntuple(a -> a == i ? 1.0 : 0.0, D), D)
+TreeAMR.chart_hessian(::IdentityAtlas{D}, ξ, p) where {D} =
+    ntuple(_ -> ntuple(_ -> ntuple(_ -> 0.0, D), D), D)
+
+# A polar atlas on the four-patch ring: patch `p` covers the angles
+# `[(p − 1)π/2, pπ/2]`, its `ξ₁ ∈ [0, 2]`, and `ξ₂ ∈ [0, 1]` is `r − 1`. A
+# point in the hole or beyond the rim is in no patch.
+struct PolarAtlas end
+function TreeAMR.chart_locate(::PolarAtlas, x)
+    r = hypot(x[1], x[2])
+    1 <= r <= 2 || return nothing
+    s = 4 * mod(atan(x[2], x[1]), 2π) / π
+    p = clamp(floor(Int, s / 2) + 1, 1, 4)
+    return ((clamp(s - 2(p - 1), 0.0, 2.0), r - 1), p)
+end
+function TreeAMR.chart_map(::PolarAtlas, ξ, p)
+    θ = π / 4 * (2(p - 1) + ξ[1])
+    return ((1 + ξ[2]) * cos(θ), (1 + ξ[2]) * sin(θ))
+end
+function TreeAMR.chart_jacobian(::PolarAtlas, ξ, p)
+    θ = π / 4 * (2(p - 1) + ξ[1])
+    r = 1 + ξ[2]
+    return ((-r * sin(θ) * π / 4, cos(θ)), (r * cos(θ) * π / 4, sin(θ)))
+end
+
+# An atlas that returns a position outside its patch's box.
+struct OverreachingAtlas end
+TreeAMR.chart_locate(::OverreachingAtlas, x) = ((x[1] + 3, x[2]), 1)

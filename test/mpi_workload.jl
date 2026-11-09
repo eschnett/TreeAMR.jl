@@ -753,6 +753,71 @@ function interpolate_case(tag)
     return nothing
 end
 
+# --- located batches (M19) ---------------------------------------------------
+
+# A polar atlas on `annulus_of`'s four patches of `(2, 2)` roots: patch `p`
+# covers the angles `[(p − 1)π/2, pπ/2]`, its `ξ₁ ∈ [0, 2]` the angle and
+# `ξ₂ ∈ [0, 2]` twice the radius beyond 1. The hole and beyond the rim are
+# in no patch.
+struct RingAtlas end
+function TreeAMR.chart_locate(::RingAtlas, x)
+    r = hypot(x[1], x[2])
+    1 <= r <= 2 || return nothing
+    s = 4 * mod(atan(x[2], x[1]), 2π) / π
+    p = clamp(floor(Int, s / 2) + 1, 1, 4)
+    return ((clamp(s - 2(p - 1), 0.0, 2.0), 2(r - 1)), p)
+end
+function TreeAMR.chart_map(::RingAtlas, ξ, p)
+    θ = π / 4 * (2(p - 1) + ξ[1])
+    r = 1 + ξ[2] / 2
+    return (r * cos(θ), r * sin(θ))
+end
+function TreeAMR.chart_jacobian(::RingAtlas, ξ, p)
+    θ = π / 4 * (2(p - 1) + ξ[1])
+    r = 1 + ξ[2] / 2
+    return ((-r * sin(θ) * π / 4, cos(θ) / 2), (r * cos(θ) * π / 4, sin(θ) / 2))
+end
+
+# Physical points over the annulus's bounding box, its hole and corners
+# included, located once through the atlas and routed to the owners of
+# their blocks, then evaluated with physical gradients and an excluded
+# region; logical PatchPoints in every patch; and the element lattice,
+# which every rank evaluates alone. Each rank asks for its own uneven
+# slice, so the values gathered in rank order are the serial ones.
+function located_case(tag)
+    forest = annulus_of(8)
+    emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
+    fs = FieldSet(forest, 2; G=1, centering=elementcentered(2), P=3)
+    pseudorandom!(fs)
+    # Two incommensurate steps: `φ²` would put the points on a line, since
+    # `φ² = 1 − φ`.
+    φ, ψ = (sqrt(5.0) - 1) / 2, 0.7548776662466927
+    all_xs = [(-2.2 + 4.4 * mod(j * φ, 1.0), -2.2 + 4.4 * mod(j * ψ, 1.0)) for j in 1:211]
+    weights = [(2, 0, 5, 1, 3)[r % 5 + 1] for r in 0:(NRANKS - 1)]
+    cuts = [0; round.(Int, length(all_xs) .* cumsum(weights) ./ sum(weights))]
+    mine = (cuts[RANK + 1] + 1):cuts[RANK + 2]
+    pts = locate(forest, all_xs[mine]; atlas=RingAtlas(), outside=:mark)
+    r = interpolate(fs, pts, ElementPolynomial(); derivs=((0, 0), (1, 0), (0, 1)),
+                    exclude=Ellipsoid((1.2, 0.4), (0.4, 0.3)))
+    inside = gathered(forest, r.inside)
+    emit(tag, "inside", count(inside), digest(reinterpret(UInt8, inside)))
+    flags = gathered(forest, r.excluded)
+    emit(tag, "excluded", count(flags), digest(reinterpret(UInt8, flags)))
+    emit(tag, "physical", digest(gathered(forest, r.values)))
+    emit(tag, "positions",
+         digest(reinterpret(UInt8, gathered(forest, collect(Iterators.flatten(
+             positions(pts)))))))
+    qs = [PatchPoint((2 * mod(j * φ, 1.0), 2 * mod(j * ψ, 1.0)), 1 + j % 4)
+          for j in 1:97]
+    q = interpolate(fs, qs[RANK == 0 ? (1:97) : (1:0)], ElementPolynomial();
+                    derivs=((0, 0), (1, 1)))
+    emit(tag, "logical", digest(gathered(forest, q.values)))
+    lat = interpolate(fs, element_lattice(fs, 2), ElementPolynomial())
+    emit(tag, "lattice", length(gathered(forest, lat.inside)),
+         digest(gathered(forest, lat.values)))
+    return nothing
+end
+
 # --- ranks without blocks ---------------------------------------------------
 
 # Two leaves, so that at three ranks one rank holds no block, through
@@ -1403,6 +1468,9 @@ function main()
     moving_blocks_case("M32x2-", Float32x2; full=false)
     # Point interpolation, routed to the owners and back.
     interpolate_case("I2")
+    # Located batches on a forest of patches (M19): through an atlas,
+    # PatchPoints, and the element lattice.
+    located_case("L2")
     # A rank without blocks through everything, at three ranks.
     empty_rank_case("E2")
     # A rotating quadrant (M12): the vertex-centered wave in 2D, and in 3D

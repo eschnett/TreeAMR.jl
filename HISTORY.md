@@ -4585,6 +4585,28 @@ M12 was decided with Erik, after M7 and before M9b.
     second. The identity atlas is bit for bit the call without one,
     across a reflecting wall, but for the sign of a zero, which the chain
     rule's sum from zero turns positive.
+  - *Step 6, grids and `element_lattice` (2026-11-09).* As designed,
+    with `positions` for any located batch and `AbstractPointGrid` as the
+    grids' supertype. One trap the tests caught: a struct's default
+    constructor takes the fields in order, so `UniformGrid((0, 0), (1,
+    1), (3, 3))` with integer corners matched it, the high corner taken
+    as the step, until inner constructors left the checking one alone.
+  - *Step 7, distributed (2026-11-09).* As designed, with two choices
+    the design left open. The plain-position form without an atlas keeps
+    M11's routing rather than becoming `locate` then `interpolate`: one
+    `allgather` per call instead of two, and its collective refusals word
+    for word, which `interpolate_exchange_tests.jl` asserts; the split
+    path gives the same bits there anyway. And the element lattice's
+    batch is marked local, evaluated with the block offset and no
+    message. The simulated-rank tests check element sets across a wall
+    with `:mark`, `Lagrange` through `locate`, `PatchPoint`s and two
+    atlases bit for bit at uneven splits of 2–5 ranks, and the refusals
+    on every rank; `test/mpi_workload.jl`'s new `L2` case agrees at 1
+    and 3 ranks. Writing it turned up that the workload's points
+    `(jφ mod 1, jφ² mod 1)` lie on one line, since `φ² = 1 − φ`, so an
+    excluded region off that line flagged nothing; `L2` takes the second
+    coordinate from the plastic number instead. M11's `I2` case uses the
+    same sequence and is left as it is.
 
 ## Downstream checks
 

@@ -225,11 +225,11 @@ says it is done:
    analytic derivatives up to second order, a missing method is refused
    on the host naming it, and outside points are marked and filled with
    NaN.
-6. **Grids and `element_lattice`.** *Done when* a `UniformGrid` and an
+6. **Grids and `element_lattice`.** *(Implemented 2026-11-09.)* *Done when* a `UniformGrid` and an
    `AffineGrid` give the values of the same points passed as an array,
    bit for bit, and `element_lattice` places its points where
    `positions` says.
-7. **Distributed.** *Done when*, with an atlas, `LocatedPoints`' routing
+7. **Distributed.** *(Implemented 2026-11-09.)* *Done when*, with an atlas, `LocatedPoints`' routing
    gives the serial values bit for bit at 1 and 3 ranks (a line of
    `test/mpi_workload.jl`).
 8. **TreeWaveOLDG's acceptance.** The annulus's rotating mode and the

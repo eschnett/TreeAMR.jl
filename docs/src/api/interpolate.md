@@ -20,6 +20,20 @@ Ellipsoid
 multi_indices
 ```
 
+## Point sets
+
+Grids computed from the index, which reach a kernel as one value, and
+the lattice of sub-centres of every element.
+
+```@docs
+AbstractPointGrid
+UniformGrid
+AffineGrid
+PatchGrid
+element_lattice
+positions
+```
+
 ## The atlas
 
 An application's maps between physical space and its patches' logical

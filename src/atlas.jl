@@ -33,7 +33,7 @@ function chart_locate end
 
 The physical position of logical position `ξ` in patch `p`: the inverse
 of [`chart_locate`](@ref TreeAMR.chart_locate). Needed for an `exclude`
-region with an atlas, which is physical.
+region with an atlas, which is physical, and for [`positions`](@ref).
 """
 function chart_map end
 

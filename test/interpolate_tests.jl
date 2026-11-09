@@ -417,6 +417,49 @@ end
     @test_throws "Locate them again" interpolate(fs, pts, Lagrange(4))
 end
 
+@testset "A grid gives the values of its points passed as an array, bit for bit: $name" for
+        (name, grid) in (("uniform 2D", UniformGrid((-1, -0.75), (1, 0.9), (17, 13))),
+                         ("a line in 2D", AffineGrid((-0.9, -0.8), ((0.11, 0.07),), (16,))),
+                         ("a plane in 3D", AffineGrid((-0.95, -0.9, 0.3),
+                                                      ((0.1, 0.02, 0.0), (0.0, 0.08, -0.05)),
+                                                      (19, 11))),
+                         ("uniform 3D", UniformGrid((-1, -1, -1), (1, 1, 1), (5, 6, 7))),
+                         ("one point", UniformGrid((0.3, 0.2), (0.3, 0.2), (1, 1))))
+    # A viewer's grid reaches the kernel as one isbits value, computed
+    # from the index; if that computation differed from the grid's own
+    # `getindex`, or the grid's order from its linear order, the image
+    # would be shifted or scrambled.
+    D = length(first(grid))
+    f, _ = tensorpoly(D, 2)
+    fs = interp_fieldset(interp_forest(D; N=D == 3 ? 6 : 8), f, cellcentered(D), 4)
+    @test isbits(grid)
+    xs = collect(grid)
+    @test size(xs) == size(grid) && vec(xs) == [grid[j] for j in 1:length(grid)]
+    derivs = gradient_derivs(D)
+    a = interpolate(fs, grid, Lagrange(4); derivs=derivs)
+    b = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+    @test isequal(a.values, b.values)
+    @test isequal(interpolate(fs, locate(fs.forest, grid), Lagrange(4); derivs=derivs).values,
+                  b.values)
+    m = interpolate(fs, grid, Lagrange(4); outside=:mark)
+    @test isequal(m.values, interpolate(fs, xs, Lagrange(4)).values)
+end
+
+@testset "A grid's points are the ones its constructor describes" begin
+    # The grid's own arithmetic, against the formula: both corners of a
+    # uniform grid included, an affine grid stepping by its axes.
+    g = UniformGrid((0, -1), (1, 1), (5, 3))
+    @test g[1] == (0.0, -1.0) && g[5] == (1.0, -1.0) && g[15] == (1.0, 1.0)
+    @test g[7] == (0.25, 0.0)
+    a = AffineGrid((1, 2, 3), ((1, 0, 0), (0, 0, 2)), (2, 3))
+    @test collect(a) == [(1.0 + i, 2.0, 3.0 + 2k) for i in 0:1, k in 0:2]
+    @test_throws "between 1 and 2 axes" AffineGrid((0, 0), ((1, 0), (0, 1), (1, 1)),
+                                                   (2, 2, 2))
+    @test_throws "one positive point count per axis" AffineGrid((0, 0), ((1, 0),), (0,))
+    @test_throws "at least one point" UniformGrid((0, 0), (1, 1), (3, 0))
+    @test_throws BoundsError g[16]
+end
+
 @testset "interpolate refuses what it cannot answer, and says why" begin
     # Each of these would otherwise be a wrong number, a bounds error
     # deep in a kernel, or a silent extrapolation.
