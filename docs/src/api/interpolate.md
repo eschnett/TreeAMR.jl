@@ -10,6 +10,7 @@ interpolate
 interpolate!
 locate
 LocatedPoints
+PatchPoint
 locate_point
 InterpolationBasis
 Lagrange

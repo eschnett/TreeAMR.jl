@@ -214,7 +214,8 @@ says it is done:
    - the measured rates on a smooth field over a refined forest are
      `P + 1` for the value and `P + 1 − maxₐ mₐ` for a derivative;
    - filling the ghosts with NaN leaves every result unchanged.
-4. **`PatchPoint` on a forest of patches.** *Done when* logical points
+4. **`PatchPoint` on a forest of patches.** *(Implemented 2026-11-09.)*
+   *Done when* logical points
    on a four-patch annulus agree bit for bit with the brick of four times
    the roots, a point on a glued face is located in the patch it names,
    and `Lagrange` is refused there.

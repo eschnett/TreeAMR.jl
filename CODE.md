@@ -3184,30 +3184,23 @@ element's own nodes, and `check_interpolation`, inside the collective
 checks, refuses `Lagrange` on it and `ElementPolynomial` on any other
 set (see [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
 
-A forest of patches (M17) is refused by `PointGeometry`, which every
-path to point location builds — `locate_point`, `interpolate` serially,
-and `interpolate` across ranks, before anything is gathered, so that
-every rank refuses together. Its coordinates are logical, patch by
-patch, and the patches' boxes may overlap or coincide, so a position
-names no one point. A physical position does, through the
-application's maps, and locating one is a root-finding problem on those
-maps, which the forest does not carry ("A multi-patch forest" under
-[Domain and boundaries](#domain-and-boundaries)); the refusal says that
-a location handed the maps, or the patch of each point, would lift it.
+On a forest of patches (M17) a plain position is refused by
+`plain_geometry`, which every path that takes positions builds —
+`locate_point`, `locate`, `interpolate` serially, and `interpolate`
+across ranks, before anything is gathered, so that every rank refuses
+together. Its coordinates are logical, patch by patch, and the patches'
+boxes may overlap or coincide, so a position names no one point. A
+point there is a `PatchPoint(ξ, p)`, a logical position in a named
+patch, or **(proposed)** a physical position, which the application's
+atlas maps to one ([Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)).
 This is the only coordinate-to-block path in `src/`, and so the only
 thing disjoint patch extents would have served. The refusal covers a
 forest of one patch built through the `patches` form as well — a
-self-glued wrap among them, whose wrap `PointGeometry` would not see.
-Such a forest names one point by a position, but nothing needs it
+self-glued wrap among them, whose wrap the patch's geometry would not
+see. Such a forest names one point by a position, but nothing needs it
 located: one patch without glue, or wrapped onto its opposite face by
 the identity, is a brick the brick form builds and locates in, and a
 twisted wrap has no user. The brick form is unaffected.
-
-**(proposed)** Point location on a forest of patches takes a
-`(local coordinates, patch)` pair as its input, a `PatchPoint`, or a
-global coordinate that the application's atlas maps to one, folding
-on the global coordinate before the patch lookup; see
-[Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches).
 
 ### Interpolation on element sets and patches
 
@@ -3282,12 +3275,24 @@ multi_indices(Val(D), maxorder)
   fold and turn. With `outside = :mark` it is `locate` then
   `interpolate`.
 - **What a point can be.** On a brick without an atlas, a position as
-  today, folded as today. On a forest of patches without an atlas, a
-  `PatchPoint(ξ, p)`, located in patch `p` alone: its roots are
-  contiguous flat roots and the curve order sorts by flat root first, so
-  M11's binary search runs unchanged from the root `ξ` lies in. A plain
-  position there stays refused. With an atlas, on either, a physical
-  position, which `chart_locate` turns into `(ξ, p)`.
+  in M11, folded as there, or a `PatchPoint(ξ, 1)`. On a forest of
+  patches without an atlas, a `PatchPoint(ξ, p)`, located in patch `p`
+  alone: its roots are contiguous flat roots and the curve order sorts
+  by flat root first, so M11's binary search runs unchanged from the
+  root `ξ` lies in, offset by the patch's first root, a field of
+  `PointGeometry` that is zero on a brick. The kernel builds patch `p`'s
+  geometry per point from a table of each patch's box, roots and first
+  root (`patch_table`, `point_geometry`): no wrap, no seam, the
+  forest's reflecting faces, which are the same for every patch's
+  unglued faces since a glued face is never reflecting. A plain
+  position there is refused; a patch the forest does not have is
+  refused naming the range; a `ξ` outside its patch's box, after the
+  mirror at a reflecting face, is an outside point. On the four-patch
+  annulus, logical points give the values of the brick of four times
+  the roots bit for bit (`patch_tests.jl`). The fused kernel takes plain
+  positions on a brick only; `PatchPoint`s, and every point of a forest
+  of patches, go through `locate`. **(proposed)** With an atlas, on
+  either, a physical position, which `chart_locate` turns into `(ξ, p)`.
 - **The atlas folds, TreeAMR does not.** The atlas handles the global
   topology, wrapping an angle or choosing a ball's patch, and returns a
   `ξ` in patch `p`'s closed box; a `ξ` outside it is refused as a
@@ -6189,8 +6194,11 @@ sphere, every cell and vertex set refused and an element set exact.
 they hold different data at the same position, in `D = 1, 2, 3`, equal
 to the brick through the layout; every boundary form handed each outer
 ghost its block's patch on the ring; on a brick the forms with and
-without it bit for bit; its refusals; and the refusal of point
-location, on a forest of one patch too. The M17 oracles are at the end
+without it bit for bit; its refusals; and point location (M19):
+`PatchPoint`s on the annulus giving the brick of four times the roots
+bit for bit, a point on a glued face kept in the patch it names, and
+the refusals of plain positions (on a forest of one patch too),
+`Lagrange` and unknown patches. The M17 oracles are at the end
 of `ghost_oracles.jl` (below). Elsewhere: `exchange_tests.jl` fills the
 cubed sphere's element set, a swapped and reversed 2D pair refined at
 the glue, and a 3D cyclic layout over 2, 3 and 5 simulated ranks, bit

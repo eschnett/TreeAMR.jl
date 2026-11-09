@@ -4562,6 +4562,17 @@ M12 was decided with Erik, after M7 and before M9b.
     levels: value 1.88, 2.92, 3.90, 5.02 for `P = 1…4`; `∂ₓ` 0.94, 1.98,
     3.00, 4.13; `∂ᵧ` 0.87, 2.04, 2.98, 4.03; `∂ₓ²` 1.05, 2.08, 2.94 and
     `∂ᵧ²` 0.98, 1.97, 3.03 for `P = 2…4`; `∂ₓ∂ᵧ` 0.89, 2.17, 2.86, 4.07.
+  - *Step 4, `PatchPoint` on a forest of patches (2026-11-09).* As
+    designed: the search offset by the patch's first root, the patch's
+    geometry built in the kernel from a table, `Lagrange` refused on a
+    forest of patches, and the refusal of plain positions moved from
+    `PointGeometry`, which now builds any patch's geometry, to
+    `plain_geometry`, its message naming `PatchPoint` and the atlas
+    instead of the maps that would lift it. The four-patch annulus at
+    300 dyadic logical points, an element set at level 1 with the
+    brick's data copied in, equals the brick of eight roots bit for bit,
+    value and first and mixed derivatives; a point on a glued face goes
+    to the last leaf of the patch it names.
 
 ## Downstream checks
 

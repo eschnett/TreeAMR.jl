@@ -421,8 +421,10 @@ end
 # What locating a point needs of the forest, as an `isbits` value a kernel
 # can take: the domain in the field set's type, the brick, the face
 # kinds, the rotating seam's pair of dimensions (M12; `(0, 0)` for none),
-# and the finest level present (an `O(nleaves)` scan, done once per batch
-# on the host).
+# the finest level present (an `O(nleaves)` scan, done once per batch on
+# the host), and the flat index of the brick's first root less one. On a
+# forest of patches (M17) it is one patch's: its box, its roots and its
+# first root, which `patch_geometry` builds in the kernel per point.
 struct PointGeometry{D,T}
     extents::NTuple{D,Tuple{T,T}}
     roots::NTuple{D,Int}
@@ -433,27 +435,89 @@ struct PointGeometry{D,T}
     # `d2`, rather than a quarter turn's.
     half::Bool
     L::Int
+    firstroot::Int
 end
 
-# Point location is refused on a forest of patches (M17), here, where
-# every path to it builds its geometry: `locate_point`, and `interpolate`
-# serially and across ranks. Every rank holds the same forest, so every
-# rank refuses together.
+# The brick's geometry, or on a forest of patches patch 1's, which is
+# what everything but the location of a `PatchPoint` reads (the seam,
+# which a forest of patches does not have).
 function PointGeometry(::Type{T}, forest::Forest{D}) where {T,D}
-    ispatched(forest) && throw(ArgumentError(
-        "point location — locate_point, and interpolate, which locates its points — " *
-        "is not defined on a forest of patches: its coordinates are logical, patch by " *
-        "patch, and the patches' boxes may overlap or coincide, so a position does not " *
-        "name one point. A physical position does, through the application's maps " *
-        "from each patch's box to space, and locating it is a root-finding problem on " *
-        "those maps, which the forest does not carry (CODE.md, \"A multi-patch " *
-        "forest\"). What would lift this is a location handed the maps, or the patch " *
-        "of each point; neither is built."))
     return PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]),
                                            T(forest.extents[d][2])), D),
                               forest.roots, forest.periodic, reflecting_faces(forest),
                               hasrotating(forest) ? seam_plane(forest) : (0, 0),
-                              ishalfturn(forest), maxlevel(forest))
+                              ishalfturn(forest), maxlevel(forest), 0)
+end
+
+# The geometry of a location from plain positions, which a forest of
+# patches refuses (M17): its coordinates are logical, patch by patch, so a
+# position names a point in every patch whose box holds it. Every path
+# that takes positions builds this — `locate_point`, `locate`, and
+# `interpolate` serially and across ranks — and every rank holds the
+# same forest, so every rank refuses together.
+function plain_geometry(::Type{T}, forest::Forest) where {T}
+    ispatched(forest) && throw(ArgumentError(
+        "a plain position names no one point on a forest of patches: its coordinates " *
+        "are logical, patch by patch, and the patches' boxes may overlap or coincide. " *
+        "Pass each point as a PatchPoint(ξ, p), a logical position in patch p, or a " *
+        "physical position with the application's atlas, which maps it to one " *
+        "(CODE.md, \"Interpolation on element sets and patches\")."))
+    return PointGeometry(T, forest)
+end
+
+"""
+    PatchPoint(ξ, p)
+
+A point given as a logical position `ξ` in patch `p` of a forest of
+patches (M17), which is how [`locate`](@ref), [`interpolate`](@ref) and
+[`locate_point`](@ref) take a point there, where a plain position names a
+point in every patch whose box holds it. `ξ` is located in patch `p`
+alone: TreeAMR follows no glue, so a `ξ` outside the patch's box is
+outside (but for the mirror at a reflecting face, which carries the
+variable's parity), and a `ξ` on a glued face belongs to patch `p`, to
+its last leaf there. On a brick, patch 1 is the brick.
+"""
+struct PatchPoint{D,T}
+    ξ::NTuple{D,T}
+    p::Int
+    PatchPoint{D,T}(ξ, p) where {D,T} = new{D,T}(ξ, p)
+end
+function PatchPoint(ξ, p::Integer)
+    t = float.(Tuple(ξ))
+    return PatchPoint{length(t),eltype(t)}(t, Int(p))
+end
+
+# The number of coordinates of a point, plain or in a patch.
+pointdims(x) = length(x)
+pointdims(x::PatchPoint) = length(x.ξ)
+
+# Each patch's box, roots and first root less one, as one isbits entry
+# per patch for a kernel; `nothing` on a brick.
+function patch_table(::Type{T}, forest::Forest{D}) where {T,D}
+    ispatched(forest) || return nothing
+    return [(ntuple(d -> (T(patch_extents(forest, p)[d][1]),
+                          T(patch_extents(forest, p)[d][2])), D),
+             patch_roots(forest, p), patch_firstroot(forest, p))
+            for p in 1:npatches(forest)]
+end
+
+# The geometry a point is located with, its position in `T`, its patch,
+# and whether the patch exists: a plain point on a brick, a `PatchPoint`
+# on a brick (patch 1 only), a `PatchPoint` on a forest of patches (its
+# patch's box and roots, no wrap, the forest's reflecting faces, which
+# are the same for every patch's unglued faces since a glued face is
+# never reflecting).
+@inline point_geometry(g::PointGeometry{D,T}, ::Nothing, x) where {D,T} =
+    g, ntuple(d -> T(x[d]), Val(D)), 1, true
+@inline point_geometry(g::PointGeometry{D,T}, ::Nothing, x::PatchPoint) where {D,T} =
+    g, ntuple(d -> T(x.ξ[d]), Val(D)), x.p, x.p == 1
+@inline function point_geometry(g::PointGeometry{D,T}, table, x::PatchPoint) where {D,T}
+    ξ = ntuple(d -> T(x.ξ[d]), Val(D))
+    p = x.p
+    1 <= p <= length(table) || return g, ξ, p, false
+    @inbounds ext, roots, fr = table[p]
+    return PointGeometry{D,T}(ext, roots, ntuple(_ -> false, Val(D)), g.reflecting, (0, 0),
+                              false, g.L, fr), ξ, p, true
 end
 
 # One coordinate brought into the domain: wrapped along a periodic
@@ -559,7 +623,7 @@ end
         end
         (rp, c)
     end
-    root = root_index(g.roots, ntuple(d -> cell[d][1], Val(D)))
+    root = g.firstroot + root_index(g.roots, ntuple(d -> cell[d][1], Val(D)))
     pc = ntuple(d -> UInt64(cell[d][2]) << (MAX_LEVEL - g.L), Val(D))
     # Largest `i` with `leaves[i] ≤ query`; `lo` and `hi` bracket it.
     # (Named apart from the extents above: a closure that assigned to a
@@ -595,15 +659,35 @@ rotating seam (M12) it is turned back into the quadrant by as many
 quarter turns as it lay away — which is where [`interpolate`](@ref)
 reads its value. `O(D·maxlevel + log nleaves)`:
 one binary search over the sorted leaves.
+
+On a forest of patches (M17) a point is a [`PatchPoint`](@ref)`(ξ, p)`,
+located in patch `p` alone; a plain position is refused there.
 """
 function locate_point(forest::Forest{D,R}, x) where {D,R}
     length(x) == D || throw(ArgumentError(
         "a point in a $D-dimensional forest has $D coordinates, got $(length(x))"))
-    g = PointGeometry(R, forest)
+    g = plain_geometry(R, forest)
     xf, _, _, ok = fold_point(g, x)
     ok || return nothing
     return locate_leaf(forest.leaves, g, xf)
 end
+
+function locate_point(forest::Forest{D,R}, x::PatchPoint) where {D,R}
+    pointdims(x) == D || throw(ArgumentError(
+        "a point in a $D-dimensional forest has $D coordinates, got $(pointdims(x))"))
+    gp, ξ, p, known = point_geometry(PointGeometry(R, forest), patch_table(R, forest), x)
+    known || throw(unknown_patch(forest, x, 1))
+    xf, _, _, ok = fold_point(gp, ξ)
+    ok || return nothing
+    return locate_leaf(forest.leaves, gp, xf)
+end
+
+# The refusal of point `j`, a `PatchPoint` naming a patch the forest does
+# not have.
+unknown_patch(forest::Forest, x, j) = ArgumentError(
+    "point $j, $x, names patch $(x.p), but the forest has " *
+    (ispatched(forest) ? "patches 1:$(npatches(forest))" :
+     "one brick, which is patch 1") * ".")
 
 # --- the stencil -------------------------------------------------------------
 
@@ -897,6 +981,16 @@ end
 
 # The refusal of point `j`, `x`, outside the domain after every fold:
 # what `locate` raises, which knows the forest only.
+function domain_error(forest::Forest, x::PatchPoint, j)
+    1 <= x.p <= npatches(forest) || return unknown_patch(forest, x, j)
+    return ArgumentError(
+        "point $j, $x, lies outside the box $(patch_extents(forest, x.p)) of patch " *
+        "$(x.p), so no block of it holds data there. TreeAMR follows no glue: a point " *
+        "beyond a glued face is a position in the patch across, which the caller, or " *
+        "the application's atlas, names; beyond an outer or outflow face there is " *
+        "nothing to interpolate from, and a reflecting face mirrors a point once.")
+end
+
 function domain_error(forest::Forest, x, j)
     seam = rotating_dims(forest)
     half = halfturn_dims(forest)
@@ -1017,7 +1111,10 @@ function interpolate_points(fs::FieldSet{T,D}, u, xs::AbstractArray, basis;
                             outside::Symbol=:error, fill=T(NaN)) where {T,D}
     # Points outside the domain kept, marked and filled: through a location
     # of their own, which records which points are inside.
-    outside === :error ||
+    # So are the points of a forest of patches, and `PatchPoint`s: the
+    # fused kernel takes plain positions on a brick only.
+    (outside !== :error || eltype(xs) <: PatchPoint ||
+     ispatched(fs.forest) && !isdistributed(fs.forest)) &&
         return interpolate_located(fs, u, locate(T, fs.forest, xs; outside=outside),
                                    basis; derivs=derivs, vars=vars, exclude=exclude,
                                    fill=fill)
@@ -1068,11 +1165,17 @@ function interpolate_points!(values, excluded, fs::FieldSet{T,D}, u, xs::Abstrac
     isdistributed(fs.forest) &&
         return interpolate_distributed!(values, excluded, fs, u, xs, basis, derivs, vars,
                                         exclude)
+    # The fused kernel takes plain positions on a brick; everything else
+    # is located first.
+    (eltype(xs) <: PatchPoint || ispatched(fs.forest)) &&
+        return interpolate_located!(values, excluded, fs, u, locate(T, fs.forest, xs),
+                                    basis; derivs=derivs, vars=vars, exclude=exclude)
     ms = check_interpolation(values, excluded, fs, u, xs, basis, derivs, vars)
     npts = length(xs)
     npts == 0 && return values, excluded
     blocks = launch_interpolation!(values, excluded, fs, u, xs,
-                                   PointGeometry(T, fs.forest), basis, ms, vars, exclude, 0)
+                                   plain_geometry(T, fs.forest), basis, ms, vars, exclude,
+                                   0)
 
     # Reduced where the indices are, so that a device batch copies back one
     # flag rather than an index per point; only a batch that has an
@@ -1097,6 +1200,13 @@ function check_interpolation(values, excluded, fs::FieldSet{T,D}, u, xs, basis, 
         "equally spaced points through the stored array, ghosts included, and an " *
         "element set's Gauss–Lobatto nodes are not equally spaced. Its interpolant is " *
         "the containing element's polynomial: use ElementPolynomial()."))
+    ispatched(fs.forest) && readsghosts(basis) && throw(ArgumentError(
+        "$basis reads ghost points, and on a forest of patches no stencil reads them: " *
+        "across a glued face the ghosts hold the neighbour patch's own points, which " *
+        "lie on this patch's grid only where the two charts continue each other " *
+        "smoothly, as a cubed sphere's quarter turns do not. An element set's " *
+        "ElementPolynomial() reads none (CODE.md, \"Interpolation on element sets and " *
+        "patches\")."))
     if u !== nothing
         readsghosts(basis) && throw(ArgumentError(
             "$basis reads ghost points, and a state vector holds only the owned ones: " *
@@ -1130,9 +1240,9 @@ function check_interpolation(values, excluded, fs::FieldSet{T,D}, u, xs, basis, 
             "data is, so the points and the outputs must be there too."))
     end
     if xs isa Array && npts > 0
-        length(first(xs)) == D || throw(ArgumentError(
+        pointdims(first(xs)) == D || throw(ArgumentError(
             "a point in a $D-dimensional field set has $D coordinates, got " *
-            "$(length(first(xs)))"))
+            "$(pointdims(first(xs)))"))
     end
     return ms
 end
@@ -1271,24 +1381,27 @@ end
     (ntuple(d -> (c >> (d - 1)) & 0x01 == 0x01, Val(D)), Int(c >> D))
 
 # One point located: converted to `T` as the fused path converts it,
-# folded, and searched for.
+# folded in its patch's geometry, and searched for. A point naming a
+# patch the forest does not have is marked with leaf `-1`, for the host
+# to refuse.
 @inline function locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves,
-                             g::PointGeometry{D,T}, j) where {D,T}
-    x = ntuple(d -> T(xs[j][d]), Val(D))
+                             g::PointGeometry{D,T}, table, j) where {D,T}
+    gp, x, p, known = point_geometry(g, table, xs[j])
     ξs[j] = x
-    patch[j] = Int32(1)
-    y, fold, r, ok = fold_point(g, x)
+    patch[j] = Int32(p)
+    y, fold, r, ok = fold_point(gp, x)
+    ok &= known
     ys[j] = y
     codes[j] = foldcode(fold, r)
     inside[j] = ok
-    leaf[j] = ok ? Int32(locate_leaf(leaves, g, y)) : Int32(0)
+    leaf[j] = !known ? Int32(-1) : ok ? Int32(locate_leaf(leaves, gp, y)) : Int32(0)
     return nothing
 end
 
 @kernel function locate_kernel!(leaf, patch, ξs, ys, codes, inside, @Const(xs),
-                                @Const(leaves), g)
+                                @Const(leaves), g, table)
     j = @index(Global, Linear)
-    locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves, g, j)
+    locate_one!(leaf, patch, ξs, ys, codes, inside, xs, leaves, g, table, j)
 end
 
 # The kernel of a launch over `npts` points on `backend`, with the CPU's
@@ -1338,11 +1451,12 @@ function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray;
         "interpolate(fs, xs, basis), which routes as it goes, works there."))
     npts = length(xs)
     if xs isa Array && npts > 0
-        length(first(xs)) == D || throw(ArgumentError(
+        pointdims(first(xs)) == D || throw(ArgumentError(
             "a point in a $D-dimensional forest has $D coordinates, got " *
-            "$(length(first(xs)))"))
+            "$(pointdims(first(xs)))"))
     end
-    g = PointGeometry(T, forest)
+    patched = eltype(xs) <: PatchPoint
+    g = patched ? PointGeometry(T, forest) : plain_geometry(T, forest)
     backend = get_backend(xs)
     leaf = allocate(backend, Int32, npts)
     patch = allocate(backend, Int32, npts)
@@ -1352,9 +1466,15 @@ function locate(::Type{T}, forest::Forest{D}, xs::AbstractArray;
     inside = allocate(backend, Bool, npts)
     if npts > 0
         leaves = todevice(backend, forest.leaves)
+        table = patched ? patch_table(T, forest) : nothing
+        table === nothing || (table = todevice(backend, table))
         pointkernel(locate_kernel!, backend, npts)(leaf, patch, ξ, y, code, inside, xs,
-                                                   leaves, g; ndrange=npts)
+                                                   leaves, g, table; ndrange=npts)
         synchronize(backend)
+        if any(<(0), leaf)
+            j = findfirst(<(0), tohost(leaf))
+            throw(unknown_patch(forest, tohost(xs)[j], j))
+        end
         if outside === :error && !all(inside)
             j = findfirst(!, tohost(inside))
             throw(domain_error(forest, tohost(xs)[j], j))
@@ -1590,11 +1710,14 @@ function interpolate_distributed!(values, excluded, fs::FieldSet{T,D}, u, xs, ba
     comm = forest.comm
     rank, P = commrank(comm), commsize(comm)
     npts = length(xs)
-    g = PointGeometry(T, forest)
+    g = plain_geometry(T, forest)
     ms, layout, refusal = nothing, UInt(0), nothing
     pts, leafof = NTuple{D,T}[], Int[]
     try
         ms = check_interpolation(values, excluded, fs, u, xs, basis, derivs, vars)
+        eltype(xs) <: PatchPoint && throw(ArgumentError(
+            "PatchPoints are not yet routed over a distributed forest: the routing of " *
+            "located points to the owners of their blocks is M19's step 7."))
         # What every rank must pass alike, since an owner evaluates the
         # points it receives with its own arguments.
         layout = layouthash(string(basis), u === nothing, ms, collect(Int, vars),
