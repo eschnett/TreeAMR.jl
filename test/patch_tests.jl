@@ -741,18 +741,100 @@ end
     @test isbits(WithPatch(AllVariables((x, p) -> (sum(x), p))))
 end
 
-@testset "Point location is refused on a forest of patches, naming what would lift it" begin
-    # A position names no one point when patch boxes coincide, so locating
-    # it — locate_point, and interpolate, serially or across ranks — must be
-    # refused with the reason and the way out, not answered from patch 1.
+@testset "PatchPoints on the annulus are the brick of four times the roots, bit for bit" begin
+    # A logical point in patch p of the four-patch ring is the point two
+    # roots per patch along the brick of eight roots, so with the same
+    # data in the same blocks the two must read the same nodes with the
+    # same weights. A search that ignored the patch's first root, or a
+    # geometry from another patch, would read another block. Dyadic
+    # points keep every position and every shift exact in both.
     ring = patch_ring(4, (2, 1))
-    @test_throws "not defined on a forest of patches" locate_point(ring, (0.5, 0.5))
-    @test_throws "root-finding problem" locate_point(ring, (0.5, 0.5))
-    @test_throws "the patch of each point" TreeAMR.PointGeometry(Float64, ring)
-    fs = patch_fieldset(ring, cellcentered(2))
-    @test_throws "not defined on a forest of patches" interpolate(fs, [(0.5, 0.5)],
-                                                                    Lagrange(2))
+    brick = Forest((8, 1); N=4)
+    refine!(ring, copy(ring.leaves))
+    refine!(brick, copy(brick.leaves))
+    fr = FieldSet(ring, 2; G=1, centering=elementcentered(2), P=1)
+    fb = FieldSet(brick, 2; G=1, centering=elementcentered(2), P=1)
+    fill_by_coordinates!((x, v) -> sin(x[1] + v) * cos(2x[2]), fb)
+    @test nblocks(fr) == nblocks(fb)
+    copyto!(fr.work, fb.work)
+    rng = Xoshiro(19)
+    grid(n) = rand(rng, 0:(n - 1)) / n
+    pps = [PatchPoint((2grid(1024), grid(1024)), rand(rng, 1:4)) for _ in 1:300]
+    filter!(q -> q.ξ[1] < 2, pps)
+    xs = [(q.ξ[1] + 2(q.p - 1), q.ξ[2]) for q in pps]
+    derivs = ((0, 0), (1, 0), (0, 1), (1, 1))
+    a = interpolate(fr, pps, ElementPolynomial(); derivs=derivs)
+    b = interpolate(fb, xs, ElementPolynomial(); derivs=derivs)
+    @test isequal(a.values, b.values)
+    @test [locate_point(ring, q) for q in pps] == [locate_point(brick, x) for x in xs]
+    pts = locate(ring, pps)
+    @test Array(pts.patch) == [q.p for q in pps]
+    @test isequal(interpolate(fr, pts, ElementPolynomial(); derivs=derivs).values,
+                  a.values)
+    # On a brick, patch 1 is the brick.
+    @test isequal(interpolate(fb, [PatchPoint(x, 1) for x in xs], ElementPolynomial();
+                              derivs=derivs).values, b.values)
+end
+
+@testset "A PatchGrid is its PatchPoints, in the grid's order" begin
+    # A viewer samples each patch on a logical grid; the grid must locate
+    # in the patch it names, point for point as the array of PatchPoints.
+    ring = patch_ring(4, (2, 1))
+    fs = FieldSet(ring, 1; G=1, centering=elementcentered(2), P=1)
+    fill_by_coordinates!(WithPatch((ξ, p, v) -> sin(ξ[1] + p) * ξ[2]), fs)
+    for p in 1:4
+        grid = PatchGrid(UniformGrid((0, 0), (2, 1), (9, 5)), p)
+        @test isbits(grid) && size(grid) == (9, 5)
+        qs = collect(grid)
+        @test all(q -> q.p == p, qs)
+        @test isequal(interpolate(fs, grid, ElementPolynomial()).values,
+                      interpolate(fs, qs, ElementPolynomial()).values)
+        @test Array(locate(ring, grid).patch) == fill(p, length(grid))
+    end
+end
+
+@testset "A PatchPoint on a glued face is located in the patch it names" begin
+    # TreeAMR follows no glue: the high face of patch p is patch p's, its
+    # last leaf there, even though the same physical point is the low face
+    # of the patch across, which a half-open search would otherwise hand
+    # it to.
+    ring = patch_ring(4, (2, 1))
+    for p in 1:4, y in (0.0, 0.3, 1.0)
+        b = locate_point(ring, PatchPoint((2.0, y), p))
+        k = ring.leaves[b]
+        @test patch(ring, k) == p
+        @test block_extent(ring, k)[1][2] == 2
+    end
+    @test patch(ring, ring.leaves[locate_point(ring, PatchPoint((0.0, 0.5), 3))]) == 3
+end
+
+@testset "A forest of patches refuses plain positions, Lagrange, and unknown patches" begin
+    # A position names a point in every patch whose box holds it, so it
+    # must be refused with the way out, not answered from patch 1; a
+    # stencil reading ghosts across a glue reads another chart's points;
+    # a patch that does not exist, or a point outside its patch's box,
+    # must not be read from a neighbouring block.
+    ring = patch_ring(4, (2, 1))
+    @test_throws "Pass each point as a PatchPoint" locate_point(ring, (0.5, 0.5))
+    @test_throws "Pass each point as a PatchPoint" locate(ring, [(0.5, 0.5)])
+    es = FieldSet(ring, 1; G=1, centering=elementcentered(2), P=1)
+    @test_throws "Pass each point as a PatchPoint" interpolate(es, [(0.5, 0.5)],
+                                                               ElementPolynomial())
+    cs = patch_fieldset(ring, cellcentered(2))
+    @test_throws "on a forest of patches no stencil reads them" interpolate(
+        cs, [PatchPoint((0.5, 0.5), 2)], Lagrange(2))
+    @test_throws "names patch 5, but the forest has patches 1:4" locate(
+        ring, [PatchPoint((0.5, 0.5), 1), PatchPoint((0.5, 0.5), 5)])
+    @test_throws "names patch 0" locate_point(ring, PatchPoint((0.5, 0.5), 0))
+    @test_throws "outside the box" interpolate(es, [PatchPoint((2.5, 0.5), 1)],
+                                               ElementPolynomial())
+    @test_throws "one brick, which is patch 1" locate_point(Forest((2, 2); N=4),
+                                                            PatchPoint((0.5, 0.5), 2))
+    m = interpolate(es, [PatchPoint((2.5, 0.5), 1), PatchPoint((0.5, 0.5), 1)],
+                    ElementPolynomial(); outside=:mark)
+    @test m.inside == [false, true] && isnan(m.values[1])
     # One patch is a forest of patches too: there is no brick to fall back on.
     one = Forest([(roots=(2, 2),)]; N=4)
-    @test_throws "not defined on a forest of patches" locate_point(one, (0.5, 0.5))
+    @test_throws "Pass each point as a PatchPoint" locate_point(one, (0.5, 0.5))
+    @test locate_point(one, PatchPoint((0.5, 0.5), 1)) isa Int
 end

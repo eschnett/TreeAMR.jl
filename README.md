@@ -28,7 +28,10 @@ interpolation to arbitrary points, M9a's checkpoint and restart, M7's
 distribution over MPI, M12's rotating symmetry, M13's faster ghost
 fill on nested meshes, M14's half turn, M15's folds over points, and
 M16's element centering), and M17's multi-patch forests are
-implemented and accepted downstream, pending their release. M7 is measured on a
+implemented and accepted downstream, pending their release; M19's
+point interpolation on element sets and forests of patches, through an
+application's atlas, is implemented, pending TreeWaveOLDG's
+acceptance. M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the

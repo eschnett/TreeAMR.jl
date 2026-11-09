@@ -194,6 +194,13 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     r = interpolate(fs, xs, Lagrange(4); derivs=derivs,
                     exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
     println(tag, " interp ", digest(vec(r.values)), " ", count(r.excluded))
+    # Located once, then evaluated (M19): two launches, each point's slots
+    # its own, so the same digest at any thread count.
+    pts = locate(eltype(fs.work), forest, xs)
+    s = interpolate(fs, pts, Lagrange(4); derivs=derivs,
+                    exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
+    println(tag, " interp-split ", digest(vec(s.values)), " ", count(s.excluded),
+            " ", isequal(s.values, r.values))
     rotating === nothing || rotating_pair(forest, tag, rotating, ops)
     return nothing
 end
@@ -327,6 +334,16 @@ function element_workload(::Val{D}; roots, N, P, periodic, reflecting=nothing,
         println(name, " linf ", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
         println(name, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
         println(name, " fold ", workload_fold(fs, u))
+        # The element's polynomial at a fixed low-discrepancy set (M19),
+        # value and gradient, from the state vector, reaching across a low
+        # wall in x where there is one so that the mirror runs too.
+        below = walls[1][1] ? 0.2 : 0.0
+        xs = [ntuple(d -> mod(0.6180339887498949 * j * (d + 1) + 0.1d, 1.0) *
+                          (1 + (d == 1 ? below : 0.0)) - (d == 1 ? below : 0.0), D)
+              for j in 1:257]
+        derivs = (ntuple(_ -> 0, D), ntuple(a -> ntuple(d -> Int(d == a), D), D)...)
+        r = interpolate(fs, u, xs, ElementPolynomial(); derivs=derivs)
+        println(name, " interp ", digest(vec(r.values)))
     end
     return nothing
 end

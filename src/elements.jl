@@ -235,3 +235,24 @@ function element_tables(::Type{T}, P::Integer) where {T}
         end
     end::ElementTables{T}
 end
+
+# The barycentric weights `λᵢ = 1/∏_{j≠i}(oᵢ − oⱼ)` of the reference
+# element's node offsets, which `ElementPolynomial` evaluates the
+# element's Lagrange basis with (M19): formed from the `BigFloat` offsets
+# and rounded once into `T`, as every element table is, and memoised per
+# `(P, T)` beside them.
+const BARYCENTRIC_CACHE = Dict{Tuple{Int,Type},Vector}()
+
+function element_barycentric(::Type{T}, P::Integer) where {T}
+    p = Int(P)
+    o = element_tables(BigFloat, p).offsets
+    return lock(LAGRANGE_LOCK) do
+        get!(BARYCENTRIC_CACHE, (p, T)) do
+            λ = setprecision(BigFloat, ELEMENT_PRECISION) do
+                [inv(prod(o[i] - o[j] for j in eachindex(o) if j != i))
+                 for i in eachindex(o)]
+            end
+            T === BigFloat ? λ : T.(λ)
+        end
+    end::Vector{T}
+end

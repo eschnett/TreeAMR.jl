@@ -114,3 +114,123 @@ function lagrange_derivative_weights(nodes, ξ, m)
         sum(c[i] * ξ^(i - 1) for i in eachindex(c); init=zero(ξ))
     end
 end
+
+# Whether the split path — `locate` in the field set's type, then
+# `interpolate` at the located points — gives the fused path's values and
+# flags bit for bit (M19). `isequal`, so that the same NaN agrees too.
+function split_matches(fs, xs, basis; kwargs...)
+    a = interpolate(fs, xs, basis; kwargs...)
+    b = interpolate(fs, locate(eltype(fs.work), fs.forest, xs), basis; kwargs...)
+    return isequal(a.values, b.values) && a.excluded == b.excluded && all(b.inside)
+end
+
+# --- test atlases (M19) --------------------------------------------------------
+#
+# Each is a map of a brick's or a patch's logical coordinates `ξ` to
+# physical ones `x`, with its inverse in closed form for `chart_locate`,
+# and an independent `inverse_derivs(atlas, x)`: `ξ`, `K[a][i] = ∂ξᵃ/∂xⁱ`
+# and `S[a][i][j] = ∂²ξᵃ/∂xⁱ∂xʲ`, differentiated by hand from the inverse,
+# which is what the tests compare the package's chain rule against.
+
+# `x = A ξ + c`.
+struct AffineAtlas{D}
+    A::NTuple{D,NTuple{D,Float64}}
+    Ainv::NTuple{D,NTuple{D,Float64}}
+    c::NTuple{D,Float64}
+end
+function AffineAtlas(A::Matrix, c)
+    D = length(c)
+    rows(M) = ntuple(i -> ntuple(k -> Float64(M[i, k]), D), D)
+    return AffineAtlas{D}(rows(A), rows(inv(A)), Tuple(Float64.(c)))
+end
+matvec(M::NTuple{D}, y) where {D} =
+    ntuple(i -> (s = 0.0; for k in 1:D; s += M[i][k] * y[k]; end; s), D)
+TreeAMR.chart_map(a::AffineAtlas{D}, ξ, p) where {D} =
+    ntuple(i -> a.c[i] + matvec(a.A, ξ)[i], D)
+TreeAMR.chart_locate(a::AffineAtlas{D}, x) where {D} =
+    (matvec(a.Ainv, ntuple(i -> x[i] - a.c[i], D)), 1)
+TreeAMR.chart_jacobian(a::AffineAtlas, ξ, p) = a.A
+TreeAMR.chart_hessian(a::AffineAtlas{D}, ξ, p) where {D} =
+    ntuple(_ -> ntuple(_ -> ntuple(_ -> 0.0, D), D), D)
+inverse_derivs(a::AffineAtlas{D}, x) where {D} =
+    (TreeAMR.chart_locate(a, x)[1], a.Ainv, ntuple(_ -> ntuple(_ -> ntuple(_ -> 0.0, D), D), D))
+
+# `xᵢ = sinh(ξᵢ)`, separable and nonlinear.
+struct SinhAtlas{D} end
+TreeAMR.chart_map(::SinhAtlas{D}, ξ, p) where {D} = ntuple(i -> sinh(ξ[i]), D)
+TreeAMR.chart_locate(::SinhAtlas{D}, x) where {D} = (ntuple(i -> asinh(x[i]), D), 1)
+TreeAMR.chart_jacobian(::SinhAtlas{D}, ξ, p) where {D} =
+    ntuple(i -> ntuple(a -> a == i ? cosh(ξ[i]) : 0.0, D), D)
+TreeAMR.chart_hessian(::SinhAtlas{D}, ξ, p) where {D} =
+    ntuple(i -> ntuple(a -> ntuple(b -> a == i && b == i ? sinh(ξ[i]) : 0.0, D), D), D)
+inverse_derivs(::SinhAtlas{D}, x) where {D} =
+    (ntuple(i -> asinh(x[i]), D),
+     ntuple(a -> ntuple(i -> a == i ? 1 / sqrt(1 + x[i]^2) : 0.0, D), D),
+     ntuple(a -> ntuple(i -> ntuple(j -> a == i == j ? -x[i] / (1 + x[i]^2)^1.5 : 0.0,
+                                    D), D), D))
+
+# `x₁ = ξ₁, x₂ = ξ₂ + c ξ₁²` in 2D, a shear that mixes the dimensions.
+struct ShearAtlas
+    c::Float64
+end
+TreeAMR.chart_map(a::ShearAtlas, ξ, p) = (ξ[1], ξ[2] + a.c * ξ[1]^2)
+TreeAMR.chart_locate(a::ShearAtlas, x) = ((x[1], x[2] - a.c * x[1]^2), 1)
+TreeAMR.chart_jacobian(a::ShearAtlas, ξ, p) = ((1.0, 0.0), (2a.c * ξ[1], 1.0))
+TreeAMR.chart_hessian(a::ShearAtlas, ξ, p) = (((0.0, 0.0), (0.0, 0.0)),
+                                              ((2a.c, 0.0), (0.0, 0.0)))
+inverse_derivs(a::ShearAtlas, x) =
+    (TreeAMR.chart_locate(a, x)[1], ((1.0, 0.0), (-2a.c * x[1], 1.0)),
+     (((0.0, 0.0), (0.0, 0.0)), ((-2a.c, 0.0), (0.0, 0.0))))
+
+# The physical derivative `m` of `u = g ∘ ξ(x)` at `x`, from the exact
+# logical derivatives `dm(ξ, v, ·)` of `g` and the inverse's derivatives.
+function physical_oracle(atlas, dm, x, v, m)
+    D = length(x)
+    ξ, K, S = inverse_derivs(atlas, x)
+    e(a) = ntuple(d -> Int(d == a), D)
+    o = sum(m)
+    o == 0 && return dm(ξ, v, m)
+    if o == 1
+        i = findfirst(==(1), m)
+        return sum(dm(ξ, v, e(a)) * K[a][i] for a in 1:D)
+    end
+    i = findfirst(>(0), m)
+    j = m[i] == 2 ? i : findlast(>(0), m)
+    return sum(dm(ξ, v, e(a) .+ e(b)) * K[a][i] * K[b][j] for a in 1:D, b in 1:D) +
+           sum(dm(ξ, v, e(a)) * S[a][i][j] for a in 1:D)
+end
+
+# The identity map, through every method, so that the chain rule
+# multiplies by exact ones and zeros.
+struct IdentityAtlas{D} end
+TreeAMR.chart_locate(::IdentityAtlas, x) = (x, 1)
+TreeAMR.chart_map(::IdentityAtlas, ξ, p) = ξ
+TreeAMR.chart_jacobian(::IdentityAtlas{D}, ξ, p) where {D} =
+    ntuple(i -> ntuple(a -> a == i ? 1.0 : 0.0, D), D)
+TreeAMR.chart_hessian(::IdentityAtlas{D}, ξ, p) where {D} =
+    ntuple(_ -> ntuple(_ -> ntuple(_ -> 0.0, D), D), D)
+
+# A polar atlas on the four-patch ring: patch `p` covers the angles
+# `[(p − 1)π/2, pπ/2]`, its `ξ₁ ∈ [0, 2]`, and `ξ₂ ∈ [0, 1]` is `r − 1`. A
+# point in the hole or beyond the rim is in no patch.
+struct PolarAtlas end
+function TreeAMR.chart_locate(::PolarAtlas, x)
+    r = hypot(x[1], x[2])
+    1 <= r <= 2 || return nothing
+    s = 4 * mod(atan(x[2], x[1]), 2π) / π
+    p = clamp(floor(Int, s / 2) + 1, 1, 4)
+    return ((clamp(s - 2(p - 1), 0.0, 2.0), r - 1), p)
+end
+function TreeAMR.chart_map(::PolarAtlas, ξ, p)
+    θ = π / 4 * (2(p - 1) + ξ[1])
+    return ((1 + ξ[2]) * cos(θ), (1 + ξ[2]) * sin(θ))
+end
+function TreeAMR.chart_jacobian(::PolarAtlas, ξ, p)
+    θ = π / 4 * (2(p - 1) + ξ[1])
+    r = 1 + ξ[2]
+    return ((-r * sin(θ) * π / 4, cos(θ)), (r * cos(θ) * π / 4, sin(θ)))
+end
+
+# An atlas that returns a position outside its patch's box.
+struct OverreachingAtlas end
+TreeAMR.chart_locate(::OverreachingAtlas, x) = ((x[1] + 3, x[2]), 1)

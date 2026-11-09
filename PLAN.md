@@ -186,7 +186,10 @@ TreeIOHDF5 and the downstreams are released with `"0.10"` in their
 
 ### M19 — Interpolation on element sets and patches
 
-*(Designed, not started.)* Point interpolation on the two things M11's
+*(Designed; TreeAMR's steps in progress on the branch
+`eschnett-claude/m19-implementation-40c9c9`, their record in
+[HISTORY.md](HISTORY.md#m19--interpolation-on-element-sets-and-patches).)*
+Point interpolation on the two things M11's
 `interpolate` refuses, element sets (M16) and forests of patches (M17),
 for TreeWaveOLDG's annulus and seven-patch ball: a horizon finder that
 needs the metric and its first derivatives at physical points, and a
@@ -196,34 +199,37 @@ the decisions taken in it are under "Point interpolation" in
 [HISTORY.md](HISTORY.md#point-interpolation). Each step has the test that
 says it is done:
 
-1. **Location split from evaluation.** `LocatedPoints`, `locate`, and
-   `interpolate(fs, pts, basis)`. *Done when* M11's tests pass unchanged,
+1. **Location split from evaluation.** *(Implemented 2026-11-09.)*
+   `LocatedPoints`, `locate`, and `interpolate(fs, pts, basis)`. *Done when* M11's tests pass unchanged,
    the split path reproduces the fused one bit for bit, and the
    thread-independence line still holds.
-2. **The basis interface by position**, `t` in spacings from the block's
+2. **The basis interface by position** *(implemented 2026-11-09)*, `t` in spacings from the block's
    origin in place of the continuous stored index. *Done when*
    `Lagrange` is bit for bit what it was.
-3. **`ElementPolynomial` and the state-vector form.** *Done when*:
+3. **`ElementPolynomial` and the state-vector form.** *(Implemented
+   2026-11-09.)* *Done when*:
    - it is exact on `Q_P` at random points, to a few eps;
    - a query at a node reproduces the node's value to rounding;
    - derivatives are exact on `Q_P`;
    - the measured rates on a smooth field over a refined forest are
      `P + 1` for the value and `P + 1 − maxₐ mₐ` for a derivative;
    - filling the ghosts with NaN leaves every result unchanged.
-4. **`PatchPoint` on a forest of patches.** *Done when* logical points
+4. **`PatchPoint` on a forest of patches.** *(Implemented 2026-11-09.)*
+   *Done when* logical points
    on a four-patch annulus agree bit for bit with the brick of four times
    the roots, a point on a glued face is located in the patch it names,
    and `Lagrange` is refused there.
-5. **The atlas, the chain rule, and `outside = :mark`.** *Done when* a
+5. **The atlas, the chain rule, and `outside = :mark`.** *(Implemented
+   2026-11-09.)* *Done when* a
    test atlas on a brick, one affine map and one nonlinear map, matches
    analytic derivatives up to second order, a missing method is refused
    on the host naming it, and outside points are marked and filled with
    NaN.
-6. **Grids and `element_lattice`.** *Done when* a `UniformGrid` and an
+6. **Grids and `element_lattice`.** *(Implemented 2026-11-09.)* *Done when* a `UniformGrid` and an
    `AffineGrid` give the values of the same points passed as an array,
    bit for bit, and `element_lattice` places its points where
    `positions` says.
-7. **Distributed.** *Done when*, with an atlas, `LocatedPoints`' routing
+7. **Distributed.** *(Implemented 2026-11-09.)* *Done when*, with an atlas, `LocatedPoints`' routing
    gives the serial values bit for bit at 1 and 3 ranks (a line of
    `test/mpi_workload.jl`).
 8. **TreeWaveOLDG's acceptance.** The annulus's rotating mode and the

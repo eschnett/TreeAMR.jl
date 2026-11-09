@@ -462,6 +462,8 @@ end
         fill_ghosts!(fs, GhostSchedule(fs, HALF_OPS4); boundary=boundary_by_coordinates(f))
         xs = [image(q, r, m) for q in qs for (r, m) in turns]
         res = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+        # Located once and evaluated apart (M19), the turn is the same.
+        @test split_matches(fs, xs, Lagrange(4); derivs=derivs)
         for (j, x) in enumerate(xs), v in 1:(D + 1)
             worst_poly = max(worst_poly, abs(res.values[v, 1, j] - f(x, v)))
             for d in 1:D

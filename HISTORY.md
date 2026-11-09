@@ -61,6 +61,7 @@ of them. Each milestone's steps are listed in its record under
   - [M15 — Folds over points](#m15--folds-over-points)
   - [M16 — Element centering](#m16--element-centering)
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
+  - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -421,6 +422,8 @@ Derivatives were first order until 2026-10-03, when the second order was added.
 Point location refuses a forest of patches (M17 step 5, 2026-11-02), as the plan decided, in `PointGeometry`, which every path to it builds, so that the distributed interpolation refuses on every rank before anything is gathered. The step made the refusal cover a forest of one patch built through the `patches` form as well, a self-glued wrap among them, whose wrap `PointGeometry` would not see: the conservative choice, left open for Erik. He decided (2026-11-03) to keep it: the brick form builds and locates in every one-patch forest that matters. He also set the direction for lifting the refusal: a mechanism that maps a global coordinate to a `(patch, local coordinates)` tuple, which point location will then take as its input, with folding done on the global coordinate before the patch lookup, so that only patch boundaries needing a fold in local coordinates stay refused ([CODE.md](CODE.md#point-interpolation)).
 
 Interpolation on element sets and patches (M19) was designed with Erik on 2026-11-08, for TreeWaveOLDG's annulus and seven-patch ball, an apparent horizon finder and a viewer ([CODE.md](CODE.md#interpolation-on-element-sets-and-patches)). It follows the direction of 2026-11-03 above: the application's atlas is the map from a global coordinate to a `(local coordinates, patch)` pair, and a `PatchPoint` is that pair as an input. The one fold it keeps in local coordinates is the mirror at a reflecting face, for the parity. Erik decided: to extend `interpolate` rather than give the API a new name; that the atlas returns a `ξ` inside its patch's box, rather than TreeAMR following a glue for one just outside it; that the chain rule runs on the calling rank, not on the block's owner; that the grids and `element_lattice` belong to the interpolator, not to visualization export (M9b); and that an atlas is recognised by its methods alone. An abstract type `Atlas`, like TreeAMR's other extension points, was recommended and declined. He dropped a Newton helper for inverting the map (not needed now, and a problem for the package that owns the patch system), left a per-variable rank table for later, and decided that on a forest of patches no stencil reads ghosts for now: no stencil clamped to owned points next to a glue, perhaps later as an opt-in, and `Lagrange` there only once inter-patch ghosts are filled by interpolation. Averaging over shared nodes was first taken as an opt-in of `ElementPolynomial`, then dropped the same day as more complicated than anticipated: face ghosts do not reach the sharers across a block's edges and corners, and the seven-patch ball has three elements around each cube edge.
+
+The type a batch is located in was settled on 2026-11-09, planning M19's implementation: `locate(T, forest, xs)` with `T` defaulting to the forest's geometry type, and `interpolate` refusing a batch of another type than the field set's, rather than converting its positions, which would not be bit for bit M11's path at a face for a `Float32` set (Erik's choice of the two offered).
 
 Under M7 the routing was "the one place this design will change". It was designed on 2026-10-01 under "Distributed meshes" and implemented in M7's step 5, with the kernel unchanged except for the block offset. The serial path measured the same before and after.
 
@@ -4504,6 +4507,119 @@ M12 was decided with Erik, after M7 and before M9b.
   TreeWaveOLDG's own limits are the identity glue only — its
   per-dimension gradient sets cannot take a cubed sphere's axis swaps —
   and diagonal metrics only.
+
+### M19 — Interpolation on element sets and patches
+
+- **M19 — Interpolation on element sets and patches.** *(Designed with
+  Erik on 2026-11-08; steps 1–7, TreeAMR's, implemented from 2026-11-09
+  on the branch `eschnett-claude/m19-implementation-40c9c9`; steps 8–9
+  are TreeWaveOLDG's.)* Point interpolation on element sets and forests
+  of patches, as designed in
+  [CODE.md](CODE.md#interpolation-on-element-sets-and-patches); the
+  design's decisions are under [Point interpolation](#point-interpolation).
+  The steps, each with what it measured:
+
+  - *Step 1, location split from evaluation (2026-11-09).* `locate`,
+    `LocatedPoints`, and `interpolate` at located points, with
+    `outside = :mark` and `fill`, which the plan had under step 5 but
+    which the inside flag made a few lines here. The per-point code of
+    M11's kernel was cut into the location (`fold_point`, `locate_leaf`)
+    and the evaluation (`evaluate_point!`), which the fused kernel calls
+    in turn and the split one in two launches, so that the two agree by
+    construction; the tests check it for every centering, fold and turn
+    of M11's suite, and `thread_workload.jl` prints the split digest
+    beside the fused one. A planning question, settled by Erik: the
+    location converts the points to a type of its own,
+    `locate(T, forest, xs)`, and `interpolate` refuses a batch of
+    another type rather than converting it, so that the split stays bit
+    for bit the fused path for a `Float32` set over a `Float64` forest.
+    `bench/interpolate.jl` (laptop, 4 threads, best of 50, the horizon
+    finder's 496 points and 20 variables) measured the fused path at
+    0.112–0.115 ms on `main` over three runs and 0.115 ms after the
+    cut, which is within that spread; the split path's `locate` takes
+    0.015 ms and its evaluation 0.106 ms, so a second field set read at
+    one location costs 0.106 ms rather than 0.115. At 49,600 points the
+    location is 7 % of the fused time (0.76 ms of 10.8).
+  - *Step 2, the basis interface by position (2026-11-09).*
+    `stencilstart(basis, t, G, c, S)` returns the clamped first index and
+    the offset from it, given the position in spacings; `stencil_place`
+    and `stencil_position` carry the stencil's point positions to the
+    `exclude` test, which before assumed equal spacing in its signature.
+    No downstream package defines a basis (only `locate_point` is used
+    outside TreeAMR), so the internal signature changed without a
+    deprecation. The step first moved `stencil_hits` to the stencil's
+    places as well, and TreeGeneralizedHarmonic's suite, run against the
+    finished milestone, caught what that broke: its horizon guard
+    overrides the six-argument `stencil_hits` that `Region`'s docstring
+    invites, and the kernel no longer called it. The equally spaced
+    stencil goes to that form again, unchanged, and only element
+    stencils and atlas-mapped regions take places; a test now holds a
+    `Region`'s override to being the method called. `Lagrange` is bit for bit M11's: the `interp` digests
+    of `test/thread_workload.jl`, eleven configurations over every
+    centering, wall, seam and half turn, equal `main`'s.
+  - *Step 3, `ElementPolynomial` and the state-vector form
+    (2026-11-09).* As designed. One finding changed the test, not the
+    design: "a query at a node reproduces the node's value" holds for a
+    node off the block's upper face only, since a point on that face
+    belongs to the block above, whose element interpolates it to its
+    own accuracy where the levels differ (an error of `5e-3` at `P = 2`
+    in 2D, far above roundoff); inside a block an element face is read
+    from the upper element, which holds the same value. Measured rates
+    on `sin(2x+v)cos(3y−½)`, `N = 2(P+1)` against `4(P+1)`, three
+    levels: value 1.88, 2.92, 3.90, 5.02 for `P = 1…4`; `∂ₓ` 0.94, 1.98,
+    3.00, 4.13; `∂ᵧ` 0.87, 2.04, 2.98, 4.03; `∂ₓ²` 1.05, 2.08, 2.94 and
+    `∂ᵧ²` 0.98, 1.97, 3.03 for `P = 2…4`; `∂ₓ∂ᵧ` 0.89, 2.17, 2.86, 4.07.
+  - *Step 4, `PatchPoint` on a forest of patches (2026-11-09).* As
+    designed: the search offset by the patch's first root, the patch's
+    geometry built in the kernel from a table, `Lagrange` refused on a
+    forest of patches, and the refusal of plain positions moved from
+    `PointGeometry`, which now builds any patch's geometry, to
+    `plain_geometry`, its message naming `PatchPoint` and the atlas
+    instead of the maps that would lift it. The four-patch annulus at
+    300 dyadic logical points, an element set at level 1 with the
+    brick's data copied in, equals the brick of eight roots bit for bit,
+    value and first and mixed derivatives; a point on a glued face goes
+    to the last leaf of the patch it names.
+  - *Step 5, the atlas, the chain rule and `outside = :mark`
+    (2026-11-09).* `:mark` had come with step 1. The atlas's methods are
+    declared in TreeAMR and checked with `hasmethod` before a launch;
+    `chart_locate` runs in the locate kernel, the chain rule in a second
+    launch after the evaluation, on the backend, with `J⁻¹` in closed
+    form; an `exclude` region is physical through `MappedRegion`. Q₃ data
+    on three levels, against the inverse maps differentiated by hand:
+    affine (2D, 3D), `sinh` (2D, 3D) and shear maps agree to `7e-16` for
+    the value, `2e-14` for the first derivatives and `8e-13` for the
+    second. The identity atlas is bit for bit the call without one,
+    across a reflecting wall, but for the sign of a zero, which the chain
+    rule's sum from zero turns positive.
+  - *Step 6, grids and `element_lattice` (2026-11-09).* As designed,
+    with `positions` for any located batch and `AbstractPointGrid` as the
+    grids' supertype. One trap the tests caught: a struct's default
+    constructor takes the fields in order, so `UniformGrid((0, 0), (1,
+    1), (3, 3))` with integer corners matched it, the high corner taken
+    as the step, until inner constructors left the checking one alone.
+  - *Step 7, distributed (2026-11-09).* As designed, with two choices
+    the design left open. The plain-position form without an atlas keeps
+    M11's routing rather than becoming `locate` then `interpolate`: one
+    `allgather` per call instead of two, and its collective refusals word
+    for word, which `interpolate_exchange_tests.jl` asserts; the split
+    path gives the same bits there anyway. And the element lattice's
+    batch is marked local, evaluated with the block offset and no
+    message. The simulated-rank tests check element sets across a wall
+    with `:mark`, `Lagrange` through `locate`, `PatchPoint`s and two
+    atlases bit for bit at uneven splits of 2–5 ranks, and the refusals
+    on every rank; `test/mpi_workload.jl`'s new `L2` case agrees at 1
+    and 3 ranks. Writing it turned up that the workload's points
+    `(jφ mod 1, jφ² mod 1)` lie on one line, since `φ² = 1 − φ`, so an
+    excluded region off that line flagged nothing; `L2` takes the second
+    coordinate from the plastic number instead. M11's `I2` case uses the
+    same sequence and is left as it is.
+  - *Compile time.* `--trace-compile-timing` of a serial
+    `test/mpi_workload.jl` against `main` (laptop): the M11
+    `interpolate_kernel!` specializations take 0.68 s against 0.64 s,
+    within the spread between runs, and the whole workload 79.1 s against
+    72.5 s, the difference being the new `L2` case (2.7 s of it the new
+    locate, evaluation, chain-rule and lattice kernels).
 
 ## Downstream checks
 
