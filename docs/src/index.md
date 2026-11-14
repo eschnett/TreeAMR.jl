@@ -1050,14 +1050,116 @@ library that MPI.jl uses. MPI.jl's wrapper `mpiexecjl` (installed with
 mpiexecjl --project=. -n 4 julia -t 8 my_run.jl
 ```
 
-On a cluster, select the system MPI through MPIPreferences — between
-nodes it is not optional, since MPI.jl's default binary may not use the
-fast interconnect — and launch with the batch system's launcher
-(`srun`), or with that MPI's own `mpiexec` inside the allocation where
-it is not built for `srun`. Ranks and threads combine. Within one node,
-one process with a thread per core, pinned as under [Threading](@ref),
+On a cluster, use the cluster's own MPI, through MPIPreferences and
+the wrapper [A cluster's own MPI](@ref) describes — between nodes it is
+not optional, since MPI.jl's default binary may not use the fast
+interconnect — and launch with the batch system's launcher (`srun`), or
+with that MPI's own `mpiexec` inside the allocation where it is not
+built for `srun`. Ranks and threads combine. Within one node, one
+process with a thread per core, pinned as under [Threading](@ref),
 measured faster than a rank per NUMA domain, since ranks pay for
 packing their halos; so use a rank per node and threads within it.
 Every rank should be able to compile on its own core; while a rank waits
 for a message, MPI usually spins rather than sleeps, so oversubscribing
 the cores slows every rank down.
+
+### A cluster's own MPI
+
+MPI.jl's default binary, MPICH_jll, runs anywhere, but on a cluster it
+may not use the fast interconnect: on Symmetry and on Nibi its latency
+between nodes is seven to sixteen times the system MPI's, and its
+bandwidth a seventh of it. The cluster's own MPI is the one to use, and
+[mpi_abi_wrapper](https://github.com/eschnett/mpi_abi_wrapper) is the
+way to use it: it wraps an installed MPI so that it provides the
+standard ABI of MPI 5.0, which MPI.jl supports as `MPIABI`, the same
+ABI that MPIABI_jll provides on a laptop. The wrapper forwards every
+call to the MPI underneath and costs nothing that a ping-pong can see.
+Two-node ping-pong, half a round trip, best of five (2026-11-13):
+
+| | 8 B | 16 MiB |
+|---|---|---|
+| Symmetry, wrapper over HPC-X 2.20 (Open MPI 4.1.7, InfiniBand) | 1.44 µs | 12.0 GB/s |
+| Symmetry, HPC-X used directly | 1.41 µs | 12.0 GB/s |
+| Symmetry, MPICH_jll | 22.6 µs | 1.85 GB/s |
+| Nibi, wrapper over Open MPI 4.1.5 (`StdEnv/2023`, 200 Gbit/s Ethernet) | 2.64 µs | 24.2 GB/s |
+| Nibi, Open MPI 4.1.5 used directly | 2.65 µs | 24.2 GB/s |
+| Nibi, MPICH_jll | 18.9 µs | 3.41 GB/s |
+
+It takes three steps: build the wrapper once for each MPI installation,
+point MPIPreferences at it once for each Julia environment, and launch
+with that MPI's launcher.
+
+**Build the wrapper** on a login node, with the MPI's module loaded.
+`MPI_C_COMPILER` selects the MPI to wrap, and the install prefix must be
+a directory of its own:
+
+```bash
+git clone https://github.com/eschnett/mpi_abi_wrapper
+cd mpi_abi_wrapper
+cmake -S . -B build -DMPI_C_COMPILER=$(which mpicc) -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=$HOME/openmpi-4.1.5-mpi-abi
+cmake --build build -j8
+cmake --install build
+$HOME/openmpi-4.1.5-mpi-abi/bin/mpi_abi_wrapper_info
+```
+
+The last line says which MPI and which launcher the prefix forwards to.
+The libraries go to `lib/` or `lib64/`, as the system's convention has
+it. Nothing else needs the module loaded at run time. On Symmetry,
+HPC-X's `mpicc` wraps NVIDIA's `nvc`, and the wrapper was built there
+with `CC=gcc OMPI_CC=gcc`.
+
+**Select it** in the environment that runs the job, once. Add
+MPIPreferences to that environment first; the preference goes to its
+`LocalPreferences.toml`, and MPI.jl recompiles for it on its next load:
+
+```julia
+using MPIPreferences
+prefix = joinpath(homedir(), "openmpi-4.1.5-mpi-abi")
+MPIPreferences.use_system_binary(;
+    library_names = [joinpath(prefix, "lib64", "libmpi_abi.so")],
+    mpiexec = joinpath(prefix, "bin", "mpiexec"),
+    abi = "MPIABI")
+```
+
+Give `abi` explicitly: MPIPreferences identifies an MPI by its version
+string, which here begins with the wrapper's name, and does not
+recognize it. Afterwards `julia --project -e 'using MPI;
+MPI.versioninfo()'` reports `MPI version: 5.0.0` and, under the library
+version, the MPI that is wrapped. To leave a project's own preferences
+untouched — the test environment, say — put the preference into an
+environment of its own and stack it with
+`JULIA_LOAD_PATH="@:<that environment>:@stdlib"`.
+
+**Launch** with the prefix's `mpiexec`, which `MPI.mpiexec()` now
+returns and `mpiexecjl` runs, and which hands its arguments unchanged
+to the wrapped MPI's own `mpiexec`; or with `srun` where that MPI is
+built for it. Inside a SLURM job, Open MPI's `mpiexec` takes its slots from
+the job's tasks: ask for `--ntasks=8 --cpus-per-task=8`, not
+`--ntasks=1 --cpus-per-task=64`, or it refuses to start more than one
+rank. HPC-X on Symmetry is not built with SLURM's PMI, so there
+`mpiexec` it is; on Nibi `srun` and `mpiexec` measured the same. Under
+`mpiexec` between nodes, pass the environment a rank needs with Open
+MPI's `-x NAME`.
+
+**On the Alliance clusters** (Nibi and the others that use the
+`StdEnv` software stack), the MPI and every library it loads are built
+against the stack's own glibc and dynamic loader, under
+`$EPREFIX=/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3`, while
+juliaup's Julia runs under the host's loader. Loading the wrapper
+then fails with `libze_loader.so.1: cannot open shared object file`,
+and putting `$EPREFIX/usr/lib64` on `LD_LIBRARY_PATH` brings in the
+stack's newer glibc and kills Julia at start-up. Instead, run Julia
+under the stack's loader: copy a juliaup installation, let the
+Alliance's `setrpaths.sh` rewrite the copy's interpreter, and put the
+copy's `bin` first on `PATH`, in the job script as well:
+
+```bash
+cp -a ~/.julia/juliaup/julia-1.13.3+0.x64.linux.gnu ~/julia-1.13.3-stdenv
+setrpaths.sh --path ~/julia-1.13.3-stdenv
+export PATH=$HOME/julia-1.13.3-stdenv/bin:$PATH
+```
+
+The Alliance's own `julia/1.13.0` module was not tried: it needs
+`StdEnv/2026`, whose Open MPI is a different one and would need a
+wrapper of its own.

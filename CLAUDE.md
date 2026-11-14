@@ -144,6 +144,12 @@ julia --project=test -e 'using MPI; m = MPI.mpiexec(); run(pipeline(setenv(`$m -
 diff /tmp/serial.txt /tmp/n3.txt
 ```
 
+On a cluster the MPI tests run against the cluster's own MPI through
+mpi_abi_wrapper, with the preference in a stacked environment
+(`docs/src/index.md`, "A cluster's own MPI"; `HISTORY.md`, "Distributed
+meshes", has the Symmetry and Nibi installs and the Alliance loader
+problem).
+
 The device counterpart, `test/mpi_device_tests.jl`, is not in
 `Pkg.test` (the test environment has no device package and must not
 gain one). It runs in a scratch environment that develops this checkout
