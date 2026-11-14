@@ -621,6 +621,59 @@ should therefore run one thread each.
 
 The multi-block check was made on 2026-10-01 and amended by the M12 design on 2026-10-03, and again by M17 on 2026-11-02, when the forest it watched for was built: it now watches for what M17 leaves out.
 
+**The cluster's MPI through mpi_abi_wrapper** (2026-11-13, Erik). Until
+then a cluster run chose between MPICH_jll, which runs anywhere but over
+TCP, and the system MPI through MPIPreferences' system binary, whose ABI
+MPI.jl identifies per implementation. Erik asked for the system MPI
+through [mpi_abi_wrapper](https://github.com/eschnett/mpi_abi_wrapper)
+1.2.0 instead, which gives any MPI the standard ABI of MPI 5.0, the one
+MPIABI_jll has on the laptop. It was built on both clusters from the
+wrapper's `main` (6292cb1) and tried with Julia 1.13.3 and MPI.jl
+0.20.29; "A cluster's own MPI" in `docs/src/index.md` has the
+instructions that came out of it.
+
+- *Symmetry*, over HPC-X 2.20's Open MPI 4.1.7
+  (`nvhpc-hpcx-cuda12/24.9`, built with `CC=gcc OMPI_CC=gcc`, installed
+  in `~/claude/hpcx-2.20-mpi-abi`); nothing needs the module loaded at
+  run time. `test/mpi_tests.jl` passed, 109 tests in 4m46 on one Milan
+  node (job 598121), and `test/mpi_workload.jl` by hand gave the same
+  lines serially and at three ranks. The first attempt (job 598117) asked
+  for one SLURM task of 64 CPUs, and Open MPI's `mpiexec` refused to
+  start three ranks on one slot. Two-node ping-pong in one job on
+  cn087–cn088 (job 598119), half a round trip, best of five:
+
+  | | 8 B | 64 KiB | 16 MiB |
+  |---|---|---|---|
+  | wrapper | 1.44 µs | 10.6 µs | 12.0 GB/s |
+  | HPC-X directly (`abi = "OpenMPI"`) | 1.41 µs | 10.7 µs | 12.0 GB/s |
+  | MPICH_jll, `srun --mpi=pmi2` | 22.6 µs | 109 µs | 1.85 GB/s |
+
+- *Nibi*, over the Open MPI 4.1.5 of `StdEnv/2023` (installed in
+  `~/claude/openmpi-4.1.5-mpi-abi`, libraries in `lib64/`). juliaup's
+  Julia could not load it: the Alliance stack is built against the glibc
+  2.37 and the loader of its Gentoo prefix, the host has glibc 2.34, and
+  Julia runs under the host's loader, which does not find the prefix's
+  `libze_loader.so.1` (needed by hwloc). `LD_LIBRARY_PATH` set to the
+  prefix's `usr/lib64` kills Julia, and adding that directory to the
+  wrapper's RPATH reached the prefix's `libpciaccess.so.0`, which needs
+  `GLIBC_ABI_DT_RELR` (glibc 2.36). A copy of the juliaup installation
+  whose interpreter `setrpaths.sh` had switched to the prefix's loader
+  loaded it, and was used from then on; the `julia/1.13.0` module needs
+  `StdEnv/2026` and was not tried. With it `test/mpi_tests.jl` passed,
+  109 tests in 2m27 on one Granite Rapids node (job 27228459), and three
+  ranks started under both the wrapper's `mpiexec` and `srun`. Two-node ping-pong on
+  c161 and c177 (job 27228460, `--switches=1`):
+
+  | | 8 B | 64 KiB | 16 MiB |
+  |---|---|---|---|
+  | wrapper, `srun` (PMIx) | 2.64 µs | 13.1 µs | 24.2 GB/s |
+  | wrapper, `mpiexec` | 2.80 µs | 13.0 µs | 24.2 GB/s |
+  | Open MPI directly, `srun` | 2.65 µs | 13.6 µs | 24.2 GB/s |
+  | MPICH_jll, `srun --mpi=pmi2` | 18.9 µs | 76.7 µs | 3.41 GB/s |
+
+MPIPreferences 0.1.12 does not recognize the wrapper's version string
+(`impl = "unknown"`), so `abi = "MPIABI"` has to be given.
+
 ## Code structure
 
 **The checkpoints left TreeAMR** (2026-10-08, decided with Erik), into
