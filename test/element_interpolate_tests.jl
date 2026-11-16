@@ -99,6 +99,22 @@ end
     end
 end
 
+@testset "Both bases' weights are inferred, as a device kernel needs them: T=$T" for
+        T in (Float64, Float32)
+    # A closure in the weights that captures a variable its function also
+    # reassigns boxes it: the weights come back as `Any`, which the CPU
+    # runs, slowly, and a device kernel cannot compile (CUDA refuses it,
+    # Metal's compiler crashes). There is no device on CI, so the types
+    # are the check, for every order a kernel asks for.
+    for P in 1:4, M in 0:2
+        b = TreeAMR.ElementBasis(T, P)
+        w = @inferred TreeAMR.basisweights(b, T(0.3), Val(M))
+        @test w isa NTuple{M + 1,NTuple{P + 1,T}}
+        w = @inferred TreeAMR.basisweights(Lagrange(P + 1), T(0.3), Val(M))
+        @test w isa NTuple{M + 1,NTuple{P + 1,T}}
+    end
+end
+
 @testset "An element set's interpolant reads no ghosts, and reads a state vector alike" begin
     # A basis that read a ghost would turn NaN there into NaN here, and
     # would read garbage from a state vector, which has no ghosts; and the
