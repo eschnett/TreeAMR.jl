@@ -19,7 +19,8 @@ const MPI_WORKLOAD = joinpath(@__DIR__, "mpi_workload.jl")
 
 # Whether the two jobs may run at once and beside the suite: five
 # single-threaded ranks, each compiling the workload, which measured
-# about 2 GB resident a rank (2026-10-02), beside this process and the
+# about 2 GB resident a rank with its heap-size hint (2026-11-16; 3 GB
+# without), beside this process and the
 # thread-independence test's subprocesses — and, where the suite runs in
 # groups, beside the other groups' processes, which `test_group_count`
 # allows only on a machine that passes this same test. A CI runner (3–4
@@ -33,12 +34,17 @@ function concurrent_launches()
 end
 
 # The workload under `mpiexec -n $n`, started and not waited for, and
-# failing if `timeout` seconds pass first.
+# failing if `timeout` seconds pass first. Each rank gets a heap-size
+# hint of 1 GB: left alone, a rank peaked at 3.0 GB (2026-11-16), and
+# three of them swapped on CI's 7 GB macOS runners until the three-rank
+# job missed its deadline; with the hint a rank peaks at 2.0 GB in the
+# same time, nearly all of it compiled code, which the hint cannot
+# shrink (512 MB saves nothing more and costs 17 % in time).
 function launch_workload(n; threads=1, timeout=900)
     mpi = MPI.mpiexec()
     project = Base.active_project()
-    cmd = `$mpi -n $n $(Base.julia_cmd()) --threads=$threads --project=$project
-           $MPI_WORKLOAD mpi`
+    cmd = `$mpi -n $n $(Base.julia_cmd()) --threads=$threads --heap-size-hint=1G
+           --project=$project $MPI_WORKLOAD mpi`
     cmd = setenv(cmd, mpi.env)
     out, err = IOBuffer(), IOBuffer()
     proc = run(pipeline(cmd; stdout=out, stderr=err); wait=false)

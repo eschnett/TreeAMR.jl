@@ -6163,7 +6163,10 @@ suite where the machine has room (`concurrent_launches`: 8+ threads and
 24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and otherwise runs the
 serial reference, the three-rank job and the two-rank job one after the
 other (the three ranks beside the reference outgrew CI's 7 GB macOS
-runners and timed out). Keep
+runners and timed out). Each rank runs with `--heap-size-hint=1G`,
+which holds it to about 2.0 GB at no cost in time, against 3.0 GB
+without: three unhinted ranks swap on those runners even alone
+([HISTORY.md](HISTORY.md#development-environment-and-ci)). Keep
 `mpi_workload.jl` self-contained like `thread_workload.jl`, its
 non-`#` output independent of the rank count, and a new case's lines
 deterministic. `mpi_device_workload.jl` and `mpi_device_tests.jl` are
