@@ -11,7 +11,8 @@
 # of it runs. The jobs are independent of each other and
 # of the serial reference. Elsewhere — a CI runner — nothing starts here,
 # and `mpi_tests.jl` runs the serial reference, the three-rank job and
-# the two-rank job one after the other, for the memory.
+# the two-rank job one after the other, for the memory; on fewer than
+# four CPU threads it skips the three-rank job (`three_ranks`).
 
 using MPI: MPI
 
@@ -33,13 +34,28 @@ function concurrent_launches()
     return Sys.CPU_THREADS >= 8 && Sys.total_memory() >= 24 * 2^30
 end
 
+# Whether the three-rank job runs at all: only where the machine has a
+# CPU thread beyond its three ranks. On CI's macOS runners (3 vCPUs of an
+# M1) three ranks compiling at once got less than one core between them
+# — 730 s against 222 s for two ranks, and past the 900 s deadline under
+# coverage — while Ubuntu's 4 vCPUs ran them in about 240 s (2026-11-16).
+# There the test compares the two-rank job alone, which Ubuntu's cells
+# back with the three-rank one. `TREEAMR_TEST_MPI_THREE=0` or `1` decides
+# it by hand.
+function three_ranks()
+    choice = get(ENV, "TREEAMR_TEST_MPI_THREE", "")
+    choice == "1" && return true
+    choice == "0" && return false
+    return Sys.CPU_THREADS >= 4
+end
+
 # The workload under `mpiexec -n $n`, started and not waited for, and
 # failing if `timeout` seconds pass first. Each rank gets a heap-size
-# hint of 1 GB: left alone, a rank peaked at 3.0 GB (2026-11-16), and
-# three of them swapped on CI's 7 GB macOS runners until the three-rank
-# job missed its deadline; with the hint a rank peaks at 2.0 GB in the
-# same time, nearly all of it compiled code, which the hint cannot
-# shrink (512 MB saves nothing more and costs 17 % in time).
+# hint of 1 GB, which holds it to 2.0 GB resident in the same time,
+# against 3.0 GB without (2026-11-16); nearly all of the rest is
+# compiled code, which the hint cannot shrink (512 MB saves nothing more
+# and costs 17 % in time). It was added for the macOS runners' 7 GB, but
+# the timeouts there were short CPU, not memory (see `three_ranks`).
 function launch_workload(n; threads=1, timeout=900)
     mpi = MPI.mpiexec()
     project = Base.active_project()
@@ -121,12 +137,12 @@ const MPI_JOBS = Ref{Any}(nothing)
 
 function start_mpi_jobs!()
     concurrent_launches() || return nothing
-    three = launch_workload(3; timeout=3600)
+    three = three_ranks() ? launch_workload(3; timeout=3600) : nothing
     two = launch_workload(2; timeout=3600)
     MPI_JOBS[] = (; three, two)
     atexit() do
         for job in (three, two)
-            process_running(job.proc) && kill(job.proc)
+            job === nothing || process_running(job.proc) && kill(job.proc)
         end
     end
     return nothing

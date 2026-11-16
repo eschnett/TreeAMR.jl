@@ -53,7 +53,11 @@
 # its 900 s deadline on Julia 1.13 (on `main` on 2026-10-04, and in the
 # copy-kernel change's CI on 2026-10-06); one at a time costs the
 # reference's minute or two of wall clock and keeps the three ranks from
-# competing with it on one runner.
+# competing with it on one runner. On fewer than four CPU threads — the
+# 3-vCPU macOS runners — the three-rank job does not run at all, since
+# three ranks there got less than one core between them and missed the
+# deadline even alone (`three_ranks` in `mpi_jobs.jl`); the Linux cells
+# run it.
 
 isdefined(@__MODULE__, :MPI_JOBS) || include("mpi_jobs.jl")
 
@@ -97,8 +101,12 @@ end
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
     room = early !== nothing || concurrent_launches()
+    # The three-rank job only with a CPU thread to spare (`three_ranks`).
+    three_ranks() || @info "Skipping the MPI workload at -n 3 on " *
+                           "$(Sys.CPU_THREADS) CPU threads; set " *
+                           "TREEAMR_TEST_MPI_THREE=1 to run it"
     three = early !== nothing ? early.three :
-            room ? launch_workload(3) : nothing
+            room && three_ranks() ? launch_workload(3) : nothing
     two = early !== nothing ? early.two :
           room ? launch_workload(2) : nothing
     serial = try
@@ -107,7 +115,7 @@ end
         foreach(j -> j === nothing || kill(j.proc), (three, two))
         rethrow()
     end
-    three === nothing && (three = launch_workload(3))
+    three === nothing && three_ranks() && (three = launch_workload(3))
     lines = workload_lines(serial)
     @test first(lines) == "# ranks 1"
     @test count(l -> occursin(" state ", l), lines) >= 7
@@ -181,10 +189,12 @@ end
     @test length(workload_mismatches(serial, moved(value * (1 + 1e-9)))) == 1
 
     outs = Dict{Int,String}()
-    outs[3] = finish_workload(three; others=two === nothing ? () : (two,))
+    if three !== nothing
+        outs[3] = finish_workload(three; others=two === nothing ? () : (two,))
+    end
     two === nothing && (two = launch_workload(2))
     outs[2] = finish_workload(two)
-    for n in (3, 2)
+    for n in sort!(collect(keys(outs)); rev=true)
         out = outs[n]
         @test first(workload_lines(out)) == "# ranks $n"
         bad = workload_mismatches(serial, out)

@@ -90,7 +90,9 @@ subprocesses running `test/thread_workload.jl`. The MPI test's two
 `mpiexec` jobs, about a minute each and nearly all compilation, run
 *beside* the rest on the same large machines (`test/mpi_jobs.jl`); on a
 smaller machine they run one after the other
-(`TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice). The
+(`TREEAMR_TEST_MPI_CONCURRENT=0` or `1` overrides the choice), and
+below four CPU threads, as on CI's macOS runners, the three-rank job is
+skipped (`TREEAMR_TEST_MPI_THREE=0` or `1`). The
 per-file weights are in `test/test_groups.jl`.
 
 **The suite is compilation-bound, not kernel-bound**, so do not try to
