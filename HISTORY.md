@@ -4909,6 +4909,41 @@ compiled code. `launch_workload` now passes `1G`. Splitting the workload
 into two smaller jobs, or a longer deadline, were the fallbacks if the
 hint is not enough.
 
+**The three-rank job skipped below four CPU threads** (2026-11-16, Erik's
+choice). The hint did not help: after its merge (9da8dde, run
+43904521726) both macOS cells timed out as before, and memory had not
+been the cause. Diagnostics added to `finish_workload` for the purpose
+(each process's CPU, memory and age, each rank's backtrace through
+SIGINFO, the machine's load, and each finished job's time) showed it on
+the branch's dispatched runs. On the macOS 1-thread cell (runs
+43922941371 and 43933523724) all three ranks were still compiling the
+workload ahead of `main()` after 15 min, at 0.3–0.85 GB resident, with
+about 7 min of CPU each: less than one core between the three, at a
+load average of 7.5, with nothing else on the runner busy. The cells'
+times in the second run:
+
+| cell | `-n 3` | `-n 2` |
+|---|---|---|
+| Ubuntu, 1 thread (4 vCPUs) | 246 s | 187 s |
+| Ubuntu, 4 threads | 228 s | 168 s |
+| macOS, 4 threads (3 vCPUs) | 730 s | 222 s |
+| macOS, 1 thread, coverage | over 900 s | not run |
+
+One rank with the coverage cell's flags takes 87 s of wall clock and
+86 s of CPU on an idle M3 Pro, so coverage alone does not stall it.
+Three ranks filling every vCPU of the macOS VM collapse, which nothing
+visible inside the VM explains; GitHub documents the runner only as "3
+(M1)" CPUs in a VM. Of the two ways out, a longer deadline on small
+machines, which keeps three ranks under coverage but adds 15 min or
+more to the coverage cell with no bound known, and skipping the
+three-rank job where the machine has no CPU thread beyond its ranks,
+Erik chose the second: `three_ranks()`, `Sys.CPU_THREADS >= 4`, with
+`TREEAMR_TEST_MPI_THREE=0/1` to decide by hand. The Linux cells keep
+the three-rank comparison; the macOS cells compare two ranks only, so
+the paths only three ranks reach (a rank without blocks in E2) are no
+longer in the coverage report. The heap-size hint stays: it costs
+nothing.
+
 ## Releases
 
 TreeAMR was registered in General on 2026-09-21; 0.1.1 was the first
