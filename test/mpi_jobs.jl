@@ -51,6 +51,40 @@ function launch_workload(n; threads=1, timeout=900)
     return (; n, proc, out, err, start=time(), timeout)
 end
 
+# The processes under `pid`, children first found by `pgrep -P`: `mpiexec`,
+# MPICH's proxy and the ranks.
+function descendants(pid)
+    found = Int[]
+    for line in eachline(ignorestatus(`pgrep -P $pid`))
+        child = parse(Int, line)
+        push!(found, child)
+        append!(found, descendants(child))
+    end
+    return found
+end
+
+# What a job that ran out of time was doing, for the error: CPU, memory and
+# age of each of its processes, which tells a hang (ranks spinning in MPI,
+# or idle) from a slow run (ranks compiling), and each Julia rank's
+# backtrace, which Julia writes to the job's stderr on SIGINFO (macOS, BSD)
+# or SIGUSR1 (Linux), followed by a one-second profile.
+function rank_state(proc)
+    pids = descendants(getpid(proc))
+    isempty(pids) && return "(none found)"
+    table = read(ignorestatus(`ps -o pid,ppid,%cpu,rss,time,etime,command
+                                  -p $(join(pids, ","))`), String)
+    signal = Sys.isapple() || Sys.isbsd() ? "INFO" : "USR1"
+    for line in split(table, '\n')[2:end]
+        words = split(line)
+        # By the binary's name, not its path: MPICH's `mpiexec` and proxy
+        # live under `~/.julia`, and SIGUSR1 would end them.
+        length(words) >= 7 && startswith(basename(words[7]), "julia") || continue
+        run(ignorestatus(`kill -$signal $(words[1])`))
+    end
+    sleep(10)
+    return table
+end
+
 # Its output, with the deadline from its start: a rank that waited for a
 # message never sent would otherwise hang the suite. A failed job takes
 # the jobs in `others` down with it, since the test fails anyway.
@@ -58,10 +92,13 @@ function finish_workload(job; others=())
     (; n, proc, out, err, start, timeout) = job
     left = max(1.0, timeout - (time() - start))
     if timedwait(() -> process_exited(proc), left) !== :ok
+        state = rank_state(proc)
         kill(proc)
         foreach(j -> kill(j.proc), others)
-        error("the MPI workload at -n $n did not finish in $timeout s; its stderr:\n" *
-              String(take!(err)))
+        error("the MPI workload at -n $n did not finish in $timeout s.\n" *
+              "Its processes before the kill:\n$state\n" *
+              "Its output so far:\n" * String(take!(out)) *
+              "\nIts stderr, with each rank's backtrace:\n" * String(take!(err)))
     end
     if !success(proc)
         foreach(j -> kill(j.proc), others)
