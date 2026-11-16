@@ -6202,7 +6202,13 @@ for `D = 1, 2, 3`, `P ≤ 4` and `G = 0, 1`; a node's value at its node,
 for every node not on a block's upper face; the measured rates; `NaN`
 ghosts changing nothing, and the state vector giving the working
 array's bits; the mirror across a reflecting wall bit for bit; the
-`exclude` test at the Gauss–Lobatto positions; and the refusals.
+`exclude` test at the Gauss–Lobatto positions; the refusals; and both
+bases' weights inferred in `Float64` and `Float32` for every order a
+kernel asks for, since a weight the compiler cannot type runs on the CPU
+and not in a device kernel, which CI has no device to try.
+`gpu_tests.jl` evaluates `ElementPolynomial` in its kernel on the
+backend, from the working array and from a state vector at located
+points, against the host.
 `interpolate_tests.jl` also holds the grids (M19): their values those of
 `collect(grid)` bit for bit, a line and a plane in 3D included, and
 their points those their constructors describe; `element_interpolate_tests.jl`

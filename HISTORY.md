@@ -425,6 +425,8 @@ Interpolation on element sets and patches (M19) was designed with Erik on 2026-1
 
 The type a batch is located in was settled on 2026-11-09, planning M19's implementation: `locate(T, forest, xs)` with `T` defaulting to the forest's geometry type, and `interpolate` refusing a batch of another type than the field set's, rather than converting its positions, which would not be bit for bit M11's path at a face for a `Float32` set (Erik's choice of the two offered).
 
+`ElementPolynomial` did not run on a device until 2026-11-16. Its weights' `element_series` ended in an `ntuple` closure over the series `c`, which its loop reassigns, so `c` was boxed and every weight came back as `Any`: on the CPU a dynamic call, on CUDA a kernel that allocates and does not compile, and on Metal a crash in LLVM's inliner. TreeWaveOLDG's waveform extraction found it on an H200 (its M8e); every test had run on the CPU, and `gpu_tests.jl` evaluated only `Lagrange` on a device. The series' last step became a function of `c` (`element_derivatives`), as `lagrange_series` had always done for the same reason; a test now holds both bases' weights to be inferred, and `gpu_tests.jl` evaluates `ElementPolynomial` on the backend.
+
 Under M7 the routing was "the one place this design will change". It was designed on 2026-10-01 under "Distributed meshes" and implemented in M7's step 5, with the kernel unchanged except for the block offset. The serial path measured the same before and after.
 
 ### Folds over points

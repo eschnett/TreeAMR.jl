@@ -797,6 +797,43 @@ end
     @test total_mass(fs) ≈ T(integral) rtol = gputol(T)
 end
 
+@testset "$bname: ElementPolynomial interpolation agrees with the host: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
+    # M19's basis in its kernel, from the working array and from a state
+    # vector, with a derivative, at points in located and in plain form.
+    # Its weights must be inferred for the kernel to compile for a device
+    # at all: a closure that captured a reassigned variable once boxed it,
+    # which the CPU runs and a device refuses (CUDA) or crashes on (Metal).
+    P, N = 3, 8
+    forest = Forest{T}(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (zero(T), one(T)), D))
+    refine!(forest, first(forest.leaves))
+    balance!(forest)
+    wave = (x, v) -> begin
+        acc = one(x[1])
+        for d in 1:D
+            acc *= cos(x[d] * oftype(x[1], 3) + oftype(x[1], v * d) / oftype(x[1], 5))
+        end
+        acc
+    end
+    xs = [ntuple(d -> T((13j + 5d) % 97 // 97), D) for j in 1:97]
+    derivs = (ntuple(_ -> 0, D), ntuple(d -> Int(d == 1), D))
+    results = map((CPU(), backend)) do bk
+        fs = FieldSet{T}(forest, 2; G=1, centering=elementcentered(D), P=P, backend=bk)
+        fill_by_coordinates!(wave, fs)
+        u = statevector(fs)
+        gather!(u, fs)
+        pts = TreeAMR.todevice(bk, xs)
+        a = interpolate(fs, pts, ElementPolynomial(); derivs=derivs)
+        b = interpolate(fs, u, locate(fs.forest, pts), ElementPolynomial(); derivs=derivs)
+        @test typeof(get_backend(b.values)) === typeof(bk)
+        (Array(a.values), Array(b.values))
+    end
+    for k in 1:2
+        @test maximum(abs, results[1][k] - results[2][k]) <
+              gputol(T) * maximum(abs, results[1][k])
+    end
+end
+
 @testset "An element set's groups launch flat as they do shaped, bit for bit: D=$D" for
         D in (2, 3)
     # A device launches an element set's transfers flat, over the full

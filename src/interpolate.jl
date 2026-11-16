@@ -261,9 +261,16 @@ end
         j == k && continue
         c = series_times(c, ξ - b.offsets[j])
     end
-    λ = b.λ[k]
-    return ntuple(m -> T(factorial(m - 1)) * c[m] * λ, Val(M + 1))
+    return element_derivatives(c, b.λ[k])
 end
+
+# The derivatives `m!·cₘ` of the series, times the barycentric weight.
+# A function of `c` rather than a closure over it, which `element_series`
+# reassigns in its loop: captured as well, it would be boxed, its type
+# lost, and the kernel would not compile for a device (see
+# `lagrange_series`).
+@inline element_derivatives(c::NTuple{L,T}, λ::T) where {L,T} =
+    ntuple(m -> T(factorial(m - 1)) * c[m] * λ, Val(L))
 
 # The positions of an element stencil's nodes: node `k` (from 0) of
 # element `q` along `d` at `origin + h·(q·n + o_k)`, `nodeposition`'s
