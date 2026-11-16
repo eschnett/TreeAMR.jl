@@ -671,6 +671,53 @@ instructions that came out of it.
   | Open MPI directly, `srun` | 2.65 µs | 13.6 µs | 24.2 GB/s |
   | MPICH_jll, `srun --mpi=pmi2` | 18.9 µs | 76.7 µs | 3.41 GB/s |
 
+- *Trillium* (2026-11-15, Erik), over the same Open MPI 4.1.5 of
+  `StdEnv/2023` (installed in `~/claude/openmpi-4.1.5-mpi-abi`, `lib64/`),
+  with juliaup's Julia 1.13.4 copied and patched by `setrpaths.sh` as on
+  Nibi; unpatched, it failed to load the wrapper there as well. The first
+  jobs ran without the module, as on Nibi, and broke: Open MPI then
+  chose libfabric's PSM3 provider, every rank printed `unknown link speed
+  0x80` on its standard output, which made four comparisons of
+  `test/mpi_tests.jl` fail (105 of 109, job 2864095), and the wrapper's
+  `mpiexec` between two nodes hung in `Failed to modify UD QP to INIT …
+  Operation not permitted` (job 2864094, cancelled after 28 minutes).
+  `srun` worked on that path, at 1.34 µs and 47.8 GB/s on two adjacent
+  nodes. The module sets `OMPI_MCA_btl=^openib,ofi`, `OMPI_MCA_mtl=^ofi`,
+  `OMPI_MCA_coll=^hcoll` and `SLURM_MPI_TYPE=pmix`; with `module load
+  StdEnv/2023` in the job, `test/mpi_tests.jl` passed, 109 tests in 1m45
+  on one Turin node (job 2864226), three ranks started under both
+  launchers, and "A cluster's own MPI" now says to load the module at run
+  time, which the Nibi runs had not needed on Ethernet. Two-node
+  ping-pong on tri1039 and tri1090 (job 2864225):
+
+  | | 8 B | 64 KiB | 16 MiB |
+  |---|---|---|---|
+  | wrapper, `srun` (PMIx) | 2.35 µs | 7.45 µs | 47.4 GB/s |
+  | wrapper, `mpiexec` | 2.34 µs | 7.44 µs | 47.4 GB/s |
+  | Open MPI directly, `srun` | 2.28 µs | 7.35 µs | 47.4 GB/s |
+  | MPICH_jll, `srun --mpi=pmi2` | 14.1 µs | 66.2 µs | 3.24 GB/s |
+
+  Whether the PSM3 path's lower latency holds on the same pair of nodes
+  is not measured.
+
+- *Fir* (2026-11-15, Erik), over the same Open MPI 4.1.5 of
+  `StdEnv/2023` (installed in `~/claude/openmpi-4.1.5-mpi-abi`, `lib64/`),
+  with juliaup's Julia 1.13.4 copied and patched by `setrpaths.sh`;
+  unpatched, it failed to load the wrapper, as on Nibi and Trillium. Fir
+  loads `StdEnv/2023` by default, in jobs as well, so the module's Open
+  MPI settings were there from the start and no warnings appeared.
+  `test/mpi_tests.jl` passed, 109 tests in 3m52 on one Turin node (job
+  4277065), and three ranks started under both launchers. Two-node
+  ping-pong on fc30556 and fc30559 (job 4277064, `--switches=1`, 200
+  Gbit/s InfiniBand):
+
+  | | 8 B | 64 KiB | 16 MiB |
+  |---|---|---|---|
+  | wrapper, `srun` (PMIx) | 1.47 µs | 8.58 µs | 24.6 GB/s |
+  | wrapper, `mpiexec` | 1.49 µs | 8.56 µs | 24.6 GB/s |
+  | Open MPI directly, `srun` | 1.48 µs | 8.52 µs | 24.6 GB/s |
+  | MPICH_jll, `srun --mpi=pmi2` | 13.5 µs | 41.1 µs | 5.04 GB/s |
+
 MPIPreferences 0.1.12 does not recognize the wrapper's version string
 (`impl = "unknown"`), so `abi = "MPIABI"` has to be given.
 
