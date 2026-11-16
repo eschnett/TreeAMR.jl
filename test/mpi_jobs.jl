@@ -82,7 +82,12 @@ function rank_state(proc)
         run(ignorestatus(`kill -$signal $(words[1])`))
     end
     sleep(10)
-    return table
+    # The whole machine: whether the ranks were short of CPU, and to what.
+    load = read(ignorestatus(`uptime`), String)
+    bycpu = Sys.islinux() ? "--sort=-%cpu" : "-r"   # Linux's `-r` means running only
+    top = join(first(split(read(ignorestatus(`ps -A -o pid,ppid,%cpu,rss,time,etime,command
+                                                 $bycpu`), String), '\n'), 12), '\n')
+    return table * "\nThe machine:\n" * load * top
 end
 
 # Its output, with the deadline from its start: a rank that waited for a
@@ -104,6 +109,8 @@ function finish_workload(job; others=())
         foreach(j -> kill(j.proc), others)
         error("the MPI workload at -n $n failed; its stderr:\n" * String(take!(err)))
     end
+    # How close it came to its deadline, in every CI cell's log.
+    @info "The MPI workload at -n $n took $(round(Int, time() - start)) s of $timeout"
     return String(take!(out))
 end
 
