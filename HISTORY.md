@@ -4891,6 +4891,24 @@ after M7's trim are in M7 step 9, M12's in its steps. Pinned with first
 touch, the thread-scaling benchmark measured 0.92 against 1.00 ns/cell
 interleaved (2026-09-23).
 
+**A heap-size hint for the MPI ranks** (2026-11-16). After M17 and M19
+grew `mpi_workload.jl` (1340 → 1530 lines), the three-rank job missed
+its 900 s deadline on CI's macOS runners (3 cores, 7 GB) three times on
+`main`: the 4-thread cell of the schedule of 2026-11-09, the 1-thread
+cell of #39's merge the same day, and the 1-thread cell of the schedule
+of 2026-11-16 and its rerun. Ubuntu, with 16 GB, never did. On macOS the
+MPI test, serial reference and both jobs, had grown from 6–16 min on
+2026-10-31 to about 23 min where it passed, so the three-rank job sat at
+its deadline, and whether it made it changed from run to run. One rank of the
+workload, serially on an M3 Pro with `--check-bounds=yes`, peaked at
+3.0 GB resident in 99 s, against the 2.0–2.4 GB measured in October, so
+three ranks no longer fit beside the suite's process and swapped. A
+heap-size hint brings the rank down without slowing it: 2.0 GB in 100 s
+at `--heap-size-hint=1G`, 1.95 GB in 117 s at `512M`; what remains is
+compiled code. `launch_workload` now passes `1G`. Splitting the workload
+into two smaller jobs, or a longer deadline, were the fallbacks if the
+hint is not enough.
+
 ## Releases
 
 TreeAMR was registered in General on 2026-09-21; 0.1.1 was the first
