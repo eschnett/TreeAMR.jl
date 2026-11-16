@@ -1066,15 +1066,17 @@ the cores slows every rank down.
 ### A cluster's own MPI
 
 MPI.jl's default binary, MPICH_jll, runs anywhere, but on a cluster it
-may not use the fast interconnect: on Symmetry and on Nibi its latency
-between nodes is seven to sixteen times the system MPI's, and its
-bandwidth a seventh of it. The cluster's own MPI is the one to use, and
+may not use the fast interconnect: on Symmetry, Nibi, Trillium and Fir
+its latency between nodes is six to sixteen times the system MPI's, and
+its bandwidth a fifth to a fifteenth of it. The cluster's own MPI is the
+one to use, and
 [mpi_abi_wrapper](https://github.com/eschnett/mpi_abi_wrapper) is the
 way to use it: it wraps an installed MPI so that it provides the
 standard ABI of MPI 5.0, which MPI.jl supports as `MPIABI`, the same
 ABI that MPIABI_jll provides on a laptop. The wrapper forwards every
 call to the MPI underneath and costs nothing that a ping-pong can see.
-Two-node ping-pong, half a round trip, best of five (2026-11-13):
+Two-node ping-pong, half a round trip, best of five (2026-11-13, and
+Trillium and Fir 2026-11-15):
 
 | | 8 B | 16 MiB |
 |---|---|---|
@@ -1084,6 +1086,12 @@ Two-node ping-pong, half a round trip, best of five (2026-11-13):
 | Nibi, wrapper over Open MPI 4.1.5 (`StdEnv/2023`, 200 Gbit/s Ethernet) | 2.64 µs | 24.2 GB/s |
 | Nibi, Open MPI 4.1.5 used directly | 2.65 µs | 24.2 GB/s |
 | Nibi, MPICH_jll | 18.9 µs | 3.41 GB/s |
+| Trillium, wrapper over Open MPI 4.1.5 (`StdEnv/2023`, NDR InfiniBand) | 2.35 µs | 47.4 GB/s |
+| Trillium, Open MPI 4.1.5 used directly | 2.28 µs | 47.4 GB/s |
+| Trillium, MPICH_jll | 14.1 µs | 3.24 GB/s |
+| Fir, wrapper over Open MPI 4.1.5 (`StdEnv/2023`, 200 Gbit/s InfiniBand) | 1.47 µs | 24.6 GB/s |
+| Fir, Open MPI 4.1.5 used directly | 1.48 µs | 24.6 GB/s |
+| Fir, MPICH_jll | 13.5 µs | 5.04 GB/s |
 
 It takes three steps: build the wrapper once for each MPI installation,
 point MPIPreferences at it once for each Julia environment, and launch
@@ -1105,7 +1113,8 @@ $HOME/openmpi-4.1.5-mpi-abi/bin/mpi_abi_wrapper_info
 
 The last line says which MPI and which launcher the prefix forwards to.
 The libraries go to `lib/` or `lib64/`, as the system's convention has
-it. Nothing else needs the module loaded at run time. On Symmetry,
+it. On Symmetry nothing needs the module loaded at run time; on the
+Alliance clusters it does (below). On Symmetry,
 HPC-X's `mpicc` wraps NVIDIA's `nvc`, and the wrapper was built there
 with `CC=gcc OMPI_CC=gcc`.
 
@@ -1138,11 +1147,12 @@ built for it. Inside a SLURM job, Open MPI's `mpiexec` takes its slots from
 the job's tasks: ask for `--ntasks=8 --cpus-per-task=8`, not
 `--ntasks=1 --cpus-per-task=64`, or it refuses to start more than one
 rank. HPC-X on Symmetry is not built with SLURM's PMI, so there
-`mpiexec` it is; on Nibi `srun` and `mpiexec` measured the same. Under
+`mpiexec` it is; on Nibi, Trillium and Fir `srun` and `mpiexec`
+measured the same. Under
 `mpiexec` between nodes, pass the environment a rank needs with Open
 MPI's `-x NAME`.
 
-**On the Alliance clusters** (Nibi and the others that use the
+**On the Alliance clusters** (Nibi, Trillium, Fir and the others that use the
 `StdEnv` software stack), the MPI and every library it loads are built
 against the stack's own glibc and dynamic loader, under
 `$EPREFIX=/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3`, while
@@ -1159,6 +1169,19 @@ cp -a ~/.julia/juliaup/julia-1.13.3+0.x64.linux.gnu ~/julia-1.13.3-stdenv
 setrpaths.sh --path ~/julia-1.13.3-stdenv
 export PATH=$HOME/julia-1.13.3-stdenv/bin:$PATH
 ```
+
+Load the MPI's module in the job script too, with `module load
+StdEnv/2023`: the wrapper finds Open MPI's libraries without it, but
+not the settings the module makes, which keep Open MPI off transports
+the cluster does not support (`OMPI_MCA_btl=^openib,ofi`,
+`OMPI_MCA_mtl=^ofi`). Without them, on Trillium's InfiniBand, every
+rank printed `unknown link speed` warnings on its standard output, and
+`mpiexec` between nodes hung. Nibi and Fir load `StdEnv/2023` by
+default, in jobs as well, so there the line changes nothing; Trillium
+loads no `StdEnv` by default, submits every job with `--export=NONE`,
+so that nothing set before `sbatch` reaches the job, and mounts `/home` read-only on its compute
+nodes, which have no internet: instantiate and precompile on a login
+node, whose CPUs are those of the compute nodes, before the job runs.
 
 The Alliance's own `julia/1.13.0` module was not tried: it needs
 `StdEnv/2026`, whose Open MPI is a different one and would need a
