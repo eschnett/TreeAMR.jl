@@ -129,9 +129,10 @@ binary MPIPreferences selects for the load path: MPICH_jll by default
 (CI), MPIABI_jll here, which a `LocalPreferences.toml` in the global
 v1.13 environment selects — with
 `setenv(cmd, mpiexec().env)`, since interpolating `mpiexec()` into a
-larger command drops its library paths. On its own (about 2 min here,
-where both jobs start beside the serial reference, and about 4 on CI's
-one-after-the-other path):
+larger command drops its library paths. The serial reference runs in a
+process of its own too (`CODE.md`, "Tests"). On its own (about 2 min
+here, where the reference and both jobs start at once, and about 4 on
+CI's one-after-the-other path):
 
 ```bash
 julia --project=test test/runtests.jl mpi_tests

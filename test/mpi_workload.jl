@@ -21,8 +21,9 @@
 # separately by `mpi_tests.jl`.
 #
 # Without the argument `mpi` the forests are serial, which is the
-# reference; `mpi_tests.jl` runs it in its own process, into an
-# `IOBuffer` it defines as `WORKLOAD_IO`. Deliberately self-contained —
+# reference; `mpi_tests.jl` runs it in a process of its own, like the
+# ranks, so that both run the same compiled code (the `packages` line at
+# the end says why). Deliberately self-contained —
 # its own RK4 and SSPRK3, no ODE package, no test helpers — so that a
 # rank starts in seconds. From step 4 of M7 on it regrids too: the
 # leaves and the transferred arrays after every regrid are digested
@@ -52,9 +53,7 @@ USE_MPI && MPI.Init()
 const COMM = USE_MPI ? MPI.COMM_WORLD : nothing
 const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
-const OUT = isdefined(@__MODULE__, :WORKLOAD_IO) ? WORKLOAD_IO : stdout
-
-emit(words...) = (RANK == 0 && println(OUT, join(words, " ")); nothing)
+emit(words...) = (RANK == 0 && println(join(words, " ")); nothing)
 
 digest(bytes::AbstractVector{UInt8}) = bytes2hex(sha256(bytes))[1:32]
 digest(v::Vector{<:AbstractFloat}) = digest(reinterpret(UInt8, v))
@@ -1373,6 +1372,25 @@ const OPS4B = Operators(prolongation=4, restriction=4, bounded=true)
 const OPSCS = Operators(family=Conservative, prolongation=3, restriction=2,
                         vertex_prolongation=4)
 
+# The packages this process loaded, which the reference and the ranks
+# must share. A package image can carry its own compiled copy of a Base
+# function, built for the image's CPU target, and once loaded that copy
+# runs in place of the system image's: FastPower's carries `hypot`, which
+# picks its algorithm by whether the target has an FMA, and an image
+# built for `generic;znver2,clone_all;znver4,clone_all` runs its generic
+# clone on an Intel CPU. A reference that had loaded FastPower (through
+# OrdinaryDiffEq, in the test process) differed from the ranks in the
+# last bit of `hypot` on Symmetry's H200 nodes ("Distributed meshes" in
+# HISTORY.md). So the reference runs in a process like the ranks', and
+# this line, compared like the others, fails if it did not; the `#` line
+# names the packages.
+function packages()
+    names = sort!([id.name for id in keys(Base.loaded_modules)])
+    emit("packages", length(names), digest(join(names, " ")))
+    emit("# packages", join(names, " "))
+    return nothing
+end
+
 function main()
     emit("# ranks", NRANKS)
     # D = 1: two leaves on a periodic line, so a third rank has no blocks;
@@ -1515,6 +1533,7 @@ function main()
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     refusals()
     verbs()
+    packages()
     return nothing
 end
 

@@ -25,12 +25,19 @@
 # glue that differs on one rank — and prints
 # digests of the leaves, of the state and of the working arrays *with
 # their ghosts*, gathered in block order, after every regrid, the exact
-# reductions and the floating-point sums. Run serially in this
-# process it is the reference; run under `mpiexec` at two and three
+# reductions and the floating-point sums. Run serially in a process of
+# its own it is the reference; run under `mpiexec` at two and three
 # ranks it must print the same lines, byte for byte, except the sums,
 # which are promised to roundoff only ("Reductions" under "Distributed
 # meshes" in CODE.md). A ghost that came from the wrong rank, the wrong
-# slot or the wrong stage changes a digest.
+# slot or the wrong stage changes a digest. The reference is not run in
+# this process: the test files before it have loaded packages the ranks
+# never load, and a package image can bring its own compiled copy of a
+# Base function, which then runs in place of the system image's. On
+# Symmetry's H200 nodes FastPower's, built for a generic CPU, made
+# `hypot` differ in the last bit (2026-11-17; `packages` in
+# `mpi_workload.jl`, whose `packages` line fails if the reference and the
+# ranks loaded different packages).
 #
 # The ranks run one thread each: a CI runner has three or four cores,
 # and MPICH polls while it waits, so two threads a rank at three ranks
@@ -44,13 +51,13 @@
 # The checkpoints, with their cross loads between rank counts, are
 # TreeIOHDF5's, and its own MPI test runs them. Where the jobs start is
 # `mpi_jobs.jl`'s: at the start of the suite where
-# the machine has room for both jobs beside it. Otherwise both start
-# here, beside the serial reference, where there is room for them (this
-# file run on its own on a large machine), or one after the other, each
-# after the run before it, where there is not (a CI runner). There the
-# three ranks of about 2.4 GB each compiling beside the reference and
-# the suite's own process outgrew a 7 GB macOS runner, and the job missed
-# its 900 s deadline on Julia 1.13 (on `main` on 2026-10-04, and in the
+# the machine has room for the three jobs beside it. Otherwise they all
+# start here, at once where there is room for them (this file run on its
+# own on a large machine), or one after the other, each after the run
+# before it, where there is not (a CI runner). There the three ranks of
+# about 2.4 GB each compiling beside the reference and the suite's own
+# process outgrew a 7 GB macOS runner, and the job missed its 900 s
+# deadline on Julia 1.13 (on `main` on 2026-10-04, and in the
 # copy-kernel change's CI on 2026-10-06); one at a time costs the
 # reference's minute or two of wall clock and keeps the three ranks from
 # competing with it on one runner. On fewer than four CPU threads — the
@@ -86,16 +93,6 @@ function workload_mismatches(ref, out; rtol=1e-12)
     return bad
 end
 
-# The serial reference, in this process: the script in a module of its
-# own, printing into a buffer it finds there.
-function serial_workload()
-    m = Module(:MPIWorkloadSerial)
-    io = IOBuffer()
-    Core.eval(m, :(const WORKLOAD_IO = $io))
-    Base.include(m, MPI_WORKLOAD)
-    return String(take!(io))
-end
-
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
@@ -105,19 +102,20 @@ end
     three_ranks() || @info "Skipping the MPI workload at -n 3 on " *
                            "$(Sys.CPU_THREADS) CPU threads; set " *
                            "TREEAMR_TEST_MPI_THREE=1 to run it"
+    reference = early !== nothing ? early.serial : launch_workload(0)
     three = early !== nothing ? early.three :
             room && three_ranks() ? launch_workload(3) : nothing
     two = early !== nothing ? early.two :
           room ? launch_workload(2) : nothing
-    serial = try
-        serial_workload()
-    catch
-        foreach(j -> j === nothing || kill(j.proc), (three, two))
-        rethrow()
-    end
+    serial = finish_workload(reference; others=Tuple(filter(!isnothing, [three, two])))
     three === nothing && three_ranks() && (three = launch_workload(3))
     lines = workload_lines(serial)
     @test first(lines) == "# ranks 1"
+    # The packages the reference loaded, compared with the ranks' below:
+    # the workload's own and their dependencies, none of the suite's.
+    @test count(startswith("packages "), lines) == 1
+    @test !occursin(r" (Test|OrdinaryDiffEq\w*|IMEXRungeKutta)( |$)",
+                    only(filter(startswith("# packages "), lines)))
     @test count(l -> occursin(" state ", l), lines) >= 7
     @test count(l -> occursin(" filled ", l), lines) >= 13
     @test any(l -> startswith(l, "B2 conserved true"), lines)

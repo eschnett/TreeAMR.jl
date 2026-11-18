@@ -6160,18 +6160,28 @@ mailbox for messages) for `regrid!`, `adapt_to_initial_data!`, the
 per-rank buffer search and the refusals, and its `StagingCommunicator`
 for the host-mirror path; `interpolate_exchange_tests.jl` over the same
 for routed interpolation. **Over MPI**, `mpi_tests.jl` runs the
-standalone `mpi_workload.jl` serially in process (the reference) and
-under `MPI.mpiexec()` at `-n 3` and `-n 2`, one thread a rank, and
-requires every line byte for byte except the `sum` lines (`rtol =
-1e-12`); `#` lines depend on the rank count and carry the refusals,
-the migrations and the negative control,
-each asserted on its own. The launches are compilation-bound (about
-55 s each), so `test/mpi_jobs.jl` starts both at the start of the
-suite where the machine has room (`concurrent_launches`: 8+ threads and
-24+ GB, or `TREEAMR_TEST_MPI_CONCURRENT=0/1`), and otherwise runs the
-serial reference, the three-rank job and the two-rank job one after the
-other (the three ranks beside the reference outgrew CI's 7 GB macOS
-runners and timed out). On fewer than four CPU threads
+standalone `mpi_workload.jl` serially in a process of its own (the
+reference) and under `MPI.mpiexec()` at `-n 3` and `-n 2`, one thread a
+rank, and requires every line byte for byte except the `sum` lines
+(`rtol = 1e-12`); `#` lines depend on the rank count and carry the
+refusals, the migrations and the negative control,
+each asserted on its own. The reference does not run in the test
+process: a comparison across processes needs processes that loaded the
+same packages, since a package image can carry its own compiled copy of
+a Base function, built for the image's CPU target, which then runs in
+place of the system image's. FastPower's `hypot`, from a cache built for
+a generic CPU, made the reference differ from the ranks in the last bit
+on Symmetry's H200 nodes once the test process had loaded it through
+OrdinaryDiffEq ([HISTORY.md](HISTORY.md#distributed-meshes)). The
+workload's last compared line, `packages`, is a digest of the names of
+the packages it loaded, and fails if they differ. The launches are
+compilation-bound (about 55 s each), so `test/mpi_jobs.jl` starts all
+three at the start of the suite where the machine has room
+(`concurrent_launches`: 8+ threads and 24+ GB, or
+`TREEAMR_TEST_MPI_CONCURRENT=0/1`), and otherwise runs the reference,
+the three-rank job and the two-rank job one after the other (the three
+ranks beside the reference outgrew CI's 7 GB macOS runners and timed
+out). On fewer than four CPU threads
 (`three_ranks`, or `TREEAMR_TEST_MPI_THREE=0/1`) the three-rank job is
 skipped: on CI's 3-vCPU macOS runners three ranks got less than one
 core between them and missed the 900 s deadline even alone, while two
@@ -6388,11 +6398,11 @@ These files are not tests:
   and the cubed sphere's element set, each filled and hooked through
   `WithPatch`; a `#` line counts the transfers each rank receives across
   a glue, and the refusals include a forest glued otherwise on one rank
-  only, which only the digest's glue term tells apart. `mpi_tests.jl` also runs
-  it in process, in a module of its own, printing into the `IOBuffer`
-  it defines as `WORKLOAD_IO`.
-- `mpi_jobs.jl` — the launcher of those `mpiexec` jobs
-  (`launch_workload`, `finish_workload`, `concurrent_launches`), which
+  only, which only the digest's glue term tells apart. Without `mpi` it
+  is the serial reference, which `mpi_tests.jl` runs in a process of its
+  own, like the ranks; its last line names the packages it loaded.
+- `mpi_jobs.jl` — the launcher of those jobs, the serial reference among
+  them (`launch_workload`, `finish_workload`, `concurrent_launches`), which
   `runtests.jl` includes before the first test so that the jobs can
   start early, in the process that runs `mpi_tests.jl`.
 - `helpers/` — the definitions of eleven test files (`ghost`, `centering`,
