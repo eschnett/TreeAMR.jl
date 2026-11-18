@@ -13,7 +13,7 @@
 #
 # In a scratch environment that develops this checkout and adds MPI,
 # KernelAbstractions, SHA and the device package (Metal here, CUDA on
-# Symmetry; see `bench/symmetry_mpi_gpu.sh`):
+# a cluster; see `jobs/mpi-gpu.toml`):
 #
 #     TREEAMR_TEST_BACKEND=metal julia --project=<env> test/mpi_device_tests.jl
 #     TREEAMR_TEST_BACKEND=cuda TREEAMR_TEST_RANKS="2 4" \

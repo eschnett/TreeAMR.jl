@@ -242,44 +242,59 @@ windows (`bench/affinity.jl` explains why). Best-of timings of
 independent processes overstate what they get together.
 
 `bench/interpolate.jl` times point interpolation (M11) on the horizon
-finder's batch and larger ones, on any backend; `bench/symmetry_interpolate.sh
-cpu|cuda` runs it on Symmetry across thread counts and NUMA placements, or
-on an H200. `HISTORY.md`'s M11 entry has the numbers.
+finder's batch and larger ones, on any backend; `jobs/interpolate.toml`
+runs it on Symmetry across thread counts and NUMA placements,
+`jobs/interpolate-cuda.toml` on an H200. `HISTORY.md`'s M11 entry has the
+numbers.
 
 `bench/copies.jl` times `scatter!`, `gather!` and `fill_ghosts!` per
 owned point and in TB/s against a linear copy, at the downstream
 TreeGeneralizedHarmonic's sizes by default (uniform, 20 variables, `G =
 3`, vertex-centered); `bench/copy_index.jl` prices seven ways of forming
 the scatter's index; `bench/copy_groups.jl` times the fill group by
-group, flat against shaped. `bench/symmetry_copies.sh` runs all three on
-an H200 for a baseline checkout beside this one (`TREEAMR_BASE`,
-`TREEAMR_COPIES_STAGES`), then the suite on CUDA. `CODE.md`'s "The copy
-kernels on a device" has the numbers.
+group, flat against shaped. `jobs/copies.toml` runs all three on an
+H200 for a baseline (a variant of the study) and this checkout, then the
+suite on CUDA. `CODE.md`'s "The copy kernels on a device" has the
+numbers.
 
 `bench/fold.jl` times the folds over points (M15) against the one-number
 reductions they replace, at TreeGeneralizedHarmonic's analysis sizes by
 default (its quadrant refined about the origin, 22 variables, `32³`,
-vertex-centered); `bench/symmetry_fold.sh` runs it, then the suite, on an
-H200. `HISTORY.md`'s M15 entry has the numbers.
+vertex-centered); `jobs/fold.toml` runs it, then the suite, on an H200,
+or on the laptop's Metal. `HISTORY.md`'s M15 entry has the numbers.
 
 `bench/nested.jl` times the ghost fill of the downstream's nested mesh
 (eschnett/TreeGeneralizedHarmonic.jl#11) stage by stage and rank by
 rank, serially or under `MPI.mpiexec()`, and counts each prolongation
-message's coarse footprint; `bench/symmetry_nested.sh` runs it for
-several checkouts in one job (`TREEAMR_NESTED_VERSIONS`,
-`TREEAMR_NESTED_STAGES`), on an AMD node with the compile-timing
-comparison of `test/mpi_workload.jl`, or through
-`bench/symmetry_nested_gpu.sh` on H200s. `bench/partition_cost.jl`
+message's coarse footprint; `jobs/nested.toml` runs it for a baseline
+and this checkout in one job, on an AMD node with the compile-timing
+comparison of `test/mpi_workload.jl`, and `jobs/nested-gpu.toml` on
+H200s, both printing their tables through `bench/nested_tables.sh`.
+`bench/partition_cost.jl`
 counts what candidate ownership rules would cost the fill, timing
 nothing. `HISTORY.md`'s M13 entry has the numbers.
 
-The Symmetry jobs write SimWatch status files through `bench/simwatch.sh`
-(`simwatch_begin DIR NAME NSTAGES`, `simwatch_stage MESSAGE`, an exit
-trap for `finished`/`failed`, a 60 s heartbeat; `simwatch_queued` on the
-submit side), into `$SLURM_SUBMIT_DIR/$SLURM_JOB_NAME-$SLURM_JOB_ID`, so
-`simwatch <submit dir>` on Symmetry shows them; `bench/symmetry_copies.sh`
-is the first to use it. Give a new job script the same few lines, and
-never point a new job at a directory or environment a running job uses.
+Cluster jobs are SimLaunch job specs in `jobs/` (`~/src/jl/SimLaunch`:
+its `SPEC.md` has every key, its `CONVERTING.md` the way from a batch
+script). SimLaunch snapshots the checkout, builds and precompiles the
+environments on the site (`env = "test+cuda"` and the like; a baseline
+checkout is a variant), writes the batch script with a SimWatch file per
+run, and prints the tables of a spec's `[after]` command into the job's
+log. Submitting is visible to others: ask Erik first, each time. So is
+cancelling: cancel a SimLaunch job with `simlaunch cancel`, never a
+plain `scancel`, which leaves SimWatch showing its runs as lost.
+
+```bash
+simlaunch snapshot . --study <study> --variant base=<baseline checkout>
+simlaunch prepare <study> --site symmetry --spec jobs/nested.toml
+simlaunch submit <study> jobs/nested.toml --site symmetry --dry-run
+simlaunch cancel <study> jobs/nested.toml --site symmetry --message "<why>"
+```
+
+`bench/symmetry_numa.sh` and `bench/symmetry_affinity.sh` are the only
+hand-written batch scripts left; they have no spec (`HISTORY.md`,
+"Development environment and CI", *Cluster jobs*, says why and has the
+retired scripts). A new cluster job is a spec.
 
 `bench/mpi.jl` is M7's weak-scaling smoke test: a fixed number of blocks
 per rank (`TILES` stacked tiles, one a rank), timed in synchronized
@@ -297,14 +312,16 @@ TREEAMR_BENCH_N=8 bench/mpiscan.sh 1 2 4
 julia -t 4 --project=test bench/replicated.jl 8 64 512
 ```
 
-Two SLURM jobs hold the M7 measurements, both run on 2026-10-02:
-`bench/symmetry_mpi.sh` (weak scaling, one rank per NUMA domain at 8
-threads, 1–4 nodes, plus single-process controls) and
-`bench/symmetry_mpi_gpu.sh` (`mpi_device_tests.jl` on H200s,
-staged and, with a CUDA-aware system MPI, direct). Each launches
-MPICH_jll through `srun --mpi=pmi2` by default or a system MPI through
-MPIPreferences (`TREEAMR_MPI=system TREEAMR_MPI_MODULE=…`). The
-checkpoint jobs and benchmarks moved to TreeIOHDF5's `bench/`.
+Two jobs hold the M7 measurements, both first run on 2026-10-02 as
+hand-written scripts:
+`jobs/mpi.toml` (weak scaling, one rank per NUMA domain at 8 threads,
+1–4 nodes, plus single-process controls, under SimLaunch's default MPI,
+HPC-X through mpi_abi_wrapper; `mpi = "jll"` takes MPICH_jll) and
+`jobs/mpi-gpu.toml` (`mpi_device_tests.jl` and `bench/mpi.jl` on four
+GPUs, staged and direct, under the default MPI only, so that it runs on
+Symmetry's H200s and on Trillium's H100s alike). A spec names a recipe
+only to compare MPI libraries. The checkpoint jobs and
+benchmarks moved to TreeIOHDF5's `bench/`.
 
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and

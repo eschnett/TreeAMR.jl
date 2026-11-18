@@ -1,0 +1,56 @@
+# The M6 acceptance run on an H200: the test suite against CUDA, in
+# Float64 and Float32, then the kernel benchmarks on the device and the
+# same on the node's host cores for the comparison.
+#
+# `HISTORY.md`'s M6 entry asks for "M3 convergence results reproduced on
+# GPU; kernel benchmarks", and it names CUDA. A Mac's Metal backend
+# answers the Float32 half of that locally and quickly, but it has no
+# hardware fp64, so the Float64 claim can only be made here.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/gpu.toml
+#     simlaunch submit <study> jobs/gpu.toml --site symmetry
+name = "gpu"
+env = "test+cuda"                   # the suite's dependencies, and CUDA
+
+[site.symmetry]                     # one H200 and its 8 host cores
+time = "1:00:00"
+resources = { gpus = 1 }
+
+# The suite's own Float64/Float32 sweep runs on the device: `gpu_tests.jl`
+# asks the backend which types it supports, and an H200 supports both.
+# The MPI test launches mpiexec inside the allocation: Hydra forks the
+# ranks rather than asking Slurm for a step, and the jobs run one after
+# the other.
+[[run]]
+label = "tests"
+cmd = "test/runtests.jl"
+threads = 8
+vars = { TREEAMR_TEST_BACKEND = "cuda", TREEAMR_TEST_MPI_CONCURRENT = "0", HYDRA_BOOTSTRAP = "fork" }
+
+[[run]]
+label = "bench-cuda-Float64"
+cmd = "bench/gpu.jl"
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_T = "Float64", TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "bench-cuda-Float32"
+cmd = "bench/gpu.jl"
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_T = "Float32", TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }
+
+# The same sizes and phases on the host, so that the outputs read side by
+# side; pages interleaved, which M5 measured as worth 2-6x on this node
+# type and which the library cannot set for itself.
+[[run]]
+label = "bench-cpu-Float64"
+cmd = "bench/gpu.jl"
+prefix = "numactl --interleave=all"
+vars = { TREEAMR_BENCH_BACKEND = "cpu", TREEAMR_BENCH_T = "Float64", TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "bench-cpu-Float32"
+cmd = "bench/gpu.jl"
+prefix = "numactl --interleave=all"
+vars = { TREEAMR_BENCH_BACKEND = "cpu", TREEAMR_BENCH_T = "Float32", TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }

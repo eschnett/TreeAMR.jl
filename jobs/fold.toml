@@ -1,0 +1,43 @@
+# Folds over points on an H200 ("Folds over points" in CODE.md):
+# `bench/fold.jl` at the downstream's sizes, a fold of 126 and of 161
+# numbers against the one-number reductions it replaces, then the test
+# suite on the device.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/fold.toml
+#     simlaunch submit <study> jobs/fold.toml --site symmetry
+#
+# `submit --run n32 --run n16` leaves the suite out. On the
+# laptop, `--site local --run n16` runs the smaller mesh in Float32
+# on Metal.
+name = "fold"
+threads = 8
+
+[site.symmetry]                     # one H200
+time = "1:00:00"
+resources = { gpus = 1 }
+env = "test+cuda"                   # the suite's dependencies, and CUDA
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_TEST_BACKEND = "cuda" }
+
+[site.local]                        # a Mac's GPU
+env = "test+metal"
+vars = { TREEAMR_BENCH_BACKEND = "metal", TREEAMR_BENCH_T = "Float32", TREEAMR_TEST_BACKEND = "metal" }
+
+# The downstream's mesh at 32³ (842 blocks, 8.8 GB) and at 16³.
+[[run]]
+label = "n32"
+cmd = "bench/fold.jl"
+vars = { TREEAMR_BENCH_N = "32" }
+
+[[run]]
+label = "n16"
+cmd = "bench/fold.jl"
+vars = { TREEAMR_BENCH_N = "16" }
+
+# The MPI test launches mpiexec inside the allocation: Hydra forks the
+# ranks rather than asking Slurm for a step, and the jobs run one after
+# the other.
+[[run]]
+label = "tests"
+cmd = "test/runtests.jl"
+vars = { TREEAMR_TEST_MPI_CONCURRENT = "0", HYDRA_BOOTSTRAP = "fork" }

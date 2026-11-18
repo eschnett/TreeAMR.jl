@@ -2108,8 +2108,8 @@ EPYC 7532, a slower node than the one above, Symmetry job 579510,
 2026-10-20, three alternating runs each, the workload's output
 identical).
 
-**What it buys on an H200** (job 570290, `bench/copies.jl` from
-`bench/symmetry_copies.sh`: a uniform periodic mesh, 20 variables,
+**What it buys on an H200** (job 570290, `bench/copies.jl`, now run
+by `jobs/copies.toml`: a uniform periodic mesh, 20 variables,
 `G = 3`, vertex-centered, `Float64`; 0.1.7 measured in the same job
 reproduces the downstream's numbers to the digit):
 
@@ -4687,7 +4687,7 @@ entries per volume.
   host instead of recomputing it, since the reduction is what is under
   test, not the transcendental.
 
-  *Measured on the H200* (`bench/symmetry_gpu.sh`, job 562304 on
+  *Measured on the H200* (the job `jobs/gpu.toml` now runs, job 562304 on
   Symmetry, 2026-09-23, at release 0.1.2; the same 960 blocks of `32^3`,
   31.5M cells, `Float64`, and the same node's 16 cores under
   `numactl --interleave=all` as the M6 table). The suite passed on CUDA
@@ -5564,13 +5564,16 @@ The first measurement of what an MPI test costs, from before M7 was built, is in
 **Performance work left for later** **(open)** (each item is to be measured
 before it is built):
 
-- *The H200 re-measurement of the staged regrid with the pool* is
-  pending: `bench/symmetry_mpi_gpu.sh`'s `bench/mpi.jl` over CUDA at 2
-  and 4 ranks, staged against direct, against step 8's 25.4 / 48.0 ms
-  staged and 7.1 / 8.7 ms direct. The pool's local effect (step 8) says
-  nothing about `cuMemHostRegister`, which neither the CPU nor Metal
-  calls, so whether the 40 ms were the page-locking is still the
-  untraced guess it was.
+- *The staged regrid with the pool* costs about 4 ms more than the
+  direct one at 4 ranks. `jobs/mpi-gpu.toml` on four H100s (Trillium,
+  2026-11-18) gives the two-level refinement 9.3 / 13.2 ms staged and
+  6.8 / 8.8 direct at 2 / 4 ranks, against M7 step 8's 25.4 / 48.0
+  staged on H200s before the pool. So the pool removed most of it,
+  which fits the page-locking guess but does not trace it. Whether
+  the remaining 4 ms are worth removing, and an H200 run of the same
+  spec, are open
+  ([HISTORY.md](HISTORY.md#development-environment-and-ci), *Cluster
+  jobs*, the fourth run).
 - *The pool's own rules.* It never shrinks: a forest keeps about one
   live schedule's and one regrid stage's buffers, free between regrids.
   A rule that drops buffers unused for some regrids, or a pool shared

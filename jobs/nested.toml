@@ -1,0 +1,291 @@
+# The nested-mesh ghost fill on one AMD node (`bench/nested.jl`, the mesh
+# of eschnett/TreeGeneralizedHarmonic.jl#11), for a baseline and this
+# checkout in the same job, run after run, so that the two differ only in
+# the package. The baseline is a variant of the study; every run uses the
+# study's own bench and test files, so a version whose workload gained a
+# case is not charged for compiling it.
+#
+#     simlaunch snapshot . --study <study> --variant base=<baseline checkout>
+#     simlaunch prepare <study> --site symmetry --spec jobs/nested.toml
+#     simlaunch submit <study> jobs/nested.toml --site symmetry
+#
+# Three stages, by the labels' first word (`submit --run` picks runs):
+#
+# - `compile-`: the `--trace-compile-timing` comparison of
+#   `test/mpi_workload.jl`, serial on domain 0, three runs of each version
+#   (CLAUDE.md's rule for a change to a launch path). The tables sum the
+#   compile times from the trace in each run's `output.log` and compare the
+#   rest of the outputs line for line.
+# - `ghosts-`: `bench/ghosts.jl`, cell-centered (where the single-tap
+#   columns of M13 change nothing: the control), on domain 0 at 1 and 8
+#   threads.
+# - `fill-`: `bench/nested.jl` at `N = 16` over 1, 2 and 4 ranks of one
+#   thread and 8 ranks of 8 threads, rank `i` of `R` on NUMA domain
+#   `i · 8 / R` and on that domain only (`domains_per_rank = 1`, as
+#   M13's tables had it), under the site's default MPI recipe (on Symmetry HPC-X's
+#   Open MPI through mpi_abi_wrapper, started by its `mpiexec`).
+#
+# Each configuration runs in two rounds, the versions in the other order
+# in the second (three for the compile timing). The `[after]` command
+# prints the tables (`bench/nested_tables.sh`): each quantity's minimum
+# per version, and each version against the first. For more versions,
+# add variants and runs; the version is the label's second word.
+# `jobs/nested-gpu.toml` is the same on H200s.
+name = "nested"
+env = "test"                        # SHA and MultiFloats, for the compile workload
+domains_per_rank = 1                # one domain a rank at any rank count; serial runs on domain 0
+vars = { TREEAMR_BENCH_N = "16" }
+
+[site.symmetry]                     # 64 cores in 8 NUMA domains
+time = "1:00:00"
+resources = { nodes = 1 }
+
+[after]
+cmd = 'bash "$PROJECT"/bench/nested_tables.sh "$SPEC" $SIMLAUNCH_JOBDIRS'
+
+# The compile timing of test/mpi_workload.jl, serial, on domain 0.
+
+[[run]]
+label = "compile-base-1"
+variant = "base"
+threads = 1
+placement = "numa"
+julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
+cmd = "test/mpi_workload.jl"
+
+[[run]]
+label = "compile-new-1"
+threads = 1
+placement = "numa"
+julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
+cmd = "test/mpi_workload.jl"
+
+[[run]]
+label = "compile-new-2"
+threads = 1
+placement = "numa"
+julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
+cmd = "test/mpi_workload.jl"
+
+[[run]]
+label = "compile-base-2"
+variant = "base"
+threads = 1
+placement = "numa"
+julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
+cmd = "test/mpi_workload.jl"
+
+[[run]]
+label = "compile-base-3"
+variant = "base"
+threads = 1
+placement = "numa"
+julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
+cmd = "test/mpi_workload.jl"
+
+[[run]]
+label = "compile-new-3"
+threads = 1
+placement = "numa"
+julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
+cmd = "test/mpi_workload.jl"
+
+# bench/ghosts.jl on domain 0, at 1 and 8 threads.
+
+[[run]]
+label = "ghosts-base-p4-r1"
+variant = "base"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "4", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-base-p6-r1"
+variant = "base"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "6", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-new-p4-r1"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "4", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-new-p6-r1"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "6", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-new-p4-r2"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "4", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-new-p6-r2"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "6", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-base-p4-r2"
+variant = "base"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "4", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+[[run]]
+label = "ghosts-base-p6-r2"
+variant = "base"
+threads = [1, 8]
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_P = "6", TREEAMR_BENCH_VARS = "20" }
+cmd = "bench/ghosts.jl"
+
+# bench/nested.jl, one rank per NUMA domain.
+
+[[run]]
+label = "fill-base-1x1-r1"
+variant = "base"
+ranks = 1
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-1x1-r1"
+ranks = 1
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-2x1-r1"
+variant = "base"
+ranks = 2
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "2x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-2x1-r1"
+ranks = 2
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "2x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-4x1-r1"
+variant = "base"
+ranks = 4
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "4x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-4x1-r1"
+ranks = 4
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "4x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-8x8-r1"
+variant = "base"
+ranks = 8
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "8x8" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-8x8-r1"
+ranks = 8
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "8x8" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-1x1-r2"
+ranks = 1
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-1x1-r2"
+variant = "base"
+ranks = 1
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-2x1-r2"
+ranks = 2
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "2x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-2x1-r2"
+variant = "base"
+ranks = 2
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "2x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-4x1-r2"
+ranks = 4
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "4x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-4x1-r2"
+variant = "base"
+ranks = 4
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "4x1" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-8x8-r2"
+ranks = 8
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "8x8" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-8x8-r2"
+variant = "base"
+ranks = 8
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_LABEL = "8x8" }
+cmd = "bench/nested.jl mpi"

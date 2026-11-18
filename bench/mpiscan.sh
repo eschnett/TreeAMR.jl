@@ -12,8 +12,8 @@
 #     TREEAMR_BENCH_N=8 TREEAMR_BENCH_THREADS=2 bench/mpiscan.sh 1 2 4
 #
 # is a laptop-sized scan. TREEAMR_BENCH_PROJECT chooses the environment
-# (default test, which has MPI); on a cluster, bench/symmetry_mpi.sh
-# launches through srun instead and uses the same table.
+# (default test, which has MPI); on a cluster, jobs/mpi.toml launches
+# through the site's MPI instead and uses the same table.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 project=${TREEAMR_BENCH_PROJECT:-test}
