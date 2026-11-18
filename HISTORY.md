@@ -617,6 +617,56 @@ in-process. CI runners have three or four cores, while `-n 3` at two
 threads wants six, and MPICH polls while it waits; on CI the ranks
 should therefore run one thread each.
 
+**The serial reference left the test process** (2026-11-17 and 18,
+Erik's choice). SimLaunch's first Symmetry run of the suite on CUDA
+(study `jobs1`, jobs 601143–601145 on the H200 node cn111, a Xeon Gold
+6442Y, Sapphire Rapids, 2026-11-16) failed "A distributed run prints
+what a serial run prints" in all three jobs, on `L2 physical` and `L2
+positions`, M19's located batch through the workload's polar atlas
+(`f81c8f…` and `acd953…` in the reference, `121a9b…` and `0e8e57…` at
+two and three ranks, on the laptop, and on CI). A probe of the case
+(`located_case("L2")` with the atlas's steps written out point by
+point) found Base's `hypot`, `atan`, `mod`, `sin` and `cos` bit for bit
+the same on the laptop and on the Intel login nodes of Symmetry (Cascade
+Lake) and Nibi (Sapphire Rapids) in a fresh process, and on a Nibi
+Granite Rapids node (job 27630282) fresh, at one and eight threads,
+with and without the rest of the workload, and after the five test
+files that precede `mpi_tests` in its group, together and one at a
+time. The difference was the depot: the study's held caches compiled
+with `JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all"` for
+its AMD jobs, which an Intel CPU loads as their generic x86-64 clone,
+without an FMA, and `Pkg.precompile` took them as valid and built no
+native ones. FastPower 1.5.1's precompile workload computes
+`fastpower(ComplexF64(1.25), 2.0)`, which reaches `hypot(::Float64,
+::Float64)` through `abs`, so its image carries a compiled `hypot` of
+its own; once loaded it runs in place of the system image's, through
+dispatch and from freshly compiled callers alike, and `hypot` chooses
+its algorithm by `Core.Intrinsics.have_fma`: correctly rounded with an
+FMA, within an ulp without. The test process loads FastPower through
+OrdinaryDiffEq for `imex_tests.jl`; the ranks never do. With every cache
+in a scratch depot built for that target, on Symmetry's login node,
+the probe after `imex_tests` printed cn111's two digests and without it
+the laptop's, and a bisection of OrdinaryDiffEqLowOrderRK's 89
+dependencies by prefix named FastPower. Of the five functions only
+`hypot` changed.
+
+Three fixes were weighed. Comparing the case to roundoff, as the `NaN`
+order of 2026-10-22 was settled, would loosen the one claim the test
+makes. Writing the atlas from correctly rounded operations only (a
+rational parametrization of the quarter circles) would fix this case
+and leave every other case's initial data, through `sin`, `cos`, `exp`
+and `tanh`, open to the same mechanism. Erik chose the third: the
+reference runs in a process of its own, launched like the ranks with the
+test process's flags and project, beside them where there is room and
+first where there is not, and the workload ends with a compared
+`packages` line, a digest of the names of the packages it loaded, with
+a `#` line listing them. The in-process reference would have failed that
+line on every machine, since the test process has loaded `Test` and the
+suite's other packages. The reference compiled the workload alone in
+78 s and 1.9 GB on the laptop; it no longer reuses what the test files
+before it compiled. That the study's depot runs generic code on the
+H200 nodes went to SimLaunch.
+
 **A partition balanced per class of leaves was built and parked** (M13 step 4, 2026-10-19 and 20). The contiguous split puts a nested mesh's prolongation sources, one stretch of the curve per level, on one or two ranks, and the sender computes. Erik decided to add a balanced partition as an option, `Forest(…; partition = :levels)`, rather than change the default, and chose its rule from the counts of `bench/partition_cost.jl`, which prices candidate owner functions from the serial schedule without timing anything: the face-aware rule, whose class is a level and the kind of prolongation source a leaf is (none, across an edge or corner only, across a face). It was built with an immutable `Partition` per generation in `ForestState`, a new export `ownedleaves`, `blockrange` refusing under the option, a reorder of the flags' gather into curve order, and tests under a round-robin test policy. Timed on Symmetry on 2026-10-20 it balanced the packing and made the fill slower at every rank count, on the CPU and on H200s, because it multiplied the phase-1 halo; Erik parked it the same day. It stays on the branch `eschnett-claude/partition-levels`; the design, the tables and the reasons are in the M13 entry under [Milestones](#milestones), and what is left to try under "Performance work left for later" in [CODE.md](CODE.md#distributed-meshes).
 
 "Performance work left for later" was recorded on 2026-10-02 after the buffer pool; none of it blocked M7. Its item on compression where the data are was added in step 6b.
