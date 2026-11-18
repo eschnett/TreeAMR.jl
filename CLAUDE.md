@@ -323,6 +323,12 @@ Symmetry's H200s and on Trillium's H100s alike). A spec names a recipe
 only to compare MPI libraries. The checkpoint jobs and
 benchmarks moved to TreeIOHDF5's `bench/`.
 
+`bench/collectives.jl` times the collectives `interpolate!` makes, at its
+sizes, in synchronized windows with percentiles; `jobs/collectives.toml`
+runs it on four of Symmetry's nodes under each MPI and collective
+setting, then `bench/mpi.jl` at 32 ranks (`HISTORY.md`, *Cluster jobs*,
+the fifth run).
+
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
 runs in the test environment, which has both:

@@ -1,0 +1,170 @@
+# Why `interpolate!` is slow at 32 ranks on 4 of Symmetry's AMD nodes
+# under HPC-X through mpi_abi_wrapper: 24–25 ms in study `jobs5`, against
+# 8–10 under HPC-X loaded directly (M7) and 3.5–4.1 under MPICH_jll
+# (`jobs2`), while every other phase of `bench/mpi.jl` agreed. The call is
+# one `Allgather` and two rounds of `Alltoall` + `Alltoallv`
+# (`bench/collectives.jl` has the sizes), so the suspects are the
+# collective components HPC-X's Open MPI picks between nodes, HCOLL and
+# UCC, and the wrapper.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/collectives.toml
+#     simlaunch submit <study> jobs/collectives.toml --site symmetry
+#
+# `c-` runs: `bench/collectives.jl`, one thread a rank, one rank a NUMA
+# domain, 8 a node, under
+# - the default recipe (`mpiabi`: HPC-X through mpi_abi_wrapper) as it
+#   is, without HCOLL (`OMPI_MCA_coll_hcoll_enable=0`), without UCC
+#   (`OMPI_MCA_coll_ucc_enable=0`) and without either, which leaves Open
+#   MPI's own `tuned` collectives;
+# - HPC-X loaded directly (`hpcx`), as it is and without HCOLL;
+# - MPICH_jll under `srun` (`jll`);
+# at 32 ranks on 4 nodes, plus the default and MPICH_jll at 16 ranks on 2
+# nodes and the default at 8 on one, where `interpolate!` took 0.9 ms
+# under all three; and the default at 8 threads a rank, as `bench/mpi.jl`
+# runs.
+#
+# `m-` runs: `bench/mpi.jl` itself at `N = 16`, 32 ranks of 8 threads on 4
+# nodes, as `jobs/mpi.toml` runs it, under the default as it is, without
+# HCOLL and without UCC, to see whether `interpolate` follows the
+# collectives.
+#
+# This spec names recipes to compare MPI libraries, so it is Symmetry's.
+# The `[after]` command prints the tables (bench/mpitable.awk: each
+# column against the first, then min and median seconds) and each
+# collectives run's percentile lines.
+name = "collectives"
+env = "test"
+threads = 1
+placement = "numa"
+domains_per_rank = 1
+vars = { TREEAMR_BENCH_REPS = "200" }
+
+[site.symmetry]                     # four nodes of 64 cores in 8 NUMA domains
+time = "1:00:00"
+resources = { nodes = 4 }
+
+[after]
+cmd = '''
+log() { for d in $SIMLAUNCH_JOBDIRS; do case $d in */"$SPEC-$1"/*) echo "$d/output.log" ;; esac; done; }
+table() { awk -F'\t' -f "$PROJECT"/bench/mpitable.awk $(for l in "$@"; do log "$l"; done); }
+echo "## collectives, 32 ranks on 4 nodes, one thread a rank"
+table c-sys-32 c-nohcoll-32 c-noucc-32 c-tuned-32 c-hpcx-32 c-hpcx-nohcoll-32 c-jll-32
+echo "## collectives by rank count: the default and MPICH_jll, and the default at 8 threads"
+table c-sys-8 c-sys-16 c-sys-32 c-jll-16 c-jll-32 c-sys-32-t8
+echo "## bench/mpi.jl, N=16, 32 ranks of 8 threads on 4 nodes"
+table m-sys-32 m-nohcoll-32 m-noucc-32
+for d in $SIMLAUNCH_JOBDIRS; do case $d in */"$SPEC-c-"*) echo "## $d"; grep '^#' "$d/output.log" ;; esac; done
+'''
+
+# bench/collectives.jl at 32 ranks on 4 nodes.
+
+[[run]]
+label = "c-sys-32"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "sys" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-nohcoll-32"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "nohcoll", OMPI_MCA_coll_hcoll_enable = "0" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-noucc-32"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "noucc", OMPI_MCA_coll_ucc_enable = "0" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-tuned-32"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "tuned", OMPI_MCA_coll_hcoll_enable = "0", OMPI_MCA_coll_ucc_enable = "0" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-hpcx-32"
+mpi = "hpcx"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "hpcx" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-hpcx-nohcoll-32"
+mpi = "hpcx"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "hpcx-nh", OMPI_MCA_coll_hcoll_enable = "0" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-jll-32"
+mpi = "jll"
+ranks = 32
+nodes = 4
+vars = { TREEAMR_BENCH_LABEL = "jll" }
+cmd = "bench/collectives.jl"
+
+# The same at fewer nodes, and at 8 threads a rank.
+
+[[run]]
+label = "c-sys-8"
+ranks = 8
+nodes = 1
+vars = { TREEAMR_BENCH_LABEL = "sys8" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-sys-16"
+ranks = 16
+nodes = 2
+vars = { TREEAMR_BENCH_LABEL = "sys16" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-jll-16"
+mpi = "jll"
+ranks = 16
+nodes = 2
+vars = { TREEAMR_BENCH_LABEL = "jll16" }
+cmd = "bench/collectives.jl"
+
+[[run]]
+label = "c-sys-32-t8"
+ranks = 32
+nodes = 4
+threads = 8
+vars = { TREEAMR_BENCH_LABEL = "sys-t8" }
+cmd = "bench/collectives.jl"
+
+# bench/mpi.jl at N = 16, 32 ranks of 8 threads, as jobs/mpi.toml runs it.
+
+[[run]]
+label = "m-sys-32"
+ranks = 32
+nodes = 4
+threads = 8
+vars = { TREEAMR_BENCH_D = "3", TREEAMR_BENCH_ROOTS = "4", TREEAMR_BENCH_REPS = "10", TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "sys" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "m-nohcoll-32"
+ranks = 32
+nodes = 4
+threads = 8
+vars = { TREEAMR_BENCH_D = "3", TREEAMR_BENCH_ROOTS = "4", TREEAMR_BENCH_REPS = "10", TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "nohcoll", OMPI_MCA_coll_hcoll_enable = "0" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "m-noucc-32"
+ranks = 32
+nodes = 4
+threads = 8
+vars = { TREEAMR_BENCH_D = "3", TREEAMR_BENCH_ROOTS = "4", TREEAMR_BENCH_REPS = "10", TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "noucc", OMPI_MCA_coll_ucc_enable = "0" }
+cmd = "bench/mpi.jl mpi"

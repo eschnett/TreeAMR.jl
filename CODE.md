@@ -5592,10 +5592,15 @@ before it is built):
   receive buffer, exposed once per schedule) or GPU-initiated transfers
   (NVSHMEM, NCCL) would let the sender write into the peer's memory
   without a receive.
-- *`interpolate!` at 32 ranks* (step 7, item 4): 8–10 ms against
-  0.6–0.9 at 2–16 ranks under HPC-X's Open MPI, and a median of 9.9 ms
-  already at 16; the HCOLL on/off job (567858) was never collected, and
-  the cause is open.
+- *`interpolate!` at 32 ranks* is not TreeAMR's: it takes 0.8 ms on
+  four of Symmetry's nodes and its collectives 0.15 ms, with or without
+  HCOLL and UCC, but on cn091–cn095 an `alltoallv` with a payload waits
+  10 ms to 2.1 s (InfiniBand's ACK timeout) while payload-free
+  collectives do not, which made M7's 8–10 ms and `jobs5`'s 25 ms
+  (`bench/collectives.jl`, `jobs/collectives.toml`;
+  [HISTORY.md](HISTORY.md#development-environment-and-ci), *Cluster
+  jobs*, the fifth run). Multi-node benchmarks avoid those nodes until
+  the faulty node or link is found.
 - *What only many more ranks will show.* Measured to 32 ranks on four
   nodes and 4 GPUs on one: the replicated forest's memory and its
   `O(nleaves)` completion (20 ms at 32 ranks when every block is a

@@ -5132,7 +5132,8 @@ The third run (study `jobs5`, the MPI specs under that default):
   32 ranks on 4 nodes takes 24–25 ms, against M7's 8–10 under HPC-X
   loaded directly and 3.5–4.1 under MPICH_jll (`jobs2`); at 2 nodes it
   is 0.9 ms in all three. Whether the wrapper costs the collectives at
-  32 ranks what a ping-pong does not show is **(open)**.
+  32 ranks what a ping-pong does not show was the question of the fifth
+  run, below: it does not.
 - `nested.toml` (job 601937, cn103, EPYC 7543): base and new agree
   within 1 % but for the 8×8 locals and unpacks (4 % and 8 %); the
   one-rank fill 608 ms. HPC-X's shared memory is faster than MPICH_jll's
@@ -5187,6 +5188,74 @@ SimLaunch gained `domains_per_rank` (d020f5e); both specs set it to 1,
 which binds rank `i` of `R` to domain `⌊i · 8 / R⌋` alone, as the old
 scripts did, so their earlier tables stand. The dry run's wrappers bound
 0; 0, 4; 0, 2, 4, 6; and 0–7, and refused 8 ranks on a 6-domain node.
+
+The fifth run (study `jobs8`, 2026-11-18, job 605548 on cn106–cn109,
+EPYC 7543, at Erik's request) looked for the 24–25 ms of `interpolate!`
+at 32 ranks. `bench/collectives.jl` times the collectives the call
+makes, with its sizes, and `jobs/collectives.toml` runs it, one thread
+and one NUMA domain a rank, under the default recipe as it is, without
+HCOLL, without UCC and without either, under HPC-X loaded directly with
+and without HCOLL, and under MPICH_jll, then `bench/mpi.jl` itself at
+`N = 16`, 32 ranks of 8 threads, under three of them. **The slowness did
+not come back, under any setting.** Median ms at 32 ranks on 4 nodes,
+200 windows each:
+
+| case | default | no HCOLL | no UCC | neither | HPC-X | HPC-X, no HCOLL | MPICH_jll |
+|---|---|---|---|---|---|---|---|
+| `allgather` 80 B | 0.011 | 0.011 | 0.012 | 0.019 | 0.011 | 0.014 | 0.29 |
+| `alltoallv` 768 B a peer | 0.073 | 0.076 | 0.075 | 0.083 | 0.072 | 0.075 | 1.44 |
+| `interpolate!`'s collectives | 0.154 | 0.155 | 0.157 | 0.169 | 0.153 | 0.152 | 2.94 |
+| the same by `Isend`/`Irecv!` | 0.133 | 0.136 | 0.138 | 0.148 | 0.133 | 0.132 | 3.05 |
+
+No window of the call's collectives took over 5 ms under Open MPI;
+under MPICH_jll, 2 of 200. At 8 threads a rank the numbers are the same.
+`bench/mpi.jl`'s `interpolate` took 0.81, 0.82 and 0.82 ms (two-level,
+minimum; default, no HCOLL, no UCC), against 25.0 in `jobs5` for the
+same run under the same recipe and commit; every other phase agreed
+with `jobs5` within the usual spread, but for one refinement regrid
+(44 ms against 25–27 in the other two runs). MPICH_jll's 2.9 ms of
+collectives are most of the 3.5–4.1 ms `jobs2` measured for the whole
+call: under MPICH_jll the call is collective-bound, over TCP.
+
+So it is neither the wrapper nor HCOLL nor UCC. What the slow runs share
+is their nodes: M7's 8–10 ms (job 567847) ran on cn092–cn095 and
+`jobs5`'s 25 ms on cn091–cn094, while `jobs2` (cn107–cn110) and this run
+(cn106–cn109) were fast.
+
+**It is those nodes.** The same spec pinned to cn091–cn094 (job 605572,
+EPYC 7532, the same study and code, Erik's request) ran out of its hour
+after three of its runs and part of a fourth, because some windows took
+seconds. What carries no payload stayed as fast as on cn106–cn109 under
+every setting: the barrier 5–8 µs, the 8-byte allreduce 6–9 µs, the
+80-byte allgather 12–20 µs, the 4-byte alltoall 10–21 µs. What carries
+one did not. Median ms under the default recipe as it is, against
+cn106–cn109 (without HCOLL, without UCC and without either the same in
+kind: 10 ms at 64 B a peer, 1.4–2.8 ms at 768 B, 2147 ms at 8 KB):
+
+| case | cn091–cn094 | cn106–cn109 |
+|---|---|---|
+| `alltoallv` 8 B a peer | 0.026 | 0.033 |
+| `alltoallv` 64 B a peer | 10.2 | 0.030 |
+| `alltoallv` 768 B a peer | 2.54 | 0.073 |
+| `alltoallv` 8 KB a peer | 2147 | 0.30 |
+| `alltoallv` 64 KB a peer | 2147 | 1.29 |
+| pairwise 768 B a peer | 9.97 | 0.084 |
+| `interpolate!`'s collectives | 2.95 | 0.154 |
+
+The minimum of most cases was the fast nodes' time; the medians are
+delays added to it. 2.147 s is `4.096 µs × 2¹⁹`, InfiniBand's local ACK
+timeout at exponent 19, so the likeliest reading is a lost packet that
+the reliable-connection transport resends only when that timeout runs
+out, and the 10 ms medians of shorter steps of the same mechanism. That
+is a fault of the fabric at these nodes — a port, a cable or their leaf
+switch — not of Open MPI's collectives, HCOLL, UCC or the wrapper, all
+of which behaved alike. It also explains M7's step-7 table, whose
+32-rank `interpolate` (8–10 ms) ran on cn092–cn095. Which node or link
+drops packets, and whether the 32-rank fill times on these nodes in
+M7 and `jobs5` (about 30 ms) carry some of it, is **(open)**: a
+node-pair ping-pong on cn091–cn095 and the ports' error counters
+would say. Benchmarks on more than one node avoid these nodes until
+then.
 
 ## Releases
 
