@@ -1,0 +1,46 @@
+# The M11 point-interpolation benchmark (`bench/interpolate.jl`) on one
+# AMD node: the thread count scanned with Julia pinning its own threads
+# (`JULIA_EXCLUSIVE=1`, the block-ownership policy placing the working
+# array by first touch), then 64 threads unpinned with pages interleaved,
+# and 8 threads bound to one NUMA domain, its cores and its memory — the
+# three placements CODE.md's NUMA measurements compare. A batch of points
+# is not owned by anyone: whichever thread takes a point reads whichever
+# block holds it, so this is where remote reads would show.
+# `jobs/interpolate-cuda.toml` is the same on an H200.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/interpolate.toml
+#     simlaunch submit <study> jobs/interpolate.toml --site symmetry
+#
+# `pin = true` holds for every run of the job (`JULIA_EXCLUSIVE=1`,
+# `srun --cpu-bind=none`, `-t N,0`: `-t 64` would start 65 threads, which
+# `JULIA_EXCLUSIVE` refuses on 64 cores). The two unpinned runs turn
+# `JULIA_EXCLUSIVE` off again and bind with `numactl` inside the `srun`
+# step; `placement` is refused beside `pin`. The stopgap interpolator
+# that M11 replaced (`TREEAMR_STOPGAP` in the old script) is not part of
+# the project and is left out.
+name = "interpolate"
+pin = true
+
+[site.symmetry]                     # 64 cores in 8 NUMA domains
+time = "1:00:00"
+resources = { nodes = 1 }
+
+[[run]]
+label = "pinned"
+cmd = "bench/interpolate.jl"
+threads = [1, 8, 16, 32, 64]
+
+[[run]]
+label = "interleaved"
+cmd = "bench/interpolate.jl"
+threads = 64
+prefix = "numactl --interleave=all"
+vars = { JULIA_EXCLUSIVE = "0" }
+
+[[run]]
+label = "domain0"
+cmd = "bench/interpolate.jl"
+threads = 8
+prefix = "numactl --cpunodebind=0 --membind=0"
+vars = { JULIA_EXCLUSIVE = "0" }

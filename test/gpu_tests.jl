@@ -14,7 +14,8 @@
 # beside the test environment's own dependencies (`test/Project.toml`).
 # The test environment itself must not gain a device package: CI has no
 # device and would install it on every run for nothing.
-# `bench/symmetry_gpu.sh` builds such an environment for CUDA; for Metal,
+# `jobs/gpu.toml` has SimLaunch build such an environment for CUDA
+# (`env = "test+cuda"`); for Metal,
 # from the repository root:
 #
 #     julia --project=<env> -e 'using Pkg; Pkg.develop(path = ".");
@@ -31,7 +32,7 @@
 # `cuda` and `metal` are recognized. A backend that is named but not
 # functional is reported and skipped rather than failing: the point is
 # to make running on real hardware easy, not to make its absence an
-# error. `bench/symmetry_gpu.sh` does exactly this on Symmetry's H200
+# error. `jobs/gpu.toml` does exactly this on Symmetry's H200
 # partition, which is where the Float64 CUDA numbers come from.
 
 using KernelAbstractions: CPU, get_backend, supports_float64, @kernel, @index

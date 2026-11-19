@@ -617,6 +617,56 @@ in-process. CI runners have three or four cores, while `-n 3` at two
 threads wants six, and MPICH polls while it waits; on CI the ranks
 should therefore run one thread each.
 
+**The serial reference left the test process** (2026-11-17 and 18,
+Erik's choice). SimLaunch's first Symmetry run of the suite on CUDA
+(study `jobs1`, jobs 601143–601145 on the H200 node cn111, a Xeon Gold
+6442Y, Sapphire Rapids, 2026-11-16) failed "A distributed run prints
+what a serial run prints" in all three jobs, on `L2 physical` and `L2
+positions`, M19's located batch through the workload's polar atlas
+(`f81c8f…` and `acd953…` in the reference, `121a9b…` and `0e8e57…` at
+two and three ranks, on the laptop, and on CI). A probe of the case
+(`located_case("L2")` with the atlas's steps written out point by
+point) found Base's `hypot`, `atan`, `mod`, `sin` and `cos` bit for bit
+the same on the laptop and on the Intel login nodes of Symmetry (Cascade
+Lake) and Nibi (Sapphire Rapids) in a fresh process, and on a Nibi
+Granite Rapids node (job 27630282) fresh, at one and eight threads,
+with and without the rest of the workload, and after the five test
+files that precede `mpi_tests` in its group, together and one at a
+time. The difference was the depot: the study's held caches compiled
+with `JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all"` for
+its AMD jobs, which an Intel CPU loads as their generic x86-64 clone,
+without an FMA, and `Pkg.precompile` took them as valid and built no
+native ones. FastPower 1.5.1's precompile workload computes
+`fastpower(ComplexF64(1.25), 2.0)`, which reaches `hypot(::Float64,
+::Float64)` through `abs`, so its image carries a compiled `hypot` of
+its own; once loaded it runs in place of the system image's, through
+dispatch and from freshly compiled callers alike, and `hypot` chooses
+its algorithm by `Core.Intrinsics.have_fma`: correctly rounded with an
+FMA, within an ulp without. The test process loads FastPower through
+OrdinaryDiffEq for `imex_tests.jl`; the ranks never do. With every cache
+in a scratch depot built for that target, on Symmetry's login node,
+the probe after `imex_tests` printed cn111's two digests and without it
+the laptop's, and a bisection of OrdinaryDiffEqLowOrderRK's 89
+dependencies by prefix named FastPower. Of the five functions only
+`hypot` changed.
+
+Three fixes were weighed. Comparing the case to roundoff, as the `NaN`
+order of 2026-10-22 was settled, would loosen the one claim the test
+makes. Writing the atlas from correctly rounded operations only (a
+rational parametrization of the quarter circles) would fix this case
+and leave every other case's initial data, through `sin`, `cos`, `exp`
+and `tanh`, open to the same mechanism. Erik chose the third: the
+reference runs in a process of its own, launched like the ranks with the
+test process's flags and project, beside them where there is room and
+first where there is not, and the workload ends with a compared
+`packages` line, a digest of the names of the packages it loaded, with
+a `#` line listing them. The in-process reference would have failed that
+line on every machine, since the test process has loaded `Test` and the
+suite's other packages. The reference compiled the workload alone in
+78 s and 1.9 GB on the laptop; it no longer reuses what the test files
+before it compiled. That the study's depot runs generic code on the
+H200 nodes went to SimLaunch.
+
 **A partition balanced per class of leaves was built and parked** (M13 step 4, 2026-10-19 and 20). The contiguous split puts a nested mesh's prolongation sources, one stretch of the curve per level, on one or two ranks, and the sender computes. Erik decided to add a balanced partition as an option, `Forest(…; partition = :levels)`, rather than change the default, and chose its rule from the counts of `bench/partition_cost.jl`, which prices candidate owner functions from the serial schedule without timing anything: the face-aware rule, whose class is a level and the kind of prolongation source a leaf is (none, across an edge or corner only, across a face). It was built with an immutable `Partition` per generation in `ForestState`, a new export `ownedleaves`, `blockrange` refusing under the option, a reorder of the flags' gather into curve order, and tests under a round-robin test policy. Timed on Symmetry on 2026-10-20 it balanced the packing and made the fill slower at every rank count, on the CPU and on H200s, because it multiplied the phase-1 halo; Erik parked it the same day. It stays on the branch `eschnett-claude/partition-levels`; the design, the tables and the reasons are in the M13 entry under [Milestones](#milestones), and what is left to try under "Performance work left for later" in [CODE.md](CODE.md#distributed-meshes).
 
 "Performance work left for later" was recorded on 2026-10-02 after the buffer pool; none of it blocked M7. Its item on compression where the data are was added in step 6b.
@@ -4943,6 +4993,319 @@ the three-rank comparison; the macOS cells compare two ranks only, so
 the paths only three ranks reach (a rank without blocks in E2) are no
 longer in the coverage report. The heap-size hint stays: it costs
 nothing.
+
+**Cluster jobs** (2026-11-16, Erik's request). The hand-written
+`bench/symmetry_*.sh` jobs became SimLaunch specs in `jobs/`, following
+SimLaunch's `CONVERTING.md`. Each script had set up its own environment
+under scratch (`test/Project.toml` with the path made absolute, or
+`Pkg.develop` plus a list of packages, CUDA added, MPIPreferences
+written), and a baseline checkout through `TREEAMR_BASE` or
+`TREEAMR_NESTED_VERSIONS`. All of that is now SimLaunch's `prepare`,
+the environment kinds `test`, `cuda` and `mpi`, and a variant of the
+study. Stages chosen by a variable became runs picked with
+`submit --run`, the stages of `bench/simwatch.sh` a SimWatch file per run, and
+the tables printed at the end an `[after]` command. Every spec passed
+`--dry-run` for Symmetry. `jobs/fold.toml` ran on the laptop's Metal
+(`--site local --run n16`), and all nine went to Symmetry the same day
+(study `jobs1`, below).
+
+| Script | Spec |
+|---|---|
+| `symmetry_copies.sh` | `copies.toml` |
+| `symmetry_fold.sh` | `fold.toml`, with a `[site.local]` table for Metal |
+| `symmetry_gpu.sh` | `gpu.toml` |
+| `symmetry_interpolate.sh cpu`, `cuda` | `interpolate.toml`, `interpolate-cuda.toml` |
+| `symmetry_nested.sh`, `symmetry_nested_gpu.sh` | `nested.toml`, `nested-gpu.toml`, tables in `bench/nested_tables.sh` |
+| `symmetry_mpi.sh` | `mpi.toml` |
+| `symmetry_mpi_gpu.sh` | `mpi-gpu.toml` |
+
+What changed on the way, because nothing in a spec carries it:
+
+- The nested benchmark's rounds with a rotating order are written out as
+  runs, `base` before `new` in odd rounds and after it in even ones.
+  The compile timing traces to stderr, so the trace is in the run's
+  `output.log` and no `compile.trace` is left where the precompile check
+  runs; the tables filter it out before comparing outputs. Its
+  wall-clock column is gone: a run's own start and end are not recorded.
+  The smoke stage is gone too: `prepare` and `--dry-run` check the setup.
+- `symmetry_mpi_gpu.sh` decided at run time whether the direct path ran
+  (`MPI.has_cuda()`). The spec runs both recipes in one job instead:
+  staged under MPICH_jll, staged and direct under HPC-X. Its benchmark
+  runs `bench/mpi.jl` as runs with `ranks` rather than through
+  `bench/mpiscan.sh`. Four GPUs go to `h200q`: the profile allows
+  `h200debugq` two.
+- The GPU jobs get the profile's 8 host cores and 64 GB a GPU, so the
+  host comparisons of `gpu.toml` and `interpolate-cuda.toml` run at 8
+  threads where the scripts had 16. `gpu.toml` sets
+  `TREEAMR_TEST_MPI_CONCURRENT=0` and `HYDRA_BOOTSTRAP=fork` for the
+  suite, as the later copies and fold scripts had learned to.
+- Every pinned run starts without an interactive thread (`-t N,0`): on
+  Julia 1.13 `-t 64` starts 65 threads, which `JULIA_EXCLUSIVE` refuses
+  on a 64-core node, and the scripts' `-t 64` pinned runs (the 64-thread
+  point of `symmetry_interpolate.sh`, the pinned control of
+  `symmetry_mpi.sh`) would abort today. `interpolate.toml` has
+  `pin = true`; its interleaved and domain-0 runs set
+  `JULIA_EXCLUSIVE=0` and bind with `numactl` inside the `srun` step,
+  since `placement` is refused beside `pin`. Elsewhere a run passes
+  `--threads=N,0`, which overrides SimLaunch's `-t N`. The stopgap
+  interpolator (`TREEAMR_STOPGAP`) lives outside the project and is left
+  out.
+- In `mpi.toml` the controls and the replicated passes keep their
+  `srun … numactl` prefix: `placement` would bind `srun`, not the task
+  it starts. They run in the MPI environment without a launcher, so all
+  runs use the same package versions.
+
+`symmetry_numa.sh` and `symmetry_affinity.sh` have no spec. Both
+reproduce measurements already recorded ("Parallelism"), and neither is
+due to run. The affinity job starts its processes at a wall-clock time
+computed when it launches, so that they time together, which a spec
+cannot say without changing `bench/affinity.jl`. The NUMA job mixes
+runs one after another with domain-bound copies side by side and reads
+the kernel's NUMA counters between them; it would split into six specs
+and lose the counters. The converted scripts, and `bench/simwatch.sh`,
+stayed until each spec's first run agreed with the old script's
+numbers, and were removed on 2026-11-18, after the fourth run below;
+Erik counted the two GPU specs' Trillium runs as their check. Git
+history has them, `bench/simwatch.sh` included; SimWatch's own
+`writers/simwatch.sh` is the helper for a hand-written job.
+
+The first Symmetry run (study `jobs1`, 825fd4f with these specs, the
+`base` variant the same commit) reproduced the old scripts' numbers
+where a job finished:
+
+- `interpolate.toml` (job 601146, cn087, EPYC 7532, the node type of
+  M11's table) in ns per point at 496 and 49600 points: 2105 and 2170
+  at one thread (M11: 2083 and 2214), 211 and 135 at 16 (256, 135), 281
+  and 43.4 at 64 (288, 42.1); eight threads in domain 0 276 (264),
+  interleaved 64 threads 44.6 (49.7).
+- `copies.toml` (job 601143, cn111) matches job 570290 in "The copy
+  kernels on a device" to two digits: the scatter 0.181, 0.140 and
+  0.116 ns per owned point, the fill 0.830, 0.301 and 0.060, the
+  two-level fill 0.366 (0.362).
+- `fold.toml` (job 601144) at `32³`: 0.267, 79.8, 34.2, 12.2 and 55.0 ms
+  against M15's 0.27, 81, 35, 12 and 56.
+- `gpu.toml` (job 601145): the triad 3853 GB/s (3842), the norm 0.43 ms
+  and `firing_boxes` 0.98 ms (0.459 and 0.970 re-measured after M6);
+  the RHS and the fill have halved since M6's table through later
+  changes, and the host column runs at 8 threads, not 16.
+- `interpolate-cuda.toml` (job 601147): 496 points in 0.32 and 0.30 ms
+  (M11: 0.26 and 0.28), 496000 points at 9.5 and 6.2 ns per point
+  (6.4 and 4.7). Slower than M11's measurement on the large batch; not
+  looked into.
+
+What it found:
+
+- **`bench/mpi.jl` had been broken since the checkpoints moved to
+  TreeIOHDF5** (2026-10-08): its `ForcedStaging` forwarded `librarycomm`, which
+  left with them, and every run of `mpi.toml` (job 601152) stopped at
+  load. It now forwards `commnodes` and `bcast`, the verbs added since.
+  The script had last run on 2026-10-02, before the change.
+- **The suite on CUDA fails one testset on cn111**, in all three jobs
+  that run it: "A distributed run prints what a serial run prints"
+  finds `L2 physical` and `L2 positions` (the located batch of M19, added
+  2026-11-09, after the last H200 suite run) differing between the
+  serial reference and both rank counts. The ranks agree with each
+  other and with the laptop's serial run at 1 and 8 threads; the serial
+  reference, in the test process on the Sapphire Rapids host, is the
+  odd one. The cause was SimLaunch's: a study had one depot for all its
+  nodes, and FastPower's cache, compiled on an AMD node for
+  `generic;znver2,clone_all;znver4,clone_all`, loaded on the Intel H200
+  node through its `generic` part. FastPower's precompile workload
+  compiles `hypot`, so its cache carries a copy of `hypot` built without
+  FMA, and that copy served the rest of the process. The test process
+  loads FastPower (through OrdinaryDiffEq, for `imex_tests`) before
+  `mpi_tests` builds the serial reference in the same process; the
+  ranks never load it. A session reproduced cn111's digests exactly on
+  Symmetry's Intel login node with every cache built for that target
+  string, and the laptop's without `imex_tests`. SimLaunch now keeps
+  one depot of compiled caches per kind of node, and the suite passes
+  on an H200 node (`jobs3`, below). The test also builds its serial
+  reference in a process of its own now, and checks that the workload
+  loads no package the ranks do not, which catches a test process that
+  loaded more than the ranks on any machine (Erik's choice, 2026-11-18;
+  "The serial reference left the test process" under "Distributed
+  meshes").
+- **`nested.toml` (job 601149) ran out of its hour on cn112**, the EPYC
+  8534P, which has fewer NUMA domains than the eight SimLaunch's
+  Symmetry profile declares for every CPU node: the two-rank run's
+  rank 1 asked `numactl` for domain 4 and exited, and rank 0 waited in
+  MPI until the time limit, since `srun` does not end a step when one
+  task fails. The compile and ghosts runs had finished: the compile
+  time of `test/mpi_workload.jl` is 135–138 s in both variants, the
+  outputs identical once `bench/nested_tables.sh` strips the colours
+  Julia writes on the `# recompile` lines (it now does). The fixes are
+  SimLaunch's: it counts a node's domains when a run starts and stops
+  at once when there are too few, ends an `srun` step when a rank
+  fails, and keeps jobs in the AMD queues off cn112, which is reached
+  through `largememq` only.
+
+The second run (study `jobs3`, the same commit, with SimLaunch's depot
+per kind of node: Zen 2 code for the AMD nodes, native code for the
+H200 nodes, each job seeing only its own) reproduced the rest:
+
+- The suite on CUDA passes in all three jobs (601855–601857, cn113, a
+  Xeon Platinum 8452Y), the located batch included.
+- `nested.toml` (job 601852, cn107, EPYC 7543): the one-rank fill
+  605 ms against the old script's 601 ms on cn099, the same node type;
+  base and new within 1 % except at 8×8 (the locals 9 %, the fill
+  5 %); the compile time of `test/mpi_workload.jl` 122.3–122.9 s and
+  1546 methods for both versions (TreeAMR's share 46.5–47.0 s and 788),
+  the outputs identical.
+- `copies.toml` (601856) and `fold.toml` (601857) match `jobs1` and
+  their milestones to two digits; `gpu.toml` (601855): the triad
+  3838 GB/s, the norm 0.44 ms, `firing_boxes` 0.99 ms. Its host
+  columns follow the node and whatever else shares it: the host triad
+  was 88 GB/s on cn111 in `jobs1` and 47 on cn113 here, so the host
+  column compares only within one job.
+- `interpolate-cuda.toml` (601858): 9.5 and 6.2 ns per point on the
+  large batch again, so its distance from M11's 6.4 and 4.7 is not the
+  generic caches. **(open)**
+- `mpi.toml` under MPICH_jll (job 601724, `jobs2`, cn107–cn110, EPYC
+  7543) agrees with M7's table within one node (`N = 32`: the rhs 29.2,
+  43.6, 46.0 and 57.8 ms at 1, 2, 4 and 8 ranks against 37.9, 47.7,
+  49.4 and 58.2; the fill 15.4, 27.0, 27.0, 27.5 against 18.7, 29.2,
+  28.6, 27.7), and at two nodes; at four, where MPICH_jll talks TCP
+  over IPoIB and M7 had HPC-X, the fill is 42.7 ms against 30.1. The
+  spec now takes SimLaunch's default recipe, HPC-X through
+  mpi_abi_wrapper, as do the HPC-X runs of the other MPI specs.
+
+The third run (study `jobs5`, the MPI specs under that default):
+
+- `mpi.toml` (job 601936, cn091–cn094, EPYC 7532, M7's node type)
+  reproduces M7's table at every rank count. `N = 32`, two-level, ms at
+  1, 2, 4, 8, 16 and 32 ranks: the rhs 37.8, 50.1, 47.7, 50.7, 54.6,
+  55.5 (M7: 37.9, 47.7, 49.4, 58.2, 55.0, 55.9), the fill 18.6, 27.5,
+  28.3, 27.6, 32.0, 30.0 (18.7, 29.2, 28.6, 27.7, 29.8, 30.1); `N = 16`
+  the fill 4.55 to 9.46 (4.37 to 9.64). The coarsening regrid is faster
+  than M7's (`N = 32`: 111–152 ms against 134–225) through later
+  changes. One number is worse: `interpolate!` of 1000 points a rank at
+  32 ranks on 4 nodes takes 24–25 ms, against M7's 8–10 under HPC-X
+  loaded directly and 3.5–4.1 under MPICH_jll (`jobs2`); at 2 nodes it
+  is 0.9 ms in all three. Whether the wrapper costs the collectives at
+  32 ranks what a ping-pong does not show was the question of the fifth
+  run, below: it does not.
+- `nested.toml` (job 601937, cn103, EPYC 7543): base and new agree
+  within 1 % but for the 8×8 locals and unpacks (4 % and 8 %); the
+  one-rank fill 608 ms. HPC-X's shared memory is faster than MPICH_jll's
+  on one node: the fill at 2, 4 and 8×8 ranks 335, 211 and 44.5 ms,
+  against 468, 237 and 64.5 under MPICH_jll (`jobs3`). The compile time
+  122.1–124.2 s, 1546 methods, outputs identical.
+
+The fourth run (study `jobs7`, 2026-11-18) took the two GPU specs to
+Trillium's GPU cluster, four H100s of one node with an EPYC 9654 host,
+under its one recipe, StdEnv/2023's Open MPI 4.1.5 with the UCX of
+cuda/12.9 through mpi_abi_wrapper. Both specs now run under the default
+recipe only: MPICH_jll is not CUDA-aware, and Trillium's GPU cluster
+does not offer it. They were the last two of the old scripts without a
+matching run. The H100 is not the H200 of M7 and M13, so these numbers
+are a first baseline on new hardware, not a reproduction:
+
+- `mpi-gpu.toml` (job 1356549, trig0009, 26 min):
+  `test/mpi_device_tests.jl` passes staged and direct, in Float64 and
+  in Float32, at 2, 3 and 4 ranks: 88 tests in each of the four runs,
+  the direct runs with `deviceaware = true`. `bench/mpi.jl` (`N = 32`,
+  `ROOTS = 4`, minimum ms at 1, 2 and 4 ranks, staged / direct, M7 step
+  8's H200 in parentheses): the two-level rhs 2.05 / 2.05, 2.81 / 2.64,
+  2.84 / 2.79 (2.07 / 2.06, 2.89 / 2.72, 2.92 / 2.76); its fill 1.79 /
+  1.80, 2.55 / 2.39, 2.58 / 2.40 (1.71 / 1.70, 2.49 / 2.29, 2.52 /
+  2.35); interpolate 0.11, 0.45 / 0.42, 0.50 / 0.52 (0.11, 0.55 / 0.55,
+  0.47 / 0.50). **The staged regrid no longer costs what it did**: the
+  two-level refinement 4.7, 9.3 / 6.8, 13.2 / 8.8 ms and the coarsening
+  3.6, 9.2 / 7.7, 12.5 / 8.9, against step 8's 25.4 / 7.1 and 48.0 /
+  8.7, and 26.1 / 7.3 and 52.6 / 8.2, measured before the buffer pool.
+  This is the re-measurement the pool had been waiting for, on other
+  GPUs; CODE.md's "Performance work left for later" has what is left.
+- `nested-gpu.toml` (job 1356552, trig0054, 13 min): base and new
+  agree within 2 % on every fill and within 6 % on every part. The
+  fill, the slowest rank's minimum over two rounds, ms, base / new
+  (M13 round 2's H200 `curve` in parentheses): 1 GPU 8.29 / 8.36
+  (7.90); 2 GPUs staged 9.73 / 9.67 (7.39), direct 10.5 / 10.6 (9.92);
+  4 GPUs staged 14.8 / 15.0 (14.9), direct 10.8 / 10.6 (9.07); phase 2
+  grouped at 4 GPUs direct 5.69 (5.45).
+- **SimWatch showed every queued run as lost.** It asks the Slurm of
+  the host it reads from (`trillium`), which is the CPU cluster's, and
+  the GPU cluster's jobs, submitted through `trig-login01`, are unknown
+  there. The status files were right ("queued as job …"). SimLaunch
+  (55fc0a2) now names the Slurm cluster in each status file, and
+  SimWatch 1.6.0 asks that cluster.
+
+The same SimLaunch release changed `placement = "numa"`: a rank now gets
+its share of a node's domains, so 2 ranks on 8 got four domains each
+rather than one. That would have given `mpi.toml`'s 1-rank baseline the
+whole node's memory bandwidth for its 8 threads, and `nested.toml`'s
+one-thread ranks room to wander from their pages. At Erik's request
+SimLaunch gained `domains_per_rank` (d020f5e); both specs set it to 1,
+which binds rank `i` of `R` to domain `⌊i · 8 / R⌋` alone, as the old
+scripts did, so their earlier tables stand. The dry run's wrappers bound
+0; 0, 4; 0, 2, 4, 6; and 0–7, and refused 8 ranks on a 6-domain node.
+
+The fifth run (study `jobs8`, 2026-11-18, job 605548 on cn106–cn109,
+EPYC 7543, at Erik's request) looked for the 24–25 ms of `interpolate!`
+at 32 ranks. `bench/collectives.jl` times the collectives the call
+makes, with its sizes, and `jobs/collectives.toml` runs it, one thread
+and one NUMA domain a rank, under the default recipe as it is, without
+HCOLL, without UCC and without either, under HPC-X loaded directly with
+and without HCOLL, and under MPICH_jll, then `bench/mpi.jl` itself at
+`N = 16`, 32 ranks of 8 threads, under three of them. **The slowness did
+not come back, under any setting.** Median ms at 32 ranks on 4 nodes,
+200 windows each:
+
+| case | default | no HCOLL | no UCC | neither | HPC-X | HPC-X, no HCOLL | MPICH_jll |
+|---|---|---|---|---|---|---|---|
+| `allgather` 80 B | 0.011 | 0.011 | 0.012 | 0.019 | 0.011 | 0.014 | 0.29 |
+| `alltoallv` 768 B a peer | 0.073 | 0.076 | 0.075 | 0.083 | 0.072 | 0.075 | 1.44 |
+| `interpolate!`'s collectives | 0.154 | 0.155 | 0.157 | 0.169 | 0.153 | 0.152 | 2.94 |
+| the same by `Isend`/`Irecv!` | 0.133 | 0.136 | 0.138 | 0.148 | 0.133 | 0.132 | 3.05 |
+
+No window of the call's collectives took over 5 ms under Open MPI;
+under MPICH_jll, 2 of 200. At 8 threads a rank the numbers are the same.
+`bench/mpi.jl`'s `interpolate` took 0.81, 0.82 and 0.82 ms (two-level,
+minimum; default, no HCOLL, no UCC), against 25.0 in `jobs5` for the
+same run under the same recipe and commit; every other phase agreed
+with `jobs5` within the usual spread, but for one refinement regrid
+(44 ms against 25–27 in the other two runs). MPICH_jll's 2.9 ms of
+collectives are most of the 3.5–4.1 ms `jobs2` measured for the whole
+call: under MPICH_jll the call is collective-bound, over TCP.
+
+So it is neither the wrapper nor HCOLL nor UCC. What the slow runs share
+is their nodes: M7's 8–10 ms (job 567847) ran on cn092–cn095 and
+`jobs5`'s 25 ms on cn091–cn094, while `jobs2` (cn107–cn110) and this run
+(cn106–cn109) were fast.
+
+**It is those nodes.** The same spec pinned to cn091–cn094 (job 605572,
+EPYC 7532, the same study and code, Erik's request) ran out of its hour
+after three of its runs and part of a fourth, because some windows took
+seconds. What carries no payload stayed as fast as on cn106–cn109 under
+every setting: the barrier 5–8 µs, the 8-byte allreduce 6–9 µs, the
+80-byte allgather 12–20 µs, the 4-byte alltoall 10–21 µs. What carries
+one did not. Median ms under the default recipe as it is, against
+cn106–cn109 (without HCOLL, without UCC and without either the same in
+kind: 10 ms at 64 B a peer, 1.4–2.8 ms at 768 B, 2147 ms at 8 KB):
+
+| case | cn091–cn094 | cn106–cn109 |
+|---|---|---|
+| `alltoallv` 8 B a peer | 0.026 | 0.033 |
+| `alltoallv` 64 B a peer | 10.2 | 0.030 |
+| `alltoallv` 768 B a peer | 2.54 | 0.073 |
+| `alltoallv` 8 KB a peer | 2147 | 0.30 |
+| `alltoallv` 64 KB a peer | 2147 | 1.29 |
+| pairwise 768 B a peer | 9.97 | 0.084 |
+| `interpolate!`'s collectives | 2.95 | 0.154 |
+
+The minimum of most cases was the fast nodes' time; the medians are
+delays added to it. 2.147 s is `4.096 µs × 2¹⁹`, InfiniBand's local ACK
+timeout at exponent 19, so the likeliest reading is a lost packet that
+the reliable-connection transport resends only when that timeout runs
+out, and the 10 ms medians of shorter steps of the same mechanism. That
+is a fault of the fabric at these nodes — a port, a cable or their leaf
+switch — not of Open MPI's collectives, HCOLL, UCC or the wrapper, all
+of which behaved alike. It also explains M7's step-7 table, whose
+32-rank `interpolate` (8–10 ms) ran on cn092–cn095. Which node or link
+drops packets, and whether the 32-rank fill times on these nodes in
+M7 and `jobs5` (about 30 ms) carry some of it, is **(open)**: a
+node-pair ping-pong on cn091–cn095 and the ports' error counters
+would say. Benchmarks on more than one node avoid these nodes until
+then.
 
 ## Releases
 

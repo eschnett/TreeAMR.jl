@@ -1,0 +1,167 @@
+# The nested-mesh ghost fill on one GPU node (four H200s on Symmetry, four
+# H100s on Trillium's GPU cluster; `bench/nested.jl`, the mesh of
+# eschnett/TreeGeneralizedHarmonic.jl#11), for a baseline and this checkout
+# in the same job, run after run, one rank a GPU, at `N = 32` on 1, 2 and 4
+# GPUs, under the site's default recipe, the standard MPI ABI (`sys` in the
+# labels): the site's MPI through mpi_abi_wrapper, CUDA-aware — on Symmetry
+# HPC-X's Open MPI, on Trillium's GPU cluster StdEnv/2023's Open MPI 4.1.5
+# — staged and direct (`TREEAMR_BENCH_DEVICEAWARE=1`). One GPU has no
+# messages, so it runs staged only. Each configuration runs in two rounds,
+# the versions in the other order in the second. `jobs/nested.toml` is the
+# CPU node's, and says more.
+#
+#     simlaunch snapshot . --study <study> --variant base=<baseline checkout>
+#     simlaunch prepare <study> --site symmetry --spec jobs/nested-gpu.toml
+#     simlaunch submit <study> jobs/nested-gpu.toml --site symmetry
+#
+# The labels name the version, the GPUs, the MPI and the path. The
+# `[after]` command prints the tables (`bench/nested_tables.sh`).
+name = "nested-gpu"
+env = "cuda"
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_N = "32" }
+
+[site.symmetry]                     # four H200s of one node
+time = "2:00:00"
+resources = { gpus = 4 }
+
+[site.trillium-gpu]                 # four H100s of one node
+time = "2:00:00"
+resources = { gpus = 4 }
+
+[after]
+cmd = 'bash "$PROJECT"/bench/nested_tables.sh "$SPEC" $SIMLAUNCH_JOBDIRS'
+
+# Round 1.
+
+[[run]]
+label = "fill-base-1gpu-sys-r1"
+variant = "base"
+ranks = 1
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "1gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-1gpu-sys-r1"
+ranks = 1
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "1gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-2gpu-sys-staged-r1"
+variant = "base"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "2gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-2gpu-sys-staged-r1"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "2gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-2gpu-sys-direct-r1"
+variant = "base"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "2gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-2gpu-sys-direct-r1"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "2gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-4gpu-sys-staged-r1"
+variant = "base"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "4gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-4gpu-sys-staged-r1"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "4gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-4gpu-sys-direct-r1"
+variant = "base"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "4gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-4gpu-sys-direct-r1"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "4gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+# Round 2.
+
+[[run]]
+label = "fill-new-1gpu-sys-r2"
+ranks = 1
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "1gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-1gpu-sys-r2"
+variant = "base"
+ranks = 1
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "1gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-2gpu-sys-staged-r2"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "2gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-2gpu-sys-staged-r2"
+variant = "base"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "2gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-2gpu-sys-direct-r2"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "2gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-2gpu-sys-direct-r2"
+variant = "base"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "2gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-4gpu-sys-staged-r2"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "4gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-4gpu-sys-staged-r2"
+variant = "base"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "4gpu-sys-staged" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-new-4gpu-sys-direct-r2"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "4gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"
+
+[[run]]
+label = "fill-base-4gpu-sys-direct-r2"
+variant = "base"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "4gpu-sys-direct" }
+cmd = "bench/nested.jl mpi"

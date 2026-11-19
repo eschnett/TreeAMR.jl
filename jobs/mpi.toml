@@ -1,0 +1,216 @@
+# The weak-scaling smoke test of M7 step 7 on Symmetry's AMD nodes:
+# `bench/mpi.jl` at a fixed number of blocks per rank, one rank per NUMA
+# domain at 8 threads, on one node at 1, 2, 4 and 8 ranks, then on 2 and
+# 4 nodes at 8 ranks a node, against the single-process control — one
+# 64-thread process over the mesh of the 8-rank run — which is the case
+# CODE.md's "What one process loses" expected one rank per domain to
+# recover. Then `bench/replicated.jl` on one domain.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/mpi.toml
+#     simlaunch submit <study> jobs/mpi.toml --site symmetry
+#
+# Every rank holds one tile of the mesh (see the header of bench/mpi.jl):
+# at `ROOTS = 4` in 3D, 176 blocks on the two-level mesh and 64 on the
+# uniform one, so N = 16 is 0.72 M cells a rank and N = 32 is 5.8 M. The
+# `[after]` command prints, per block size, the weak-scaling table
+# (bench/mpitable.awk, efficiency against 1 rank on 1 domain) and the
+# same-mesh table, the 8-rank run against the two controls (efficiency
+# below 1 there means the control is faster), then each run's `#` lines:
+# messages and bytes per fill and rank, migrated blocks, ns per cell.
+#
+# Rank `i` of a node with `R` ranks is on NUMA domain `i · 8 / R` and on
+# that domain only (`domains_per_rank = 1`: without it, fewer ranks than
+# domains would share out all eight, and the 1-rank baseline would have
+# the whole node's memory bandwidth for its 8 threads); within the domain
+# the threads are left to the kernel. The controls and the
+# replicated passes run in one task of the first node, through `prefix`,
+# which binds them as written: `placement` would bind `srun` itself, not
+# its task.
+#
+# The MPI is the site's default recipe: on Symmetry HPC-X's Open MPI over
+# UCX through mpi_abi_wrapper, started by its `mpiexec` (12 GB/s and 2 µs
+# between nodes), as M7's table had it. `mpi = "jll"` takes MPICH_jll
+# under `srun --mpi=pmi2` instead, whose libfabric has no InfiniBand
+# provider and talks TCP over IPoIB between nodes (about 2 GB/s and 40 µs,
+# measured 2026-10-02; study `jobs2` ran it). Compare times only within
+# one job: each window is the slowest rank's time from a common barrier,
+# so ranks are measured together, but runs are not.
+name = "mpi"
+env = "test"
+mpi = "default"                     # the controls run in the same environment, without a launcher
+domains_per_rank = 1                # for the runs with a placement: one domain a rank at any rank count
+vars = { TREEAMR_BENCH_D = "3", TREEAMR_BENCH_ROOTS = "4", TREEAMR_BENCH_REPS = "10" }
+
+[site.symmetry]                     # four nodes of 64 cores in 8 NUMA domains
+time = "1:00:00"
+resources = { nodes = 4 }
+
+[after]
+cmd = '''
+log() { for d in $SIMLAUNCH_JOBDIRS; do case $d in */"$SPEC-$1"/*) echo "$d/output.log" ;; esac; done; }
+for n in 16 32; do
+    echo "## N=$n: weak scaling, one rank per domain at 8 threads"
+    awk -F'\t' -f "$PROJECT"/bench/mpitable.awk $(for l in 1x8 2x8 4x8 8x8 16x8 32x8; do log "N$n-$l"; done)
+    echo "## N=$n: one node, the same mesh: 8 ranks against one process"
+    awk -F'\t' -f "$PROJECT"/bench/mpitable.awk $(for l in 8x8 1x64pin 1x64il; do log "N$n-$l"; done)
+done
+for d in $SIMLAUNCH_JOBDIRS; do echo "## $d"; grep '^#' "$d/output.log"; done
+'''
+
+# N = 16: one rank per domain at 8 threads, on 1, 2 and 4 nodes.
+
+[[run]]
+label = "N16-1x8"
+ranks = 1
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "1x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N16-2x8"
+ranks = 2
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "2x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N16-4x8"
+ranks = 4
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "4x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N16-8x8"
+ranks = 8
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "8x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N16-16x8"
+ranks = 16
+nodes = 2
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "16x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N16-32x8"
+ranks = 32
+nodes = 4
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_LABEL = "32x8" }
+cmd = "bench/mpi.jl mpi"
+
+# N = 16: one 64-thread process over the mesh of the 8-rank run, pinned with
+# first touch and with pages interleaved.
+
+[[run]]
+label = "N16-1x64pin"
+threads = 64
+julia_args = ["--threads=64,0"]      # -t 64 would start 65 threads, which JULIA_EXCLUSIVE refuses
+prefix = "srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_TILES = "8", TREEAMR_BENCH_LABEL = "1x64pin", JULIA_EXCLUSIVE = "1" }
+cmd = "bench/mpi.jl"
+
+[[run]]
+label = "N16-1x64il"
+threads = 64
+prefix = "srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none numactl --interleave=all"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_TILES = "8", TREEAMR_BENCH_LABEL = "1x64il" }
+cmd = "bench/mpi.jl"
+
+# N = 32: one rank per domain at 8 threads, on 1, 2 and 4 nodes.
+
+[[run]]
+label = "N32-1x8"
+ranks = 1
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_LABEL = "1x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N32-2x8"
+ranks = 2
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_LABEL = "2x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N32-4x8"
+ranks = 4
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_LABEL = "4x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N32-8x8"
+ranks = 8
+nodes = 1
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_LABEL = "8x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N32-16x8"
+ranks = 16
+nodes = 2
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_LABEL = "16x8" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "N32-32x8"
+ranks = 32
+nodes = 4
+threads = 8
+placement = "numa"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_LABEL = "32x8" }
+cmd = "bench/mpi.jl mpi"
+
+# N = 32: one 64-thread process over the mesh of the 8-rank run, pinned with
+# first touch and with pages interleaved.
+
+[[run]]
+label = "N32-1x64pin"
+threads = 64
+julia_args = ["--threads=64,0"]      # -t 64 would start 65 threads, which JULIA_EXCLUSIVE refuses
+prefix = "srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_TILES = "8", TREEAMR_BENCH_LABEL = "1x64pin", JULIA_EXCLUSIVE = "1" }
+cmd = "bench/mpi.jl"
+
+[[run]]
+label = "N32-1x64il"
+threads = 64
+prefix = "srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none numactl --interleave=all"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_TILES = "8", TREEAMR_BENCH_LABEL = "1x64il" }
+cmd = "bench/mpi.jl"
+
+# The replicated O(nleaves) passes at large leaf counts, in one process on
+# domain 0 at a rank's 8 threads (no MPI).
+
+[[run]]
+label = "replicated"
+threads = 8
+prefix = "srun --nodes=1 --ntasks=1 --cpus-per-task=64 --cpu-bind=none numactl --cpunodebind=0 --membind=0"
+cmd = "bench/replicated.jl 8 64 512 1024"

@@ -1,0 +1,103 @@
+# The copy kernels on an H200 ("The copy kernels on a device" in CODE.md):
+# `bench/copies.jl` for a baseline and this checkout, run after run on the
+# same GPU, at the sizes a downstream application measured them at;
+# `bench/copy_index.jl`, which prices each way of forming the index;
+# `bench/copy_groups.jl`, the fill group by group; then the test suite on
+# the device. The baseline is a variant of the study:
+#
+#     simlaunch snapshot . --study <study> --variant base=<baseline checkout>
+#     simlaunch prepare <study> --site symmetry --spec jobs/copies.toml
+#     simlaunch submit <study> jobs/copies.toml --site symmetry
+#
+# The labels start with the stage, `copies-`, `index-`, `groups-` and
+# `tests`; `submit --run` picks some. A study without a baseline runs
+# every label but the `copies-base-` ones.
+name = "copies"
+env = "test+cuda"                   # the suite's dependencies, and CUDA
+threads = 1                         # the benchmarks; the suite runs at 8
+vars = { TREEAMR_BENCH_BACKEND = "cuda" }
+
+[site.symmetry]                     # one H200
+time = "1:00:00"
+resources = { gpus = 1 }
+
+# The downstream's rows: 512 blocks of 16³ and of 32³, 8 of 128³; 20
+# variables, G = 3, vertex-centered, Float64. Then 32³ on two levels.
+
+[[run]]
+label = "copies-base-n16"
+variant = "base"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "copies-base-n32"
+variant = "base"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "copies-base-n128"
+variant = "base"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "128", TREEAMR_BENCH_ROOTS = "2" }
+
+[[run]]
+label = "copies-base-n32-l2"
+variant = "base"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8", TREEAMR_BENCH_LEVELS = "2" }
+
+[[run]]
+label = "copies-new-n16"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "copies-new-n32"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "copies-new-n128"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "128", TREEAMR_BENCH_ROOTS = "2" }
+
+[[run]]
+label = "copies-new-n32-l2"
+cmd = "bench/copies.jl"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8", TREEAMR_BENCH_LEVELS = "2" }
+
+[[run]]
+label = "index-n16"
+cmd = "bench/copy_index.jl"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_BLOCKS = "512" }
+
+[[run]]
+label = "index-n32"
+cmd = "bench/copy_index.jl"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_BLOCKS = "512" }
+
+[[run]]
+label = "groups-n16"
+cmd = "bench/copy_groups.jl"
+vars = { TREEAMR_BENCH_N = "16", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "groups-n32"
+cmd = "bench/copy_groups.jl"
+vars = { TREEAMR_BENCH_N = "32", TREEAMR_BENCH_ROOTS = "8" }
+
+[[run]]
+label = "groups-n128"
+cmd = "bench/copy_groups.jl"
+vars = { TREEAMR_BENCH_N = "128", TREEAMR_BENCH_ROOTS = "2" }
+
+# The MPI test launches mpiexec inside the allocation: Hydra forks the
+# ranks rather than asking Slurm for a step, and the jobs run one after
+# the other.
+[[run]]
+label = "tests"
+cmd = "test/runtests.jl"
+threads = 8
+vars = { TREEAMR_TEST_BACKEND = "cuda", TREEAMR_TEST_MPI_CONCURRENT = "0", HYDRA_BOOTSTRAP = "fork" }

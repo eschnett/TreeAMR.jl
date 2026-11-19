@@ -2,24 +2,28 @@
 # `runtests.jl` includes it before the first test, and `mpi_tests.jl`
 # includes it if it was not.
 #
-# Each job runs `mpi_workload.jl` under `mpiexec` — three ranks, then two —
+# Each job runs `mpi_workload.jl` in a process of its own — serially,
+# which is the reference, and under `mpiexec` at three ranks and at two —
 # and is compilation-bound: some 55 s of wall clock a job, against a few
 # seconds of arithmetic (measured in M7 step 9, "Suite cost" in HISTORY.md).
-# Where the machine has room for both jobs beside the suite, they start
-# at the start of the process that runs `mpi_tests.jl` (the whole suite,
-# or one group of it) and compile on otherwise idle cores while the rest
-# of it runs. The jobs are independent of each other and
-# of the serial reference. Elsewhere — a CI runner — nothing starts here,
-# and `mpi_tests.jl` runs the serial reference, the three-rank job and
-# the two-rank job one after the other, for the memory; on fewer than
-# four CPU threads it skips the three-rank job (`three_ranks`).
+# The reference is not run in the test process, whose earlier test files
+# have loaded packages the ranks never load, and a package image can
+# change what a Base function computes (`packages` in `mpi_workload.jl`).
+# Where the machine has room for the three jobs beside the suite, they
+# start at the start of the process that runs `mpi_tests.jl` (the whole
+# suite, or one group of it) and compile on otherwise idle cores while
+# the rest of it runs. The jobs are independent of each other.
+# Elsewhere — a CI runner — nothing starts here, and `mpi_tests.jl` runs
+# the reference, the three-rank job and the two-rank job one after the
+# other, for the memory; on fewer than four CPU threads it skips the
+# three-rank job (`three_ranks`).
 
 using MPI: MPI
 
 const MPI_WORKLOAD = joinpath(@__DIR__, "mpi_workload.jl")
 
-# Whether the two jobs may run at once and beside the suite: five
-# single-threaded ranks, each compiling the workload, which measured
+# Whether the jobs may run at once and beside the suite: six
+# single-threaded processes, each compiling the workload, which measured
 # about 2 GB resident a rank with its heap-size hint (2026-11-16; 3 GB
 # without), beside this process and the
 # thread-independence test's subprocesses — and, where the suite runs in
@@ -49,19 +53,25 @@ function three_ranks()
     return Sys.CPU_THREADS >= 4
 end
 
-# The workload under `mpiexec -n $n`, started and not waited for, and
-# failing if `timeout` seconds pass first. Each rank gets a heap-size
+# The workload under `mpiexec -n $n`, or with `n = 0` serially without
+# `mpiexec` (the reference), started and not waited for, and failing if
+# `timeout` seconds pass first. Each process gets the same Julia flags,
+# the test process's, and the same project. Each rank gets a heap-size
 # hint of 1 GB, which holds it to 2.0 GB resident in the same time,
 # against 3.0 GB without (2026-11-16); nearly all of the rest is
 # compiled code, which the hint cannot shrink (512 MB saves nothing more
 # and costs 17 % in time). It was added for the macOS runners' 7 GB, but
 # the timeouts there were short CPU, not memory (see `three_ranks`).
 function launch_workload(n; threads=1, timeout=900)
-    mpi = MPI.mpiexec()
     project = Base.active_project()
-    cmd = `$mpi -n $n $(Base.julia_cmd()) --threads=$threads --heap-size-hint=1G
-           --project=$project $MPI_WORKLOAD mpi`
-    cmd = setenv(cmd, mpi.env)
+    julia = `$(Base.julia_cmd()) --threads=$threads --heap-size-hint=1G
+             --project=$project $MPI_WORKLOAD`
+    cmd = if n == 0
+        julia
+    else
+        mpi = MPI.mpiexec()
+        setenv(`$mpi -n $n $julia mpi`, mpi.env)
+    end
     out, err = IOBuffer(), IOBuffer()
     proc = run(pipeline(cmd; stdout=out, stderr=err); wait=false)
     return (; n, proc, out, err, start=time(), timeout)
@@ -85,8 +95,8 @@ end
 # backtrace, which Julia writes to the job's stderr on SIGINFO (macOS, BSD)
 # or SIGUSR1 (Linux), followed by a one-second profile.
 function rank_state(proc)
-    pids = descendants(getpid(proc))
-    isempty(pids) && return "(none found)"
+    # The process itself too: the serial reference has no `mpiexec` above it.
+    pids = [getpid(proc); descendants(getpid(proc))]
     table = read(ignorestatus(`ps -o pid,ppid,%cpu,rss,time,etime,command
                                   -p $(join(pids, ","))`), String)
     signal = Sys.isapple() || Sys.isbsd() ? "INFO" : "USR1"
@@ -111,22 +121,23 @@ end
 # the jobs in `others` down with it, since the test fails anyway.
 function finish_workload(job; others=())
     (; n, proc, out, err, start, timeout) = job
+    how = n == 0 ? "serially" : "at -n $n"
     left = max(1.0, timeout - (time() - start))
     if timedwait(() -> process_exited(proc), left) !== :ok
         state = rank_state(proc)
         kill(proc)
         foreach(j -> kill(j.proc), others)
-        error("the MPI workload at -n $n did not finish in $timeout s.\n" *
+        error("the MPI workload $how did not finish in $timeout s.\n" *
               "Its processes before the kill:\n$state\n" *
               "Its output so far:\n" * String(take!(out)) *
               "\nIts stderr, with each rank's backtrace:\n" * String(take!(err)))
     end
     if !success(proc)
         foreach(j -> kill(j.proc), others)
-        error("the MPI workload at -n $n failed; its stderr:\n" * String(take!(err)))
+        error("the MPI workload $how failed; its stderr:\n" * String(take!(err)))
     end
     # How close it came to its deadline, in every CI cell's log.
-    @info "The MPI workload at -n $n took $(round(Int, time() - start)) s of $timeout"
+    @info "The MPI workload $how took $(round(Int, time() - start)) s of $timeout"
     return String(take!(out))
 end
 
@@ -137,11 +148,12 @@ const MPI_JOBS = Ref{Any}(nothing)
 
 function start_mpi_jobs!()
     concurrent_launches() || return nothing
+    serial = launch_workload(0; timeout=3600)
     three = three_ranks() ? launch_workload(3; timeout=3600) : nothing
     two = launch_workload(2; timeout=3600)
-    MPI_JOBS[] = (; three, two)
+    MPI_JOBS[] = (; serial, three, two)
     atexit() do
-        for job in (three, two)
+        for job in (serial, three, two)
             job === nothing || process_running(job.proc) && kill(job.proc)
         end
     end

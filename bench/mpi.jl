@@ -135,9 +135,11 @@ struct ForcedStaging{C<:TreeAMR.Communicator} <: TreeAMR.Communicator
     inner::C
 end
 TreeAMR.hoststaging(::ForcedStaging, ::AbstractVector) = true
-for verb in (:commrank, :commsize, :librarycomm)
+for verb in (:commrank, :commsize, :commnodes)
     @eval TreeAMR.$verb(c::ForcedStaging) = TreeAMR.$verb(c.inner)
 end
+TreeAMR.bcast(c::ForcedStaging, v::AbstractVector, root::Integer) =
+    TreeAMR.bcast(c.inner, v, root)
 TreeAMR.allgather(c::ForcedStaging, x) = TreeAMR.allgather(c.inner, x)
 TreeAMR.allgatherv(c::ForcedStaging, v::AbstractVector) = TreeAMR.allgatherv(c.inner, v)
 TreeAMR.waitall(c::ForcedStaging, requests::AbstractVector) =

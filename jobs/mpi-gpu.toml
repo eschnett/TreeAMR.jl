@@ -1,0 +1,115 @@
+# The MPI+GPU acceptance run of M7 step 8 on one GPU node (four H200s on
+# Symmetry, four H100s on Trillium's GPU cluster): the distributed mesh on
+# CUDA, one rank per GPU, every rank count against the serial run on the
+# same backend, through host staging and with the device buffers handed to
+# MPI directly; then the weak-scaling benchmark of step 7 on the device,
+# where the cost of the two paths is measured.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/mpi-gpu.toml
+#     simlaunch submit <study> jobs/mpi-gpu.toml --site symmetry
+#
+# `test/mpi_device_tests.jl` (see its header and that of
+# `test/mpi_device_workload.jl`) runs serially, then under `mpiexec -n 2`,
+# `-n 3` and `-n 4`, each rank on GPU `local rank mod GPUs`, every line of
+# the output compared with the serial one — byte for byte, but for the
+# floating-point sums — and the `#` lines checked to show that the path
+# meant is the path that ran. In Float64 and in Float32.
+#
+# The two message paths ("MPI+GPU" under "Distributed meshes" in CODE.md):
+# host staging always runs; the direct one needs a CUDA-aware MPI. Both
+# run under the site's default recipe, the standard MPI ABI (`sys` in the
+# labels): the site's MPI through mpi_abi_wrapper, on Symmetry HPC-X's
+# Open MPI, on Trillium's GPU cluster StdEnv/2023's Open MPI 4.1.5 with the
+# UCX of cuda/12.9. The spec names no other recipe, so it runs on any site
+# with a GPU and an MPI recipe; MPICH_jll, which is not CUDA-aware and
+# which Trillium's GPU cluster does not offer, is left out. The labels name
+# the MPI and the path. The `[after]` command prints the weak-scaling table
+# of each path (bench/mpitable.awk).
+name = "mpi-gpu"
+env = "test+cuda"                   # SHA and Test, for the device tests
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_N = "32" }
+
+[site.symmetry]                     # four H200s of one node
+time = "2:00:00"
+resources = { gpus = 4 }
+
+[site.trillium-gpu]                 # four H100s of one node
+time = "2:00:00"
+resources = { gpus = 4 }
+
+[after]
+cmd = '''
+for p in sys-staged sys-direct; do
+    logs=$(for d in $SIMLAUNCH_JOBDIRS; do case $d in */"$SPEC-bench-$p-"*) echo "$d/output.log" ;; esac; done)
+    [ -n "$logs" ] || continue
+    echo "## bench/mpi.jl on CUDA, $p"
+    awk -F'\t' -f "$PROJECT"/bench/mpitable.awk $logs
+done
+'''
+
+# test/mpi_device_tests.jl: the serial run, then 2, 3 and 4 ranks, each
+# compared with it. It starts its ranks itself, through the recipe's mpiexec.
+
+[[run]]
+label = "tests-sys-staged-Float64"
+mpi = "default"
+vars = { TREEAMR_TEST_BACKEND = "cuda", TREEAMR_TEST_T = "Float64", TREEAMR_TEST_RANKS = "2 3 4", TREEAMR_TEST_DEVICEAWARE = "0" }
+cmd = "test/mpi_device_tests.jl"
+
+[[run]]
+label = "tests-sys-staged-Float32"
+mpi = "default"
+vars = { TREEAMR_TEST_BACKEND = "cuda", TREEAMR_TEST_T = "Float32", TREEAMR_TEST_RANKS = "2 3 4", TREEAMR_TEST_DEVICEAWARE = "0" }
+cmd = "test/mpi_device_tests.jl"
+
+[[run]]
+label = "tests-sys-direct-Float64"
+mpi = "default"
+vars = { TREEAMR_TEST_BACKEND = "cuda", TREEAMR_TEST_T = "Float64", TREEAMR_TEST_RANKS = "2 3 4", TREEAMR_TEST_DEVICEAWARE = "1" }
+cmd = "test/mpi_device_tests.jl"
+
+[[run]]
+label = "tests-sys-direct-Float32"
+mpi = "default"
+vars = { TREEAMR_TEST_BACKEND = "cuda", TREEAMR_TEST_T = "Float32", TREEAMR_TEST_RANKS = "2 3 4", TREEAMR_TEST_DEVICEAWARE = "1" }
+cmd = "test/mpi_device_tests.jl"
+
+# bench/mpi.jl on CUDA at 1, 2 and 4 ranks, one GPU a rank.
+
+[[run]]
+label = "bench-sys-staged-1"
+ranks = 1
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "bench-sys-staged-2"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "2x1" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "bench-sys-staged-4"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "0", TREEAMR_BENCH_LABEL = "4x1" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "bench-sys-direct-1"
+ranks = 1
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "bench-sys-direct-2"
+ranks = 2
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "2x1" }
+cmd = "bench/mpi.jl mpi"
+
+[[run]]
+label = "bench-sys-direct-4"
+ranks = 4
+vars = { TREEAMR_BENCH_DEVICEAWARE = "1", TREEAMR_BENCH_LABEL = "4x1" }
+cmd = "bench/mpi.jl mpi"

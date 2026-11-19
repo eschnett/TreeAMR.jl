@@ -1,0 +1,32 @@
+# The M11 point-interpolation benchmark (`bench/interpolate.jl`) on one
+# H200: Float64 and Float32 on the device, then the same batches on the
+# node's host cores for the comparison. `jobs/interpolate.toml` is the
+# CPU node's.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/interpolate-cuda.toml
+#     simlaunch submit <study> jobs/interpolate-cuda.toml --site symmetry
+name = "interpolate-cuda"
+env = "cuda"
+
+[site.symmetry]                     # one H200 and its 8 host cores
+time = "1:00:00"
+resources = { gpus = 1 }
+
+[[run]]
+label = "cuda-Float64"
+cmd = "bench/interpolate.jl"
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_T = "Float64", TREEAMR_BENCH_NPTS = "496,4960,49600,496000" }
+
+[[run]]
+label = "cuda-Float32"
+cmd = "bench/interpolate.jl"
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_T = "Float32", TREEAMR_BENCH_NPTS = "496,4960,49600,496000" }
+
+[[run]]
+label = "host"
+cmd = "bench/interpolate.jl"
+julia_args = ["--threads=8,0"]      # all 8 cores pinned: -t 8 would start 9 threads
+vars = { JULIA_EXCLUSIVE = "1" }
