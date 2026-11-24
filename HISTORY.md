@@ -5167,6 +5167,15 @@ M12 was decided with Erik, after M7 and before M9b.
     nested loops over the widths, by owner on the CPU, it is 5.1× faster
     at full width (545 → 106 ns per ghost and variable) and 13× and 70×
     at 36 and 6 taps.
+  - *Step 4, the checkpoint (2026-11-24).* TreeIOHDF5 saves the appendix
+    as a dataset of its own in each part, beside the cores, with a
+    checksum per block — Erik's choice over closed `(N+1)^D` blocks
+    padded where a block does not own a plane, which would have reused
+    TreeIOHDF5's per-block streaming at 9.7–42 % more storage for such
+    sets in 3D (TreeIOHDF5's `HISTORY.md`, "M20: the appendix"). The
+    companion interface gained `hasappendix`, `corelength` and
+    `appendix_entries`, the last new, and the field `glue` of a
+    `FieldSet`.
 
 ## Downstream checks
 

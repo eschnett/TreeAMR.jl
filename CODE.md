@@ -3812,10 +3812,11 @@ every access allocated its index tuples on the CPU (70 ns and 148 B an
 entry through a fold, 9 ns and nothing now). `fill_by_coordinates!` fills
 the appendix after the cores, every form of its callback through one
 kernel over the appendix's points, and `adapt_to_initial_data!` takes the
-`atlas` its schedules need. Still to learn of it: TreeIOHDF5, whose
-checkpoint must save and restore the appendix, a change to the
-companion interface ([Companion interface](#companion-interface)) and a
-format feature of its own.
+`atlas` its schedules need. TreeIOHDF5 saves it as a dataset of its own
+beside the cores, under the format feature `interpolated_glue`, through
+the companion interface's `hasappendix`, `corelength` and
+`appendix_entries` ([Companion interface](#companion-interface)); its
+`CODE.md` has the format.
 
 ### Folds over points
 
@@ -6423,6 +6424,14 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
+- the appendix of a set interpolated across a glue (M20): `hasappendix`,
+  `corelength`, the length of a state vector's cores, and
+  `appendix_entries(fs, j)`, the entries of global leaf `j`'s appendix
+  in the state vector, on any rank (`glue.jl`, `state.jl`). The state
+  vector is the cores, then the appendix block by block, so these place
+  every block's part of it; TreeIOHDF5 stores the cores as before and
+  the appendix in a dataset of its own, and reads the field `glue` of a
+  `FieldSet` to rebuild the set;
 - the face kinds: `reflecting_faces`, `outflow_faces` (`forest.jl`),
   each a `(lo, hi)` pair per dimension, in the shape of the `Forest`
   keywords;
@@ -6430,9 +6439,9 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   `extents`, `leaves` and `comm` (`roots`, `periodic` and `extents` for
   a brick only: on a forest of patches they are patch 1's, and
   `patch_keywords` replaces them); of a `FieldSet`,
-  `work`, `nvars`, `G`, `centering`, `P`, `walls`, `parity`, `rotation`,
-  `halfturn` and `forest` (`walls` since AMR-8, `halfturn` since M14,
-  `P` since M16: a checkpoint saves them, and a restart rebuilds the set
+  `work`, `nvars`, `G`, `centering`, `P`, `walls`, `glue`, `parity`,
+  `rotation`, `halfturn` and `forest` (`walls` since AMR-8, `halfturn`
+  since M14, `P` since M16, `glue` since M20: a checkpoint saves them, and a restart rebuilds the set
   with them; `centering` may then be `elementcentered(D)`, all
   `:element`, which `FieldSet` accepts only together with `P`);
   of a `MortonKey`, `root`, `level` and `coords`. A `GhostSchedule`

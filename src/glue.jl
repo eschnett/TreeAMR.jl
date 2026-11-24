@@ -803,6 +803,31 @@ function build_appendix_layout(fs::FieldSet{T,D}) where {T,D}
     return AppendixLayout{D}(dims, base, count, points, block, first, total)
 end
 
+# The points of the appendix of a block whose high face planes along the
+# dimensions `e` it owns: each plane once, a point on several in the plane
+# of the lowest dimension, as `build_appendix_layout` enumerates them.
+function appendix_count(e::NTuple{D,Bool}, N::Int) where {D}
+    n = 0
+    for d in 1:D
+        e[d] || continue
+        size = 1
+        for d′ in 1:D
+            d′ == d && continue
+            size *= d′ < d ? N : N + e[d′]
+        end
+        n += size
+    end
+    return n
+end
+
+# The entries of the appendix of global leaf `j` in `fs`'s state vector,
+# its points times the variables, on any rank: what TreeIOHDF5 streams and
+# stores for that block (a name of the companion interface, CODE.md).
+appendix_entries(fs::FieldSet{T,D}, j::Integer) where {T,D} =
+    hasappendix(fs) ?
+    fs.nvars * appendix_count(appendix_dims(fs.forest, fs.forest.leaves[j],
+                                            staggers(fs.centering)), fs.forest.N) : 0
+
 # The position, from 1, of the point `I` (owned index `1 … N+1`) among its
 # block's appendix points, `e` the block's appendix dimensions: the planes
 # of the lower dimensions first, then lexicographic within its own.
