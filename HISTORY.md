@@ -5063,6 +5063,20 @@ M12 was decided with Erik, after M7 and before M9b.
     polynomial of degree 5 is reproduced to rounding, and on the
     annulus, declared aligned, the interpolated ghosts are the copied
     ones bit for bit.
+  - *Step 4, the appendix (2026-11-23).* Closed ownership: a block at a
+    glued high face of its patch owns that face plane, which follows the
+    cores in the state vector; `GroupKey` carries a per-dimension `top`
+    flag, the mirror of symmetric walls' `low`, so that a block's own
+    range and every copy across a tangential face run to `G+N+1` there,
+    and the region beyond starts at `G+N+2`. With the plane owned the
+    interpolation reads it, so the window includes every vertex-like
+    high plane, and the half-open slice's carrying of a point across the
+    glue (`owned_side`) and its refusal of a plane glued high to high
+    went. The last cell below a glued high face is no longer
+    extrapolated: on the kinked torus the ghosts of the smooth function
+    now come out 1.0e−2, 1.3e−4, 2.2e−6 and 3.5e−8 at 1, 2, 4 and 8 roots
+    per patch side, rates 6.3, 5.9 and 5.9, against 0.19, 3.5e−3 and
+    5.7e−5 under half-open ownership.
 
 ## Downstream checks
 

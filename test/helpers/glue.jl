@@ -50,13 +50,14 @@ end
 const KINKED_OPS = Operators(prolongation=4, restriction=4, glue=6)
 
 # Every stored point of every block of `fs` beyond a glued face of its
-# patch and nowhere else, with its logical position and patch: what the
+# patch and nowhere else, past the high face planes the block owns, with its logical position and patch: what the
 # glue plan fills.
 function glue_ghosts(fs)
     forest = fs.forest
     conn = forest.conn
     G, c = fs.G, staggers(fs.centering)
     out = Tuple{Int,NTuple{2,Int},NTuple{2,Float64},Int}[]
+    dims = TreeAMR.appendix_layout(fs).dims          # the owned high planes (M20)
     for b in 1:nblocks(fs)
         k = forest.leaves[b]
         p = patch(forest, k)
@@ -64,7 +65,8 @@ function glue_ghosts(fs)
         o = block_origin(forest, k)
         for I in CartesianIndices(size(fs.work)[1:2])
             idx = Tuple(I)
-            δ = ntuple(d -> idx[d] <= G[d] ? -1 : idx[d] > G[d] + fs.forest.N ? 1 : 0, 2)
+            δ = ntuple(d -> idx[d] <= G[d] ? -1 :
+                            idx[d] > G[d] + fs.forest.N + dims[b][d] ? 1 : 0, 2)
             all(iszero, δ) && continue
             TreeAMR.interpolated_region(conn, k, δ) || continue
             ξ = ntuple(d -> o[d] + (idx[d] - G[d] - 1) * h, 2)

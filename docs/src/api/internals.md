@@ -4,6 +4,7 @@ Not exported, and not part of the public interface, but documented
 because they define the shape of the schedule.
 
 ```@docs
+TreeAMR.AppendixArray
 TreeAMR.Stencil1D
 TreeAMR.TransferGroup
 TreeAMR.BoundaryRegion

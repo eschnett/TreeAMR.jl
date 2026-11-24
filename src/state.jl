@@ -18,7 +18,12 @@
 Number of entries in this field set's state vector: `N^D · nvars ·
 nblocks`, counting interior cells only.
 """
-statelength(fs::FieldSet{T,D}) where {T,D} = fs.forest.N^D * fs.nvars * nblocks(fs)
+statelength(fs::FieldSet{T,D}) where {T,D} =
+    corelength(fs) + (hasappendix(fs) ? appendix_layout(fs).total : 0)
+
+# The cores' part of the state, `N^D · nvars · nblocks`: all of it but the
+# appendix of a set interpolated across a glue (M20).
+corelength(fs::FieldSet{T,D}) where {T,D} = fs.forest.N^D * fs.nvars * nblocks(fs)
 
 """
     statevector(fs::FieldSet)
@@ -35,19 +40,39 @@ function statevector(fs::FieldSet{T}) where {T}
     backend = get_backend(fs.work)
     u = allocate(backend, T, (statelength(fs),))
     zerofill!(statearray(u, fs), backend)          # first touch by block owner
+    # The appendix (M20), a few planes, after the cores.
+    hasappendix(fs) && fill!(view(u, (corelength(fs) + 1):length(u)), zero(T))
     return u
 end
 
 """
-    statearray(u, fs::FieldSet)
+    statearray(u, fs::FieldSet; appendix=false)
 
 View a flat state vector as an `(N, ..., N, nvars, nblocks)` array,
 sharing memory. This is the layout application kernels write `du` in;
 the index order matches the working array, minus the ghosts.
+
+A set interpolated across a glue (`glue = :interpolate`, M20) owns the
+high face planes of its blocks at a glued face of their patch, which
+follow the blocks' cores in the state vector. `statearray(u, fs)` is
+then the cores alone, and `statearray(u, fs; appendix = true)` the whole
+state, an [`AppendixArray`](@ref TreeAMR.AppendixArray) whose `i_d` runs
+to `N + 1` where a block owns that plane: what a right-hand side
+launched with `map_blocks!(…; appendix = true)` writes through. On any
+other set the keyword changes nothing. See "Finite differences across a
+glue" in `CODE.md`.
 """
-function statearray(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
+function statearray(u::AbstractVector, fs::FieldSet{T,D};
+                    appendix::Bool=false) where {T,D}
     check_statelength(u, fs)
-    return reshape(u, ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs))
+    shape = (ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs))
+    hasappendix(fs) || return reshape(u, shape...)
+    n = corelength(fs)
+    core = reshape(view(u, 1:n), shape...)
+    appendix || return core
+    L = appendix_layout(fs)
+    return AppendixArray(core, view(u, (n + 1):length(u)), L.dims, L.base, L.count,
+                         fs.forest.N)
 end
 
 function check_statelength(u::AbstractVector, fs::FieldSet)
@@ -103,7 +128,11 @@ ghosts untouched. The first step of every RHS evaluation; follow it with
 """
 function scatter!(fs::FieldSet{T,D}, u::AbstractVector) where {T,D}
     check_statelength(u, fs)
-    run_over_interiors!(scatter_kernel!, fs, fs.work, u)
+    hasappendix(fs) || (run_over_interiors!(scatter_kernel!, fs, fs.work, u); return fs)
+    n = corelength(fs)
+    run_over_interiors!(scatter_kernel!, fs, fs.work, view(u, 1:n))
+    move_appendix!(appendix_scatter_kernel!, fs, fs.work, view(u, (n + 1):length(u)),
+                   appendix_layout(fs))
     return fs
 end
 
@@ -119,7 +148,11 @@ for reading results back out.
 """
 function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
     check_statelength(u, fs)
-    run_over_interiors!(gather_kernel!, fs, u, fs.work)
+    hasappendix(fs) || (run_over_interiors!(gather_kernel!, fs, u, fs.work); return u)
+    n = corelength(fs)
+    run_over_interiors!(gather_kernel!, fs, view(u, 1:n), fs.work)
+    move_appendix!(appendix_gather_kernel!, fs, view(u, (n + 1):length(u)), fs.work,
+                   appendix_layout(fs))
     return u
 end
 
@@ -283,7 +316,7 @@ end
 
 """
     map_blocks!(kernel!, fs::FieldSet, args...; closed=false, stored=false,
-                workgroupsize=nothing)
+                workgroupsize=nothing, appendix)
 
 Launch a KernelAbstractions kernel over every **owned** point of every
 block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
@@ -296,6 +329,14 @@ shared boundary plane (see [`closedview`](@ref)). That is what a
 quantity defined on a block's faces wants: a flux has `N+1` faces per
 dimension, not `N`, and the extra one is the block's own high face. In a
 cell-centered field set the two are the same loop.
+
+On a set interpolated across a glue (M20), which owns the high face
+planes of its blocks at a glued face of their patch, `appendix` is
+required: with `appendix = true` the loop runs over the closed range, and
+a right-hand side written through [`statearray`](@ref)`(du, fs; appendix
+= true)` reaches the planes a block owns and drops the rest; with `false`
+it runs over the owned range alone, and the appendix stays as it was. On
+any other set it is ignored.
 
 With `stored = true` the loop runs over every **stored** point of every
 block, ghosts included — `ndrange = (size(fs.work)[1:D]..., nblocks(fs))`,
@@ -362,7 +403,24 @@ end
 """
 function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
                      closed::Bool=false, stored::Bool=false,
-                     workgroupsize=nothing) where {T,D}
+                     workgroupsize=nothing,
+                     appendix::Union{Bool,Nothing}=nothing) where {T,D}
+    # A set with an appendix (M20) says whether the launch covers it: a
+    # right-hand side that forgot it would leave its planes unevolved.
+    if hasappendix(fs)
+        appendix === nothing && throw(ArgumentError(
+            "this field set owns the high face planes of its blocks at a glued face " *
+            "(its appendix, closed ownership across a glue), so map_blocks! needs " *
+            "`appendix = true` or `false`: with `true` the launch covers the closed " *
+            "range and the kernel writes through `statearray(du, fs; appendix = true)`, " *
+            "which keeps the planes a block owns and drops the rest; with `false` it " *
+            "covers the cores alone, and a right-hand side then leaves the appendix " *
+            "unevolved (CODE.md, \"Finite differences across a glue\")"))
+        appendix && (stored && throw(ArgumentError(
+            "map_blocks! takes `appendix = true` or `stored = true`, not both: the " *
+            "appendix is a set of owned planes, which the closed range covers"));
+                     closed = true)
+    end
     stored && closed && throw(ArgumentError(
         "map_blocks! takes `closed = true` or `stored = true`, not both: the " *
         "closed range G+1 … G+N+c is a sub-range of the stored one 1 … N+2G+c, " *

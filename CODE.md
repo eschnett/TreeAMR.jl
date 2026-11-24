@@ -3538,15 +3538,14 @@ missing order or atlas, and the collective checks compare the order and
 `hash(atlas)` across ranks with the rest of the layout.
 
 *Implemented so far:* the keywords, the refusals at schedule build (not
-yet `regrid!`'s), the location with `chart_aligned`, and the stage,
-serially and on the CPU, under half-open ownership: `src/glue.jl`, tested
-in `test/glue_tests.jl`. Until the appendix lands, a ghost the atlas
-puts on a glued high face plane, which it may give to either side, is
-carried across that glue by the glue's own map to the patch where the
-plane is owned (`owned_side`); a plane glued high to high is refused; and
-a point in the last cell below a glued high face is extrapolated by less
-than a spacing. A distributed forest and reflecting or outflow faces are
-refused.
+yet `regrid!`'s), the location with `chart_aligned`, the stage, and
+closed ownership with its appendix — `statelength`, `scatter!`,
+`gather!`, `statearray(u, fs; appendix = true)` (an `AppendixArray`),
+`map_blocks!`'s keyword and the closed ranges of the fill — serially
+and on the CPU: `src/glue.jl`, tested in `test/glue_tests.jl`. Folds
+and norms still read the cores alone, which count every glued face
+point once where a high face is glued to a low one and not otherwise. A
+distributed forest and reflecting or outflow faces are refused.
 
 **Where a ghost lies, and what fills it.** A ghost of block `b` of
 patch `p` beyond a glued face of `p` — across a face, an edge or a

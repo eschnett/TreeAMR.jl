@@ -6,9 +6,9 @@
 # through the application's atlas when the schedule is built. Each fill
 # then evaluates one tensor-product Lagrange stencil per ghost point and
 # variable. See "Finite differences across a glue" in CODE.md, which this
-# file implements serially and on the CPU, under half-open ownership (the
-# appendix of closed ownership, the sender's evaluation across ranks and
-# the device path are later steps of M20).
+# file implements serially and on the CPU, with closed ownership's
+# appendix (the sender's evaluation across ranks and the device path are
+# later steps of M20).
 
 """
     TreeAMR.chart_aligned(atlas, p, q) -> NTuple{D,Bool}
@@ -66,6 +66,22 @@ end
 
 isglued(conn::Patches{D}, p::Integer, e::Integer, side::Integer) where {D} =
     conn.glue[glue_slot(p, e, side, D)].patch != 0
+
+# Along which dimensions leaf `k` owns its high face plane under closed
+# ownership (M20): the vertex-like ones along which its high face lies on
+# a glued high face of its patch. That plane is the block's appendix.
+function appendix_dims(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int}) where {D}
+    conn = forest.conn::Patches{D}
+    lvl = level(k)
+    p = searchsortedlast(conn.firstroot, Int(k.root))
+    n = conn.roots[p]
+    rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
+    return ntuple(D) do e
+        c[e] == 1 || return false
+        g = (rootpos[e] << lvl) + Int(k.coords[e])
+        return g == (n[e] << lvl) - 1 && isglued(conn, p, e, 2)
+    end
+end
 
 # Whether the ghost region of leaf `k` in direction `δ` lies across a
 # glue and nowhere else: it leaves `k`'s patch, through glued faces only.
@@ -205,11 +221,9 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                 "$δ: a map must be defined past its patch's box, by the ghost width at " *
                 "least (CODE.md, \"Finite differences across a glue\")"))
             # The patch across, or `p` itself across a face glued to its own
-            # opposite face, a wrap. A point on a glued high face plane, which
-            # the atlas may give either side of, is taken to the side where
-            # that plane is owned.
+            # opposite face, a wrap. A point on a glued face may be given to
+            # either side: both own their face planes (closed ownership).
             ξ′, q = loc
-            ξ′, q = owned_side(forest, conn, R, ξ′, q, lvl, c)
             s = locate_point(forest, PatchPoint(ξ′, q))
             s === nothing && throw(ArgumentError(
                 "no leaf of patch $q holds $ξ′, where the atlas locates the ghost at $ξ " *
@@ -232,9 +246,9 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                 t = (S(ξ′[e]) - S(lo[e][1])) / S(h) - (c[e] == 1 ? 0 : S(1) / 2)
                 n = (npts[e] << lvl) * N
                 # The window: the patch's own points, its high face plane
-                # only where that is not glued, since under half-open
-                # ownership a glued high plane is a ghost filled here too.
-                hi = c[e] == 1 && !isglued(conn, q, e, 2) ? n : n - 1
+                # included along a vertex-like dimension, owned where it is
+                # glued (the appendix) and the hook's at an outer face.
+                hi = c[e] == 1 ? n : n - 1
                 if al[e]
                     r = round(Int, t)
                     abs(t - r) <= S(1) / 1000 || throw(ArgumentError(
@@ -274,42 +288,6 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
     end
     return GluePlan{T,D}(k, target, index, source, firsts, widths,
                          reshape(weights, k * D, length(target)))
-end
-
-# A point `ξ` of patch `q` at the level `lvl`, moved across every glued
-# high face of a vertex-like dimension it lies on, by the glue's map in
-# point coordinates, to the patch where that face plane is owned (under
-# half-open ownership a glued high plane is a ghost, filled by the very
-# stage that reads here). A plane glued high to high has no owner, and is
-# refused until closed ownership gives it one.
-function owned_side(forest::Forest{D,R}, conn::Patches{D}, ::Type{R}, ξ, q::Int, lvl::Int,
-                    c::NTuple{D,Int}) where {D,R}
-    N = forest.N
-    h = spacing(R, forest, lvl)
-    scale = (1 << lvl) * N
-    t = ntuple(e -> (ξ[e] - patch_extents(forest, q)[e][1]) / h, D)
-    for _ in 1:D
-        npts = patch_roots(forest, q)
-        e = findfirst(e -> c[e] == 1 && isglued(conn, q, e, 2) &&
-                           abs(t[e] - npts[e] * scale) <= 1e-6, 1:D)
-        e === nothing && break
-        # On the face exactly, so that the map lands on the face across
-        # exactly, in point coordinates that are integers there.
-        t = Base.setindex(t, R(npts[e] * scale), e)
-        entry = conn.glue[glue_slot(q, e, 2, D)]
-        entry.face[2] == 2 && throw(ArgumentError(
-            "a ghost lands on the high face of dimension $e of patch $q, glued to the " *
-            "high face of dimension $(entry.face[1]) of patch $(entry.patch): under " *
-            "half-open ownership neither patch owns that plane, and interpolating " *
-            "from it waits for closed ownership (M20 step 4)"))
-        t = ntuple(D) do a
-            x = t[Int(entry.perm[a])]
-            return entry.flip[a] ? entry.offset[a] * scale - x : x + entry.offset[a] * scale
-        end
-        q = entry.patch
-    end
-    lo = patch_extents(forest, q)
-    return ntuple(e -> lo[e][1] + t[e] * h, D), q
 end
 
 # What a stencil reads beyond its source block's owned range is the
@@ -363,6 +341,183 @@ function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, backend) where {T,D}
     kernel = glue_kernel!(backend)
     kernel(fs.work, plan.target, plan.index, plan.source, plan.first, plan.width,
            plan.weights, Val(D), Val(plan.k); ndrange=(length(plan), fs.nvars))
+    synchronize(backend)
+    return nothing
+end
+
+# --- The appendix (M20) ---------------------------------------------------------
+#
+# Under closed ownership a block whose high face lies on a glued high face
+# of its patch owns that face plane too, along every such vertex-like
+# dimension. Those planes follow the cores in the state vector: block by
+# block, variable by variable, the block's points in a fixed order — the
+# plane of each dimension in turn, every point once (one on two planes,
+# at an edge or a corner, in the plane of the lower dimension), each
+# plane lexicographic in its other dimensions, the first fastest. See
+# "Closed ownership and the appendix" in CODE.md, "Finite differences
+# across a glue".
+
+# Whether a field set has an appendix: interpolated across the glue of a
+# forest of patches, with a vertex-like dimension.
+hasappendix(fs::FieldSet) =
+    fs.glue === :interpolate && ispatched(fs.forest) && any(==(:vertex), fs.centering)
+
+# The appendix of one field set over its forest's current leaves: per
+# local block its dimensions, its offset in the appendix and its number
+# of points per variable; and every point, owned index `1 … N+1` per
+# dimension, block after block in the order above, with its block.
+struct AppendixLayout{D}
+    dims::Vector{NTuple{D,Bool}}
+    base::Vector{Int}
+    count::Vector{Int}
+    points::Vector{NTuple{D,Int32}}
+    block::Vector{Int32}
+    first::Vector{Int}
+    total::Int
+end
+
+function appendix_layout(fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    N = forest.N
+    c = staggers(fs.centering)
+    range = blockrange(forest)
+    dims = NTuple{D,Bool}[]
+    base = Int[]
+    count = Int[]
+    points = NTuple{D,Int32}[]
+    block = Int32[]
+    first = Int[]
+    total = 0
+    for (b, j) in enumerate(range)
+        e = hasappendix(fs) ? appendix_dims(forest, forest.leaves[j], c) :
+            ntuple(_ -> false, D)
+        push!(dims, e)
+        push!(base, total)
+        push!(first, length(points) + 1)
+        n0 = length(points)
+        for d in 1:D
+            e[d] || continue
+            ranges = ntuple(D) do d′
+                d′ == d && return (N + 1):(N + 1)
+                return d′ < d ? (1:N) : (1:(N + e[d′]))
+            end
+            for I in CartesianIndices(ranges)
+                push!(points, ntuple(d′ -> Int32(I[d′]), D))
+                push!(block, Int32(b))
+            end
+        end
+        push!(count, length(points) - n0)
+        total += fs.nvars * (length(points) - n0)
+    end
+    return AppendixLayout{D}(dims, base, count, points, block, first, total)
+end
+
+# The position, from 1, of the point `I` (owned index `1 … N+1`) among its
+# block's appendix points, `e` the block's appendix dimensions: the planes
+# of the lower dimensions first, then lexicographic within its own.
+@inline function appendix_rank(I::NTuple{D,Int}, e::NTuple{D,Bool}, N::Int) where {D}
+    d = findfirst(d′ -> I[d′] == N + 1, 1:D)::Int
+    off = 0
+    for d2 in 1:(d - 1)
+        e[d2] || continue
+        size = 1
+        for d′ in 1:D
+            d′ == d2 && continue
+            size *= d′ < d2 ? N : N + e[d′]
+        end
+        off += size
+    end
+    r = 0
+    stride = 1
+    for d′ in 1:D
+        d′ == d && continue
+        r += (I[d′] - 1) * stride
+        stride *= d′ < d ? N : N + e[d′]
+    end
+    return off + r + 1
+end
+
+"""
+    AppendixArray
+
+The whole state of a set with an appendix, as `statearray(u, fs;
+appendix = true)` returns it: an `(i1, …, iD, var, b)` array whose `i_d`
+runs to `N + 1` along a dimension where block `b` owns its high face
+plane, reading and writing the core or the appendix as the index says. A
+write to a point the block does not own is discarded, so that a kernel
+launched over the closed range may write every point it visits; reading
+one is an error. See "Finite differences across a glue" in `CODE.md`.
+"""
+struct AppendixArray{T,D,C<:AbstractArray{T},A<:AbstractVector{T}}
+    core::C
+    appendix::A
+    dims::Vector{NTuple{D,Bool}}
+    base::Vector{Int}
+    count::Vector{Int}
+    N::Int
+end
+
+@inline function appendix_slot(a::AppendixArray{T,D}, I::NTuple{D,Int}, v::Int,
+                               b::Int) where {T,D}
+    e = a.dims[b]
+    all(d -> I[d] <= a.N + e[d], 1:D) || return 0
+    return a.base[b] + (v - 1) * a.count[b] + appendix_rank(I, e, a.N)
+end
+
+function Base.getindex(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
+    i = ntuple(d -> I[d], Val(D))
+    v, b = I[D + 1], I[D + 2]
+    all(d -> i[d] <= a.N, 1:D) && return a.core[i..., v, b]
+    s = appendix_slot(a, i, v, b)
+    s == 0 && throw(BoundsError(a, I))
+    return a.appendix[s]
+end
+
+function Base.setindex!(a::AppendixArray{T,D}, x, I::Vararg{Int}) where {T,D}
+    i = ntuple(d -> I[d], Val(D))
+    v, b = I[D + 1], I[D + 2]
+    if all(d -> i[d] <= a.N, 1:D)
+        a.core[i..., v, b] = x
+        return a
+    end
+    s = appendix_slot(a, i, v, b)
+    s == 0 || (a.appendix[s] = x)
+    return a
+end
+
+Base.size(a::AppendixArray{T,D}) where {T,D} =
+    (ntuple(_ -> a.N + 1, D)..., size(a.core, D + 1), size(a.core, D + 2))
+
+# The appendix's points between the working array and the state vector,
+# one work item per point and variable.
+@kernel function appendix_scatter_kernel!(work, @Const(app), @Const(points),
+                                          @Const(block), @Const(first), @Const(base),
+                                          @Const(count), ::Val{D}, ::Val{G}) where {D,G}
+    j, v = @index(Global, NTuple)
+    @inbounds begin
+        b = block[j]
+        I = points[j]
+        s = base[b] + (v - 1) * count[b] + (j - first[b]) + 1
+        work[ntuple(d -> Int(I[d]) + G[d], Val(D))..., v, b] = app[s]
+    end
+end
+@kernel function appendix_gather_kernel!(app, @Const(work), @Const(points),
+                                         @Const(block), @Const(first), @Const(base),
+                                         @Const(count), ::Val{D}, ::Val{G}) where {D,G}
+    j, v = @index(Global, NTuple)
+    @inbounds begin
+        b = block[j]
+        I = points[j]
+        s = base[b] + (v - 1) * count[b] + (j - first[b]) + 1
+        app[s] = work[ntuple(d -> Int(I[d]) + G[d], Val(D))..., v, b]
+    end
+end
+
+function move_appendix!(kernel, fs::FieldSet{T,D}, a, b, L::AppendixLayout{D}) where {T,D}
+    isempty(L.points) && return nothing
+    backend = get_backend(fs.work)
+    kernel(backend)(a, b, L.points, L.block, L.first, L.base, L.count, Val(D), Val(fs.G);
+                    ndrange=(length(L.points), fs.nvars))
     synchronize(backend)
     return nothing
 end

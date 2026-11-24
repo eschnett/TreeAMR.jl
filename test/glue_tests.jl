@@ -7,15 +7,17 @@ using TreeAMR: GluePlan, chart_aligned
 # each patch, which a six-point stencil reproduces exactly.
 glue_poly(ξ, p) = 0.5 + p * ξ[1]^5 + 2ξ[1]^3 * ξ[2]^4 - (p + 1) * ξ[2]^5 + ξ[1] * ξ[2]
 
-# Owned points from `f(ξ, p)`, every other stored point NaN, then the fill.
+# Owned points, the appendix included, from `f(ξ, p)`, every other stored
+# point NaN, then the fill.
 function fill_from_owned!(fs, sched, f)
     forest = fs.forest
     G, N = fs.G, forest.N
+    dims = TreeAMR.appendix_layout(fs).dims
     fs.work .= NaN
     for b in 1:nblocks(fs)
         k = forest.leaves[b]
         p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
-        for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N), 2))
+        for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), 2))
             ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1) * h, 2)
             fs.work[I, 1, b] = f(ξ, p)
         end
@@ -36,13 +38,12 @@ end
         fill_from_owned!(fs, sched, glue_poly)
         ghosts = glue_ghosts(fs)
         @test length(ghosts) == length(sched.glueplan)
-        # A ghost on a glued face plane is read from where that plane is
-        # owned, and each patch has its own polynomial.
-        lvl = level(first(forest.leaves))
+        # Each patch has its own polynomial, and owns its face planes, so
+        # a ghost on a glued face takes the value of the patch the atlas
+        # gives it to.
         err = maximum(ghosts) do (b, idx, ξ, p)
             ξ′, q = TreeAMR.chart_locate(KINKED, TreeAMR.chart_map(KINKED, ξ, p))
-            ξ″, q″ = TreeAMR.owned_side(forest, forest.conn, Float64, ξ′, q, lvl, (1, 1))
-            return abs(fs.work[idx..., 1, b] - glue_poly(ξ″, q″))
+            return abs(fs.work[idx..., 1, b] - glue_poly(ξ′, q))
         end
         @test err < 1e-11
     end
@@ -87,7 +88,9 @@ ring8() = Forest([(roots=(2, 1),) for _ in 1:4]; N=8,
     si = GhostSchedule(fi, ops; atlas=AlignedPolar())
     sc = GhostSchedule(fc, ops)
     @test all(==(1), reduce(vcat, collect.(si.glueplan.width)))
-    f(ξ, p) = sin(3 * (2(p - 1) + ξ[1])) * (1 + ξ[2])^2
+    # Periodic around the ring, and the same bits on both sides of a glue,
+    # where the patches' angles `2(p - 1) + ξ₁` are the same integer.
+    f(ξ, p) = cospi(3 * (2(p - 1) + ξ[1]) / 4) * (1 + ξ[2])^2
     fill_from_owned!(fi, si, f)
     fill_from_owned!(fc, sc, f)
     @test isequal(fi.work, fc.work)
@@ -151,4 +154,76 @@ end
     fill_ghosts!(fi, si)
     fill_ghosts!(fc, sc)
     @test fi.work == fc.work
+end
+
+@testset "Closed ownership adds each patch's glued high face planes to the state, once" begin
+    # Guards the appendix's layout: a patch of n × n roots of N points owns
+    # (nN + 1)² points under closed ownership against (nN)² in its cores,
+    # every point of the planes once, the edge point included.
+    for n in (1, 2)
+        forest = kinked_forest(n)
+        fs = FieldSet(forest, 3; G=3, centering=vertexcentered(2), glue=:interpolate)
+        N = forest.N
+        @test statelength(fs) - TreeAMR.corelength(fs) == 3 * 2 * (2n * N + 1)
+        @test statelength(FieldSet(forest, 3; G=3, centering=vertexcentered(2))) ==
+              TreeAMR.corelength(fs)
+        # A cell-centered set has no face plane to own.
+        @test statelength(FieldSet(forest, 3; G=3, glue=:interpolate)) ==
+              TreeAMR.corelength(fs)
+    end
+end
+
+@testset "The appendix round-trips through scatter!, gather! and statearray" begin
+    # Guards the order of the appendix: scatter! and gather! move each
+    # entry to the stored point statearray(…; appendix = true) names.
+    forest = kinked_forest(2)
+    fs = FieldSet(forest, 2; G=3, centering=vertexcentered(2), glue=:interpolate)
+    u = collect(1.0:statelength(fs))
+    scatter!(fs, u)
+    w = zero(u)
+    gather!(w, fs)
+    @test w == u
+    A = statearray(u, fs; appendix=true)
+    L = TreeAMR.appendix_layout(fs)
+    N, G = forest.N, fs.G
+    seen = 0
+    for b in 1:nblocks(fs), v in 1:2,
+        I in CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))
+        @test A[Tuple(I)..., v, b] == fs.work[(Tuple(I) .+ G)..., v, b]
+        seen += 1
+    end
+    @test seen == length(u)
+    @test statearray(u, fs) == reshape(u[1:TreeAMR.corelength(fs)], N, N, 2, nblocks(fs))
+    # A write to a point a block does not own is dropped.
+    b = findfirst(e -> !e[1], L.dims)
+    A[N + 1, 1, 1, b] = -1.0
+    @test u == collect(1.0:statelength(fs))
+end
+
+@kernel function glue_position_kernel!(du, @Const(origins), @Const(h), ::Val{G}) where {G}
+    I = @index(Global, NTuple)
+    b = I[3]
+    du[I[1], I[2], 1, b] = origins[b][1] + (I[1] - 1) * h[b] + 10 * (origins[b][2] + (I[2] - 1) * h[b])
+end
+
+@testset "map_blocks! with appendix = true writes every point the state owns" begin
+    # Guards the launch over the closed range: a right-hand side written
+    # once reaches the appendix, and a set with one must say whether.
+    forest = kinked_forest(2)
+    fs = FieldSet(forest, 1; G=3, centering=vertexcentered(2), glue=:interpolate)
+    du = fill(NaN, statelength(fs))
+    origins = [block_origin(forest, k) for k in forest.leaves]
+    h = [spacing(forest, k) for k in forest.leaves]
+    @test_throws "needs `appendix = true` or `false`" map_blocks!(
+        glue_position_kernel!, fs, statearray(du, fs; appendix=true), origins, h, Val(fs.G))
+    map_blocks!(glue_position_kernel!, fs, statearray(du, fs; appendix=true), origins, h,
+                Val(fs.G); appendix=true)
+    @test !any(isnan, du)
+    A = statearray(du, fs; appendix=true)
+    L = TreeAMR.appendix_layout(fs)
+    N = forest.N
+    @test all(b -> all(I -> A[Tuple(I)..., 1, b] ==
+                            origins[b][1] + (I[1] - 1) * h[b] + 10 * (origins[b][2] + (I[2] - 1) * h[b]),
+                       CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))),
+              1:nblocks(fs))
 end

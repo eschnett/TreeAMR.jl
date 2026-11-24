@@ -398,7 +398,16 @@ struct GroupKey{D}
     glue::Int8
     low::NTuple{D,Bool}
     shift::NTuple{D,Int8}
+    # Along which dimensions the target owns its high face plane, the
+    # appendix of a set interpolated across a glue (M20): its own range
+    # runs to G+N+1 there, and the region beyond starts at G+N+2.
+    top::NTuple{D,Bool}
 end
+GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
+            mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8, low::NTuple{D,Bool},
+            shift::NTuple{D,Int8}) where {D} =
+    GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, low, shift,
+                ntuple(_ -> false, D))
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -423,7 +432,7 @@ kindrank(kind::Symbol) =
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
     (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
-     k.low, k.shift)
+     k.low, k.shift, k.top)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -812,8 +821,16 @@ end
 # (`G+2 : G+N` under 2), its halves meeting between `G+1+N/2` and
 # `G+2+N/2`, and the high region `G+N+2 : N+2G+c` (`G+N+1 : …` under 2).
 function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
-                      closed::Bool=false; low::Bool=false, shift::Integer=0)
+                      closed::Bool=false; low::Bool=false, shift::Integer=0,
+                      top::Bool=false)
     shift != 0 && return shifted_range(N, G, c, δd, od, halved, shift == 1)
+    if top
+        # The appendix (M20): the block owns its high face plane G+N+1.
+        (c == 1 && !halved) || error("an appendix plane asked for with stagger $c " *
+                                     "and halved = $halved; this is a bug")
+        δd == 1 && return (G + N + 2):(N + 2G + c)
+        δd == 0 && return (G + 1 + low):(G + N + 1)
+    end
     δd == 1 && return (G + N + 1):(N + 2G + c)
     δd == -1 && return 1:(G + low)
     top = closed ? c : 0                            # the shared plane, to the top half
@@ -838,8 +855,8 @@ end
 # neighbor's first *owned* point G+1 — which is the same point. So a copy
 # still reads interiors only, which is what makes phase 1 race free.
 function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int;
-                      low::Bool=false, shift::Integer=0) where {T}
-    rng = target_range(N, G, c, δd, 0, false; low=low, shift=shift)
+                      low::Bool=false, shift::Integer=0, top::Bool=false) where {T}
+    rng = target_range(N, G, c, δd, 0, false; low=low, shift=shift, top=top)
     srcstart = Int32[j - N * δd for j in rng]
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
@@ -1040,7 +1057,10 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
 # building a cell or vertex set's schedule does not compile them.
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
                       P::Integer, regrid::Bool=false, low::Bool=false,
-                      shift::Integer=0) where {T}
+                      shift::Integer=0, top::Bool=false) where {T}
+    # A block owns its high face plane only next to a glue, where every
+    # transfer is a same-level copy (M20).
+    top && kind !== :copy && error("an appendix plane asked for in a $kind; this is a bug")
     if P > 0
         c == 0 && !low && shift == 0 || error(
             "an element stencil asked for with stagger $c, low = $low, shift = " *
@@ -1050,7 +1070,7 @@ function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
         return Base.inferencebarrier(element_stencil)(T, N, G, kind, δd, od, Int(P),
                                                       regrid)::S
     end
-    kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift)
+    kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift, top=top)
     kind === :restrict &&
         return restriction_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
     return prolongation_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
@@ -1058,9 +1078,9 @@ end
 
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators,
                       mode::Int8; P::Integer, regrid::Bool=false, low::Bool=false,
-                      shift::Integer=0) where {T}
+                      shift::Integer=0, top::Bool=false) where {T}
     s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid, low=low,
-                     shift=shift)
+                     shift=shift, top=top)
     mode == BOUNDED_POINTVALUE || return s
     return stack_linear(s, kind_stencil(T, N, G, c, kind, δd, od, LINEAR_OPERATORS;
                                         P=P, regrid=regrid, low=low, shift=shift))
@@ -1303,18 +1323,23 @@ function block_sources!(pairs::TransferPairs{D},
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
     walls = lowwalls(forest, k, c, symmetric)
+    # The high face planes this block owns (M20).
+    tops = glueregions === nothing ? ntuple(_ -> false, D) :
+           appendix_dims(forest, k, c)
     for δ in dirs
         # Where this block's low wall plane is written (AMR-8), along every
         # dimension that does not step up.
         low = ntuple(d -> walls[d] && δ[d] != 1, D)
+        top = ntuple(d -> tops[d] && δ[d] != -1, D)
         shift = seam_shift(forest, k, c, δ, symmetric)
         record!(kind, offset, lvl, s, via::Crossing) =
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
-                                           via.turns, via.glue, low, shift),
+                                           via.turns, via.glue, low, shift, top),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false;
-                                                           low=low[d], shift=shift[d]),
+                                                           low=low[d], shift=shift[d],
+                                                           top=top[d]),
                                          D))
         # A cell-centered dimension with `G_d = 0` has no low slab and no
         # high one, so every direction that leaves the block along it has
@@ -2236,7 +2261,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # where the block's low wall is written.
         δs = state == 0 ? δd : 0
         s = kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
-                         P=order, low=state == 0 && low, shift=state == 0 ? shift : 0)
+                         P=order, low=state == 0 && low, shift=state == 0 ? shift : 0,
+                         top=state == 0 && key.top[d])
         state == 0 && return s
         state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd; low=low)
         return mirror_rows(s, N, ghosts[d], stags[d], δd)
