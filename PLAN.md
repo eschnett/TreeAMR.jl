@@ -431,8 +431,9 @@ Each step has the test that says it is done:
      patch corners, the face planes included;
    - on the seven-patch ball, the state holds each glued face point
      once for each patch holding it, `scatter!` and `gather!` round-trip
-     it, a fold of a constant gives the domain's volume, a checkpoint
-     round-trips through TreeIOHDF5, and the fill of data symmetric
+     it, a fold counts each physical point once (the ball's distinct
+     nodes) and sums a function of the position over exactly the
+     distinct points, a checkpoint round-trips through TreeIOHDF5, and the fill of data symmetric
      under the ball's symmetries is symmetric to rounding, as the
      prototype's is under closed ownership;
    - on the thirteen-patch ball, every ghost between two outer shells
@@ -446,16 +447,18 @@ Each step has the test that says it is done:
      interpolated ghost arrives in the schedule's point-to-point
      messages, computed by the rank that owns its sources;
    - all of it serially, at 1 and 3 ranks (a line of
-     `test/mpi_workload.jl`) and on a device, with
-     `--trace-compile-timing` of `test/mpi_workload.jl` no worse than on
-     `main`.
+     `test/mpi_workload.jl`) and on a device, with the cost to
+     `--trace-compile-timing` of `main`'s `test/mpi_workload.jl` against
+     `main` measured and recorded.
 5. **TreeWave on the seven-patch ball**: the plane wave of TreeWaveOLDG's
    `sevenpatch.jl`, with Dirichlet data on the outer sphere through the
    boundary hook. *Done when* the L2 error and the L∞ error near the
    glues both converge at the operator's order; the energy stays
    bounded over many crossing times, which is where an unstable
    off-centered stencil or a patch corner would show, at the
-   dissipation step 3b found the corners need (`ε = 0.5`); a solution
+   dissipation step 3b found the corners need (`ε = 0.5`), with the
+   ball's physical volume from the scheme's own quadrature, which
+   splits each shared face point between its patches; a solution
    and its image under point inversion evolve into each other's images
    to rounding; and the difference between a solution and its mirror
    image is measured and recorded.

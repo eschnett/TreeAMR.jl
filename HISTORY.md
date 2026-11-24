@@ -5180,6 +5180,19 @@ M12 was decided with Erik, after M7 and before M9b.
     first derivative's largest error stays 0.46, 0.38, 0.37, 0.37 and its
     L2 error falls at 1/2, the kink's width; the second's largest error
     grows as 1/h (6.3, 13.6, 27.4, 55.1) and its L2 error as h^(−1/2).
+  - *Step 4, two criteria restated (2026-11-24, Erik).* "A fold of a
+    constant gives the domain's volume" on the seven-patch ball became
+    "a fold counts each physical point once and sums a function of the
+    position over exactly the distinct points", which the tests check:
+    TreeAMR's fold sees logical positions, and a physical volume needs
+    the atlas's Jacobian and weights that split each shared face point
+    between its patches — a quadrature, the scheme's, so the volume moved
+    to step 5, the energy on the ball. "`--trace-compile-timing` no worse
+    than on `main`" became a cost measured and recorded: about 5 % on the
+    laptop (65–68 s against 62–65 s for `main`'s workload), after the
+    barriers of the device step, the rest attributed to `GroupKey`'s
+    `top` flag on every set's build path and to noise; accepted, as the
+    element sets' 2 % and the stage groups' cost were.
   - *Step 4, the checkpoint (2026-11-24).* TreeIOHDF5 saves the appendix
     as a dataset of its own in each part, beside the cores, with a
     checksum per block — Erik's choice over closed `(N+1)^D` blocks
