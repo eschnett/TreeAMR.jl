@@ -6,9 +6,8 @@
 # through the application's atlas when the schedule is built. Each fill
 # then evaluates one tensor-product Lagrange stencil per ghost point and
 # variable. See "Finite differences across a glue" in CODE.md, which this
-# file implements on the CPU, serially and over a distributed forest,
-# with closed ownership's appendix (the device path is a later part of
-# M20 step 4).
+# file implements serially and over a distributed forest, on the CPU and
+# on a device, with closed ownership's appendix.
 
 """
     TreeAMR.chart_aligned(atlas, p, q) -> NTuple{D,Bool}
@@ -40,9 +39,11 @@ const GlueRegion{D} = Tuple{Int,NTuple{D,Int},CartesianIndices{D,NTuple{D,UnitRa
 # ranks located them, peer by peer), and the ghosts of this rank's blocks
 # whose values other ranks send (`recv…`, in the order this rank located
 # them), each fill one message per peer and direction under `GLUE_TAG`,
-# point by point with the variables fastest. One concrete type whether
-# empty or not, so that a schedule's type does not say whether it
-# interpolates.
+# point by point with the variables fastest. On a device the same tables
+# are uploaded once, at the build (`device`), and the message buffers live
+# there, with host mirrors where the communicator stages (`buffers`). One
+# concrete type whether empty or not, so that a schedule's type does not
+# say whether it interpolates.
 struct GluePlan{T,D}
     k::Int
     target::Vector{Int32}
@@ -61,14 +62,51 @@ struct GluePlan{T,D}
     recvindex::Vector{NTuple{D,Int32}}
     recvpeers::Vector{Int}
     recvcounts::Vector{Int}
-    sendbuf::Vector{T}
-    recvbuf::Vector{T}
+    device::Any
+    buffers::Any
 end
 GluePlan{T,D}() where {T,D} =
     GluePlan{T,D}(0, Int32[], NTuple{D,Int32}[], Int32[], NTuple{D,Int32}[],
                   NTuple{D,Int8}[], zeros(T, 0, 0), Int32[], NTuple{D,Int32}[],
                   NTuple{D,Int8}[], zeros(T, 0, 0), Int[], Int[], Int32[],
-                  NTuple{D,Int32}[], Int[], Int[], T[], T[])
+                  NTuple{D,Int32}[], Int[], Int[], nothing, GlueBuffers())
+
+# The message buffers of a glue plan, on the backend, and the host mirrors
+# a staging communicator sends from and receives into; sized for the
+# variable count of the last fill.
+mutable struct GlueBuffers
+    send::Any
+    recv::Any
+    wiresend::Any
+    wirerecv::Any
+end
+GlueBuffers() = GlueBuffers(nothing, nothing, nothing, nothing)
+
+# The tables the kernels read, uploaded to `backend`, under the plan's
+# own field names.
+function upload_glue(plan::GluePlan, backend)
+    dev(a) = todevice(backend, a)
+    return (target=dev(plan.target), index=dev(plan.index), source=dev(plan.source),
+            first=dev(plan.first), width=dev(plan.width), weights=dev(plan.weights),
+            sendsource=dev(plan.sendsource), sendfirst=dev(plan.sendfirst),
+            sendwidth=dev(plan.sendwidth), sendweights=dev(plan.sendweights),
+            recvtarget=dev(plan.recvtarget), recvindex=dev(plan.recvindex))
+end
+
+# The buffers for `n` points of `nv` variables each way, made or remade
+# when the size changes.
+function glue_buffers!(plan::GluePlan{T}, backend, comm, nv::Int) where {T}
+    bufs = plan.buffers::GlueBuffers
+    nsend, nrecv = length(plan.sendsource) * nv, length(plan.recvtarget) * nv
+    if bufs.send === nothing || length(bufs.send) != nsend || length(bufs.recv) != nrecv
+        bufs.send = allocate(backend, T, nsend)
+        bufs.recv = allocate(backend, T, nrecv)
+        staged = hoststaging(comm, bufs.send)
+        bufs.wiresend = staged ? Vector{T}(undef, nsend) : bufs.send
+        bufs.wirerecv = staged ? Vector{T}(undef, nrecv) : bufs.recv
+    end
+    return bufs
+end
 Base.isempty(plan::GluePlan) =
     isempty(plan.target) && isempty(plan.sendsource) && isempty(plan.recvtarget)
 # The ghosts of this rank's blocks it fills, computed here or received.
@@ -240,8 +278,8 @@ end
 # the ghosts whose source another rank owns go to that rank in one
 # `alltoallv`, which builds their stencils and evaluates them each fill.
 function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
-                   c::NTuple{D,Int}, ops::Operators, atlas,
-                   owned::UnitRange{Int}) where {T,D,R}
+                   c::NTuple{D,Int}, ops::Operators, atlas, owned::UnitRange{Int},
+                   backend::Backend) where {T,D,R}
     offset = first(owned) - 1
     k = ops.glue
     stencil(g) = glue_stencil(T, forest, atlas, G, c, k, g)
@@ -269,7 +307,7 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
     sent = map(stencil, received)
     flat(list) = isempty(list) ? zeros(T, k * D, 0) : reduce(hcat, list)
     nonzero(cs) = [r - 1 for r in eachindex(cs) if cs[r] > 0]
-    return GluePlan{T,D}(k,
+    plan = GluePlan{T,D}(k,
                          Int32[ghosts[i].target - offset for i in mine],
                          NTuple{D,Int32}[ghosts[i].index for i in mine],
                          Int32[ghosts[i].source - offset for i in mine],
@@ -283,7 +321,10 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                          nonzero(rcounts), filter(>(0), rcounts),
                          Int32[g.target - offset for g in asked],
                          NTuple{D,Int32}[g.index for g in asked],
-                         nonzero(counts), filter(>(0), counts), T[], T[])
+                         nonzero(counts), filter(>(0), counts), nothing, GlueBuffers())
+    backend isa CPU && return plan
+    return GluePlan{T,D}((getfield(plan, f) for f in fieldnames(GluePlan)[1:(end - 2)])...,
+                         upload_glue(plan, backend), GlueBuffers())
 end
 
 # The logical position of stored index `idx` of leaf `key`.
@@ -478,34 +519,40 @@ end
 # waits, so the wait cannot deadlock.
 function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, backend, comm) where {T,D}
     isempty(plan) && return nothing
+    tables = plan.device === nothing ? plan : plan.device
+    run_glue!(fs, plan, tables, backend, comm)
+    return nothing
+end
+
+function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, tables, backend,
+                   comm) where {T,D}
     nv = fs.nvars
+    bufs = glue_buffers!(plan, backend, comm, nv)
     recvs = Any[]
-    if !isempty(plan.recvpeers)
-        resize!(plan.recvbuf, length(plan.recvtarget) * nv)
-        for (peer, r) in zip(plan.recvpeers, segment_ranges(plan.recvcounts, nv))
-            push!(recvs, irecv(comm, view(plan.recvbuf, r), peer, GLUE_TAG))
-        end
+    for (peer, r) in zip(plan.recvpeers, segment_ranges(plan.recvcounts, nv))
+        push!(recvs, irecv(comm, view(bufs.wirerecv, r), peer, GLUE_TAG))
     end
     sends = Any[]
     if !isempty(plan.sendpeers)
-        resize!(plan.sendbuf, length(plan.sendsource) * nv)
-        glue_pack_kernel!(backend)(plan.sendbuf, fs.work, plan.sendsource, plan.sendfirst,
-                                   plan.sendwidth, plan.sendweights, nv, Val(D),
+        glue_pack_kernel!(backend)(bufs.send, fs.work, tables.sendsource, tables.sendfirst,
+                                   tables.sendwidth, tables.sendweights, nv, Val(D),
                                    Val(plan.k); ndrange=(length(plan.sendsource), nv))
         synchronize(backend)
+        bufs.wiresend === bufs.send || copyto!(bufs.wiresend, bufs.send)
         for (peer, r) in zip(plan.sendpeers, segment_ranges(plan.sendcounts, nv))
-            push!(sends, isend(comm, view(plan.sendbuf, r), peer, GLUE_TAG))
+            push!(sends, isend(comm, view(bufs.wiresend, r), peer, GLUE_TAG))
         end
     end
     if !isempty(plan.target)
-        glue_kernel!(backend)(fs.work, plan.target, plan.index, plan.source, plan.first,
-                              plan.width, plan.weights, Val(D), Val(plan.k);
-                              ndrange=(length(plan.target), nv))
+        glue_kernel!(backend)(fs.work, tables.target, tables.index, tables.source,
+                              tables.first, tables.width, tables.weights, Val(D),
+                              Val(plan.k); ndrange=(length(plan.target), nv))
     end
     if !isempty(recvs)
         waitall(comm, recvs)
-        glue_unpack_kernel!(backend)(fs.work, plan.recvbuf, plan.recvtarget,
-                                     plan.recvindex, nv, Val(D);
+        bufs.wirerecv === bufs.recv || copyto!(bufs.recv, bufs.wirerecv)
+        glue_unpack_kernel!(backend)(fs.work, bufs.recv, tables.recvtarget,
+                                     tables.recvindex, nv, Val(D);
                                      ndrange=(length(plan.recvtarget), nv))
     end
     synchronize(backend)
@@ -544,7 +591,37 @@ struct AppendixLayout{D}
     total::Int
 end
 
-function appendix_layout(fs::FieldSet{T,D}) where {T,D}
+# The layout, built once per change of the forest and kept in the field
+# set with its tables on the set's backend: `scatter!`, `gather!` and
+# `statearray` run on every evaluation, and a device kernel reads the
+# tables where it runs.
+struct AppendixCache{D,VD,VI,VP,VB}
+    generation::Int
+    host::AppendixLayout{D}
+    dims::VD
+    base::VI
+    count::VI
+    points::VP
+    block::VB
+    first::VI
+end
+
+function appendix_cache(fs::FieldSet{T,D}) where {T,D}
+    cached = fs.appendix
+    g = generation(fs.forest)
+    cached !== nothing && cached.generation == g && return cached
+    L = build_appendix_layout(fs)
+    backend = get_backend(fs.work)
+    dev(a) = todevice(backend, a)
+    fresh = AppendixCache(g, L, dev(L.dims), dev(L.base), dev(L.count), dev(L.points),
+                          dev(L.block), dev(L.first))
+    fs.appendix = fresh
+    return fresh
+end
+
+appendix_layout(fs::FieldSet{T,D}) where {T,D} = appendix_cache(fs).host::AppendixLayout{D}
+
+function build_appendix_layout(fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     N = forest.N
     c = staggers(fs.centering)
@@ -584,7 +661,12 @@ end
 # block's appendix points, `e` the block's appendix dimensions: the planes
 # of the lower dimensions first, then lexicographic within its own.
 @inline function appendix_rank(I::NTuple{D,Int}, e::NTuple{D,Bool}, N::Int) where {D}
-    d = findfirst(d′ -> I[d′] == N + 1, 1:D)::Int
+    # The first dimension at the high plane, by a loop: a device kernel
+    # reads through this, and `findfirst` returns a union.
+    d = D
+    for d′ in D:-1:1
+        I[d′] == N + 1 && (d = d′)
+    end
     off = 0
     for d2 in 1:(d - 1)
         e[d2] || continue
@@ -616,14 +698,27 @@ write to a point the block does not own is discarded, so that a kernel
 launched over the closed range may write every point it visits; reading
 one is an error. See "Finite differences across a glue" in `CODE.md`.
 """
-struct AppendixArray{T,D,C<:AbstractArray{T},A<:AbstractVector{T}}
+struct AppendixArray{T,D,C<:AbstractArray{T},A<:AbstractVector{T},
+                     VD<:AbstractVector{NTuple{D,Bool}},VI<:AbstractVector{Int}}
     core::C
     appendix::A
-    dims::Vector{NTuple{D,Bool}}
-    base::Vector{Int}
-    count::Vector{Int}
+    dims::VD
+    base::VI
+    count::VI
     N::Int
 end
+AppendixArray(core::AbstractArray{T}, appendix::AbstractVector{T},
+              dims::AbstractVector{NTuple{D,Bool}}, base::AbstractVector{Int},
+              count::AbstractVector{Int}, N::Int) where {T,D} =
+    AppendixArray{T,D,typeof(core),typeof(appendix),typeof(dims),typeof(base)}(
+        core, appendix, dims, base, count, N)
+
+# Into a device kernel, as a right-hand side launched with `map_blocks!(…;
+# appendix = true)` takes it: every array converted for the device.
+Adapt.adapt_structure(to, a::AppendixArray) =
+    AppendixArray(Adapt.adapt(to, a.core), Adapt.adapt(to, a.appendix),
+                  Adapt.adapt(to, a.dims), Adapt.adapt(to, a.base),
+                  Adapt.adapt(to, a.count), a.N)
 
 @inline function appendix_slot(a::AppendixArray{T,D}, I::NTuple{D,Int}, v::Int,
                                b::Int) where {T,D}
@@ -637,8 +732,8 @@ function Base.getindex(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
     v, b = I[D + 1], I[D + 2]
     all(d -> i[d] <= a.N, 1:D) && return a.core[i..., v, b]
     s = appendix_slot(a, i, v, b)
-    s == 0 && throw(BoundsError(a, I))
-    return a.appendix[s]
+    @boundscheck s == 0 && throw(BoundsError(a, I))
+    return @inbounds a.appendix[s]
 end
 
 function Base.setindex!(a::AppendixArray{T,D}, x, I::Vararg{Int}) where {T,D}
@@ -681,11 +776,11 @@ end
     end
 end
 
-function move_appendix!(kernel, fs::FieldSet{T,D}, a, b, L::AppendixLayout{D}) where {T,D}
-    isempty(L.points) && return nothing
+function move_appendix!(kernel, fs::FieldSet{T,D}, a, b, L::AppendixCache) where {T,D}
+    isempty(L.host.points) && return nothing
     backend = get_backend(fs.work)
     kernel(backend)(a, b, L.points, L.block, L.first, L.base, L.count, Val(D), Val(fs.G);
-                    ndrange=(length(L.points), fs.nvars))
+                    ndrange=(length(L.host.points), fs.nvars))
     synchronize(backend)
     return nothing
 end
@@ -785,6 +880,9 @@ counted_copy(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::Int) where
 # The masks of this rank's blocks, on `backend`, for a set with an
 # appendix; a set without one passes `NoMasks()`.
 fold_masks(backend, fs::FieldSet) = todevice(backend, host_fold_masks(fs))
+
+# The points a fold counts in each block, which a norm's volume weights.
+counted_per_block(fs::FieldSet) = [counted_points(m, fs.forest.N) for m in host_fold_masks(fs)]
 
 function host_fold_masks(fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest

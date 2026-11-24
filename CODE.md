@@ -3543,13 +3543,13 @@ appendix — `statelength`, `scatter!`, `gather!`, `statearray(u, fs;
 appendix = true)` (an `AppendixArray`), `map_blocks!`'s keyword and the
 closed ranges of the fill — the folds and norms counting each point
 once, and `regrid!`'s guard with the appendix carried by a kept
-block's copy, serially and over a distributed forest, on the CPU:
-`src/glue.jl`, tested in `test/glue_tests.jl`, on the seven- and
-thirteen-patch balls in `test/glue_ball_tests.jl`, over simulated ranks
-in `test/glue_exchange_tests.jl` and through MPI in
-`test/mpi_workload.jl`'s `G2`. Reflecting or outflow faces are refused,
-and a fold over the state vector (not the working array) refuses a
-device.
+block's copy, serially and over a distributed forest, on the CPU and
+on a device: `src/glue.jl`, tested in `test/glue_tests.jl`, on the
+seven- and thirteen-patch balls in `test/glue_ball_tests.jl`, over
+simulated ranks in `test/glue_exchange_tests.jl`, through MPI in
+`test/mpi_workload.jl`'s `G2`, on a device in `test/gpu_tests.jl` and
+through MPI on a device in `test/mpi_device_workload.jl`'s `G2`.
+Reflecting or outflow faces are refused.
 
 **Where a ghost lies, and what fills it.** A ghost of block `b` of
 patch `p` beyond a glued face of `p` — across a face, an edge or a
@@ -3731,12 +3731,36 @@ along an aligned dimension — `k²` taps between the thirteen-patch
 ball's outer shells and `k` across its middle sphere, not `k³` — stored
 per point with their widths, the source block and the base stored
 index; on the CPU by
-the target's owner, on a device flat. It is element-like in one
+the target's owner, on a device flat. On a device the plan's tables are
+uploaded once, at the build, and its message buffers live there, with
+host mirrors where the communicator is not handed device memory, as the
+stages' are. It is element-like in one
 respect: a set without interpolated ghosts compiles none of it. The
 point lists have one concrete type whether empty or not, and the launch
 sits behind `Base.inferencebarrier`, so the brick's and the copy's
 launch paths keep their types (compare `--trace-compile-timing` of
 `test/mpi_workload.jl` against `main`).
+
+**What a set without a glue compiles of it.** Everything only an
+interpolated set or a set with an appendix runs is reached through
+`Base.inferencebarrier`, as element-only code is, because the switch is
+a run-time field of the set, not its type: the glue plan's build, its
+checks and its fill (the fill not even entered for an empty plan); the
+appendix's `scatter!`, `gather!`, length and layout; the fold masks and
+the norm's counts; `regrid!`'s guard and its re-keyed transfers; and the
+`AppendixArray`, which `statearray(u, fs; appendix = true)` returns
+uninferred. `statearray(u, fs)` keeps one return type for every set —
+the cores as the array `reshape(u, …)` gives, over `u`'s own memory on
+the host (`Base.wrap`) — so that a kernel taking it compiles once, and
+`statearray` is constant-propagated so that the default keyword selects
+it. The neighbor search takes the interpolated mode as a `Bool` and an
+always-present region list, one specialization rather than two. What
+remains on every set's path is the `top` flag of `GroupKey` and its
+keyword through `kind_stencil` and `target_range`. Measured on an Apple
+M3 Pro, `main`'s `test/mpi_workload.jl` compiles in 65–68 s against this
+package and in 62–65 s against `main`, three alternating rounds each,
+about 5 % more; before the barriers above it was 69–72 s, and the
+union of `statearray`'s return types was most of the difference.
 
 **No refinement boundary at a glue.** A coarse-fine face, edge or
 corner touching a glued face is refused by `GhostSchedule` for an
@@ -3755,10 +3779,18 @@ this — interpolating from a leaf at another level, which a located
 point finds anyway, and the appendix in the regrid transfers — comes
 after M20.
 
-**What else learns of the appendix.** The flat device launches of
-`scatter!`, `gather!` and `map_blocks!`, and a fold reading the state
-vector, whose `AppendixArray` holds host tables; the MPI message
-layouts of a repartition; and TreeIOHDF5, whose
+**What else learns of the appendix.** The appendix's layout — per block
+its dimensions, offset and size, and every point — is built once per
+change of the forest and kept in the field set (`fs.appendix`, untyped,
+so that a set's type does not say whether it has one), with its tables
+on the set's backend: `scatter!`, `gather!` and `statearray` run every
+evaluation, and their kernels read the tables where they run. An
+`AppendixArray` goes into a device kernel through `Adapt`, which is why
+`Adapt`, already loaded by KernelAbstractions, is a direct dependency:
+a right-hand side launched with `map_blocks!(…; appendix = true)` and a
+fold over the state vector take it as an argument. Its reads check the
+index on the host only (`@boundscheck`), so that a kernel under
+`@inbounds` compiles no throw. Still to learn of it: TreeIOHDF5, whose
 checkpoint must save and restore the appendix, a change to the
 companion interface ([Companion interface](#companion-interface)) and a
 format feature of its own.
@@ -6564,7 +6596,13 @@ point once; a refusal of the glue plan raised on every rank; and a
 regrid whose kept blocks carry their appendix between ranks.
 `mpi_workload.jl`'s `G2` is the kinked torus through MPI: a fill, the
 reductions, a regrid and the fill again, with a `#` line counting the
-ghosts received.
+ghosts received; `mpi_device_workload.jl`'s `G2` the same on a device,
+whose `#` line `mpi_device_tests.jl` reads for the ghosts received and
+the messages staged through host mirrors. `gpu_tests.jl` runs the kinked
+torus and the seven-patch ball on every backend against the CPU: the
+state's round trip, the fill, the folds over the working array and over
+the state vector, a right-hand side through the whole state, and in 2D
+a regrid.
 
 `patch_tests.jl` holds the multi-patch forest's own tests (M17), each
 claim stated against a forest with no glue, as M12's are against the

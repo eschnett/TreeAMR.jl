@@ -5126,6 +5126,26 @@ M12 was decided with Erik, after M7 and before M9b.
     and so does swapping two variables' slots in a message. Through MPI
     at three ranks `test/mpi_workload.jl`'s `G2` matches the serial run
     line for line, 1299 ghosts received across ranks.
+  - *Step 4, the device path (2026-11-24).* The glue plan's tables are
+    uploaded at the build and its message buffers live on the device,
+    staged through host mirrors as the stages' are; the appendix's
+    layout is cached per field set on its backend; and an
+    `AppendixArray` enters a kernel through `Adapt`, now a direct
+    dependency (it was already loaded by KernelAbstractions). On Metal,
+    Float32, `test/gpu_tests.jl` passes, the kinked torus and the
+    seven-patch ball against the CPU, and `test/mpi_device_tests.jl`
+    at 2 and 3 ranks with the glue's messages staged. The compile-time
+    check against `main` (`--trace-compile-timing` of `main`'s
+    `test/mpi_workload.jl`, Apple M3 Pro) found the branch at 69–72 s
+    against 62–65 s; by commit, from 61.0 s at the design to 62.7 s
+    after the first slice, 64.5 s after the appendix, 74.0 s after the
+    folds and 70.2 s after MPI. Most of it was every set compiling the
+    appendix's paths: `statearray` returned a union, so every kernel
+    taking it compiled twice, and `scatter!`, `gather!`, the fold masks,
+    the glue plan and `regrid!`'s guard were inferred for every set.
+    Behind barriers it came to 65–68 s, about 5 % over `main`, which
+    the `top` flag of `GroupKey` and laptop noise account for as far
+    as this machine can tell; a quieter measurement belongs on Symmetry.
 
 ## Downstream checks
 

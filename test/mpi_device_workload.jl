@@ -470,6 +470,87 @@ function moving_blocks_case(tag)
     return nothing
 end
 
+# --- ghosts interpolated across a glue (M20) --------------------------------
+
+# The kinked torus: patch 1 affine, patch 2 `x = aη + bη²`, `y = ζ +
+# cη(1 − η)`, glued at both faces of dimension 1, each wrapped along 2.
+struct GlueTorus end
+const GA, GB, GC = 0.8, 0.4, 0.3
+function TreeAMR.chart_map(::GlueTorus, ξ, p)
+    p == 1 && return (-1 + ξ[1], ξ[2])
+    return (GA * ξ[1] + GB * ξ[1]^2, ξ[2] + GC * ξ[1] * (1 - ξ[1]))
+end
+function TreeAMR.chart_locate(::GlueTorus, x)
+    X = mod(x[1] + 1, 1 + GA + GB) - 1
+    X < 0 && return ((X + 1, mod(x[2], 1.0)), 1)
+    η = (-GA + sqrt(GA^2 + 4GB * X)) / (2GB)
+    return ((η, mod(x[2] - GC * η * (1 - η), 1.0)), 2)
+end
+
+function glue_torus(n)
+    pair(from, to) = [(from=from, to=to, map=(1, 2)), (from=to, to=from, map=(1, 2))]
+    glue = vcat(pair((1, 1, 2), (2, 1, 1)), pair((2, 1, 2), (1, 1, 1)),
+                [(from=(p, 2, s), to=(p, 2, 3 - s), map=(1, 2)) for p in 1:2 for s in 1:2])
+    return Forest([(roots=(n, n), extents=((zero(T), one(T)), (zero(T), one(T))))
+                   for _ in 1:2]; N=8, glue=glue, comm=COMM)
+end
+
+# The state from a smooth function of the physical point, on the host,
+# uploaded.
+function glue_state(fs)
+    forest = fs.forest
+    N = forest.N
+    host = zeros(T, statelength(fs))
+    A = statearray(host, FieldSet{T}(forest, fs.nvars; G=fs.G, centering=fs.centering,
+                                     glue=:interpolate); appendix=true)
+    dims = TreeAMR.appendix_layout(fs).dims
+    for b in 1:nblocks(fs)
+        k = blockkey(fs, b)
+        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
+        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2)), v in 1:fs.nvars
+            x = TreeAMR.chart_map(GlueTorus(), ntuple(d -> Float64(o[d] + (I[d] - 1) * h), 2),
+                                  p)
+            A[Tuple(I)..., v, b] = T(v * (0.5 + sin(2π * (2x[1] / (1 + GA + GB) + x[2]))))
+        end
+    end
+    return todev(host)
+end
+
+# The ghosts of this rank's blocks another rank evaluated, and how many
+# ranks sent through host mirrors, over the ranks.
+function glue_messages(forest, sched)
+    plan = sched.glueplan
+    bufs = plan.buffers
+    staged = bufs.send !== nothing && !isempty(plan.sendpeers) && bufs.wiresend !== bufs.send
+    counts = TreeAMR.allgather(forest.comm, (length(plan.recvtarget),
+                                             !isempty(plan.sendpeers), staged))
+    return "received", sum(first, counts), "sending", count(c -> c[2], counts), "staged",
+           count(c -> c[3], counts)
+end
+
+# The kinked torus interpolated across its glues on the device: a fill,
+# the reductions, a regrid that keeps the glued blocks and carries their
+# appendix, and the fill again.
+function glue_case(tag)
+    forest = glue_torus(4)
+    ops = Operators(prolongation=4, restriction=4, glue=6)
+    fs = FieldSet{T}(forest, 2; G=3, centering=vertexcentered(2), glue=:interpolate,
+                     backend=BACKEND)
+    u = glue_state(fs)
+    scatter!(fs, u)
+    sched = GhostSchedule(fs, ops; atlas=GlueTorus())
+    fill_ghosts!(fs, sched)
+    emit(tag, "filled", digest(gathered(forest, fs.work)))
+    emit("#", tag, "glue", glue_messages(forest, sched)...)
+    reductions(tag, fs, u)
+    emit(tag, "regridded", regrid!(forest, fs => sched; flags=fill(Refine, nblocks(fs))),
+         nleaves(forest))
+    sched = GhostSchedule(fs, ops; atlas=GlueTorus())
+    fill_ghosts!(fs, sched)
+    emit(tag, "refilled", digest(gathered(forest, fs.work)))
+    return nothing
+end
+
 function main()
     emit("# ranks", NRANKS, "backend", BNAME, "T", T, "deviceaware", DEVICEAWARE)
     wave_case("W2v", forest_of((4, 4), 8; centre=(1.6, 2.3)); G=1,
@@ -493,6 +574,8 @@ function main()
                  steps=4)
     tracked_pulse_case("TP"; cycles=2, steps=3)
     moving_blocks_case("M")
+    # Ghosts interpolated across a glue (M20).
+    glue_case("G2")
     return nothing
 end
 

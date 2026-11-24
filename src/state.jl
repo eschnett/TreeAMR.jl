@@ -19,7 +19,11 @@ Number of entries in this field set's state vector: `N^D · nvars ·
 nblocks`, counting interior cells only.
 """
 statelength(fs::FieldSet{T,D}) where {T,D} =
-    corelength(fs) + (hasappendix(fs) ? appendix_layout(fs).total : 0)
+    corelength(fs) + (hasappendix(fs) ? Base.inferencebarrier(appendix_total)(fs)::Int : 0)
+
+# The appendix's length (M20), behind a barrier in `statelength`, so that
+# a set without one compiles none of its layout.
+appendix_total(fs::FieldSet) = appendix_layout(fs).total
 
 # The cores' part of the state, `N^D · nvars · nblocks`: all of it but the
 # appendix of a set interpolated across a glue (M20).
@@ -58,21 +62,42 @@ follow the blocks' cores in the state vector. `statearray(u, fs)` is
 then the cores alone, and `statearray(u, fs; appendix = true)` the whole
 state, an [`AppendixArray`](@ref TreeAMR.AppendixArray) whose `i_d` runs
 to `N + 1` where a block owns that plane: what a right-hand side
-launched with `map_blocks!(…; appendix = true)` writes through. On any
-other set the keyword changes nothing. See "Finite differences across a
+launched with `map_blocks!(…; appendix = true)` writes through. Its
+type is not inferred, so that no other set compiles it: hand it to a
+function or a launch, which dispatches on it once. On any other set the
+keyword changes nothing. See "Finite differences across a
 glue" in `CODE.md`.
 """
-function statearray(u::AbstractVector, fs::FieldSet{T,D};
-                    appendix::Bool=false) where {T,D}
+# Constant-propagated, so that the default `appendix = false` leaves one
+# return type, the cores'.
+Base.@constprop :aggressive function statearray(u::AbstractVector, fs::FieldSet{T,D};
+                                                appendix::Bool=false) where {T,D}
     check_statelength(u, fs)
+    appendix && hasappendix(fs) && return Base.inferencebarrier(whole_statearray)(u, fs)
+    return core_statearray(u, fs)
+end
+
+# The cores, `(N, …, N, nvars, nblocks)`: the leading `corelength` entries
+# of `u`, as the one array type `reshape(u, …)` gives, with or without an
+# appendix behind them, so that every set's `statearray` has one type and
+# a kernel taking it compiles once. On the host an `Array` over `u`'s own
+# memory; elsewhere a reshaped view, which on a device is the device's
+# own array type.
+function core_statearray(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
     shape = (ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs))
-    hasappendix(fs) || return reshape(u, shape...)
+    return core_array(u, corelength(fs), shape)
+end
+core_array(u::AbstractVector, n::Int, shape) =
+    length(u) == n ? reshape(u, shape) : reshape(view(u, 1:n), shape)
+core_array(u::Vector, n::Int, shape) = Base.wrap(Array, u.ref, shape)
+
+# The whole state of a set with an appendix (M20), behind a barrier in
+# `statearray`.
+function whole_statearray(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
     n = corelength(fs)
-    core = reshape(view(u, 1:n), shape...)
-    appendix || return core
-    L = appendix_layout(fs)
-    return AppendixArray(core, view(u, (n + 1):length(u)), L.dims, L.base, L.count,
-                         fs.forest.N)
+    L = appendix_cache(fs)
+    return AppendixArray(core_statearray(u, fs), view(u, (n + 1):length(u)), L.dims,
+                         L.base, L.count, fs.forest.N)
 end
 
 function check_statelength(u::AbstractVector, fs::FieldSet)
@@ -128,12 +153,26 @@ ghosts untouched. The first step of every RHS evaluation; follow it with
 """
 function scatter!(fs::FieldSet{T,D}, u::AbstractVector) where {T,D}
     check_statelength(u, fs)
-    hasappendix(fs) || (run_over_interiors!(scatter_kernel!, fs, fs.work, u); return fs)
+    hasappendix(fs) && (Base.inferencebarrier(scatter_appendix!)(fs, u); return fs)
+    run_over_interiors!(scatter_kernel!, fs, fs.work, u)
+    return fs
+end
+
+# `scatter!` and `gather!` of a set with an appendix (M20), behind a
+# barrier, so that no other set compiles their kernels.
+function scatter_appendix!(fs::FieldSet{T,D}, u::AbstractVector) where {T,D}
     n = corelength(fs)
     run_over_interiors!(scatter_kernel!, fs, fs.work, view(u, 1:n))
     move_appendix!(appendix_scatter_kernel!, fs, fs.work, view(u, (n + 1):length(u)),
-                   appendix_layout(fs))
-    return fs
+                   appendix_cache(fs))
+    return nothing
+end
+function gather_appendix!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
+    n = corelength(fs)
+    run_over_interiors!(gather_kernel!, fs, view(u, 1:n), fs.work)
+    move_appendix!(appendix_gather_kernel!, fs, view(u, (n + 1):length(u)), fs.work,
+                   appendix_cache(fs))
+    return nothing
 end
 
 """
@@ -148,11 +187,8 @@ for reading results back out.
 """
 function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
     check_statelength(u, fs)
-    hasappendix(fs) || (run_over_interiors!(gather_kernel!, fs, u, fs.work); return u)
-    n = corelength(fs)
-    run_over_interiors!(gather_kernel!, fs, view(u, 1:n), fs.work)
-    move_appendix!(appendix_gather_kernel!, fs, view(u, (n + 1):length(u)), fs.work,
-                   appendix_layout(fs))
+    hasappendix(fs) && (Base.inferencebarrier(gather_appendix!)(u, fs); return u)
+    run_over_interiors!(gather_kernel!, fs, u, fs.work)
     return u
 end
 
@@ -658,8 +694,15 @@ end
 
 function block_mapreduce(f, op, init, fs::FieldSet{T,D}, u::AbstractVector;
                          vars=1:fs.nvars) where {T,D}
-    return _block_mapreduce(f, op, init, statearray(u, fs; appendix=true), fs,
-                            ntuple(_ -> 0, D), _varrange(vars, fs.nvars))
+    # A set with an appendix (M20) reads it too, behind a barrier: the
+    # `AppendixArray` is a type of its own.
+    hasappendix(fs) &&
+        return Base.inferencebarrier(_block_mapreduce)(f, op, init,
+                                                       statearray(u, fs; appendix=true), fs,
+                                                       ntuple(_ -> 0, D),
+                                                       _varrange(vars, fs.nvars))::Vector{typeof(init)}
+    return _block_mapreduce(f, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
+                            _varrange(vars, fs.nvars))
 end
 
 function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
@@ -983,10 +1026,6 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
                      vars::UnitRange{Int}, tag, lanes=nothing) where {R,T,D}
     forest = fs.forest
     backend = get_backend(array)
-    array isa AppendixArray && !(backend isa CPU) && throw(ArgumentError(
-        "a fold over the state vector of a set with an appendix (closed ownership " *
-        "across a glue) runs on the CPU only so far: the device path of M20 step 4 " *
-        "is still to come. Fold over the working array after `scatter!` instead"))
     tags = fold_tags(backend, tag, forest)
     NV = length(vars)
     check_fold(rf, R, FoldPoint{D,NV,T,tagtype(tags)})
@@ -1003,7 +1042,8 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     args = (backend, partials, array, rf, init, origins, spacings, levels, tags, fs,
             first(vars), g, Val(NV), Val(W))
     if hasappendix(fs)
-        Base.inferencebarrier(launch_fold!)(fold_masks(backend, fs), args...)
+        Base.inferencebarrier(launch_fold!)(Base.inferencebarrier(fold_masks)(backend, fs),
+                                             args...)
     else
         launch_fold!(NoMasks(), args...)
     end
@@ -1046,8 +1086,14 @@ end
 
 function block_fold(rf, op, init, fs::FieldSet{T,D}, u::AbstractVector; vars=1:fs.nvars,
                     tag=nothing) where {T,D}
-    return _block_fold(rf, op, init, statearray(u, fs; appendix=true), fs,
-                       ntuple(_ -> 0, D), _varrange(vars, fs.nvars), tag)
+    # The appendix (M20) behind a barrier, as in `block_mapreduce`.
+    hasappendix(fs) &&
+        return Base.inferencebarrier(_block_fold)(rf, op, init,
+                                                  statearray(u, fs; appendix=true), fs,
+                                                  ntuple(_ -> 0, D),
+                                                  _varrange(vars, fs.nvars), tag)::Vector{typeof(init)}
+    return _block_fold(rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
+                       _varrange(vars, fs.nvars), tag)
 end
 
 """
@@ -1258,12 +1304,13 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     # combination as everything else — so `sum`'s association from M3 is
     # kept, and M7 has one place to reduce across ranks.
     # With an appendix (M20) a block counts the points its fold visits.
-    masks = hasappendix(fs) ? host_fold_masks(fs) : nothing
+    # Behind a barrier, so that no other set compiles the masks.
+    counts = hasappendix(fs) ?
+             Base.inferencebarrier(counted_per_block)(fs)::Vector{Int} :
+             fill(forest.N^D, nblocks(fs))
     volumes = Vector{R}(undef, nblocks(fs))
     for b in 1:nblocks(fs)
-        cells = (masks === nothing ? forest.N^D : counted_points(masks[b], forest.N)) *
-                fs.nvars
-        volumes[b] = cellvolume(blockkey(fs, b)) * cells
+        volumes[b] = cellvolume(blockkey(fs, b)) * (counts[b] * fs.nvars)
     end
     volume = combine_blocks(+, zero(R), fs, volumes, nothing)
     return (total, volume)

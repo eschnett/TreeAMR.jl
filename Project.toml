@@ -4,6 +4,7 @@ version = "0.2.10"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 
 [weakdeps]
@@ -13,6 +14,7 @@ MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
 TreeAMRMPIExt = "MPI"
 
 [compat]
+Adapt = "4"
 KernelAbstractions = "0.9.42"
 MPI = "0.20"
 julia = "1.13"

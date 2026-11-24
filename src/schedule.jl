@@ -1318,14 +1318,14 @@ function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
                         b::Int, dirs, symmetric::Bool=false;
-                        glueregions=nothing) where {D}
+                        interpolated::Bool=false,
+                        glueregions::Vector{GlueRegion{D}}=GlueRegion{D}[]) where {D}
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
     walls = lowwalls(forest, k, c, symmetric)
     # The high face planes this block owns (M20).
-    tops = glueregions === nothing ? ntuple(_ -> false, D) :
-           appendix_dims(forest, k, c)
+    tops = interpolated ? appendix_dims(forest, k, c) : ntuple(_ -> false, D)
     for δ in dirs
         # Where this block's low wall plane is written (AMR-8), along every
         # dimension that does not step up.
@@ -1350,7 +1350,7 @@ function block_sources!(pairs::TransferPairs{D},
         isempty(region) && continue
         # Across a glue of a set interpolated there (M20): located through
         # the atlas once the search is done, not searched for here.
-        if glueregions !== nothing && interpolated_region(forest.conn, k, δ)
+        if interpolated && interpolated_region(forest.conn, k, δ)
             push!(glueregions, (b, δ, region))
             continue
         end
@@ -2164,8 +2164,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
             # Interpolated across its glue (M20): a patch corner has a
             # source like any other ghost, and the source is read in its
             # own patch's frame, so neither refusal below applies.
-            check_glue_interpolation(forest, N, gs, ss, operators, atlas)
-            check_glue_levels(forest, blockrange(forest))
+            # Behind a barrier, as everything only such a set runs.
+            Base.inferencebarrier(check_glue_interpolation)(forest, N, gs, ss, operators,
+                                                            atlas)
+            Base.inferencebarrier(check_glue_levels)(forest, blockrange(forest))
         else
             # What a forest of patches (M17) cannot fill: a region beyond a
             # patch corner, which an element set's faces-only filter below
@@ -2215,7 +2217,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         for b in range
             block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
                            offset + b, dirs, symmetric;
-                           glueregions=interpolated ? perglue[c] : nothing)
+                           interpolated=interpolated, glueregions=perglue[c])
         end
     end
 
@@ -2232,8 +2234,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # Every rank builds it, regions or not: over a distributed forest the
     # build is collective (M20).
     glueplan = interpolated ?
-               glue_plan(T, forest, reduce(vcat, perglue; init=GlueRegion{D}[]), ghosts,
-                         stags, operators, atlas, owned) : GluePlan{T,D}()
+               Base.inferencebarrier(glue_plan)(T, forest,
+                                                reduce(vcat, perglue; init=GlueRegion{D}[]),
+                                                ghosts, stags, operators, atlas, owned,
+                                                backend)::GluePlan{T,D} : GluePlan{T,D}()
     # Over a distributed forest (M7) the transfers split three ways: the
     # local ones stay in `pairs`, in local block indices; those with a
     # remote source are received; and those this rank computes for a
@@ -2245,7 +2249,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # so the search for it runs in the same mode as its owner's.
     sent = sent_transfers(forest, owned) do into, j
         block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs, symmetric;
-                       glueregions=interpolated ? GlueRegion{D}[] : nothing)
+                       interpolated=interpolated, glueregions=GlueRegion{D}[])
     end
 
     # One dimension of a group's stencils. Along a wall dimension of a

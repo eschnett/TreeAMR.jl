@@ -1085,10 +1085,10 @@ function regrid!(forest::Forest{D}, pairs;
     # face at its level: their marks are dropped here, and a change that
     # balance carries into one of them is refused. Replicated, so every
     # rank decides alike.
-    guarded = glue_guarded(forest, sets)
-    guarded && keep_glued!(flagged, forest)
+    guarded = ispatched(forest) && Base.inferencebarrier(glue_guarded)(forest, sets)::Bool
+    guarded && Base.inferencebarrier(keep_glued!)(flagged, forest)
     newleaves = completed_leaves(forest, flagged)
-    guarded && check_glue_kept(forest, newleaves)
+    guarded && Base.inferencebarrier(check_glue_kept)(forest, newleaves)
     newleaves == oldleaves && return false
 
     # The partitions before and after: this rank's old leaves, which its
@@ -1131,7 +1131,9 @@ function regrid!(forest::Forest{D}, pairs;
             # A block that owns its glued high face planes (M20) carries
             # them through its copy.
             setpairs = hasappendix(fs) ?
-                       appendix_pairs(sources, forest, newleaves, staggers(fs)) : sources
+                       Base.inferencebarrier(appendix_pairs)(sources, forest, newleaves,
+                                                             staggers(fs))::TransferPairs{D} :
+                       sources
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
                                  sched.operators, backend, setpairs; P=fs.P,
                                  oldrange=oldrange,

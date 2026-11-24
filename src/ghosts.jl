@@ -941,7 +941,8 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     # hook, whose points the stencils read, and before phase 2, which never
     # reads these ghosts. Behind a barrier, so that a set without them
     # compiles none of it.
-    Base.inferencebarrier(run_glue!)(fs, schedule.glueplan, backend, forest.comm)
+    isempty(schedule.glueplan) ||
+        Base.inferencebarrier(run_glue!)(fs, schedule.glueplan, backend, forest.comm)
 
     # Phase 2: prolongations, coarsest targets first. A prolongation may
     # read its coarse source's ghosts, which the earlier sweeps filled;

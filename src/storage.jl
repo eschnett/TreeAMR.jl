@@ -420,6 +420,12 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
     work::A
+    # The appendix's layout (M20) over the forest's current leaves, on the
+    # host and on the set's backend, built on first use after each change
+    # of the forest (`appendix_cache`); `nothing` until then and for a set
+    # without an appendix. Untyped, so that a set's type does not say
+    # whether it has one.
+    appendix::Any
 end
 
 # `G` as a sentinel-defaulted keyword rather than a required one, so that
@@ -480,7 +486,7 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, order,
                                         walls, glue, parities, rotations, halfturns, factors,
-                                        rotvars, work)
+                                        rotvars, work, nothing)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
