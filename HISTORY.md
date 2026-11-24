@@ -5167,6 +5167,19 @@ M12 was decided with Erik, after M7 and before M9b.
     nested loops over the widths, by owner on the CPU, it is 5.1× faster
     at full width (545 → 106 ns per ghost and variable) and 13× and 70×
     at 36 and 6 taps.
+  - *Step 4, the derivatives across a glue (2026-11-24).* PLAN.md's
+    criterion, measured in `test/glue_tests.jl` on the kinked pair (the
+    torus's two patches glued at one face, the hook outside, since a set
+    copying across the torus's glue meets its patch corners): the
+    fourth-order centered first and second derivatives at every core
+    point, along both dimensions, against the function's own. With
+    interpolated ghosts (`k = 6`) both converge at 4, the points next to
+    the glue included: the largest errors at 1, 2, 4 and 8 roots per side
+    fall at rates 3.84, 3.94 and 3.97 (first) and 4.35, 3.99 and 3.98
+    (second), to 4.0e−5 and 9.7e−5 at 8 roots. With copied ghosts the
+    first derivative's largest error stays 0.46, 0.38, 0.37, 0.37 and its
+    L2 error falls at 1/2, the kink's width; the second's largest error
+    grows as 1/h (6.3, 13.6, 27.4, 55.1) and its L2 error as h^(−1/2).
   - *Step 4, the checkpoint (2026-11-24).* TreeIOHDF5 saves the appendix
     as a dataset of its own in each part, beside the cores, with a
     checksum per block — Erik's choice over closed `(N+1)^D` blocks

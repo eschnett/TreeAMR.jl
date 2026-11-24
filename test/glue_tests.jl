@@ -453,3 +453,67 @@ end
     @test any(k -> level(k) == 1, forest.leaves)
     @test length(GhostSchedule(fs, ops; atlas=atlas).glueplan) > 0
 end
+
+# The kinked pair: the torus's two patches glued at one face only, every
+# other face outer, so that a set copying across the glue meets no patch
+# corner and can be compared with one interpolating.
+kinked_pair(n) = Forest([(roots=(n, n), extents=((0.0, 1.0), (0.0, 1.0))) for _ in 1:2];
+                        N=8, glue=patch_glue_both((1, 1, 2), (2, 1, 1), (1, 2)))
+
+# The torus's smooth function as each patch's map places it, and its
+# first and second derivatives along logical dimension `d`, by central
+# differences of that function in 256-bit arithmetic.
+kinked_data(ξ, p) = kinked_wave(KINKED, TreeAMR.chart_map(KINKED, ξ, p))
+function kinked_derivatives(ξ, p, d)
+    setprecision(BigFloat, 256) do
+        h = big"1e-25"
+        x = big.(ξ)
+        e = ntuple(i -> i == d ? h : zero(h), 2)
+        fc, fp, fm = kinked_data(x, p), kinked_data(x .+ e, p), kinked_data(x .- e, p)
+        return Float64((fp - fm) / 2h), Float64((fp - 2 * fc + fm) / h^2)
+    end
+end
+
+# The largest errors of the fourth-order centered first and second
+# derivatives over every core point, each along both dimensions, after a
+# fill of the kinked pair in `glue` mode.
+function kinked_derivative_errors(n, glue)
+    forest = kinked_pair(n)
+    fs = kinked_set(forest; glue=glue)
+    sched = glue === :interpolate ? GhostSchedule(fs, KINKED_OPS; atlas=KINKED) :
+            GhostSchedule(fs, Operators(prolongation=4, restriction=4))
+    fill_from_owned!(fs, sched, kinked_data;
+                     boundary=CellBoundary(WithPatch((x, p, v, δ) -> kinked_data(x, p))))
+    G, N = fs.G, forest.N
+    c1 = (1 / 12, -2 / 3, 0.0, 2 / 3, -1 / 12)
+    c2 = (-1 / 12, 4 / 3, -5 / 2, 4 / 3, -1 / 12)
+    e1 = e2 = 0.0
+    for b in 1:nblocks(fs)
+        k = blockkey(fs, b)
+        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
+        for I in CartesianIndices((1:N, 1:N)), d in 1:2
+            u(j) = fs.work[ntuple(e -> G[e] + I[e] + (e == d ? j : 0), 2)..., 1, b]
+            x1, x2 = kinked_derivatives(ntuple(e -> o[e] + (I[e] - 1) * h, 2), p, d)
+            e1 = max(e1, abs(sum(c1[j + 3] * u(j) for j in -2:2) / h - x1))
+            e2 = max(e2, abs(sum(c2[j + 3] * u(j) for j in -2:2) / h^2 - x2))
+        end
+    end
+    return e1, e2
+end
+
+@testset "A smooth solution's derivatives converge at the operator's order across a kink" begin
+    # Guards what the interpolation is for: a fourth-order derivative read
+    # across a glue where the map kinks. With interpolated ghosts the first
+    # and second derivatives converge at 4 everywhere, the points next to
+    # the glue included; with copied ones the ghosts hold a function with a
+    # kink in the reader's coordinate, and the first derivative's largest
+    # error stays O(1) while the second's grows like 1/h (HISTORY.md, M20,
+    # "the derivatives across a glue", has the numbers).
+    ns = (2, 4, 8)
+    rate(errs, i) = [log2(errs[j][i] / errs[j + 1][i]) for j in 1:(length(errs) - 1)]
+    interpolated = [kinked_derivative_errors(n, :interpolate) for n in ns]
+    @test all(>(3.8), rate(interpolated, 1)) && all(>(3.8), rate(interpolated, 2))
+    copied = [kinked_derivative_errors(n, :copy) for n in ns]
+    @test all(e -> e[1] > 0.3, copied)
+    @test all(<(-0.9), rate(copied, 2))
+end
