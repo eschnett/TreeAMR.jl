@@ -729,7 +729,8 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # interpolates.
     bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
     build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
-                                           operators, bounded(key); P=P, regrid=true), D)
+                                           operators, bounded(key); P=P, regrid=true,
+                                           top=key.top[d]), D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -762,6 +763,72 @@ function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
                          newrange=1:nnew, nold=nold, nnew=nnew, oldowner=nothing,
                          newowner=nothing)
     return stage.locals
+end
+
+# The regrid of a set interpolated across a glue (M20). Every leaf on a
+# glued face keeps its level, so that the ghosts across a glue are never
+# interpolated across levels and a block's appendix only ever moves with
+# it (CODE.md, "Finite differences across a glue", *No refinement
+# boundary at a glue*).
+
+# Whether any set `regrid!` moves is interpolated across a glue of the
+# forest's patches.
+function glue_guarded(forest::Forest, sets)
+    ispatched(forest) || return false
+    for p in sets
+        x = p.first
+        any(fs -> fs.glue === :interpolate, x isa RotationPair ? (x.a, x.b) : (x,)) &&
+            return true
+    end
+    return false
+end
+
+# Drop the marks of the leaves on a glued face, whatever asked for them,
+# the application or the buffer.
+function keep_glued!(marks::Vector{RegridFlag}, forest::Forest{D}) where {D}
+    conn = forest.conn::Patches{D}
+    for (i, k) in enumerate(forest.leaves)
+        isempty(glued_faces(conn, k)) || (marks[i] = Keep)
+    end
+    return marks
+end
+
+# Refuse new leaves that change a leaf on a glued face: what 2:1 balance
+# carried there from a refinement nearby.
+function check_glue_kept(forest::Forest{D}, newleaves::Vector{MortonKey{D}}) where {D}
+    conn = forest.conn::Patches{D}
+    for k in forest.leaves
+        faces = glued_faces(conn, k)
+        isempty(faces) && continue
+        insorted(k, newleaves) && continue
+        e, s = first(faces)
+        throw(ArgumentError(
+            "regrid! would refine leaf $k of patch $(patch(forest, k)), which lies on the " *
+            "$(sidename(s)) face of dimension $e, a glued face: its own flag was dropped, " *
+            "but 2:1 balance carries a refinement nearby into it. A set interpolated " *
+            "across a glue keeps every block on a glued face at its level, so that no " *
+            "ghost is interpolated across levels (CODE.md, \"Finite differences across " *
+            "a glue\"); keep the refinement further from the patches' glued faces"))
+    end
+    return nothing
+end
+
+# The transfers of a set with an appendix: a copy into a block that owns
+# high face planes copies them too, under the `top` flag of its key. Any
+# other transfer into such a block is a bug, since the guard above keeps
+# it at its level.
+function appendix_pairs(pairs::TransferPairs{D}, forest::Forest{D},
+                        newleaves::Vector{MortonKey{D}}, c::NTuple{D,Int}) where {D}
+    out = TransferPairs{D}()
+    for (key, (targets, sources)) in pairs, i in eachindex(targets)
+        top = appendix_dims(forest, newleaves[targets[i]], c)
+        any(top) && key.kind !== :copy &&
+            error("a $(key.kind) into a block with an appendix; this is a bug")
+        k2 = GroupKey{D}(key.kind, key.direction, key.offset, key.level, key.mirror,
+                         key.orientation, key.glue, key.low, key.shift, top)
+        push!.(get!(out, k2, (Int32[], Int32[])), (targets[i], sources[i]))
+    end
+    return out
 end
 
 # The argument checks of `regrid!`, run on every rank before anything is
@@ -965,6 +1032,13 @@ if regrid!(forest, fs => schedule; flags = flags)
 end
 ```
 
+Over a forest of patches, if any set moved is interpolated across a
+glue (`glue = :interpolate`), every block on a glued face keeps its
+level: its flag, or the buffer's, is dropped, and a refinement that 2:1
+balance would carry into it is refused, saying which block, so that no
+refinement boundary reaches a glue. Such a kept block's copy carries
+its appendix. See "Finite differences across a glue" in `CODE.md`.
+
 Set `transfer = false` to rebuild the mesh and storage without moving
 data at all — what the initial-data cycle wants, since it re-evaluates
 the initial data on the new mesh instead (see
@@ -1006,7 +1080,15 @@ function regrid!(forest::Forest{D}, pairs;
     allmarks = distributed ? allgatherv(comm, marks) : marks
 
     oldleaves = copy(forest.leaves)
-    newleaves = completed_leaves(forest, regrid_marks(forest, allmarks, marks, buffer))
+    flagged = regrid_marks(forest, allmarks, marks, buffer)
+    # A set interpolated across a glue (M20) keeps every leaf on a glued
+    # face at its level: their marks are dropped here, and a change that
+    # balance carries into one of them is refused. Replicated, so every
+    # rank decides alike.
+    guarded = glue_guarded(forest, sets)
+    guarded && keep_glued!(flagged, forest)
+    newleaves = completed_leaves(forest, flagged)
+    guarded && check_glue_kept(forest, newleaves)
     newleaves == oldleaves && return false
 
     # The partitions before and after: this rank's old leaves, which its
@@ -1046,8 +1128,12 @@ function regrid!(forest::Forest{D}, pairs;
             sources === nothing && (sources = regrid_sources(oldleaves, newleaves;
                                                              oldrange=oldrange,
                                                              newrange=newrange))
+            # A block that owns its glued high face planes (M20) carries
+            # them through its copy.
+            setpairs = hasappendix(fs) ?
+                       appendix_pairs(sources, forest, newleaves, staggers(fs)) : sources
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
-                                 sched.operators, backend, sources; P=fs.P,
+                                 sched.operators, backend, setpairs; P=fs.P,
                                  oldrange=oldrange,
                                  newrange=newrange, nold=nold, nnew=nnew,
                                  oldowner=oldowner, newowner=newowner)

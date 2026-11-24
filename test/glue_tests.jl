@@ -227,3 +227,135 @@ end
                        CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))),
               1:nblocks(fs))
 end
+
+# Two patches of `n × n` roots side by side along dimension 1, glued at
+# one pair of faces with the normal reversed: low face to low face, or
+# high face to high face. Every other face is outer.
+function folded_pair(n, side; N=8)
+    glue = patch_glue_both((1, 1, side), (2, 1, side), (-1, 2))
+    patches = [(roots=(n, n), extents=((0.0, 1.0), (0.0, 1.0))) for _ in 1:2]
+    return Forest(patches; N=N, glue=glue)
+end
+
+# A state vector holding, at every owned point, the patch and the owned
+# index, so that a fold can tell which copy it read.
+function patch_state(fs)
+    u = fill(NaN, statelength(fs))
+    A = statearray(u, fs; appendix=true)
+    dims = TreeAMR.appendix_layout(fs).dims
+    N = fs.forest.N
+    for b in 1:nblocks(fs)
+        p = patch(fs.forest, fs.forest.leaves[b])
+        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2))
+            A[Tuple(I)..., 1, b] = p
+        end
+    end
+    return u
+end
+
+@testset "A fold counts every glued face point once, at its lowest patch" begin
+    # Guards the count under closed ownership: the cores alone count a
+    # point on a low face glued to a low face twice and one on a high face
+    # glued to a high face not at all, and the appendix holds the high
+    # planes. Each point is read at the copy of the lowest patch, which
+    # here is patch 1 wherever it holds the point.
+    count1(acc, p) = acc + 1
+    for n in (1, 2)
+        # The torus: 2(nN)² distinct points; patch 1 holds both of its
+        # glued planes along dimension 1, (nN + 1) nN points, and the wrap
+        # along dimension 2 counts its low plane.
+        forest = kinked_forest(n)
+        N = forest.N
+        fs = kinked_set(forest)
+        u = patch_state(fs)
+        @test mesh_fold(count1, +, 0, fs, u) == 2 * (n * N)^2
+        ones1 = mesh_fold((acc, p) -> acc + (p.u[1] == 1), +, 0, fs, u; vars=1)
+        @test ones1 == (n * N + 1) * n * N
+        @test mesh_mapreduce(x -> 1, +, 0, fs, u) == 2 * (n * N)^2
+        @test mesh_mapreduce(identity, max, 0.0, fs, u) == 2
+        # The working array after scatter! counts the same points.
+        scatter!(fs, u)
+        @test mesh_fold(count1, +, 0, fs) == 2 * (n * N)^2
+        @test mesh_mapreduce(x -> 1, +, 0, fs) == 2 * (n * N)^2
+        # The device's lane split, on the CPU, visits the same points.
+        @test sum(TreeAMR._block_fold(count1, +, 0, fs.work, fs, fs.G, 1:1, nothing,
+                                      4)) == 2 * (n * N)^2
+        # A fold visits the appendix: its owned index reaches N + 1.
+        @test mesh_fold((acc, p) -> max(acc, maximum(p.I)), max, 0, fs, u) == N + 1
+        # Low face to low face: patch 2's low plane is patch 1's.
+        for (side, total, mine) in ((1, 2 * (n * N)^2 - n * N, (n * N)^2),
+                                    (2, 2 * (n * N)^2 + n * N, (n * N)^2 + n * N))
+            fp = FieldSet(folded_pair(n, side), 1; G=3, centering=vertexcentered(2),
+                          glue=:interpolate)
+            v = patch_state(fp)
+            @test mesh_fold(count1, +, 0, fp, v) == total
+            @test mesh_fold((acc, p) -> acc + (p.u[1] == 1), +, 0, fp, v) == mine
+            # Without the appendix the cores count the shared plane twice
+            # or not at all.
+            fc = FieldSet(folded_pair(n, side), 1; G=3, centering=vertexcentered(2))
+            @test mesh_fold(count1, +, 0, fc, zeros(statelength(fc))) == 2 * (n * N)^2
+        end
+    end
+end
+
+@testset "Norms over a set with an appendix weight the points the fold counts" begin
+    # Guards the norm's volume: a constant has its own value as its norm,
+    # which needs the volume to count the points the sum counts.
+    for side in (1, 2)
+        fs = FieldSet(folded_pair(2, side), 2; G=3, centering=vertexcentered(2),
+                      glue=:interpolate)
+        u = fill(3.0, statelength(fs))
+        @test volume_weighted_norm(fs, u) ≈ 3.0 rtol = 1e-14
+        @test volume_weighted_norm(fs, u; p=1) ≈ 3.0 rtol = 1e-14
+        @test volume_weighted_norm(fs, u; p=Inf) == 3.0
+    end
+    fs = kinked_set(kinked_forest(2))
+    u = fill(-2.0, statelength(fs))
+    @test volume_weighted_norm(fs, u) ≈ 2.0 rtol = 1e-14
+    scatter!(fs, u)
+    @test total_mass(fs) ≈ -2.0 * 2 rtol = 1e-14
+end
+
+# The leaves of `forest` on a glued face of their patch.
+on_glue(forest, k) = !isempty(TreeAMR.glued_faces(forest.conn, k))
+
+@testset "regrid! keeps every leaf on a glued face at its level, and its appendix" begin
+    # Guards the regrid of a set interpolated across a glue: a flag on a
+    # glued face is dropped, the interior refines, the owned points of the
+    # kept blocks, their appendix planes included, come through
+    # unchanged, and the schedule builds again, with no refinement
+    # boundary at a glue.
+    forest = kinked_forest(4)
+    N = forest.N
+    fs = kinked_set(forest)
+    sched = GhostSchedule(fs, KINKED_OPS; atlas=KINKED)
+    owned(u) = let A = statearray(u, fs; appendix=true), L = TreeAMR.appendix_layout(fs)
+        Dict(k => [A[Tuple(I)..., 1, b]
+                   for I in CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))]
+             for (b, k) in enumerate(forest.leaves) if on_glue(forest, k))
+    end
+    u = collect(1.0:statelength(fs))
+    scatter!(fs, u)
+    before = owned(u)
+    # A flag on a glued face alone changes nothing.
+    flags = [on_glue(forest, k) ? Refine : Keep for k in forest.leaves]
+    @test !regrid!(forest, fs => sched; flags=flags)
+    # Every block flagged: only the interior ones refine.
+    nglued = count(k -> on_glue(forest, k), forest.leaves)
+    @test regrid!(forest, fs => sched; flags=fill(Refine, nblocks(fs)))
+    @test nleaves(forest) == nglued + 4 * (32 - nglued)
+    @test all(k -> level(k) == (on_glue(forest, k) ? 0 : 1), forest.leaves)
+    v = statevector(fs)
+    gather!(v, fs)
+    @test owned(v) == before
+    sched = GhostSchedule(fs, KINKED_OPS; atlas=KINKED)
+    # A refinement next to a glued face, which balance would carry into
+    # it, is refused, saying why.
+    neighbors(k) = (n for δ in TreeAMR.alldirections(Val(2))
+                    for n in oriented_neighbors(forest, k, δ)[2])
+    flags = [level(k) == 1 && any(n -> on_glue(forest, n), neighbors(k)) ? Refine : Keep
+             for k in forest.leaves]
+    @test any(==(Refine), flags)
+    @test_throws "2:1 balance carries a refinement nearby" regrid!(forest, fs => sched;
+                                                                   flags=flags)
+end

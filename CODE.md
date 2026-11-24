@@ -3537,15 +3537,16 @@ again when they rebuild the schedule. An interpolated set refuses a
 missing order or atlas, and the collective checks compare the order and
 `hash(atlas)` across ranks with the rest of the layout.
 
-*Implemented so far:* the keywords, the refusals at schedule build (not
-yet `regrid!`'s), the location with `chart_aligned`, the stage, and
-closed ownership with its appendix — `statelength`, `scatter!`,
-`gather!`, `statearray(u, fs; appendix = true)` (an `AppendixArray`),
-`map_blocks!`'s keyword and the closed ranges of the fill — serially
-and on the CPU: `src/glue.jl`, tested in `test/glue_tests.jl`. Folds
-and norms still read the cores alone, which count every glued face
-point once where a high face is glued to a low one and not otherwise. A
-distributed forest and reflecting or outflow faces are refused.
+*Implemented so far:* the keywords, the refusals at schedule build,
+the location with `chart_aligned`, the stage, closed ownership with its
+appendix — `statelength`, `scatter!`, `gather!`, `statearray(u, fs;
+appendix = true)` (an `AppendixArray`), `map_blocks!`'s keyword and the
+closed ranges of the fill — the folds and norms counting each point
+once, and `regrid!`'s guard with the appendix carried by a kept
+block's copy, serially and on the CPU: `src/glue.jl`, tested in
+`test/glue_tests.jl`. A distributed forest and reflecting or outflow
+faces are refused, and a fold over the state vector (not the working
+array) refuses a device.
 
 **Where a ghost lies, and what fills it.** A ghost of block `b` of
 patch `p` beyond a glued face of `p` — across a face, an edge or a
@@ -3655,7 +3656,23 @@ A fold or a norm counts every point once: a point on a glued face at
 the copy of the lowest-numbered patch holding it, which the fold reads
 from the core or the appendix. Under a low face glued to a low face
 both cores hold the point; under a high face glued to a high face
-neither does, and both appendices do.
+neither does, and both appendices do. The copies of a point are found
+by following the glues of every glued face it lies on, in each patch's
+integer coordinates, so exactly; among copies on one patch, a patch
+glued to itself, the lower position counts, so a wrap counts its low
+plane. A block's owned points fall into at most `3^D` pieces — along
+each dimension its glued low face plane, its appendix plane, or
+neither — whose points all lie on the same glued faces, and a glue
+joins a whole face to a whole face, so the decision is one bit per
+piece: a `FoldMask` per block, built on the host for each reduction,
+which the fold kernel tests at each point of the closed range. Where
+two copies lie on the lowest patch the pieces are checked point by
+point, and a self-glue that splits a piece is refused. A set without an
+appendix passes `NoMasks()` and compiles none of it. `block_mapreduce`
+and `mesh_mapreduce` over a set with an appendix run as this fold,
+behind `Base.inferencebarrier`, every selected variable at a point in
+turn; and a norm's volume counts the points the fold does, so that a
+constant is its own norm.
 
 **Stages.** An interpolated transfer reads what phase 1 and the
 boundary hook write and writes ghosts across a glue only, which nothing
@@ -3698,14 +3715,19 @@ balance would carry into one of them is refused, saying which block and
 why. So every block within reach of a glue, on either side, is at one
 level, the interpolated ghosts never interpolate across levels, and
 the appendix is never prolongated or restricted: when `regrid!`
-compacts and repartitions, a block's appendix moves with it. Lifting
+compacts and repartitions, a block's appendix moves with it, its copy
+keyed with the same `top` flag as the fill's. The guard is on whenever
+a set `regrid!` moves is interpolated across a glue; it drops the marks
+after the buffer has recruited, so a buffer reaching a glued face is
+dropped there too. Lifting
 this — interpolating from a leaf at another level, which a located
 point finds anyway, and the appendix in the regrid transfers — comes
 after M20.
 
 **What else learns of the appendix.** The flat device launches of
-`scatter!`, `gather!` and `map_blocks!`; the MPI message layouts of a
-repartition; `block_fold` and the norms (above); and TreeIOHDF5, whose
+`scatter!`, `gather!` and `map_blocks!`, and a fold reading the state
+vector, whose `AppendixArray` holds host tables; the MPI message
+layouts of a repartition; and TreeIOHDF5, whose
 checkpoint must save and restore the appendix, a change to the
 companion interface ([Companion interface](#companion-interface)) and a
 format feature of its own.
@@ -3793,7 +3815,11 @@ reduction does.
 
 **Which points.** Exactly the owned points `map_blocks!` visits, so a
 vertex-like block's shared upper plane is not counted, and every
-physical point is counted once. `vars` selects what `p.u` holds, not
+physical point is counted once. On a set with an appendix that is the
+appendix too, each glued face point at one of its copies ("Closed
+ownership and the appendix" under
+[Finite differences across a glue](#finite-differences-across-a-glue)),
+and `p.I` reaches `N + 1` there. `vars` selects what `p.u` holds, not
 which points are visited.
 
 **A weight is per point.** `rf` multiplies by `p.h^D` itself. The same

@@ -527,6 +527,15 @@ end
     values[b] = acc
 end
 
+# `block_mapreduce` over a set with an appendix, as a fold.
+function appendix_mapreduce(f, op, init, array, fs::FieldSet, g, vars::UnitRange{Int})
+    rf(acc, p) = foldvalues(f, op, acc, p.u)
+    return _block_fold(rf, op, init, array, fs, g, vars, nothing)
+end
+@inline foldvalues(f, op, acc, ::Tuple{}) = acc
+@inline foldvalues(f, op, acc, u::Tuple) =
+    foldvalues(f, op, op(acc, f(first(u))), Base.tail(u))
+
 # The device path: two launches, one synchronization, one copy back.
 function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
                                  backend::Backend, g::NTuple{D,Int},
@@ -597,7 +606,9 @@ lane, not once per block.
 
 The first form reads the working array's interiors, skipping the ghosts;
 the second reads a state vector, which has no ghosts to skip. `vars` is
-an integer or a contiguous range of variable indices.
+an integer or a contiguous range of variable indices. A set interpolated
+across a glue reduces its appendix too, counting each glued face point
+once, as [`mesh_fold`](@ref) does, through which it runs.
 
 This is the read-side counterpart of [`map_blocks!`](@ref), and it is
 the shape every diagnostic here has. Combining the values is left to the
@@ -647,12 +658,19 @@ end
 
 function block_mapreduce(f, op, init, fs::FieldSet{T,D}, u::AbstractVector;
                          vars=1:fs.nvars) where {T,D}
-    return _block_mapreduce(f, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
-                            _varrange(vars, fs.nvars))
+    return _block_mapreduce(f, op, init, statearray(u, fs; appendix=true), fs,
+                            ntuple(_ -> 0, D), _varrange(vars, fs.nvars))
 end
 
 function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
                           vars::UnitRange{Int}) where {R,T,D}
+    # A set with an appendix (M20) reduces through the fold, which visits
+    # the appendix and counts a glued face point once: point by point,
+    # every selected variable at a point in turn. Behind a barrier, so
+    # that no other set compiles it.
+    hasappendix(fs) &&
+        return Base.inferencebarrier(appendix_mapreduce)(f, op, init, array, fs, g,
+                                                         vars)::Vector{R}
     backend = get_backend(array)
     return backend isa CPU ?
            _block_mapreduce_host(f, op, init, array, fs, g, vars) :
@@ -860,7 +878,8 @@ What a fold's `rf` is handed for each owned point (see
 - `p.level`: the block's refinement level;
 - `p.tag`: the block's value of the fold's `tag` function, or `nothing`;
 - `p.I`: the owned index, each entry in `1:N` (add `G[d]` for the
-  stored index, as in [`map_blocks!`](@ref));
+  stored index, as in [`map_blocks!`](@ref)), or `N + 1` on an appendix
+  plane of a set interpolated across a glue;
 - `p.b`: the local block index.
 """
 struct FoldPoint{D,NV,T,TG}
@@ -903,17 +922,18 @@ end
 @kernel function fold_points_kernel!(partials, @Const(array), rf, init,
                                      @Const(origins), @Const(spacings), nodes,
                                      @Const(levels),
-                                     tags, firstvar::Int,
+                                     tags, masks, firstvar::Int,
                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}, ::Val{NV},
                                      ::Val{W}) where {D,G,C,N,NV,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
     origin, h = origins[b], spacings[b]
-    lev, tag = levels[b], tags[b]
-    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    lev, tag, mask = levels[b], tags[b], masks[b]
+    cells = CartesianIndices(ntuple(_ -> N + fold_extra(masks), Val(D)))
     acc = init
     for j in l:W:length(cells)
         I = Tuple(cells[j])
+        counted(mask, I, N) || continue
         x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
         c = ntuple(d -> I[d] + G[d], Val(D))
         u = ntuple(v -> array[c..., firstvar + v - 1, b], Val(NV))
@@ -963,6 +983,10 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
                      vars::UnitRange{Int}, tag, lanes=nothing) where {R,T,D}
     forest = fs.forest
     backend = get_backend(array)
+    array isa AppendixArray && !(backend isa CPU) && throw(ArgumentError(
+        "a fold over the state vector of a set with an appendix (closed ownership " *
+        "across a glue) runs on the CPU only so far: the device path of M20 step 4 " *
+        "is still to come. Fold over the working array after `scatter!` instead"))
     tags = fold_tags(backend, tag, forest)
     NV = length(vars)
     check_fold(rf, R, FoldPoint{D,NV,T,tagtype(tags)})
@@ -973,11 +997,15 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     spacings = todevice(backend, block_spacings(forest, T))
     levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
     partials = allocate(backend, R, (W, n))
-    with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
-                         spacings, nodes, levels, tags, first(vars), Val(D), Val(g),
-                         Val(staggers(fs)), Val(forest.N), Val(NV), Val(W);
-                         ndrange=(W * n,))
+    # A set with an appendix (M20) visits its appendix planes too, and a
+    # glued face point at one copy only: its masks, behind a barrier, so
+    # that no other set compiles that kernel.
+    args = (backend, partials, array, rf, init, origins, spacings, levels, tags, fs,
+            first(vars), g, Val(NV), Val(W))
+    if hasappendix(fs)
+        Base.inferencebarrier(launch_fold!)(fold_masks(backend, fs), args...)
+    else
+        launch_fold!(NoMasks(), args...)
     end
     if W == 1
         synchronize(backend)
@@ -987,6 +1015,18 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     fold_lanes_kernel!(backend)(values, partials, op, Val(W); ndrange=n)
     synchronize(backend)
     return tohost(values)
+end
+
+function launch_fold!(masks, backend, partials, array, rf, init, origins, spacings,
+                      levels, tags, fs::FieldSet{T,D}, firstvar::Int, g::NTuple{D,Int},
+                      nv::Val, w::Val{W}) where {T,D,W}
+    with_nodes(backend, T, fs.P) do nodes
+        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
+                         spacings, nodes, levels, tags, masks, firstvar, Val(D), Val(g),
+                         Val(staggers(fs)), Val(fs.forest.N), nv, w;
+                         ndrange=(W * nblocks(fs),))
+    end
+    return nothing
 end
 
 """
@@ -1006,8 +1046,8 @@ end
 
 function block_fold(rf, op, init, fs::FieldSet{T,D}, u::AbstractVector; vars=1:fs.nvars,
                     tag=nothing) where {T,D}
-    return _block_fold(rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
-                       _varrange(vars, fs.nvars), tag)
+    return _block_fold(rf, op, init, statearray(u, fs; appendix=true), fs,
+                       ntuple(_ -> 0, D), _varrange(vars, fs.nvars), tag)
 end
 
 """
@@ -1040,7 +1080,11 @@ The first form reads the working array, skipping the ghosts; the second
 reads a state vector. Either way the points are exactly the owned points
 [`map_blocks!`](@ref) visits, `N` per dimension, so a vertex-centered
 block's shared upper plane is not counted and every physical point is
-counted once.
+counted once. A set interpolated across a glue (`glue = :interpolate`)
+also owns its blocks' glued high face planes, its appendix: those are
+visited too, and a point on a glued face, which every patch holding it
+owns, is counted at one copy, the lowest patch's (see "Finite
+differences across a glue" in `CODE.md`).
 
 The laws are those that let a block be split across a device's lanes:
 `op` is associative, to roundoff at least; `op(init, init) == init`; and
@@ -1213,9 +1257,12 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     # The domain volume as the sum of the block volumes, through the same
     # combination as everything else — so `sum`'s association from M3 is
     # kept, and M7 has one place to reduce across ranks.
-    cells = forest.N^D * fs.nvars
+    # With an appendix (M20) a block counts the points its fold visits.
+    masks = hasappendix(fs) ? host_fold_masks(fs) : nothing
     volumes = Vector{R}(undef, nblocks(fs))
     for b in 1:nblocks(fs)
+        cells = (masks === nothing ? forest.N^D : counted_points(masks[b], forest.N)) *
+                fs.nvars
         volumes[b] = cellvolume(blockkey(fs, b)) * cells
     end
     volume = combine_blocks(+, zero(R), fs, volumes, nothing)

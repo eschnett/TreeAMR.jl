@@ -5077,6 +5077,25 @@ M12 was decided with Erik, after M7 and before M9b.
     now come out 1.0e−2, 1.3e−4, 2.2e−6 and 3.5e−8 at 1, 2, 4 and 8 roots
     per patch side, rates 6.3, 5.9 and 5.9, against 0.19, 3.5e−3 and
     5.7e−5 under half-open ownership.
+  - *Step 4, folds and the regrid guard (2026-11-24).* Folds,
+    reductions and norms visit the appendix and count each glued
+    face point once, at the copy with the lowest patch and position.
+    TreeMultiPatch's step 1 made it necessary sooner than planned: its
+    balls glue the cube's three low faces to the low faces of their
+    shells, where both cores hold the face points. The decision is one
+    bit per piece of a block, its glued low plane, its appendix plane
+    or neither along each dimension, since every point of a piece lies
+    on the same glued faces; a self-glue that splits a piece, which no
+    layout has, is refused. On the kinked torus a fold counts
+    `2(nN)²` points, as many as the torus has, and patch 1 holds
+    `(nN + 1) nN` of them; on two patches glued low to low it counts
+    `nN` fewer than the cores hold, and high to high `nN` more. A norm's
+    volume counts the same points, so a constant is its own norm. The
+    `regrid!` guard drops the marks of every leaf on a glued face, after
+    the buffer, and refuses what balance carries into one; a kept
+    block's copy carries its appendix under the `top` flag, which the
+    regrid test found missing at first (a kept block's appendix came
+    back zero).
 
 ## Downstream checks
 

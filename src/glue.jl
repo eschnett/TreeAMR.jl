@@ -67,6 +67,17 @@ end
 isglued(conn::Patches{D}, p::Integer, e::Integer, side::Integer) where {D} =
     conn.glue[glue_slot(p, e, side, D)].patch != 0
 
+# The glued faces of its patch that leaf `k` lies on, as `(dim, side)`.
+function glued_faces(conn::Patches{D}, k::MortonKey{D}) where {D}
+    lvl = level(k)
+    p = searchsortedlast(conn.firstroot, Int(k.root))
+    n = conn.roots[p]
+    rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
+    g = ntuple(e -> (rootpos[e] << lvl) + Int(k.coords[e]), D)
+    return [(e, s) for e in 1:D for s in 1:2
+            if (s == 1 ? g[e] == 0 : g[e] == (n[e] << lvl) - 1) && isglued(conn, p, e, s)]
+end
+
 # Along which dimensions leaf `k` owns its high face plane under closed
 # ownership (M20): the vertex-like ones along which its high face lies on
 # a glued high face of its patch. That plane is the block's appendix.
@@ -107,11 +118,7 @@ function check_glue_levels(forest::Forest{D}, range) where {D}
         k = forest.leaves[b]
         p = patch(forest, k)
         lvl = level(k)
-        n = conn.roots[p]
-        rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
-        g = ntuple(e -> (rootpos[e] << lvl) + Int(k.coords[e]), D)
-        touched = [(e, s) for e in 1:D for s in 1:2
-                   if (s == 1 ? g[e] == 0 : g[e] == (n[e] << lvl) - 1) && isglued(conn, p, e, s)]
+        touched = glued_faces(conn, k)
         isempty(touched) && continue
         for δ in alldirections(Val(D))
             any(((e, s),) -> δ[e] != (s == 1 ? 1 : -1), touched) || continue
@@ -521,3 +528,150 @@ function move_appendix!(kernel, fs::FieldSet{T,D}, a, b, L::AppendixLayout{D}) w
     synchronize(backend)
     return nothing
 end
+
+# --- Counting a glued face point once (M20) ----------------------------------------
+#
+# Under closed ownership a point on a glued face is owned by every patch
+# holding it, so a fold or a norm that read every owned point would count
+# it twice, or three or four times at an edge or a corner. It is counted
+# at one copy: the one with the lowest `(patch, position)`, the position
+# in the patch's own integer coordinates, so that a patch glued to itself
+# (a wrap) counts its low plane and not its high one. See "Closed
+# ownership and the appendix" in CODE.md, "Finite differences across a
+# glue".
+#
+# A block's owned points fall into at most `3^D` pieces: along each
+# dimension, the low face plane where it lies on a glued face of the
+# patch (class 0), the high appendix plane (class 2), or neither (class
+# 1). Every point of a piece lies on the same glued faces, and a glue
+# joins a whole face to a whole face, so its copies lie on the same
+# patches, and the decision is one bit per piece. The one exception, two
+# copies on the lowest patch, is checked point by point.
+
+# Which of a block's owned points a fold visits: the dimensions with a
+# glued low face plane and with an appendix plane, and one bit per piece,
+# piece `Σ class_d 3^(d-1)`.
+struct FoldMask{D}
+    low::NTuple{D,Bool}
+    high::NTuple{D,Bool}
+    pieces::UInt32
+end
+
+# The masks of a set without an appendix: every block visits its `N^D`
+# owned points, and the kernel compiles none of this.
+struct NoMasks end
+@inline Base.getindex(::NoMasks, ::Integer) = nothing
+fold_extra(::NoMasks) = 0
+fold_extra(::AbstractVector) = 1
+
+@inline counted(::Nothing, I, N) = true
+@inline function counted(m::FoldMask{D}, I::NTuple{D,Int}, N::Int) where {D}
+    piece, stride = 0, 1
+    for d in 1:D
+        i = I[d]
+        cls = i > N ? 2 : (i == 1 && m.low[d]) ? 0 : 1
+        cls == 2 && !m.high[d] && return false
+        piece += cls * stride
+        stride *= 3
+    end
+    return (m.pieces >> piece) & 0x1 == 0x1
+end
+
+# The number of points a mask counts, of `N^D` per block without one.
+function counted_points(m::FoldMask{D}, N::Int) where {D}
+    total = 0
+    for cls in CartesianIndices(ntuple(_ -> 0:2, D))
+        piece = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
+        (m.pieces >> piece) & 0x1 == 0x1 || continue
+        total += prod(ntuple(D) do d
+            cls[d] == 0 ? Int(m.low[d]) : cls[d] == 2 ? Int(m.high[d]) : N - m.low[d]
+        end)
+    end
+    return total
+end
+
+# Every copy of the point at doubled coordinates `y` of patch `p` (twice
+# its position in spacings of level `lvl`, so that a cell center is odd
+# and never on a face), following each glued face it lies on, as
+# `(patch, y)` pairs, itself first.
+function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int,
+                     N::Int) where {D}
+    copies = [(p, y)]
+    i = 1
+    while i <= length(copies)
+        q, z = copies[i]
+        n = conn.roots[q]
+        for e in 1:D, side in 1:2
+            z[e] == (side == 1 ? 0 : 2N * (n[e] << lvl)) || continue
+            entry = conn.glue[glue_slot(q, e, side, D)]
+            entry.patch == 0 && continue
+            there = ntuple(D) do a
+                x = z[Int(entry.perm[a])]
+                o = 2N * (entry.offset[a] << lvl)
+                return entry.flip[a] ? o - x : x + o
+            end
+            (entry.patch, there) in copies || push!(copies, (entry.patch, there))
+        end
+        i += 1
+    end
+    return copies
+end
+
+# Whether the copy of the point `y` of patch `p` is the one counted.
+counted_copy(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::Int) where {D} =
+    minimum(glue_copies(conn, p, y, lvl, N)) == (p, y)
+
+# The masks of this rank's blocks, on `backend`, for a set with an
+# appendix; a set without one passes `NoMasks()`.
+fold_masks(backend, fs::FieldSet) = todevice(backend, host_fold_masks(fs))
+
+function host_fold_masks(fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    conn = forest.conn::Patches{D}
+    N = forest.N
+    c = staggers(fs.centering)
+    masks = FoldMask{D}[]
+    for j in blockrange(forest)
+        k = forest.leaves[j]
+        lvl = level(k)
+        p = patch(forest, k)
+        n = conn.roots[p]
+        rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
+        o = ntuple(e -> N * ((rootpos[e] << lvl) + Int(k.coords[e])), D)
+        low = ntuple(e -> c[e] == 1 && o[e] == 0 && isglued(conn, p, e, 1), D)
+        high = appendix_dims(forest, k, c)
+        position(I) = ntuple(e -> 2 * (o[e] + I[e] - 1) + 1 - c[e], D)
+        pieces = UInt32(0)
+        for cls in CartesianIndices(ntuple(_ -> 0:2, D))
+            ranges = ntuple(D) do d
+                cls[d] == 0 ? (low[d] ? (1:1) : (1:0)) :
+                cls[d] == 2 ? (high[d] ? ((N + 1):(N + 1)) : (1:0)) : ((1 + low[d]):N)
+            end
+            any(isempty, ranges) && continue
+            piece = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
+            I0 = map(first, ranges)
+            copies = glue_copies(conn, p, position(I0), lvl, N)
+            bit = minimum(copies) == (p, position(I0))
+            # Two copies on the lowest patch, a patch glued to itself:
+            # which counts may depend on the point, so every point is
+            # asked. A wrap answers alike for the whole piece.
+            if count(x -> x[1] == minimum(copies)[1], copies) > 1
+                for I in CartesianIndices(ranges)
+                    counted_copy(conn, p, position(Tuple(I)), lvl, N) == bit && continue
+                    throw(ArgumentError(
+                        "patch $p is glued to itself so that the points of one face of " *
+                        "leaf $k, $(Tuple(I)) and $I0, are counted at different copies: " *
+                        "a fold over a set with closed ownership counts each glued face " *
+                        "point once, at the copy with the lowest patch and position, " *
+                        "and decides it per face of a block, which this glue does not " *
+                        "allow (CODE.md, \"Finite differences across a glue\")"))
+                end
+            end
+            bit && (pieces |= UInt32(1) << piece)
+        end
+        push!(masks, FoldMask{D}(low, high, pieces))
+    end
+    return masks
+end
+
+KernelAbstractions.get_backend(a::AppendixArray) = get_backend(a.core)
