@@ -1308,7 +1308,10 @@ a face center, a vertex, an element's Gauss–Lobatto node, whatever this
 field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
 `v` the variable index. The ghosts and the shared boundary plane are
-left untouched: they are filled by the ghost exchange (M2).
+left untouched: they are filled by the ghost exchange (M2). A set
+interpolated across a glue (M20) owns the high face planes of its
+blocks at a glued face of their patch, its appendix, and those are
+filled too.
 
 `f` is called once per point from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
@@ -1354,6 +1357,8 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
                          ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(f, Val(fs.nvars), false, false), fs)
     return fs
 end
 
@@ -1372,6 +1377,8 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(w.f, Val(fs.nvars), true, false), fs)
     return fs
 end
 
@@ -1387,6 +1394,8 @@ function fill_by_coordinates!(w::WithPatch, fs::FieldSet{T,D}) where {T,D}
                          ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(w.f, Val(fs.nvars), false, true), fs)
     return fs
 end
 
@@ -1406,6 +1415,8 @@ function fill_by_coordinates!(w::WithPatch{<:AllVariables}, fs::FieldSet{T,D}) w
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(f, Val(fs.nvars), true, true), fs)
     return fs
 end
 

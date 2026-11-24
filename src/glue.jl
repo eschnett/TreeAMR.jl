@@ -29,6 +29,23 @@ function chart_aligned end
 # the direction and the stored indices.
 const GlueRegion{D} = Tuple{Int,NTuple{D,Int},CartesianIndices{D,NTuple{D,UnitRange{Int}}}}
 
+# The entries of a list grouped by the local block they belong to, for the
+# launch by owner: their order, stable, and where each block's run starts,
+# with the length of the longest run.
+struct GlueRuns
+    order::Vector{Int32}
+    start::Vector{Int32}
+    longest::Int
+end
+GlueRuns() = GlueRuns(Int32[], Int32[1], 0)
+function GlueRuns(blocks::Vector{Int32}, nb::Int)
+    counts = zeros(Int, nb)
+    foreach(b -> counts[b] += 1, blocks)
+    start = Int32.(cumsum([1; counts]))
+    return GlueRuns(Int32.(sortperm(blocks; alg=Base.Sort.DEFAULT_STABLE)), start,
+                    maximum(counts; init=0))
+end
+
 # The interpolated ghosts of one schedule. Those whose source block is on
 # this rank (every one, serially): per ghost point the target block and
 # stored index, the source block, the stored index of the stencil's first
@@ -62,6 +79,10 @@ struct GluePlan{T,D}
     recvindex::Vector{NTuple{D,Int32}}
     recvpeers::Vector{Int}
     recvcounts::Vector{Int}
+    reads::Vector{Int}
+    localruns::GlueRuns
+    sendruns::GlueRuns
+    recvruns::GlueRuns
     device::Any
     buffers::Any
 end
@@ -69,7 +90,8 @@ GluePlan{T,D}() where {T,D} =
     GluePlan{T,D}(0, Int32[], NTuple{D,Int32}[], Int32[], NTuple{D,Int32}[],
                   NTuple{D,Int8}[], zeros(T, 0, 0), Int32[], NTuple{D,Int32}[],
                   NTuple{D,Int8}[], zeros(T, 0, 0), Int[], Int[], Int32[],
-                  NTuple{D,Int32}[], Int[], Int[], nothing, GlueBuffers())
+                  NTuple{D,Int32}[], Int[], Int[], Int[], GlueRuns(), GlueRuns(),
+                  GlueRuns(), nothing, GlueBuffers())
 
 # The message buffers of a glue plan, on the backend, and the host mirrors
 # a staging communicator sends from and receives into; sized for the
@@ -270,10 +292,9 @@ end
 # The glue plan of one schedule: every interpolated region `(b, δ,
 # region)` of this rank's blocks — `b` a global leaf, `region` stored
 # indices — located through the atlas, with its stencil. Refuses, saying
-# why, a ghost the atlas puts in no patch or back in its own, one whose
-# source is at another level, an alignment that does not hold, and a
-# stencil that would read a point no copy within the source's patch
-# fills. Every rank comes here, whether it has regions or not: over a
+# why, a ghost the atlas puts in no patch, one whose source is at another
+# level, an alignment that does not hold, and a stencil that would read a
+# point that phase 1 and the hook leave unfilled. Every rank comes here, whether it has regions or not: over a
 # distributed forest the refusals are agreed on (`collective_checks`) and
 # the ghosts whose source another rank owns go to that rank in one
 # `alltoallv`, which builds their stencils and evaluates them each fill.
@@ -288,6 +309,10 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
         return (ghosts, map(stencil, ghosts)), UInt(0)
     end
     ghosts, stencils = located
+    # The leaves this rank's ghosts read, which `regrid!` keeps.
+    reads = Int[]
+    foreach(s -> append!(reads, s[4]), stencils)
+    sort!(unique!(reads))
     # The ghosts this rank computes, and those it asks other ranks for,
     # counted by owner and kept in the order located.
     P = commsize(forest.comm)
@@ -321,8 +346,14 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                          nonzero(rcounts), filter(>(0), rcounts),
                          Int32[g.target - offset for g in asked],
                          NTuple{D,Int32}[g.index for g in asked],
-                         nonzero(counts), filter(>(0), counts), nothing, GlueBuffers())
-    backend isa CPU && return plan
+                         nonzero(counts), filter(>(0), counts), reads,
+                         GlueRuns(), GlueRuns(), GlueRuns(), nothing, GlueBuffers())
+    if backend isa CPU
+        nb = length(owned)
+        return GluePlan{T,D}((getfield(plan, f) for f in fieldnames(GluePlan)[1:18])...,
+                             GlueRuns(plan.target, nb), GlueRuns(plan.sendsource, nb),
+                             GlueRuns(plan.recvtarget, nb), nothing, GlueBuffers())
+    end
     return GluePlan{T,D}((getfield(plan, f) for f in fieldnames(GluePlan)[1:(end - 2)])...,
                          upload_glue(plan, backend), GlueBuffers())
 end
@@ -430,54 +461,144 @@ function glue_stencil(::Type{T}, forest::Forest{D,R}, atlas, G::NTuple{D,Int},
         1 <= first && last <= N + 2G[e] + c[e] || throw(ArgumentError(
             "the stencil of the ghost at $(where_()[1]) of patch $p reaches outside the " *
             "stored array of its source block $skey along dimension $e"))
-        # Beyond the owned range: the ghosts below, or above the shared
-        # plane of a vertex-like dimension, which a copy within the patch
-        # fills, or at an outer high face the hook.
-        overhang[e] = first <= G[e] ? -1 : last > G[e] + N + c[e] ? 1 : 0
+        # Beyond the owned range: the ghosts below, or from the high plane
+        # of a vertex-like dimension up, which the neighbor within the
+        # patch fills — except the plane at the patch's high face, which
+        # the block owns at a glue (the appendix) and the hook fills at an
+        # outer face, both before this stage.
+        top = c[e] == 1 && start[e] + N == n
+        overhang[e] = first <= G[e] ? -1 : last > G[e] + N + top ? 1 : 0
         fs[e] = first
         ws[e] = w
     end
-    check_overhang(forest, skey, overhang, where_()...)
-    return ntuple(d -> fs[d], D), ntuple(d -> ws[d], D), col
+    reads = check_overhang(forest, skey, overhang, where_()...)
+    pushfirst!(reads, g.source)
+    return ntuple(d -> fs[d], D), ntuple(d -> ws[d], D), col, reads
 end
 
 # What a stencil reads beyond its source block's owned range is the
-# source's ghosts inside its own patch, which phase 1's same-level copies
-# fill: refused if a neighbor in one of those directions is missing (the
-# stencil would read across a glue) or at another level.
+# source's ghosts inside its own patch, which phase 1 fills before this
+# stage: a copy from a neighbor at the same level, a restriction from finer
+# ones. Refused if a neighbor in one of those directions is missing (the
+# stencil would read across a glue) or coarser, whose prolongation comes
+# in phase 2, after this stage. Returns the neighbors' leaves, which
+# `regrid!` keeps at their levels.
 function check_overhang(forest::Forest{D}, skey::MortonKey{D}, overhang, ξ, p) where {D}
+    reads = Int[]
     for δ in alldirections(Val(D))
         all(e -> δ[e] == 0 || δ[e] == overhang[e], 1:D) || continue
-        nbrs = oriented_neighbors(forest, skey, δ)[2]
-        ok = !isempty(nbrs) && level(first(nbrs)) == level(skey) &&
-             !iscrossing(oriented_neighbors(forest, skey, δ)[1])
+        crossing, nbrs = oriented_neighbors(forest, skey, δ)
+        ok = !isempty(nbrs) && all(nb -> level(nb) >= level(skey), nbrs) &&
+             !iscrossing(crossing)
         ok || throw(ArgumentError(
             "the stencil of the ghost at $ξ of patch $p reads the ghosts of its source " *
-            "block $skey in direction $δ, where no block of the same level and patch " *
-            "fills them: the ghost lies too deep in the patch across, or a refinement " *
-            "boundary is within reach of the glue"))
+            "block $skey in direction $δ, which no block of the same level or finer " *
+            "in its patch fills before the ghosts across the glue are: the ghost lies " *
+            "too deep in the patch across, or a coarser block is within reach of the " *
+            "glue"))
+        foreach(nb -> push!(reads, find_leaf(forest, nb)), nbrs)
     end
-    return nothing
+    return reads
 end
 
 # The value of the stencil `j` for variable `v`: the tensor product of its
-# weights over the source block `s`'s points (M20); along an aligned
-# dimension the width is one. The same arithmetic for a ghost filled in
-# place and for one evaluated into a message, so that both are the serial
-# value bit for bit.
-@inline function glue_value(work, s, f, w, weights, j, v, ::Val{D}, ::Val{K}) where {D,K}
+# weights over the source block `s`'s points (M20), summed one dimension
+# at a time, the first innermost, each loop as long as the stencil's width
+# there — one along an aligned dimension, so that a ghost with shared
+# coordinates costs its taps and not `K^D`. The same arithmetic for a
+# ghost filled in place and for one evaluated into a message, on every
+# backend, so that both are the serial value bit for bit.
+@inline function glue_value(work, s, f, w, weights, j, v, ::Val{1}, ::Val{K}) where {K}
     acc = zero(eltype(work))
-    @inbounds for tap in 0:(K^D - 1)
-        digits = ntuple(d -> (tap ÷ K^(d - 1)) % K, Val(D))
-        any(d -> digits[d] >= w[d], 1:D) && continue
-        c = one(eltype(work))
-        for d in 1:D
-            c *= weights[(d - 1) * K + digits[d] + 1, j]
-        end
-        acc += c * work[ntuple(d -> Int(f[d]) + digits[d], Val(D))..., v, s]
+    @inbounds for i1 in 1:Int(w[1])
+        acc += weights[i1, j] * work[Int(f[1]) + i1 - 1, v, s]
     end
     return acc
 end
+@inline function glue_value(work, s, f, w, weights, j, v, ::Val{2}, ::Val{K}) where {K}
+    acc = zero(eltype(work))
+    @inbounds for i2 in 1:Int(w[2])
+        a1 = zero(eltype(work))
+        for i1 in 1:Int(w[1])
+            a1 += weights[i1, j] * work[Int(f[1]) + i1 - 1, Int(f[2]) + i2 - 1, v, s]
+        end
+        acc += weights[K + i2, j] * a1
+    end
+    return acc
+end
+@inline function glue_value(work, s, f, w, weights, j, v, ::Val{3}, ::Val{K}) where {K}
+    acc = zero(eltype(work))
+    @inbounds for i3 in 1:Int(w[3])
+        a2 = zero(eltype(work))
+        for i2 in 1:Int(w[2])
+            a1 = zero(eltype(work))
+            for i1 in 1:Int(w[1])
+                a1 += weights[i1, j] *
+                      work[Int(f[1]) + i1 - 1, Int(f[2]) + i2 - 1, Int(f[3]) + i3 - 1, v, s]
+            end
+            a2 += weights[K + i2, j] * a1
+        end
+        acc += weights[2K + i3, j] * a2
+    end
+    return acc
+end
+
+# On the CPU the three kernels run by owner, as every per-block pass does:
+# one workgroup per block, its entries the block's (`order[start[b] …
+# start[b + 1] - 1]`), every variable of an entry in turn. A local ghost
+# and a received one belong to their target block, a ghost evaluated for
+# another rank to its source block.
+@kernel function glue_owner_kernel!(work, @Const(order), @Const(start), @Const(target),
+                                    @Const(index), @Const(source), @Const(firsts),
+                                    @Const(widths), @Const(weights), nvars,
+                                    ::Val{D}, ::Val{K}) where {D,K}
+    i, b = @index(Global, NTuple)
+    @inbounds begin
+        r = Int(start[b]) + i - 1
+        if r < Int(start[b + 1])
+            j = Int(order[r])
+            idx = ntuple(d -> Int(index[j][d]), Val(D))
+            for v in 1:nvars
+                work[idx..., v, Int(target[j])] =
+                    glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
+                               Val(D), Val(K))
+            end
+        end
+    end
+end
+@kernel function glue_owner_pack_kernel!(buf, @Const(work), @Const(order), @Const(start),
+                                         @Const(source), @Const(firsts), @Const(widths),
+                                         @Const(weights), nvars,
+                                         ::Val{D}, ::Val{K}) where {D,K}
+    i, b = @index(Global, NTuple)
+    @inbounds begin
+        r = Int(start[b]) + i - 1
+        if r < Int(start[b + 1])
+            j = Int(order[r])
+            for v in 1:nvars
+                buf[(j - 1) * nvars + v] =
+                    glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
+                               Val(D), Val(K))
+            end
+        end
+    end
+end
+@kernel function glue_owner_unpack_kernel!(work, @Const(buf), @Const(order), @Const(start),
+                                           @Const(target), @Const(index), nvars,
+                                           ::Val{D}) where {D}
+    i, b = @index(Global, NTuple)
+    @inbounds begin
+        r = Int(start[b]) + i - 1
+        if r < Int(start[b + 1])
+            j = Int(order[r])
+            idx = ntuple(d -> Int(index[j][d]), Val(D))
+            for v in 1:nvars
+                work[idx..., v, Int(target[j])] = buf[(j - 1) * nvars + v]
+            end
+        end
+    end
+end
+
 
 # A ghost whose source is on this rank: one work item per point and
 # variable, each writing its own slot.
@@ -533,10 +654,20 @@ function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, tables, backend,
         push!(recvs, irecv(comm, view(bufs.wirerecv, r), peer, GLUE_TAG))
     end
     sends = Any[]
+    nb = nblocks(fs)
     if !isempty(plan.sendpeers)
-        glue_pack_kernel!(backend)(bufs.send, fs.work, tables.sendsource, tables.sendfirst,
-                                   tables.sendwidth, tables.sendweights, nv, Val(D),
-                                   Val(plan.k); ndrange=(length(plan.sendsource), nv))
+        if backend isa CPU
+            runs = plan.sendruns
+            launch_by_owner!(glue_owner_pack_kernel!, backend, bufs.send, fs.work,
+                             runs.order, runs.start, plan.sendsource, plan.sendfirst,
+                             plan.sendwidth, plan.sendweights, nv, Val(D), Val(plan.k);
+                             ndrange=(runs.longest, nb))
+        else
+            glue_pack_kernel!(backend)(bufs.send, fs.work, tables.sendsource,
+                                       tables.sendfirst, tables.sendwidth,
+                                       tables.sendweights, nv, Val(D), Val(plan.k);
+                                       ndrange=(length(plan.sendsource), nv))
+        end
         synchronize(backend)
         bufs.wiresend === bufs.send || copyto!(bufs.wiresend, bufs.send)
         for (peer, r) in zip(plan.sendpeers, segment_ranges(plan.sendcounts, nv))
@@ -544,16 +675,31 @@ function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, tables, backend,
         end
     end
     if !isempty(plan.target)
-        glue_kernel!(backend)(fs.work, tables.target, tables.index, tables.source,
-                              tables.first, tables.width, tables.weights, Val(D),
-                              Val(plan.k); ndrange=(length(plan.target), nv))
+        if backend isa CPU
+            runs = plan.localruns
+            launch_by_owner!(glue_owner_kernel!, backend, fs.work, runs.order, runs.start,
+                             plan.target, plan.index, plan.source, plan.first, plan.width,
+                             plan.weights, nv, Val(D), Val(plan.k);
+                             ndrange=(runs.longest, nb))
+        else
+            glue_kernel!(backend)(fs.work, tables.target, tables.index, tables.source,
+                                  tables.first, tables.width, tables.weights, Val(D),
+                                  Val(plan.k); ndrange=(length(plan.target), nv))
+        end
     end
     if !isempty(recvs)
         waitall(comm, recvs)
         bufs.wirerecv === bufs.recv || copyto!(bufs.recv, bufs.wirerecv)
-        glue_unpack_kernel!(backend)(fs.work, bufs.recv, tables.recvtarget,
-                                     tables.recvindex, nv, Val(D);
-                                     ndrange=(length(plan.recvtarget), nv))
+        if backend isa CPU
+            runs = plan.recvruns
+            launch_by_owner!(glue_owner_unpack_kernel!, backend, fs.work, bufs.recv,
+                             runs.order, runs.start, plan.recvtarget, plan.recvindex, nv,
+                             Val(D); ndrange=(runs.longest, nb))
+        else
+            glue_unpack_kernel!(backend)(fs.work, bufs.recv, tables.recvtarget,
+                                         tables.recvindex, nv, Val(D);
+                                         ndrange=(length(plan.recvtarget), nv))
+        end
     end
     synchronize(backend)
     isempty(sends) || waitall(comm, sends)
@@ -727,7 +873,9 @@ Adapt.adapt_structure(to, a::AppendixArray) =
     return a.base[b] + (v - 1) * a.count[b] + appendix_rank(I, e, a.N)
 end
 
-function Base.getindex(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
+# Inlined, so that a kernel's index arithmetic folds into them: on the
+# CPU a call per point allocated its tuples (90 ns and 160 B a read).
+@inline function Base.getindex(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
     i = ntuple(d -> I[d], Val(D))
     v, b = I[D + 1], I[D + 2]
     all(d -> i[d] <= a.N, 1:D) && return a.core[i..., v, b]
@@ -736,7 +884,7 @@ function Base.getindex(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
     return @inbounds a.appendix[s]
 end
 
-function Base.setindex!(a::AppendixArray{T,D}, x, I::Vararg{Int}) where {T,D}
+@inline function Base.setindex!(a::AppendixArray{T,D}, x, I::Vararg{Int}) where {T,D}
     i = ntuple(d -> I[d], Val(D))
     v, b = I[D + 1], I[D + 2]
     if all(d -> i[d] <= a.N, 1:D)
@@ -748,6 +896,7 @@ function Base.setindex!(a::AppendixArray{T,D}, x, I::Vararg{Int}) where {T,D}
     return a
 end
 
+Base.eltype(::Type{<:AppendixArray{T}}) where {T} = T
 Base.size(a::AppendixArray{T,D}) where {T,D} =
     (ntuple(_ -> a.N + 1, D)..., size(a.core, D + 1), size(a.core, D + 2))
 
@@ -774,6 +923,62 @@ end
         s = base[b] + (v - 1) * count[b] + (j - first[b]) + 1
         app[s] = work[ntuple(d -> Int(I[d]) + G[d], Val(D))..., v, b]
     end
+end
+
+# The appendix's points of `fill_by_coordinates!` (M20): every form of its
+# callback as one that returns all the variables from the position and
+# the patch. `all` and `patch` say which form `f` is: `f(x, v)`,
+# `f(x) -> vals`, `f(x, p, v)` or `f(x, p) -> vals`.
+struct AppendixCallback{F,NV,A,P}
+    f::F
+end
+AppendixCallback(f, ::Val{NV}, all::Bool, patch::Bool) where {NV} =
+    AppendixCallback{typeof(f),NV,all,patch}(f)
+@inline (g::AppendixCallback{F,NV,false,false})(x, p) where {F,NV} =
+    ntuple(v -> g.f(x, v), Val(NV))
+@inline (g::AppendixCallback{F,NV,true,false})(x, p) where {F,NV} = g.f(x)
+@inline (g::AppendixCallback{F,NV,false,true})(x, p) where {F,NV} =
+    ntuple(v -> g.f(x, p, v), Val(NV))
+@inline (g::AppendixCallback{F,NV,true,true})(x, p) where {F,NV} = g.f(x, p)
+
+# One work item per appendix point: its position formed by the expression
+# `coordinates_kernel!` uses, from the owned index `N + 1` on its plane, so
+# that a point the patches share is filled from the same arithmetic.
+@kernel function appendix_coordinates_kernel!(work, g, @Const(points), @Const(block),
+                                              @Const(origins), @Const(spacings),
+                                              @Const(patches), nodes, ::Val{D}, ::Val{G},
+                                              ::Val{C}, ::Val{NV}) where {D,G,C,NV}
+    j = @index(Global, Linear)
+    @inbounds begin
+        b = Int(block[j])
+        I = points[j]
+        origin, h, p = origins[b], spacings[b], Int(patches[b])
+        x = ntuple(d -> nodeposition(origin[d], h, Int(I[d]), C[d], nodes), Val(D))
+        vals = g(x, p)
+        idx = ntuple(d -> Int(I[d]) + G[d], Val(D))
+        ntuple(Val(NV)) do v
+            work[idx..., v, b] = vals[v]
+            nothing
+        end
+    end
+end
+
+function fill_appendix_coordinates!(g::AppendixCallback, fs::FieldSet{T,D}) where {T,D}
+    L = appendix_cache(fs)
+    isempty(L.host.points) && return nothing
+    forest = fs.forest
+    backend = get_backend(fs.work)
+    origins = todevice(backend, block_origins(forest, T))
+    spacings = todevice(backend, block_spacings(forest, T))
+    patches = todevice(backend, block_patches(forest))
+    with_nodes(backend, T, fs.P) do nodes
+        appendix_coordinates_kernel!(backend)(fs.work, g, L.points, L.block, origins,
+                                              spacings, patches, nodes, Val(D), Val(fs.G),
+                                              Val(staggers(fs)), Val(fs.nvars);
+                                              ndrange=length(L.host.points))
+    end
+    synchronize(backend)
+    return nothing
 end
 
 function move_appendix!(kernel, fs::FieldSet{T,D}, a, b, L::AppendixCache) where {T,D}
@@ -849,9 +1054,11 @@ end
 # Every copy of the point at doubled coordinates `y` of patch `p` (twice
 # its position in spacings of level `lvl`, so that a cell center is odd
 # and never on a face), following each glued face it lies on, as
-# `(patch, y)` pairs, itself first.
-function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int,
-                     N::Int) where {D}
+# `(patch, y)` pairs, itself first. A glue that turns the axes may carry
+# the point onto a dimension of the other patch with another centering,
+# where no point of the set lies (`c` the staggers): that image is no copy.
+function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::Int,
+                     c::NTuple{D,Int}) where {D}
     copies = [(p, y)]
     i = 1
     while i <= length(copies)
@@ -866,6 +1073,7 @@ function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int,
                 o = 2N * (entry.offset[a] << lvl)
                 return entry.flip[a] ? o - x : x + o
             end
+            all(a -> iseven(there[a]) == (c[a] == 1), 1:D) || continue
             (entry.patch, there) in copies || push!(copies, (entry.patch, there))
         end
         i += 1
@@ -874,8 +1082,9 @@ function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int,
 end
 
 # Whether the copy of the point `y` of patch `p` is the one counted.
-counted_copy(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::Int) where {D} =
-    minimum(glue_copies(conn, p, y, lvl, N)) == (p, y)
+counted_copy(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::Int,
+             c::NTuple{D,Int}) where {D} =
+    minimum(glue_copies(conn, p, y, lvl, N, c)) == (p, y)
 
 # The masks of this rank's blocks, on `backend`, for a set with an
 # appendix; a set without one passes `NoMasks()`.
@@ -917,14 +1126,14 @@ function host_fold_masks(fs::FieldSet{T,D}) where {T,D}
             any(isempty, ranges) && continue
             piece = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
             I0 = map(first, ranges)
-            copies = glue_copies(conn, p, position(I0), lvl, N)
+            copies = glue_copies(conn, p, position(I0), lvl, N, c)
             bit = minimum(copies) == (p, position(I0))
             # Two copies on the lowest patch, a patch glued to itself:
             # which counts may depend on the point, so every point is
             # asked. A wrap answers alike for the whole piece.
             if count(x -> x[1] == minimum(copies)[1], copies) > 1
                 for I in CartesianIndices(ranges)
-                    counted_copy(conn, p, position(Tuple(I)), lvl, N) == bit && continue
+                    counted_copy(conn, p, position(Tuple(I)), lvl, N, c) == bit && continue
                     throw(ArgumentError(
                         "patch $p is glued to itself so that the points of one face of " *
                         "leaf $k, $(Tuple(I)) and $I0, are counted at different copies: " *

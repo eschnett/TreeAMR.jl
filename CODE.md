@@ -3579,14 +3579,19 @@ of `q`, into `q`'s closed box at that level: its points `0 … n`, the
 glued high face plane included (it is owned, below) and an outer high
 face plane too, which the hook has filled by then. So near `q`'s faces
 the stencil is lop-sided, which cost no measurable accuracy in the
-prototype. It reads `s`'s stored array: its owned points, its appendix,
-and its ghosts inside `q`, which phase 1's same-level copies have
-filled — never a ghost of `s` across a glue, which is interpolated from
-`p` in turn. Two conditions keep that true, both checked at schedule
-build: `k ≤ 2(G_d + c_d)` along every dimension, so that a centered
-stencil about a point of `s` stays inside `s`'s stored array, and **no refinement
-boundary at a glue** (below), so that every block within reach of a
-glue is at one level and its ghosts inside its patch are copies.
+prototype. It reads `s`'s stored array: its owned points, its appendix
+or the hook's outer high plane, and its ghosts inside `q` — never a
+ghost of `s` across a glue, which is interpolated from `p` in turn. Two
+conditions keep that true, both checked at schedule build: `k ≤ 2(G_d
++ c_d)` along every dimension, so that a centered stencil about a point
+of `s` stays inside `s`'s stored array; and every ghost of `s` it reads,
+the high plane of a vertex-like dimension included unless `s` owns it
+or it is an outer face's, has a neighbor within `q` at `s`'s level or
+finer in that direction, whose copy or restriction phase 1 has
+finished. A coarser neighbor's ghosts are prolongated in phase 2, after
+this stage, and are refused rather than read a fill behind. The source
+itself is at the target's level, by **no refinement boundary at a
+glue** (below).
 
 **Aligned coordinates.** Some patch systems share a coordinate across a
 glue exactly, and then the interpolation must not reach along it. On
@@ -3673,7 +3678,9 @@ from the core or the appendix. Under a low face glued to a low face
 both cores hold the point; under a high face glued to a high face
 neither does, and both appendices do. The copies of a point are found
 by following the glues of every glued face it lies on, in each patch's
-integer coordinates, so exactly; among copies on one patch, a patch
+integer coordinates, so exactly, and an image that lands where the
+other patch's centering has no point (a glue turning a vertex-like
+dimension onto a cell-like one) is no copy; among copies on one patch, a patch
 glued to itself, the lower position counts, so a wrap counts its low
 plane. A block's owned points fall into at most `3^D` pieces — along
 each dimension its glued low face plane, its appendix plane, or
@@ -3725,13 +3732,20 @@ test counts them). Over three ranks the kinked torus's fill sends 1299
 ghosts and comes out bit for bit the serial one, under MPI as over
 simulated ranks.
 
-**The kernel** runs one work item per ghost point and variable and sums
-the tensor product of `D` weight vectors, each of width `k`, or one
-along an aligned dimension — `k²` taps between the thirteen-patch
-ball's outer shells and `k` across its middle sphere, not `k³` — stored
-per point with their widths, the source block and the base stored
-index; on the CPU by
-the target's owner, on a device flat. On a device the plan's tables are
+**The kernel** sums the tensor product of `D` weight vectors, one
+dimension at a time, each loop as long as the stencil's width there:
+`k`, or one along an aligned dimension, so that a ghost between the
+thirteen-patch ball's outer shells costs `k²` taps and one across its
+middle sphere `k`, not `k³`. The weights are stored per point with the
+widths, the source block and the base stored index. On the CPU it runs
+by owner, a workgroup per block over that block's entries and every
+variable — the target's block for a ghost filled in place or received,
+the source's for one evaluated into a message; on a device flat, one
+work item per point and variable. Measured on the seven-patch ball at
+`k = 6` (Apple M3 Pro, one thread): 106 ns per ghost and variable for
+216 taps, 24 ns for 36 and 7.5 ns for 6; the first form, a loop over
+`K^D` taps that skipped those past the width, took 545 ns at every
+width. On a device the plan's tables are
 uploaded once, at the build, and its message buffers live there, with
 host mirrors where the communicator is not handed device memory, as the
 stages' are. It is element-like in one
@@ -3767,7 +3781,10 @@ corner touching a glued face is refused by `GhostSchedule` for an
 interpolated set, and `regrid!` keeps every block touching a glued face
 at its level: their own flags are dropped, and a change that 2:1
 balance would carry into one of them is refused, saying which block and
-why. So every block within reach of a glue, on either side, is at one
+why. So are the blocks the schedule's glue stencils read: their sources
+and the neighbors whose copies or restrictions fill the ghosts they
+read (`GluePlan.reads`, gathered over the ranks), so that whatever
+`regrid!` accepts, the schedule builds again. So every block within reach of a glue, on either side, is at one
 level, the interpolated ghosts never interpolate across levels, and
 the appendix is never prolongated or restricted: when `regrid!`
 compacts and repartitions, a block's appendix moves with it, its copy
@@ -3790,7 +3807,12 @@ evaluation, and their kernels read the tables where they run. An
 a right-hand side launched with `map_blocks!(…; appendix = true)` and a
 fold over the state vector take it as an argument. Its reads check the
 index on the host only (`@boundscheck`), so that a kernel under
-`@inbounds` compiles no throw. Still to learn of it: TreeIOHDF5, whose
+`@inbounds` compiles no throw; its accessors are inlined, without which
+every access allocated its index tuples on the CPU (70 ns and 148 B an
+entry through a fold, 9 ns and nothing now). `fill_by_coordinates!` fills
+the appendix after the cores, every form of its callback through one
+kernel over the appendix's points, and `adapt_to_initial_data!` takes the
+`atlas` its schedules need. Still to learn of it: TreeIOHDF5, whose
 checkpoint must save and restore the appendix, a change to the
 companion interface ([Companion interface](#companion-interface)) and a
 format feature of its own.

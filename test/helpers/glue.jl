@@ -99,3 +99,21 @@ function fill_from_owned!(fs, sched, f; boundary=nothing)
     fill_ghosts!(fs, sched; boundary=boundary)
     return fs
 end
+
+# Two patches side by side along dimension 1, glued at one face, with
+# affine maps of different spacings: patch 1 is `x = -1 + ξ₁`, patch 2
+# `x = a η`, both `y = ξ₂`. Every other face is outer. With `a` small a
+# ghost of patch 1 lands deep in patch 2, in its second block layer.
+struct StretchedPair
+    a::Float64
+end
+TreeAMR.chart_map(t::StretchedPair, ξ, p) = p == 1 ? (-1 + ξ[1], ξ[2]) : (t.a * ξ[1], ξ[2])
+function TreeAMR.chart_locate(t::StretchedPair, x)
+    0 <= x[2] <= 1 || return nothing
+    -1 <= x[1] < 0 && return ((x[1] + 1, x[2]), 1)
+    0 <= x[1] <= t.a && return ((x[1] / t.a, x[2]), 2)
+    return nothing
+end
+stretched_forest(n; N=8) =
+    Forest([(roots=(n, n), extents=((0.0, 1.0), (0.0, 1.0))) for _ in 1:2]; N=N,
+           glue=patch_glue_both((1, 1, 2), (2, 1, 1), (1, 2)))

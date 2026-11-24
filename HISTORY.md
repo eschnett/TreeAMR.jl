@@ -5146,6 +5146,27 @@ M12 was decided with Erik, after M7 and before M9b.
     Behind barriers it came to 65–68 s, about 5 % over `main`, which
     the `top` flag of `GroupKey` and laptop noise account for as far
     as this machine can tell; a quieter measurement belongs on Symmetry.
+  - *Step 4, the review (2026-11-24).* A review of the design and the
+    code by a separate agent (`multipatch-review.md`) confirmed every
+    decision, Erik's and the implementer's, six of them with changes, and
+    found bugs the tests had missed, each reproduced before it was
+    fixed. `AppendixArray`'s accessors were not inlined and allocated on
+    the CPU (a fold over a state vector 71 ns and 148 B an entry, now
+    9 ns and none). `fill_by_coordinates!` left the appendix at zero, and
+    `adapt_to_initial_data!` could not pass an atlas. The overhang rule
+    did not count the high plane of a vertex-like dimension, so a stencil
+    reaching it next to a coarser neighbor read a ghost that phase 2
+    prolongates after the glue's stage, a fill behind (53 of 318 ghosts
+    on a stretched pair); it also refused a finer neighbor, whose ghosts
+    phase 1 restricts, so that `regrid!` could accept a mesh the schedule
+    then refused. The rule now counts the plane, accepts the same level
+    or finer, and `regrid!` keeps every leaf the stencils read. The
+    fold's copies followed a glue that turns the axes onto a dimension
+    of another centering, where the set has no point (496 of 512 counted
+    for cell×vertex). And the kernel looped over all `K^D` taps: as
+    nested loops over the widths, by owner on the CPU, it is 5.1× faster
+    at full width (545 → 106 ns per ghost and variable) and 13× and 70×
+    at 36 and 6 taps.
 
 ## Downstream checks
 

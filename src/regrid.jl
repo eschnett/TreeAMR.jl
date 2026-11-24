@@ -783,20 +783,49 @@ function glue_guarded(forest::Forest, sets)
     return false
 end
 
-# Drop the marks of the leaves on a glued face, whatever asked for them,
-# the application or the buffer.
-function keep_glued!(marks::Vector{RegridFlag}, forest::Forest{D}) where {D}
+# The leaves the glue stencils of the sets' schedules read, over every
+# rank: what a regrid must not change, beside the leaves on a glued face,
+# for the schedule to build again.
+function glue_read_leaves(forest::Forest, sets)
+    reads = Int[]
+    for p in sets
+        fs, sched = p.first, p.second
+        fs isa FieldSet && sched isa GhostSchedule && fs.glue === :interpolate || continue
+        append!(reads, sched.glueplan.reads)
+    end
+    isdistributed(forest) && (reads = allgatherv(forest.comm, reads))
+    return sort!(unique!(reads))
+end
+
+# Drop the marks of the leaves on a glued face and of those the glue
+# stencils read, whatever asked for them, the application or the buffer.
+function keep_glued!(marks::Vector{RegridFlag}, forest::Forest{D},
+                     read::Vector{Int}) where {D}
     conn = forest.conn::Patches{D}
     for (i, k) in enumerate(forest.leaves)
         isempty(glued_faces(conn, k)) || (marks[i] = Keep)
     end
+    foreach(i -> marks[i] = Keep, read)
     return marks
 end
 
-# Refuse new leaves that change a leaf on a glued face: what 2:1 balance
-# carried there from a refinement nearby.
-function check_glue_kept(forest::Forest{D}, newleaves::Vector{MortonKey{D}}) where {D}
+# Refuse new leaves that change a leaf on a glued face or one the glue
+# stencils read: what 2:1 balance carried there from a refinement nearby.
+function check_glue_kept(forest::Forest{D}, newleaves::Vector{MortonKey{D}},
+                         read::Vector{Int}) where {D}
     conn = forest.conn::Patches{D}
+    for i in read
+        k = forest.leaves[i]
+        insorted(k, newleaves) && continue
+        throw(ArgumentError(
+            "regrid! would change leaf $k of patch $(patch(forest, k)), which the " *
+            "interpolation across a glue reads (a source block, or a neighbor that fills " *
+            "the ghosts one reads): its own flag was dropped, but 2:1 balance carries a " *
+            "refinement nearby into it. A set interpolated across a glue keeps those " *
+            "blocks at their levels, so that the schedule builds again (CODE.md, " *
+            "\"Finite differences across a glue\"); keep the refinement further from the " *
+            "patches' glued faces"))
+    end
     for k in forest.leaves
         faces = glued_faces(conn, k)
         isempty(faces) && continue
@@ -1086,9 +1115,13 @@ function regrid!(forest::Forest{D}, pairs;
     # balance carries into one of them is refused. Replicated, so every
     # rank decides alike.
     guarded = ispatched(forest) && Base.inferencebarrier(glue_guarded)(forest, sets)::Bool
-    guarded && Base.inferencebarrier(keep_glued!)(flagged, forest)
+    # So does every leaf the sets' glue stencils read, their sources and
+    # the neighbors that fill the ghosts they read.
+    read = guarded ? Base.inferencebarrier(glue_read_leaves)(forest, sets)::Vector{Int} :
+           Int[]
+    guarded && Base.inferencebarrier(keep_glued!)(flagged, forest, read)
     newleaves = completed_leaves(forest, flagged)
-    guarded && Base.inferencebarrier(check_glue_kept)(forest, newleaves)
+    guarded && Base.inferencebarrier(check_glue_kept)(forest, newleaves, read)
     newleaves == oldleaves && return false
 
     # The partitions before and after: this rank's old leaves, which its
@@ -1223,7 +1256,9 @@ The criterion is given exactly one of two ways:
 
 The schedule is rebuilt from `fs` itself, so it carries that field set's
 ghost width, element type and backend — a device-resident field set
-adapts without anything further.
+adapts without anything further. A set interpolated across a glue (M20)
+needs the application's atlas for its schedules: pass `atlas`, as to
+[`GhostSchedule`](@ref); the first and the third form take it.
 
 Over a forest with a rotating seam (M12) a set whose layout is not
 symmetric in the seam's plane, and that has ghosts there, adapts
@@ -1265,17 +1300,17 @@ without blocks, as all but one do from a single leaf.
 function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
                                 initial, flag=nothing, flags=nothing,
                                 buffer::Integer=0, maxpasses::Integer=10,
-                                boundary=nothing) where {T,D}
+                                boundary=nothing, atlas=nothing) where {T,D}
     criterion = adapt_criterion(flag, flags)
     forest = fs.forest
-    schedule = GhostSchedule(fs, operators)
+    schedule = GhostSchedule(fs, operators; atlas=atlas)
     fill_by_coordinates!(initial, fs)
 
     for pass in 1:maxpasses
         fill_ghosts!(fs, schedule; boundary=boundary)
         changed = regrid!(forest, fs => schedule; flags=criterion(fs), buffer=buffer,
                           boundary=boundary, transfer=false)
-        schedule = GhostSchedule(fs, operators)
+        schedule = GhostSchedule(fs, operators; atlas=atlas)
         fill_by_coordinates!(initial, fs)
         changed || return (schedule, pass, true)
     end
@@ -1317,12 +1352,13 @@ end
 # the forest regridded once per pass for all of them.
 function adapt_to_initial_data!(pairs::Tuple{Vararg{Pair}}; initial::Tuple,
                                 flag=nothing, flags=nothing, buffer::Integer=0,
-                                maxpasses::Integer=10, boundary=nothing)
+                                maxpasses::Integer=10, boundary=nothing, atlas=nothing)
     criterion = adapt_criterion(flag, flags)
     entries = adapt_entries(pairs, initial)
     sets = map(e -> e.fs, entries)
     forest = first(sets).forest
-    build() = map(e -> e.ops === nothing ? nothing : GhostSchedule(e.fs, e.ops), entries)
+    build() = map(e -> e.ops === nothing ? nothing :
+                       GhostSchedule(e.fs, e.ops; atlas=atlas), entries)
     refill() = foreach(e -> e.init === nothing || fill_by_coordinates!(e.init, e.fs),
                        entries)
     schedules = build()

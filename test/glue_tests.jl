@@ -340,3 +340,116 @@ on_glue(forest, k) = !isempty(TreeAMR.glued_faces(forest.conn, k))
     @test_throws "2:1 balance carries a refinement nearby" regrid!(forest, fs => sched;
                                                                    flags=flags)
 end
+
+@testset "Reading a state through its appendix allocates nothing" begin
+    # Guards the inlining of AppendixArray's accessors: a call per point
+    # allocated its index tuples, 150 B and 70 ns an entry, in every fold
+    # and norm over a state vector and every right-hand side written
+    # through `appendix = true`.
+    fs = kinked_set(kinked_forest(2))
+    u = collect(1.0:statelength(fs))
+    A = statearray(u, fs; appendix=true)
+    function total(A, N, nb)
+        s = 0.0
+        for b in 1:nb, j in 1:N, i in 1:N
+            s += A[i, j, 1, b]
+            A[i, j, 1, b] = s
+        end
+        return s
+    end
+    total(A, fs.forest.N, nblocks(fs))
+    @test (@allocated total(A, fs.forest.N, nblocks(fs))) == 0
+    @test eltype(A) === Float64
+end
+
+@testset "fill_by_coordinates! fills the appendix in every form" begin
+    # Guards the initial-data path of a set with an appendix: the owned
+    # high face planes are state too, and were left at zero. Each form of
+    # the callback fills every owned point with the same numbers.
+    forest = kinked_forest(2)
+    N = forest.N
+    f(x, v) = v + x[1] - 3x[2]
+    forms = (f, AllVariables(x -> (f(x, 1), f(x, 2))), WithPatch((x, p, v) -> f(x, v)),
+             WithPatch(AllVariables((x, p) -> (f(x, 1), f(x, 2)))))
+    for form in forms
+        fs = FieldSet(forest, 2; G=3, centering=vertexcentered(2), glue=:interpolate)
+        fill_by_coordinates!(form, fs)
+        u = statevector(fs)
+        gather!(u, fs)
+        A = statearray(u, fs; appendix=true)
+        L = TreeAMR.appendix_layout(fs)
+        @test all(1:nblocks(fs)) do b
+            k = blockkey(fs, b)
+            o, h = block_origin(forest, k), spacing(forest, k)
+            all(CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))) do I
+                x = (o[1] + (I[1] - 1) * h, o[2] + (I[2] - 1) * h)
+                A[I[1], I[2], 1, b] == f(x, 1) && A[I[1], I[2], 2, b] == f(x, 2)
+            end
+        end
+    end
+    # And the adaptation cycle takes the atlas for its schedules.
+    fs = kinked_set(forest)
+    sched, passes, converged = adapt_to_initial_data!(fs, KINKED_OPS; atlas=KINKED,
+                                                      initial=(x, v) -> x[1],
+                                                      flag=(b, k) -> Keep)
+    @test converged && passes == 1 && length(sched.glueplan) > 0
+end
+
+@testset "A fold counts mixed centerings once across a glue that turns the axes" begin
+    # Guards the search for a point's copies: a glue that sends dimension
+    # 1 of one patch onto dimension 2 of the other carries a vertex-like
+    # face onto a cell-like one, where the set has no point, and the fold
+    # counted a copy there that does not exist.
+    n, N = 2, 8
+    forest = Forest([(roots=(n, n),), (roots=(n, n),)]; N=N,
+                    glue=patch_glue_both((1, 1, 2), (2, 2, 1), (2, -1)))
+    for (cen, shared) in (((:vertex, :vertex), n * N), ((:vertex, :cell), 0),
+                          ((:cell, :vertex), 0))
+        fs = FieldSet(forest, 1; G=3, centering=cen, glue=:interpolate)
+        @test mesh_fold((acc, p) -> acc + 1, +, 0, fs, zeros(statelength(fs))) ==
+              statelength(fs) - shared
+    end
+end
+
+@testset "A glue stencil reads only what phase 1 and the hook have filled" begin
+    # Guards the overhang rule. A ghost that lands deep in the patch across
+    # reads its source block's high plane, which a coarser neighbor fills
+    # by prolongation only in phase 2, after the glue's stage: the build
+    # refuses it rather than leave the ghost a fill behind. A finer
+    # neighbor's ghosts are restricted in phase 1, and are read.
+    ops = Operators(prolongation=4, restriction=4, glue=6)
+    for (a, refused) in ((0.22, true), (0.8, false))
+        forest = stretched_forest(2)
+        for k in copy(forest.leaves)
+            p, pos = patch(forest, k), TreeAMR.root_position(forest, k.root)[1]
+            ((p == 1 && pos == 1) || (p == 2 && pos == 0)) && refine!(forest, k)
+        end
+        balance!(forest)
+        fs = FieldSet(forest, 1; G=3, centering=vertexcentered(2), glue=:interpolate)
+        if refused
+            @test_throws "no block of the same level or finer" GhostSchedule(
+                fs, ops; atlas=StretchedPair(a))
+        else
+            atlas = StretchedPair(a)
+            f(ξ, p) = (x = TreeAMR.chart_map(atlas, ξ, p); 1 + x[1] - 2x[1]^2 * x[2]^3)
+            sched = GhostSchedule(fs, ops; atlas=atlas)
+            fill_from_owned!(fs, sched, f;
+                             boundary=CellBoundary(WithPatch((x, p, v, δ) -> f(x, p))))
+            @test !any(((b, idx, ξ, p),) -> isnan(fs.work[idx..., 1, b]), glue_ghosts(fs))
+        end
+    end
+    # regrid! keeps what the stencils read, so the schedule builds again:
+    # a finer neighbor of a glued source is accepted, a coarser one never
+    # arises.
+    forest = stretched_forest(4)
+    atlas = StretchedPair(0.5)
+    fs = FieldSet(forest, 1; G=3, centering=vertexcentered(2), glue=:interpolate)
+    sched = GhostSchedule(fs, ops; atlas=atlas)
+    read = sched.glueplan.reads
+    @test any(i -> isempty(TreeAMR.glued_faces(forest.conn, forest.leaves[i])), read)
+    before = forest.leaves[read]
+    @test regrid!(forest, fs => sched; flags=fill(Refine, nblocks(fs)))
+    @test all(k -> k in forest.leaves, before)
+    @test any(k -> level(k) == 1, forest.leaves)
+    @test length(GhostSchedule(fs, ops; atlas=atlas).glueplan) > 0
+end
