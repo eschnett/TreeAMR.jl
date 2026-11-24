@@ -8,8 +8,10 @@ no physics.
 and M16 are done. M17, multi-patch forests on uniform meshes, is
 implemented and accepted by TreeWaveOLDG, and awaits its release. M19,
 interpolation on element sets and forests of patches, has TreeAMR's
-steps 1–7 implemented; TreeWaveOLDG's acceptance remains. Next is
-visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+steps 1–7 implemented; TreeWaveOLDG's acceptance remains. M20, finite
+differences on patches, has TreeAMR's step 4 implemented — ghosts
+interpolated across a glue and closed ownership's appendix; TreeWave on
+the patch systems remains. Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -3544,7 +3546,7 @@ hash by value: one holding an array or mutable state hashes by identity,
 differently in every process, and needs a `Base.hash` method over its
 values (TreeMultiPatch's layouts are `isbits`).
 
-*Implemented so far:* the keywords, the refusals at schedule build,
+*Implemented* (M20 step 4): the keywords, the refusals at schedule build,
 the location with `chart_aligned`, the stage, closed ownership with its
 appendix — `statelength`, `scatter!`, `gather!`, `statearray(u, fs;
 appendix = true)` (an `AppendixArray`), `map_blocks!`'s keyword and the

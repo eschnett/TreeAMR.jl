@@ -99,7 +99,11 @@ an annulus or a cubed sphere on uniform meshes (see
 TreeWaveOLDG's acceptance, interpolates element sets through the
 element's own polynomial and forests of patches at logical points or,
 through the application's atlas, physical ones ([`locate`](@ref),
-[`ElementPolynomial`](@ref)). Next is visualization export (M9b).
+[`ElementPolynomial`](@ref)). M20, implemented in TreeAMR and awaiting
+TreeWave's use, fills a finite-difference set's ghosts across a glue by
+interpolation through the atlas, for the kinked maps of a cubed sphere
+(`glue = :interpolate` on a [`FieldSet`](@ref)). Next is visualization
+export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),

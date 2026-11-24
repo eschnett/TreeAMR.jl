@@ -416,41 +416,13 @@ Each step has the test that says it is done:
 3b. **A prototype of the coupling.** Done 2026-11-23, on two tori and the
    cubed sphere's surface; closed ownership chosen. The record is in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
-4. **TreeAMR: closed ownership and interpolated ghosts across a glue**,
-   as designed under "Finite differences across a glue" in
-   [CODE.md](CODE.md#finite-differences-across-a-glue), once Erik has
-   reviewed it. *Done when*:
-   - on the annulus, interpolated ghosts are the copied ones bit for
-     bit, every ghost point being a node across;
-   - on a two-patch test in 2D whose map kinks at the glue, a smooth
-     solution's derivatives converge at the operator's order with
-     interpolated ghosts, and the rate with copied ones, which is
-     expected to drop at the glue, is recorded in
-     [HISTORY.md](HISTORY.md);
-   - on the seven-patch ball, every ghost of a polynomial of the
-     interpolation's degree is exact to rounding at faces, edges and
-     patch corners, the face planes included;
-   - on the seven-patch ball, the state holds each glued face point
-     once for each patch holding it, `scatter!` and `gather!` round-trip
-     it, a fold counts each physical point once (the ball's distinct
-     nodes) and sums a function of the position over exactly the
-     distinct points, a checkpoint round-trips through TreeIOHDF5, and the fill of data symmetric
-     under the ball's symmetries is symmetric to rounding, as the
-     prototype's is under closed ownership;
-   - on the thirteen-patch ball, every ghost between two outer shells
-     has width one along the radius and every ghost between an inner and
-     an outer shell width one along both angles, and an atlas declaring
-     an alignment its maps do not have is refused at schedule build;
-   - on a brick, `statelength`, `statearray` and every existing test are
-     unchanged; a coarse-fine boundary at a glue is refused by
-     `GhostSchedule` and by `regrid!`;
-   - `fill_ghosts!` makes no collective call, and at 3 ranks each
-     interpolated ghost arrives in the schedule's point-to-point
-     messages, computed by the rank that owns its sources;
-   - all of it serially, at 1 and 3 ranks (a line of
-     `test/mpi_workload.jl`) and on a device, with the cost to
-     `--trace-compile-timing` of `main`'s `test/mpi_workload.jl` against
-     `main` measured and recorded.
+4. **TreeAMR: closed ownership and interpolated ghosts across a glue.**
+   Done 2026-11-24, serially, over MPI and on a device, and TreeIOHDF5
+   saves the appendix (its branch `eschnett-claude/m20-appendix`); two
+   criteria restated by Erik. The design is in
+   [CODE.md](CODE.md#finite-differences-across-a-glue); the record and
+   the criteria as met in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
 5. **TreeWave on the seven-patch ball**: the plane wave of TreeWaveOLDG's
    `sevenpatch.jl`, with Dirichlet data on the outer sphere through the
    boundary hook. *Done when* the L2 error and the L∞ error near the

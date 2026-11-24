@@ -5225,6 +5225,35 @@ M12 was decided with Erik, after M7 and before M9b.
     companion interface gained `hasappendix`, `corelength` and
     `appendix_entries`, the last new, and the field `glue` of a
     `FieldSet`.
+  - *Step 4, done (2026-11-24).* PLAN.md's criteria, as restated, and
+    where each is met:
+    - on the annulus, interpolated ghosts are the copied ones bit for
+      bit (`glue_tests.jl`);
+    - on the kinked pair, a smooth solution's fourth-order first and
+      second derivatives converge at 4 with interpolated ghosts and do
+      not with copied ones, the numbers above (`glue_tests.jl`);
+    - on the seven-patch ball, a patch's polynomial of the
+      interpolation's degree comes back to `2e-14` at every ghost,
+      faces, cube edges and patch corners included (`glue_ball_tests.jl`);
+    - on the seven-patch ball, the state holds each glued face point
+      once for each patch holding it, round-trips through `scatter!` and
+      `gather!`, a fold counts each physical point once and sums a
+      function of the position over exactly the distinct points, the
+      fill of symmetric data is symmetric to `1.6e-14`
+      (`glue_ball_tests.jl`), and a checkpoint round-trips byte for byte
+      (TreeIOHDF5's `checkpoint_tests.jl`, on its branch);
+    - on the thirteen-patch ball, the stencils have width one along the
+      shared coordinates, and a wrong declaration is refused
+      (`glue_ball_tests.jl`);
+    - on a brick nothing changed (the suite), and a refinement boundary
+      at a glue is refused by `GhostSchedule` and by `regrid!`
+      (`glue_tests.jl`);
+    - `fill_ghosts!` makes no collective call and at 3 ranks the ghosts
+      arrive in point-to-point messages from the sources' owners
+      (`glue_exchange_tests.jl`, `mpi_workload.jl`'s `G2`, 1299 ghosts);
+    - serially, at 1 and 3 ranks and on a device (Metal, `gpu_tests.jl`
+      and `mpi_device_workload.jl`'s `G2`), with the compile-time cost
+      measured and recorded, about 5 %.
 
 ## Downstream checks
 
