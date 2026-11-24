@@ -4984,7 +4984,15 @@ M12 was decided with Erik, after M7 and before M9b.
     ownership pattern predicts. The mirror asymmetry at `t = 50` is
     3e−5 for half-open with owned corners and grows with time, 4e−7
     with averaged right-hand sides, 1e−7 for `o = 0`, and 5e−6 for
-    `o = 2` with 4-point ghosts.
+    `o = 2` with 4-point ghosts. *(Corrected the same day: these compare
+    a point with the owner of its image, and under closed ownership a
+    face point's image may be the other copy, which differs by the
+    scheme's error. Compared strictly inside the faces
+    (`bench/coupling/sphere_symmetry.jl`, `t = 10`), `o = 0` is
+    symmetric to 1.4e−15, while half-open ownership with owned corners
+    stays at 6.0e−6, and 1.1e−7 with averaged right-hand sides. So
+    closed ownership is mirror-symmetric to rounding, and no stencil
+    choice at a node was to blame, as the design had guessed.)*
 
     *What it says.* Half-open ownership as TreeAMR's layout has it is
     ruled out for vertex-centered finite differences on a cubed sphere:
@@ -5018,6 +5026,20 @@ M12 was decided with Erik, after M7 and before M9b.
     collective on every call. And refinement boundaries stay away from
     the glues for now, so that neither the ghosts nor the appendix meet
     a level difference.
+  - *Aligned coordinates (2026-11-23).* Erik required that the
+    interpolation between the thirteen-patch ball's outer shells, whose
+    radial coordinate is the radius, be guaranteed two-dimensional, and
+    asked whether a check within rounding, a check after the patch
+    system is set up, or an explicit declaration should do it. He chose
+    the declaration, verified: the atlas names the aligned
+    coordinates per pair of patches (`chart_aligned`), the schedule
+    build checks every ghost against it to a thousandth of a spacing,
+    and the aligned coordinate is then taken exactly, so the stencil
+    there has width one. Rounding to a nearby node alone would depend on
+    the accuracy of the atlas's inverse map, and would also round ghosts
+    that are near a node only by coincidence. The same declaration makes
+    the interpolation across the middle sphere one-dimensional, since
+    the inner and outer shells over one cube face share both angles.
 
 ## Downstream checks
 

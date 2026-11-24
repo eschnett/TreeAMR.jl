@@ -36,6 +36,7 @@ tried, measurements that later ones replaced, and the milestone records
   - [Regridding](#regridding)
   - [Point interpolation](#point-interpolation)
   - [Interpolation on element sets and patches](#interpolation-on-element-sets-and-patches)
+  - [Finite differences across a glue](#finite-differences-across-a-glue)
   - [Folds over points](#folds-over-points)
   - [Checkpoint and restart](#checkpoint-and-restart)
 - [Application interface (sketch)](#application-interface-sketch)
@@ -3504,6 +3505,199 @@ Not part of it, until an application asks:
   nodes are shared, and distributed forests, where the owners of a
   point's sharers depend on `P`, which `locate` does not know.
 
+### Finite differences across a glue
+
+*(Proposed, M20 step 4; not implemented. The decisions behind it and
+the prototype's measurements are under M20 in
+[HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches);
+the plan is in [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).)*
+
+A finite-difference scheme cannot take its ghosts across a glue by the
+copy of "Glued faces" under [Ghost filling](#ghost-filling): on a cubed
+sphere the maps join with a kink, `∂x/∂ξ` jumping at every glue, and a
+stencil that reads copied points differentiates a function with a kink
+in its own coordinate. The prototype measured an L2 error of 0.12 at
+every resolution. A field set built with **`glue = :interpolate`** is
+instead filled across a glue by interpolation in the patch across, at
+the physical point the target's own map names, and it owns every point
+on a glued face on each patch holding it. Element sets keep the copy,
+which their face nodes need; a cell or vertex set keeps it unless it
+asks for interpolation, and on a brick the keyword changes nothing.
+
+**What the caller passes.** `FieldSet(…; glue = :interpolate)`, a
+property of the set as `walls` is, because it changes the state's
+layout (below), and refused for an element set, saying why.
+`Operators(…; glue = k)`, the order of the interpolation across a glue,
+in the sense of `prolongation`'s, with no default: what a derivative
+stencil of order `p` needs from its ghosts is the scheme's to say (a
+second derivative of order 4 needs 6). `GhostSchedule(fs, ops; atlas)`,
+the application's atlas ("Interpolation on element sets and patches"),
+since only the map knows where a ghost lies; `regrid!`'s callers pass it
+again when they rebuild the schedule. An interpolated set refuses a
+missing order or atlas, and the collective checks compare the order and
+`hash(atlas)` across ranks with the rest of the layout.
+
+**Where a ghost lies, and what fills it.** A ghost of block `b` of
+patch `p` beyond a glued face of `p` — across a face, an edge or a
+patch corner, which no longer needs refusing — sits at the logical
+position `nodeposition` gives it, past `p`'s box. `chart_map(atlas, ξ,
+p)` takes it to a physical `x`, so **the atlas's maps must be defined
+past each patch's box** by the widest exchange region, `G_d + c_d`
+spacings, which M19's contract did not ask; a cubed sphere's maps
+continue naturally. `chart_locate(atlas, x)` names the patch `q ≠ p` and
+the logical `ξ′` there, and the search of M19's location step
+(`fold_point`, `locate_leaf`) the block `s` of `q` holding `ξ′`. A
+ghost that `chart_locate` places outside every patch lies beyond an outer
+face, and is the boundary hook's, as beyond an outer face of a brick.
+
+The value is a tensor product of one-dimensional Lagrange stencils of
+`k` points at `ξ′`, centered where they fit and clamped, per dimension
+of `q`, into `q`'s closed box at that level: its points `0 … n`, the
+glued high face plane included (it is owned, below) and an outer high
+face plane too, which the hook has filled by then. So near `q`'s faces
+the stencil is lop-sided, which cost no measurable accuracy in the
+prototype. It reads `s`'s stored array: its owned points, its appendix,
+and its ghosts inside `q`, which phase 1's same-level copies have
+filled — never a ghost of `s` across a glue, which is interpolated from
+`p` in turn. Two conditions keep that true, both checked at schedule
+build: `k ≤ 2(G_d + c_d)` along every dimension, so that a centered
+stencil about a point of `s` stays inside `s`'s stored array, and **no refinement
+boundary at a glue** (below), so that every block within reach of a
+glue is at one level and its ghosts inside its patch are copies.
+
+**Aligned coordinates.** Some patch systems share a coordinate across a
+glue exactly, and then the interpolation must not reach along it. On
+the thirteen-patch ball the outer shells are `x = r(ξ_k) c/|c|`: between
+two of them a ghost has the radius of a node of the shell across, so
+the interpolation is two-dimensional, in the angles only; across the
+middle sphere an inner and an outer shell over one cube face share both
+angles, `c/|c|`, and it is one-dimensional, in the radius. The atlas
+declares this, since only the maps know it: an optional method
+`chart_aligned(atlas, p, q) -> NTuple{D,Int8}` gives, per dimension `e`
+of `q`, the dimension `d` of `p` whose logical coordinate `ξ′_e` equals
+(`+d`), or equals reversed within the patches' common extent (`−d`), or
+`0` for none; without the method nothing is aligned. At schedule build
+TreeAMR checks every interpolated ghost against it: `chart_locate`'s
+`ξ′_e` must lie within a thousandth of a spacing of the declared value,
+far above any rounding of the map and its inverse and far below what a
+wrong declaration gives across a kink, or the build is refused, naming
+the patches, the ghost and both values. Then it takes `ξ′_e` from the
+declaration, by index arithmetic, exactly, so that it is a node, and
+the stencil along `e` has width one: no read along that dimension, by
+construction rather than by a weight that happens to be zero. A check
+that rounded `ξ′_e` to a nearby node would not guarantee this: it would
+depend on how well the atlas inverts its map, and would also round
+ghosts that are near a node by coincidence.
+
+**Closed ownership and the appendix.** Under half-open ownership a
+patch owns its low face planes only. On the seven-patch ball that leaves
+two of the eight corner lines, where three shells meet, to no shell
+whatever the orientation, and the prototype found no stable way to
+extrapolate them. So an interpolated set owns every glued face point on
+each patch holding it: a block whose high face, along a vertex-like
+dimension, lies on a glued face of its patch also owns that face plane,
+the closed range `G+1 … G+N+1` along that dimension. The copies of a
+point on two patches are evolved apart, each by its own patch's
+stencil, and differ by the scheme's error, as on overlapping grids; the
+prototype measured them stable at the dissipation the corners need
+anyway. (Closed ownership stays rejected inside a patch, for the reason
+under [Centerings](#centerings): copies at a coarse-fine face would see
+different ghosts, and nothing keeps one there.)
+
+The core stays: `N^D` per block per variable, in block order, as every
+function of [Data layout](#data-layout) has it. The planes closed
+ownership adds follow all the cores as the **appendix**: per block with
+any, per variable, the points of its high glued face planes, each point
+once — a point on two such planes, at an edge or a corner, in the plane
+of the lowest dimension — every plane in the order of its stored
+indices. `statelength` counts both; `scatter!` and `gather!` move both;
+`statearray(u, fs)` stays the cores' array, so code written for bricks
+reads the cores as before; and **`stateview(u, fs)`** is the whole state
+as an `(i1, …, iD, var, b)` array whose `i_d` runs to `N + 1` where the
+block owns the plane, reading and writing the core or the appendix as
+the index says, and discarding a write to a point the block does not
+own. On a set with no appendix `stateview` is `statearray`. A block's
+appendix offset is a host table built with the schedule's layout, and
+the planes are already stored: a vertex-like set stores its high plane
+at `G+N+1` today, as a ghost.
+
+`map_blocks!` on a set with an appendix requires **`appendix = true`
+or `false`**, with no default, because a right-hand side that forgets
+the appendix leaves its planes unevolved without a word. With `true` it
+launches over the closed range, as `closed = true` does, and the kernel
+writes through `stateview`, which discards the planes a block does not
+own. That costs a plane per dimension on every block, about `D/N` of the
+work, 9 % at `N = 32` in 3D; a launch over the appendix alone is the
+optimization if it shows.
+
+The fill skips the appendix: along a glued dimension a block's own
+range is its closed range, and every region that reaches into the
+other dimensions follows it, so that a same-level copy within the
+patch carries the neighbor's appendix plane into the target's ghost,
+where an interpolation stencil may read it. This is the shape of
+symmetric walls' trim, with the opposite sign, and goes the same way:
+a per-dimension flag in `GroupKey`, part of its order, so that both
+ends of a message agree.
+
+A fold or a norm counts every point once: a point on a glued face at
+the copy of the lowest-numbered patch holding it, which the fold reads
+from the core or the appendix. Under a low face glued to a low face
+both cores hold the point; under a high face glued to a high face
+neither does, and both appendices do.
+
+**Stages.** An interpolated transfer reads what phase 1 and the
+boundary hook write and writes ghosts across a glue only, which nothing
+in phase 1 reads. So it runs as a stage of its own after the hook and
+before phase 2, with a message round of its own. Phase 2's
+prolongations never read it: a coarse-fine face never touches a glue,
+and a prolongation reads its coarse source's ghosts within one block of
+that face.
+
+**Between ranks the sender computes.** At schedule build, each rank
+locates its own blocks' interpolated ghosts on the host — the atlas,
+then the search against the replicated leaves, no communication — and
+sends each ghost's target (leaf, stored index), source leaf and `ξ′` to
+the source's owner in the build's one `alltoallv`, sorted by target
+rank, leaf and stored index. The owner builds the stencils in that
+order. Each fill, the owner evaluates them into its send buffer and the
+target unpacks them into the ghosts with the plain copy, in the order
+it sent them. Nothing in that order comes from a `Dict`, and
+`fill_ghosts!` makes no collective call. A ghost whose source is on its
+own rank takes the same kernel, writing in place.
+
+**The kernel** runs one work item per ghost point and variable and sums
+the tensor product of `D` weight vectors, each of width `k`, or one
+along an aligned dimension — `k²` taps between the thirteen-patch
+ball's outer shells and `k` across its middle sphere, not `k³` — stored
+per point with their widths, the source block and the base stored
+index; on the CPU by
+the target's owner, on a device flat. It is element-like in one
+respect: a set without interpolated ghosts compiles none of it. The
+point lists have one concrete type whether empty or not, and the launch
+sits behind `Base.inferencebarrier`, so the brick's and the copy's
+launch paths keep their types (compare `--trace-compile-timing` of
+`test/mpi_workload.jl` against `main`).
+
+**No refinement boundary at a glue.** A coarse-fine face, edge or
+corner touching a glued face is refused by `GhostSchedule` for an
+interpolated set, and `regrid!` keeps every block touching a glued face
+at its level: their own flags are dropped, and a change that 2:1
+balance would carry into one of them is refused, saying which block and
+why. So every block within reach of a glue, on either side, is at one
+level, the interpolated ghosts never interpolate across levels, and
+the appendix is never prolongated or restricted: when `regrid!`
+compacts and repartitions, a block's appendix moves with it. Lifting
+this — interpolating from a leaf at another level, which a located
+point finds anyway, and the appendix in the regrid transfers — comes
+after M20.
+
+**What else learns of the appendix.** The flat device launches of
+`scatter!`, `gather!` and `map_blocks!`; the MPI message layouts of a
+repartition; `block_fold` and the norms (above); and TreeIOHDF5, whose
+checkpoint must save and restore the appendix, a change to the
+companion interface ([Companion interface](#companion-interface)) and a
+format feature of its own.
+
 ### Folds over points
 
 `block_mapreduce` hands its `f` one value at a time. It never sees
@@ -6873,13 +7067,10 @@ Remaining, none blocking before their milestone:
   127 faces are a limit of the `Int8` that carries a face's index, not
   of the design. **(proposed)** The patch layouts, their maps and their
   atlases move from TreeWaveOLDG to a package of their own,
-  TreeMultiPatch; and a finite-difference set's ghosts across a glue
-  are interpolated from the patch across, located through the atlas at
-  schedule build, rather than copied, because a cubed sphere's maps join
-  with a kink that a copied ghost differentiates across. An interpolated
-  set needs neither the patch corners nor the reversed vertex-like axis
-  above. A vertex-like set evolves each glued face point on every
-  patch holding it (closed ownership), so that a block on a patch's
-  high glued face also owns its high face plane, which follows the
-  `N^D` cores in the state vector as an appendix. All of it is in
-  [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).
+  TreeMultiPatch ([PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches));
+  and a finite-difference set is filled across a glue by
+  interpolation, owns every glued face point on each patch holding it,
+  and carries the planes that adds as an appendix to its state
+  ([Finite differences across a glue](#finite-differences-across-a-glue)).
+  An interpolated set needs neither the patch corners nor the reversed
+  vertex-like axis above.

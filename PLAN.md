@@ -297,24 +297,28 @@ versions as a companion does: needing an internal would mean the thing
 belongs in TreeAMR, exported. TreeAMR's tests keep their own glue lists
 and atlases in `test/helpers/` and do not depend on it.
 
-**Interpolated ghosts, as far as decided.** A ghost of a block at a glued
+**Interpolated ghosts.** The TreeAMR side is designed under
+"Finite differences across a glue" in
+[CODE.md](CODE.md#finite-differences-across-a-glue) (proposed); what
+follows is the plan's summary of it. A ghost of a block at a glued
 face, edge or corner sits at the point the target patch's map, extended
 past its box, names. The schedule locates that point once, at build
-time, through the atlas, in whichever patch holds it, with M19's
-`locate`; each fill then evaluates a Lagrange stencil there. Between
-ranks the sender computes (decided): the rank that owns the source
-points applies the stencil and sends the value in the schedule's own
-point-to-point messages, laid out once when the schedule is built, as a
-copy's are. M19's routing, an `allgather` and an `alltoallv` on every
-`interpolate`, is for occasional batches and stays out of the fill. So
-no tree query and no collective enters the per-evaluation path, a patch corner has a source like any other ghost,
+time, through the atlas and the search of M19's location step, in
+whichever patch holds it; each fill then evaluates a Lagrange stencil
+there. Between ranks the sender computes (decided): the rank that owns
+the source points applies the stencil and sends the value in the
+schedule's own point-to-point messages, laid out once when the schedule
+is built, as a copy's are. M19's routing, an `allgather` and an
+`alltoallv` on every `interpolate`, is for occasional batches and stays
+out of the fill. So no tree query and no collective enters the
+per-evaluation path, a patch corner has a source like any other ghost,
 and the refusals of a patch corner and of a reversed vertex-like axis
 across a glue do not apply to an interpolated set. The stencil reads
-degrees of freedom only, off-centered near the faces of the patch
-across: that patch's points, its face planes included, but not its
-ghosts beyond, which are interpolated from this one. A transfer that
-reads degrees of freedom and writes ghosts belongs in phase 1, as an
-element set's do. Copying stays what an element set does across a glue, since its
+the patch across's points, its face planes included, and its ghosts
+inside that patch, but not its ghosts across a glue, which are
+interpolated from this one; so the interpolation runs as a stage of its
+own, after phase 1 and the boundary hook and before phase 2. Copying
+stays what an element set does across a glue, since its
 face nodes are its coupling. Decided, and still to settle in step 4:
 
 - **Global components** (decided). TreeAMR interpolates each variable
@@ -359,12 +363,13 @@ face nodes are its coupling. Decided, and still to settle in step 4:
   stored already, as every vertex-like set stores its non-owned high
   plane; what changes is that they are evolved: `statelength`,
   `scatter!` and `gather!` carry the appendix; `statearray` stays the
-  cores' array, and the appendix has a view of its own; `map_blocks!`
-  evaluates the appendix's points too, on request, so that the
-  application's right-hand side covers them; the fill skips them; the
-  flat device launches, the MPI message layouts and TreeIOHDF5's format
-  learn of them. A fold or norm counts a point once, weighting each copy
-  by the inverse of its number of copies. A glue's low face plane,
+  cores' array, and `stateview` is the whole state, core and appendix;
+  `map_blocks!` on a set with an appendix requires `appendix = true` or
+  `false`, so that the application's right-hand side covers the planes
+  by choice; the fill skips them; the flat device launches, the MPI
+  message layouts and TreeIOHDF5's format learn of them. A fold or norm
+  counts a point once, at the copy of the lowest-numbered patch holding
+  it. A glue's low face plane,
   owned under half-open ownership already, is unchanged. Closed
   ownership was rejected for bricks because the copies of a point at a
   coarse-fine face drift apart ([HISTORY.md](HISTORY.md#centerings));
@@ -384,11 +389,15 @@ Each step has the test that says it is done:
 1. **TreeMultiPatch**, with `PolarAnnulus`, `SevenPatchBall` and
    `ThirteenPatchBall` moved from TreeWaveOLDG, the balls' shells
    reoriented with the radial axis outward, so that the outer sphere is
-   every shell's high face and the hook's. *Done when* the
+   every shell's high face and the hook's, and the thirteen-patch ball's
+   atlas declaring its aligned coordinates (`chart_aligned`: the radius
+   between outer shells, both angles between an inner and an outer shell
+   over one face). *Done when* the
    Jacobian, area vectors and second derivatives agree with
    ForwardDiff's, past the box too; `Σ_d ∂_d S[d] = 0` holds to rounding
    on every patch; `chart_locate` inverts `chart_map` at random points,
-   glued faces and patch corners included; each layout's `√g` integrates
+   glued faces and patch corners included; every declared alignment
+   holds to rounding at random points past each box; each layout's `√g` integrates
    to its physical volume; every layout's forest builds and passes its
    check; and the maps run in a kernel on Metal.
 2. **TreeWaveOLDG on TreeMultiPatch**, its geometry code removed and the
@@ -407,7 +416,9 @@ Each step has the test that says it is done:
    cubed sphere's surface; closed ownership chosen. The record is in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
 4. **TreeAMR: closed ownership and interpolated ghosts across a glue**,
-   designed in [CODE.md](CODE.md) first. *Done when*:
+   as designed under "Finite differences across a glue" in
+   [CODE.md](CODE.md#finite-differences-across-a-glue), once Erik has
+   reviewed it. *Done when*:
    - on the annulus, interpolated ghosts are the copied ones bit for
      bit, every ghost point being a node across;
    - on a two-patch test in 2D whose map kinks at the glue, a smooth
@@ -422,9 +433,12 @@ Each step has the test that says it is done:
      once for each patch holding it, `scatter!` and `gather!` round-trip
      it, a fold of a constant gives the domain's volume, a checkpoint
      round-trips through TreeIOHDF5, and the fill of data symmetric
-     under the ball's symmetries is symmetric to rounding (the
-     prototype measured 1e−7 under a mirror reflection, which a stencil
-     choice that is symmetric at nodes may bring down);
+     under the ball's symmetries is symmetric to rounding, as the
+     prototype's is under closed ownership;
+   - on the thirteen-patch ball, every ghost between two outer shells
+     has width one along the radius and every ghost between an inner and
+     an outer shell width one along both angles, and an atlas declaring
+     an alignment its maps do not have is refused at schedule build;
    - on a brick, `statelength`, `statearray` and every existing test are
      unchanged; a coarse-fine boundary at a glue is refused by
      `GhostSchedule` and by `regrid!`;
