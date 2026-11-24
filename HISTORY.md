@@ -62,6 +62,7 @@ of them. Each milestone's steps are listed in its record under
   - [M16 — Element centering](#m16--element-centering)
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
+  - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -4772,6 +4773,251 @@ M12 was decided with Erik, after M7 and before M9b.
     within the spread between runs, and the whole workload 79.1 s against
     72.5 s, the difference being the new `L2` case (2.7 s of it the new
     locate, evaluation, chain-rule and lattice kernels).
+
+### M20 — TreeMultiPatch, and finite differences on patches
+
+- **M20 — TreeMultiPatch, and finite differences on patches.** *(Planned
+  with Erik on 2026-11-22 and 2026-11-23; not designed.)* The plan is in
+  [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).
+
+  - *Where the patch systems live (2026-11-22).* Erik asked whether the
+    multi-patch systems, then in TreeWaveOLDG, should become part of
+    TreeAMR or a package of their own, with TreeWave, TreeGeneralizedHarmonic
+    and TreeGRRMHD to use them. A package of their own, TreeMultiPatch,
+    was proposed: TreeAMR's coordinates stay logical, the maps need
+    ForwardDiff, StaticArrays and MultiFloats, and a new layout should not
+    cost a TreeAMR release and the TreeIOHDF5 release that follows it.
+  - *The coupling across a glue (2026-11-23).* Copying ghosts, which
+    TreeAMR does, is consistent only where the maps join smoothly. On a
+    cubed sphere `∂x/∂ξ` jumps at every glue, so a finite-difference
+    stencil that reads across one differentiates a function with a kink
+    in its own coordinate (argued, not yet measured; M20 step 4 measures
+    it). Erik listed the ways to couple patches: fluxes, as TreeHydro and
+    TreeWaveOLDG do; characteristics, awkward for the second-order
+    generalized harmonic equations; and interpolation, whose form
+    depends on whether the state holds global or patch-local tensor
+    components. He chose interpolation as the best option for
+    TreeGeneralizedHarmonic and TreeWave, its simplified version, with
+    switching TreeGeneralizedHarmonic to OLDG as the alternative. Two
+    candidates weighed before that were set aside with it: summation by
+    parts with penalties, which would have needed an exchange of each
+    side's own copy of the shared face plane, and copied ghosts with the
+    patch-corner and reversed-axis refusals lifted, which leaves the
+    kink.
+  - *Global components (2026-11-23).* The states hold global tensor
+    components, Cartesian, as TreeGeneralizedHarmonic's already do, so
+    TreeAMR interpolates every variable as a scalar. Erik chose this
+    over patch-local components, which would have needed a per-set
+    callback transforming each interpolated tensor by the Jacobians of
+    both maps.
+  - *Symmetry at glued faces (2026-11-23).* Erik raised the asymmetry
+    of half-open ownership in the central cube, and asked whether
+    orienting the patches could make the seven-patch ball symmetric. It
+    cannot: a coordinate reflection reverses every axis of the cube and
+    both tangential axes of every shell, and so swaps each one's owned
+    low face plane with its unowned high one, whatever the orientation.
+    As TreeWaveOLDG builds the ball, all patches aligned with the global
+    axes, the cube evolves its three low face planes and the shells its
+    three high ones, the shell-shell glues are high-to-high (no owner),
+    low-to-low (two) or mixed, and the outer sphere is evolved on three
+    shells and the hook's on the other three. Erik suggested filling the
+    owned low plane as a ghost during the inter-patch exchange, as
+    symmetric walls (AMR-8) do at a domain face; that is the proposal in
+    the plan, with the shells reoriented as mirror images, radial axis
+    outward, for the outer sphere.
+  - *One owner per face point (2026-11-23).* Erik decided that every
+    face point is owned by one patch, and that extrapolating a face
+    point, which writing both copies by the fill would have needed, is
+    not worth its cost or risk. He expected the cube's faces to work out
+    and asked what the best is between the shells: a rotational sense
+    for the equatorial ring with a north-south difference, "as symmetric
+    as possible", or averaging. Counting low faces settled it. The
+    shells own all six cube faces (radial axis outward). Each ring of
+    four shells around an axis has four low faces for four glues, so
+    every glue has exactly one low side and each ring a rotational
+    sense, all three rings and not only the equator; an enumeration of
+    the shells' tangential orientations finds exactly 8 that work. Each
+    leaves two antipodal corner lines of the eight owned by no shell,
+    since each shell has one corner with both lateral faces low. With
+    the same sense about each axis the pattern is symmetric under point
+    inversion and the 120° rotations about one body diagonal. Averaging
+    two evolved copies is not available under half-open ownership;
+    averaging the right-hand sides is, and was proposed. The two
+    unowned corner lines were left to Erik: extrapolation along them,
+    or closed ownership at glued faces.
+  - *Overlap points, and the prototype (2026-11-23).* Erik raised that
+    ghost stencils restricted to the owned points of the patch across
+    must be lop-sided or of lower order, and proposed a few overlap
+    points, owned by both patches past each glue, which would also
+    give the two corner lines owners. Step 3b's prototype, scripts on
+    plain arrays outside both suites (`bench/coupling/`, `torus.jl` and
+    the `torus_*.jl` that drive it), measured the couplings before any
+    TreeAMR change. *Setup:* a 2D torus of two patches, periodic along
+    `ζ`, glued at both normal faces, with `n` cells of logical spacing
+    `1/n` on each axis. Patch 1 is affine, `x = −1 + ξ`. Patch 2 is
+    `x = 0.8η + 0.4η²`, `y = ζ + 0.3η(1 − η)`, so the spacing jumps from
+    1 to 0.8 at one glue and to 1.6 at the other, and the grid lines meet
+    at an angle. The scheme is TreeGeneralizedHarmonic's: vertex-centered,
+    second-order form, `Δu = g^{ab}∂_a∂_b u + (Δξ^b)∂_b u` with
+    fourth-order centered stencils, mixed derivatives as products of
+    first ones, sixth-order Kreiss–Oliger dissipation `(ε/h)`, RK4 at
+    CFL 0.25 on the largest logical speed, `G = 3`, and 6-point Lagrange
+    ghosts per dimension unless noted. Checks: the Laplacian of exact
+    data converges at 4 on the kinked torus, the interpolated ghosts at
+    6, and on a torus without a kink every coupling gives the same
+    errors to the printed digits.
+
+    *Convergence*, a plane wave `(2, 1)` to `t = 2`, `ε = 0`, L2 error at
+    `n = 16, 32, 64, 128`:
+
+    | Coupling | n = 16 | 32 | 64 | 128 | Rates |
+    |---|---|---|---|---|---|
+    | copied ghosts | 1.30e−1 | 1.25e−1 | 1.23e−1 | 1.23e−1 | 0.06 0.02 0.00 |
+    | half-open | 2.27e−3 | 1.48e−4 | 9.53e−6 | 6.06e−7 | 3.94 3.95 3.98 |
+    | half-open, averaged | 2.39e−3 | 1.53e−4 | 9.70e−6 | 6.11e−7 | 3.97 3.98 3.99 |
+    | overlap `o = 0` | 2.51e−3 | 1.56e−4 | 9.92e−6 | 1.96e−5 | 4.01 3.97 −0.98 |
+    | overlap `o = 1` | 2.61e−3 | 1.59e−4 | 9.88e−6 | 6.17e−7 | 4.04 4.01 4.00 |
+    | overlap `o = 2` | 2.21e−3 | 1.62e−4 | 9.95e−6 | 6.19e−7 | 3.77 4.03 4.01 |
+    | overlap `o = 3` | 2.46e−3 | 1.66e−4 | 1.00e−5 | 6.20e−7 | 3.88 4.05 4.01 |
+
+    The L∞ error within four points of a glue converges at 4.0–4.1 for
+    every coupling but the copy and `o = 0`. Copied ghosts do not
+    converge at all, which confirms the argument about the kink. The
+    lop-sided stencils of half-open ownership cost nothing measurable in
+    accuracy against centered ones. `o = 0` was already growing at
+    `n = 128`.
+
+    *Stability*, random data of amplitude 10⁻³, energy
+    `Σ √g (v² + g^{ab}D_a u D_b u)` to `t = 200` (about 90 crossings),
+    as `E/E₀` at the end or the time it passed 10³:
+
+    | Coupling | n | ε = 0.02 | 0.05 | 0.1 | 0.2 | 0.4 |
+    |---|---|---|---|---|---|---|
+    | half-open | 32 | t = 55 | 1.4e−2 | 5.0e−3 | 3.0e−3 | 1.9e−3 |
+    | half-open | 64 | 3.1e2 | 3.8e−3 | 2.3e−3 | 1.4e−3 | 8.8e−4 |
+    | half-open, averaged | 32 | t = 30 | 9.4e−3 | 5.0e−3 | 3.0e−3 | 1.9e−3 |
+    | half-open, averaged | 64 | 5.4e−2 | 3.7e−3 | 2.3e−3 | 1.4e−3 | 8.7e−4 |
+    | half-open, 4-point | 32 | t = 140 | 9.9 | 8.1e−2 | 1.1e−2 | 3.2e−3 |
+    | half-open, 4-point | 64 | 1.5e2 | 6.4e−2 | 5.1e−3 | 2.1e−3 | 1.1e−3 |
+    | overlap `o = 1` | 32 | t = 40 | t = 60 | t = 108 | t = 140 | 4.8e2 |
+    | overlap `o = 1` | 64 | t = 30 | t = 62 | t = 136 | 2.0e1 | 9.2e−4 |
+    | overlap `o = 2` | 32 | t = 20 | t = 44 | t = 62 | t = 123 | 3.9e−3 |
+    | overlap `o = 2` | 64 | t = 16 | t = 34 | 1.3e2 | 2.4e−1 | 7.6e−3 |
+    | overlap `o = 2`, 4-point | 32 | t = 22 | t = 54 | t = 81 | 3.5e2 | 2.7e−3 |
+    | overlap `o = 2`, 4-point | 64 | t = 21 | t = 65 | 3.6 | 1.2e−2 | 2.1e−3 |
+
+    At `ε = 0.1`, `o = 0` blew up by `t = 12` and `o = 3` by `t = 94`;
+    copied ghosts blew up by `t = 29` at either `ε`. Restricting an
+    overlap's donors to the core of the patch across, never its overlap
+    points, changed neither its errors nor its stability (`o = 2` and
+    `o = 3`, blow-up by `t = 100` and `t = 196` at `ε = 0.2`). *Controls:*
+    without dissipation every coupling blows up, and so does the scheme
+    on a smoothly curved torus with no kink at all
+    (`x = σ + 0.2 sin πσ`, `y = ζ + 0.3 sin πσ`), by `t = 4`; at
+    `ε = 0.1` that torus and a flat one are stable under both
+    couplings. So `ε = 0` measures the scheme, not the coupling.
+
+    *What it says.* Half-open ownership with lop-sided 6-point ghosts
+    is the most stable coupling measured, from `ε = 0.05`, and averaging
+    the right-hand sides on the face planes changes neither accuracy nor
+    stability, so the symmetry it buys is free here. Overlap points are
+    not more stable but less: every width needs about `ε = 0.4`, eight
+    times as much, apparently because two independently evolved copies
+    of a point have a difference mode that only dissipation damps. The
+    measurement covers one 2D configuration of a linear scalar wave,
+    with no patch corner, no refinement and no 3D; it is evidence, not
+    proof.
+  - *More tests: a harsher torus and the cubed sphere (2026-11-23).*
+    Erik asked for more before choosing. *The torus, harder*: a second
+    map, `x = 0.6η + 0.9η²`, `y = ζ + 0.6η(1 − η)`, whose spacing jumps
+    from 1 to 0.6 and to 2.4; CFL 0.4; `n = 128`; and `t = 1000`.
+    Half-open ownership converges at 3.96–4.02 on the harsh map, as
+    overlap does, and stays stable in every case from `ε = 0.05`, except
+    the harsh map at `n = 32`, which needs `ε = 0.1`. Overlap `o = 2`
+    with 6-point ghosts blows up in every case below `ε = 0.2`, and on the
+    harsh map at `ε = 0.2` too. With 4-point ghosts, `o = 2` blows up on
+    the harsh map at `n = 32` even at `ε = 1` (by `t = 139`). Closed
+    ownership, `o = 0`, is stable on both maps from `ε = 0.5` with 6-point
+    ghosts and from `ε = 0.2` with 4-point ones.
+
+    *The cubed sphere* (`bench/coupling/sphere.jl` and the
+    `sphere_*.jl` that drive it): the surface of the unit sphere as six
+    gnomonic patches, the shells' tangential structure in the seven-patch ball,
+    with three patches at every corner and no outer boundary. The
+    Laplace–Beltrami operator, in each patch
+    `r²[(1+A²)u_AA + 2AB u_AB + (1+B²)u_BB + 2A u_A + 2B u_B]`, with the
+    same stencils, dissipation (`ε` over the logical spacing, as
+    TreeGeneralizedHarmonic scales it) and time stepping. The shells'
+    orientations are those of one owner per edge, all three rings
+    turning the same way: an enumeration finds 8, two per diagonal of
+    unowned corners. Checks: the Laplacian of exact data converges at
+    4, the interpolated ghosts at about 6.5, the face-plane copies are
+    exact, and the corner extrapolation converges at about 8. Exact
+    solution: a rotating harmonic of degree 3, `ω = √12`.
+
+    | Coupling (6-point ghosts unless noted) | L2 at t = 2, n = 16, 32, 64 (ε = 0.5) | ε = 0.1 | 0.2 | 0.5 | 1.0 |
+    |---|---|---|---|---|---|
+    | half-open, unowned corners extrapolated along their edges (3 points) | 4.3e−2 5.3e−3 6.5e−4 | t = 2 | t = 4 | t = 62 | t = 29 |
+    | half-open, every corner owned (hypothetical) | 1.5e−3 9.2e−5 5.6e−6 | t = 2 | t = 4 | 2.4e−3 | 1.5e−3 |
+    | the same, 4-point ghosts | 1.6e−3 1.1e−4 1.2e−5 | t = 3 | t = 10 | 2.4e−3 | 1.5e−3 |
+    | the same, averaged right-hand sides | 1.6e−3 9.2e−5 5.6e−6 | t = 2 | t = 5 | 2.4e−3 | 1.5e−3 |
+    | overlap `o = 0` | 1.5e−3 9.1e−5 5.6e−6 | t = 2 | t = 5 | 2.4e−3 | 1.5e−3 |
+    | overlap `o = 1` | 1.5e−3 9.2e−5 5.7e−6 | t = 7 | t = 8 | t = 18 | 1.4e−3 |
+    | overlap `o = 2` | 1.5e−3 9.2e−5 5.7e−6 | t = 11 | t = 39 | 1.8e2 | 1.5e−3 |
+    | overlap `o = 3` | 1.5e−3 9.1e−5 5.7e−6 | t = 7 | t = 10 | 1.2e2 | 4.8e−2 |
+    | overlap `o = 2`, 4-point ghosts | 1.2e−3 6.7e−5 4.0e−6 | t = 83 | 7.2e−3 | 2.4e−3 | 1.5e−3 |
+
+    The last four columns are random data at `n = 32` to `t = 100`,
+    final `E/E₀` or the blow-up time. Extrapolating the two unowned
+    corners is unstable at every order tried: 6, 4, 3 and 2 points, at
+    every `ε` up to 1. With 6 points it blows up by `t = 1` whatever `ε`.
+    The growth sits at the corner, whose value its own neighbours'
+    stencils feed back through extrapolation weights as large as 20.
+    Owning the corners, which TreeAMR's layout cannot (a hypothetical
+    here), removes that; what remains is a slower instability at the
+    owned corners, where three patches meet, which `ε = 0.5` damps and
+    a smaller CFL does not (a spatial instability). At `n = 64` to
+    `t = 50`, every coupling with owned corners is stable at `ε = 0.5`,
+    and at `ε = 0.2` only `o = 2` with 4-point ghosts is. The
+    asymmetry of data symmetric under inversion and under `x → −x`, at
+    `n = 32`, `ε = 0.5`: inversion stays exact in every variant, as the
+    ownership pattern predicts. The mirror asymmetry at `t = 50` is
+    3e−5 for half-open with owned corners and grows with time, 4e−7
+    with averaged right-hand sides, 1e−7 for `o = 0`, and 5e−6 for
+    `o = 2` with 4-point ghosts.
+
+    *What it says.* Half-open ownership as TreeAMR's layout has it is
+    ruled out for vertex-centered finite differences on a cubed sphere:
+    the two unowned corner lines cannot be extrapolated stably. Some
+    layout change is needed either way. Two couplings survive every
+    test at `ε = 0.5`, within TreeGeneralizedHarmonic's range (it runs
+    near holes at `ε ≈ 0.5`). One is closed ownership, `o = 0`, which is
+    symmetric by construction. The other is half-open ownership with
+    averaged right-hand sides plus an owner for the corner lines alone,
+    which needs only `ε = 0.05` on the torus. Overlap of one or more
+    planes, at either stencil width, fails at least one test. The
+    corners, not the coupling, set the dissipation.
+  - *Closed ownership (2026-11-23).* Erik chose closed ownership, every
+    glued face point evolved by each patch holding it, over half-open
+    ownership with averaged right-hand sides and owned corner lines. It
+    replaces his earlier decision that each face point have one owner,
+    which the unowned corner lines made impossible without a layout
+    change anyway. With it go the shells' orientation rule, the rings'
+    rotational sense, the averaging and the exchange back to an owner;
+    the shells keep their radial axis outward, for the outer sphere.
+  - *The remaining decisions (2026-11-23).* Asked whether the plan had
+    every major decision, three were open, and Erik settled them. The
+    planes closed ownership adds are an appendix to the state vector,
+    after the `N^D` cores, rather than blocks of `N + 1` planes, so that
+    `statearray` and every brick stay as they are; Erik took this for
+    the way symmetry boundaries already work, which they do not quite:
+    symmetric walls (AMR-8) keep the layout and have the fill write an
+    owned plane, and no part of TreeAMR has a state appendix yet.
+    Interpolated ghosts cross ranks by the sender computing, in the
+    schedule's own point-to-point messages, since M19's routing is
+    collective on every call. And refinement boundaries stay away from
+    the glues for now, so that neither the ghosts nor the appendix meet
+    a level difference.
 
 ## Downstream checks
 

@@ -6871,4 +6871,15 @@ Remaining, none blocking before their milestone:
   Nonconforming or overlapping patches, whose interfaces are donor
   interpolation rather than a copy, are out of scope. The glue table's
   127 faces are a limit of the `Int8` that carries a face's index, not
-  of the design.
+  of the design. **(proposed)** The patch layouts, their maps and their
+  atlases move from TreeWaveOLDG to a package of their own,
+  TreeMultiPatch; and a finite-difference set's ghosts across a glue
+  are interpolated from the patch across, located through the atlas at
+  schedule build, rather than copied, because a cubed sphere's maps join
+  with a kink that a copied ghost differentiates across. An interpolated
+  set needs neither the patch corners nor the reversed vertex-like axis
+  above. A vertex-like set evolves each glued face point on every
+  patch holding it (closed ownership), so that a block on a patch's
+  high glued face also owns its high face plane, which follows the
+  `N^D` cores in the state vector as an appendix. All of it is in
+  [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).
