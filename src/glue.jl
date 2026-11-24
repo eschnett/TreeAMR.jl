@@ -263,17 +263,18 @@ function check_glue_interpolation(forest::Forest{D,R}, N::Int, G::NTuple{D,Int},
 end
 
 # The Lagrange weights of the points `first … first + k - 1` at `t`, in
-# the arithmetic type `S`, rounded once into `T`.
-function glue_weights(::Type{T}, ::Type{S}, t, first::Int, k::Int) where {T,S}
+# the arithmetic type `S`, rounded once into `T`, into `w[at + 1 … at + k]`.
+function glue_weights!(w::Vector{T}, at::Int, ::Type{S}, t, first::Int, k::Int) where {T,S}
     ts = S(t)
-    return ntuple(k) do i
-        w = one(S)
+    for i in 1:k
+        x = one(S)
         for j in 1:k
             j == i && continue
-            w *= (ts - (first + j - 1)) / S(i - j)
+            x *= (ts - (first + j - 1)) / S(i - j)
         end
-        return T(w)
+        w[at + i] = T(x)
     end
+    return w
 end
 
 # One interpolated ghost as the target block's rank locates it: the
@@ -303,16 +304,30 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                    backend::Backend) where {T,D,R}
     offset = first(owned) - 1
     k = ops.glue
-    stencil(g) = glue_stencil(T, forest, atlas, G, c, k, g)
+    # Asked once, not per ghost: `hasmethod` costs a method lookup.
+    aligned = hasmethod(chart_aligned, Tuple{typeof(atlas),Int,Int})
+    # Located and checked in threaded chunks of regions, each with its
+    # own buffers and its own cache of what the stencils read, and
+    # concatenated in chunk order, so that the plan is the same at any
+    # thread count; a refusal is the first chunk's that has one.
     located = collective_checks(forest, "GhostSchedule") do
-        ghosts = locate_glue_ghosts(forest, regions, G, c, atlas)
-        return (ghosts, map(stencil, ghosts)), UInt(0)
+        nr = length(regions)
+        parts = Vector{Any}(undef, length(threadchunks(nr)))
+        threaded_chunks(nr) do ci, range
+            ghosts = locate_glue_ghosts(forest, view(regions, range), G, c, atlas)
+            parts[ci] = (ghosts, glue_stencils(T, forest, atlas, aligned, G, c, k, ghosts)...)
+        end
+        isempty(parts) && return (GlueGhost{D,R}[], NTuple{D,Int32}[], NTuple{D,Int8}[], T[],
+                                  Int[]), UInt(0)
+        ghosts = reduce(vcat, (x[1] for x in parts))
+        firsts = reduce(vcat, (x[2] for x in parts))
+        widths = reduce(vcat, (x[3] for x in parts))
+        weights = reduce(vcat, (x[4] for x in parts))
+        reads = sort!(unique!(reduce(vcat, (x[5] for x in parts))))
+        return (ghosts, firsts, widths, weights, reads), UInt(0)
     end
-    ghosts, stencils = located
-    # The leaves this rank's ghosts read, which `regrid!` keeps.
-    reads = Int[]
-    foreach(s -> append!(reads, s[4]), stencils)
-    sort!(unique!(reads))
+    ghosts, allfirst, allwidth, allweights, reads = located
+    W = reshape(allweights, k * D, length(ghosts))
     # The ghosts this rank computes, and those it asks other ranks for,
     # counted by owner and kept in the order located.
     P = commsize(forest.comm)
@@ -329,20 +344,15 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
     # What the other ranks ask this one for, in their rank order.
     received, rcounts = P > 1 ? alltoallv(forest.comm, asked, counts) :
                         (GlueGhost{D,R}[], Int[0])
-    sent = map(stencil, received)
-    flat(list) = isempty(list) ? zeros(T, k * D, 0) : reduce(hcat, list)
+    sfirst, swidth, sweights, _ = glue_stencils(T, forest, atlas, aligned, G, c, k, received)
     nonzero(cs) = [r - 1 for r in eachindex(cs) if cs[r] > 0]
     plan = GluePlan{T,D}(k,
                          Int32[ghosts[i].target - offset for i in mine],
                          NTuple{D,Int32}[ghosts[i].index for i in mine],
                          Int32[ghosts[i].source - offset for i in mine],
-                         NTuple{D,Int32}[stencils[i][1] for i in mine],
-                         NTuple{D,Int8}[stencils[i][2] for i in mine],
-                         flat([stencils[i][3] for i in mine]),
+                         allfirst[mine], allwidth[mine], W[:, mine],
                          Int32[g.source - offset for g in received],
-                         NTuple{D,Int32}[s[1] for s in sent],
-                         NTuple{D,Int8}[s[2] for s in sent],
-                         flat([s[3] for s in sent]),
+                         sfirst, swidth, reshape(sweights, k * D, length(received)),
                          nonzero(rcounts), filter(>(0), rcounts),
                          Int32[g.target - offset for g in asked],
                          NTuple{D,Int32}[g.index for g in asked],
@@ -407,13 +417,36 @@ function locate_glue_ghosts(forest::Forest{D,R}, regions, G::NTuple{D,Int},
     return out
 end
 
-# The stencil of one located ghost: the stored index of its first point
-# in the source block, its width per dimension, and its weights, `k` per
-# dimension. A function of the ghost and the replicated tree alone, so
-# that the source's owner builds what the target's rank checked, bit for
-# bit.
-function glue_stencil(::Type{T}, forest::Forest{D,R}, atlas, G::NTuple{D,Int},
-                      c::NTuple{D,Int}, k::Int, g::GlueGhost{D}) where {T,D,R}
+# The stencils of the located ghosts `ghosts`: per ghost the stored index
+# of its first point in the source block and its width per dimension,
+# its weights, `k` per dimension, one after the other in one vector, and
+# the leaves the stencils read (their sources, and the neighbors whose
+# ghosts they read). A function of the ghosts and the replicated tree
+# alone, so that the source's owner builds what the target's rank
+# checked, bit for bit. What a stencil reads beyond its source is checked
+# once per source block and direction (`cache`), not per ghost.
+function glue_stencils(::Type{T}, forest::Forest{D}, atlas, aligned::Bool,
+                       G::NTuple{D,Int}, c::NTuple{D,Int}, k::Int, ghosts) where {T,D}
+    firsts = Vector{NTuple{D,Int32}}(undef, length(ghosts))
+    widths = Vector{NTuple{D,Int8}}(undef, length(ghosts))
+    weights = zeros(T, k * D * length(ghosts))
+    cache = Dict{Tuple{Int,NTuple{D,Int}},Vector{Int}}()
+    for (j, g) in enumerate(ghosts)
+        firsts[j], widths[j] = glue_stencil!(weights, (j - 1) * k * D, cache, forest, atlas,
+                                             aligned, G, c, k, g)
+    end
+    reads = Int[]
+    for ((s, _), nbrs) in cache
+        push!(reads, s)
+        append!(reads, nbrs)
+    end
+    return firsts, widths, weights, reads
+end
+
+# One located ghost's stencil, its weights into `weights[at + 1 … at + kD]`.
+function glue_stencil!(weights::Vector{T}, at::Int, cache, forest::Forest{D,R}, atlas,
+                       aligned::Bool, G::NTuple{D,Int}, c::NTuple{D,Int}, k::Int,
+                       g::GlueGhost{D}) where {T,D,R}
     N = forest.N
     S = promote_type(T, Float64)
     p = Int(g.from)
@@ -422,17 +455,15 @@ function glue_stencil(::Type{T}, forest::Forest{D,R}, atlas, G::NTuple{D,Int},
     lvl = level(skey)
     h = spacing(R, forest, lvl)
     ξ′ = g.ξ
-    al = hasmethod(chart_aligned, Tuple{typeof(atlas),Int,Int}) ?
-         chart_aligned(atlas, p, q) : ntuple(_ -> false, D)
+    al = aligned ? chart_aligned(atlas, p, q) : ntuple(_ -> false, D)
     lo = patch_extents(forest, q)
     npts = patch_roots(forest, q)
     spos = root_position(forest, skey.root)
     start = ntuple(e -> ((spos[e] << lvl) + Int(skey.coords[e])) * N, D)
     where_() = (ghost_position(R, forest, forest.leaves[g.target], g.index, G, c), p)
-    fs = Vector{Int32}(undef, D)
-    ws = Vector{Int8}(undef, D)
-    col = zeros(T, k * D)
-    overhang = zeros(Int, D)
+    fs = ntuple(_ -> Int32(0), D)
+    ws = ntuple(_ -> Int8(0), D)
+    overhang = ntuple(_ -> 0, D)
     for e in 1:D
         t = (S(ξ′[e]) - S(lo[e][1])) / S(h) - (c[e] == 1 ? 0 : S(1) / 2)
         n = (npts[e] << lvl) * N
@@ -447,14 +478,14 @@ function glue_stencil(::Type{T}, forest::Forest{D,R}, atlas, G::NTuple{D,Int},
                 "with patch $p (chart_aligned), but the ghost at $(where_()[1]) of patch " *
                 "$p lands at $(t) spacings along it, not at a node"))
             f, w = r, 1
-            col[(e - 1) * k + 1] = one(T)
+            weights[at + (e - 1) * k + 1] = one(T)
         else
             hi - k + 1 >= 0 || throw(ArgumentError(
                 "patch $q has $(hi + 1) points along dimension $e at level $lvl, fewer " *
                 "than the glue order $k"))
             f = clamp(floor(Int, t) - k ÷ 2 + 1, 0, hi - k + 1)
             w = k
-            col[(e - 1) * k .+ (1:k)] .= glue_weights(T, S, t, f, k)
+            glue_weights!(weights, at + (e - 1) * k, S, t, f, k)
         end
         first = f - start[e] + G[e] + 1
         last = first + w - 1
@@ -467,13 +498,14 @@ function glue_stencil(::Type{T}, forest::Forest{D,R}, atlas, G::NTuple{D,Int},
         # the block owns at a glue (the appendix) and the hook fills at an
         # outer face, both before this stage.
         top = c[e] == 1 && start[e] + N == n
-        overhang[e] = first <= G[e] ? -1 : last > G[e] + N + top ? 1 : 0
-        fs[e] = first
-        ws[e] = w
+        overhang = Base.setindex(overhang,
+                                 first <= G[e] ? -1 : last > G[e] + N + top ? 1 : 0, e)
+        fs = Base.setindex(fs, Int32(first), e)
+        ws = Base.setindex(ws, Int8(w), e)
     end
-    reads = check_overhang(forest, skey, overhang, where_()...)
-    pushfirst!(reads, g.source)
-    return ntuple(d -> fs[d], D), ntuple(d -> ws[d], D), col, reads
+    haskey(cache, (g.source, overhang)) ||
+        (cache[(g.source, overhang)] = check_overhang(forest, skey, overhang, where_()...))
+    return fs, ws
 end
 
 # What a stencil reads beyond its source block's owned range is the
@@ -922,6 +954,28 @@ end
 end
 
 Base.eltype(::Type{<:AppendixArray{T}}) where {T} = T
+
+"""
+    isowned(A, i1, …, iD, v, b) -> Bool
+
+Whether the point `(i1, …, iD)` of variable `v` of block `b` is one the
+state owns, `A` being [`statearray`](@ref)`(u, fs; appendix = true)`:
+for a set with an appendix (`glue = :interpolate`, M20), `i_d ≤ N` or
+block `b` owns its high face plane along `d`; for any other array,
+whether the index is in its bounds.
+
+A right-hand side launched with [`map_blocks!`](@ref)`(…; appendix =
+true)` runs over the closed range, `N + 1` points along every
+vertex-like dimension, and a write to a point the block does not own is
+dropped; with `isowned` the kernel can skip the work for those points
+instead, about `D/N` of it. It works in a device kernel. See "Finite
+differences across a glue" in `CODE.md`.
+"""
+@inline function isowned(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
+    e = @inbounds a.dims[I[D + 2]]
+    return all(d -> I[d] <= a.N + e[d], 1:D)
+end
+@inline isowned(a::AbstractArray, I::Vararg{Int}) = checkbounds(Bool, a, I...)
 Base.size(a::AppendixArray{T,D}) where {T,D} =
     (ntuple(_ -> a.N + 1, D)..., size(a.core, D + 1), size(a.core, D + 2))
 

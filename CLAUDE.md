@@ -388,6 +388,12 @@ the one that says why.
   explicitly to whatever builds a stencil or a position, and form every
   position through `nodeposition` ("Centerings", *The element
   centering*).
+- **A set interpolated across a glue owns an appendix.** Under `glue =
+  :interpolate` the blocks' glued high face planes follow the cores in
+  the state vector: a new state-layer function must handle them, behind
+  `Base.inferencebarrier`, since the switch is a run-time field. Leaves
+  on a glued face, and those a glue stencil reads, keep their level
+  through `regrid!` ("Finite differences across a glue").
 - **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
   block at a low domain face has its own range start at `G+2` along that
   vertex-like dimension; the trim is part of `GroupKey` ("Centerings").

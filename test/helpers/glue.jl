@@ -70,27 +70,28 @@ function glue_ghosts(fs)
                             idx[d] > G[d] + fs.forest.N + dims[b][d] ? 1 : 0, D)
             all(iszero, δ) && continue
             TreeAMR.interpolated_region(conn, k, δ) || continue
-            ξ = ntuple(d -> o[d] + (idx[d] - G[d] - 1) * h, D)
+            ξ = ntuple(d -> o[d] + (idx[d] - G[d] - 1 + (1 - c[d]) / 2) * h, D)
             push!(out, (b, idx, ξ, p))
         end
     end
     return out
 end
 
-# Owned points of a vertex-centered set, the appendix included, from
-# `f(ξ, p)`, times `v` for variable `v`, every other stored point NaN,
+# Owned points of a set, the appendix included, from `f(ξ, p)` at their
+# positions, times `v` for variable `v`, every other stored point NaN,
 # then the fill with `boundary`.
 function fill_from_owned!(fs, sched, f; boundary=nothing)
     forest = fs.forest
     G, N = fs.G, forest.N
     D = length(G)
+    c = staggers(fs.centering)
     dims = TreeAMR.appendix_layout(fs).dims
     fs.work .= NaN
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
         for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), D))
-            ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1) * h, D)
+            ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1 + (1 - c[d]) / 2) * h, D)
             for v in 1:fs.nvars
                 fs.work[I, v, b] = v * f(ξ, p)
             end

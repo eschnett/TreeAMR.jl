@@ -249,7 +249,8 @@ says it is done:
 ### M20 — TreeMultiPatch, and finite differences on patches
 
 *(Proposed 2026-11-22; its design decisions taken 2026-11-23; the
-TreeAMR side not yet designed in CODE.md.)*
+TreeAMR side designed in CODE.md, "Finite differences across a glue",
+and implemented in step 4.)*
 TreeWave's scalar wave, a finite-difference scheme, on the patch systems
 TreeWaveOLDG runs, as the simplified version of what
 TreeGeneralizedHarmonic needs. The patch systems move out of

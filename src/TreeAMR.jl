@@ -38,7 +38,7 @@ export Operators, OperatorFamily, PointValue, Conservative, ElementLocal,
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
-       block_mapreduce, mesh_mapreduce, volume_weighted_norm
+       block_mapreduce, mesh_mapreduce, volume_weighted_norm, isowned
 
 # Several field sets in one state vector (for TreeGRRMHD)
 export staterange, stateview

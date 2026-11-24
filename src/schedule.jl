@@ -657,6 +657,20 @@ two dimensions, never an element set, which is filled on faces only. So
 is one that the axis map does not carry onto itself, or that reverses a
 vertex-like dimension (see `check_glue_layout`).
 
+*Interpolated across a glue* (M20). A set built with `glue =
+:interpolate` takes its ghosts across a glue by Lagrange interpolation
+in the patch across, of the order `Operators(…; glue = k)` gives, at the
+point the target patch's map names: pass the application's atlas,
+`GhostSchedule(fs, operators; atlas)`, which the build calls
+(`chart_map`, `chart_locate`, and `chart_aligned` where it has one) and
+the fill never does. A patch corner is filled like any other ghost, and
+the set owns its glued high face planes, its appendix (see
+[`statearray`](@ref)). Over a distributed forest the ranks compare the
+atlas by `hash`, as the rest of the layout: an atlas holding an array or
+mutable state hashes by identity, differently in every process, and
+needs a `Base.hash` method of its own over its values. See "Finite
+differences across a glue" in `CODE.md`.
+
 *Element sets.* An element-centered set ([`elementcentered`](@ref),
 M16), whose schedule is built with the [`ElementLocal`](@ref) family, is
 filled on **faces only**: the one ghost plane across each face of a
@@ -673,7 +687,7 @@ and `phase2` and `levels` are empty.
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
-    GhostSchedule(fs::FieldSet, operators::Operators)
+    GhostSchedule(fs::FieldSet, operators::Operators; atlas = nothing)
 
 `operators` is required: interpolation order follows from the
 application's discretization, so there is no order the mesh could

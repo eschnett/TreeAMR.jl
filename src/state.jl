@@ -275,14 +275,16 @@ function stateview(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
 end
 
 """
-    statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
+    statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer;
+               appendix=false)
 
 The `i`-th set's segment of `u` as that set's `(N, ..., N, nvars,
 nblocks)` array, sharing memory: `statearray(stateview(u, sets, i),
-sets[i])`.
+sets[i]; appendix)`.
 """
-statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer) =
-    statearray(stateview(u, sets, i), sets[i])
+Base.@constprop :aggressive statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}},
+                                      i::Integer; appendix::Bool=false) =
+    statearray(stateview(u, sets, i), sets[i]; appendix=appendix)
 
 """
     scatter!(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector)
@@ -370,9 +372,11 @@ On a set interpolated across a glue (M20), which owns the high face
 planes of its blocks at a glued face of their patch, `appendix` is
 required: with `appendix = true` the loop runs over the closed range, and
 a right-hand side written through [`statearray`](@ref)`(du, fs; appendix
-= true)` reaches the planes a block owns and drops the rest; with `false`
-it runs over the owned range alone, and the appendix stays as it was. On
-any other set it is ignored.
+= true)` reaches the planes a block owns and drops the rest, which
+[`isowned`](@ref) lets the kernel skip; with `false` it runs over the
+owned range alone, and the appendix entries of `du` are left as they
+were — not zeroed, so a right-hand side that does not compute them must
+set them itself. On any other set it is ignored.
 
 With `stored = true` the loop runs over every **stored** point of every
 block, ghosts included — `ndrange = (size(fs.work)[1:D]..., nblocks(fs))`,

@@ -1482,7 +1482,11 @@ with `key` the block's [`MortonKey`](@ref), `δ` the outward direction,
 and `region` the `CartesianIndices` of the ghost cells in stored
 coordinates. Use [`coordinates`](@ref) to get their positions. Passing
 `nothing` leaves those ghosts untouched, which is what a fully periodic
-domain wants.
+domain wants. Over a set interpolated across a glue (M20) the
+interpolation reads the hook's outer high face plane where a stencil
+reaches an outer face of the patch across, so a fill without the hook
+leaves the ghosts across the glue near that face reading whatever the
+plane held; fill such a set with its hook.
 
 In a vertex-like dimension the outward region on the domain's **high**
 side starts at the shared boundary plane `G+N+1`, one plane further in

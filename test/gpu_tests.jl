@@ -1120,7 +1120,7 @@ end
     J = ntuple(d -> I[d], Val(D))
     b = I[D + 1]
     @inbounds for v in 1:NV
-        du[J..., v, b] = v * sum(J) + 100b
+        isowned(du, J..., v, b) && (du[J..., v, b] = v * sum(J) + 100b)
     end
 end
 

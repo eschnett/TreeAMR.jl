@@ -517,3 +517,64 @@ end
     @test all(e -> e[1] > 0.3, copied)
     @test all(<(-0.9), rate(copied, 2))
 end
+
+@testset "isowned names the points a block owns, and a multi-set state reaches its appendix" begin
+    # Guards the closed range's bookkeeping a right-hand side relies on:
+    # the points `isowned` accepts are exactly the state's, so a kernel
+    # that skips the others computes every owned point once; and a set
+    # with an appendix inside a state vector of several sets reads and
+    # writes it through the same `appendix` keyword.
+    forest = kinked_forest(2)
+    N = forest.N
+    fs = kinked_set(forest)
+    other = FieldSet(forest, 2; G=1)
+    u = collect(1.0:statelength(fs))
+    A = statearray(u, fs; appendix=true)
+    owned = count(isowned(A, Tuple(I)..., 1, b)
+                  for b in 1:nblocks(fs) for I in CartesianIndices((1:(N + 1), 1:(N + 1))))
+    @test owned == statelength(fs)
+    @test isowned(statearray(u, fs), N, N, 1, 1) && !isowned(statearray(u, fs), N + 1, 1, 1, 1)
+    sets = (other, fs)
+    w = statevector(sets)
+    W = statearray(w, sets, 2; appendix=true)
+    @test W isa TreeAMR.AppendixArray
+    for b in 1:nblocks(fs), I in CartesianIndices((1:(N + 1), 1:(N + 1)))
+        isowned(W, Tuple(I)..., 1, b) && (W[Tuple(I)..., 1, b] = A[Tuple(I)..., 1, b])
+    end
+    @test stateview(w, sets, 2) == u
+    @test statearray(w, sets, 2) isa AbstractArray{Float64,4}
+end
+
+# A polynomial of degree `k - 1` in each logical coordinate, different in
+# each patch, which a `k`-point stencil reproduces exactly.
+glue_poly_k(k) = (ξ, p) -> 0.5 + p * ξ[1]^(k - 1) - (p + 1) * ξ[2]^(k - 1) +
+                           ξ[1]^(k ÷ 2) * ξ[2]^(k ÷ 2 - 1)
+
+@testset "Interpolated ghosts are exact for every centering and order" begin
+    # Guards the stencil's window and weights away from the one layout the
+    # other tests use: a cell-like dimension has no point on a face and no
+    # appendix, a mixed set has one along one dimension only, and the
+    # window's clamping and centering change with the order. Each patch's
+    # polynomial of degree `k - 1` comes back to rounding at every ghost
+    # across the kinked torus's glues and wrap, patch corners included.
+    for C in ((:cell, :cell), (:vertex, :cell), (:cell, :vertex), (:vertex, :vertex)),
+        k in (2, 4, 6)
+        forest = kinked_forest(2)
+        fs = FieldSet(forest, 1; G=3, centering=C, glue=:interpolate)
+        sched = GhostSchedule(fs, Operators(prolongation=4, restriction=4, glue=k);
+                              atlas=KINKED)
+        f = glue_poly_k(k)
+        fill_from_owned!(fs, sched, f)
+        ghosts = glue_ghosts(fs)
+        @test length(ghosts) == length(sched.glueplan)
+        err = maximum(ghosts) do (b, idx, ξ, p)
+            ξ′, q = TreeAMR.chart_locate(KINKED, TreeAMR.chart_map(KINKED, ξ, p))
+            return abs(fs.work[idx..., 1, b] - f(ξ′, q))
+        end
+        @test err < 1e-11
+        # Each patch's closed box, `nN + 1` points along a vertex-like
+        # dimension, beyond its `(nN)²` cores.
+        @test statelength(fs) - TreeAMR.corelength(fs) ==
+              2 * (prod(16 + (C[d] === :vertex) for d in 1:2) - 16^2)
+    end
+end

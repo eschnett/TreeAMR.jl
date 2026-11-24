@@ -4777,7 +4777,8 @@ M12 was decided with Erik, after M7 and before M9b.
 ### M20 — TreeMultiPatch, and finite differences on patches
 
 - **M20 — TreeMultiPatch, and finite differences on patches.** *(Planned
-  with Erik on 2026-11-22 and 2026-11-23; not designed.)* The plan is in
+  with Erik on 2026-11-22 and 2026-11-23, designed on 2026-11-23, step 4
+  implemented on 2026-11-23 and 2026-11-24.)* The plan is in
   [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).
 
   - *Where the patch systems live (2026-11-22).* Erik asked whether the
@@ -5180,6 +5181,28 @@ M12 was decided with Erik, after M7 and before M9b.
     first derivative's largest error stays 0.46, 0.38, 0.37, 0.37 and its
     L2 error falls at 1/2, the kink's width; the second's largest error
     grows as 1/h (6.3, 13.6, 27.4, 55.1) and its L2 error as h^(−1/2).
+  - *Step 4, the review's pre-release items (2026-11-24).* The stale
+    lines (the section's "not implemented", the entry's "not designed",
+    the state length) and an M20 rule in both rule lists; `isowned`,
+    exported, which a right-hand side asks of the `AppendixArray` to skip
+    the planes a block does not own (on a device too); the `appendix`
+    keyword of the multi-set `statearray`; the docstring saying that
+    `appendix = false` leaves `du`'s appendix as it was. Tests of every
+    centering, cell, vertex and both mixed, at orders 2, 4 and 6. The
+    plan's build: `hasmethod` asked once, the weights written in place,
+    what a stencil reads beyond its source checked once per source and
+    direction, and the location and the stencils threaded over chunks of
+    regions: on the seven-patch ball (44 928 ghosts) 4.97 µs and 5.4 kB a
+    ghost before, at any thread count, 3.83 µs and 2.8 kB at one thread
+    and 1.28 µs at four after (Apple M3 Pro). Reusing located ghosts
+    across regrids was left: at these costs a ball of 8 roots per side at
+    `N = 32` (about 5 million ghosts) builds in about a second per
+    schedule on Symmetry's 64 threads, if it scales. Of the review's
+    suspicions, the largest order on a vertex set, `k = 2(G + 1)`, with
+    ghosts landing on nodes at block boundaries, builds and fills (S4,
+    not reproduced); an atlas hashing by identity and a fill without the
+    hook are documented, in `GhostSchedule`'s and `fill_ghosts!`'s
+    docstrings and the refusal's message (S1, S3).
   - *Step 4, two criteria restated (2026-11-24, Erik).* "A fold of a
     constant gives the domain's volume" on the seven-patch ball became
     "a fold counts each physical point once and sums a function of the

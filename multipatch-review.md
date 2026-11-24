@@ -14,7 +14,11 @@ Timings are from an Apple M3 Pro: trust the ratios, and re-measure the
 absolute numbers on Symmetry.
 
 **Status.** The five changes recommended before downstream work are
-done (`HISTORY.md`, M20, *Step 4, the review*); the rest stand as
+done (`HISTORY.md`, M20, *Step 4, the review*), and so are the items
+before release, 6 to 10 — 7, TreeIOHDF5's appendix, on its own branch —
+but for the reuse of located ghosts across regrids in 6, which was left
+(*Step 4, the review's pre-release items*); the suspicions S1 and S3 are
+documented, and S4 did not reproduce. The items after M20 stand as
 written.
 
 **Contents**

@@ -980,7 +980,11 @@ declared up front:
 Two arrays exist:
 
 - the **state vector**: a flat vector of length `N^D · nvars · nblocks`
-  holding leaf interiors only — this is what ODE integrators see;
+  holding leaf interiors only — this is what ODE integrators see; a set
+  interpolated across a glue (M20) adds its blocks' owned glued high face
+  planes after all of those, its appendix ("Closed ownership and the
+  appendix" under [Finite differences across a
+  glue](#finite-differences-across-a-glue));
 - the **working array**: one big persistent `(D+2)`-dimensional array
   holding all leaf blocks including ghosts:
 
@@ -3507,8 +3511,8 @@ Not part of it, until an application asks:
 
 ### Finite differences across a glue
 
-*(Proposed, M20 step 4; not implemented. The decisions behind it and
-the prototype's measurements are under M20 in
+*(M20 step 4. The decisions behind it, the prototype's measurements and
+the record of each slice are under M20 in
 [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches);
 the plan is in [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).)*
 
@@ -3535,7 +3539,10 @@ the application's atlas ("Interpolation on element sets and patches"),
 since only the map knows where a ghost lies; `regrid!`'s callers pass it
 again when they rebuild the schedule. An interpolated set refuses a
 missing order or atlas, and the collective checks compare the order and
-`hash(atlas)` across ranks with the rest of the layout.
+`hash(atlas)` across ranks with the rest of the layout. So an atlas must
+hash by value: one holding an array or mutable state hashes by identity,
+differently in every process, and needs a `Base.hash` method over its
+values (TreeMultiPatch's layouts are `isbits`).
 
 *Implemented so far:* the keywords, the refusals at schedule build,
 the location with `chart_aligned`, the stage, closed ownership with its
@@ -3657,8 +3664,10 @@ the appendix leaves its planes unevolved without a word. With `true` it
 launches over the closed range, as `closed = true` does, and the kernel
 writes through `statearray(du, fs; appendix = true)`, which discards the
 planes a block does not own. That costs a plane per dimension on every block, about `D/N` of the
-work, 9 % at `N = 32` in 3D; a launch over the appendix alone is the
-optimization if it shows.
+work, 9 % at `N = 32` in 3D, which a kernel skips by asking
+`isowned(A, i…, v, b)` of the `AppendixArray` it writes through (it works
+on a device); a launch over the appendix alone is the optimization if
+even that shows.
 
 The fill skips the appendix: along a glued dimension a block's own
 range is its closed range, and every region that reaches into the
@@ -3699,7 +3708,9 @@ turn; and a norm's volume counts the points the fold does, so that a
 constant is its own norm.
 
 **Stages.** An interpolated transfer reads what phase 1 and the
-boundary hook write and writes ghosts across a glue only, which nothing
+boundary hook write — the hook's outer high face plane where a stencil
+reaches an outer face, so a fill of such a set without its hook leaves
+the ghosts near that face reading a stale plane — and writes ghosts across a glue only, which nothing
 in phase 1 reads. So it runs as a stage of its own after the hook and
 before phase 2, with a message round of its own. Phase 2's
 prolongations never read it: a coarse-fine face never touches a glue,
@@ -4149,8 +4160,9 @@ out contiguously in tuple order — `statevector((hydro, Bx, By, Bz))`,
 `i`-th set's entries, `stateview(u, sets, i)` for its segment as a view
 and `statearray(du, sets, i)` for that segment in its set's array shape.
 Each set contributes `N^D · nvars · nblocks` entries whatever its
-centering; half-open ownership (see [Centerings](#centerings)) is what
-makes this a plain concatenation. Each segment has exactly its set's
+centering, and a set with an appendix (M20) its appendix after them, its
+`statelength` in all; half-open ownership (see [Centerings](#centerings))
+is what makes this a plain concatenation. Each segment has exactly its set's
 single-set layout, so every single-set function applied to
 `stateview(u, sets, i)` and `sets[i]` — the reductions included —
 behaves as on a separate vector, and the tuple methods are loops over
@@ -6205,6 +6217,18 @@ The ideas that span several files and are easy to violate:
   nothing but `P` tells the two apart: pass `P` explicitly to whatever
   builds a stencil or a position, and form every position through
   `nodeposition`, never from the index directly.
+- **A set interpolated across a glue owns an appendix, and every state
+  function must know it** (M20, "Closed ownership and the appendix"
+  under [Finite differences across a
+  glue](#finite-differences-across-a-glue)). A set built with `glue =
+  :interpolate` holds its blocks' glued high face planes after the cores
+  in the state vector. A new function of the state layer handles it —
+  through `hasappendix`, `appendix_cache` or `statearray(u, fs;
+  appendix = true)` — and, so that no other set compiles it, behind
+  `Base.inferencebarrier`, the switch being a run-time field. Every leaf
+  on a glued face and every leaf a glue stencil reads keeps its level
+  through `regrid!` (`GluePlan.reads`), and a glue stencil reads only
+  what phase 1 and the hook fill (`check_overhang`).
 - **Interiors-only state vector.** An RHS is `scatter!` → `fill_ghosts!` →
   `map_blocks!`, with kernels writing `du` in state layout via `statearray`.
   `u` is never mutated; the working array is scratch. There is deliberately
