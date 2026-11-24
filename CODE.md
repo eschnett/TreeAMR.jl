@@ -3543,11 +3543,13 @@ appendix — `statelength`, `scatter!`, `gather!`, `statearray(u, fs;
 appendix = true)` (an `AppendixArray`), `map_blocks!`'s keyword and the
 closed ranges of the fill — the folds and norms counting each point
 once, and `regrid!`'s guard with the appendix carried by a kept
-block's copy, serially and on the CPU: `src/glue.jl`, tested in
-`test/glue_tests.jl` and on the seven- and thirteen-patch balls in
-`test/glue_ball_tests.jl`. A distributed forest and reflecting or outflow
-faces are refused, and a fold over the state vector (not the working
-array) refuses a device.
+block's copy, serially and over a distributed forest, on the CPU:
+`src/glue.jl`, tested in `test/glue_tests.jl`, on the seven- and
+thirteen-patch balls in `test/glue_ball_tests.jl`, over simulated ranks
+in `test/glue_exchange_tests.jl` and through MPI in
+`test/mpi_workload.jl`'s `G2`. Reflecting or outflow faces are refused,
+and a fold over the state vector (not the working array) refuses a
+device.
 
 **Where a ghost lies, and what fills it.** A ghost of block `b` of
 patch `p` beyond a glued face of `p` — across a face, an edge or a
@@ -3660,7 +3662,10 @@ patch carries the neighbor's appendix plane into the target's ghost,
 where an interpolation stencil may read it. This is the shape of
 symmetric walls' trim, with the opposite sign, and goes the same way:
 a per-dimension flag in `GroupKey`, part of its order, so that both
-ends of a message agree.
+ends of a message agree: the search for the transfers a rank sends for
+another rank's block runs in the interpolated mode too, or it would key
+them without the flag and the two ends would lay the message out
+differently.
 
 A fold or a norm counts every point once: a point on a glued face at
 the copy of the lowest-numbered patch holding it, which the fold reads
@@ -3677,7 +3682,9 @@ joins a whole face to a whole face, so the decision is one bit per
 piece: a `FoldMask` per block, built on the host for each reduction,
 which the fold kernel tests at each point of the closed range. Where
 two copies lie on the lowest patch the pieces are checked point by
-point, and a self-glue that splits a piece is refused. A set without an
+point, and a self-glue that splits a piece is refused; over a distributed
+forest with a patch glued to itself every rank checks every leaf, so
+that all refuse alike. A set without an
 appendix passes `NoMasks()` and compiles none of it. `block_mapreduce`
 and `mesh_mapreduce` over a set with an appendix run as this fold,
 behind `Base.inferencebarrier`, every selected variable at a point in
@@ -3695,14 +3702,28 @@ that face.
 **Between ranks the sender computes.** At schedule build, each rank
 locates its own blocks' interpolated ghosts on the host — the atlas,
 then the search against the replicated leaves, no communication — and
-sends each ghost's target (leaf, stored index), source leaf and `ξ′` to
-the source's owner in the build's one `alltoallv`, sorted by target
-rank, leaf and stored index. The owner builds the stencils in that
-order. Each fill, the owner evaluates them into its send buffer and the
-target unpacks them into the ghosts with the plain copy, in the order
-it sent them. Nothing in that order comes from a `Dict`, and
-`fill_ghosts!` makes no collective call. A ghost whose source is on its
-own rank takes the same kernel, writing in place.
+builds every one's stencil, which is where the refusals of the location
+and the stencil fire; they depend on the blocks a rank holds, so they
+go through `collective_checks`, and every rank refuses with the one
+that found it rather than wait in what follows. It then sends each
+ghost whose source another rank owns, as a `GlueGhost` — target leaf,
+stored index and patch, source leaf, `ξ′` — to the source's owner in
+the build's one `alltoallv`, in the order located (block by block,
+region by region, point by point), grouped by owner. The owner builds
+those stencils again with the same function, `glue_stencil`, a
+function of the record and the replicated tree alone, so bit for bit
+what the target's rank checked. Each fill, in a round of its own under
+`GLUE_TAG` between phase 1 and phase 2: every rank posts its receives,
+evaluates what it owes others into its send buffer, a point's variables
+together, and sends one message per peer; fills its own ghosts in place
+with the same arithmetic (`glue_value`); then copies the received
+values into the ghosts in the order it located them. Its sends are
+waited for within the round, which cannot deadlock, since every rank
+posts its receives before it waits. Nothing in that order comes from a
+`Dict`, and `fill_ghosts!` makes no collective call (the in-process
+test counts them). Over three ranks the kinked torus's fill sends 1299
+ghosts and comes out bit for bit the serial one, under MPI as over
+simulated ranks.
 
 **The kernel** runs one work item per ghost point and variable and sums
 the tensor product of `D` weight vectors, each of width `k`, or one
@@ -5294,7 +5315,9 @@ device](#the-copy-kernels-on-a-device) has what the copies cost.
 
 **Deadlock freedom and message matching.** Messages are nonblocking
 and matched by peer and tag, and the tag names the stage: phase 1, the
-target level, the face dimension, or the regrid. A rank enters only the
+target level, the face dimension, the regrid, or the ghosts interpolated
+across a glue (M20), whose round runs between phase 1 and phase 2 and
+waits for its own sends. A rank enters only the
 stages in which it has a message or a local group. A skipped stage
 cannot be confused with another, since its tag is its own.
 
@@ -6375,7 +6398,8 @@ which companion releases go with it.
 `element_tests.jl` (M16), `reflect_tests.jl` (M10), `outflow_tests.jl`,
 `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
-`atlas_tests.jl` (M19), `glue_tests.jl` and `glue_ball_tests.jl` (M20),
+`atlas_tests.jl` (M19), `glue_tests.jl`, `glue_ball_tests.jl` and
+`glue_exchange_tests.jl` (M20),
 `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -6531,7 +6555,16 @@ roots per side, which an off-center window breaks and a polynomial does
 not see; `chart_aligned`'s widths on the thirteen-patch ball, one along
 the radius between outer shells and along both angles between the
 layers; and the refusals of a wrong declaration and of a cube too
-coarse for its corner ghosts.
+coarse for its corner ghosts. `glue_exchange_tests.jl` holds them over
+simulated ranks, as tasks over `helpers/regrid_exchange.jl`'s rendezvous
+communicator: the kinked torus and the seven-patch ball, two variables,
+over 2, 3 and 5 ranks, bit for bit the serial fill, with no collective
+call in the fill and every ghost sent received; a fold counting each
+point once; a refusal of the glue plan raised on every rank; and a
+regrid whose kept blocks carry their appendix between ranks.
+`mpi_workload.jl`'s `G2` is the kinked torus through MPI: a fill, the
+reductions, a regrid and the fill again, with a `#` line counting the
+ghosts received.
 
 `patch_tests.jl` holds the multi-patch forest's own tests (M17), each
 claim stated against a forest with no glue, as M12's are against the

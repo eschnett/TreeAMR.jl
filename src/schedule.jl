@@ -2229,16 +2229,23 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         merge_pairs!(pairs, perpairs[c])
         append!(boundaries, perboundaries[c])
     end
-    glueplan = glue_plan(T, forest, reduce(vcat, perglue; init=GlueRegion{D}[]), ghosts,
-                         stags, operators, atlas, offset)
+    # Every rank builds it, regions or not: over a distributed forest the
+    # build is collective (M20).
+    glueplan = interpolated ?
+               glue_plan(T, forest, reduce(vcat, perglue; init=GlueRegion{D}[]), ghosts,
+                         stags, operators, atlas, owned) : GluePlan{T,D}()
     # Over a distributed forest (M7) the transfers split three ways: the
     # local ones stay in `pairs`, in local block indices; those with a
     # remote source are received; and those this rank computes for a
     # remote target are sent, found by the target owner's own search.
     received = split_received!(pairs, owned, nleaves(forest))
     boundaries = localize_boundaries(boundaries, owned)
+    # A remote target's regions across a glue are its own rank's to
+    # locate, and its owned high face planes (M20) shape what it is sent,
+    # so the search for it runs in the same mode as its owner's.
     sent = sent_transfers(forest, owned) do into, j
-        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs, symmetric)
+        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs, symmetric;
+                       glueregions=interpolated ? GlueRegion{D}[] : nothing)
     end
 
     # One dimension of a group's stencils. Along a wall dimension of a

@@ -6,9 +6,9 @@
 # through the application's atlas when the schedule is built. Each fill
 # then evaluates one tensor-product Lagrange stencil per ghost point and
 # variable. See "Finite differences across a glue" in CODE.md, which this
-# file implements serially and on the CPU, with closed ownership's
-# appendix (the sender's evaluation across ranks and the device path are
-# later steps of M20).
+# file implements on the CPU, serially and over a distributed forest,
+# with closed ownership's appendix (the device path is a later part of
+# M20 step 4).
 
 """
     TreeAMR.chart_aligned(atlas, p, q) -> NTuple{D,Bool}
@@ -30,12 +30,19 @@ function chart_aligned end
 # the direction and the stored indices.
 const GlueRegion{D} = Tuple{Int,NTuple{D,Int},CartesianIndices{D,NTuple{D,UnitRange{Int}}}}
 
-# The interpolated ghosts of one schedule: per ghost point the target
-# block and stored index, the source block, the stored index of the
-# stencil's first point and its width per dimension (`k`, or 1 along an
-# aligned dimension), and its weights, `k` per dimension, column `j`.
-# One concrete type whether empty or not, so that a schedule's type does
-# not say whether it interpolates.
+# The interpolated ghosts of one schedule. Those whose source block is on
+# this rank (every one, serially): per ghost point the target block and
+# stored index, the source block, the stored index of the stencil's first
+# point and its width per dimension (`k`, or 1 along an aligned
+# dimension), and its weights, `k` per dimension, column `j`. Over a
+# distributed forest (M20) the sender computes: the stencils this rank
+# evaluates for other ranks' ghosts (`send…`, in the order the targets'
+# ranks located them, peer by peer), and the ghosts of this rank's blocks
+# whose values other ranks send (`recv…`, in the order this rank located
+# them), each fill one message per peer and direction under `GLUE_TAG`,
+# point by point with the variables fastest. One concrete type whether
+# empty or not, so that a schedule's type does not say whether it
+# interpolates.
 struct GluePlan{T,D}
     k::Int
     target::Vector{Int32}
@@ -44,12 +51,33 @@ struct GluePlan{T,D}
     first::Vector{NTuple{D,Int32}}
     width::Vector{NTuple{D,Int8}}
     weights::Matrix{T}
+    sendsource::Vector{Int32}
+    sendfirst::Vector{NTuple{D,Int32}}
+    sendwidth::Vector{NTuple{D,Int8}}
+    sendweights::Matrix{T}
+    sendpeers::Vector{Int}
+    sendcounts::Vector{Int}
+    recvtarget::Vector{Int32}
+    recvindex::Vector{NTuple{D,Int32}}
+    recvpeers::Vector{Int}
+    recvcounts::Vector{Int}
+    sendbuf::Vector{T}
+    recvbuf::Vector{T}
 end
 GluePlan{T,D}() where {T,D} =
     GluePlan{T,D}(0, Int32[], NTuple{D,Int32}[], Int32[], NTuple{D,Int32}[],
-                  NTuple{D,Int8}[], zeros(T, 0, 0))
-Base.isempty(plan::GluePlan) = isempty(plan.target)
-Base.length(plan::GluePlan) = length(plan.target)
+                  NTuple{D,Int8}[], zeros(T, 0, 0), Int32[], NTuple{D,Int32}[],
+                  NTuple{D,Int8}[], zeros(T, 0, 0), Int[], Int[], Int32[],
+                  NTuple{D,Int32}[], Int[], Int[], T[], T[])
+Base.isempty(plan::GluePlan) =
+    isempty(plan.target) && isempty(plan.sendsource) && isempty(plan.recvtarget)
+# The ghosts of this rank's blocks it fills, computed here or received.
+Base.length(plan::GluePlan) = length(plan.target) + length(plan.recvtarget)
+
+# The message tag of the interpolated ghosts: a round of its own between
+# phase 1 and phase 2, past the prolongation tags (CODE.md, "Deadlock
+# freedom and message matching").
+const GLUE_TAG = 36
 
 # The faces of its patch a step `δ` from leaf `k` leaves through: per
 # dimension 0 where it stays, 1 through the low face, 2 through the high.
@@ -171,9 +199,6 @@ function check_glue_interpolation(forest::Forest{D,R}, N::Int, G::NTuple{D,Int},
         "a field set interpolated across a glue over a forest with reflecting or " *
         "outflow faces is not implemented: the edge regions beyond such a face and a " *
         "glued one are neither mirrored nor located yet (M20 step 4)"))
-    commsize(forest.comm) == 1 || throw(ArgumentError(
-        "a field set interpolated across a glue over a distributed forest is not " *
-        "implemented yet: the sending rank's evaluation is a later part of M20 step 4"))
     return nothing
 end
 
@@ -191,35 +216,98 @@ function glue_weights(::Type{T}, ::Type{S}, t, first::Int, k::Int) where {T,S}
     end
 end
 
+# One interpolated ghost as the target block's rank locates it: the
+# target's global leaf, stored index and patch, the source's global leaf
+# and the position in the source's patch. Plain bits, so that over a
+# distributed forest the build's one `alltoallv` hands it to the source's
+# owner, who builds the stencil from it exactly as the target's rank did.
+struct GlueGhost{D,R}
+    target::Int
+    index::NTuple{D,Int32}
+    from::Int32
+    source::Int
+    ξ::NTuple{D,R}
+end
+
 # The glue plan of one schedule: every interpolated region `(b, δ,
 # region)` of this rank's blocks — `b` a global leaf, `region` stored
 # indices — located through the atlas, with its stencil. Refuses, saying
 # why, a ghost the atlas puts in no patch or back in its own, one whose
 # source is at another level, an alignment that does not hold, and a
-# stencil that would read a point no copy within the source's patch fills.
+# stencil that would read a point no copy within the source's patch
+# fills. Every rank comes here, whether it has regions or not: over a
+# distributed forest the refusals are agreed on (`collective_checks`) and
+# the ghosts whose source another rank owns go to that rank in one
+# `alltoallv`, which builds their stencils and evaluates them each fill.
 function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
-                   c::NTuple{D,Int}, ops::Operators, atlas, offset::Int) where {T,D,R}
-    isempty(regions) && return GluePlan{T,D}()
-    conn = forest.conn::Patches{D}
-    N = forest.N
+                   c::NTuple{D,Int}, ops::Operators, atlas,
+                   owned::UnitRange{Int}) where {T,D,R}
+    offset = first(owned) - 1
     k = ops.glue
-    S = promote_type(T, Float64)
-    aligned = hasmethod(chart_aligned, Tuple{typeof(atlas),Int,Int})
-    target = Int32[]
-    index = NTuple{D,Int32}[]
-    source = Int32[]
-    firsts = NTuple{D,Int32}[]
-    widths = NTuple{D,Int8}[]
-    weights = T[]
+    stencil(g) = glue_stencil(T, forest, atlas, G, c, k, g)
+    located = collective_checks(forest, "GhostSchedule") do
+        ghosts = locate_glue_ghosts(forest, regions, G, c, atlas)
+        return (ghosts, map(stencil, ghosts)), UInt(0)
+    end
+    ghosts, stencils = located
+    # The ghosts this rank computes, and those it asks other ranks for,
+    # counted by owner and kept in the order located.
+    P = commsize(forest.comm)
+    mine = [i for i in eachindex(ghosts) if ghosts[i].source in owned]
+    asked = GlueGhost{D,R}[]
+    counts = zeros(Int, P)
+    if P > 1
+        theirs = [i for i in eachindex(ghosts) if !(ghosts[i].source in owned)]
+        owner = [leafowner(forest, ghosts[i].source) for i in theirs]
+        perm = sortperm(owner; alg=Base.Sort.DEFAULT_STABLE)
+        asked = ghosts[theirs[perm]]
+        foreach(o -> counts[o + 1] += 1, owner)
+    end
+    # What the other ranks ask this one for, in their rank order.
+    received, rcounts = P > 1 ? alltoallv(forest.comm, asked, counts) :
+                        (GlueGhost{D,R}[], Int[0])
+    sent = map(stencil, received)
+    flat(list) = isempty(list) ? zeros(T, k * D, 0) : reduce(hcat, list)
+    nonzero(cs) = [r - 1 for r in eachindex(cs) if cs[r] > 0]
+    return GluePlan{T,D}(k,
+                         Int32[ghosts[i].target - offset for i in mine],
+                         NTuple{D,Int32}[ghosts[i].index for i in mine],
+                         Int32[ghosts[i].source - offset for i in mine],
+                         NTuple{D,Int32}[stencils[i][1] for i in mine],
+                         NTuple{D,Int8}[stencils[i][2] for i in mine],
+                         flat([stencils[i][3] for i in mine]),
+                         Int32[g.source - offset for g in received],
+                         NTuple{D,Int32}[s[1] for s in sent],
+                         NTuple{D,Int8}[s[2] for s in sent],
+                         flat([s[3] for s in sent]),
+                         nonzero(rcounts), filter(>(0), rcounts),
+                         Int32[g.target - offset for g in asked],
+                         NTuple{D,Int32}[g.index for g in asked],
+                         nonzero(counts), filter(>(0), counts), T[], T[])
+end
+
+# The logical position of stored index `idx` of leaf `key`.
+function ghost_position(::Type{R}, forest::Forest{D}, key::MortonKey{D},
+                        idx::NTuple{D,<:Integer}, G::NTuple{D,Int},
+                        c::NTuple{D,Int}) where {R,D}
+    h = spacing(R, forest, level(key))
+    origin = block_origin(R, forest, key)
+    return ntuple(d -> nodeposition(origin[d], h, Int(idx[d]) - G[d], c[d], nothing), D)
+end
+
+# Every interpolated ghost of `regions`, located: the atlas names the
+# patch and the position there, the search the source leaf, which must
+# be at the target's level.
+function locate_glue_ghosts(forest::Forest{D,R}, regions, G::NTuple{D,Int},
+                            c::NTuple{D,Int}, atlas) where {D,R}
+    out = GlueGhost{D,R}[]
     for (b, δ, region) in regions
         key = forest.leaves[b]
         p = patch(forest, key)
         lvl = level(key)
-        h = spacing(R, forest, lvl)
-        origin = block_origin(R, forest, key)
         for I in region
             idx = Tuple(I)
-            ξ = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], c[d], nothing), D)
+            ξ = ghost_position(R, forest, key, idx, G, c)
             x = chart_map(atlas, ξ, p)
             loc = chart_locate(atlas, x)
             loc === nothing && throw(ArgumentError(
@@ -240,61 +328,76 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                 "the ghost at $ξ of patch $p (level $lvl) lies in leaf $skey of patch " *
                 "$q, at level $(level(skey)): a set interpolated across a glue needs " *
                 "every block within reach of the glue at one level"))
-            al = aligned ? chart_aligned(atlas, p, q) : ntuple(_ -> false, D)
-            lo = patch_extents(forest, q)
-            npts = patch_roots(forest, q)
-            spos = root_position(forest, skey.root)
-            start = ntuple(e -> ((spos[e] << lvl) + Int(skey.coords[e])) * N, D)
-            fs = Vector{Int32}(undef, D)
-            ws = Vector{Int8}(undef, D)
-            col = zeros(T, k * D)
-            overhang = zeros(Int, D)
-            for e in 1:D
-                t = (S(ξ′[e]) - S(lo[e][1])) / S(h) - (c[e] == 1 ? 0 : S(1) / 2)
-                n = (npts[e] << lvl) * N
-                # The window: the patch's own points, its high face plane
-                # included along a vertex-like dimension, owned where it is
-                # glued (the appendix) and the hook's at an outer face.
-                hi = c[e] == 1 ? n : n - 1
-                if al[e]
-                    r = round(Int, t)
-                    abs(t - r) <= S(1) / 1000 || throw(ArgumentError(
-                        "the atlas $(typeof(atlas)) declares dimension $e of patch $q " *
-                        "aligned with patch $p (chart_aligned), but the ghost at $ξ of " *
-                        "patch $p lands at $(t) spacings along it, not at a node"))
-                    f, w = r, 1
-                    col[(e - 1) * k + 1] = one(T)
-                else
-                    hi - k + 1 >= 0 || throw(ArgumentError(
-                        "patch $q has $(hi + 1) points along dimension $e at level " *
-                        "$lvl, fewer than the glue order $k"))
-                    f = clamp(floor(Int, t) - k ÷ 2 + 1, 0, hi - k + 1)
-                    w = k
-                    col[(e - 1) * k .+ (1:k)] .= glue_weights(T, S, t, f, k)
-                end
-                first = f - start[e] + G[e] + 1
-                last = first + w - 1
-                1 <= first && last <= N + 2G[e] + c[e] || throw(ArgumentError(
-                    "the stencil of the ghost at $ξ of patch $p reaches outside the " *
-                    "stored array of its source block $skey along dimension $e"))
-                # Beyond the owned range: the ghosts below, or above the
-                # shared plane of a vertex-like dimension, which a copy
-                # within the patch fills, or at an outer high face the hook.
-                overhang[e] = first <= G[e] ? -1 : last > G[e] + N + c[e] ? 1 : 0
-                fs[e] = first
-                ws[e] = w
-            end
-            check_overhang(forest, skey, overhang, ξ, p)
-            push!(target, Int32(b - offset))
-            push!(index, ntuple(d -> Int32(idx[d]), D))
-            push!(source, Int32(s - offset))
-            push!(firsts, ntuple(d -> fs[d], D))
-            push!(widths, ntuple(d -> ws[d], D))
-            append!(weights, col)
+            push!(out, GlueGhost{D,R}(b, ntuple(d -> Int32(idx[d]), D), Int32(p), s,
+                                      ntuple(d -> R(ξ′[d]), D)))
         end
     end
-    return GluePlan{T,D}(k, target, index, source, firsts, widths,
-                         reshape(weights, k * D, length(target)))
+    return out
+end
+
+# The stencil of one located ghost: the stored index of its first point
+# in the source block, its width per dimension, and its weights, `k` per
+# dimension. A function of the ghost and the replicated tree alone, so
+# that the source's owner builds what the target's rank checked, bit for
+# bit.
+function glue_stencil(::Type{T}, forest::Forest{D,R}, atlas, G::NTuple{D,Int},
+                      c::NTuple{D,Int}, k::Int, g::GlueGhost{D}) where {T,D,R}
+    N = forest.N
+    S = promote_type(T, Float64)
+    p = Int(g.from)
+    skey = forest.leaves[g.source]
+    q = patch(forest, skey)
+    lvl = level(skey)
+    h = spacing(R, forest, lvl)
+    ξ′ = g.ξ
+    al = hasmethod(chart_aligned, Tuple{typeof(atlas),Int,Int}) ?
+         chart_aligned(atlas, p, q) : ntuple(_ -> false, D)
+    lo = patch_extents(forest, q)
+    npts = patch_roots(forest, q)
+    spos = root_position(forest, skey.root)
+    start = ntuple(e -> ((spos[e] << lvl) + Int(skey.coords[e])) * N, D)
+    where_() = (ghost_position(R, forest, forest.leaves[g.target], g.index, G, c), p)
+    fs = Vector{Int32}(undef, D)
+    ws = Vector{Int8}(undef, D)
+    col = zeros(T, k * D)
+    overhang = zeros(Int, D)
+    for e in 1:D
+        t = (S(ξ′[e]) - S(lo[e][1])) / S(h) - (c[e] == 1 ? 0 : S(1) / 2)
+        n = (npts[e] << lvl) * N
+        # The window: the patch's own points, its high face plane included
+        # along a vertex-like dimension, owned where it is glued (the
+        # appendix) and the hook's at an outer face.
+        hi = c[e] == 1 ? n : n - 1
+        if al[e]
+            r = round(Int, t)
+            abs(t - r) <= S(1) / 1000 || throw(ArgumentError(
+                "the atlas $(typeof(atlas)) declares dimension $e of patch $q aligned " *
+                "with patch $p (chart_aligned), but the ghost at $(where_()[1]) of patch " *
+                "$p lands at $(t) spacings along it, not at a node"))
+            f, w = r, 1
+            col[(e - 1) * k + 1] = one(T)
+        else
+            hi - k + 1 >= 0 || throw(ArgumentError(
+                "patch $q has $(hi + 1) points along dimension $e at level $lvl, fewer " *
+                "than the glue order $k"))
+            f = clamp(floor(Int, t) - k ÷ 2 + 1, 0, hi - k + 1)
+            w = k
+            col[(e - 1) * k .+ (1:k)] .= glue_weights(T, S, t, f, k)
+        end
+        first = f - start[e] + G[e] + 1
+        last = first + w - 1
+        1 <= first && last <= N + 2G[e] + c[e] || throw(ArgumentError(
+            "the stencil of the ghost at $(where_()[1]) of patch $p reaches outside the " *
+            "stored array of its source block $skey along dimension $e"))
+        # Beyond the owned range: the ghosts below, or above the shared
+        # plane of a vertex-like dimension, which a copy within the patch
+        # fills, or at an outer high face the hook.
+        overhang[e] = first <= G[e] ? -1 : last > G[e] + N + c[e] ? 1 : 0
+        fs[e] = first
+        ws[e] = w
+    end
+    check_overhang(forest, skey, overhang, where_()...)
+    return ntuple(d -> fs[d], D), ntuple(d -> ws[d], D), col
 end
 
 # What a stencil reads beyond its source block's owned range is the
@@ -316,39 +419,97 @@ function check_overhang(forest::Forest{D}, skey::MortonKey{D}, overhang, ξ, p) 
     return nothing
 end
 
-# Each ghost point and variable sums the tensor product of its weights over
-# the source block's points (M20); along an aligned dimension the width is
-# one. One work item per point and variable, each writing its own slot.
+# The value of the stencil `j` for variable `v`: the tensor product of its
+# weights over the source block `s`'s points (M20); along an aligned
+# dimension the width is one. The same arithmetic for a ghost filled in
+# place and for one evaluated into a message, so that both are the serial
+# value bit for bit.
+@inline function glue_value(work, s, f, w, weights, j, v, ::Val{D}, ::Val{K}) where {D,K}
+    acc = zero(eltype(work))
+    @inbounds for tap in 0:(K^D - 1)
+        digits = ntuple(d -> (tap ÷ K^(d - 1)) % K, Val(D))
+        any(d -> digits[d] >= w[d], 1:D) && continue
+        c = one(eltype(work))
+        for d in 1:D
+            c *= weights[(d - 1) * K + digits[d] + 1, j]
+        end
+        acc += c * work[ntuple(d -> Int(f[d]) + digits[d], Val(D))..., v, s]
+    end
+    return acc
+end
+
+# A ghost whose source is on this rank: one work item per point and
+# variable, each writing its own slot.
 @kernel function glue_kernel!(work, @Const(target), @Const(index), @Const(source),
                               @Const(firsts), @Const(widths), @Const(weights),
                               ::Val{D}, ::Val{K}) where {D,K}
     j, v = @index(Global, NTuple)
     @inbounds begin
-        b = target[j]
-        s = source[j]
-        f = firsts[j]
-        w = widths[j]
-        acc = zero(eltype(work))
-        for tap in 0:(K^D - 1)
-            digits = ntuple(d -> (tap ÷ K^(d - 1)) % K, Val(D))
-            any(d -> digits[d] >= w[d], 1:D) && continue
-            c = one(eltype(work))
-            for d in 1:D
-                c *= weights[(d - 1) * K + digits[d] + 1, j]
-            end
-            acc += c * work[ntuple(d -> Int(f[d]) + digits[d], Val(D))..., v, s]
-        end
-        work[ntuple(d -> Int(index[j][d]), Val(D))..., v, b] = acc
+        acc = glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
+                         Val(D), Val(K))
+        work[ntuple(d -> Int(index[j][d]), Val(D))..., v, Int(target[j])] = acc
     end
 end
 
-# The fill of the interpolated ghosts, after phase 1 and the boundary hook.
-function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, backend) where {T,D}
+# A ghost of another rank's block, evaluated into the send buffer, the
+# variables of a point together.
+@kernel function glue_pack_kernel!(buf, @Const(work), @Const(source), @Const(firsts),
+                                   @Const(widths), @Const(weights), nvars,
+                                   ::Val{D}, ::Val{K}) where {D,K}
+    j, v = @index(Global, NTuple)
+    @inbounds buf[(j - 1) * nvars + v] =
+        glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v, Val(D),
+                   Val(K))
+end
+
+# A received ghost, copied into place.
+@kernel function glue_unpack_kernel!(work, @Const(buf), @Const(target), @Const(index),
+                                     nvars, ::Val{D}) where {D}
+    j, v = @index(Global, NTuple)
+    @inbounds work[ntuple(d -> Int(index[j][d]), Val(D))..., v, Int(target[j])] =
+        buf[(j - 1) * nvars + v]
+end
+
+# The fill of the interpolated ghosts, after phase 1 and the boundary hook:
+# the receives posted, the sends evaluated and sent, the local ghosts
+# filled in place while the messages travel, then the received ones
+# copied in. Its sends are waited for here, so that the fill's other
+# stages see nothing of this one; every rank posts its receives before it
+# waits, so the wait cannot deadlock.
+function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, backend, comm) where {T,D}
     isempty(plan) && return nothing
-    kernel = glue_kernel!(backend)
-    kernel(fs.work, plan.target, plan.index, plan.source, plan.first, plan.width,
-           plan.weights, Val(D), Val(plan.k); ndrange=(length(plan), fs.nvars))
+    nv = fs.nvars
+    recvs = Any[]
+    if !isempty(plan.recvpeers)
+        resize!(plan.recvbuf, length(plan.recvtarget) * nv)
+        for (peer, r) in zip(plan.recvpeers, segment_ranges(plan.recvcounts, nv))
+            push!(recvs, irecv(comm, view(plan.recvbuf, r), peer, GLUE_TAG))
+        end
+    end
+    sends = Any[]
+    if !isempty(plan.sendpeers)
+        resize!(plan.sendbuf, length(plan.sendsource) * nv)
+        glue_pack_kernel!(backend)(plan.sendbuf, fs.work, plan.sendsource, plan.sendfirst,
+                                   plan.sendwidth, plan.sendweights, nv, Val(D),
+                                   Val(plan.k); ndrange=(length(plan.sendsource), nv))
+        synchronize(backend)
+        for (peer, r) in zip(plan.sendpeers, segment_ranges(plan.sendcounts, nv))
+            push!(sends, isend(comm, view(plan.sendbuf, r), peer, GLUE_TAG))
+        end
+    end
+    if !isempty(plan.target)
+        glue_kernel!(backend)(fs.work, plan.target, plan.index, plan.source, plan.first,
+                              plan.width, plan.weights, Val(D), Val(plan.k);
+                              ndrange=(length(plan.target), nv))
+    end
+    if !isempty(recvs)
+        waitall(comm, recvs)
+        glue_unpack_kernel!(backend)(fs.work, plan.recvbuf, plan.recvtarget,
+                                     plan.recvindex, nv, Val(D);
+                                     ndrange=(length(plan.recvtarget), nv))
+    end
     synchronize(backend)
+    isempty(sends) || waitall(comm, sends)
     return nothing
 end
 
@@ -631,7 +792,15 @@ function host_fold_masks(fs::FieldSet{T,D}) where {T,D}
     N = forest.N
     c = staggers(fs.centering)
     masks = FoldMask{D}[]
-    for j in blockrange(forest)
+    # The refusal below depends on the block, so over a distributed forest
+    # with a patch glued to itself every rank asks it of every leaf, and
+    # all refuse alike (every forest's other folds pay nothing for it).
+    range = blockrange(forest)
+    selfglued = any(p -> any(e -> e.patch == p, conn.glue[glue_slot(p, d, s, D)]
+                                                for d in 1:D, s in 1:2),
+                    eachindex(conn.roots))
+    blocks = isdistributed(forest) && selfglued ? (1:nleaves(forest)) : range
+    for j in blocks
         k = forest.leaves[j]
         lvl = level(k)
         p = patch(forest, k)
@@ -671,7 +840,7 @@ function host_fold_masks(fs::FieldSet{T,D}) where {T,D}
         end
         push!(masks, FoldMask{D}(low, high, pieces))
     end
-    return masks
+    return blocks == range ? masks : masks[range]
 end
 
 KernelAbstractions.get_backend(a::AppendixArray) = get_backend(a.core)

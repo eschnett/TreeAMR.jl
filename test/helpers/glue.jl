@@ -60,7 +60,7 @@ function glue_ghosts(fs)
     out = Tuple{Int,NTuple{D,Int},NTuple{D,Float64},Int}[]
     dims = TreeAMR.appendix_layout(fs).dims          # the owned high planes (M20)
     for b in 1:nblocks(fs)
-        k = forest.leaves[b]
+        k = blockkey(fs, b)
         p = patch(forest, k)
         h = spacing(forest, k)
         o = block_origin(forest, k)
@@ -78,7 +78,8 @@ function glue_ghosts(fs)
 end
 
 # Owned points of a vertex-centered set, the appendix included, from
-# `f(ξ, p)`, every other stored point NaN, then the fill with `boundary`.
+# `f(ξ, p)`, times `v` for variable `v`, every other stored point NaN,
+# then the fill with `boundary`.
 function fill_from_owned!(fs, sched, f; boundary=nothing)
     forest = fs.forest
     G, N = fs.G, forest.N
@@ -86,11 +87,13 @@ function fill_from_owned!(fs, sched, f; boundary=nothing)
     dims = TreeAMR.appendix_layout(fs).dims
     fs.work .= NaN
     for b in 1:nblocks(fs)
-        k = forest.leaves[b]
+        k = blockkey(fs, b)
         p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
         for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), D))
             ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1) * h, D)
-            fs.work[I, 1, b] = f(ξ, p)
+            for v in 1:fs.nvars
+                fs.work[I, v, b] = v * f(ξ, p)
+            end
         end
     end
     fill_ghosts!(fs, sched; boundary=boundary)

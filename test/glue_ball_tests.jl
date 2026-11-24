@@ -13,14 +13,6 @@ function ball_poly(ξ, p)
            u[1] * u[2] * u[3] + u[2]^5 / 3
 end
 
-# The outer sphere's ghosts and its face plane, which the stencils of the
-# outermost shells read, from the same data.
-ball_hook(f) = CellBoundary(WithPatch((x, p, v, δ) -> f(x, p)))
-
-const BALL_OPS = Operators(prolongation=4, restriction=4, glue=6)
-ball_set(forest; nvars=1) =
-    FieldSet(forest, nvars; G=3, centering=vertexcentered(3), glue=:interpolate)
-
 # The largest difference between each interpolated ghost and `f` at the
 # patch and position the atlas locates it at.
 function ball_ghost_error(fs, atlas, f)

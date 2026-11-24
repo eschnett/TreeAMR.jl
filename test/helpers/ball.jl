@@ -70,6 +70,14 @@ function ball_glue(b::TestBall)
     return glue
 end
 
+# The vertex-centered set the ball tests fill, its operators, and the
+# hook for the outer sphere's ghosts and face plane, which the stencils of
+# the outermost shells read, from the same data as the owned points.
+const BALL_OPS = Operators(prolongation=4, restriction=4, glue=6)
+ball_set(forest; nvars=1) =
+    FieldSet(forest, nvars; G=3, centering=vertexcentered(3), glue=:interpolate)
+ball_hook(f) = CellBoundary(WithPatch((x, p, v, δ) -> v * f(x, p)))
+
 ball_forest(b::TestBall; N=8, kw...) =
     Forest([(roots=ball_roots(b, p),) for p in 1:ball_patches(b)]; N=N,
            glue=ball_glue(b), kw...)

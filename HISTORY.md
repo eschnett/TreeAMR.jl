@@ -5110,6 +5110,22 @@ M12 was decided with Erik, after M7 and before M9b.
     no patch, which `CODE.md` now states as a bound on the cube's
     resolution, and which also corrected its claim that such a ghost is
     the hook's.
+  - *Step 4, MPI (2026-11-24).* The sender computes, as designed, with
+    one change: the target's rank builds and checks every stencil before
+    the `alltoallv`, so that every refusal is agreed on before a rank
+    could wait in it, and the owner rebuilds the stencils of what it
+    receives with the same function. The glue round waits for its own
+    sends rather than handing them to the fill's last wait. Writing it
+    found that the phase-1 transfers a rank sends for another rank's
+    block were searched without the appendix's `top` flag, so the two
+    ends of a message disagreed on its layout as soon as a block owning
+    a glued high face plane had a remote neighbor; serially nothing
+    showed it. Over simulated ranks (2, 3 and 5) the kinked torus and
+    the seven-patch ball fill bit for bit as serially, with no
+    collective call in the fill; reverting the `top` fix fails the test,
+    and so does swapping two variables' slots in a message. Through MPI
+    at three ranks `test/mpi_workload.jl`'s `G2` matches the serial run
+    line for line, 1299 ghosts received across ranks.
 
 ## Downstream checks
 
