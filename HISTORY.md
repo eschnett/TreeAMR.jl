@@ -5096,6 +5096,20 @@ M12 was decided with Erik, after M7 and before M9b.
     block's copy carries its appendix under the `top` flag, which the
     regrid test found missing at first (a kept block's appendix came
     back zero).
+  - *Step 4, the balls (2026-11-24).* The seven- and thirteen-patch
+    balls, TreeMultiPatch's layouts copied into `test/helpers/ball.jl`,
+    in `test/glue_ball_tests.jl`. At two roots per cube side and `N = 8`
+    (44 928 interpolated ghosts on the seven-patch ball, 94 824 on the
+    thirteen-patch one) a patch's polynomial of degree 5 comes back to
+    `2e-14` at every ghost; a fold counts the distinct nodes, each once;
+    and the ghosts of data with the cube's symmetries keep them to
+    `1.6e-14` against an interpolation error of `5.5e-4`. A window
+    shifted one point off center leaves the polynomial exact and breaks
+    the symmetry, which is why the test is there. At one root per side
+    the build refuses: the cube's corner ghosts lie past the sphere, in
+    no patch, which `CODE.md` now states as a bound on the cube's
+    resolution, and which also corrected its claim that such a ghost is
+    the hook's.
 
 ## Downstream checks
 

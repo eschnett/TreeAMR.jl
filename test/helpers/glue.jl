@@ -50,28 +50,49 @@ end
 const KINKED_OPS = Operators(prolongation=4, restriction=4, glue=6)
 
 # Every stored point of every block of `fs` beyond a glued face of its
-# patch and nowhere else, past the high face planes the block owns, with its logical position and patch: what the
-# glue plan fills.
+# patch and nowhere else, past the high face planes the block owns, with
+# its logical position and patch: what the glue plan fills.
 function glue_ghosts(fs)
     forest = fs.forest
     conn = forest.conn
     G, c = fs.G, staggers(fs.centering)
-    out = Tuple{Int,NTuple{2,Int},NTuple{2,Float64},Int}[]
+    D = length(G)
+    out = Tuple{Int,NTuple{D,Int},NTuple{D,Float64},Int}[]
     dims = TreeAMR.appendix_layout(fs).dims          # the owned high planes (M20)
     for b in 1:nblocks(fs)
         k = forest.leaves[b]
         p = patch(forest, k)
         h = spacing(forest, k)
         o = block_origin(forest, k)
-        for I in CartesianIndices(size(fs.work)[1:2])
+        for I in CartesianIndices(size(fs.work)[1:D])
             idx = Tuple(I)
             δ = ntuple(d -> idx[d] <= G[d] ? -1 :
-                            idx[d] > G[d] + fs.forest.N + dims[b][d] ? 1 : 0, 2)
+                            idx[d] > G[d] + fs.forest.N + dims[b][d] ? 1 : 0, D)
             all(iszero, δ) && continue
             TreeAMR.interpolated_region(conn, k, δ) || continue
-            ξ = ntuple(d -> o[d] + (idx[d] - G[d] - 1) * h, 2)
+            ξ = ntuple(d -> o[d] + (idx[d] - G[d] - 1) * h, D)
             push!(out, (b, idx, ξ, p))
         end
     end
     return out
+end
+
+# Owned points of a vertex-centered set, the appendix included, from
+# `f(ξ, p)`, every other stored point NaN, then the fill with `boundary`.
+function fill_from_owned!(fs, sched, f; boundary=nothing)
+    forest = fs.forest
+    G, N = fs.G, forest.N
+    D = length(G)
+    dims = TreeAMR.appendix_layout(fs).dims
+    fs.work .= NaN
+    for b in 1:nblocks(fs)
+        k = forest.leaves[b]
+        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
+        for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), D))
+            ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1) * h, D)
+            fs.work[I, 1, b] = f(ξ, p)
+        end
+    end
+    fill_ghosts!(fs, sched; boundary=boundary)
+    return fs
 end

@@ -3544,7 +3544,8 @@ appendix = true)` (an `AppendixArray`), `map_blocks!`'s keyword and the
 closed ranges of the fill — the folds and norms counting each point
 once, and `regrid!`'s guard with the appendix carried by a kept
 block's copy, serially and on the CPU: `src/glue.jl`, tested in
-`test/glue_tests.jl`. A distributed forest and reflecting or outflow
+`test/glue_tests.jl` and on the seven- and thirteen-patch balls in
+`test/glue_ball_tests.jl`. A distributed forest and reflecting or outflow
 faces are refused, and a fold over the state vector (not the working
 array) refuses a device.
 
@@ -3558,8 +3559,17 @@ spacings, which M19's contract did not ask; a cubed sphere's maps
 continue naturally. `chart_locate(atlas, x)` names the patch `q ≠ p` and
 the logical `ξ′` there, and the search of M19's location step
 (`fold_point`, `locate_leaf`) the block `s` of `q` holding `ξ′`. A
-ghost that `chart_locate` places outside every patch lies beyond an outer
-face, and is the boundary hook's, as beyond an outer face of a brick.
+ghost region that leaves its patch through an outer face too, beside a
+glued one, is the boundary hook's, as beyond an outer face of a brick;
+the forest's topology says so, not the atlas. A ghost that crosses
+glued faces only and that `chart_locate` places outside every patch is
+refused at schedule build, since no stencil reaches it and no outer
+face makes it the hook's. On the balls that bounds the cube's
+resolution: its corner ghosts, `G` spacings out along the diagonal,
+lie at `√3 Lc (1 + 2G/(nN))` from the center, which must be inside the
+sphere the inner shells reach; at `G = 3`, `N = 8` and `R1 = 2.5 Lc`
+one root per cube side is too coarse (`3.03 Lc`) and two suffice
+(`2.38 Lc`).
 
 The value is a tensor product of one-dimensional Lagrange stencils of
 `k` points at `ξ′`, centered where they fit and clamped, per dimension
@@ -6365,7 +6375,7 @@ which companion releases go with it.
 `element_tests.jl` (M16), `reflect_tests.jl` (M10), `outflow_tests.jl`,
 `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
-`atlas_tests.jl` (M19),
+`atlas_tests.jl` (M19), `glue_tests.jl` and `glue_ball_tests.jl` (M20),
 `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -6499,6 +6509,29 @@ prolongations received across ranks and the refusal of an element
 order that differs on one rank only; `mpi_tests.jl` asserts the one
 stage, the conserved mass, the received prolongations and the refusal,
 and counts 24 changing regrids).
+
+`glue_tests.jl` holds the sets interpolated across a glue (M20) on 2D
+forests: the kinked torus of `bench/coupling/torus.jl`
+(`helpers/glue.jl`), whose ghosts reproduce a patch's polynomial of
+degree `glue - 1` to rounding and converge at the glue order; the
+annulus, declared aligned, bit for bit the copy; two patches glued low
+to low and high to high; the refusals at schedule build; the appendix
+through `statelength`, `scatter!`, `gather!`, `statearray` and
+`map_blocks!`; the folds and norms counting each point once; and
+`regrid!`'s guard. `glue_ball_tests.jl` holds the same on the seven- and
+thirteen-patch balls of TreeMultiPatch, written out again in
+`helpers/ball.jl`, since the test environment cannot depend on a
+package that depends on TreeAMR: a patch's polynomial at every ghost,
+faces, cube edges and patch corners included, with the outer sphere's
+plane from the hook; the state's length, its round trip, and a fold
+counting the ball's distinct nodes, each once (`(M + 1)³ + (mN - 1)(6M²
++ 2)`, `M = nN`); the fill of data with the cube's symmetries keeping
+them to `1.6e-14` against an interpolation error of `5.5e-4` at two
+roots per side, which an off-center window breaks and a polynomial does
+not see; `chart_aligned`'s widths on the thirteen-patch ball, one along
+the radius between outer shells and along both angles between the
+layers; and the refusals of a wrong declaration and of a cube too
+coarse for its corner ghosts.
 
 `patch_tests.jl` holds the multi-patch forest's own tests (M17), each
 claim stated against a forest with no glue, as M12's are against the

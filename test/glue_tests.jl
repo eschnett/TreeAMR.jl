@@ -7,25 +7,6 @@ using TreeAMR: GluePlan, chart_aligned
 # each patch, which a six-point stencil reproduces exactly.
 glue_poly(ξ, p) = 0.5 + p * ξ[1]^5 + 2ξ[1]^3 * ξ[2]^4 - (p + 1) * ξ[2]^5 + ξ[1] * ξ[2]
 
-# Owned points, the appendix included, from `f(ξ, p)`, every other stored
-# point NaN, then the fill.
-function fill_from_owned!(fs, sched, f)
-    forest = fs.forest
-    G, N = fs.G, forest.N
-    dims = TreeAMR.appendix_layout(fs).dims
-    fs.work .= NaN
-    for b in 1:nblocks(fs)
-        k = forest.leaves[b]
-        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
-        for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), 2))
-            ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1) * h, 2)
-            fs.work[I, 1, b] = f(ξ, p)
-        end
-    end
-    fill_ghosts!(fs, sched)
-    return fs
-end
-
 @testset "Interpolated ghosts across a kinked glue reproduce a patch's polynomial exactly" begin
     # Guards the stencil: the window, its clamping into the patch across,
     # the weights and the source block's index arithmetic. Data that is a
