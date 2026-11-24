@@ -44,4 +44,5 @@ TreeAMR.chart_locate
 TreeAMR.chart_map
 TreeAMR.chart_jacobian
 TreeAMR.chart_hessian
+TreeAMR.chart_aligned
 ```

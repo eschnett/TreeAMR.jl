@@ -3537,6 +3537,17 @@ again when they rebuild the schedule. An interpolated set refuses a
 missing order or atlas, and the collective checks compare the order and
 `hash(atlas)` across ranks with the rest of the layout.
 
+*Implemented so far:* the keywords, the refusals at schedule build (not
+yet `regrid!`'s), the location with `chart_aligned`, and the stage,
+serially and on the CPU, under half-open ownership: `src/glue.jl`, tested
+in `test/glue_tests.jl`. Until the appendix lands, a ghost the atlas
+puts on a glued high face plane, which it may give to either side, is
+carried across that glue by the glue's own map to the patch where the
+plane is owned (`owned_side`); a plane glued high to high is refused; and
+a point in the last cell below a glued high face is extrapolated by less
+than a spacing. A distributed forest and reflecting or outflow faces are
+refused.
+
 **Where a ghost lies, and what fills it.** A ghost of block `b` of
 patch `p` beyond a glued face of `p` — across a face, an edge or a
 patch corner, which no longer needs refusing — sits at the logical
@@ -3573,21 +3584,21 @@ the interpolation is two-dimensional, in the angles only; across the
 middle sphere an inner and an outer shell over one cube face share both
 angles, `c/|c|`, and it is one-dimensional, in the radius. The atlas
 declares this, since only the maps know it: an optional method
-`chart_aligned(atlas, p, q) -> NTuple{D,Int8}` gives, per dimension `e`
-of `q`, the dimension `d` of `p` whose logical coordinate `ξ′_e` equals
-(`+d`), or equals reversed within the patches' common extent (`−d`), or
-`0` for none; without the method nothing is aligned. At schedule build
-TreeAMR checks every interpolated ghost against it: `chart_locate`'s
-`ξ′_e` must lie within a thousandth of a spacing of the declared value,
-far above any rounding of the map and its inverse and far below what a
-wrong declaration gives across a kink, or the build is refused, naming
-the patches, the ghost and both values. Then it takes `ξ′_e` from the
-declaration, by index arithmetic, exactly, so that it is a node, and
-the stencil along `e` has width one: no read along that dimension, by
-construction rather than by a weight that happens to be zero. A check
-that rounded `ξ′_e` to a nearby node would not guarantee this: it would
-depend on how well the atlas inverts its map, and would also round
-ghosts that are near a node by coincidence.
+`chart_aligned(atlas, p, q) -> NTuple{D,Bool}` says along which
+dimensions of `q` a point at a node of `p`'s grid lands on a node of
+`q`'s at the same level; without the method nothing is aligned. An
+annulus's atlas declares both dimensions, its maps joining smoothly with
+nodes on nodes. At schedule build TreeAMR checks every interpolated
+ghost against it: along a declared dimension `chart_locate`'s `ξ′_e`
+must lie within a thousandth of a spacing of a node, far above any
+rounding of the map and its inverse and far below what a wrong
+declaration gives across a kink, or the build is refused, naming the
+patches, the ghost and where it landed. Then it takes that node exactly,
+and the stencil along `e` has width one: no read along that dimension,
+by construction rather than by a weight that happens to be zero.
+Rounding to a nearby node without the declaration would not guarantee
+this: it would depend on how well the atlas inverts its map, and would
+also round ghosts that are near a node by coincidence.
 
 **Closed ownership and the appendix.** Under half-open ownership a
 patch owns its low face planes only. On the seven-patch ball that leaves
@@ -3612,11 +3623,13 @@ once — a point on two such planes, at an edge or a corner, in the plane
 of the lowest dimension — every plane in the order of its stored
 indices. `statelength` counts both; `scatter!` and `gather!` move both;
 `statearray(u, fs)` stays the cores' array, so code written for bricks
-reads the cores as before; and **`stateview(u, fs)`** is the whole state
-as an `(i1, …, iD, var, b)` array whose `i_d` runs to `N + 1` where the
-block owns the plane, reading and writing the core or the appendix as
-the index says, and discarding a write to a point the block does not
-own. On a set with no appendix `stateview` is `statearray`. A block's
+reads the cores as before; and **`statearray(u, fs; appendix = true)`**
+is the whole state as an `(i1, …, iD, var, b)` array whose `i_d` runs to
+`N + 1` where the block owns the plane, reading and writing the core or
+the appendix as the index says, and discarding a write to a point the
+block does not own. On a set with no appendix it is the plain
+`statearray`. (`stateview` is taken: it is one set's segment of a state
+vector of several sets.) A block's
 appendix offset is a host table built with the schedule's layout, and
 the planes are already stored: a vertex-like set stores its high plane
 at `G+N+1` today, as a ghost.
@@ -3625,8 +3638,8 @@ at `G+N+1` today, as a ghost.
 or `false`**, with no default, because a right-hand side that forgets
 the appendix leaves its planes unevolved without a word. With `true` it
 launches over the closed range, as `closed = true` does, and the kernel
-writes through `stateview`, which discards the planes a block does not
-own. That costs a plane per dimension on every block, about `D/N` of the
+writes through `statearray(du, fs; appendix = true)`, which discards the
+planes a block does not own. That costs a plane per dimension on every block, about `D/N` of the
 work, 9 % at `N = 32` in 3D; a launch over the appendix alone is the
 optimization if it shows.
 

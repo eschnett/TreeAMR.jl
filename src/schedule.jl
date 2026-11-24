@@ -706,6 +706,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     centering::NTuple{D,Symbol}                  # centering it was built for
     P::Int                                       # element order it was built for (M16)
     walls::Symbol                                # walls it was built for (AMR-8)
+    glue::Symbol                                 # glue mode it was built for (M20)
     operators::Operators
     backend::BK
     phase1::Vector{GRP}
@@ -716,17 +717,19 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     stages::Vector{ST}                           # phase 1, then phase 2 by level
     stagegroups::Vector{UnitRange{Int}}          # runs of `stages` that run together
     grouplocals::Vector{Vector{GRP}}             # each run's local groups, in stage order
+    glueplan::GluePlan{T,D}                      # the ghosts interpolated across a glue
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
-        forest, generation, G, centering, P, walls, operators, backend, phase1, phase2,
-        levels, boundaries, boundaryplan, stages, stagegroups) where {T,D,R,BK,GRP,BP,ST}
-        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls,
+        forest, generation, G, centering, P, walls, glue, operators, backend, phase1,
+        phase2, levels, boundaries, boundaryplan, stages, stagegroups,
+        glueplan) where {T,D,R,BK,GRP,BP,ST}
+        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls, glue,
                                        operators,
                                        backend, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
-                                       group_locals(stages, stagegroups))
+                                       group_locals(stages, stagegroups), glueplan)
     end
 end
 
@@ -1294,7 +1297,8 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
-                        b::Int, dirs, symmetric::Bool=false) where {D}
+                        b::Int, dirs, symmetric::Bool=false;
+                        glueregions=nothing) where {D}
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
@@ -1319,6 +1323,12 @@ function block_sources!(pairs::TransferPairs{D},
         # cannot empty it, so testing the unhalved region covers every
         # kind.)
         isempty(region) && continue
+        # Across a glue of a set interpolated there (M20): located through
+        # the atlas once the search is done, not searched for here.
+        if glueregions !== nothing && interpolated_region(forest.conn, k, δ)
+            push!(glueregions, (b, δ, region))
+            continue
+        end
         δ′, faces = wall_direction(forest, k, δ)
         if any(!=(OuterFace), faces)
             mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, faces, region, low,
@@ -2101,14 +2111,15 @@ function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple
     return nothing
 end
 
-GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
+GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
-                  walls=fs.walls, T=T, backend=get_backend(fs.work))
+                  walls=fs.walls, glue=fs.glue, atlas=atlas, T=T,
+                  backend=get_backend(fs.work))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
                        centering=cellcentered(D), P::Integer=0,
-                       walls::Symbol=:half_open,
+                       walls::Symbol=:half_open, glue::Symbol=:copy, atlas=nothing,
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
@@ -2122,17 +2133,28 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # `0` is the forest form's "no elements", as `FieldSet` stores it.
         order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
         check_operators(N, gs, cs, order, operators)
-        # What a forest of patches (M17) cannot fill: a region beyond a
-        # patch corner, which an element set's faces-only filter below
-        # never asks for, and a layout the glue's axis map does not keep.
-        check_patch_corners(forest.conn, N, gs, ss, order)
-        check_glue_layout(forest.conn, gs, cs, ss)
+        check_glue(glue)
+        check_glue_order(glue, order)
+        if glue === :interpolate && ispatched(forest)
+            # Interpolated across its glue (M20): a patch corner has a
+            # source like any other ghost, and the source is read in its
+            # own patch's frame, so neither refusal below applies.
+            check_glue_interpolation(forest, N, gs, ss, operators, atlas)
+            check_glue_levels(forest, blockrange(forest))
+        else
+            # What a forest of patches (M17) cannot fill: a region beyond a
+            # patch corner, which an element set's faces-only filter below
+            # never asks for, and a layout the glue's axis map does not keep.
+            check_patch_corners(forest.conn, N, gs, ss, order)
+            check_glue_layout(forest.conn, gs, cs, ss)
+        end
         check_floattype(T, backend)
         check_walls(walls)
         layout = layouthash(gs, cs, order, walls, Int(operators.family),
                             operators.prolongation,
                             operators.restriction, operators.bounded,
-                            operators.vertex_prolongation, T,
+                            operators.vertex_prolongation, glue, operators.glue,
+                            glue === :interpolate ? hash(atlas) : UInt(0), T,
                             nameof(typeof(backend)))
         return (gs, cs, ss, order), layout
     end
@@ -2162,10 +2184,13 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     chunks = threadchunks(nb)
     perpairs = [TransferPairs{D}() for _ in chunks]
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
+    interpolated = glue === :interpolate && ispatched(forest)
+    perglue = [GlueRegion{D}[] for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
             block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
-                           offset + b, dirs, symmetric)
+                           offset + b, dirs, symmetric;
+                           glueregions=interpolated ? perglue[c] : nothing)
         end
     end
 
@@ -2179,6 +2204,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         merge_pairs!(pairs, perpairs[c])
         append!(boundaries, perboundaries[c])
     end
+    glueplan = glue_plan(T, forest, reduce(vcat, perglue; init=GlueRegion{D}[]), ghosts,
+                         stags, operators, atlas, offset)
     # Over a distributed forest (M7) the transfers split three ways: the
     # local ones stay in `pairs`, in local block indices; those with a
     # remote source are received; and those this rank computes for a
@@ -2256,8 +2283,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
-        forest, generation(forest), ghosts, centers, order, walls, operators, backend,
-        phase1, phase2, levels, boundaries, bplan, stages, groups)
+        forest, generation(forest), ghosts, centers, order, walls, glue, operators,
+        backend, phase1, phase2, levels, boundaries, bplan, stages, groups, glueplan)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

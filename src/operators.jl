@@ -86,7 +86,7 @@ ElementLocal
 
 """
     Operators(; prolongation, restriction, family=PointValue, bounded=false,
-              vertex_prolongation=nothing)
+              vertex_prolongation=nothing, glue=nothing)
     Operators(; family=ElementLocal)
 
 The operator family and orders a [`GhostSchedule`](@ref) is built with.
@@ -299,6 +299,17 @@ ignores `vertex_prolongation`, and without it a conservative set with a
 vertex-like dimension is refused. `bounded = true` is not implemented
 together with it. The vertex-like requirement is `G ≥
 vertex_prolongation ÷ 2 - 1`.
+
+**Across a glue.** `glue` is the order of the interpolation that fills
+the ghosts of a `glue = :interpolate` field set across a glued face of a
+forest of patches (M20): the number of points per dimension of its
+Lagrange stencil, even and at least 2, exact to degree `glue - 1`. It is
+required for such a set, with no default, because what a derivative
+stencil needs from its ghosts is the scheme's to say: a second
+derivative of order 4 needs `glue = 6`. A set that copies across its
+glue ignores it. It must fit the set's stored array, `glue ≤ 2(G + c)`
+along every dimension, `c = 1` in a vertex-like one. See "Finite
+differences across a glue" in `CODE.md`.
 """
 struct Operators
     family::OperatorFamily
@@ -306,6 +317,7 @@ struct Operators
     restriction::Int
     bounded::Bool                      # the operators create no new extrema
     vertex_prolongation::Int           # conservative, along a stagger; 0 if none
+    glue::Int                          # interpolation across a glue (M20); 0 if none
 
     # Sentinel defaults rather than required keywords, so that omitting
     # one reports *why* there is no default instead of a bare
@@ -313,7 +325,8 @@ struct Operators
     function Operators(; prolongation::Union{Integer,Nothing}=nothing,
                        restriction::Union{Integer,Nothing}=nothing,
                        family::OperatorFamily=PointValue, bounded::Bool=false,
-                       vertex_prolongation::Union{Integer,Nothing}=nothing)
+                       vertex_prolongation::Union{Integer,Nothing}=nothing,
+                       glue::Union{Integer,Nothing}=nothing)
         # Before the missing-order check: the element family has no
         # orders, so asking for them is the error, not omitting them.
         if family === ElementLocal
@@ -332,7 +345,12 @@ struct Operators
                 "compatible restriction, fixed by the order P of the field set, and " *
                 "bounding them would break the compatibility that keeps a " *
                 "summation-by-parts scheme's energy invariant across a coarse-fine face"))
-            return new(family, 0, 0, false, 0)
+            glue === nothing || throw(ArgumentError(
+                "the ElementLocal family takes no glue order: an element set copies " *
+                "its face nodes across a glue rather than interpolating them, so " *
+                "there is no order to choose here. Write " *
+                "`Operators(family = ElementLocal)`."))
+            return new(family, 0, 0, false, 0, 0)
         end
         for (name, p) in (("prolongation", prolongation), ("restriction", restriction))
             p === nothing && throw(ArgumentError(
@@ -385,8 +403,14 @@ struct Operators
                 "stencil in every dimension. Use the unbounded operators for a " *
                 "staggered conservative set"))
         end
+        if glue !== nothing
+            glue >= 2 && iseven(glue) || throw(ArgumentError(
+                "the glue order must be even and at least 2 (the stencil is centered " *
+                "on the cell or node interval the point lies in), got $glue"))
+        end
         return new(family, Int(prolongation), Int(restriction), bounded,
-                   vertex_prolongation === nothing ? 0 : Int(vertex_prolongation))
+                   vertex_prolongation === nothing ? 0 : Int(vertex_prolongation),
+                   glue === nothing ? 0 : Int(glue))
     end
 end
 
@@ -426,7 +450,8 @@ Base.show(io::IO, ops::Operators) =
           ", restriction=", ops.restriction, ", family=", ops.family,
           ops.bounded ? ", bounded=true" : "",
           ops.vertex_prolongation == 0 ? "" :
-          ", vertex_prolongation=$(ops.vertex_prolongation)", ")")
+          ", vertex_prolongation=$(ops.vertex_prolongation)",
+          ops.glue == 0 ? "" : ", glue=$(ops.glue)", ")")
 
 # The prolongation width along a vertex-like dimension: the family's own
 # order for point values, `vertex_prolongation` for the conservative

@@ -853,8 +853,8 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, eltype(fs.work),
-                   nameof(typeof(backend)), sched === nothing))
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, fs.glue,
+                   eltype(fs.work), nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
         "schedule was built for a different forest"))
@@ -874,6 +874,9 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
     fs.walls === sched.walls || throw(ArgumentError(
         "the field set has walls = :$(fs.walls) but its schedule was built for " *
         ":$(sched.walls); pair each field set with its own schedule"))
+    fs.glue === sched.glue || throw(ArgumentError(
+        "the field set has glue = :$(fs.glue) but its schedule was built for " *
+        ":$(sched.glue); pair each field set with its own schedule"))
     # What `fill_ghosts!` would refuse further down, refused here,
     # where the refusal is agreed between the ranks.
     eltype(fs.work) == scheduletype(sched) || throw(ArgumentError(
@@ -885,7 +888,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "own schedule"))
     ops = sched.operators
     push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded,
-                   ops.vertex_prolongation))
+                   ops.vertex_prolongation, ops.glue))
     return nothing
 end
 

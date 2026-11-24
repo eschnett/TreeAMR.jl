@@ -937,6 +937,12 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
         apply_boundary!(fs, boundary, schedule, backend)
     end
 
+    # Across a glue of a set interpolated there (M20): after phase 1 and the
+    # hook, whose points the stencils read, and before phase 2, which never
+    # reads these ghosts. Behind a barrier, so that a set without them
+    # compiles none of it.
+    Base.inferencebarrier(run_glue!)(fs, schedule.glueplan, backend)
+
     # Phase 2: prolongations, coarsest targets first. A prolongation may
     # read its coarse source's ghosts, which the earlier sweeps filled;
     # levels that read nothing the ones below them write run together, as
@@ -1574,6 +1580,11 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "the field set has walls = :$(fs.walls) but this schedule was built for " *
         ":$(schedule.walls); the target ranges at a low domain face differ between " *
         "the two. Build one with `GhostSchedule(fs, operators)`."))
+    fs.glue === schedule.glue || throw(ArgumentError(
+        "the field set has glue = :$(fs.glue) but this schedule was built for " *
+        ":$(schedule.glue); the ghosts across a glued face are copied under one and " *
+        "interpolated under the other. Build one with " *
+        "`GhostSchedule(fs, operators; atlas)`."))
 
     backend = get_backend(fs.work)
     samebackend(backend, schedule.backend) || throw(ArgumentError(

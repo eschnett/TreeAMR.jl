@@ -363,7 +363,7 @@ face nodes are its coupling. Decided, and still to settle in step 4:
   stored already, as every vertex-like set stores its non-owned high
   plane; what changes is that they are evolved: `statelength`,
   `scatter!` and `gather!` carry the appendix; `statearray` stays the
-  cores' array, and `stateview` is the whole state, core and appendix;
+  cores' array, and `statearray(u, fs; appendix = true)` the whole state;
   `map_blocks!` on a set with an appendix requires `appendix = true` or
   `false`, so that the application's right-hand side covers the planes
   by choice; the fill skips them; the flat device launches, the MPI

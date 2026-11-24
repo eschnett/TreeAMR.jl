@@ -5040,6 +5040,29 @@ M12 was decided with Erik, after M7 and before M9b.
     that are near a node only by coincidence. The same declaration makes
     the interpolation across the middle sphere one-dimensional, since
     the inner and outer shells over one cube face share both angles.
+  - *Step 4, the first slice (2026-11-23).* The keywords (`glue` on
+    `FieldSet`, `glue` on `Operators`, `atlas` on `GhostSchedule`), the
+    refusals at schedule build, the location with `chart_aligned`, and the
+    interpolated stage, serially and on the CPU, under half-open
+    ownership, in `src/glue.jl`. Two things changed from the design. The
+    alignment declaration became one flag per dimension of `q`, "a node
+    of `p` lands on a node of `q`", rather than the dimension of `p`
+    whose coordinate equals `q`'s: the annulus's angle is shifted by a
+    patch's length across each glue, not equal, and the flag form covers
+    it, the thirteen-patch ball's radius and angles alike. And the
+    accessor of the whole state became `statearray(u, fs; appendix =
+    true)`, since `stateview` names a set's segment of a several-set
+    state already. Implementing it showed that an atlas may give a ghost
+    on a shared face to either patch, its own included, where under
+    half-open ownership that plane is a ghost filled by the same stage;
+    such a point is carried across the glue by the glue's own map, to
+    the patch that owns the plane, until closed ownership owns it on
+    both sides. Measured on the kinked torus (`test/glue_tests.jl`): the
+    ghosts of a smooth function converge at 6 with 6-point stencils
+    (0.19, 3.5e−3, 5.7e−5 at 1, 2 and 4 roots per patch side), a patch's
+    polynomial of degree 5 is reproduced to rounding, and on the
+    annulus, declared aligned, the interpolated ghosts are the copied
+    ones bit for bit.
 
 ## Downstream checks
 
