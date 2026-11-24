@@ -110,6 +110,7 @@ function allgather(c::MPICommunicator, x)
 end
 
 function allgatherv(c::MPICommunicator, v::AbstractVector)
+    TreeAMR.check_gatherable(v)
     send = collect(v)
     counts = MPI.Allgather(length(send), c.comm)
     recv = similar(send, sum(counts))

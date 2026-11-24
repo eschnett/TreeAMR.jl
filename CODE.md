@@ -4780,12 +4780,33 @@ in the layer order.
 
 - It defines an abstract `Communicator` and the default
   `SerialCommunicator`, rank 0 of 1, which sends nothing.
-- The package talks to it through a few internal verbs: `commrank`,
+- The package talks to it through a few verbs: `commrank`,
   `commsize`, `allgather` of one `isbits` value, `allgatherv` of a
-  vector, `alltoallv`, and nonblocking `isend` / `irecv` with
+  vector of them, `alltoallv`, and nonblocking `isend` / `irecv` with
   `waitall` over flat buffers. Two more,
   `commnodes`, the number of shared-memory nodes, and `bcast` of one
   rank's vector, serve TreeIOHDF5's checkpoints.
+- The first four are `public`, with `Communicator` and
+  `SerialCommunicator`, and `communicator(forest)` and
+  `communicator(fs)` return the forest's communicator (TreeGRRMHD's
+  AMR-13). An application combines host values of its own over the
+  ranks with them — a diagnostic's sum, a decision from the clock or the
+  file system that gates a collective call — where TreeHydro and
+  TreeGeneralizedHarmonic each called the internals qualified, around
+  helpers of their own. They are not exported, since `allgather` and
+  `commsize` are generic names to put into every `using TreeAMR`
+  namespace. The rest stay internal for a reason: they travel on the
+  package's own duplicate of the communicator, where collectives are
+  matched in call order, which every rank keeps, but a point-to-point
+  message an application sent could match one of the package's.
+  `allgatherv` refuses a vector whose elements are not `isbits` on every
+  communicator, the serial one included, so that what would fail over
+  MPI fails serially too. A rank-order fold over the ranks
+  (TreeHydro's `rank_reduce`) and an agreed refusal (its
+  `agree_refusal`) were proposed beside them and are left to the
+  applications **(open)**: the first would be `combine_blocks`'s fold
+  made public, the second a public form of the agreement the forest
+  digest serves.
 - Every verb has a serial method, so `src/` never branches on whether
   MPI is there. A serial run takes the distributed code path with every
   message empty, and the existing suite is its test.
@@ -5700,7 +5721,7 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 |---|---|---|
 | threading | `threading.jl` | `threadchunks` (the block-ownership partition), the three host-side parallel-loop helpers everything else is built on, and `launch_by_owner!` |
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
-| communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the internal verbs (`commrank`, `commsize`, `allgather`, `allgatherv`, `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
+| communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the verbs (`commrank`, `commsize`, `allgather`, `allgatherv` public; `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter + connectivity (one brick, or patches and their glue table, M17); neighbor finding (oriented across a rotating seam or a glued face), `refine!`/`coarsen!`, `balance!` (conformity at a seam and a glued face) |
 | geometry | `geometry.jl` | key + stored cell index → physical coordinates (logical, patch by patch, on a forest of patches); `block_origins`, `block_spacings` and `block_patches` |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest, and so do `parity`, `rotation` and their tables; `RotationPair` |
@@ -6055,9 +6076,10 @@ beside TreeAMR.
 ### Companion interface
 
 Two kinds of package build on TreeAMR. **Physics packages** — TreeWave,
-TreeHydro, TreeGeneralizedHarmonic — use the exported API only, and
-TreeAMR's semantic versioning covers exactly that: such a package bounds
-TreeAMR by `[compat]` over a minor series (`TreeAMR = "0.2"`).
+TreeHydro, TreeGeneralizedHarmonic — use the exported and the `public`
+names only, and TreeAMR's semantic versioning covers exactly that: such
+a package bounds TreeAMR by `[compat]` over a minor series
+(`TreeAMR = "0.2"`).
 **Companion packages** provide infrastructure themselves —
 [TreeIOHDF5](https://github.com/eschnett/TreeIOHDF5.jl), the checkpoints;
 a point-interpolation package would be another — and may also use the
@@ -6087,11 +6109,11 @@ in `__init__` would not be seen by the resolver.)
 
 The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
 
-- the communicator layer: `Communicator`, `commrank`, `commsize`,
-  `allgather`, `allgatherv`, `bcast`, `commnodes`, `isend`, `irecv`,
+- the communicator layer: `bcast`, `commnodes`, `isend`, `irecv`,
   `waitall` (`communicator.jl`; `bcast` and `commnodes` exist only for
   the checkpoints, and stay here because `ext/TreeAMRMPIExt.jl`
-  implements them);
+  implements them), beside the public `Communicator`, `commrank`,
+  `commsize`, `allgather` and `allgatherv`;
 - the cross-rank agreement: `ForestDigest`, `digest_verdict`,
   `layouthash` (`forest.jl`);
 - the rotating seam: `hasrotating`, `rotating_dims`, `ishalfturn`,
