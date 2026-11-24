@@ -264,6 +264,16 @@ default (its quadrant refined about the origin, 22 variables, `32³`,
 vertex-centered); `jobs/fold.toml` runs it, then the suite, on an H200,
 or on the laptop's Metal. `HISTORY.md`'s M15 entry has the numbers.
 
+`bench/coupling/` is M20's prototype of the coupling across a glue,
+on plain arrays and without TreeAMR, standard library only: `torus.jl`,
+two patches on a torus whose map kinks at the glue, and `sphere.jl`, the
+cubed sphere's surface, each with the scripts behind the tables of M20
+in `HISTORY.md` (`*_checks.jl` verify the operators and the fill):
+
+```bash
+julia --startup-file=no -t 12 bench/coupling/sphere_study.jl
+```
+
 `bench/nested.jl` times the ghost fill of the downstream's nested mesh
 (eschnett/TreeGeneralizedHarmonic.jl#11) stage by stage and rank by
 rank, serially or under `MPI.mpiexec()`, and counts each prolongation
