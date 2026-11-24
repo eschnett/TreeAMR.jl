@@ -17,14 +17,17 @@
     Communicator
 
 The processes a [`Forest`](@ref) is distributed over, as the package
-sees them: an abstract type whose subtypes answer the internal verbs
+sees them: an abstract type whose subtypes answer the verbs
 [`commrank`](@ref TreeAMR.commrank), [`commsize`](@ref TreeAMR.commsize),
 [`allgather`](@ref TreeAMR.allgather),
 [`allgatherv`](@ref TreeAMR.allgatherv),
 [`alltoallv`](@ref TreeAMR.alltoallv), [`bcast`](@ref TreeAMR.bcast),
 [`commnodes`](@ref TreeAMR.commnodes) and the nonblocking
 [`isend`](@ref TreeAMR.isend) / [`irecv`](@ref TreeAMR.irecv) /
-[`waitall`](@ref TreeAMR.waitall).
+[`waitall`](@ref TreeAMR.waitall). The first four are public, so that an
+application can combine its own host values over the ranks of a forest,
+reached as [`communicator`](@ref)`(forest)`; the others are the
+package's own.
 
 [`SerialCommunicator`](@ref TreeAMR.SerialCommunicator) is the default.
 An application does not construct one of these itself: it passes its own
@@ -49,9 +52,16 @@ Base.show(io::IO, ::SerialCommunicator) = print(io, "SerialCommunicator()")
 """
     communicator(comm) -> TreeAMR.Communicator
     communicator(comm::MPI.Comm; deviceaware = false)
+    communicator(forest::Forest) -> TreeAMR.Communicator
+    communicator(fs::FieldSet) -> TreeAMR.Communicator
 
 The package's view of an application's communicator: what a
-[`Forest`](@ref) stores for its `comm` keyword. A
+[`Forest`](@ref) stores for its `comm` keyword. Given a forest, or a
+field set over one, it returns the communicator the forest stores,
+which is what the public collectives
+[`allgather`](@ref TreeAMR.allgather) and
+[`allgatherv`](@ref TreeAMR.allgatherv) take when an application
+combines a host value of its own over the ranks. A
 [`TreeAMR.Communicator`](@ref TreeAMR.Communicator) is returned as it is,
 and `nothing` — the keyword's default — is a
 [`SerialCommunicator`](@ref TreeAMR.SerialCommunicator).
@@ -113,7 +123,9 @@ missing_verb(comm::Communicator, verb::Symbol) = throw(ArgumentError(
 """
     commrank(comm) -> Int
 
-This process's rank in `comm`, `0:commsize(comm) - 1`.
+This process's rank in `comm`, `0:commsize(comm) - 1`; serially 0. Not
+collective. Public, not exported: take `comm` from
+[`communicator`](@ref)`(forest)`.
 """
 commrank(::SerialCommunicator) = 0
 commrank(comm::Communicator) = missing_verb(comm, :commrank)
@@ -121,7 +133,8 @@ commrank(comm::Communicator) = missing_verb(comm, :commrank)
 """
     commsize(comm) -> Int
 
-The number of processes in `comm`.
+The number of processes in `comm`; serially 1. Not collective. Public,
+not exported, as [`commrank`](@ref TreeAMR.commrank).
 """
 commsize(::SerialCommunicator) = 1
 commsize(comm::Communicator) = missing_verb(comm, :commsize)
@@ -130,9 +143,26 @@ commsize(comm::Communicator) = missing_verb(comm, :commsize)
     allgather(comm, x) -> Vector
 
 The `isbits` value `x` of every rank, in rank order, on every rank:
-collective. It is what a reduction is built from (`combine_blocks`
-gathers one partial per rank and folds them in rank order), so that the
-association is the package's and the same on every rank.
+collective. Serially it is `[x]`. A value that is not `isbits` is
+refused, on the rank that passes it.
+
+It is what the package's own reductions are built from: each rank's
+partial is gathered and every rank folds the same vector in rank order,
+so that the association is fixed and every rank gets the same bits,
+which an `Allreduce` does not promise. An application combines a host
+value of its own the same way — a diagnostic's sum, or a decision taken
+from the clock or the file system that must be the same on every rank
+before it gates a collective call:
+
+```julia
+comm = communicator(forest)
+stop = any(TreeAMR.allgather(comm, time() > deadline))   # the same on every rank
+```
+
+Public, not exported. Like every collective, every rank calls it, in the
+same order relative to the package's other collective calls, from the
+task that makes them, never from inside a threaded loop. A rank with no
+blocks takes part.
 """
 function allgather(::SerialCommunicator, x)
     isbits(x) || throw(ArgumentError(
@@ -141,13 +171,25 @@ function allgather(::SerialCommunicator, x)
 end
 allgather(comm::Communicator, x) = missing_verb(comm, :allgather)
 
+# What `allgatherv` refuses on every communicator, the serial one
+# included, so that a gather that would fail over MPI fails serially too.
+check_gatherable(v::AbstractVector) = isbitstype(eltype(v)) || throw(ArgumentError(
+    "allgatherv sends a vector of isbits elements, which MPI can describe, got a " *
+    "$(typeof(v))"))
+
 """
     allgatherv(comm, v::AbstractVector) -> Vector
 
 The concatenation, in rank order, of every rank's vector `v`, on every
-rank: collective. The lengths may differ between ranks, and may be zero.
+rank: collective. The lengths may differ between ranks, and may be zero;
+the element type must be the same on every rank, and `isbits`.
+Serially it is `collect(v)`. Public, not exported, under the same rules
+as [`allgather`](@ref TreeAMR.allgather).
 """
-allgatherv(::SerialCommunicator, v::AbstractVector) = collect(v)
+function allgatherv(::SerialCommunicator, v::AbstractVector)
+    check_gatherable(v)
+    return collect(v)
+end
 allgatherv(comm::Communicator, v::AbstractVector) = missing_verb(comm, :allgatherv)
 
 """

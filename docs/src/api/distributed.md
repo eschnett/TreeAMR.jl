@@ -48,11 +48,24 @@ communicator
 blockrange
 ```
 
-## Communicators
+## Combining values over the ranks
 
-Not exported: an application passes its own communicator as
-`Forest(…; comm)`, and the package talks to it through these verbs, each
-of which has a serial method.
+An application passes its own communicator as `Forest(…; comm)`, and
+the package talks to it through verbs, each of which has a serial
+method. Four of them an application may call too, on
+[`communicator`](@ref)`(forest)`, to combine a host value of its own
+over the ranks — a diagnostic's sum, or a decision taken from the clock
+or the file system that has to be the same on every rank. The two
+collectives return the same vector on every rank, in rank order, so a
+fold over it is the same on every rank too; serially they return the
+caller's own contribution. They are public but not exported, since
+their names are generic: call them qualified, as `TreeAMR.allgather`,
+or import them by name.
+
+```julia
+comm = communicator(forest)
+stop = any(TreeAMR.allgather(comm, time() > deadline))   # the same on every rank
+```
 
 ```@docs
 TreeAMR.Communicator
@@ -61,6 +74,17 @@ TreeAMR.commrank
 TreeAMR.commsize
 TreeAMR.allgather
 TreeAMR.allgatherv
+```
+
+## Communicators
+
+Not public: the verbs the package uses for itself — the all-to-all of
+point interpolation, the messages of the exchange, and the two that
+only TreeIOHDF5's checkpoints use. Their messages travel on the
+package's own duplicate of the application's communicator, so a
+message an application sent there could match one of the package's.
+
+```@docs
 TreeAMR.alltoallv
 TreeAMR.bcast
 TreeAMR.commnodes

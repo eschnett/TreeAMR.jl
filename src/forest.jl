@@ -1095,6 +1095,11 @@ end
 # what takes the distributed path of an operation that has one.
 isdistributed(forest::Forest) = commsize(forest.comm) > 1
 
+# The communicator a forest is distributed over, for an application that
+# combines host values over the ranks itself (AMR-13). Documented with
+# `communicator` in `communicator.jl`.
+communicator(forest::Forest) = forest.comm
+
 # --- The forest digest (M7) ----------------------------------------------
 #
 # Every forest mutation is collective, and every host pass is a
