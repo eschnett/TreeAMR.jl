@@ -560,12 +560,13 @@ Each step has the test that says it is done:
    planes; with the half turn's slab at a glued reversed axis, deferred
    from step 3. The record is in
    [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
-5. **TreeMultiPatch's symmetric layouts**: both balls under the bitant,
-   quadrant and octant mirrors and under the 90° and 180° turns about
-   `z`, alone and with the `z` mirror, with even root counts across the
-   cuts. *Done when* each layout's forest builds and passes its check,
-   its atlas folds every point of the full ball, its `√g` integrates to
-   its share of the volume, and `chart_aligned` declares the new pairs.
+5. **TreeMultiPatch's symmetric layouts.** Done 2026-11-25, on
+   TreeMultiPatch's branch `eschnett-claude/m21-symmetric-layouts`: both
+   balls under the seven symmetries, every point of the full ball folded
+   by the atlas, which reports the symmetry (Erik's widening of the
+   contract), and TreeAMR's interpolated ghosts on each reduced
+   seven-patch ball equal to the full ball's. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
 6. **TreeWave on the symmetric balls**: the sum of a plane wave's images
    under the symmetry, an exact solution with that symmetry. *Done
    when* each reduced ball's run is the full ball's, restricted, to

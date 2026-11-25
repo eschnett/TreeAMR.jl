@@ -5536,6 +5536,18 @@ M12 was decided with Erik, after M7 and before M9b.
     fold; tested on the kinked strip with an atlas that folds every point
     past the plane itself, ghosts within 1e-12 and interpolation within
     1e-10 of the full strip.
+  - *Step 5, TreeMultiPatch's symmetric layouts (2026-11-25).* On
+    TreeMultiPatch's branch `eschnett-claude/m21-symmetric-layouts`
+    (3d5361f, its `HISTORY.md` has the record): `SymmetricBall`, sub-boxes of
+    the full ball's patches with the full maps, mirror faces at the
+    mirror cuts and turned glue at the turns' seams, derived from the
+    maps, and an atlas that folds every point physically and reports the
+    symmetry. For all seven symmetries of both balls the forests build and
+    pass their check, every point of the full ball folds and comes back
+    to 1e-12, and on the seven-patch ball TreeAMR's interpolated ghosts
+    equal the full ball's to 1e-12 — the whole of M21's TreeAMR side on a
+    real layout, the corners at the turn's axis and the half turn's slab
+    at a glued axis included.
 
 ## Downstream checks
 
