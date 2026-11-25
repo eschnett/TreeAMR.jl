@@ -928,6 +928,9 @@ The [`MortonKey`](@ref) of local block `b`: leaf
 """
 blockkey(fs::FieldSet, b::Integer) = fs.forest.leaves[blockrange(fs.forest)[b]]
 
+# The communicator of the set's forest (AMR-13); see `communicator`.
+communicator(fs::FieldSet) = communicator(fs.forest)
+
 """
     blockview(fs::FieldSet, b::Integer)
     blockview(fs::FieldSet, b::Integer, v::Integer)

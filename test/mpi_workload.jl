@@ -38,7 +38,9 @@
 # one group of stages, and from M16 on element sets, through a fill in one
 # stage, the reductions and two regrids; from M17 on forests of patches,
 # the annulus and the cubed sphere, through a fill across their glued
-# faces with the patch handed to the callbacks. The checkpoints moved to
+# faces with the patch handed to the callbacks; from M20 on ghosts
+# interpolated across a glue, on the kinked torus; from AMR-13 on the
+# public collectives, as an application calls them. The checkpoints moved to
 # TreeIOHDF5, whose own workload runs them.
 
 using TreeAMR
@@ -1395,6 +1397,32 @@ function refusals()
     return nothing
 end
 
+# The public collectives (AMR-13), as an application calls them: through
+# `communicator` of a field set and of its forest, over a single leaf, so
+# that at two and three ranks every rank but rank 0 is without blocks and
+# takes part all the same. Each rank checks the gathered vectors against
+# what rank order makes them, and that every rank holds the same ones;
+# what is printed does not depend on the rank count.
+function public_verbs(tag)
+    forest = Forest((1, 1); N=4, comm=COMM)
+    fs = FieldSet(forest, 1; G=1)
+    comm = communicator(fs)
+    P, r = TreeAMR.commsize(comm), TreeAMR.commrank(comm)
+    good = comm === communicator(forest) === forest.comm && (P, r) == (NRANKS, RANK)
+    # One value a rank, in rank order: its rank and its block count.
+    pairs = TreeAMR.allgather(comm, (r, nblocks(fs)))
+    good &= pairs == [(s, Int(s == 0)) for s in 0:(P - 1)]
+    # A vector a rank, of differing lengths and empty on rank 0: rank s
+    # contributes s copies of s.
+    v = TreeAMR.allgatherv(comm, fill(r, r))
+    good &= v == reduce(vcat, [fill(s, s) for s in 0:(P - 1)]; init=Int[])
+    # Every rank holds the same vectors.
+    h = TreeAMR.allgather(comm, hash((pairs, v)))
+    good &= all(==(first(h)), h)
+    emit(tag, "public", all(TreeAMR.allgather(comm, good)), sum(last, pairs))
+    return nothing
+end
+
 # The verbs the exchange does not use (`alltoallv` routes interpolation
 # points from step 5 on), with empty contributions, and the one
 # duplicate per communicator: every forest over `COMM` holds the same
@@ -1610,6 +1638,7 @@ function main()
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     # Ghosts interpolated across a glue (M20), on the kinked torus.
     glue_case("G2")
+    public_verbs("V")
     refusals()
     verbs()
     packages()

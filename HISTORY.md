@@ -674,6 +674,32 @@ H200 nodes went to SimLaunch.
 
 The multi-block check was made on 2026-10-01 and amended by the M12 design on 2026-10-03, and again by M17 on 2026-11-02, when the forest it watched for was built: it now watches for what M17 leaves out.
 
+**The communicator verbs became public** (2026-11-24, TreeGRRMHD's
+AMR-13, Erik). TreeHydro and TreeGeneralizedHarmonic each combined host
+values over the ranks — diagnostics' sums, decisions from the clock or
+the file system — by calling `commrank`, `commsize`, `allgather` and
+`allgatherv` qualified, through the field `forest.comm`, and each
+carried the same helpers around them: `rank_reduce`, `agree_any`,
+`agree_refusal` and `isroot`. TreeGRRMHD, about to write a third copy,
+offered two forms: the four verbs exported, taking a communicator or
+anything with one, or TreeHydro's `rank_reduce` and `agree_refusal`
+exported beside `mesh_mapreduce`. The verbs were made `public` rather
+than exported, since `allgather` and `commsize` are generic names to put
+into every `using TreeAMR` namespace and the downstreams' qualified
+calls already have the right form. Instead of a method of each verb
+for a forest and a field set, `communicator(forest)` and
+`communicator(fs)` return the forest's communicator, which keeps one
+method per verb and communicator type and leaves the MPI extension as
+it was. `alltoallv`, `bcast`, `commnodes` and the point-to-point verbs
+stayed internal: a collective on the package's duplicate is matched in
+call order, which every rank keeps, but an application's point-to-point
+message there could match one of the package's. `allgatherv` gained the
+`isbits` check `allgather` had, on the serial communicator too, so that
+a gather that would fail over MPI fails in a serial test. `isroot` and
+`agree_any` are one line each over the public verbs and did not become
+API; `rank_reduce` and `agree_refusal` were left to the applications
+and recorded as open in [CODE.md](CODE.md#distributed-meshes).
+
 **The cluster's MPI through mpi_abi_wrapper** (2026-11-13, Erik). Until
 then a cluster run chose between MPICH_jll, which runs anywhere but over
 TCP, and the system MPI through MPIPreferences' system binary, whose ABI

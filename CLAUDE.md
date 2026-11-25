@@ -430,11 +430,11 @@ the one that says why.
   block-shaped CPU launch in `src/` goes through `launch_by_owner!`, and
   a new host loop over blocks through `threaded_chunks` ("What one
   process loses").
-- **Physics packages use the exports only; companion packages pin
-  exact TreeAMR versions.** A name or field of the companion interface
-  that changes is a change for TreeIOHDF5: run its suite before a
-  release, and release it with the new version appended to its
-  `[compat]` list ("Companion interface").
+- **Physics packages use the exported and `public` names only;
+  companion packages pin exact TreeAMR versions.** A name or field of
+  the companion interface that changes is a change for TreeIOHDF5: run
+  its suite before a release, and release it with the new version
+  appended to its `[compat]` list ("Companion interface").
 - **Every forest mutation is collective.** Any new check that can fire
   on some ranks only goes through `collective_checks`. Do not add a
   field to `Forest`: put mutable state in `ForestState` ("Distributed

@@ -71,6 +71,9 @@ public chart_locate, chart_map, chart_jacobian, chart_hessian
 
 # Distributed meshes (M7)
 export communicator, blockrange
+# The collectives an application combines its own host values with
+# (AMR-13): public, but not exported, since their names are generic.
+public Communicator, SerialCommunicator, commrank, commsize, allgather, allgatherv
 
 # Folds over points (M15)
 export mesh_fold, block_fold, Sum, Max, Min, addto

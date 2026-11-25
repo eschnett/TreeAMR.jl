@@ -1017,7 +1017,16 @@ dt = cfl * minimum_spacing(forest) / λ
 The same goes for any decision that gates a collective call. A
 checkpoint taken when a rank's own wall clock says so, or a step
 rejected by a norm of the local state vector, sends some ranks into
-the call and the others past it.
+the call and the others past it. Agree on such a value first with
+[`TreeAMR.allgather`](@ref)`(`[`communicator`](@ref)`(forest), x)`,
+which returns every rank's `x` in rank order, the same vector on every
+rank; [`TreeAMR.allgatherv`](@ref) concatenates a vector from each rank.
+Both are collective, and serially they return your own value:
+
+```julia
+comm = communicator(forest)
+checkpoint = any(TreeAMR.allgather(comm, time() - last_checkpoint > interval))
+```
 
 **Regridding.** Flag your own blocks as before: `regrid!` takes one flag
 per local block, gathers them, and every rank completes the marks and

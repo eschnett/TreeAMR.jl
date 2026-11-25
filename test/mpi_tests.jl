@@ -173,6 +173,9 @@ end
     @test all(t -> length(filter(startswith(t), lines)) == 1,
               ("PR2 cell filled", "PR2 vertex filled", "PR2 element filled",
                "PS3 element filled"))
+    # The public collectives (AMR-13) hold their contract on the serial
+    # reference too, so that the ranks' agreeing with it means something.
+    @test "V public true 1" in lines
     # The comparison itself: a changed digest is caught, and so is a sum
     # that moved by more than roundoff — while the same sum to roundoff
     # is not.

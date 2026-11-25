@@ -195,6 +195,8 @@ end
     @test allgather(comm, (true, 1.5)) == [(true, 1.5)]
     @test_throws "isbits" allgather(comm, [1.0])
     @test allgatherv(comm, [1, 2, 3]) == [1, 2, 3]
+    @test allgatherv(comm, Int[]) == Int[]
+    @test_throws "isbits" allgatherv(comm, [[1.0]])
     @test alltoallv(comm, [1.0, 2.0], [2]) == ([1.0, 2.0], [2])
     @test_throws "one entry" alltoallv(comm, [1.0, 2.0], [1, 1])
     @test_throws "no peer 1" isend(comm, [1.0], 1, 0)
@@ -210,4 +212,37 @@ end
     @test_throws "does not implement `allgatherv`" allgatherv(fake, [1])
     @test_throws "does not implement `isend`" isend(fake, [1.0], 1, 0)
     @test_throws "does not implement `commnodes`" commnodes(fake)
+end
+
+@testset "The four collectives are public, and a forest and a field set give theirs" begin
+    # An application that combines host values of its own over the ranks
+    # (AMR-13) calls these qualified; were one renamed or made internal
+    # again, every downstream that agrees on a decision would break
+    # without a deprecation. They are not exported, since their names are
+    # generic, and the package's other verbs stay internal.
+    for name in (:Communicator, :SerialCommunicator, :commrank, :commsize, :allgather,
+                 :allgatherv)
+        @test Base.ispublic(TreeAMR, name)
+        @test !Base.isexported(TreeAMR, name)
+    end
+    for name in (:alltoallv, :bcast, :commnodes, :isend, :irecv, :waitall)
+        @test !Base.ispublic(TreeAMR, name)
+    end
+    # `communicator` of a forest or a field set is the communicator the
+    # forest stores, and the verbs over it are the serial ones: rank 0 of
+    # 1, and every collective returns the caller's own contribution.
+    forest = Forest((2, 2); N=4)
+    fs = FieldSet(forest, 1; G=1)
+    @test communicator(forest) === forest.comm === SerialCommunicator()
+    @test communicator(fs) === forest.comm
+    @test (commrank(communicator(fs)), commsize(communicator(fs))) == (0, 1)
+    @test allgather(communicator(forest), nblocks(fs)) == [nleaves(forest)]
+    @test allgatherv(communicator(fs), collect(blockrange(forest))) ==
+          1:nleaves(forest)
+    # A forest over a rank of a simulated distribution gives its own
+    # communicator, and a forest built over another forest shares it.
+    part = rank_forest(forest, 1, 3)
+    @test communicator(part) === part.comm
+    @test commrank(communicator(part)) == 1 && commsize(communicator(part)) == 3
+    @test Forest((2, 2); N=4, comm=forest).comm === forest.comm
 end
