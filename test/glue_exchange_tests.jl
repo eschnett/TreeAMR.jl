@@ -11,8 +11,11 @@
 # The forest of patches `serial` as a rank holds it, over `comm`.
 function glue_rank_forest(serial::Forest{D,T}, comm) where {D,T}
     kw = TreeAMR.patch_keywords(serial)
+    # The forest-wide faces and a turn's plane (M21), beside the patches.
+    turn = haskey(kw, :rotating) ? (rotating=kw.rotating,) :
+           haskey(kw, :halfturn) ? (halfturn=kw.halfturn,) : (;)
     return Forest{T}(kw.patches; N=serial.N, glue=kw.glue, leaves=serial.leaves,
-                     comm=comm)
+                     comm=comm, reflecting=TreeAMR.reflecting_faces(serial), turn...)
 end
 
 # The layouts: the kinked torus in 2D, the seven-patch ball in 3D with two
@@ -25,7 +28,23 @@ const GLUE_EXCHANGE_CASES = [
     ("the seven-patch ball", () -> ball_forest(seven_ball(2, 1)), seven_ball(2, 1),
      BALL_OPS, forest -> ball_set(forest; nvars=2),
      (ξ, p) -> sin(sum(TreeAMR.chart_map(seven_ball(2, 1), ξ, p))),
-     ball_hook((ξ, p) -> sin(sum(TreeAMR.chart_map(seven_ball(2, 1), ξ, p)))))]
+     ball_hook((ξ, p) -> sin(sum(TreeAMR.chart_map(seven_ball(2, 1), ξ, p))))),
+    # M21: ghosts folded beside a mirror and beside a half turn's seam,
+    # whose variable column and sign the sender applies.
+    ("the mirrored strip", () -> strip_forest(:mirror), STRIP, KINKED_OPS,
+     forest -> FieldSet(forest, 2; G=3, centering=vertexcentered(2), glue=:interpolate,
+                        parity=[(EvenParity, EvenParity), (EvenParity, OddParity)]),
+     (ξ, p) -> strip_data(Val(:mirror), TreeAMR.chart_map(STRIP, ξ, p))[1],
+     CellBoundary(WithPatch((ξ, p, v, δ) ->
+                                v * strip_data(Val(:mirror),
+                                               TreeAMR.chart_map(STRIP, ξ, p))[1]))),
+    ("the half-turn strip", () -> strip_forest(:half), STRIP, KINKED_OPS,
+     forest -> FieldSet(forest, 3; G=3, centering=vertexcentered(2), glue=:interpolate,
+                        halfturn=(1, -2, -3)),
+     (ξ, p) -> strip_data(Val(:half), TreeAMR.chart_map(STRIP, ξ, p))[2],
+     CellBoundary(WithPatch((ξ, p, v, δ) ->
+                                v * strip_data(Val(:half),
+                                               TreeAMR.chart_map(STRIP, ξ, p))[2])))]
 
 @testset "Over simulated ranks the interpolated ghosts are the serial ones bit for bit" begin
     # Guards the sender's evaluation: a ghost located on one rank and

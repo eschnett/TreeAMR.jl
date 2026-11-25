@@ -487,6 +487,11 @@ struct PointGeometry{D,T}
     half::Bool
     L::Int
     firstroot::Int
+    # A forest of patches with a symmetry of its own patches (M21): a point
+    # is folded through the per-patch table (`patch_fold`), never through
+    # the forest-wide faces, and its derivatives are carried back in
+    # physical space by the chain rule rather than flipped logically.
+    patched::Bool
 end
 
 # The brick's geometry, or on a forest of patches patch 1's, which is
@@ -497,7 +502,8 @@ function PointGeometry(::Type{T}, forest::Forest{D}) where {T,D}
                                            T(forest.extents[d][2])), D),
                               forest.roots, forest.periodic, reflecting_faces(forest),
                               hasrotating(forest) ? seam_plane(forest) : (0, 0),
-                              ishalfturn(forest), maxlevel(forest), 0)
+                              ishalfturn(forest), maxlevel(forest), 0,
+                              symmetric_patches(forest))
 end
 
 # The geometry of a location from plain positions, which a forest of
@@ -546,11 +552,114 @@ pointdims(x::PatchPoint) = length(x.ξ)
 # per patch for a kernel; `nothing` on a brick.
 function patch_table(::Type{T}, forest::Forest{D}) where {T,D}
     ispatched(forest) || return nothing
+    symmetric_patches(forest) && return [(ntuple(d -> (T(patch_extents(forest, p)[d][1]),
+                                                      T(patch_extents(forest, p)[d][2])), D),
+                                          patch_roots(forest, p), patch_firstroot(forest, p),
+                                          face_folds(T, forest, p))
+                                         for p in 1:npatches(forest)]
     return [(ntuple(d -> (T(patch_extents(forest, p)[d][1]),
                           T(patch_extents(forest, p)[d][2])), D),
              patch_roots(forest, p), patch_firstroot(forest, p))
             for p in 1:npatches(forest)]
 end
+
+# How a point past one face of a patch folds (M21), plain bits for a
+# kernel: `kind` 1 for a mirror of label `label`, 2 for a turned glue
+# into patch `q`, by `turn` quarter turns, where the logical position is
+# `base[a] ± ξ[perm[a]]` (minus where `flip[a]`), 0 for any other face.
+struct FaceFold{D,T}
+    kind::Int8
+    label::Int8
+    q::Int32
+    turn::Int8
+    perm::NTuple{D,Int8}
+    flip::NTuple{D,Bool}
+    base::NTuple{D,T}
+end
+
+# The folds of patch `p`'s faces, at `2(d - 1) + side`.
+function face_folds(::Type{T}, forest::Forest{D}, p::Int) where {T,D}
+    conn = forest.conn::Patches{D}
+    ext = conn.extents[p]
+    w = (ext[1][2] - ext[1][1]) / conn.roots[p][1]
+    return ntuple(2D) do i
+        d, side = (i - 1) ÷ 2 + 1, (i - 1) % 2 + 1
+        slot = glue_slot(p, d, side, D)
+        entry = conn.glue[slot]
+        none = FaceFold{D,T}(Int8(0), Int8(0), Int32(0), Int8(0), ntuple(e -> Int8(e), D),
+                             ntuple(_ -> false, D), ntuple(_ -> zero(T), D))
+        if conn.kinds[slot] == ReflectingFace
+            return FaceFold{D,T}(Int8(1), conn.labels[slot], Int32(0), Int8(0),
+                                 none.perm, none.flip, none.base)
+        elseif entry.patch != 0 && entry.turn != 0
+            eq = conn.extents[entry.patch]
+            base = ntuple(D) do a
+                e = Int(entry.perm[a])
+                return T(eq[a][1] + w * entry.offset[a] +
+                         (entry.flip[a] ? ext[e][1] : -ext[e][1]))
+            end
+            return FaceFold{D,T}(Int8(2), Int8(0), Int32(entry.patch), entry.turn,
+                                 entry.perm, entry.flip, base)
+        end
+        return none
+    end
+end
+
+# A logical position `ξ` of patch `p` folded into a patch's closed box
+# through the per-patch table (M21), as `fold_patch_point` folds a glue
+# ghost: across mirror faces and turned glues. Returns `(ξ, q, mask, turn,
+# ok)`, `mask` the mirror labels as bits; `ok` is false where the point
+# leaves through any other face, or does not come back in.
+@inline function patch_fold(table, ξ::NTuple{D,T}, p::Int) where {D,T}
+    mask, turn, q, x = 0, 0, p, ξ
+    for _ in 1:(2D + 1)
+        @inbounds entry = table[q]
+        ext = entry[1]
+        d, side = outside_face(x, ext)
+        d == 0 && return x, q, mask, turn % 4, true
+        f = tuple_pick(entry[4], 2(d - 1) + side)
+        if f.kind == 1
+            x = mirror_coordinate(x, d, side == 1 ? ext[d][1] : ext[d][2])
+            mask |= 1 << (Int(f.label) - 1)
+        elseif f.kind == 2
+            x = hop_coordinates(x, f)
+            q = Int(f.q)
+            turn += Int(f.turn)
+        else
+            return x, q, mask, turn % 4, false
+        end
+    end
+    return x, q, mask, turn % 4, false
+end
+
+# The first dimension along which `x` lies outside the box `ext`, and the
+# side, or `(0, 0)`.
+@inline function outside_face(x::NTuple{D}, ext) where {D}
+    for e in 1:D
+        x[e] < ext[e][1] && return e, 1
+        x[e] > ext[e][2] && return e, 2
+    end
+    return 0, 0
+end
+
+# `x` mirrored along `d` about `wall`, and carried across a turned glue's
+# fold `f`: functions of their arguments only, so that a kernel's loop
+# reassigning `x` captures it in no closure, which would box it.
+@inline mirror_coordinate(x::NTuple{D}, d::Int, wall) where {D} =
+    ntuple(e -> e == d ? 2wall - x[e] : x[e], Val(D))
+@inline hop_coordinates(x::NTuple{D}, f::FaceFold{D}) where {D} =
+    ntuple(a -> f.flip[a] ? f.base[a] - x[Int(f.perm[a])] : f.base[a] + x[Int(f.perm[a])],
+           Val(D))
+
+# Entry `i` of a tuple by a run-time index, by static recursion, which a
+# device compiles to selects rather than a dynamic field access.
+@inline tuple_pick(t::Tuple{Any}, i::Int) = t[1]
+@inline tuple_pick(t::Tuple, i::Int) = i == 1 ? t[1] : tuple_pick(Base.tail(t), i - 1)
+
+# The fold code of a symmetric forest's point (M21): the mirror labels'
+# bits where a brick's has the mirrored dimensions, and the turns.
+@inline labelcode(mask::Int, turn::Int, ::Val{D}) where {D} =
+    foldcode(ntuple(k -> (mask >> (k - 1)) & 1 == 1, Val(D)), turn)
 
 # The geometry a point is located with, its position in `T`, its patch,
 # and whether the patch exists: a plain point on a brick, a `PatchPoint`
@@ -567,8 +676,10 @@ end
     p = x.p
     1 <= p <= length(table) || return g, ξ, p, false
     @inbounds ext, roots, fr = table[p]
-    return PointGeometry{D,T}(ext, roots, ntuple(_ -> false, Val(D)), g.reflecting, (0, 0),
-                              false, g.L, fr), ξ, p, true
+    return PointGeometry{D,T}(ext, roots, ntuple(_ -> false, Val(D)),
+                              g.patched ? ntuple(_ -> (false, false), Val(D)) : g.reflecting,
+                              (0, 0),
+                              false, g.L, fr, g.patched), ξ, p, true
 end
 
 # One coordinate brought into the domain: wrapped along a periodic
@@ -828,7 +939,7 @@ end
             for _ in 1:derivs[k][d]
                 s *= ih
             end
-            fold[d] && (flips += derivs[k][d])
+            fold[d] && !g.patched && (flips += derivs[k][d])
             (r == 1 || r == 2) && d == d1 && (flips += derivs[k][d])
             (r == 3 || r == 2) && d == d2 && (flips += derivs[k][d])
         end
@@ -1375,7 +1486,8 @@ stencil_source(fs::FieldSet{T,D}, u) where {T,D} =
 # forest without a seam, and for a set whose layout is not symmetric in
 # the seam's plane, whose value there is its partner's, so that such a
 # point is refused.
-seam_rotvars(fs::FieldSet) = seam_turns(fs) ? fs.rotvars : nothing
+seam_rotvars(fs::FieldSet) =
+    seam_turns(fs) || patch_turn(fs.forest) !== nothing ? fs.rotvars : nothing
 
 # Whether a point beyond the seam can be answered from `fs` itself.
 seam_turns(fs::FieldSet) = hasrotating(fs.forest) && symmetric_layout(fs)
@@ -1385,6 +1497,14 @@ seam_turns(fs::FieldSet) = hasrotating(fs.forest) && symmetric_layout(fs)
 function swapped_derivs(forest::Forest, ms)
     d1, d2 = seam_plane(forest)
     return map(m -> ntuple(d -> d == d1 ? m[d2] : d == d2 ? m[d1] : m[d], length(m)), ms)
+end
+
+# The patch of each located point's leaf, on the backend (M21): the patch a
+# symmetric forest's point was folded into. 0 for a point outside.
+function folded_patches(forest::Forest, pts)
+    leaf = tohost(pts.leaf)
+    out = Int32[l > 0 ? Int32(patch(forest, forest.leaves[l])) : Int32(0) for l in leaf]
+    return todevice(get_backend(pts.leaf), out)
 end
 
 # --- located points (M19) ----------------------------------------------------
@@ -1487,12 +1607,34 @@ end
     gp, x, p, known = point_geometry(g, table, xs[j])
     ξs[j] = x
     patch[j] = Int32(p)
+    if g.patched && known && table !== nothing
+        locate_folded!(leaf, ys, codes, inside, leaves, g, table, x, p, Int32(0), j)
+        return nothing
+    end
     y, fold, r, ok = fold_point(gp, x)
     ok &= known
     ys[j] = y
     codes[j] = foldcode(fold, r)
     inside[j] = ok
     leaf[j] = !known ? Int32(-1) : ok ? Int32(locate_leaf(leaves, gp, y)) : Int32(0)
+    return nothing
+end
+
+# A point of a symmetric forest (M21) folded through the per-patch table,
+# then located in the patch it lands in; `miss` is the leaf a point past
+# its patch's box that does not come back in is marked with.
+@inline function locate_folded!(leaf, ys, codes, inside, leaves, g::PointGeometry{D,T},
+                                table, x, p, miss, j, m0::Int=0, t0::Int=0) where {D,T}
+    y, q, mask, turn, ok = patch_fold(table, x, p)
+    # Composed with a fold the atlas reported (M21).
+    mask, turn = mask ⊻ m0, (turn + t0) % 4
+    gq, _, _, _ = point_geometry(g, table, PatchPoint{D,T}(y, q))
+    _, _, _, inbox = fold_point(gq, y)
+    ok &= inbox
+    ys[j] = y
+    codes[j] = labelcode(mask, turn, Val(D))
+    inside[j] = ok
+    leaf[j] = ok ? Int32(locate_leaf(leaves, gq, y)) : (miss == 0 ? Int32(0) : miss)
     return nothing
 end
 
@@ -1519,6 +1661,21 @@ end
     gp, ξ, p, known = point_geometry(g, table, pp)
     ξs[j] = ξ
     patch[j] = p % Int32
+    m0, t0 = located_symmetry(c)
+    if g.patched && known && table !== nothing
+        locate_folded!(leaf, ys, codes, inside, leaves, g, table, ξ, p, Int32(-2), j, m0,
+                       t0)
+        return nothing
+    end
+    # A symmetry reported where the forest has none of its patches' own is
+    # a broken contract.
+    if m0 != 0 || t0 != 0
+        ys[j] = ξ
+        codes[j] = 0x00
+        inside[j] = false
+        leaf[j] = Int32(-2)
+        return nothing
+    end
     y, fold, r, ok = fold_point(gp, ξ)
     ok &= known
     ys[j] = y
@@ -1759,7 +1916,15 @@ function interpolate_located!(values, excluded, fs::FieldSet{T,D}, u, pts::Locat
     # A point beyond a rotating seam of a set that cannot turn it, marked
     # where the kernel found it and refused as the fused path refuses it.
     if any(!=(0), status)
-        j = findfirst(!=(0), tohost(status))
+        hs = tohost(status)
+        j = findfirst(!=(0), hs)
+        hs[j] == 2 && throw(ArgumentError(
+            "point $j, $(tohost(pts.ξ)[j]) of patch $(tohost(pts.patch)[j]), lies past a " *
+            "mirror face or a turned glue of its patch and was folded back into the " *
+            "domain, and its derivatives are asked for without an atlas: they are " *
+            "carried back by the symmetry in physical space, which only the atlas's " *
+            "maps give. Locate the point by its physical position with the atlas, or ask " *
+            "for its value alone (CODE.md, \"Symmetries on patches\")."))
         throw(outside_error(fs, tohost(pts.ξ)[j], j))
     end
     atlas === nothing || launch_chain!(values, logical, pts, atlas, ms, T(fill))
@@ -1800,6 +1965,13 @@ end
         status[j] = Int8(1)
         return nothing
     end
+    # Folded through a symmetric forest's table (M21), a point's derivatives
+    # are carried back in physical space, which only an atlas gives.
+    if g.patched && codes[j] != 0x00 && atlas === nothing &&
+       any(m -> any(!iszero, m), derivs)
+        status[j] = Int8(2)
+        return nothing
+    end
     evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
                     mapped_region(region, atlas, patches[j]), basis, g, derivs, swapped,
                     Val(M), Val(G), Val(C), Val(S), Int(leaf[j]) - boffset, ys[j], fold, r,
@@ -1835,9 +2007,13 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::Located
     M = maximum(m -> maximum(m), ms)
     src, G, S = stencil_source(fs, u)
     rotvars = seam_rotvars(fs)
-    swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
+    swapped = rotvars === nothing || !hasrotating(fs.forest) ? nothing :
+              swapped_derivs(fs.forest, ms)
+    # A symmetric forest's point (M21) is evaluated in the patch it was
+    # folded into, which its leaf names.
+    patches = g.patched ? folded_patches(forest, pts) : pts.patch
     pointkernel(evaluate_kernel!, backend, npts)(
-        values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, pts.patch,
+        values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, patches,
         pts.atlas, origins, spacings, src, fs.factors, rotvars, vs, region, basis, g, Val(ms),
         Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset, fillvalue;
         ndrange=npts)

@@ -63,6 +63,7 @@ of them. Each milestone's steps are listed in its record under
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
+  - [M21 — Symmetries on patches](#m21--symmetries-on-patches)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -5358,6 +5359,195 @@ M12 was decided with Erik, after M7 and before M9b.
       its GitHub `main` through `[sources]` until it is registered; 370
       tests. No release yet: General refuses a package whose dependency
       it does not have.
+
+### M21 — Symmetries on patches
+
+- **M21 — Symmetries on patches.** *(Asked for and planned with Erik on
+  2026-11-25, designed that day.)* The plan is in
+  [PLAN.md](PLAN.md#m21--symmetries-on-patches), the design in
+  [CODE.md](CODE.md#symmetries-on-patches).
+
+  - *The request (2026-11-25).* Erik asked what supporting a brick's
+    symmetries — the bitant, quadrant and octant mirrors and the 90° and
+    180° turns for a spinning black hole — would take on multi-patch
+    systems. The answer listed what stood in the way: face kinds per
+    `(dim, side)` for every patch at once, the refusal of `rotating` and
+    `halfturn` on patches, and M20's rule that a leaf on a glued face
+    keeps its level.
+  - *Refinement (Erik's decisions, 2026-11-25).* No restriction on
+    regridding in the central box. Asked whether prolongation across a
+    seam face was possible: it is, the rotated prolongations and
+    restrictions existing for a seam's edges and corners, but a
+    coarse-fine seam face also needs an oriented interface restriction
+    for conservative sets and an ownership rule for a vertex-like set's
+    two copies of the seam plane at different levels. Erik's fallback,
+    conformity at the seam, is what a brick seam has, and costs nothing
+    for a refinement pattern centred on the axis. Decided: mirror planes
+    restrict nothing; turn seams keep conformity; aligned symmetry glues
+    are exempt from M20's keep-level rule; prolongation across a seam
+    face is left for later.
+  - *Step 1, the design (2026-11-25).* Written as a proposal and
+    approved by Erik, with its four proposals as written:
+    - the brick's seams stay out of the glue table, the open question
+      M17 left (`RotationPair` across a glue and the brick form's other
+      features would have to come first), the glue form tested against
+      the brick seam bit for bit;
+    - the layout declares a symmetry and the forest records its logic,
+      the alternative, a forest keyword, being impossible without the
+      maps;
+    - the keyword shapes: per-patch `mirror` labels and `outflow`, a
+      glue entry's fourth field `turn`, and the brick's `rotating` and
+      `halfturn` naming labels on patches;
+    - seam points counted once by a set with an appendix and per copy
+      by one without, as over a brick's seam, rather than bringing the
+      fold masks to every set.
+
+    Two choices in the design were weighed and not put to Erik as
+    questions. Folding an interpolated ghost logically, through the
+    forest's own faces from a `chart_locate` result past a symmetry face,
+    was chosen over a new atlas method returning the symmetry that folds
+    a point, which would have had TreeAMR trust the atlas's encoding of
+    labels and turns. And folding at all was needed because a stencil
+    evaluated at the unfolded point would reach `G + k/2` past the plane,
+    beyond the stored ghosts, where at the folded point it reaches
+    `k/2 ≤ G + c`.
+  - *Step 2, a patch's own faces (2026-11-25).* `Patches` gained `kinds`
+    and `labels` per patch face, the forest-wide keywords folded in; a
+    patch takes `mirror` and `outflow` fields; parity is per mirror label
+    on patches; the `GroupKey` gained `labels`, zero on a brick, whose
+    keys are unchanged. The oracle departs from the plan's wording, the
+    full forest on symmetric data: a brick with reflecting and outflow
+    faces, laid out as two patches with swapped axes (2D) and cycled ones
+    (3D), so that a mirror plane is a different logical face on each
+    patch and the comparison is bit for bit where it can be, M10's tests
+    holding the brick against the full domain. Measured: the fill in
+    every centering, the element one included, equal to the brick bit
+    for bit uniform and within 1e-14 refined against the mirror plane;
+    cell and vertex sets through a `regrid!` on the plane and back within
+    1e-13, and three Laplacian steps within 1e-12. With `factorcol`
+    ignoring the labels, 36 of the file's assertions fail. Point
+    interpolation was left to step 4, which the plan gives the fold:
+    until then a point past a patch's own mirror face is outside. And the
+    companion interface's `patch_keywords` now gives a patch's own faces,
+    which TreeIOHDF5 must save or refuse before its next release (step
+    7). The full suite passed, 169,215 tests at eight threads with both
+    MPI jobs, but for one assertion on the old wording of a refusal,
+    updated; the docs build passed.
+  - *Step 3, turns as glue entries (2026-11-25).* A glue entry gained
+    `turn`, the patches form `rotating` and `halfturn` naming the turn's
+    plane by labels, a copy across a turned entry the set's map and sign
+    (the key's orientation is the glue's turn, the axis map the entry's),
+    and the neighbor search the composition of two glued faces that agree
+    — the corner at a turn's axis, a brick seam's `r = 2`. A side effect:
+    the point where four patches of a cut brick meet composes too, so
+    `patch_tests.jl`'s cut no longer refuses its cell and vertex sets but
+    fills them as the brick, bit for bit; a step through three glued faces
+    stays refused. The half turn's shifted slab carried over as a
+    brick's, for a reversed axis whose faces are unglued. Turned glues
+    are exempt from M20's keep-level rule (`iskinked`); a forest with no
+    kinked glue has no appendix and needs no atlas. A gap from step 2
+    was closed on the way: the refusal of an interpolated set beside a
+    wall read only the forest-wide kinds, and now reads every patch face.
+
+    The oracle departs from the plan's wording in two ways. M12's and
+    M14's own test files were not re-run on the glue form; instead every
+    stored point of the glue form is compared with the brick seam's, bit
+    for bit — 2D and 3D beneath a mirror, quarter and half turn, cell and
+    vertex, half-open and symmetric walls, uniform and refined — through a
+    regrid on the seam and three Laplacian steps, which those files hold
+    the seams to. And the turned glue between two patches is compared with
+    the brick seam on the same leaves, bit for bit, rather than with the
+    full plane to rounding. The interpolated set's free regrid is tested
+    serially; over MPI and on Metal the tests run a turned fill and
+    regrid with a plain vertex set, which an interpolated set on a forest
+    without a kinked glue is the same as, having no appendix and no glue
+    plan. Deferred to step 4: the half turn's slab where the reversed
+    axis' faces are glued, as on a half-turn ball's cube, whose
+    ownership there is closed for an interpolated set and which no
+    schedule can reach before the fold; it is refused, saying so.
+
+    Measured: `symmetry_tests.jl` 330 assertions; the MPI workload's `T2`
+    the same at one and three ranks, the glue forms equal to the seams;
+    the device suite on Metal, 2,703; the full suite 169,349 at eight
+    threads with both MPI jobs; the docs build.
+  - *Step 4, the fold of interpolated ghosts (2026-11-25; `interpolate!`
+    to follow).* A region beyond a kinked glue may also lie beyond a
+    mirror face or a turned glue of the same patch, and is located rather
+    than mirrored or copied across the kink; the atlas may return a
+    point past a symmetry face, and TreeAMR folds it logically through
+    the forest's faces (`fold_patch_point`), each ghost carrying the
+    folded symmetry's `rotvars` column and sign through the plan to the
+    kernels and the sender. A stencil beside a symmetry plane has its
+    window run on into the mirrored or turned ghosts, which phase 1
+    fills, so that it is centred as the full domain's is: with the window
+    clamped to the patch, as M20 left it, the reduced strip differed
+    from the full one by 1e-7, the interpolation's own error, rather than
+    rounding. The half turn's slab where the reversed axis' faces are
+    glued, deferred from step 3, follows the ownership there: at the
+    bottom block the lower boundary stays, the top block's appendix plane
+    being its image (a third shift state, the upper boundary moved
+    alone). Mirrored transfers now carry the appendix flag, which M20
+    never needed, having refused walls beside a kinked glue: without it
+    the mirror ghosts under a block's appendix plane were left unwritten.
+    The oracle is a new layout, the kinked strip, three patches whose
+    maps kink, symmetric under a mirror and a half turn, reduced and
+    full: every stored point within 1e-12, vertex- and cell-centered;
+    bit for bit over simulated ranks; on Metal against the CPU. The full
+    suite passed, 169,408 tests, and the docs build.
+  - *Step 4, the fold in `interpolate!` (2026-11-25).* On a forest with a
+    symmetry of its own patches a located point past its patch's box is
+    folded through a per-patch table in the location kernel, evaluated in
+    the patch it lands in with the symmetry's variable column and sign,
+    and its physical derivatives taken by the chain rule there and carried
+    back by the symmetry as a signed permutation of the physical axes,
+    rather than flipped logically: a logical transform across a turned
+    glue between two patches would have needed the derivatives'
+    multi-indices permuted per point, where the brick seam's are a
+    constant of the forest. A `PatchPoint` without an atlas keeps its
+    value and has its derivatives at a folded point refused, there being
+    no physical frame to carry them back in; a forest whose mirrors are
+    all forest-wide keeps the old path. Found on the way: point
+    interpolation on a forest of patches takes element sets only (M19
+    refused ghost-reading bases there, when ghosts across a glue were
+    copies), so the tests interpolate element sets; a set interpolated
+    across a glue (M20) has ghosts a Lagrange stencil could read, and
+    whether to admit it there is left open. On the device two things
+    needed care: the folded branch compiled on a brick, and the fold's
+    loop reassigned a position its closures captured, which a device
+    cannot box; and the chain rule's order-2 branch compiles for every
+    run-time multi-index, so a lower order passes a zero Hessian.
+    Measured: the kinked strip with its mirror forest-wide, patch by
+    patch and its half turn, values and second derivatives within 1e-10
+    of the full strip; a quarter turn and a half turn against the full
+    plane with symmetric data, within 1e-10; with the derivative
+    transform the identity, three of those fail; over simulated ranks bit
+    for bit (645 assertions); on Metal, 2,718; the full suite 169,476 at
+    eight threads with both MPI jobs; the docs build.
+  - *The atlas contract widened (Erik's decision, 2026-11-25).* Starting
+    step 5 showed that a reduced ball's points in the wedge of a removed
+    shell lie past no kept patch's cut within reach of its map, so the
+    logical fold of step 1's design cannot reach them, and step 5's
+    "folds every point of the full ball" could not hold. Offered: keep
+    the design and leave such points outside, or let `chart_locate`
+    return the image's position with the symmetry that carries it back —
+    the alternative step 1 had set aside so that TreeAMR would not trust
+    the atlas's encoding. Erik chose the second, for extraction spheres
+    at large radius. TreeAMR composes the reported symmetry with its own
+    fold; tested on the kinked strip with an atlas that folds every point
+    past the plane itself, ghosts within 1e-12 and interpolation within
+    1e-10 of the full strip.
+  - *Step 5, TreeMultiPatch's symmetric layouts (2026-11-25).* On
+    TreeMultiPatch's branch `eschnett-claude/m21-symmetric-layouts`
+    (3d5361f, its `HISTORY.md` has the record): `SymmetricBall`, sub-boxes of
+    the full ball's patches with the full maps, mirror faces at the
+    mirror cuts and turned glue at the turns' seams, derived from the
+    maps, and an atlas that folds every point physically and reports the
+    symmetry. For all seven symmetries of both balls the forests build and
+    pass their check, every point of the full ball folds and comes back
+    to 1e-12, and on the seven-patch ball TreeAMR's interpolated ghosts
+    equal the full ball's to 1e-12 — the whole of M21's TreeAMR side on a
+    real layout, the corners at the turn's axis and the half turn's slab
+    at a glued axis included.
 
 ## Downstream checks
 

@@ -388,6 +388,21 @@ end
 # whose image there is a symmetric low wall (see `target_range`, and
 # *Half turns* in CODE.md). It changes the target range, so it is part of
 # the key. Zero everywhere else.
+#
+# Across a glued face `orientation` is the glue's turn (M21; `glue_turn`),
+# 0 for an ordinary glue: the quarter turns the variables are carried by,
+# which pick the `rotvars` column and the sign, as a seam's orientation
+# does, while the axis map stays the glue entry's. `glue2` is the second
+# glued face of a step across two at once, at a corner the two entries
+# agree on (`Crossing.glue2`), 0 otherwise.
+#
+# `labels` holds, per mirrored dimension of a forest of patches, the
+# mirror label of the face the target is mirrored across (M21), where it
+# differs from the dimension itself, and 0 elsewhere: the parity the
+# kernel multiplies by is the variable's under that label, so two blocks
+# whose walls mirror one logical dimension under different labels do not
+# share a group (`factorcol`). Zero on a brick, whose labels are its
+# dimensions, so that a brick's keys are what they were.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
@@ -402,12 +417,20 @@ struct GroupKey{D}
     # appendix of a set interpolated across a glue (M20): its own range
     # runs to G+N+1 there, and the region beyond starts at G+N+2.
     top::NTuple{D,Bool}
+    labels::NTuple{D,Int8}
+    glue2::Int8
 end
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
             mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8, low::NTuple{D,Bool},
-            shift::NTuple{D,Int8}) where {D} =
+            shift::NTuple{D,Int8}, top::NTuple{D,Bool}=ntuple(_ -> false, D),
+            labels::NTuple{D,Int8}=ntuple(_ -> Int8(0), D)) where {D} =
     GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, low, shift,
-                ntuple(_ -> false, D))
+                top, labels, Int8(0))
+
+# The orientation a step's key carries: a seam's quarter turns, or a
+# glue's (M21).
+key_orientation(forest::Forest, via::Crossing) =
+    Int8(via.turns != 0 ? via.turns : glue_turn(forest, via))
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -432,7 +455,7 @@ kindrank(kind::Symbol) =
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
     (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
-     k.low, k.shift, k.top)
+     k.low, k.shift, k.top, k.labels, k.glue2)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -837,7 +860,7 @@ end
 function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
                       closed::Bool=false; low::Bool=false, shift::Integer=0,
                       top::Bool=false)
-    shift != 0 && return shifted_range(N, G, c, δd, od, halved, shift == 1)
+    shift != 0 && return shifted_range(N, G, c, δd, od, halved, Int(shift))
     if top
         # The appendix (M20): the block owns its high face plane G+N+1.
         (c == 1 && !halved) || error("an appendix plane asked for with stagger $c " *
@@ -853,14 +876,19 @@ function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
     return (G + 1 + low):(G + N + top)
 end
 
-# The shifted ranges of `target_range` (M14); `up` moves the upper
-# boundary too.
-function shifted_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool, up::Bool)
+# The shifted ranges of `target_range` (M14): state 1 moves both of the
+# region's boundaries one plane up, state 2 the lower one only (M14's
+# symmetric walls), and state 3 the upper one only (M21: the bottom block
+# of a half turn's slab whose image source, the top block, owns its high
+# plane as an appendix).
+function shifted_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
+                       state::Int)
+    lower, up = state != 3, state != 2
     δd == 1 && return (G + N + 1 + up):(N + 2G + c)
-    δd == -1 && return 1:(G + 1)
+    δd == -1 && return 1:(G + lower)
     top = G + N + up
-    halved && return (G + 2 + od * (N ÷ 2)):(od == 0 ? G + 1 + N ÷ 2 : top)
-    return (G + 2):top
+    halved && return (od == 0 ? G + 1 + lower : G + 2 + N ÷ 2):(od == 0 ? G + 1 + N ÷ 2 : top)
+    return (G + 1 + lower):top
 end
 
 # Same-level copy: a pure shift of N cells against the direction, for
@@ -1345,10 +1373,12 @@ function block_sources!(pairs::TransferPairs{D},
         # dimension that does not step up.
         low = ntuple(d -> walls[d] && δ[d] != 1, D)
         top = ntuple(d -> tops[d] && δ[d] != -1, D)
-        shift = seam_shift(forest, k, c, δ, symmetric)
+        shift = seam_shift(forest, k, c, δ, symmetric, interpolated)
         record!(kind, offset, lvl, s, via::Crossing) =
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
-                                           via.turns, via.glue, low, shift, top),
+                                           key_orientation(forest, via), via.glue, low,
+                                           shift, top, ntuple(_ -> Int8(0), D),
+                                           via.glue2),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false;
@@ -1371,7 +1401,7 @@ function block_sources!(pairs::TransferPairs{D},
         δ′, faces = wall_direction(forest, k, δ)
         if any(!=(OuterFace), faces)
             mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, faces, region, low,
-                            shift)
+                            shift, top)
             continue
         end
         crossing, nbrs = oriented_neighbors(forest, k, δ)
@@ -1468,8 +1498,10 @@ end
 # up (1), except under symmetric walls on a block at the high face of
 # `d2`, whose upper boundary's image is a low wall the fill writes (2).
 function seam_shift(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
-                    δ::NTuple{D,Int}, symmetric::Bool) where {D}
+                    δ::NTuple{D,Int}, symmetric::Bool, interpolated::Bool=false) where {D}
     zero = ntuple(_ -> Int8(0), D)
+    forest.conn isa Patches &&
+        return glue_seam_shift(forest, k, c, δ, symmetric, interpolated)
     ishalfturn(forest) || return zero
     d1, d2 = seam_plane(forest)
     δ[d1] == -1 && c[d2] == 1 || return zero
@@ -1505,7 +1537,8 @@ function mirror_sources!(pairs::TransferPairs{D},
                          b::Int, δ::NTuple{D,Int}, δ′::NTuple{D,Int},
                          walls::NTuple{D,FaceKind}, region,
                          low::NTuple{D,Bool}=ntuple(_ -> false, D),
-                         shift::NTuple{D,Int8}=ntuple(_ -> Int8(0), D)) where {D}
+                         shift::NTuple{D,Int8}=ntuple(_ -> Int8(0), D),
+                         top::NTuple{D,Bool}=ntuple(_ -> false, D)) where {D}
     k = forest.leaves[b]
     zerooffset = ntuple(_ -> 0, D)
     mask = map(!=(OuterFace), walls)
@@ -1524,10 +1557,19 @@ function mirror_sources!(pairs::TransferPairs{D},
         return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
     end
     states = vec(collect(Iterators.product(choices...)))
+    # The mirror label of each reflecting face crossed (M21), kept where it
+    # is not the dimension itself (see `GroupKey`).
+    p = patch(forest, k)
+    labels = ntuple(D) do d
+        walls[d] == ReflectingFace || return Int8(0)
+        label = mirror_label(forest, p, d, δ[d] < 0 ? 1 : 2)
+        return label == d ? Int8(0) : Int8(label)
+    end
     record!(kind, offset, lvl, s, via::Crossing) =
         for state in states
-            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns,
-                                           via.glue, low, shift),
+            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state,
+                                           key_orientation(forest, via), via.glue, low,
+                                           shift, top, labels, via.glue2),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         end
@@ -1719,11 +1761,13 @@ nobound(key) = UNBOUNDED
 # the glue entry's own, and anything else the identity (`noaxes`, the
 # default of a builder whose transfers are neither, as the regrid's).
 function group_axes(forest::Forest{D}, key::GroupKey{D}) where {D}
+    # A glue first: across a turned one (M21) the orientation is the turn
+    # of the variables, and the axis map is still the entry's.
+    key.glue != 0 && return glue_axes(forest, Crossing(Int8(0), key.glue, key.glue2))
     if key.orientation != 0
         perm, flip = axismap(key.orientation, seam_plane(forest), Val(D))
         return map(Int8, perm), flip
     end
-    key.glue != 0 && return glue_axes(forest, Crossing(0, key.glue))
     return identity_axes(Val(D))
 end
 noaxes(key::GroupKey{D}) where {D} = identity_axes(Val(D))
@@ -2084,17 +2128,42 @@ function check_patch_corners(conn::Patches{D}, N::Int, G::NTuple{D,Int},
         conn.glue[glue_slot(p, e, se, D)].patch != 0 || continue
         isempty(target_range(N, G[d], c[d], sd == 2 ? 1 : -1, 0, false)) && continue
         isempty(target_range(N, G[e], c[e], se == 2 ? 1 : -1, 0, false)) && continue
-        throw(ArgumentError(
-            "patch $p is glued at its $(sidename(sd)) face of dimension $d and at its " *
-            "$(sidename(se)) face of dimension $e, so a block in the corner between " *
-            "them has a ghost region beyond both faces at once: a patch corner, where " *
-            "three or more patches meet and no one block lies across, which the ghost " *
-            "fill does not fill. An element-centered set is filled on faces only and " *
-            "never reaches one; a cell- or vertex-centered set does unless its ghost " *
-            "widths leave that region empty."))
+        # A corner the two entries agree on has one block across it, as a
+        # turn's axis does (M21): the neighbor search composes the two.
+        # Probed from the root in that corner, at level 0, where the search
+        # answers for every level, the glue's maps scaling with the level.
+        n = conn.roots[p]
+        pos = ntuple(a -> a == d ? (sd == 1 ? 0 : n[a] - 1) :
+                          a == e ? (se == 1 ? 0 : n[a] - 1) : 0, D)
+        δ = ntuple(a -> a == d ? (sd == 1 ? -1 : 1) : a == e ? (se == 1 ? -1 : 1) : 0, D)
+        root = conn.firstroot[p] + root_index(n, pos)
+        glued_anchor(conn, MortonKey{D}(root, 0, ntuple(_ -> 0, D)), δ) === nothing ||
+            continue
+        refuse_patch_corner(p, d, sd, e, se)
+    end
+    # Beyond three glued faces at once the search composes nothing, so a
+    # region there is refused wherever all three of its ranges are nonempty.
+    for p in eachindex(conn.roots), d in 1:D, e in (d + 1):D, f in (e + 1):D,
+        sd in 1:2, se in 1:2, sf in 1:2
+        all(((a, s),) -> conn.glue[glue_slot(p, a, s, D)].patch != 0,
+            ((d, sd), (e, se), (f, sf))) || continue
+        any(((a, s),) -> isempty(target_range(N, G[a], c[a], s == 2 ? 1 : -1, 0, false)),
+            ((d, sd), (e, se), (f, sf))) && continue
+        refuse_patch_corner(p, d, sd, e, se)
     end
     return nothing
 end
+
+# The refusal of a patch corner between the faces `(d, sd)` and `(e, se)`
+# of patch `p`, which the schedule cannot fill.
+refuse_patch_corner(p, d, sd, e, se) = throw(ArgumentError(
+    "patch $p is glued at its $(sidename(sd)) face of dimension $d and at its " *
+    "$(sidename(se)) face of dimension $e, so a block in the corner between " *
+    "them has a ghost region beyond both faces at once: a patch corner, where " *
+    "three or more patches meet and no one block lies across, which the ghost " *
+    "fill does not fill. An element-centered set is filled on faces only and " *
+    "never reaches one; a cell- or vertex-centered set does unless its ghost " *
+    "widths leave that region empty."))
 sidename(s::Integer) = s == 1 ? "low" : "high"
 
 # The layouts a glued face can carry (M17). A turned source is read with
@@ -2112,6 +2181,47 @@ sidename(s::Integer) = s == 1 ? "low" : "high"
 # glued to a low face owns it on both sides, as a rotating seam does, and
 # is allowed.
 check_glue_layout(::OneBrick, G, centering, c) = nothing
+# `seam_shift` across a turned glue (M21): a turned entry on the low face of
+# `d` that reverses a vertex-like tangential axis `e` of its own patch, a
+# half turn's, partitions the slab beyond it along `e` so that each region
+# is the image of one block's owned points, as a brick's half turn does.
+# Every boundary moves one plane up (1), but at the ends of `e`: at the
+# top, the upper boundary stays where the bottom block's low plane is not
+# evolved, under symmetric walls at an unglued face (2); at the bottom,
+# the lower one stays where the top block owns its high plane, the
+# appendix of an interpolated set at a kinked glue (3); a block at both
+# ends with both is not shifted at all (0).
+function glue_seam_shift(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
+                         δ::NTuple{D,Int}, symmetric::Bool,
+                         interpolated::Bool=false) where {D}
+    zero = ntuple(_ -> Int8(0), D)
+    conn = forest.conn::Patches{D}
+    conn.turnplane == (0, 0) && return zero
+    p = patch(forest, k)
+    n = conn.roots[p]
+    lvl = level(k)
+    pos = root_position(n, Int(k.root) - conn.firstroot[p])
+    g = ntuple(d -> (pos[d] << lvl) + Int(k.coords[d]), D)
+    shift = zero
+    for d in 1:D
+        δ[d] == -1 && g[d] == 0 || continue
+        entry = conn.glue[glue_slot(p, d, 1, D)]
+        entry.turn != 0 || continue
+        for a in 1:D
+            e = Int(entry.perm[a])
+            entry.flip[a] && e != d && c[e] == 1 || continue
+            top, bottom = g[e] == (n[e] << lvl) - 1, g[e] == 0
+            topowns = interpolated && iskinked(conn, p, e, 2)
+            lowevolved = isglued(conn, p, e, 1) || !symmetric
+            lower = !(bottom && topowns)
+            upper = !(top && !lowevolved)
+            state = lower ? (upper ? 1 : 2) : (upper ? 3 : 0)
+            shift = Base.setindex(shift, Int8(state), e)
+        end
+    end
+    return shift
+end
+
 function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple{D,Symbol},
                            c::NTuple{D,Int}) where {D}
     for p in eachindex(conn.roots), d in 1:D, s in 1:2
@@ -2131,6 +2241,11 @@ function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple
             e = Int(entry.perm[a])
             entry.flip[a] && c[e] == 1 || continue
             e == d && s == 1 && continue
+            # A turn's seam reversing a tangential axis of its own patch, a
+            # half turn's (M21), partitions its slab as the image of the
+            # blocks' owned points, from the ownership at that axis' faces
+            # (`glue_seam_shift`).
+            entry.turn != 0 && entry.patch == p && e != d && continue
             throw(ArgumentError(e == d ?
                 "face $face is glued to face $there, a high face to a high face, and " *
                 "this layout holds dimension $d vertex-like: a block owns the low wall " *
@@ -2305,8 +2420,16 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # transfer keeps 0 unless it is also mirrored.
     function factorcol(key)
         parity = map(m -> m == 3 ? Int8(0) : m, key.mirror)
+        # The factor table is indexed by mirror label (M21): a mirrored
+        # dimension's state goes to its label's place, which on a brick, and
+        # wherever `labels` is 0, is the dimension's own.
+        labelled = ntuple(D) do k
+            d = findfirst(e -> parity[e] != 0 &&
+                               (key.labels[e] == 0 ? e : Int(key.labels[e])) == k, 1:D)
+            return d === nothing ? Int8(0) : parity[d]
+        end
         return any(!iszero, parity) || key.orientation != 0 ?
-               mirrorcolumn(parity) + 3^D * Int(key.orientation) : 0
+               mirrorcolumn(labelled) + 3^D * Int(key.orientation) : 0
     end
     axesof(key) = group_axes(forest, key)
 

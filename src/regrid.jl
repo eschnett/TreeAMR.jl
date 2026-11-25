@@ -854,7 +854,8 @@ function appendix_pairs(pairs::TransferPairs{D}, forest::Forest{D},
         any(top) && key.kind !== :copy &&
             error("a $(key.kind) into a block with an appendix; this is a bug")
         k2 = GroupKey{D}(key.kind, key.direction, key.offset, key.level, key.mirror,
-                         key.orientation, key.glue, key.low, key.shift, top)
+                         key.orientation, key.glue, key.low, key.shift, top, key.labels,
+                         key.glue2)
         push!.(get!(out, k2, (Int32[], Int32[])), (targets[i], sources[i]))
     end
     return out

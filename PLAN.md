@@ -448,7 +448,8 @@ TreeGeneralizedHarmonic and TreeGRRMHD on patches.
 
 ### M21 — Symmetries on patches
 
-*(Proposed 2026-11-25; Erik's decisions on refinement taken that day.)*
+*(Proposed 2026-11-25; Erik's decisions on refinement taken that day;
+designed in step 1, in CODE.md, "Symmetries on patches".)*
 The symmetries a brick has — mirror planes (bitant, quadrant, octant)
 and turns about an axis by 90° and 180° (M12, M14), alone or with a
 mirror plane across the axis — on forests of patches, so that a
@@ -535,32 +536,37 @@ glue entries.
 
 Each step has the test that says it is done:
 
-1. **The design**, in CODE.md, marked proposed until Erik approves it,
-   the open questions above settled. *Done when* Erik approves.
-2. **Face kinds per patch face.** *Done when*, on TreeAMR's own test
-   layouts, a forest of patches cut by a mirror plane fills its ghosts,
-   regrids and evolves, as the full forest does on symmetric data, to
-   rounding, in every centering, with a refinement region against the
-   mirror plane; and the refusals of the per-`(dim, side)` kinds on
-   patches give way.
-3. **Turn seams as glue entries.** *Done when* a brick seam written as a
-   glue entry fills, regrids and evolves bit for bit as M12's and M14's
-   seams do (their tests, re-run on the glue form); a forest of patches
-   with a turned glue does as the full forest on symmetric data, to
-   rounding; `balance!` keeps conformity there; and a leaf on an aligned
-   glue regrids freely under `glue = :interpolate`, serially, over MPI
-   and on a device.
-4. **The fold.** *Done when* interpolated ghosts across a kinked glue
-   next to a mirror plane and next to a seam agree with the full
-   layout's to rounding, in parity and in the turned components; and
-   `interpolate!` returns the full domain's values at points beyond the
-   planes.
-5. **TreeMultiPatch's symmetric layouts**: both balls under the bitant,
-   quadrant and octant mirrors and under the 90° and 180° turns about
-   `z`, alone and with the `z` mirror, with even root counts across the
-   cuts. *Done when* each layout's forest builds and passes its check,
-   its atlas folds every point of the full ball, its `√g` integrates to
-   its share of the volume, and `chart_aligned` declares the new pairs.
+1. **The design.** Done 2026-11-25: Erik approved it with its four
+   proposals, which settle the open questions above. The design is in
+   [CODE.md](CODE.md#symmetries-on-patches); the record in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
+2. **Face kinds per patch face.** Done 2026-11-25: a patch's own
+   `mirror` and `outflow` faces fill, regrid and evolve as a brick's
+   reflecting and outflow faces do, laid out with swapped axes, bit for
+   bit uniform and to rounding refined against the mirror plane, in every
+   centering. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
+3. **Turn seams as glue entries.** Done 2026-11-25: a brick's quarter
+   and half turn written as glue entries fill, regrid and evolve bit for
+   bit as the seams do, a turned glue between two patches too; `balance!`
+   keeps conformity there, and an interpolated set regrids freely at one;
+   over MPI and on Metal. The half turn's slab where the reversed axis'
+   faces are glued goes with the fold, to step 4. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
+4. **The fold.** Done 2026-11-25: interpolated ghosts across a kinked glue
+   beside a mirror and beside a half turn's seam agree with the full
+   layout to rounding, parity and turned components included, and
+   `interpolate!` gives the full domain's values and derivatives past the
+   planes; with the half turn's slab at a glued reversed axis, deferred
+   from step 3. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
+5. **TreeMultiPatch's symmetric layouts.** Done 2026-11-25, on
+   TreeMultiPatch's branch `eschnett-claude/m21-symmetric-layouts`: both
+   balls under the seven symmetries, every point of the full ball folded
+   by the atlas, which reports the symmetry (Erik's widening of the
+   contract), and TreeAMR's interpolated ghosts on each reduced
+   seven-patch ball equal to the full ball's. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
 6. **TreeWave on the symmetric balls**: the sum of a plane wave's images
    under the symmetry, an exact solution with that symmetry. *Done
    when* each reduced ball's run is the full ball's, restricted, to

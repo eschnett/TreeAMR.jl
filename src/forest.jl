@@ -52,17 +52,23 @@ struct OneBrick{D} <: Connectivity{D} end
 # root units, not level ones, because the offset scales with the level,
 # as the seam's `n2` does. The gather form is the one `RotatedSource`
 # reads a turned source by, so the schedule can take `perm` and `flip`
-# from here as they are.
+# from here as they are. `turn` (M21) is the number of quarter turns, of
+# the forest's turn about its axis, that carry a point beyond this face to
+# its image across it: 0 for an ordinary glue, whose data is the same
+# field on both sides, and 1–3 for a symmetry's seam, across which a
+# field set applies its `rotation` (or, for 2 on a half-turn forest, its
+# `halfturn`) map.
 struct GlueEntry{D}
     patch::Int
     face::NTuple{2,Int}
     perm::NTuple{D,Int8}
     flip::NTuple{D,Bool}
     offset::NTuple{D,Int}
+    turn::Int8
 end
 GlueEntry{D}() where {D} =
     GlueEntry{D}(0, (0, 0), ntuple(e -> Int8(e), D), ntuple(_ -> false, D),
-                 ntuple(_ -> 0, D))
+                 ntuple(_ -> 0, D), Int8(0))
 
 # Several bricks of roots — patches — glued at faces. Patch `p` owns the
 # flat roots `firstroot[p] .+ (0:prod(roots[p]) - 1)`, numbered within it
@@ -76,13 +82,27 @@ GlueEntry{D}() where {D} =
 # through two glued faces at once: a patch corner, which the neighbor
 # search answers with no neighbor and the schedule refuses where a field
 # set would read it. A property of the table alone, so computed here,
-# once.
+# once. `kinds` and `labels` (M21) are the kind of every patch face, at
+# the same slots as `glue` — `OuterFace` for a glued one, whose kind is
+# its entry — and the mirror label of a reflecting face, 0 elsewhere: the
+# label of the physical axis its plane is normal to, which a field set's
+# parity is declared under ("Symmetries on patches" in CODE.md). The
+# forest-wide `reflecting` and `outflow` keywords are folded in, with
+# label `d`, so that a step reads one table.
 struct Patches{D,T} <: Connectivity{D}
     roots::Vector{NTuple{D,Int}}
     extents::Vector{NTuple{D,Tuple{T,T}}}
     firstroot::Vector{Int}
     glue::Vector{GlueEntry{D}}
     corners::Bool
+    kinds::Vector{FaceKind}
+    labels::Vector{Int8}
+    # The forest's turn (M21): the mirror labels `(k1, k2)` of its plane,
+    # `(0, 0)` for none, and whether it is a half turn rather than a
+    # quarter turn. Kept here, not in `Forest.rotating`, so that the brick
+    # seam's neighbor arithmetic never runs on a forest of patches.
+    turnplane::NTuple{2,Int8}
+    half::Bool
 end
 
 # The entry of face `side` (1 low, 2 high) of dimension `d` of patch `p`.
@@ -191,7 +211,16 @@ see [`root_position`](@ref) and [`root_index`](@ref).
 extents defaulting as above, and `glue` a vector of
 `(from = (patch, dim, side), to = (patch, dim, side), map = (…))`, with
 `side` 1 for the low face and 2 for the high one. `reflecting` and
-`outflow` apply to the faces of every patch that are not glued.
+`outflow` apply to the faces of every patch that are not glued. A patch
+may also give its own faces kinds (M21), as the fields
+`mirror = ((k_lo, k_hi), …)` — the **mirror label** of each reflecting
+face, the axis its plane is normal to, and 0 elsewhere — and
+`outflow = ((lo, hi), …)`, one pair per dimension each. So a symmetry
+plane that is a different logical face on each patch is said where it
+is; a field set's `parity` is then declared per label, entry `k` under
+the mirror normal to axis `k`. A face is set one way, not glued, and a
+label belongs to faces of one dimension of a patch. See "Symmetries on
+patches" in `CODE.md`.
 
 Without `leaves` the forest starts as its unrefined roots. With it, it
 starts from that leaf list instead — keys in curve order, as
@@ -465,12 +494,12 @@ function patch_dimension(patches)
             "patch $p, $(repr(patch)), is not a named tuple `(roots = (…), extents = " *
             "(…))` whose roots are a tuple of integers: each patch is a brick of " *
             "roots, with its own logical extents"))
-        extra = [n for n in keys(patch) if !(n in (:roots, :extents))]
+        extra = [n for n in keys(patch) if !(n in (:roots, :extents, :mirror, :outflow))]
         isempty(extra) || throw(ArgumentError(
             "patch $p, $(repr(patch)), has the field(s) $(join(extra, ", ")), and a " *
-            "patch has only `roots` and `extents`: the glue between patches is the " *
-            "forest's `glue` keyword, and the faces' kinds its `reflecting` and " *
-            "`outflow`"))
+            "patch has only `roots`, `extents`, and the kinds of its own faces, " *
+            "`mirror` and `outflow`: the glue between patches is the forest's `glue` " *
+            "keyword"))
     end
     D = length(first(patches).roots)
     all(p -> length(p.roots) == D, patches) || throw(ArgumentError(
@@ -482,13 +511,6 @@ end
 
 function patch_forest(::Val{D}, ::Type{T}, patches, glue, N, periodic, reflecting,
                       outflow, rotating, halfturn, extents, leaves, comm) where {D,T}
-    (rotating === nothing && halfturn === nothing) || throw(ArgumentError(
-        "a forest of patches takes no seam, got rotating = $(repr(rotating)) and " *
-        "halfturn = $(repr(halfturn)): its patches are glued by the `glue` table, and " *
-        "a seam is the brick form's other way of gluing faces, by a quarter or a half " *
-        "turn. The two mechanisms are not combined. A turn between patches is a glue " *
-        "entry whose map turns the axes; a seam on one brick is " *
-        "`Forest(roots; rotating = …)` or `halfturn = …`."))
     periodic === nothing || !any(periodic) || throw(ArgumentError(
         "a forest of patches is not periodic, got periodic = $periodic: a wrap is a " *
         "patch glued to its own opposite face, which the glue table says directly — " *
@@ -502,7 +524,7 @@ function patch_forest(::Val{D}, ::Type{T}, patches, glue, N, periodic, reflectin
     faces = face_kinds(ntuple(_ -> false, D),
                        something(reflecting, ntuple(_ -> (false, false), D)),
                        something(outflow, ntuple(_ -> (false, false), D)))
-    conn = patch_connectivity(Val(D), T, patches, glue, faces)
+    conn = patch_connectivity(Val(D), T, patches, glue, faces, rotating, halfturn)
     list = leaf_list(Val(D), last(conn.firstroot) + prod(last(conn.roots)), leaves)
     forest = Forest{D,T}(conn.roots[1], ntuple(_ -> false, D), faces, (Int8(0), Int8(0)),
                          conn.extents[1], Int(N), list, ForestState(),
@@ -513,7 +535,9 @@ end
 
 # The patches and the glue table, checked, as the forest stores them.
 function patch_connectivity(::Val{D}, ::Type{T}, patches, glue,
-                            faces::NTuple{D,NTuple{2,FaceKind}}) where {D,T}
+                            faces::NTuple{D,NTuple{2,FaceKind}}, rotating=nothing,
+                            halfturn=nothing) where {D,T}
+    plane, half = patch_turn_plane(Val(D), rotating, halfturn)
     np = length(patches)
     roots = NTuple{D,Int}[]
     extents = NTuple{D,Tuple{T,T}}[]
@@ -552,6 +576,7 @@ function patch_connectivity(::Val{D}, ::Type{T}, patches, glue,
 
     table = fill(GlueEntry{D}(), nslots)
     maps = fill(ntuple(identity, D), nslots)
+    turns = zeros(Int8, nslots)
     for (i, item) in enumerate(glue)
         item isa NamedTuple && all(n -> haskey(item, n), (:from, :to, :map)) ||
             throw(ArgumentError(
@@ -561,6 +586,7 @@ function patch_connectivity(::Val{D}, ::Type{T}, patches, glue,
         p, d, s = from = check_face(item.from, :from, i, np, D)
         q, d2, s2 = to = check_face(item.to, :to, i, np, D)
         σ = check_axis_map(item.map, i, D)
+        turn = check_turn(item, i, from, to, plane, half)
         slot = glue_slot(p, d, s, D)
         table[slot].patch == 0 || throw(ArgumentError(
             "face $from is glued twice, by glue entry $i and an earlier one: a face is " *
@@ -597,7 +623,7 @@ function patch_connectivity(::Val{D}, ::Type{T}, patches, glue,
             src[a] == d && return there - sign(σ[d]) * here
             return flip[a] ? roots[q][a] : 0
         end
-        table[slot] = GlueEntry{D}(q, (d2, s2), map(Int8, src), flip, offset)
+        table[slot] = GlueEntry{D}(q, (d2, s2), map(Int8, src), flip, offset, turn)
         maps[slot] = σ
     end
     # Both directions listed, each the other's inverse: then a step from
@@ -622,11 +648,143 @@ function patch_connectivity(::Val{D}, ::Type{T}, patches, glue,
                 "$(maps[glue_slot(to..., D)]): both directions of every gluing are " *
                 "listed, each the inverse of the other, so face $to is glued to " *
                 "$((p, d, s)) by map = $inverse"))
+        mod(entry.turn + back.turn, 4) == 0 || throw(ArgumentError(
+            "face $((p, d, s)) is glued to face $to with turn = $(entry.turn), and face " *
+            "$to back with turn = $(back.turn): a step across and back is no turn at " *
+            "all, so the reverse of an entry turned by r is turned by -r, here " *
+            "turn = $(mod(-entry.turn, 4))"))
     end
     corners = any(1:np) do p
         count(d -> any(s -> table[glue_slot(p, d, s, D)].patch != 0, 1:2), 1:D) >= 2
     end
-    return Patches{D,T}(roots, extents, firstroot, table, corners)
+    kinds, labels = patch_faces(Val(D), patches, faces, table)
+    for slot in eachindex(labels)
+        k = labels[slot]
+        k != 0 && k in plane && throw(ArgumentError(
+            "face $(glue_face(slot, D)) is a mirror of label $k, which is in the plane " *
+            "$(Int.(plane)) of the forest's turn: a mirror plane through the turn's " *
+            "axis is not a symmetry the turn commutes with, so the two are not " *
+            "combined here"))
+    end
+    return Patches{D,T}(roots, extents, firstroot, table, corners, kinds, labels, plane,
+                        half)
+end
+
+# The forest's turn on the patches form (M21): `rotating = (k1, k2)` for a
+# quarter turn or `halfturn = (k1, k2)` for a half turn, naming the mirror
+# labels — the physical axes — of the turn's plane, as the brick form's
+# keywords name its dimensions. `((0, 0), false)` for neither.
+function patch_turn_plane(::Val{D}, rotating, halfturn) where {D}
+    rotating === nothing && halfturn === nothing && return (Int8(0), Int8(0)), false
+    (rotating === nothing || halfturn === nothing) || throw(ArgumentError(
+        "rotating = $(repr(rotating)) and halfturn = $(repr(halfturn)) are both given: a " *
+        "forest has one turn, a quarter turn or a half turn about one axis"))
+    name, plane = rotating === nothing ? ("halfturn", halfturn) : ("rotating", rotating)
+    D >= 2 && plane isa Tuple{Integer,Integer} && all(k -> 1 <= k <= D, plane) &&
+        plane[1] != plane[2] || throw(ArgumentError(
+        "$name = $(repr(plane)) is not two different axes of 1:$D: on a forest of " *
+        "patches it names the plane of the turn by its two mirror labels, the axes " *
+        "the turn carries into each other"))
+    return (Int8(plane[1]), Int8(plane[2])), rotating === nothing
+end
+
+# The `turn` of glue entry `i` (M21), checked: 0 when it is not given,
+# and otherwise a number of quarter turns of the forest's turn, a half
+# turn's 2 only, across a low face glued to a low face, as a brick's seam
+# is, so that both seam planes of a vertex-like set are owned.
+function check_turn(item, i::Int, from, to, plane, half::Bool)
+    haskey(item, :turn) || return Int8(0)
+    t = item.turn
+    t isa Integer && 0 <= t <= 3 || throw(ArgumentError(
+        "glue entry $i has turn = $(repr(t)), which is not 0, 1, 2 or 3: the number of " *
+        "quarter turns that carry a point beyond the face to its image across it"))
+    t == 0 && return Int8(0)
+    plane == (0, 0) && throw(ArgumentError(
+        "glue entry $i has turn = $t, and the forest declares no turn: give the plane " *
+        "of the turn as `rotating = (k1, k2)`, or `halfturn = (k1, k2)`, by the mirror " *
+        "labels of its two axes, so that a field set can be asked how its variables " *
+        "turn"))
+    half && t != 2 && throw(ArgumentError(
+        "glue entry $i has turn = $t on a forest whose turn is a half turn: across its " *
+        "seam a point is carried by the half turn, turn = 2, only"))
+    from[3] == 1 && to[3] == 1 || throw(ArgumentError(
+        "glue entry $i turns face $from onto face $to, and a turn glues a low face to a " *
+        "low face, as a brick's seam does: a layout puts its symmetry faces low, so " *
+        "that a vertex-like set owns both copies of the seam plane"))
+    return Int8(t)
+end
+
+# The kind and mirror label of every patch face (M21), at the glue's slots:
+# the forest-wide `faces` on every unglued face, with label `d`, and each
+# patch's own `mirror` and `outflow`, checked. A face is set one way only,
+# a glued face is not a wall, and within a patch a label belongs to the
+# faces of one dimension, since two logical axes of one patch are not
+# normal to one plane.
+function patch_faces(::Val{D}, patches, faces::NTuple{D,NTuple{2,FaceKind}},
+                     table::Vector{GlueEntry{D}}) where {D}
+    np = length(patches)
+    kinds = fill(OuterFace, 2D * np)
+    labels = zeros(Int8, 2D * np)
+    for (p, patch) in enumerate(patches), d in 1:D, s in 1:2
+        slot = glue_slot(p, d, s, D)
+        table[slot].patch == 0 || continue
+        kinds[slot] = faces[d][s]
+        kinds[slot] == ReflectingFace && (labels[slot] = Int8(d))
+    end
+    for (p, patch) in enumerate(patches)
+        mirror = patch_face_field(patch, :mirror, p, D, 0, Integer)
+        outflow = patch_face_field(patch, :outflow, p, D, false, Bool)
+        for d in 1:D, s in 1:2
+            k, o = Int(mirror[d][s]), outflow[d][s]
+            (k == 0 && !o) && continue
+            face = (p, d, s)
+            slot = glue_slot(p, d, s, D)
+            0 <= k <= D || throw(ArgumentError(
+                "patch $p has mirror label $k on face $face, outside 1:$D: a mirror " *
+                "face's label is the axis its plane is normal to, one of the $D under " *
+                "which a field set declares its parities, and 0 where the face is no " *
+                "mirror"))
+            (k != 0 && o) && throw(ArgumentError(
+                "patch $p sets face $face both reflecting (mirror label $k) and " *
+                "outflow: a face is a mirror or extrapolated, not both"))
+            table[slot].patch == 0 || throw(ArgumentError(
+                "patch $p sets face $face $(o ? "outflow" : "reflecting"), and the face " *
+                "is glued to face $((table[slot].patch, table[slot].face...)): a glued " *
+                "face has a neighbor across it, so it is not a wall"))
+            faces[d][s] == OuterFace || throw(ArgumentError(
+                "patch $p sets face $face $(o ? "outflow" : "reflecting"), and the " *
+                "forest's `$(faces[d][s] == ReflectingFace ? "reflecting" : "outflow")` " *
+                "keyword already sets the $(s == 1 ? "low" : "high") face of dimension " *
+                "$d of every patch: a face is set one way, by the forest-wide keyword " *
+                "for every patch at once or by its patch's own field"))
+            kinds[slot] = o ? OutflowFace : ReflectingFace
+            labels[slot] = Int8(k)
+        end
+        for d in 1:D, e in (d + 1):D, s in 1:2, t in 1:2
+            k = labels[glue_slot(p, d, s, D)]
+            k != 0 && k == labels[glue_slot(p, e, t, D)] && throw(ArgumentError(
+                "patch $p has mirror label $k on a face of dimension $d and on one of " *
+                "dimension $e: a label names the axis a mirror plane is normal to, and " *
+                "two logical axes of one patch are not normal to one plane"))
+        end
+    end
+    return kinds, labels
+end
+
+# A patch's own face field, `mirror` or `outflow` (M21), checked for its
+# shape: one `(lo, hi)` pair per dimension, as the brick's `reflecting`,
+# and `default` on every face where the patch does not give it.
+function patch_face_field(patch, name::Symbol, p::Int, D::Int, default, ::Type{E}) where {E}
+    haskey(patch, name) || return ntuple(_ -> (default, default), D)
+    f = getfield(patch, name)
+    f isa Tuple && length(f) == D &&
+        all(x -> x isa Tuple{E,E}, f) || throw(ArgumentError(
+        "patch $p has $name = $(repr(f)), which is not $D pairs `(lo, hi)` of " *
+        "$(E === Bool ? "`Bool`s" : "integers"): a patch's $name gives each of its " *
+        "faces, low and high per dimension, as the brick's `reflecting` does" *
+        (name === :mirror ? ", with the mirror label of a reflecting face and 0 " *
+                            "elsewhere" : "")))
+    return f
 end
 
 # A face `(patch, dim, side)` of a glue entry, checked.
@@ -676,10 +834,26 @@ end
 function patch_keywords(forest::Forest{D,T}) where {D,T}
     forest.conn isa OneBrick && return nothing
     conn = forest.conn::Patches{D,T}
-    patches = [(roots=conn.roots[p], extents=conn.extents[p])
-               for p in eachindex(conn.roots)]
-    glue = NamedTuple{(:from, :to, :map),
-                      Tuple{NTuple{3,Int},NTuple{3,Int},NTuple{D,Int}}}[]
+    # A patch's own faces (M21) are those the forest-wide keywords do not
+    # set; every patch gets the two fields when some patch has one, so the
+    # list stays of one type, and none when no patch does, so a forest
+    # without them gives what it gave.
+    faces = getfield(forest, :faces)
+    own(p, d, s) = faces[d][s] == OuterFace ? conn.kinds[glue_slot(p, d, s, D)] : OuterFace
+    patches = if any(p -> any(d -> any(s -> own(p, d, s) != OuterFace, 1:2), 1:D),
+                     eachindex(conn.roots))
+        [(roots=conn.roots[p], extents=conn.extents[p],
+          mirror=ntuple(d -> ntuple(s -> own(p, d, s) == ReflectingFace ?
+                                         Int(conn.labels[glue_slot(p, d, s, D)]) : 0, 2), D),
+          outflow=ntuple(d -> ntuple(s -> own(p, d, s) == OutflowFace, 2), D))
+         for p in eachindex(conn.roots)]
+    else
+        [(roots=conn.roots[p], extents=conn.extents[p]) for p in eachindex(conn.roots)]
+    end
+    # A forest with a turn (M21) gives every entry its `turn` and the
+    # plane's keyword beside the two; one without gives what it gave.
+    turned = conn.turnplane != (0, 0)
+    entries = []
     for p in eachindex(conn.roots), d in 1:D, s in 1:2
         entry = conn.glue[glue_slot(p, d, s, D)]
         entry.patch == 0 && continue
@@ -687,9 +861,20 @@ function patch_keywords(forest::Forest{D,T}) where {D,T}
             a = findfirst(==(e), entry.perm)::Int
             return entry.flip[a] ? -a : a
         end
-        push!(glue, (from=(p, d, s), to=(entry.patch, entry.face...), map=σ))
+        push!(entries, turned ?
+                       (from=(p, d, s), to=(entry.patch, entry.face...), map=σ,
+                        turn=Int(entry.turn)) :
+                       (from=(p, d, s), to=(entry.patch, entry.face...), map=σ))
     end
-    return (patches=patches, glue=glue)
+    turned || return (patches=patches,
+                      glue=NamedTuple{(:from, :to, :map),
+                                      Tuple{NTuple{3,Int},NTuple{3,Int},NTuple{D,Int}}}[
+                          e for e in entries])
+    glue = NamedTuple{(:from, :to, :map, :turn),
+                      Tuple{NTuple{3,Int},NTuple{3,Int},NTuple{D,Int},Int}}[e for e in entries]
+    plane = Int.(conn.turnplane)
+    return conn.half ? (patches=patches, glue=glue, halfturn=plane) :
+           (patches=patches, glue=glue, rotating=plane)
 end
 
 # Whether the forest is made of patches (M17), and how many it has.
@@ -1145,7 +1330,9 @@ end
 function connectivity_digest(forest::Forest{D,T}) where {D,T}
     conn = forest.conn::Patches{D,T}
     return (conn.roots, conn.extents,
-            [(e.patch, e.face, Int.(e.perm), e.flip, e.offset) for e in conn.glue])
+            [(e.patch, e.face, Int.(e.perm), e.flip, e.offset, Int(e.turn))
+             for e in conn.glue],
+            Int.(conn.kinds), Int.(conn.labels), Int.(conn.turnplane), conn.half)
 end
 
 sameforest(a::ForestDigest, b::ForestDigest) =
@@ -1380,7 +1567,12 @@ isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) 
 struct Crossing
     turns::Int8
     glue::Int8
+    # A second glued face crossed at once (M21), at a patch corner the two
+    # entries agree on, as at a turn's axis: the step crosses `glue` and
+    # then `glue2`. 0 for a single face, as everywhere before M21.
+    glue2::Int8
 end
+Crossing(turns::Integer, glue::Integer) = Crossing(Int8(turns), Int8(glue), Int8(0))
 Crossing() = Crossing(0, 0)
 
 # Whether a step crosses a seam or a glued face.
@@ -1390,8 +1582,51 @@ iscrossing(c::Crossing) = c.turns != 0 || c.glue != 0
 # gather form of `GlueEntry`: axis `a` beyond the glue is axis `perm[a]`
 # of the asking block, reversed where `flip[a]`.
 function glue_axes(forest::Forest{D}, c::Crossing) where {D}
-    entry = (forest.conn::Patches{D}).glue[c.glue]
-    return entry.perm, entry.flip
+    conn = forest.conn::Patches{D}
+    entry = conn.glue[c.glue]
+    c.glue2 == 0 && return entry.perm, entry.flip
+    # Two faces crossed: axis `a` beyond the second is axis `perm2[a]`
+    # beyond the first, which is axis `perm[perm2[a]]` here, reversed where
+    # either step reverses it.
+    second = conn.glue[c.glue2]
+    perm = ntuple(a -> entry.perm[Int(second.perm[a])], D)
+    flip = ntuple(a -> second.flip[a] ⊻ entry.flip[Int(second.perm[a])], D)
+    return perm, flip
+end
+
+# Whether a forest of patches has a symmetry of its own patches (M21): a
+# turn, or a patch face whose kind is its own rather than the forest-wide
+# keywords'. Point interpolation folds through the per-patch table there.
+function symmetric_patches(forest::Forest{D}) where {D}
+    forest.conn isa Patches || return false
+    conn = forest.conn::Patches{D}
+    conn.turnplane != (0, 0) && return true
+    faces = getfield(forest, :faces)
+    for p in eachindex(conn.roots), d in 1:D, s in 1:2
+        slot = glue_slot(p, d, s, D)
+        conn.glue[slot].patch == 0 && conn.kinds[slot] != faces[d][s] && return true
+    end
+    return false
+end
+
+# The turn of a forest of patches (M21), `(plane, half)` with the plane's
+# two mirror labels, or `nothing` for none and on a brick, whose seam is
+# `rotating_dims` and `halfturn_dims`.
+function patch_turn(forest::Forest{D}) where {D}
+    forest.conn isa Patches || return nothing
+    conn = forest.conn::Patches{D}
+    conn.turnplane == (0, 0) && return nothing
+    return (Int.(conn.turnplane), conn.half)
+end
+
+# The number of quarter turns a step across glued faces carries a point
+# by (M21): the sum of its entries' turns, modulo 4.
+function glue_turn(forest::Forest{D}, c::Crossing) where {D}
+    c.glue == 0 && return 0
+    conn = forest.conn::Patches{D}
+    t = Int(conn.glue[c.glue].turn)
+    c.glue2 != 0 && (t += Int(conn.glue[c.glue2].turn))
+    return mod(t, 4)
 end
 
 # The orientation of the naive node at global coordinates `g`: 0 off the
@@ -1534,7 +1769,33 @@ function glued_anchor(conn::Patches{D}, k::MortonKey{D}, δ::NTuple{D,Int}) wher
         end
     end
     exits == 0 && return glued_node(conn, p, g, lvl, Crossing())
-    exits == 1 || return nothing
+    exits == 1 && return cross_glue(conn, p, g, d, lvl, 0)
+    exits == 2 || return nothing
+    # Two faces at once (M21): crossed one after the other, in both orders.
+    # Where the two agree — the same node, the same axis map and turn — the
+    # corner has one node across it, as at a turn's axis, whose region beyond
+    # both seam faces is the image of the block's own by two of its turns.
+    # Where they do not, at a cubed sphere's corner, it has none.
+    d1 = findfirst(e -> g[e] < 0 || g[e] >= n[e] << lvl, 1:D)::Int
+    a = cross_glue(conn, p, g, d1, lvl, d)
+    b = cross_glue(conn, p, g, d, lvl, d1)
+    (a === nothing || b === nothing) && return nothing
+    a[1:2] == b[1:2] || return nothing
+    ca, cb = a[3], b[3]
+    axes(c) = (c1 = conn.glue[c.glue]; c2 = conn.glue[c.glue2];
+               (ntuple(e -> c1.perm[Int(c2.perm[e])], D),
+                ntuple(e -> c2.flip[e] ⊻ c1.flip[Int(c2.perm[e])], D),
+                mod(Int(c1.turn) + Int(c2.turn), 4)))
+    axes(ca) == axes(cb) || return nothing
+    return a
+end
+
+# A step at level coordinates `g` of patch `p` across its face along `d`
+# by the glue's affine map (see `GlueEntry`), into the patch across, where
+# it must land inside — or, with `then ≠ 0`, leave that patch through the
+# one face the image of `then` names, and cross that face's glue too.
+function cross_glue(conn::Patches{D}, p::Int, g::NTuple{D,Int}, d::Int, lvl::Int,
+                    then::Int) where {D}
     slot = glue_slot(p, d, g[d] < 0 ? 1 : 2, D)
     entry = conn.glue[slot]
     entry.patch == 0 && return nothing
@@ -1544,8 +1805,17 @@ function glued_anchor(conn::Patches{D}, k::MortonKey{D}, δ::NTuple{D,Int}) wher
                                x + (entry.offset[a] << lvl)
     end
     m = conn.roots[entry.patch]
-    any(e -> there[e] < 0 || there[e] >= m[e] << lvl, 1:D) && return nothing
-    return glued_node(conn, entry.patch, there, lvl, Crossing(0, slot))
+    out(e) = there[e] < 0 || there[e] >= m[e] << lvl
+    if then == 0
+        any(out, 1:D) && return nothing
+        return glued_node(conn, entry.patch, there, lvl, Crossing(0, slot))
+    end
+    e = findfirst(a -> Int(entry.perm[a]) == then, 1:D)::Int
+    count(out, 1:D) == 1 && out(e) || return nothing
+    second = glue_slot(entry.patch, e, there[e] < 0 ? 1 : 2, D)
+    next = cross_glue(conn, entry.patch, there, e, lvl, 0)
+    next === nothing && return nothing
+    return (next[1], next[2], Crossing(Int8(0), Int8(slot), Int8(second)))
 end
 
 # The anchor `(root, coords, crossing)` of the node at level coordinates
@@ -1586,8 +1856,32 @@ Base.propertynames(forest::Forest, private::Bool=false) =
 
 # Whether the forest has any reflecting face at all — what decides
 # whether a field set over it must declare a parity. An outflow face
-# needs none.
-hasreflecting(forest::Forest) = any(f -> ReflectingFace in f, forest.faces)
+# needs none. On a forest of patches, any patch's (M21).
+hasreflecting(forest::Forest{D}) where {D} =
+    forest.conn isa Patches ? ReflectingFace in (forest.conn::Patches{D}).kinds :
+    any(f -> ReflectingFace in f, forest.faces)
+
+# The kind and the mirror label of face `side` of dimension `d` of patch
+# `p` (M21): on a brick the forest's own, with label `d` for a reflecting
+# face, and on a forest of patches the patch's, which folds in the
+# forest-wide keywords. The label is 0 for a face that is no mirror.
+facekind(forest::Forest{D}, p::Integer, d::Integer, side::Integer) where {D} =
+    forest.conn isa Patches ? (forest.conn::Patches{D}).kinds[glue_slot(p, d, side, D)] :
+    getfield(forest, :faces)[d][side]
+function mirror_label(forest::Forest{D}, p::Integer, d::Integer, side::Integer) where {D}
+    forest.conn isa Patches && return Int((forest.conn::Patches{D}).labels[glue_slot(p, d,
+                                                                                    side, D)])
+    return getfield(forest, :faces)[d][side] == ReflectingFace ? Int(d) : 0
+end
+
+# The labels some reflecting face mirrors under (M21): the dimensions with
+# a reflecting face on a brick, the labels of the patches' mirror faces on
+# a forest of patches. A field set declares a parity under each.
+function mirrored_labels(forest::Forest{D}) where {D}
+    forest.conn isa Patches || return map(any, reflecting_faces(forest))
+    labels = (forest.conn::Patches{D}).labels
+    return ntuple(k -> Int8(k) in labels, D)
+end
 
 # Split a ghost direction of block `k` at the reflecting and outflow
 # faces it crosses (M10). Returns `(δ′, walls)`: `walls[d]` is the kind of
@@ -1610,14 +1904,15 @@ function wall_direction(forest::Forest{D}, k::MortonKey{D},
                         δ::NTuple{D,Int}) where {D}
     n = 1 << level(k)
     rootpos = root_position(forest, k.root)
-    roots = patch_roots(forest, patch(forest, k))
+    p = patch(forest, k)
+    roots = patch_roots(forest, p)
     walls = ntuple(D) do d
         δ[d] == 0 && return OuterFace
         forest.periodic[d] && return OuterFace
         stepped = Int(k.coords[d]) + δ[d]
         exits = δ[d] < 0 ? (stepped < 0 && rootpos[d] == 0) :
                            (stepped >= n && rootpos[d] == roots[d] - 1)
-        return exits ? forest.faces[d][δ[d] < 0 ? 1 : 2] : OuterFace
+        return exits ? facekind(forest, p, d, δ[d] < 0 ? 1 : 2) : OuterFace
     end
     return ntuple(d -> walls[d] == OuterFace ? δ[d] : 0, D), walls
 end
