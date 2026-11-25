@@ -635,7 +635,11 @@ declared up front:
   elsewhere, and a product of components takes the product of their
   parities. The parity is required, with no default, since it is physics.
   `NoParity` exists for dimensions without a reflecting face and is
-  refused in one that has one. A variable without a parity has
+  refused in one that has one. On a forest of patches the entries are
+  per **mirror label** rather than per dimension (M21, "Symmetries on
+  patches" below): entry `k` is the variable's parity under the mirror
+  plane normal to axis `k`, whatever logical dimension that plane is on
+  each patch, and is required where some patch has a face of label `k`. A variable without a parity has
   no value beyond the wall, and ghosts without a value do not stay in the
   ghosts: the first regrid prolongation that reads them carries them into
   the interior.
@@ -680,7 +684,11 @@ declared up front:
   grow; `reflecting_faces(forest)` and `outflow_faces(forest)` give the
   pairs back in the keywords' shape, and so do the properties
   `forest.reflecting` and `forest.outflow`, through `getproperty`, since
-  physics packages read `forest.reflecting` as the field it was.
+  physics packages read `forest.reflecting` as the field it was. A
+  forest of patches keeps the kind and the mirror label of every patch
+  face in its connectivity (below); `faces` there is the forest-wide
+  keywords', and inside the package every face is read through
+  `facekind(forest, p, d, side)` and `mirror_label(forest, p, d, side)`.
 - **Rotating** (a pair of dimensions): a quarter-plane symmetry. Only one quadrant of the
   `(d1, d2)` plane is simulated, and the other three are its images
   under rotations by 90° about the line where the low faces of `d1` and
@@ -922,9 +930,10 @@ declared up front:
     high one, `−d′` for two low or two high faces);
   - a reverse entry that is missing or not the inverse, and a face glued
     twice;
-  - a glued face that is reflecting or outflow. The face kinds are per
-    `(dim, side)` and apply to the unglued faces of every patch at once,
-    so they cannot be set where some patch is glued;
+  - a glued face that is reflecting or outflow, set by the forest-wide
+    keywords, which apply to the unglued faces of every patch at once and
+    so cannot be set where some patch is glued, or by the patch's own
+    fields (below);
   - more than 127 patch faces, `2D × npatches` (21 patches in 3D, 31 in
     2D; see the glue table below);
   - and the shapes: an empty list, a patch that is not a named tuple of
@@ -933,6 +942,26 @@ declared up front:
     range.
 
   There is no refusal of overlapping extents.
+
+  **A patch's own faces** (M21 step 2). A patch may give its faces kinds
+  of its own, beside `roots` and `extents`: `mirror = ((k_lo, k_hi), …)`,
+  the mirror label of each reflecting face and 0 elsewhere, and
+  `outflow = ((lo, hi), …)`, both one pair per dimension as the brick's
+  `reflecting` is. A mirror plane of a symmetry is then said where it is,
+  a different logical face on each patch, with the label naming the
+  physical axis it is normal to, which a field set's parity is declared
+  under ([Symmetries on patches](#symmetries-on-patches)). The
+  forest-wide `reflecting` and `outflow` keep their meaning, every
+  unglued face of that `(dim, side)`, with label `d`. The forest refuses,
+  each time saying why, a label outside `1:D`, a face both mirrored and
+  outflow, a patch's face that is glued, a face the forest-wide keywords
+  already set, one label on faces of two dimensions of a patch, which
+  cannot both be normal to one plane, and a field that is not one pair
+  per dimension. `Patches` holds `kinds` and `labels`, one entry per
+  patch face at the glue table's slots, the forest-wide kinds folded in,
+  so a step reads one table (`wall_direction`); both are covered by the
+  digest, and `patch_keywords` gives a patch's own faces back as the two
+  fields, on every patch when some patch has one.
 
   The forest holds the connectivity in a tenth field, `conn`,
   abstract-typed (`Connectivity{D}`) as `comm` is, so that `Forest{D,T}`
@@ -1305,7 +1334,13 @@ offset) with its **target rows remapped** by the mirror `j ↦ j*`:
 The source windows and weights are the ordinary ones, so `Stencil1D`
 and the transfer kernel do not change. The kernel only multiplies the
 result by a per-variable factor, the product of the variable's parities
-over the masked dimensions. It keeps a table of these factors on the
+over the masked dimensions — over their mirror labels on a forest of
+patches (M21), which the `GroupKey` carries as `labels` where a label is
+not its dimension, so that two blocks mirroring one logical dimension
+under different labels do not share a group, and from which `factorcol`
+places each dimension's mirror state at its label's place in the
+table. On a brick the labels are the dimensions and the keys are what
+they were. It keeps a table of these factors on the
 field set, not in the schedule: a schedule still belongs to a layout,
 and parity belongs to the variables. The mirror image of a ghost slab
 lies inside the owned range and within its wall-side half, since
@@ -3837,9 +3872,17 @@ the companion interface's `hasappendix`, `corelength` and
 
 *(M21. The decisions behind it are under M21 in
 [HISTORY.md](HISTORY.md#m21--symmetries-on-patches); the plan is in
-[PLAN.md](PLAN.md#m21--symmetries-on-patches). Designed, not yet
-implemented: the sections it changes still describe the code as it is,
-and each is brought up to date by the step that implements its part.)*
+[PLAN.md](PLAN.md#m21--symmetries-on-patches). Each step brings the
+sections it changes up to date as it implements its part.)*
+
+*Implemented* (M21 step 2): a patch's own faces and their labels ("A
+multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)),
+parity per label, and the `GroupKey`'s `labels`; tested in
+`test/symmetry_tests.jl`. Not yet: the turned glue entries (step 3) and
+the fold (step 4). Until the fold, `interpolate!` mirrors only at the
+forest-wide reflecting faces, so a point past a patch's own mirror face
+is outside, refused or marked as any point outside is, and never given
+a value.
 
 A brick has its symmetries: mirror planes at reflecting faces, a quarter
 turn and a half turn about a line where two low faces meet ("Domain and
@@ -6705,7 +6748,11 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   the patches form of `Forest`, `(patches, glue)` with the glue in its
   canonical order, or `nothing` for a brick. TreeIOHDF5 saves them
   under its feature `patches` and rebuilds the forest through that form,
-  which validates them; it reads no field of the connectivity;
+  which validates them; it reads no field of the connectivity. Since
+  M21 step 2 a patch may carry the fields `mirror` and `outflow`, its
+  own faces: a companion that saves only `roots` and `extents` would
+  restore the forest without them, so its release for this version must
+  save them or refuse a forest that has them;
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
@@ -6747,7 +6794,7 @@ which companion releases go with it.
 `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
 `atlas_tests.jl` (M19), `glue_tests.jl`, `glue_ball_tests.jl` and
-`glue_exchange_tests.jl` (M20),
+`glue_exchange_tests.jl` (M20), `symmetry_tests.jl` (M21),
 `interface_tests.jl`, the four in-process
 M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
@@ -6954,7 +7001,23 @@ without it bit for bit; its refusals; and point location (M19):
 bit for bit, a point on a glued face kept in the patch it names, and
 the refusals of plain positions (on a forest of one patch too),
 `Lagrange` and unknown patches. The M17 oracles are at the end
-of `ghost_oracles.jl` (below). Elsewhere: `exchange_tests.jl` fills the
+of `ghost_oracles.jl` (below).
+
+`symmetry_tests.jl` holds M21's (symmetries on patches). Step 2's: a
+brick with reflecting and outflow faces laid out as two patches with
+swapped axes, in 2D and as a 3D cycle, its faces given patch by patch,
+so that a mirror plane is a different logical face on each patch with
+its label; every face's kind and label as given, and the forest rebuilt
+from `patch_keywords` to the same digest; the fill in every centering,
+the element one included, uniform with no undefined ghost and equal to
+the brick through the layout map bit for bit, and refined against the
+mirror plane to 1e-14; cell and vertex sets through a `regrid!` that
+refines every block on the mirror plane and coarsens them back, and
+three explicit Laplacian steps, equal to the brick to 1e-13 and 1e-12;
+and the refusals. A second variable is odd under label 2 only, so a
+parity taken along the logical dimension instead of the label fails
+the fill: with the labels ignored in `factorcol`, 36 of its assertions
+do. Elsewhere: `exchange_tests.jl` fills the
 cubed sphere's element set, a swapped and reversed 2D pair refined at
 the glue, and a 3D cyclic layout over 2, 3 and 5 simulated ranks, bit
 for bit with the serial fill and with turned packs present; `rotate_tests.jl`

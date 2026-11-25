@@ -5411,6 +5411,28 @@ M12 was decided with Erik, after M7 and before M9b.
     evaluated at the unfolded point would reach `G + k/2` past the plane,
     beyond the stored ghosts, where at the folded point it reaches
     `k/2 ≤ G + c`.
+  - *Step 2, a patch's own faces (2026-11-25).* `Patches` gained `kinds`
+    and `labels` per patch face, the forest-wide keywords folded in; a
+    patch takes `mirror` and `outflow` fields; parity is per mirror label
+    on patches; the `GroupKey` gained `labels`, zero on a brick, whose
+    keys are unchanged. The oracle departs from the plan's wording, the
+    full forest on symmetric data: a brick with reflecting and outflow
+    faces, laid out as two patches with swapped axes (2D) and cycled ones
+    (3D), so that a mirror plane is a different logical face on each
+    patch and the comparison is bit for bit where it can be, M10's tests
+    holding the brick against the full domain. Measured: the fill in
+    every centering, the element one included, equal to the brick bit
+    for bit uniform and within 1e-14 refined against the mirror plane;
+    cell and vertex sets through a `regrid!` on the plane and back within
+    1e-13, and three Laplacian steps within 1e-12. With `factorcol`
+    ignoring the labels, 36 of the file's assertions fail. Point
+    interpolation was left to step 4, which the plan gives the fold:
+    until then a point past a patch's own mirror face is outside. And the
+    companion interface's `patch_keywords` now gives a patch's own faces,
+    which TreeIOHDF5 must save or refuse before its next release (step
+    7). The full suite passed, 169,215 tests at eight threads with both
+    MPI jobs, but for one assertion on the old wording of a refusal,
+    updated; the docs build passed.
 
 ## Downstream checks
 

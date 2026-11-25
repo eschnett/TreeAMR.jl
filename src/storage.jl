@@ -299,8 +299,12 @@ is **required** when the forest has a reflecting face (M10): whether a
 variable changes sign in a mirror is physics, which the mesh cannot
 know. It holds one entry per variable, each either a single `Parity` for
 every dimension or an `NTuple{D,Parity}`; every dimension with a
-reflecting face needs `EvenParity` or `OddParity`. Over a forest without
-reflecting faces it may be omitted, and is ignored if given.
+reflecting face needs `EvenParity` or `OddParity`. On a forest of
+patches whose patches give their own mirror faces (M21), entry `k` is
+the parity under the mirror of label `k`, the axis its plane is normal
+to, rather than along dimension `k`, and every label some face carries
+needs one. Over a forest without reflecting faces it may be omitted, and
+is ignored if given.
 
 `rotation` says how the variables turn under the quarter turn `R` of a
 rotating seam, and is **required** when the forest has one (M12; see
@@ -542,9 +546,14 @@ function parities_of(parity, forest::Forest{D}, nvars::Int) where {D}
                 "NTuple{$D,Parity}, one per dimension; got $(repr(p))"))
         return ntuple(d -> p[d], D)
     end
+    # On a forest of patches the parity is per mirror label (M21), which on
+    # a brick is the dimension.
+    mirrored = mirrored_labels(forest)
+    where_(d) = ispatched(forest) ? "under mirror label $d, which some patch's reflecting face has" :
+                "in dimension $d, which has a reflecting face"
     for (v, p) in enumerate(parities), d in 1:D
-        any(reflecting_faces(forest)[d]) && p[d] === NoParity && throw(ArgumentError(
-            "variable $v has NoParity in dimension $d, which has a reflecting face. " *
+        mirrored[d] && p[d] === NoParity && throw(ArgumentError(
+            "variable $v has NoParity $(where_(d)). " *
             "A variable without a parity has no value beyond the wall, and its " *
             "ghosts there would not stay ghosts: the first prolongation that reads " *
             "them carries them into the interior. Give it EvenParity or OddParity."))
@@ -708,8 +717,9 @@ end
 function check_rotation_parity(forest::Forest{D}, target, source, q::Vector{Int},
                                what::AbstractString) where {D}
     (target === nothing || source === nothing) && return nothing
+    mirrored = mirrored_labels(forest)
     for v in eachindex(q), d in 1:D
-        any(reflecting_faces(forest)[d]) || continue
+        mirrored[d] || continue
         w = abs(q[v])
         target[v][d] == source[w][d] || throw(ArgumentError(
             "$what sends variable $v to variable $w, but in dimension $d, which has a " *

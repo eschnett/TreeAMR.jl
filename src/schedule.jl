@@ -388,6 +388,14 @@ end
 # whose image there is a symmetric low wall (see `target_range`, and
 # *Half turns* in CODE.md). It changes the target range, so it is part of
 # the key. Zero everywhere else.
+#
+# `labels` holds, per mirrored dimension of a forest of patches, the
+# mirror label of the face the target is mirrored across (M21), where it
+# differs from the dimension itself, and 0 elsewhere: the parity the
+# kernel multiplies by is the variable's under that label, so two blocks
+# whose walls mirror one logical dimension under different labels do not
+# share a group (`factorcol`). Zero on a brick, whose labels are its
+# dimensions, so that a brick's keys are what they were.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
@@ -402,12 +410,13 @@ struct GroupKey{D}
     # appendix of a set interpolated across a glue (M20): its own range
     # runs to G+N+1 there, and the region beyond starts at G+N+2.
     top::NTuple{D,Bool}
+    labels::NTuple{D,Int8}
 end
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
             mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8, low::NTuple{D,Bool},
-            shift::NTuple{D,Int8}) where {D} =
+            shift::NTuple{D,Int8}, top::NTuple{D,Bool}=ntuple(_ -> false, D)) where {D} =
     GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, low, shift,
-                ntuple(_ -> false, D))
+                top, ntuple(_ -> Int8(0), D))
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -432,7 +441,7 @@ kindrank(kind::Symbol) =
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
     (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
-     k.low, k.shift, k.top)
+     k.low, k.shift, k.top, k.labels)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -1524,10 +1533,19 @@ function mirror_sources!(pairs::TransferPairs{D},
         return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
     end
     states = vec(collect(Iterators.product(choices...)))
+    # The mirror label of each reflecting face crossed (M21), kept where it
+    # is not the dimension itself (see `GroupKey`).
+    p = patch(forest, k)
+    labels = ntuple(D) do d
+        walls[d] == ReflectingFace || return Int8(0)
+        label = mirror_label(forest, p, d, δ[d] < 0 ? 1 : 2)
+        return label == d ? Int8(0) : Int8(label)
+    end
     record!(kind, offset, lvl, s, via::Crossing) =
         for state in states
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns,
-                                           via.glue, low, shift),
+                                           via.glue, low, shift,
+                                           ntuple(_ -> false, D), labels),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         end
@@ -2305,8 +2323,16 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # transfer keeps 0 unless it is also mirrored.
     function factorcol(key)
         parity = map(m -> m == 3 ? Int8(0) : m, key.mirror)
+        # The factor table is indexed by mirror label (M21): a mirrored
+        # dimension's state goes to its label's place, which on a brick, and
+        # wherever `labels` is 0, is the dimension's own.
+        labelled = ntuple(D) do k
+            d = findfirst(e -> parity[e] != 0 &&
+                               (key.labels[e] == 0 ? e : Int(key.labels[e])) == k, 1:D)
+            return d === nothing ? Int8(0) : parity[d]
+        end
         return any(!iszero, parity) || key.orientation != 0 ?
-               mirrorcolumn(parity) + 3^D * Int(key.orientation) : 0
+               mirrorcolumn(labelled) + 3^D * Int(key.orientation) : 0
     end
     axesof(key) = group_axes(forest, key)
 

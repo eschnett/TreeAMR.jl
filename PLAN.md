@@ -540,12 +540,12 @@ Each step has the test that says it is done:
    proposals, which settle the open questions above. The design is in
    [CODE.md](CODE.md#symmetries-on-patches); the record in
    [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
-2. **Face kinds per patch face.** *Done when*, on TreeAMR's own test
-   layouts, a forest of patches cut by a mirror plane fills its ghosts,
-   regrids and evolves, as the full forest does on symmetric data, to
-   rounding, in every centering, with a refinement region against the
-   mirror plane; and the refusals of the per-`(dim, side)` kinds on
-   patches give way.
+2. **Face kinds per patch face.** Done 2026-11-25: a patch's own
+   `mirror` and `outflow` faces fill, regrid and evolve as a brick's
+   reflecting and outflow faces do, laid out with swapped axes, bit for
+   bit uniform and to rounding refined against the mirror plane, in every
+   centering. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
 3. **Turn seams as glue entries.** *Done when* a brick seam written as a
    glue entry fills, regrids and evolves bit for bit as M12's and M14's
    seams do (their tests, re-run on the glue form); a forest of patches

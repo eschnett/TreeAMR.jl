@@ -84,7 +84,8 @@ using TreeAMR: Crossing, OneBrick, Patches, ForestDigest, patch_keywords,
     @test_throws "is not a named tuple `(from" Forest(two; N=4, glue=[((1, 1, 2), (2, 1, 1))])
     @test_throws "list of patches is empty" Forest(NamedTuple[]; N=4)
     @test_throws "is not a named tuple `(roots" Forest([(2, 2)]; N=4)
-    @test_throws "has only `roots` and `extents`" Forest([(roots=(2, 2), glue=())]; N=4)
+    @test_throws "has only `roots`, `extents`, and the kinds of its own faces" Forest(
+        [(roots=(2, 2), glue=())]; N=4)
     @test_throws "different lengths" Forest([(roots=(2, 2),), (roots=(2,),)]; N=4)
     @test_throws "must all be positive" Forest([(roots=(2, 0),)]; N=4)
     @test_throws "of patch 2 give anisotropic" Forest(
