@@ -30,6 +30,7 @@ milestones were planned in, and the list below is in execution order.
   - [M18 — KernelAbstractions 0.10](#m18--kernelabstractions-010)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
+  - [M21 — Symmetries on patches](#m21--symmetries-on-patches)
 
 ## Milestones
 
@@ -444,3 +445,132 @@ need and the GR codes' outer boundaries will; and
 TreeGeneralizedHarmonic and TreeGRRMHD on patches.
 
 *Done when* steps 1–6 pass.
+
+### M21 — Symmetries on patches
+
+*(Proposed 2026-11-25; Erik's decisions on refinement taken that day.)*
+The symmetries a brick has — mirror planes (bitant, quadrant, octant)
+and turns about an axis by 90° and 180° (M12, M14), alone or with a
+mirror plane across the axis — on forests of patches, so that a
+spinning black hole sits at the centre of a seven- or thirteen-patch
+ball computed in a half, a quarter or an eighth of it. Both balls are
+symmetric under the reflections through the coordinate planes and the
+turns about `z` (step 5 of M20 measured the mirror and the inversion to
+rounding), and every symmetry plane is a patch mid-plane: the cube's, or
+a shell's tangential one, a root boundary when the root count across it
+is even. The octant, for one, is the cube's octant and three quarter
+shells; the 90° turn the cube's quarter, the `+x` and `+y` half shells
+glued to each other through the turn, and the two `z` shells' quarters,
+each glued to itself.
+
+What stands in the way today ("A multi-patch forest" in
+[CODE.md](CODE.md#domain-and-boundaries)): the face kinds are per
+`(dim, side)` for every patch at once, and a glued face may not be
+reflecting, so a mirror plane that is a different logical face on each
+patch cannot be said; a forest of patches refuses `rotating` and
+`halfturn`; and under `glue = :interpolate` every leaf on a glued face
+keeps its level, so a seam through the central box would freeze the
+black hole's neighbourhood.
+
+**Refinement** (decided by Erik):
+
+- **Mirror planes restrict nothing.** A mirror plane is a reflecting
+  face, not a glue: nothing lies across it to match, and its ghosts
+  come from the block's own mirrored interior, prolongated from a
+  mirrored source where a level changes, as on a brick.
+- **Turn seams keep conformity**, a brick seam's rule ("Rotating seams"
+  under [Ghost filling](CODE.md#ghost-filling)): a leaf on a seam face
+  and its image are at one level, and `balance!` refines the coarser.
+  Against the full domain this refines more only where the full domain
+  would have a coarse-fine face lying *on* the seam's half-plane; a
+  pattern centred on the axis, as about a spinning black hole on it,
+  conforms by symmetry. Edges and corners across a seam keep 2:1
+  balance, through the rotated prolongation and restriction a brick's
+  seam already has.
+- **Free regridding in the central box.** A symmetry glue is aligned,
+  an exact copy through a signed permutation, and is exempt from M20's
+  rule that a leaf on a glued face keeps its level; that rule stays
+  where it was made, at the kinked glues between the cube and the
+  shells.
+- **Prolongation across a seam face** is possible, and left for later,
+  if a refinement pattern needs a coarse-fine face on a seam: it needs
+  an oriented interface restriction for conservative sets and an
+  ownership rule for a vertex-like set's two copies of the seam plane
+  at different levels, which conformity makes unnecessary.
+
+**The pieces**, each to be designed in step 1:
+
+- **Face kinds per patch face**: reflecting, outflow or the hook, set
+  for each `(patch, dim, side)` that is not glued, on a forest of
+  patches; a brick's per-`(dim, side)` kinds unchanged. The same serves
+  a reflecting or outflow outer sphere, which M20 left out. A set's
+  parity is declared per physical axis, as the states hold Cartesian
+  components (M20's global components), and each mirror face takes the
+  parity of the physical axis its plane is normal to, which the layout
+  names.
+- **Turn seams as glue entries**: a glue entry gains a frame turn —
+  none, a quarter turn either way, or a half turn — and a copy across
+  it applies the set's `rotation` or `halfturn` variable map, as
+  `RotatedSource` does for a brick seam. A vertex-like set's two owned
+  copies of the seam plane, and the half turn's shifted seam slab, are
+  re-derived for patches, where closed ownership (M20) may make the
+  slab's shift unnecessary.
+- **The fold at a kinked glue**: a ghost interpolated across a kinked
+  glue near a mirror plane or a seam can sit outside the reduced
+  domain, and its stencil can straddle the plane. The atlas folds the
+  point back — an optional method giving the image point and the
+  symmetry that carried it — and the ghost is the value at the image
+  under that symmetry's parity signs or variable map, per ghost.
+  `interpolate!` folds the same way, which a horizon finder on a
+  symmetric ball needs.
+- **Counting**: a seam point counted once in folds and norms, which the
+  glued-point masks do once a seam is a glue entry.
+
+**Open, for step 1**: whether a brick's seams collapse into the glue
+table too ("A multi-patch forest" in
+[CODE.md](CODE.md#domain-and-boundaries) leaves it open); whether the
+symmetry is declared by the layout (TreeMultiPatch) or by a forest
+keyword; and the checkpoint format for per-patch face kinds and turned
+glue entries.
+
+Each step has the test that says it is done:
+
+1. **The design**, in CODE.md, marked proposed until Erik approves it,
+   the open questions above settled. *Done when* Erik approves.
+2. **Face kinds per patch face.** *Done when*, on TreeAMR's own test
+   layouts, a forest of patches cut by a mirror plane fills its ghosts,
+   regrids and evolves, as the full forest does on symmetric data, to
+   rounding, in every centering, with a refinement region against the
+   mirror plane; and the refusals of the per-`(dim, side)` kinds on
+   patches give way.
+3. **Turn seams as glue entries.** *Done when* a brick seam written as a
+   glue entry fills, regrids and evolves bit for bit as M12's and M14's
+   seams do (their tests, re-run on the glue form); a forest of patches
+   with a turned glue does as the full forest on symmetric data, to
+   rounding; `balance!` keeps conformity there; and a leaf on an aligned
+   glue regrids freely under `glue = :interpolate`, serially, over MPI
+   and on a device.
+4. **The fold.** *Done when* interpolated ghosts across a kinked glue
+   next to a mirror plane and next to a seam agree with the full
+   layout's to rounding, in parity and in the turned components; and
+   `interpolate!` returns the full domain's values at points beyond the
+   planes.
+5. **TreeMultiPatch's symmetric layouts**: both balls under the bitant,
+   quadrant and octant mirrors and under the 90° and 180° turns about
+   `z`, alone and with the `z` mirror, with even root counts across the
+   cuts. *Done when* each layout's forest builds and passes its check,
+   its atlas folds every point of the full ball, its `√g` integrates to
+   its share of the volume, and `chart_aligned` declares the new pairs.
+6. **TreeWave on the symmetric balls**: the sum of a plane wave's images
+   under the symmetry, an exact solution with that symmetry. *Done
+   when* each reduced ball's run is the full ball's, restricted, to
+   rounding, at `N = 8` over `t = 2`, refined about the origin; and the
+   energy stays bounded as in M20.
+7. **The releases**: TreeAMR, TreeIOHDF5 with the new format,
+   TreeMultiPatch, TreeWave.
+
+Not in M21: prolongation across a seam face (above); refinement at a
+kinked glue, M20's rule; patch-local components; symmetries of a turn
+about any axis but the balls' `z`.
+
+*Done when* steps 1–7 pass.
