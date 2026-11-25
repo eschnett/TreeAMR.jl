@@ -407,30 +407,34 @@ Each step has the test that says it is done:
    annulus's, the seven-patch and the thirteen-patch ball's convergence
    tables and energies are what they were.
 3. **TreeWave on the annulus.** Done 2026-11-24, before step 2, and
-   vertex-centred only (Erik's decision), on TreeWave's branch
-   `eschnett-claude/m20-annulus`: the rotating Bessel mode converges at
-   the operator's order, two. The record is under M20 in
+   vertex-centred only (Erik's decision), now on TreeWave's `main`: the
+   rotating Bessel mode converges at the operator's order, two. The
+   record is under M20 in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
 3b. **A prototype of the coupling.** Done 2026-11-23, on two tori and the
    cubed sphere's surface; closed ownership chosen. The record is in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
-4. **TreeAMR: closed ownership and interpolated ghosts across a glue.**
-   Done 2026-11-24, serially, over MPI and on a device, and TreeIOHDF5
-   saves the appendix (its branch `eschnett-claude/m20-appendix`); two
-   criteria restated by Erik. The design is in
+4. **TreeAMR: closed ownership and interpolated ghosts across a
+   glue.** Done 2026-11-24, serially, over MPI and on a device, and
+   TreeIOHDF5 saves the appendix (released in its 0.1.11); two criteria
+   restated by Erik. The design is in
    [CODE.md](CODE.md#finite-differences-across-a-glue); the record and
    the criteria as met in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
-5. **TreeWave on the seven-patch ball.** Done 2026-11-24, before step 2,
-   on TreeWave's branch `eschnett-claude/m20-annulus` against this
-   checkout: the plane wave converges at second order in L2 and near the
-   glues, the closed ball's energy falls over 33 crossings at `ε = 1/2`,
-   the quadrature gives the volume at second order, and both inversion
-   and the mirror hold to rounding. The record is under M20 in
+5. **TreeWave on the seven-patch ball.** Done 2026-11-24, before step
+   2, now on TreeWave's `main` against the registered 0.2.12: the plane
+   wave converges at second order in L2 and near the glues, the closed
+   ball's energy falls over 33 crossings at `ε = 1/2`, the quadrature
+   gives the volume at second order, and both inversion and the mirror
+   hold to rounding. The record is under M20 in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
-6. **The releases**: TreeAMR (TreeWave's and TreeHydro's suites against
-   the checkout); TreeIOHDF5 with the new version appended to its
-   `[compat]`; TreeMultiPatch registered; then TreeWaveOLDG and TreeWave.
+6. **The releases.** TreeAMR 0.2.12 and TreeIOHDF5 0.1.11 are
+   registered (2026-11-25; the record is in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches)).
+   Left: TreeMultiPatch registered (its repository, CI and `[compat]
+   TreeAMR = "0.2.12"` are in place); then TreeWaveOLDG and TreeWave
+   released, each with its `[sources]` entry for TreeMultiPatch replaced
+   by a `[compat]` bound.
 
 Not in M20: refinement boundaries at a glue; the transformation of
 patch-local components; per-patch face kinds, for a reflecting or

@@ -5329,6 +5329,35 @@ M12 was decided with Erik, after M7 and before M9b.
       is mirror-symmetric.
     TreeWave's `CODE.md`, "The seven-patch ball", has the scheme and the
     numbers.
+  - *Step 6, the releases (2026-11-25; in progress).*
+    - **TreeAMR 0.2.12**, registered (eschnett/TreeAMR.jl#47). `main`
+      had moved to 0.2.11 (the public communicator verbs, TreeGRRMHD's
+      AMR-13) and was merged into the M20 branch rather than rebased
+      under it, since this file and the commit messages cite the
+      branch's hashes (the downstream runs against `4fcba03`); one
+      conflict, in `test/mpi_workload.jl`'s `main`, where both new cases
+      run. Not an API break, so a patch release: everything M20 adds is
+      opt-in through `glue = :interpolate`, the folds' masks and
+      `regrid!`'s guard apply only to such a set, and the new export
+      `isowned` is a name no downstream defines. The merge passed the
+      full suite with both MPI jobs (169,005 tests) and the docs build.
+    - **TreeIOHDF5 0.1.11**, registered (eschnett/TreeIOHDF5.jl#15),
+      with `[compat] TreeAMR = "=0.2.12"` alone rather than appended to
+      the list as step 6 had planned: it imports `hasappendix`,
+      `corelength` and `appendix_entries`, which 0.2.12 added. 1141
+      tests against the 0.2.12 tree.
+    - **TreeMultiPatch** got its repository (Erik), CI in the two tiers
+      of the Tree* repositories, TagBot and Dependabot, and its
+      `[compat] TreeAMR` raised from `"0.2"` to `"0.2.12"`, Erik's
+      decision: `"0.2"` admitted releases without the public `chart_*`
+      functions (before 0.2.9) and without `chart_aligned` (before
+      0.2.12), where its methods would sit on a function of its own that
+      no glue schedule calls. Not registered yet.
+    - **TreeWave** merged steps 3 and 5 (eschnett/TreeWave.jl#13), with
+      TreeAMR from the registry at `"0.2.12"` and TreeMultiPatch from
+      its GitHub `main` through `[sources]` until it is registered; 370
+      tests. No release yet: General refuses a package whose dependency
+      it does not have.
 
 ## Downstream checks
 
@@ -5889,5 +5918,5 @@ outflow faces and the bounded prolongation. 0.2.2 (2026-10-16) carried
 TreeGRRMHD's AMR-7 to AMR-10 — bounded point values, conservative
 staggered sets, symmetric walls and the relative boundary hook — and
 0.2.3 (2026-10-16) raised the Julia floor to 1.13, 0.2.4 carries the
-nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), 0.2.6 the folds over points (M15), and 0.2.7 the element centering (M16). The repository keeps no changelog; the release commit says what
+nested-mesh ghost fill (M13), 0.2.5 the half turn (M14), 0.2.6 the folds over points (M15), and 0.2.7 the element centering (M16). 0.2.11 (2026-11-24) made the communicator verbs public (TreeGRRMHD's AMR-13), and 0.2.12 (2026-11-25) carries the ghosts interpolated across a glue with closed ownership and the appendix (M20 step 4), opt-in and so a patch release. The repository keeps no changelog; the release commit says what
 changed.
