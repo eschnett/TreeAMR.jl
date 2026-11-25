@@ -406,13 +406,11 @@ Each step has the test that says it is done:
    written in TreeMultiPatch, not TreeWaveOLDG. *Done when* the
    annulus's, the seven-patch and the thirteen-patch ball's convergence
    tables and energies are what they were.
-3. **TreeWave on the annulus**, with copied ghosts and no TreeAMR change:
-   the glues are identities, so no axis is reversed and there is no patch
-   corner, and the maps join smoothly, `θ` linear through every glue, so
-   a copy is the interpolation there. Vertex-centered, with Neumann walls
-   through reflecting faces as TreeWaveOLDG's annulus has, and the
-   Laplacian through TreeMultiPatch's metric. *Done when* the rotating
-   Bessel mode converges at the operator's order.
+3. **TreeWave on the annulus.** Done 2026-11-24, before step 2, and
+   vertex-centred only (Erik's decision), on TreeWave's branch
+   `eschnett-claude/m20-annulus`: the rotating Bessel mode converges at
+   the operator's order, two. The record is under M20 in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
 3b. **A prototype of the coupling.** Done 2026-11-23, on two tori and the
    cubed sphere's surface; closed ownership chosen. The record is in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).

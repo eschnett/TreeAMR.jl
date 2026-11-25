@@ -5254,6 +5254,23 @@ M12 was decided with Erik, after M7 and before M9b.
     - serially, at 1 and 3 ranks and on a device (Metal, `gpu_tests.jl`
       and `mpi_device_workload.jl`'s `G2`), with the compile-time cost
       measured and recorded, about 5 %.
+  - *Step 3, the annulus (2026-11-24).* Step 2, TreeWaveOLDG on
+    TreeMultiPatch, was set aside for the moment, since another session
+    was changing TreeWaveOLDG; step 3 went first. Erik decided that
+    TreeWave on patches is vertex-centred only: its cell-centred
+    derivatives, kept on the flat box as a comparison, are not carried
+    over. TreeWave (branch `eschnett-claude/m20-annulus`) writes the
+    Laplacian in conservative form through TreeMultiPatch's metric,
+    `(1/√g) ∂_a (A^{ab} ∂_b u)` with `A^{ab} = S[a] ⋅ S[b]/√g`, second
+    order, the cross terms included, and fills the metric at every
+    stored point from the maps rather than exchanging it, since the maps
+    are defined past each box. With the registered TreeAMR 0.2.10 and
+    copied ghosts, the rotating Bessel mode converges at second order on
+    the annulus: L2 rates 2.04 (`m = 1`) and 1.95 (`m = 3, n = 2`), L∞
+    1.99 and 1.94, over `N = 8, 16, 32`; the Laplacian alone converges at
+    2.0 on the annulus and, with its cross terms, at 1.8–2.0 on the
+    seven-patch ball. TreeWave's `CODE.md`, "Patches", has the scheme and
+    the numbers.
 
 ## Downstream checks
 
@@ -5269,7 +5286,10 @@ nothing either, 310 tests in 1m17 against the M12 checkout (2026-10-03).
 M16 changed nothing for it: 349 tests in 1m41 against the M16 checkout
 (2026-10-31). Nor did M17: 349 tests in 3m19 against the M17 checkout
 (777a3b4, 2026-11-03), on Symmetry (job 588617, cn080, EPYC 7532), where
-the suite runs slower than on the laptop.
+the suite runs slower than on the laptop. Nor did M20's step 4, the
+appendix and interpolated ghosts across a glue: 349 tests in 2m47 at 8
+threads against the M20 checkout (4fcba03, 2026-11-24), on Symmetry (job
+610628, cn110, EPYC 7543), the first run of `jobs/downstream.toml`.
 
 **TreeHydro.** It is **implemented, not a sketch**: sixteen files in
 `src/`, fourteen test files, two viewers in `bin/`, its own CI and
@@ -5296,7 +5316,11 @@ checkout, at one thread (2026-10-02); nor did M12 (0.1.7), 12447 tests in
 5m28 against the M16 checkout (2026-10-31); nor did M17, 12679 tests in
 13m42 against the M17 checkout (777a3b4, 2026-11-03) on Symmetry (job
 588624, cn082, EPYC 7532), with TreeIOHDF5 taken from its M17 branch
-(787c3a9), since no registered TreeIOHDF5 accepts TreeAMR 0.2.7. Its own MPI port
+(787c3a9), since no registered TreeIOHDF5 accepts TreeAMR 0.2.7; nor
+did M20's step 4, 12713 tests in 11m28 at 8 threads against the M20
+checkout (4fcba03, 2026-11-24) on Symmetry (job 610629, cn103, EPYC
+7543, `jobs/downstream.toml`), with TreeIOHDF5 from its M20 branch
+(1a36b15), which saves the appendix. Its own MPI port
 (2026-10-02) found the one TreeAMR bug so far on a rank without blocks —
 the `AllVariables` boundary hook's length check, of which it is the only
 caller — so it needs TreeAMR 0.1.6, which has the fix.

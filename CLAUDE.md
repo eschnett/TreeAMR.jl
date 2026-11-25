@@ -207,7 +207,9 @@ thorough one, worth the minutes for anything that touches the exchange,
 the interface restriction or the operators, because it is the only
 place conservation at coarse-fine faces is exercised by a real scheme
 rather than by Burgers in `test/`. The same scratch-copy rule holds for
-it. What each downstream calls is under "Downstream applications" in
+it. `jobs/downstream.toml` runs either suite on one of Symmetry's AMD
+nodes, a study per downstream, from such a copy; its header has the
+steps. What each downstream calls is under "Downstream applications" in
 `CODE.md`.
 
 Companion checks. Before tagging any release, run TreeIOHDF5's suite
