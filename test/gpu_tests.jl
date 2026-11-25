@@ -1251,3 +1251,25 @@ end
         @test maximum(abs, out[1] - out[2]) <= 16 * gputol(T)
     end
 end
+
+@testset "$bname: interpolate! folds past a symmetry plane on the device: T=$T" for
+        (bname, backend, types) in BACKENDS, T in types
+    # M21. Points past the strip's half turn's seam, through the atlas in
+    # `T`: the per-patch fold table, the fold in the location kernel, the
+    # turned variables and the folded chain rule all on the device, giving
+    # the CPU's numbers.
+    atlas = strip_in(T)
+    xs = [(T(3.8 * ((7j) % 31) / 31 - 1.9), T(1.5 * ((11j) % 29) / 29 - 0.75)) for j in 1:40]
+    out = map((CPU(), backend)) do bk
+        forest = strip_forest(:half; T=T)
+        fs = FieldSet{T}(forest, 3; G=1, centering=elementcentered(2), P=3, backend=bk,
+                         strip_keywords(Val(:half))...)
+        fill_by_coordinates!(WithPatch((ξ, p, v) ->
+                                           strip_data(Val(:half),
+                                                      TreeAMR.chart_map(atlas, ξ, p))[v]), fs)
+        r = interpolate(fs, TreeAMR.todevice(bk, xs), ElementPolynomial();
+                        derivs=((0, 0), (1, 0), (0, 1)), atlas=atlas)
+        Array(r.values)
+    end
+    @test maximum(abs, out[1] - out[2]) <= 64 * gputol(T) * maximum(abs, out[1])
+end

@@ -3973,11 +3973,10 @@ and "Finite differences across a glue"); tested in
 And of step 4, the fold of ghosts interpolated beside a symmetry plane
 (under "Finite differences across a glue"), with the half turn's slab
 where the reversed axis' faces are glued; tested against the full
-layout on the kinked strip, over simulated ranks and on the device.
-Not yet: the fold in `interpolate!`, which mirrors only at the
-forest-wide reflecting faces and follows no turned glue, so a point past
-a patch's own mirror face or a turned glue is outside, refused or marked
-as any point outside is, and never given a value.
+layout on the kinked strip, over simulated ranks and on the device; and
+the fold in `interpolate!` (below), tested the same way. Every step of
+M21's design that is TreeAMR's is implemented; TreeMultiPatch's layouts,
+TreeWave's runs and the releases remain (`PLAN.md`).
 
 A brick has its symmetries: mirror planes at reflecting faces, a quarter
 turn and a half turn about a line where two low faces meet ("Domain and
@@ -4154,10 +4153,31 @@ and reading the source's symmetry ghosts:
   reflecting face or a turned entry when its source is a same-level
   block, as it accepts one inside the patch.
 
-`interpolate!` folds the same way on patches: the point geometry of a
-patch reads its own face kinds and follows turned entries, as it follows
-a brick's seam, so a horizon finder's points beyond a symmetry plane get
-the full domain's values.
+`interpolate!` folds the same way on patches. On a forest with a
+symmetry of its own patches (`symmetric_patches`: a turn, or a patch's
+own face kinds) a located point past its patch's box is folded through a
+per-patch table (`patch_table`'s `FaceFold`s, plain bits for the
+location kernel, `patch_fold`) — mirrored across a mirror face, carried
+across a turned glue — and searched for in the patch it lands in; its
+fold code holds the mirror labels and the turns, from which the
+evaluation takes the variable column and the sign, with no logical
+derivative flip. Its derivatives are carried back in physical space
+instead: the chain rule runs at the folded position, in the patch the
+leaf names (`folded_patches`), and each requested multi-index is
+permuted and signed by the fold's symmetry, a signed permutation of the
+physical axes built from the mirror labels and the turn in its plane
+(`fold_axes`, `chain_folded_point!`). So a horizon finder's points past
+a symmetry plane get the full domain's values and derivatives. A
+`PatchPoint` located without an atlas gets its value there, and its
+derivatives at a folded point are refused, saying why: only the atlas's
+maps give the physical frame they are carried back in. A forest whose
+only mirrors are the forest-wide keywords keeps the path it had, the
+brick's logical fold. `positions` gives each point as it was given.
+**(open)** Point interpolation on a forest of patches takes element sets
+only, since M19 refused ghost-reading bases there when every ghost across
+a glue was a copy; a set interpolated across a glue (M20) has ghosts a
+Lagrange stencil could read, which a horizon finder on a symmetric ball
+of a finite-difference code would want.
 
 **Counting.** A point on a mirror plane is one point. The seam planes of
 a turn are two copies of the same points: a set without an appendix
@@ -7133,7 +7153,19 @@ beside its half turn's seam, vertex- and cell-centered, every stored
 point equal to the full strip's within 1e-12 — the edge ghosts folded,
 the stencils beside the plane centred, the half turn's slab at a glued
 reversed axis; the same over simulated ranks (`glue_exchange_tests.jl`)
-and on the device. Elsewhere: `exchange_tests.jl` fills the
+and on the device. And `interpolate!` on an element set over the strip,
+with its mirror given forest-wide and patch by patch and with its half
+turn: physical points on both sides of the plane through the atlas,
+values and first and second derivatives within 1e-10 of the full strip's;
+`PatchPoint`s' values, and the refusal of their derivatives past a
+patch's own symmetry face; over simulated ranks bit for bit with the
+serial batch (`interpolate_exchange_tests.jl`), and on the device. With
+the fold's derivative transform made the identity, the per-patch mirror
+and the half turn fail. And a brick's quadrant and half plane written as
+one self-glued patch, through the identity atlas, against the full plane
+with symmetric data — an invariant scalar and its gradient — values and
+derivatives within 1e-10, the quarter turn's exchange of the axes
+included. Elsewhere: `exchange_tests.jl` fills the
 cubed sphere's element set, a swapped and reversed 2D pair refined at
 the glue, and a 3D cyclic layout over 2, 3 and 5 simulated ranks, bit
 for bit with the serial fill and with turned packs present; `rotate_tests.jl`

@@ -144,6 +144,23 @@ function TreeAMR.chart_map(t::KinkedStrip, ξ, p)
     x = 1 + t.a * η + t.b * η^2
     return (p == 2 ? x : -x, ζ * (1 + t.c * η * (1 - η)))
 end
+# The maps' derivatives, for an interpolation's physical derivatives.
+function TreeAMR.chart_jacobian(t::KinkedStrip, ξ, p)
+    z = zero(ξ[1])
+    p == 1 && return ((one(z), z), (z, one(z)))
+    η, ζ = ξ
+    sx = p == 2 ? 1 : -1
+    return ((sx * (t.a + 2t.b * η), z), (ζ * t.c * (1 - 2η), 1 + t.c * η * (1 - η)))
+end
+function TreeAMR.chart_hessian(t::KinkedStrip, ξ, p)
+    z = zero(ξ[1])
+    p == 1 && return (((z, z), (z, z)), ((z, z), (z, z)))
+    η, ζ = ξ
+    sx = p == 2 ? 1 : -1
+    cross = t.c * (1 - 2η)
+    return (((sx * 2t.b, z), (z, z)), ((-2t.c * ζ, cross), (cross, z)))
+end
+
 function TreeAMR.chart_locate(t::KinkedStrip, x)
     abs(x[1]) <= 1 && return ((x[1], x[2]), 1)
     X = abs(x[1]) - 1
@@ -166,6 +183,10 @@ function strip_forest(kind; n=1, N=8, T=Float64)
     kind === :full && return Forest{T}(patches; N=N, glue=glue)
     kind === :mirror &&
         return Forest{T}(patches; N=N, glue=glue, reflecting=((false, false), (true, false)))
+    # The same mirror given patch by patch, label 2 on each low face.
+    kind === :ownmirror &&
+        return Forest{T}([merge(q, (mirror=((0, 0), (2, 0)),)) for q in patches]; N=N,
+                         glue=glue)
     turned = [(from=(1, 2, 1), to=(1, 2, 1), map=(-1, -2), turn=2),
               (from=(2, 2, 1), to=(3, 2, 1), map=(1, -2), turn=2),
               (from=(3, 2, 1), to=(2, 2, 1), map=(1, -2), turn=2)]
@@ -186,6 +207,8 @@ function strip_data(::Val{:half}, x)
             sin(k(0.9) * x[1] + k(1.1) * x[2]), sin(k(0.5) * x[1] - k(0.7) * x[2]))
 end
 strip_keywords(::Val{:mirror}) = (parity=[(EvenParity, EvenParity), (EvenParity, OddParity)],)
+strip_keywords(::Val{:ownmirror}) = strip_keywords(Val(:mirror))
+strip_data(::Val{:ownmirror}, x) = strip_data(Val(:mirror), x)
 strip_keywords(::Val{:half}) = (halfturn=(1, -2, -3),)
 
 # A set over the strip filled from the data at its owned points, the

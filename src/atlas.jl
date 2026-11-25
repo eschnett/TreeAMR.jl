@@ -270,9 +270,90 @@ function launch_chain!(values, logical, pts::LocatedPoints, atlas, ms, fillvalue
     npts == 0 && return values
     backend = get_backend(values)
     O = maximum(sum, ms)
-    pointkernel(chain_kernel!, backend, npts)(values, logical, pts.ξ, pts.patch,
-                                              pts.inside, atlas, Val(ms), Val(O),
-                                              fillvalue; ndrange=npts)
+    forest = pts.forest
+    if symmetric_patches(forest)
+        # At the point the fold reached (M21), in its patch, and carried
+        # back by the symmetry.
+        turn = patch_turn(forest)
+        plane = turn === nothing ? (0, 0) : turn[1]
+        pointkernel(chain_folded_kernel!, backend, npts)(
+            values, logical, pts.y, folded_patches(forest, pts), pts.code, pts.inside,
+            atlas, plane, Val(ms), Val(O), fillvalue; ndrange=npts)
+    else
+        pointkernel(chain_kernel!, backend, npts)(values, logical, pts.ξ, pts.patch,
+                                                  pts.inside, atlas, Val(ms), Val(O),
+                                                  fillvalue; ndrange=npts)
+    end
     synchronize(backend)
     return values
+end
+
+# The physical symmetry of a fold (M21), as a signed permutation of the
+# axes: with `x = M x′` the point and the image it was folded to, `M` the
+# mirrors of the labels in `mask` then `turn` quarter turns in the plane
+# `(k1, k2)` (`e_k1 → e_k2`, `e_k2 → -e_k1`), `∂ᵢu(x) = sᵢ ∂′_{π(i)}` of
+# the turned variables at `x′`. Returns `(π, s)`.
+@inline function fold_axes(mask::Int, turn::Int, plane::NTuple{2,Int}, ::Val{D}) where {D}
+    k1, k2 = plane
+    # `M e_j = σ_j e_{τ(j)}`.
+    function column(j)
+        i, σ = j, (mask >> (j - 1)) & 1 == 1 ? -1 : 1
+        for _ in 1:turn
+            if i == k1
+                i = k2
+            elseif i == k2
+                i, σ = k1, -σ
+            end
+        end
+        return i, σ
+    end
+    cols = ntuple(column, Val(D))
+    π = ntuple(i -> something(findfirst(c -> c[1] == i, cols), i), Val(D))
+    s = ntuple(i -> cols[π[i]][2], Val(D))
+    return π, s
+end
+
+# The requested physical derivatives of point `j` of a symmetric forest
+# (M21): at its folded position `y` in the patch `patches[j]` it landed in,
+# each multi-index carried back by the fold's signed permutation.
+@inline function chain_folded_point!(values, logical, ys, patches, codes, inside, atlas,
+                                     plane, ::Val{MS}, ::Val{O}, fillvalue,
+                                     j) where {MS,O}
+    nv = size(values, 1)
+    if !inside[j]
+        for k in 1:length(MS), iv in 1:nv
+            values[iv, k, j] = fillvalue
+        end
+        return nothing
+    end
+    y = ys[j]
+    D = length(y)
+    q = Int(patches[j])
+    # The carried-back multi-index is known at run time only, so every order
+    # is compiled: a lower `O` gets a zero Hessian and, at 0, the identity,
+    # which its derivatives never read.
+    T = eltype(values)
+    K = O >= 1 ? chart_K(atlas, y, q, Val(O)) :
+        ntuple(a -> ntuple(i -> T(a == i), Val(D)), Val(D))
+    H = O >= 2 ? chart_H(atlas, y, q, Val(O)) :
+        ntuple(_ -> ntuple(_ -> ntuple(_ -> zero(T), Val(D)), Val(D)), Val(D))
+    c = Int(codes[j])
+    π, s = fold_axes(c & ((1 << D) - 1), c >> D, plane, Val(D))
+    for k in 1:length(MS)
+        m = MS[k]
+        m′ = ntuple(e -> sum(ntuple(i -> π[i] == e ? m[i] : 0, Val(D))), Val(D))
+        σ = prod(ntuple(i -> isodd(m[i]) ? s[i] : 1, Val(D)))
+        for iv in 1:nv
+            values[iv, k, j] = σ * physical_derivative(logical, iv, j, m′, K, H)
+        end
+    end
+    return nothing
+end
+
+@kernel function chain_folded_kernel!(values, @Const(logical), @Const(ys), @Const(patches),
+                                      @Const(codes), @Const(inside), atlas, plane,
+                                      ::Val{MS}, ::Val{O}, fillvalue) where {MS,O}
+    j = @index(Global, Linear)
+    chain_folded_point!(values, logical, ys, patches, codes, inside, atlas, plane,
+                        Val(MS), Val(O), fillvalue, j)
 end

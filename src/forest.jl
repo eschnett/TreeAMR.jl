@@ -1594,6 +1594,21 @@ function glue_axes(forest::Forest{D}, c::Crossing) where {D}
     return perm, flip
 end
 
+# Whether a forest of patches has a symmetry of its own patches (M21): a
+# turn, or a patch face whose kind is its own rather than the forest-wide
+# keywords'. Point interpolation folds through the per-patch table there.
+function symmetric_patches(forest::Forest{D}) where {D}
+    forest.conn isa Patches || return false
+    conn = forest.conn::Patches{D}
+    conn.turnplane != (0, 0) && return true
+    faces = getfield(forest, :faces)
+    for p in eachindex(conn.roots), d in 1:D, s in 1:2
+        slot = glue_slot(p, d, s, D)
+        conn.glue[slot].patch == 0 && conn.kinds[slot] != faces[d][s] && return true
+    end
+    return false
+end
+
 # The turn of a forest of patches (M21), `(plane, half)` with the plane's
 # two mirror labels, or `nothing` for none and on a brick, whose seam is
 # `rotating_dims` and `halfturn_dims`.

@@ -553,11 +553,13 @@ Each step has the test that says it is done:
    over MPI and on Metal. The half turn's slab where the reversed axis'
    faces are glued goes with the fold, to step 4. The record is in
    [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
-4. **The fold.** *Done when* interpolated ghosts across a kinked glue
-   next to a mirror plane and next to a seam agree with the full
-   layout's to rounding, in parity and in the turned components; and
-   `interpolate!` returns the full domain's values at points beyond the
-   planes.
+4. **The fold.** Done 2026-11-25: interpolated ghosts across a kinked glue
+   beside a mirror and beside a half turn's seam agree with the full
+   layout to rounding, parity and turned components included, and
+   `interpolate!` gives the full domain's values and derivatives past the
+   planes; with the half turn's slab at a glued reversed axis, deferred
+   from step 3. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
 5. **TreeMultiPatch's symmetric layouts**: both balls under the bitant,
    quadrant and octant mirrors and under the 90° and 180° turns about
    `z`, alone and with the `z` mirror, with even root counts across the

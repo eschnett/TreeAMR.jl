@@ -409,7 +409,7 @@ end
 # --- Step 4: the fold --------------------------------------------------------
 
 @testset "Interpolated ghosts beside a symmetry plane are the full layout's: $sym, $(C[1])" for
-        sym in (:mirror, :half), C in (vertexcentered(2), cellcentered(2))
+        sym in (:mirror, :ownmirror, :half), C in (vertexcentered(2), cellcentered(2))
     # The ghosts of a set interpolated across the strip's kinked glues, beside
     # its mirror and beside its half turn's seam: a ghost whose point lies
     # past the plane is located there by the atlas, folded back into the
@@ -429,4 +429,83 @@ end
     @test worst < 1e-12
     @test n > 0
     @test any(!iszero, sr.glueplan.fcol) || any(!=(1), sr.glueplan.vcol)
+end
+
+@testset "interpolate! past a symmetry plane gives the full layout's values: $sym" for
+        sym in (:mirror, :ownmirror, :half)
+    # Physical points on both sides of the strip's mirror or half turn's
+    # seam, through the atlas, interpolated in an element set (a forest of
+    # patches interpolates element sets, whose polynomials read no ghost):
+    # a point past the plane is folded back into the reduced strip through
+    # its patch's own faces and turned glues, its value the symmetry's image
+    # of the value there, and its first and second derivatives carried back
+    # in physical space. The reduced strip must answer as the full one, to
+    # rounding. A `PatchPoint` past the plane, without an atlas, gets its
+    # value; past a patch's own symmetry face its derivatives, which only
+    # the atlas's maps can carry back, are refused with the reason, while
+    # past a forest-wide mirror they are flipped logically, as before.
+    function element_strip(forest, full)
+        nv = length(strip_data(Val(sym), (0.0, 0.0)))
+        fs = FieldSet(forest, nv; G=1, centering=elementcentered(2), P=3,
+                      (full ? (;) : strip_keywords(Val(sym)))...)
+        fill_by_coordinates!(WithPatch((ξ, p, v) ->
+                                           strip_data(Val(sym),
+                                                      TreeAMR.chart_map(STRIP, ξ, p))[v]), fs)
+        return fs
+    end
+    fsr = element_strip(strip_forest(sym), false)
+    fsf = element_strip(strip_forest(:full), true)
+    xs = [(-1.9 + 3.8 * ((7j) % 31) / 31, -0.75 + 1.5 * ((11j) % 29) / 29) for j in 1:60]
+    @test count(x -> x[2] < 0, xs) > 20
+    derivs = ((0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2))
+    basis = ElementPolynomial()
+    r = interpolate(fsr, xs, basis; derivs=derivs, atlas=STRIP)
+    f = interpolate(fsf, xs, basis; derivs=derivs, atlas=STRIP)
+    @test maximum(abs, r.values - f.values) < 1e-10 * maximum(abs, f.values)
+    ps = [PatchPoint((x[1] / 2, -abs(x[2]) / 2), 1) for x in xs[1:10]]
+    @test maximum(abs, interpolate(fsr, ps, basis).values -
+                       interpolate(fsf, ps, basis).values) < 1e-12
+    if sym === :mirror
+        @test maximum(abs, interpolate(fsr, ps, basis; derivs=((1, 0), (0, 1))).values -
+                           interpolate(fsf, ps, basis; derivs=((1, 0), (0, 1))).values) <
+              1e-10
+    else
+        @test_throws "derivatives are asked for without an atlas" interpolate(
+            fsr, ps, basis; derivs=((1, 0),))
+    end
+end
+
+@testset "interpolate! through a turned glue is the full plane's: $kind" for
+        kind in (:quarter, :half)
+    # A brick's quadrant (or half plane) written as one patch glued to
+    # itself by a turn, through the identity atlas, against the full plane:
+    # points beyond the seam are folded logically across the turned entry
+    # and their derivatives carried back by the turn in physical space. The
+    # data have the symmetry — a scalar a quarter turn leaves alone and its
+    # gradient, a vector that turns with the plane — so the folded answer
+    # must be the full plane's, to rounding. The quarter turn exchanges the
+    # plane's axes, so a wrong permutation of the derivatives' multi-indices,
+    # or a wrong sign, differs.
+    # The quarter turn is about the origin; the half turn about `(0, 1)`,
+    # the centre line of the brick's `y ∈ [0, 2]`, so its full domain is the
+    # strip `y ∈ [0, 2]` and its data are symmetric about that point.
+    _, patched = seam_forests(2, kind; N=8)
+    full = kind === :quarter ? Forest((4, 4); N=8, extents=((-2.0, 2.0), (-2.0, 2.0))) :
+           Forest((4, 2); N=8, extents=((-2.0, 2.0), (0.0, 2.0)))
+    c = kind === :quarter ? 0.0 : 1.0
+    s(x) = x[1]^2 * (x[2] - c)^2 + cos(x[1]) + cos(x[2] - c)
+    f(x) = (s(x), 2x[1] * (x[2] - c)^2 - sin(x[1]), 2x[1]^2 * (x[2] - c) - sin(x[2] - c))
+    kw = kind === :quarter ? (rotation=(1, -3, 2),) : (halfturn=(1, -2, -3),)
+    fp = FieldSet(patched, 3; G=1, centering=elementcentered(2), P=3, kw...)
+    ff = FieldSet(full, 3; G=1, centering=elementcentered(2), P=3)
+    fill_by_coordinates!((x, v) -> f(x)[v], fp)
+    fill_by_coordinates!((x, v) -> f(x)[v], ff)
+    xs = [(3.6 * ((7j) % 31) / 31 - 1.8, 3.6 * ((11j) % 29) / 29 - 1.8 + c)
+          for j in 1:60]
+    filter!(x -> kind === :quarter ? (x[1] < 0 || x[2] < 0) : x[1] < 0 && 0 < x[2] < 2, xs)
+    @test length(xs) > 15
+    derivs = ((0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2))
+    p = interpolate(fp, xs, ElementPolynomial(); derivs=derivs, atlas=IdentityAtlas{2}())
+    q = interpolate(ff, xs, ElementPolynomial(); derivs=derivs)
+    @test maximum(abs, p.values - q.values) < 1e-10 * maximum(abs, q.values)
 end

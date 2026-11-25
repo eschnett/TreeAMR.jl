@@ -323,10 +323,13 @@ function located_rank_forest(serial::Forest{D,T}, comms, r) where {D,T}
                                        outflow=TreeAMR.outflow_faces(serial),
                                        extents=serial.extents, leaves=serial.leaves,
                                        comm=comms[r])
+    # A turn's plane (M21), beside the patches.
+    turn = haskey(kw, :rotating) ? (rotating=kw.rotating,) :
+           haskey(kw, :halfturn) ? (halfturn=kw.halfturn,) : (;)
     return Forest{T}(kw.patches; N=serial.N, glue=kw.glue,
                      reflecting=TreeAMR.reflecting_faces(serial),
                      outflow=TreeAMR.outflow_faces(serial), leaves=serial.leaves,
-                     comm=comms[r])
+                     comm=comms[r], turn...)
 end
 
 @testset "A distributed located batch is the serial one, point for point: $name" for
@@ -353,7 +356,19 @@ end
              f -> FieldSet(f, 2; G=1, centering=elementcentered(2), P=2),
              rng -> [TreeAMR.chart_map(SinhAtlas{2}(), (2rand(rng) - 1, 2rand(rng) - 1), 1)
                      for _ in 1:150],
-             SinhAtlas{2}(), ElementPolynomial(), (3,)))
+             SinhAtlas{2}(), ElementPolynomial(), (3,)),
+            # M21: points past a symmetry plane, folded through the patches'
+            # own faces and turned glues on every rank alike.
+            ("past the strip's own mirror", strip_forest(:ownmirror),
+             f -> FieldSet(f, 2; G=1, centering=elementcentered(2), P=3,
+                           strip_keywords(Val(:mirror))...),
+             rng -> [(3.8rand(rng) - 1.9, 1.5rand(rng) - 0.75) for _ in 1:150],
+             STRIP, ElementPolynomial(), (2, 3)),
+            ("past the strip's half turn", strip_forest(:half),
+             f -> FieldSet(f, 3; G=1, centering=elementcentered(2), P=3,
+                           strip_keywords(Val(:half))...),
+             rng -> [(3.8rand(rng) - 1.9, 1.5rand(rng) - 0.75) for _ in 1:150],
+             STRIP, ElementPolynomial(), (2, 3)))
     # A point routed to the wrong rank, evaluated on the wrong local block,
     # put back in the wrong slot, or mapped through the chain rule on the
     # wrong rank gives a wrong value; one evaluated from other inputs than

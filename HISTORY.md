@@ -5494,6 +5494,35 @@ M12 was decided with Erik, after M7 and before M9b.
     full: every stored point within 1e-12, vertex- and cell-centered;
     bit for bit over simulated ranks; on Metal against the CPU. The full
     suite passed, 169,408 tests, and the docs build.
+  - *Step 4, the fold in `interpolate!` (2026-11-25).* On a forest with a
+    symmetry of its own patches a located point past its patch's box is
+    folded through a per-patch table in the location kernel, evaluated in
+    the patch it lands in with the symmetry's variable column and sign,
+    and its physical derivatives taken by the chain rule there and carried
+    back by the symmetry as a signed permutation of the physical axes,
+    rather than flipped logically: a logical transform across a turned
+    glue between two patches would have needed the derivatives'
+    multi-indices permuted per point, where the brick seam's are a
+    constant of the forest. A `PatchPoint` without an atlas keeps its
+    value and has its derivatives at a folded point refused, there being
+    no physical frame to carry them back in; a forest whose mirrors are
+    all forest-wide keeps the old path. Found on the way: point
+    interpolation on a forest of patches takes element sets only (M19
+    refused ghost-reading bases there, when ghosts across a glue were
+    copies), so the tests interpolate element sets; a set interpolated
+    across a glue (M20) has ghosts a Lagrange stencil could read, and
+    whether to admit it there is left open. On the device two things
+    needed care: the folded branch compiled on a brick, and the fold's
+    loop reassigned a position its closures captured, which a device
+    cannot box; and the chain rule's order-2 branch compiles for every
+    run-time multi-index, so a lower order passes a zero Hessian.
+    Measured: the kinked strip with its mirror forest-wide, patch by
+    patch and its half turn, values and second derivatives within 1e-10
+    of the full strip; a quarter turn and a half turn against the full
+    plane with symmetric data, within 1e-10; with the derivative
+    transform the identity, three of those fail; over simulated ranks bit
+    for bit (645 assertions); on Metal, 2,718; the full suite 169,476 at
+    eight threads with both MPI jobs; the docs build.
 
 ## Downstream checks
 
