@@ -399,17 +399,34 @@ end
                                        N=4, glue=seam_glue(3, :quarter), rotating=(1, 2))
     forest = one(q; rotating=(1, 2))
     @test_throws "needs `rotation`" FieldSet(forest, 1; G=1)
-    # A half turn reversing a vertex-like axis whose faces are glued, here
-    # to each other, a wrap, so that the corner composes and the layout is
-    # what refuses.
-    glued = [seam_glue(2, :half);
-             patch_glue_both((1, 2, 2), (1, 2, 1), (1, 2))]
-    wrap = one(glued; halfturn=(1, 2))
-    fs = FieldSet(wrap, 1; G=1, centering=vertexcentered(2), halfturn=(1,))
-    @test_throws "not yet for glued ones" GhostSchedule(fs, PATCH_OPS)
     # The keywords rebuild a turned forest, turns and plane included.
     kw = patch_keywords(forest)
     again = Forest(kw.patches; N=4, glue=kw.glue, rotating=kw.rotating)
     @test ForestDigest(again, UInt(0), false).brick ==
           ForestDigest(forest, UInt(0), false).brick
+end
+
+# --- Step 4: the fold --------------------------------------------------------
+
+@testset "Interpolated ghosts beside a symmetry plane are the full layout's: $sym, $(C[1])" for
+        sym in (:mirror, :half), C in (vertexcentered(2), cellcentered(2))
+    # The ghosts of a set interpolated across the strip's kinked glues, beside
+    # its mirror and beside its half turn's seam: a ghost whose point lies
+    # past the plane is located there by the atlas, folded back into the
+    # domain through the mirror or the turned glue, and is the symmetry's
+    # image of the value there — the parity's sign, or the turned vector's
+    # components negated — and a stencil at a folded point reads the
+    # source's own mirrored or turned ghosts. The reduced strip must hold
+    # the full strip's values at every stored point, to rounding. A ghost
+    # not folded, a sign or a variable map left out, a stencil that cannot
+    # reach the symmetry ghosts, or a half turn's slab partitioned without
+    # the appendix's plane, differs at the scheme's order or is refused.
+    reduced, full = strip_forest(sym), strip_forest(:full)
+    fsr, sr = strip_set(reduced, sym, C)
+    fsf, _ = strip_set(full, sym, C; full=true)
+    @test !any(isnan, fsr.work)
+    worst, n = strip_difference(fsr, fsf)
+    @test worst < 1e-12
+    @test n > 0
+    @test any(!iszero, sr.glueplan.fcol) || any(!=(1), sr.glueplan.vcol)
 end

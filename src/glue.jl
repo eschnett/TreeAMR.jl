@@ -80,6 +80,13 @@ struct GluePlan{T,D}
     recvpeers::Vector{Int}
     recvcounts::Vector{Int}
     reads::Vector{Int}
+    # Per ghost, local and sent (M21): the `rotvars` column its variables
+    # are read from, `turn + 1`, and the factor column of its sign, 0 for
+    # none — the symmetry its location was folded through (`GlueGhost.sym`).
+    vcol::Vector{Int8}
+    fcol::Vector{Int32}
+    sendvcol::Vector{Int8}
+    sendfcol::Vector{Int32}
     localruns::GlueRuns
     sendruns::GlueRuns
     recvruns::GlueRuns
@@ -90,8 +97,18 @@ GluePlan{T,D}() where {T,D} =
     GluePlan{T,D}(0, Int32[], NTuple{D,Int32}[], Int32[], NTuple{D,Int32}[],
                   NTuple{D,Int8}[], zeros(T, 0, 0), Int32[], NTuple{D,Int32}[],
                   NTuple{D,Int8}[], zeros(T, 0, 0), Int[], Int[], Int32[],
-                  NTuple{D,Int32}[], Int[], Int[], Int[], GlueRuns(), GlueRuns(),
-                  GlueRuns(), nothing, GlueBuffers())
+                  NTuple{D,Int32}[], Int[], Int[], Int[], Int8[], Int32[], Int8[], Int32[],
+                  GlueRuns(), GlueRuns(), GlueRuns(), nothing, GlueBuffers())
+
+# The `rotvars` column and the factor column of a ghost's symmetry code
+# (`GlueGhost.sym`): the turn's column, and the mirror state per label
+# plus `3^D` times the turn, as a transfer's `factorcol` is.
+function sym_columns(sym::Integer, ::Val{D}) where {D}
+    turn, mask = Int(sym) % 4, Int(sym) ÷ 4
+    sym == 0 && return Int8(1), Int32(0)
+    state = ntuple(k -> Int8((mask >> (k - 1)) & 1), D)
+    return Int8(turn + 1), Int32(mirrorcolumn(state) + 3^D * turn)
+end
 
 # The message buffers of a glue plan, on the backend, and the host mirrors
 # a staging communicator sends from and receives into; sized for the
@@ -112,7 +129,9 @@ function upload_glue(plan::GluePlan, backend)
             first=dev(plan.first), width=dev(plan.width), weights=dev(plan.weights),
             sendsource=dev(plan.sendsource), sendfirst=dev(plan.sendfirst),
             sendwidth=dev(plan.sendwidth), sendweights=dev(plan.sendweights),
-            recvtarget=dev(plan.recvtarget), recvindex=dev(plan.recvindex))
+            recvtarget=dev(plan.recvtarget), recvindex=dev(plan.recvindex),
+            vcol=dev(plan.vcol), fcol=dev(plan.fcol), sendvcol=dev(plan.sendvcol),
+            sendfcol=dev(plan.sendfcol))
 end
 
 # The buffers for `n` points of `nv` variables each way, made or remade
@@ -201,8 +220,57 @@ function interpolated_region(conn::Patches{D}, k::MortonKey{D},
     ex = patch_exits(conn, k, δ)
     all(iszero, ex) && return false
     p = searchsortedlast(conn.firstroot, Int(k.root))
-    return all(e -> ex[e] == 0 || isglued(conn, p, e, ex[e]), 1:D) &&
+    # Beyond a kinked glue, and possibly beyond mirror faces and turned
+    # glues of the same patch too (M21): such a region lies where the
+    # glue's map puts it, past a symmetry plane, and is located and folded
+    # back (`fold_patch_point`), not mirrored or copied across the kink.
+    wall(e) = conn.kinds[glue_slot(p, e, ex[e], D)] == ReflectingFace
+    return all(e -> ex[e] == 0 || isglued(conn, p, e, ex[e]) || wall(e), 1:D) &&
            any(e -> ex[e] != 0 && iskinked(conn, p, e, ex[e]), 1:D)
+end
+
+# A logical position `ξ` of patch `p`, as an atlas may return it past a
+# mirror face or a turned glue of the patch (M21), folded into the
+# patch's closed box: mirrored across a reflecting face, carried across a
+# turned glue by its axis map into the patch across. Both are exact maps
+# of logical coordinates. Returns `(ξ, p, mask, turn)`, `mask` the mirror
+# labels it was mirrored under as bits and `turn` the quarter turns, or
+# the position as given where it leaves through any other face, which
+# the caller then refuses as a point in no leaf.
+function fold_patch_point(forest::Forest{D,R}, ξ::NTuple{D}, p::Int) where {D,R}
+    conn = forest.conn::Patches{D}
+    mask, turn = 0, 0
+    for _ in 1:(2D + 1)
+        ext = conn.extents[p]
+        d = findfirst(e -> !(ext[e][1] <= ξ[e] <= ext[e][2]), 1:D)
+        d === nothing && return ξ, p, mask, mod(turn, 4)
+        side = ξ[d] < ext[d][1] ? 1 : 2
+        slot = glue_slot(p, d, side, D)
+        entry = conn.glue[slot]
+        if conn.kinds[slot] == ReflectingFace
+            wall = ext[d][side]
+            ξ = Base.setindex(ξ, 2wall - ξ[d], d)
+            mask |= 1 << (Int(conn.labels[slot]) - 1)
+        elseif entry.patch != 0 && entry.turn != 0
+            # In root units from the patch's low corner, the entry's map in
+            # gather form (see `GlueEntry`), and back into the logical
+            # coordinates of the patch across.
+            w = ntuple(e -> (ext[e][2] - ext[e][1]) / conn.roots[p][e], D)
+            r = ntuple(e -> (ξ[e] - ext[e][1]) / w[e], D)
+            q = entry.patch
+            eq = conn.extents[q]
+            ξ = ntuple(D) do a
+                x = r[Int(entry.perm[a])]
+                y = entry.flip[a] ? entry.offset[a] - x : x + entry.offset[a]
+                return eq[a][1] + y * w[Int(entry.perm[a])]
+            end
+            p = q
+            turn += Int(entry.turn)
+        else
+            break
+        end
+    end
+    return ξ, p, mask, mod(turn, 4)
 end
 
 # The refusal of a refinement boundary at a glue (M20): a face, edge or
@@ -239,6 +307,20 @@ function check_glue_levels(forest::Forest{D}, range) where {D}
     return nothing
 end
 
+# Whether face `side` of dimension `e` of patch `q` is a symmetry's (M21):
+# a mirror, or a turned glue.
+symmetry_face(forest::Forest{D}, q::Int, e::Int, side::Int) where {D} =
+    facekind(forest, q, e, side) == ReflectingFace ||
+    (forest.conn::Patches{D}).glue[glue_slot(q, e, side, D)].turn != 0
+
+# Whether a step crosses turned glues only (M21), across which a set
+# copies at one level, as across a brick's seam, in phase 1.
+function symmetric_crossing(forest::Forest{D}, c::Crossing) where {D}
+    c.turns == 0 && c.glue != 0 || return false
+    conn = forest.conn::Patches{D}
+    return conn.glue[c.glue].turn != 0 && (c.glue2 == 0 || conn.glue[c.glue2].turn != 0)
+end
+
 # The checks of an interpolated set's schedule that need no tree search,
 # against its layout, its operators and its atlas.
 function check_glue_interpolation(forest::Forest{D,R}, N::Int, G::NTuple{D,Int},
@@ -268,13 +350,14 @@ function check_glue_interpolation(forest::Forest{D,R}, N::Int, G::NTuple{D,Int},
             "block reaches k ÷ 2 points beyond its owned range, so k ≤ 2(G + c) = " *
             "$(2 * (G[d] + c[d])) with G = $(G[d]) and c = $(c[d]) there"))
     end
-    # Every patch face, its own (M21) included; the fold of M21 step 4 is
-    # what lifts it.
-    haskinked(forest) && any(!=(OuterFace), (forest.conn::Patches{D}).kinds) &&
+    # A mirror face is a symmetry, folded through (M21); an outflow face is
+    # not, and the edge regions beyond one and a kinked glue have no image.
+    haskinked(forest) && OutflowFace in (forest.conn::Patches{D}).kinds &&
         throw(ArgumentError(
-        "a field set interpolated across a glue over a forest with reflecting or " *
-        "outflow faces is not implemented: the edge regions beyond such a face and a " *
-        "glued one are neither mirrored nor located yet (M21 step 4)"))
+        "a field set interpolated across a glue over a forest with outflow faces is " *
+        "not implemented: an edge region beyond an outflow face and a kinked glue is " *
+        "neither extrapolated nor located, since the outflow face is no symmetry to " *
+        "fold the point through"))
     return nothing
 end
 
@@ -304,6 +387,9 @@ struct GlueGhost{D,R}
     from::Int32
     source::Int
     ξ::NTuple{D,R}
+    # The symmetry the location was folded through (M21): its quarter
+    # turns plus 4 times the bits of the mirror labels. 0 for none.
+    sym::Int32
 end
 
 # The glue plan of one schedule: every interpolated region `(b, δ,
@@ -373,10 +459,14 @@ function glue_plan(::Type{T}, forest::Forest{D,R}, regions, G::NTuple{D,Int},
                          Int32[g.target - offset for g in asked],
                          NTuple{D,Int32}[g.index for g in asked],
                          nonzero(counts), filter(>(0), counts), reads,
+                         Int8[sym_columns(ghosts[i].sym, Val(D))[1] for i in mine],
+                         Int32[sym_columns(ghosts[i].sym, Val(D))[2] for i in mine],
+                         Int8[sym_columns(g.sym, Val(D))[1] for g in received],
+                         Int32[sym_columns(g.sym, Val(D))[2] for g in received],
                          GlueRuns(), GlueRuns(), GlueRuns(), nothing, GlueBuffers())
     if backend isa CPU
         nb = length(owned)
-        return GluePlan{T,D}((getfield(plan, f) for f in fieldnames(GluePlan)[1:18])...,
+        return GluePlan{T,D}((getfield(plan, f) for f in fieldnames(GluePlan)[1:22])...,
                              GlueRuns(plan.target, nb), GlueRuns(plan.sendsource, nb),
                              GlueRuns(plan.recvtarget, nb), nothing, GlueBuffers())
     end
@@ -416,7 +506,9 @@ function locate_glue_ghosts(forest::Forest{D,R}, regions, G::NTuple{D,Int},
             # The patch across, or `p` itself across a face glued to its own
             # opposite face, a wrap. A point on a glued face may be given to
             # either side: both own their face planes (closed ownership).
-            ξ′, q = loc
+            # Past a symmetry plane, folded back into the domain (M21), the
+            # ghost then the symmetry's image of the value there.
+            ξ′, q, mask, turn = fold_patch_point(forest, loc...)
             s = locate_point(forest, PatchPoint(ξ′, q))
             s === nothing && throw(ArgumentError(
                 "no leaf of patch $q holds $ξ′, where the atlas locates the ghost at $ξ " *
@@ -427,7 +519,7 @@ function locate_glue_ghosts(forest::Forest{D,R}, regions, G::NTuple{D,Int},
                 "$q, at level $(level(skey)): a set interpolated across a glue needs " *
                 "every block within reach of the glue at one level"))
             push!(out, GlueGhost{D,R}(b, ntuple(d -> Int32(idx[d]), D), Int32(p), s,
-                                      ntuple(d -> R(ξ′[d]), D)))
+                                      ntuple(d -> R(ξ′[d]), D), Int32(turn + 4mask)))
         end
     end
     return out
@@ -499,7 +591,12 @@ function glue_stencil!(weights::Vector{T}, at::Int, cache, forest::Forest{D,R}, 
             hi - k + 1 >= 0 || throw(ArgumentError(
                 "patch $q has $(hi + 1) points along dimension $e at level $lvl, fewer " *
                 "than the glue order $k"))
-            f = clamp(floor(Int, t) - k ÷ 2 + 1, 0, hi - k + 1)
+            # At a symmetry face (M21) the window runs on into the ghosts,
+            # the mirrored or turned copies phase 1 fills, so that a stencil
+            # beside the plane is centred as the full domain's would be.
+            below = symmetry_face(forest, q, e, 1) ? G[e] : 0
+            above = symmetry_face(forest, q, e, 2) ? G[e] : 0
+            f = clamp(floor(Int, t) - k ÷ 2 + 1, -below, hi + above - k + 1)
             w = k
             glue_weights!(weights, at + (e - 1) * k, S, t, f, k)
         end
@@ -535,9 +632,19 @@ function check_overhang(forest::Forest{D}, skey::MortonKey{D}, overhang, ξ, p) 
     reads = Int[]
     for δ in alldirections(Val(D))
         all(e -> δ[e] == 0 || δ[e] == overhang[e], 1:D) || continue
+        # Beyond a mirror face of the source (M21) its ghosts are its own
+        # mirrored interior, or a same-level neighbor's in `δ′`, filled in
+        # phase 1 before the glue stage; beyond a turned glue they are a
+        # same-level copy too, conformity keeping the level. A stencil at a
+        # folded point reaches them.
+        δ′, walls = wall_direction(forest, skey, δ)
+        if any(==(ReflectingFace), walls) && !any(==(OutflowFace), walls)
+            all(iszero, δ′) && continue
+            δ = δ′
+        end
         crossing, nbrs = oriented_neighbors(forest, skey, δ)
         ok = !isempty(nbrs) && all(nb -> level(nb) >= level(skey), nbrs) &&
-             !iscrossing(crossing)
+             (!iscrossing(crossing) || symmetric_crossing(forest, crossing))
         ok || throw(ArgumentError(
             "the stencil of the ghost at $ξ of patch $p reads the ghosts of its source " *
             "block $skey in direction $δ, which no block of the same level or finer " *
@@ -598,7 +705,8 @@ end
 # another rank to its source block.
 @kernel function glue_owner_kernel!(work, @Const(order), @Const(start), @Const(target),
                                     @Const(index), @Const(source), @Const(firsts),
-                                    @Const(widths), @Const(weights), nvars,
+                                    @Const(widths), @Const(weights), @Const(vcol),
+                                    @Const(fcol), rotvars, factors, nvars,
                                     ::Val{D}, ::Val{K}) where {D,K}
     i, b = @index(Global, NTuple)
     @inbounds begin
@@ -608,15 +716,16 @@ end
             idx = ntuple(d -> Int(index[j][d]), Val(D))
             for v in 1:nvars
                 work[idx..., v, Int(target[j])] =
-                    glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
-                               Val(D), Val(K))
+                    glue_sym(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
+                             vcol, fcol, rotvars, factors, Val(D), Val(K))
             end
         end
     end
 end
 @kernel function glue_owner_pack_kernel!(buf, @Const(work), @Const(order), @Const(start),
                                          @Const(source), @Const(firsts), @Const(widths),
-                                         @Const(weights), nvars,
+                                         @Const(weights), @Const(vcol), @Const(fcol),
+                                         rotvars, factors, nvars,
                                          ::Val{D}, ::Val{K}) where {D,K}
     i, b = @index(Global, NTuple)
     @inbounds begin
@@ -625,11 +734,24 @@ end
             j = Int(order[r])
             for v in 1:nvars
                 buf[(j - 1) * nvars + v] =
-                    glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
-                               Val(D), Val(K))
+                    glue_sym(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
+                             vcol, fcol, rotvars, factors, Val(D), Val(K))
             end
         end
     end
+end
+
+# The value of ghost `j` for target variable `v` (M21): the stencil over
+# the source variable its symmetry's `rotvars` column names, times the
+# sign at its factor column, the mirror's parity and the turn's sign —
+# what a mirrored or turned transfer applies. A ghost not folded reads
+# `v` itself, through column 1, with no sign.
+@inline function glue_sym(work, s, f, w, weights, j, v, vcol, fcol, rotvars, factors,
+                          ::Val{D}, ::Val{K}) where {D,K}
+    src = rotvars === nothing ? v : Int(rotvars[v, Int(vcol[j])])
+    acc = glue_value(work, s, f, w, weights, j, src, Val(D), Val(K))
+    col = Int(fcol[j])
+    return col == 0 || factors === nothing ? acc : factors[v, col] * acc
 end
 @kernel function glue_owner_unpack_kernel!(work, @Const(buf), @Const(order), @Const(start),
                                            @Const(target), @Const(index), nvars,
@@ -652,11 +774,12 @@ end
 # variable, each writing its own slot.
 @kernel function glue_kernel!(work, @Const(target), @Const(index), @Const(source),
                               @Const(firsts), @Const(widths), @Const(weights),
+                              @Const(vcol), @Const(fcol), rotvars, factors,
                               ::Val{D}, ::Val{K}) where {D,K}
     j, v = @index(Global, NTuple)
     @inbounds begin
-        acc = glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v,
-                         Val(D), Val(K))
+        acc = glue_sym(work, Int(source[j]), firsts[j], widths[j], weights, j, v, vcol,
+                       fcol, rotvars, factors, Val(D), Val(K))
         work[ntuple(d -> Int(index[j][d]), Val(D))..., v, Int(target[j])] = acc
     end
 end
@@ -664,12 +787,13 @@ end
 # A ghost of another rank's block, evaluated into the send buffer, the
 # variables of a point together.
 @kernel function glue_pack_kernel!(buf, @Const(work), @Const(source), @Const(firsts),
-                                   @Const(widths), @Const(weights), nvars,
+                                   @Const(widths), @Const(weights), @Const(vcol),
+                                   @Const(fcol), rotvars, factors, nvars,
                                    ::Val{D}, ::Val{K}) where {D,K}
     j, v = @index(Global, NTuple)
     @inbounds buf[(j - 1) * nvars + v] =
-        glue_value(work, Int(source[j]), firsts[j], widths[j], weights, j, v, Val(D),
-                   Val(K))
+        glue_sym(work, Int(source[j]), firsts[j], widths[j], weights, j, v, vcol, fcol,
+                 rotvars, factors, Val(D), Val(K))
 end
 
 # A received ghost, copied into place.
@@ -708,12 +832,15 @@ function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, tables, backend,
             runs = plan.sendruns
             launch_by_owner!(glue_owner_pack_kernel!, backend, bufs.send, fs.work,
                              runs.order, runs.start, plan.sendsource, plan.sendfirst,
-                             plan.sendwidth, plan.sendweights, nv, Val(D), Val(plan.k);
-                             ndrange=(runs.longest, nb))
+                             plan.sendwidth, plan.sendweights, plan.sendvcol,
+                             plan.sendfcol, fs.rotvars, fs.factors, nv, Val(D),
+                             Val(plan.k); ndrange=(runs.longest, nb))
         else
             glue_pack_kernel!(backend)(bufs.send, fs.work, tables.sendsource,
                                        tables.sendfirst, tables.sendwidth,
-                                       tables.sendweights, nv, Val(D), Val(plan.k);
+                                       tables.sendweights, tables.sendvcol,
+                                       tables.sendfcol, fs.rotvars, fs.factors, nv, Val(D),
+                                       Val(plan.k);
                                        ndrange=(length(plan.sendsource), nv))
         end
         synchronize(backend)
@@ -727,11 +854,12 @@ function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, tables, backend,
             runs = plan.localruns
             launch_by_owner!(glue_owner_kernel!, backend, fs.work, runs.order, runs.start,
                              plan.target, plan.index, plan.source, plan.first, plan.width,
-                             plan.weights, nv, Val(D), Val(plan.k);
-                             ndrange=(runs.longest, nb))
+                             plan.weights, plan.vcol, plan.fcol, fs.rotvars, fs.factors, nv,
+                             Val(D), Val(plan.k); ndrange=(runs.longest, nb))
         else
             glue_kernel!(backend)(fs.work, tables.target, tables.index, tables.source,
-                                  tables.first, tables.width, tables.weights, Val(D),
+                                  tables.first, tables.width, tables.weights, tables.vcol,
+                                  tables.fcol, fs.rotvars, fs.factors, Val(D),
                                   Val(plan.k); ndrange=(length(plan.target), nv))
         end
     end

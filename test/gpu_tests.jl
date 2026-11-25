@@ -1234,3 +1234,20 @@ end
         end
     end
 end
+
+@testset "$bname: ghosts folded beside a symmetry plane run on the device: T=$T" for
+        (bname, backend, types) in BACKENDS, T in types
+    # M21. The kinked strip beside its mirror and beside its half turn's
+    # seam: the glue plan's per-ghost variable column and sign travel to the
+    # device with its tables, and the kernels apply them there. Nothing
+    # unwritten, and the CPU's numbers.
+    for sym in (:mirror, :half)
+        out = map((CPU(), backend)) do bk
+            fs, _ = strip_set(strip_forest(sym; T=T), sym, vertexcentered(2); T=T,
+                              backend=bk)
+            Array(fs.work)
+        end
+        @test !any(isnan, out[2])
+        @test maximum(abs, out[1] - out[2]) <= 16 * gputol(T)
+    end
+end

@@ -1887,9 +1887,13 @@ is the plain copy it always is. What is new:
   but the upper one at the top under symmetric walls
   (`glue_seam_shift`), so that each region is the image of one block's
   owned points. Where the axis' faces are glued, as on a half-turn
-  ball's cube, the ownership there is the patch's own — closed for an
-  interpolated set — and the shift is not derived yet; it is refused,
-  saying so.
+  ball's cube, the ownership there is the patch's own, closed for an
+  interpolated set, and the partition follows it: at the bottom of the
+  axis the lower boundary stays where it is when the top block owns its
+  high plane as an appendix, since that plane's image is the bottom's
+  own low plane (shift state 3, the upper boundary moved alone), and at
+  the top the upper boundary stays when the bottom's low plane is not
+  evolved, under symmetric walls at an unglued face (state 2).
 - *Phase 1 stays race free*, by the seam's argument: a copy or a
   restriction across a glue reads the real source's owned points nearest
   the face, and the layout refusals above are what keep that true along
@@ -3665,7 +3669,26 @@ glued one, is the boundary hook's, as beyond an outer face of a brick;
 the forest's topology says so, not the atlas. A ghost that crosses
 glued faces only and that `chart_locate` places outside every patch is
 refused at schedule build, since no stencil reaches it and no outer
-face makes it the hook's. On the balls that bounds the cube's
+face makes it the hook's.
+
+*Beside a symmetry plane* (M21). A region beyond a kinked glue may lie
+beyond a mirror face or a turned glue of the same patch too, at an edge
+or a corner; it is located, not mirrored or copied across the kink
+(`interpolated_region`). Its point, and any located point near the
+plane, may come back from `chart_locate` past a mirror face or a turned
+glue of `q`, where the full domain's patch puts it, as a reduced
+layout's atlas gives it. TreeAMR then folds the position logically,
+through the forest's own faces (`fold_patch_point`): mirrored across a
+reflecting face, carried across a turned glue by its axis map into the
+patch across, both exact, until it lies in a patch's closed box. The
+fold collects the symmetry that carried it, the mirror labels and the
+turns, and the ghost is the symmetry's image of the value there: the
+stencil over the source variable that symmetry's `rotvars` column names,
+times the sign at its factor column, as a mirrored or turned transfer
+applies them. The plan holds both columns per ghost (`vcol`, `fcol`),
+local and sent; the sender applies them, so a received value is copied
+as it is. An outflow face is no symmetry, and an interpolated set beside
+one is still refused. On the balls that bounds the cube's
 resolution: its corner ghosts, `G` spacings out along the diagonal,
 lie at `√3 Lc (1 + 2G/(nN))` from the center, which must be inside the
 sphere the inner shells reach; at `G = 3`, `N = 8` and `R1 = 2.5 Lc`
@@ -3678,9 +3701,15 @@ of `q`, into `q`'s closed box at that level: its points `0 … n`, the
 glued high face plane included (it is owned, below) and an outer high
 face plane too, which the hook has filled by then. So near `q`'s faces
 the stencil is lop-sided, which cost no measurable accuracy in the
-prototype. It reads `s`'s stored array: its owned points, its appendix
-or the hook's outer high plane, and its ghosts inside `q` — never a
-ghost of `s` across a glue, which is interpolated from `p` in turn. Two
+prototype. At a symmetry face of `q` the window runs on into the
+ghosts beyond it (M21), the mirrored or turned copies phase 1 fills,
+so that a stencil beside the plane is centred as the full domain's
+would be and the reduced layout holds the full one's values. It reads
+`s`'s stored array: its owned points, its appendix or the hook's outer
+high plane, its ghosts inside `q`, and beside a symmetry plane its
+mirrored or turned ghosts, which `check_overhang` accepts where phase 1
+fills them from a block at `s`'s level or finer — never a ghost of `s`
+across a kinked glue, which is interpolated from `p` in turn. Two
 conditions keep that true, both checked at schedule build: `k ≤ 2(G_d
 + c_d)` along every dimension, so that a centered stencil about a point
 of `s` stays inside `s`'s stored array; and every ghost of `s` it reads,
@@ -3941,13 +3970,14 @@ entries, the corner two glues agree on, the half turn's slab, and the
 rule of kinked glues (under "Glued faces" in [Ghost filling](#ghost-filling)
 and "Finite differences across a glue"); tested in
 `test/symmetry_tests.jl`, the MPI workload's `T2` and the device suite.
-Not yet: the fold (step 4), and with it a half turn's slab where the
-reversed axis' faces are glued, which only an interpolated set on a
-half-turn ball meets and which cannot be scheduled before the fold
-anyway. Until the fold, `interpolate!` mirrors only at the
-forest-wide reflecting faces, so a point past a patch's own mirror face
-is outside, refused or marked as any point outside is, and never given
-a value.
+And of step 4, the fold of ghosts interpolated beside a symmetry plane
+(under "Finite differences across a glue"), with the half turn's slab
+where the reversed axis' faces are glued; tested against the full
+layout on the kinked strip, over simulated ranks and on the device.
+Not yet: the fold in `interpolate!`, which mirrors only at the
+forest-wide reflecting faces and follows no turned glue, so a point past
+a patch's own mirror face or a turned glue is outside, refused or marked
+as any point outside is, and never given a value.
 
 A brick has its symmetries: mirror planes at reflecting faces, a quarter
 turn and a half turn about a line where two low faces meet ("Domain and
@@ -7096,7 +7126,14 @@ brick bit for bit; `balance!`'s conformity across a turned face, and an
 interpolated set regridding freely at one; the refusals; and the
 keywords' round trip. The MPI workload's `T2` holds the glue forms
 against the seams at every rank count, and the device suite a turned
-fill and regrid against the CPU's. Elsewhere: `exchange_tests.jl` fills the
+fill and regrid against the CPU's. Step 4's: a set interpolated across
+the kinked strip's glues (`helpers/glue.jl`, three patches whose maps
+kink, symmetric under a mirror and a half turn) beside its mirror and
+beside its half turn's seam, vertex- and cell-centered, every stored
+point equal to the full strip's within 1e-12 — the edge ghosts folded,
+the stencils beside the plane centred, the half turn's slab at a glued
+reversed axis; the same over simulated ranks (`glue_exchange_tests.jl`)
+and on the device. Elsewhere: `exchange_tests.jl` fills the
 cubed sphere's element set, a swapped and reversed 2D pair refined at
 the glue, and a 3D cyclic layout over 2, 3 and 5 simulated ranks, bit
 for bit with the serial fill and with turned packs present; `rotate_tests.jl`

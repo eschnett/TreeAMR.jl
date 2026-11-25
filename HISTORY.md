@@ -5470,6 +5470,30 @@ M12 was decided with Erik, after M7 and before M9b.
     the same at one and three ranks, the glue forms equal to the seams;
     the device suite on Metal, 2,703; the full suite 169,349 at eight
     threads with both MPI jobs; the docs build.
+  - *Step 4, the fold of interpolated ghosts (2026-11-25; `interpolate!`
+    to follow).* A region beyond a kinked glue may also lie beyond a
+    mirror face or a turned glue of the same patch, and is located rather
+    than mirrored or copied across the kink; the atlas may return a
+    point past a symmetry face, and TreeAMR folds it logically through
+    the forest's faces (`fold_patch_point`), each ghost carrying the
+    folded symmetry's `rotvars` column and sign through the plan to the
+    kernels and the sender. A stencil beside a symmetry plane has its
+    window run on into the mirrored or turned ghosts, which phase 1
+    fills, so that it is centred as the full domain's is: with the window
+    clamped to the patch, as M20 left it, the reduced strip differed
+    from the full one by 1e-7, the interpolation's own error, rather than
+    rounding. The half turn's slab where the reversed axis' faces are
+    glued, deferred from step 3, follows the ownership there: at the
+    bottom block the lower boundary stays, the top block's appendix plane
+    being its image (a third shift state, the upper boundary moved
+    alone). Mirrored transfers now carry the appendix flag, which M20
+    never needed, having refused walls beside a kinked glue: without it
+    the mirror ghosts under a block's appendix plane were left unwritten.
+    The oracle is a new layout, the kinked strip, three patches whose
+    maps kink, symmetric under a mirror and a half turn, reduced and
+    full: every stored point within 1e-12, vertex- and cell-centered;
+    bit for bit over simulated ranks; on Metal against the CPU. The full
+    suite passed, 169,408 tests, and the docs build.
 
 ## Downstream checks
 

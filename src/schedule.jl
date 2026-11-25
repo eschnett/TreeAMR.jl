@@ -860,7 +860,7 @@ end
 function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
                       closed::Bool=false; low::Bool=false, shift::Integer=0,
                       top::Bool=false)
-    shift != 0 && return shifted_range(N, G, c, δd, od, halved, shift == 1)
+    shift != 0 && return shifted_range(N, G, c, δd, od, halved, Int(shift))
     if top
         # The appendix (M20): the block owns its high face plane G+N+1.
         (c == 1 && !halved) || error("an appendix plane asked for with stagger $c " *
@@ -876,14 +876,19 @@ function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
     return (G + 1 + low):(G + N + top)
 end
 
-# The shifted ranges of `target_range` (M14); `up` moves the upper
-# boundary too.
-function shifted_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool, up::Bool)
+# The shifted ranges of `target_range` (M14): state 1 moves both of the
+# region's boundaries one plane up, state 2 the lower one only (M14's
+# symmetric walls), and state 3 the upper one only (M21: the bottom block
+# of a half turn's slab whose image source, the top block, owns its high
+# plane as an appendix).
+function shifted_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
+                       state::Int)
+    lower, up = state != 3, state != 2
     δd == 1 && return (G + N + 1 + up):(N + 2G + c)
-    δd == -1 && return 1:(G + 1)
+    δd == -1 && return 1:(G + lower)
     top = G + N + up
-    halved && return (G + 2 + od * (N ÷ 2)):(od == 0 ? G + 1 + N ÷ 2 : top)
-    return (G + 2):top
+    halved && return (od == 0 ? G + 1 + lower : G + 2 + N ÷ 2):(od == 0 ? G + 1 + N ÷ 2 : top)
+    return (G + 1 + lower):top
 end
 
 # Same-level copy: a pure shift of N cells against the direction, for
@@ -1368,7 +1373,7 @@ function block_sources!(pairs::TransferPairs{D},
         # dimension that does not step up.
         low = ntuple(d -> walls[d] && δ[d] != 1, D)
         top = ntuple(d -> tops[d] && δ[d] != -1, D)
-        shift = seam_shift(forest, k, c, δ, symmetric)
+        shift = seam_shift(forest, k, c, δ, symmetric, interpolated)
         record!(kind, offset, lvl, s, via::Crossing) =
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
                                            key_orientation(forest, via), via.glue, low,
@@ -1396,7 +1401,7 @@ function block_sources!(pairs::TransferPairs{D},
         δ′, faces = wall_direction(forest, k, δ)
         if any(!=(OuterFace), faces)
             mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, faces, region, low,
-                            shift)
+                            shift, top)
             continue
         end
         crossing, nbrs = oriented_neighbors(forest, k, δ)
@@ -1493,9 +1498,10 @@ end
 # up (1), except under symmetric walls on a block at the high face of
 # `d2`, whose upper boundary's image is a low wall the fill writes (2).
 function seam_shift(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
-                    δ::NTuple{D,Int}, symmetric::Bool) where {D}
+                    δ::NTuple{D,Int}, symmetric::Bool, interpolated::Bool=false) where {D}
     zero = ntuple(_ -> Int8(0), D)
-    forest.conn isa Patches && return glue_seam_shift(forest, k, c, δ, symmetric)
+    forest.conn isa Patches &&
+        return glue_seam_shift(forest, k, c, δ, symmetric, interpolated)
     ishalfturn(forest) || return zero
     d1, d2 = seam_plane(forest)
     δ[d1] == -1 && c[d2] == 1 || return zero
@@ -1531,7 +1537,8 @@ function mirror_sources!(pairs::TransferPairs{D},
                          b::Int, δ::NTuple{D,Int}, δ′::NTuple{D,Int},
                          walls::NTuple{D,FaceKind}, region,
                          low::NTuple{D,Bool}=ntuple(_ -> false, D),
-                         shift::NTuple{D,Int8}=ntuple(_ -> Int8(0), D)) where {D}
+                         shift::NTuple{D,Int8}=ntuple(_ -> Int8(0), D),
+                         top::NTuple{D,Bool}=ntuple(_ -> false, D)) where {D}
     k = forest.leaves[b]
     zerooffset = ntuple(_ -> 0, D)
     mask = map(!=(OuterFace), walls)
@@ -1562,8 +1569,7 @@ function mirror_sources!(pairs::TransferPairs{D},
         for state in states
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state,
                                            key_orientation(forest, via), via.glue, low,
-                                           shift, ntuple(_ -> false, D), labels,
-                                           via.glue2),
+                                           shift, top, labels, via.glue2),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         end
@@ -2177,13 +2183,17 @@ sidename(s::Integer) = s == 1 ? "low" : "high"
 check_glue_layout(::OneBrick, G, centering, c) = nothing
 # `seam_shift` across a turned glue (M21): a turned entry on the low face of
 # `d` that reverses a vertex-like tangential axis `e` of its own patch, a
-# half turn's, shifts the partition of the slab beyond it along `e` as a
-# brick's half turn does, every boundary one plane up (1), or all but the
-# upper one at the patch's high end of `e` under symmetric walls (2). The
-# layout check admits such an entry only where `e`'s faces are unglued,
-# which is the brick's own case.
+# half turn's, partitions the slab beyond it along `e` so that each region
+# is the image of one block's owned points, as a brick's half turn does.
+# Every boundary moves one plane up (1), but at the ends of `e`: at the
+# top, the upper boundary stays where the bottom block's low plane is not
+# evolved, under symmetric walls at an unglued face (2); at the bottom,
+# the lower one stays where the top block owns its high plane, the
+# appendix of an interpolated set at a kinked glue (3); a block at both
+# ends with both is not shifted at all (0).
 function glue_seam_shift(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
-                         δ::NTuple{D,Int}, symmetric::Bool) where {D}
+                         δ::NTuple{D,Int}, symmetric::Bool,
+                         interpolated::Bool=false) where {D}
     zero = ntuple(_ -> Int8(0), D)
     conn = forest.conn::Patches{D}
     conn.turnplane == (0, 0) && return zero
@@ -2200,8 +2210,13 @@ function glue_seam_shift(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
         for a in 1:D
             e = Int(entry.perm[a])
             entry.flip[a] && e != d && c[e] == 1 || continue
-            top = g[e] == (n[e] << lvl) - 1
-            shift = Base.setindex(shift, Int8(symmetric && top ? 2 : 1), e)
+            top, bottom = g[e] == (n[e] << lvl) - 1, g[e] == 0
+            topowns = interpolated && iskinked(conn, p, e, 2)
+            lowevolved = isglued(conn, p, e, 1) || !symmetric
+            lower = !(bottom && topowns)
+            upper = !(top && !lowevolved)
+            state = lower ? (upper ? 1 : 2) : (upper ? 3 : 0)
+            shift = Base.setindex(shift, Int8(state), e)
         end
     end
     return shift
@@ -2227,21 +2242,10 @@ function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple
             entry.flip[a] && c[e] == 1 || continue
             e == d && s == 1 && continue
             # A turn's seam reversing a tangential axis of its own patch, a
-            # half turn's (M21), shifts its slab as a brick's half turn does
-            # (`glue_seam_shift`), where the axis' faces are unglued, as on
-            # the brick. Where they are glued, ownership there is the
-            # patch's — closed for an interpolated set — and the shift with
-            # it is not derived yet.
-            if entry.turn != 0 && entry.patch == p && e != d
-                all(t -> conn.glue[glue_slot(p, e, t, D)].patch == 0, 1:2) && continue
-                throw(ArgumentError(
-                    "face $face is glued to itself by a turn that reverses axis $e, " *
-                    "which this layout holds vertex-like, and a face of axis $e of " *
-                    "patch $p is glued: the seam slab's partition along a reversed " *
-                    "vertex-like axis follows the ownership at that axis' faces, which " *
-                    "is derived for unglued faces, as on a brick's half turn, and not " *
-                    "yet for glued ones. Hold dimension $e cell-centered."))
-            end
+            # half turn's (M21), partitions its slab as the image of the
+            # blocks' owned points, from the ownership at that axis' faces
+            # (`glue_seam_shift`).
+            entry.turn != 0 && entry.patch == p && e != d && continue
             throw(ArgumentError(e == d ?
                 "face $face is glued to face $there, a high face to a high face, and " *
                 "this layout holds dimension $d vertex-like: a block owns the low wall " *
