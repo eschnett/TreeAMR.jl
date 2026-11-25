@@ -448,7 +448,8 @@ TreeGeneralizedHarmonic and TreeGRRMHD on patches.
 
 ### M21 — Symmetries on patches
 
-*(Proposed 2026-11-25; Erik's decisions on refinement taken that day.)*
+*(Proposed 2026-11-25; Erik's decisions on refinement taken that day;
+step 1's design is in CODE.md, "Symmetries on patches", proposed.)*
 The symmetries a brick has — mirror planes (bitant, quadrant, octant)
 and turns about an axis by 90° and 180° (M12, M14), alone or with a
 mirror plane across the axis — on forests of patches, so that a
