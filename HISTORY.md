@@ -5271,6 +5271,38 @@ M12 was decided with Erik, after M7 and before M9b.
     2.0 on the annulus and, with its cross terms, at 1.8–2.0 on the
     seven-patch ball. TreeWave's `CODE.md`, "Patches", has the scheme and
     the numbers.
+  - *Step 5, the seven-patch ball (2026-11-24).* Also ahead of step 2,
+    on the same TreeWave branch, with this checkout through `[sources]`.
+    The ball's state is interpolated across every glue (`G = 2`, 4-point
+    ghosts, `glue = 4`), its right-hand side covers the appendix through
+    `map_blocks!(…; appendix = true)` and `isowned`, with fourth-order
+    Kreiss–Oliger dissipation `ε/(16h) δ⁴`, and the plane wave
+    `sin(k ⋅ x − |k|t + φ)` is its own Dirichlet data through a hook that
+    follows the time. The criteria, measured (`Lc = 1`, `R1 = 3`, one
+    root a patch, `cfl = 1/4`):
+    - the L2 error and the L∞ error within two spacings of a glue
+      converge at the operator's order, two: without dissipation L2
+      rates 2.02 and 2.01 and near the glues 2.21 and 2.16 over
+      `N = 8, 16, 32`; at `ε = 1/2` the errors fall by 5.2–6.0 a
+      doubling to `N = 64`, the dissipation's `O(εh³)` above the
+      scheme's error at these sizes;
+    - the closed ball's energy (random data, `u = v = 0` beyond the
+      sphere) falls at every sample to `t = 200`, about 33 crossings,
+      at `ε = 1/2` and `N = 8, 16`; it does at `ε = 0.2` and `0.1` too
+      (to `t = 100`), and grows by 1.3e27 by `t = 50` at `ε = 0`. So
+      the second-order scheme needs less dissipation than the
+      prototype's fourth-order one did;
+    - the energy and the volume come from each patch's trapezoidal rule
+      in its logical coordinates, a shared face point split between its
+      patches: the volume converges at 2.00 (−6.0e−3 to −9.4e−5 relative
+      over `N = 8 … 64`);
+    - a solution and its image under point inversion evolve into each
+      other's images to 6.0e−16 (`N = 16`, `t = 10`, values to 0.41);
+    - the mirror `x₁ → −x₁`, measured: 7.4e−16, rounding too, which
+      confirms the prototype's corrected finding that closed ownership
+      is mirror-symmetric.
+    TreeWave's `CODE.md`, "The seven-patch ball", has the scheme and the
+    numbers.
 
 ## Downstream checks
 

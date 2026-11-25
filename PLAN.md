@@ -421,18 +421,13 @@ Each step has the test that says it is done:
    [CODE.md](CODE.md#finite-differences-across-a-glue); the record and
    the criteria as met in
    [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
-5. **TreeWave on the seven-patch ball**: the plane wave of TreeWaveOLDG's
-   `sevenpatch.jl`, with Dirichlet data on the outer sphere through the
-   boundary hook. *Done when* the L2 error and the L∞ error near the
-   glues both converge at the operator's order; the energy stays
-   bounded over many crossing times, which is where an unstable
-   off-centered stencil or a patch corner would show, at the
-   dissipation step 3b found the corners need (`ε = 0.5`), with the
-   ball's physical volume from the scheme's own quadrature, which
-   splits each shared face point between its patches; a solution
-   and its image under point inversion evolve into each other's images
-   to rounding; and the difference between a solution and its mirror
-   image is measured and recorded.
+5. **TreeWave on the seven-patch ball.** Done 2026-11-24, before step 2,
+   on TreeWave's branch `eschnett-claude/m20-annulus` against this
+   checkout: the plane wave converges at second order in L2 and near the
+   glues, the closed ball's energy falls over 33 crossings at `ε = 1/2`,
+   the quadrature gives the volume at second order, and both inversion
+   and the mirror hold to rounding. The record is under M20 in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
 6. **The releases**: TreeAMR (TreeWave's and TreeHydro's suites against
    the checkout); TreeIOHDF5 with the new version appended to its
    `[compat]`; TreeMultiPatch registered; then TreeWaveOLDG and TreeWave.
