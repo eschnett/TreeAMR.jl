@@ -63,6 +63,7 @@ of them. Each milestone's steps are listed in its record under
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
+  - [M21 — Symmetries on patches](#m21--symmetries-on-patches)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -5358,6 +5359,58 @@ M12 was decided with Erik, after M7 and before M9b.
       its GitHub `main` through `[sources]` until it is registered; 370
       tests. No release yet: General refuses a package whose dependency
       it does not have.
+
+### M21 — Symmetries on patches
+
+- **M21 — Symmetries on patches.** *(Asked for and planned with Erik on
+  2026-11-25, designed that day.)* The plan is in
+  [PLAN.md](PLAN.md#m21--symmetries-on-patches), the design in
+  [CODE.md](CODE.md#symmetries-on-patches).
+
+  - *The request (2026-11-25).* Erik asked what supporting a brick's
+    symmetries — the bitant, quadrant and octant mirrors and the 90° and
+    180° turns for a spinning black hole — would take on multi-patch
+    systems. The answer listed what stood in the way: face kinds per
+    `(dim, side)` for every patch at once, the refusal of `rotating` and
+    `halfturn` on patches, and M20's rule that a leaf on a glued face
+    keeps its level.
+  - *Refinement (Erik's decisions, 2026-11-25).* No restriction on
+    regridding in the central box. Asked whether prolongation across a
+    seam face was possible: it is, the rotated prolongations and
+    restrictions existing for a seam's edges and corners, but a
+    coarse-fine seam face also needs an oriented interface restriction
+    for conservative sets and an ownership rule for a vertex-like set's
+    two copies of the seam plane at different levels. Erik's fallback,
+    conformity at the seam, is what a brick seam has, and costs nothing
+    for a refinement pattern centred on the axis. Decided: mirror planes
+    restrict nothing; turn seams keep conformity; aligned symmetry glues
+    are exempt from M20's keep-level rule; prolongation across a seam
+    face is left for later.
+  - *Step 1, the design (2026-11-25).* Written as a proposal and
+    approved by Erik, with its four proposals as written:
+    - the brick's seams stay out of the glue table, the open question
+      M17 left (`RotationPair` across a glue and the brick form's other
+      features would have to come first), the glue form tested against
+      the brick seam bit for bit;
+    - the layout declares a symmetry and the forest records its logic,
+      the alternative, a forest keyword, being impossible without the
+      maps;
+    - the keyword shapes: per-patch `mirror` labels and `outflow`, a
+      glue entry's fourth field `turn`, and the brick's `rotating` and
+      `halfturn` naming labels on patches;
+    - seam points counted once by a set with an appendix and per copy
+      by one without, as over a brick's seam, rather than bringing the
+      fold masks to every set.
+
+    Two choices in the design were weighed and not put to Erik as
+    questions. Folding an interpolated ghost logically, through the
+    forest's own faces from a `chart_locate` result past a symmetry face,
+    was chosen over a new atlas method returning the symmetry that folds
+    a point, which would have had TreeAMR trust the atlas's encoding of
+    labels and turns. And folding at all was needed because a stencil
+    evaluated at the unfolded point would reach `G + k/2` past the plane,
+    beyond the stored ghosts, where at the folded point it reaches
+    `k/2 ≤ G + c`.
 
 ## Downstream checks
 

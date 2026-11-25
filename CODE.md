@@ -896,12 +896,11 @@ declared up front:
   - *The seams stay as they are.* `rotating` and `halfturn` are not
     re-expressed as glue entries: the connectivity is a second mechanism
     beside them that reuses the same pieces, and a forest of patches
-    takes no seam. **(open)** Whether the seams collapse into the glue
-    table, now that both exist, is Erik's call, to be settled in M21's
-    design ([Symmetries on patches](#symmetries-on-patches), proposed),
-    which puts turns into glue entries on patches; their own rules — the shifted
-    seam slab, `RotationPair`, a vertex-like set's two owned seam planes
-    — do not fall out of the table as built.
+    takes no seam. The brick's seams stay out of the glue table: M21
+    puts turns into glue entries for forests of patches only, and says
+    why ([Symmetries on patches](#symmetries-on-patches)); their own
+    rules — the shifted seam slab, `RotationPair`, a vertex-like set's
+    two owned seam planes — do not fall out of the table as built.
 
   The forest refuses, each time saying why:
 
@@ -3836,10 +3835,11 @@ the companion interface's `hasappendix`, `corelength` and
 
 ### Symmetries on patches
 
-**(proposed)** *(M21 step 1, for Erik's approval; the plan is in
-[PLAN.md](PLAN.md#m21--symmetries-on-patches). Nothing here is
-implemented, and the sections it changes still describe the code as it
-is.)*
+*(M21. The decisions behind it are under M21 in
+[HISTORY.md](HISTORY.md#m21--symmetries-on-patches); the plan is in
+[PLAN.md](PLAN.md#m21--symmetries-on-patches). Designed, not yet
+implemented: the sections it changes still describe the code as it is,
+and each is brought up to date by the step that implements its part.)*
 
 A brick has its symmetries: mirror planes at reflecting faces, a quarter
 turn and a half turn about a line where two low faces meet ("Domain and
@@ -4033,27 +4033,40 @@ glue (`glue_copies`).
 datasets of their own under a new format feature, `patch_symmetry`,
 which an older reader refuses; a file without it reads as today.
 
-**Open, for Erik.**
+**The brick's seams stay.** A brick's `rotating` and `halfturn` keep
+their own neighbor arithmetic; the turned glue entry serves forests of
+patches only. Moving the brick's seams into the glue table would first
+need `RotationPair` across a glue, for the asymmetric layouts a brick
+seam fills from a partner and a glue refuses, and glue forms of what the
+brick form has beside its seam, such as a periodic dimension. The test
+of the glue form is the brick's: a brick seam re-expressed as one patch
+glued to itself fills, regrids and evolves bit for bit as the seam
+does, so a later move is a change of representation with its test in
+hand.
 
-- *Brick seams in the glue table* (open since M17, "A multi-patch
-  forest" under [Domain and boundaries](#domain-and-boundaries)).
-  Proposed: not now. The brick form stays as it is; the glue form serves
-  patches, and step 3 checks the two against each other bit for bit, a
-  brick seam re-expressed as a single patch glued to itself. Collapsing
-  them later is then a change of representation with its test in hand.
-- *Where the symmetry is declared.* Proposed: the layout chooses it
-  (`SevenPatchBall(…; symmetry = :octant)` and the like), and the forest
-  records what it means logically — per-patch faces, turned entries, the
-  turn's labels — through the keywords above. TreeAMR checks the logic
-  (labels in range, reverse turns, the composition at an axis); the
-  geometry, that a reduced layout is the full one's quotient, is
-  TreeMultiPatch's to test.
-- *The keyword shapes* above, the per-patch `mirror` labels and the
-  fourth field of a glue entry, are a proposal.
-- *Seam points in folds*, counted twice without an appendix and once
-  with: proposed as above, since the masks exist only for sets with an
-  appendix; counting once everywhere would bring the masks to every set
-  on a forest with a turned glue.
+**The layout declares the symmetry; the forest records it.** A reduced
+ball is chosen by its layout (`SevenPatchBall(…; symmetry = :octant)`
+and the like, in TreeMultiPatch), which alone knows where the planes
+cross each patch, and passes the forest what that means logically: the
+patches, their mirror faces and labels, the turned entries and the
+turn's labels, through the keywords above. TreeAMR checks the logic it
+can see — labels in range and given a parity, an entry turned by `r`
+reversed by `−r mod 4`, turned faces low faces glued to low faces, the
+two orders of a crossing at an axis agreeing, the field sets' maps
+against their parities. That a reduced layout is the full one's
+quotient — a mirror face on its plane, `chart_map` across a turned entry
+the turn of `chart_map` on this side — is geometry, and TreeMultiPatch's
+to test.
+
+**Seam points in folds.** A set with an appendix counts a point of a turn
+seam once, its fold masks treating a turned entry as any glue; a set
+without one counts each copy, as over a brick's seam. On the balls every
+vertex-like set is interpolated across their kinked glues, and so has an
+appendix, and cell and element sets have no shared seam points; what
+counts twice is a vertex-like set copied across its glues on a layout
+with turns and no kinked glue, which matches the brick. Counting once
+everywhere would bring the masks, now compiled behind a barrier for sets
+with an appendix only, to every such set.
 
 ### Folds over points
 

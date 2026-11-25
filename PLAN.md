@@ -449,7 +449,7 @@ TreeGeneralizedHarmonic and TreeGRRMHD on patches.
 ### M21 — Symmetries on patches
 
 *(Proposed 2026-11-25; Erik's decisions on refinement taken that day;
-step 1's design is in CODE.md, "Symmetries on patches", proposed.)*
+designed in step 1, in CODE.md, "Symmetries on patches".)*
 The symmetries a brick has — mirror planes (bitant, quadrant, octant)
 and turns about an axis by 90° and 180° (M12, M14), alone or with a
 mirror plane across the axis — on forests of patches, so that a
@@ -536,8 +536,10 @@ glue entries.
 
 Each step has the test that says it is done:
 
-1. **The design**, in CODE.md, marked proposed until Erik approves it,
-   the open questions above settled. *Done when* Erik approves.
+1. **The design.** Done 2026-11-25: Erik approved it with its four
+   proposals, which settle the open questions above. The design is in
+   [CODE.md](CODE.md#symmetries-on-patches); the record in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
 2. **Face kinds per patch face.** *Done when*, on TreeAMR's own test
    layouts, a forest of patches cut by a mirror plane fills its ghosts,
    regrids and evolves, as the full forest does on symmetric data, to
