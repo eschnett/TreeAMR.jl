@@ -901,19 +901,19 @@ declared up front:
     the axis map, which the virtual frame builds like any other.
     Refinement across a glued face itself — oriented prolongation,
     restriction and interface restriction there — is not in the design.
-  - *The seams stay as they are.* `rotating` and `halfturn` are not
-    re-expressed as glue entries: the connectivity is a second mechanism
-    beside them that reuses the same pieces, and a forest of patches
-    takes no seam. The brick's seams stay out of the glue table: M21
-    puts turns into glue entries for forests of patches only, and says
-    why ([Symmetries on patches](#symmetries-on-patches)); their own
-    rules — the shifted seam slab, `RotationPair`, a vertex-like set's
-    two owned seam planes — do not fall out of the table as built.
+  - *The seams stay as they are.* A brick's `rotating` and `halfturn`
+    are not re-expressed as glue entries: the connectivity is a second
+    mechanism beside them that reuses the same pieces. A forest of
+    patches takes its turns as glue entries instead (M21, **turned
+    glue entries** below), with the same two keywords naming the turn's
+    plane by mirror labels; the brick's seams stay out of the glue
+    table, and [Symmetries on patches](#symmetries-on-patches) says why.
+    Their own rules — the shifted seam slab, a vertex-like set's two
+    owned seam planes — carry over to a turned entry; `RotationPair`
+    does not, since a glue refuses a layout its map does not carry.
 
   The forest refuses, each time saying why:
 
-  - `rotating` or `halfturn` with the patches form: one mechanism of
-    gluing faces at a time;
   - any `true` in `periodic`, glue or not: a wrap is a patch glued to its
     own opposite face, `(from = (p, d, 2), to = (p, d, 1), map =
     (1, 2, …))` and its reverse, which the tests check against a
@@ -942,6 +942,39 @@ declared up front:
     range.
 
   There is no refusal of overlapping extents.
+
+  **Turned glue entries** (M21 step 3). A glue entry may carry a fourth
+  field, `turn`, the quarter turns that carry a point beyond its face to
+  its image across it, and the forest then declares its turn's plane as
+  `rotating = (k1, k2)` or `halfturn = (k1, k2)`, by the mirror labels of
+  the plane's two axes. A turned entry is a symmetry's seam: a field set
+  over such a forest declares `rotation` or `halfturn` as over a brick
+  seam and gets the same tables, and a copy across the entry applies the
+  map (under "Glued faces" in [Ghost filling](#ghost-filling)). The
+  forest refuses, saying why, a turn without a declared plane, both
+  keywords, a plane that is not two different axes, a turn outside
+  `0:3` or other than 2 on a half-turn forest, a turn across anything
+  but a low face glued to a low face — a layout puts its symmetry faces
+  low, so that a vertex-like set owns both copies of the seam plane —
+  the reverse of an entry turned by `r` turned other than by `−r`, and a
+  mirror label in the turn's plane. `GlueEntry` holds `turn`, and
+  `Patches` the plane and whether the turn is a half turn, rather than
+  `Forest.rotating`, so that the brick seam's neighbor arithmetic never
+  runs on a forest of patches; `patch_turn(forest)` reads them, and
+  `patch_keywords` gives every entry's `turn` and the plane's keyword
+  back when the forest has a turn.
+
+  *A corner two glues agree on.* A step that leaves a patch through two
+  glued faces at once is taken across one and then the other, in both
+  orders (`glued_anchor`, `cross_glue`); where both reach the same node
+  with the same axis map and turn, that node is its neighbor, and the
+  `Crossing` carries both slots (`glue`, `glue2`), the axis map composed
+  from the two (`glue_axes`). That is a turn's axis, where the region
+  beyond both seam faces is the image of the block's own under two turns
+  — a brick seam's `r = 2` — and equally the point where four patches of
+  a cut brick meet. At a cubed sphere's corner the two orders reach
+  different patches, and the step finds nothing, as before; a step
+  through three glued faces at once finds nothing too.
 
   **A patch's own faces** (M21 step 2). A patch may give its faces kinds
   of its own, beside `roots` and `extents`: `mirror = ((k_lo, k_hi), …)`,
@@ -1797,13 +1830,21 @@ is the plain copy it always is. What is new:
   and may still be turned, and one glued by the identity is not turned
   and runs as an ordinary copy. `RotatedSource`'s type and the kernel
   are unchanged, so the device path compiles what it compiled before.
-- *No variable map.* Across a glue an application that stores physical,
-  Cartesian components needs the identity: the ghost is a single-valued
-  field at a point both patches have a name for. So every field set over
-  a forest of patches has a one-column identity `rotvars`, the oriented
-  read takes column 1, and `factors` is the parity table if the forest
-  has reflecting faces and `nothing` otherwise; `factorcol` stays 0 for
-  a glued transfer that is not also mirrored. There is no per-interface
+- *No variable map, but across a turn.* Across an ordinary glue an
+  application that stores physical, Cartesian components needs the
+  identity: the ghost is a single-valued field at a point both patches
+  have a name for. So every field set over a forest of patches without
+  a turn has a one-column identity `rotvars`, the oriented read takes
+  column 1, and `factors` is the parity table if the forest has
+  reflecting faces and `nothing` otherwise; `factorcol` stays 0 for a
+  glued transfer that is not also mirrored. Across a turned entry (M21)
+  the ghost is the image of the data across, and the set's map applies
+  as at a brick seam: over a forest with a turn every set has the
+  seam's tables, `rotvars` `nvars × 4` and the factors over the mirror
+  states and the turns, and the key's `orientation` is the glue's turn
+  (`key_orientation`), so the kernel reads column `turn + 1` and
+  `factorcol` adds `3^D · turn`, while the axis map stays the entry's
+  (`group_axes` reads a glue before an orientation). There is no per-interface
   variable map, for an application that stores patch-local components:
   across field sets whose ghost geometry differs — an element scheme's
   gradient sets, `G = e_d` each — neither the field set nor a pair could
@@ -1811,13 +1852,16 @@ is the plain copy it always is. What is new:
   components in one set with faces-only ghosts, and contract with the
   Jacobian in the kernel.
 - *A patch corner is refused where it would be read.* A ghost region
-  beyond two glued faces at once has no one block across it, and the
-  search finds nothing there, which `block_sources!` would hand to the
+  beyond two glued faces at once has no one block across it unless the
+  two glues agree there (a turn's axis, a cut brick; *A corner two glues
+  agree on* under [Domain and boundaries](#domain-and-boundaries)), and
+  elsewhere the search finds nothing there, which `block_sources!` would hand to the
   hook as though it lay beyond an outer face. So `GhostSchedule` refuses
   it, among its collective checks and before any search, from the
   connectivity's `corners` flag and the layout (`check_patch_corners`):
-  for every patch glued at faces of two dimensions, a set whose target
-  range beyond both faces is nonempty. An element set never reaches one:
+  for every patch glued at faces of two dimensions that do not compose
+  (probed from the corner's root at level 0), and at faces of three, a
+  set whose target range beyond them is nonempty. An element set never reaches one:
   it is filled on faces only, and the faces-only filter removes every
   edge and corner direction before the search. So on a cubed sphere an
   element set fills and a cell- or vertex-centered set is refused,
@@ -1836,7 +1880,16 @@ is the plain copy it always is. What is new:
   saying why. And a reversed vertex-like axis is refused except as the
   normal of a low face glued to a low face, because half-open ownership
   does not survive the reversal (see "Across a glued face" under
-  [Centerings](#centerings)).
+  [Centerings](#centerings)) — or as the tangential axis a turned entry
+  of a patch glued to itself reverses, a half turn's, where that axis'
+  faces are unglued: there the slab beyond the seam is partitioned as a
+  brick's half turn partitions it, every boundary one plane up, or all
+  but the upper one at the top under symmetric walls
+  (`glue_seam_shift`), so that each region is the image of one block's
+  owned points. Where the axis' faces are glued, as on a half-turn
+  ball's cube, the ownership there is the patch's own — closed for an
+  interpolated set — and the shift is not derived yet; it is refused,
+  saying so.
 - *Phase 1 stays race free*, by the seam's argument: a copy or a
   restriction across a glue reads the real source's owned points nearest
   the face, and the layout refusals above are what keep that true along
@@ -3826,9 +3879,15 @@ package and in 62–65 s against `main`, three alternating rounds each,
 about 5 % more; before the barriers above it was 69–72 s, and the
 union of `statearray`'s return types was most of the difference.
 
-**No refinement boundary at a glue.** A coarse-fine face, edge or
-corner touching a glued face is refused by `GhostSchedule` for an
-interpolated set, and `regrid!` keeps every block touching a glued face
+**No refinement boundary at a glue.** This is a rule of the kinked
+glues alone (`iskinked`): a turned entry (M21) is a symmetry's seam,
+which meets the face across node for node, so an interpolated set copies
+across it as any set does, owns no appendix there, and regrids at it
+under conformity alone, as at a brick seam — the central box of a
+symmetric ball regrids freely. A forest whose glues are all turned has
+no appendix (`haskinked`), and needs no atlas. At a kinked glue, a
+coarse-fine face, edge or corner touching it is refused by
+`GhostSchedule` for an interpolated set, and `regrid!` keeps every block touching a glued face
 at its level: their own flags are dropped, and a change that 2:1
 balance would carry into one of them is refused, saying which block and
 why. So are the blocks the schedule's glue stencils read: their sources
@@ -3875,11 +3934,17 @@ the companion interface's `hasappendix`, `corelength` and
 [PLAN.md](PLAN.md#m21--symmetries-on-patches). Each step brings the
 sections it changes up to date as it implements its part.)*
 
-*Implemented* (M21 step 2): a patch's own faces and their labels ("A
-multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)),
-parity per label, and the `GroupKey`'s `labels`; tested in
-`test/symmetry_tests.jl`. Not yet: the turned glue entries (step 3) and
-the fold (step 4). Until the fold, `interpolate!` mirrors only at the
+*Implemented* (M21 steps 2 and 3): a patch's own faces and their labels
+("A multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)),
+parity per label, and the `GroupKey`'s `labels`; the turned glue
+entries, the corner two glues agree on, the half turn's slab, and the
+rule of kinked glues (under "Glued faces" in [Ghost filling](#ghost-filling)
+and "Finite differences across a glue"); tested in
+`test/symmetry_tests.jl`, the MPI workload's `T2` and the device suite.
+Not yet: the fold (step 4), and with it a half turn's slab where the
+reversed axis' faces are glued, which only an interpolated set on a
+half-turn ball meets and which cannot be scheduled before the fold
+anyway. Until the fold, `interpolate!` mirrors only at the
 forest-wide reflecting faces, so a point past a patch's own mirror face
 is outside, refused or marked as any point outside is, and never given
 a value.
@@ -6750,9 +6815,11 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   under its feature `patches` and rebuilds the forest through that form,
   which validates them; it reads no field of the connectivity. Since
   M21 step 2 a patch may carry the fields `mirror` and `outflow`, its
-  own faces: a companion that saves only `roots` and `extents` would
-  restore the forest without them, so its release for this version must
-  save them or refuse a forest that has them;
+  own faces, and since step 3 a forest with a turn gives every glue
+  entry its `turn` and the keyword `rotating` or `halfturn` beside
+  `patches` and `glue`: a companion that saves only roots, extents and
+  maps would restore the forest without them, so its release for this
+  version must save them or refuse a forest that has them;
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
@@ -6985,7 +7052,8 @@ schedule's bug check. The fill: a brick cut into patches glued as it
 was, every centering, uniform and refined beside the glue, equal to the
 brick over every stored point (`compare_matching_blocks`); cut at a
 patch corner, an element set and a cell set with `G = 0` along one of
-the two dimensions equal to the brick, every other layout refused;
+the two dimensions equal to the brick, and since M21's composition of
+a corner two glues agree on, every other layout too;
 seven layouts laid out with swapped, reversed and cycled axes, every
 centering refused or filled with no undefined ghost and equal to the
 brick through the layout map (to 1e-14 where refined beside the glue,
@@ -7017,7 +7085,18 @@ three explicit Laplacian steps, equal to the brick to 1e-13 and 1e-12;
 and the refusals. A second variable is odd under label 2 only, so a
 parity taken along the logical dimension instead of the label fails
 the fill: with the labels ignored in `factorcol`, 36 of its assertions
-do. Elsewhere: `exchange_tests.jl` fills the
+do. Step 3's: a brick's quarter and half turn written as glue entries of
+the one patch it is, in 2D and in 3D beneath a mirror, cell- and
+vertex-centered, half-open and with symmetric walls, uniform and refined
+at both ends of the seam, every stored point equal to the seam's bit for
+bit (the axis's corner and the half turn's slab included); a regrid on
+the seam and back with three Laplacian steps, bit for bit; the quadrant
+cut into four patches with the seam between two of them, against the
+brick bit for bit; `balance!`'s conformity across a turned face, and an
+interpolated set regridding freely at one; the refusals; and the
+keywords' round trip. The MPI workload's `T2` holds the glue forms
+against the seams at every rank count, and the device suite a turned
+fill and regrid against the CPU's. Elsewhere: `exchange_tests.jl` fills the
 cubed sphere's element set, a swapped and reversed 2D pair refined at
 the glue, and a 3D cyclic layout over 2, 3 and 5 simulated ranks, bit
 for bit with the serial fill and with turned packs present; `rotate_tests.jl`

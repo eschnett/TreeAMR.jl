@@ -5433,6 +5433,43 @@ M12 was decided with Erik, after M7 and before M9b.
     7). The full suite passed, 169,215 tests at eight threads with both
     MPI jobs, but for one assertion on the old wording of a refusal,
     updated; the docs build passed.
+  - *Step 3, turns as glue entries (2026-11-25).* A glue entry gained
+    `turn`, the patches form `rotating` and `halfturn` naming the turn's
+    plane by labels, a copy across a turned entry the set's map and sign
+    (the key's orientation is the glue's turn, the axis map the entry's),
+    and the neighbor search the composition of two glued faces that agree
+    — the corner at a turn's axis, a brick seam's `r = 2`. A side effect:
+    the point where four patches of a cut brick meet composes too, so
+    `patch_tests.jl`'s cut no longer refuses its cell and vertex sets but
+    fills them as the brick, bit for bit; a step through three glued faces
+    stays refused. The half turn's shifted slab carried over as a
+    brick's, for a reversed axis whose faces are unglued. Turned glues
+    are exempt from M20's keep-level rule (`iskinked`); a forest with no
+    kinked glue has no appendix and needs no atlas. A gap from step 2
+    was closed on the way: the refusal of an interpolated set beside a
+    wall read only the forest-wide kinds, and now reads every patch face.
+
+    The oracle departs from the plan's wording in two ways. M12's and
+    M14's own test files were not re-run on the glue form; instead every
+    stored point of the glue form is compared with the brick seam's, bit
+    for bit — 2D and 3D beneath a mirror, quarter and half turn, cell and
+    vertex, half-open and symmetric walls, uniform and refined — through a
+    regrid on the seam and three Laplacian steps, which those files hold
+    the seams to. And the turned glue between two patches is compared with
+    the brick seam on the same leaves, bit for bit, rather than with the
+    full plane to rounding. The interpolated set's free regrid is tested
+    serially; over MPI and on Metal the tests run a turned fill and
+    regrid with a plain vertex set, which an interpolated set on a forest
+    without a kinked glue is the same as, having no appendix and no glue
+    plan. Deferred to step 4: the half turn's slab where the reversed
+    axis' faces are glued, as on a half-turn ball's cube, whose
+    ownership there is closed for an interpolated set and which no
+    schedule can reach before the fold; it is refused, saying so.
+
+    Measured: `symmetry_tests.jl` 330 assertions; the MPI workload's `T2`
+    the same at one and three ranks, the glue forms equal to the seams;
+    the device suite on Metal, 2,703; the full suite 169,349 at eight
+    threads with both MPI jobs; the docs build.
 
 ## Downstream checks
 

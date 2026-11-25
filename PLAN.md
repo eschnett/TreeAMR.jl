@@ -546,13 +546,13 @@ Each step has the test that says it is done:
    bit uniform and to rounding refined against the mirror plane, in every
    centering. The record is in
    [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
-3. **Turn seams as glue entries.** *Done when* a brick seam written as a
-   glue entry fills, regrids and evolves bit for bit as M12's and M14's
-   seams do (their tests, re-run on the glue form); a forest of patches
-   with a turned glue does as the full forest on symmetric data, to
-   rounding; `balance!` keeps conformity there; and a leaf on an aligned
-   glue regrids freely under `glue = :interpolate`, serially, over MPI
-   and on a device.
+3. **Turn seams as glue entries.** Done 2026-11-25: a brick's quarter
+   and half turn written as glue entries fill, regrid and evolve bit for
+   bit as the seams do, a turned glue between two patches too; `balance!`
+   keeps conformity there, and an interpolated set regrids freely at one;
+   over MPI and on Metal. The half turn's slab where the reversed axis'
+   faces are glued goes with the fold, to step 4. The record is in
+   [HISTORY.md](HISTORY.md#m21--symmetries-on-patches).
 4. **The fold.** *Done when* interpolated ghosts across a kinked glue
    next to a mirror plane and next to a seam agree with the full
    layout's to rounding, in parity and in the turned components; and

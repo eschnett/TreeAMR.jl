@@ -474,6 +474,13 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                 (rotations, rotations, rotations) : nothing
         f, v = seamtables(T, parities, steps, Int(nvars), Val(D))
         todevice(backend, f), todevice(backend, v)
+    elseif patch_turn(forest) !== nothing
+        # A turned glue (M21) applies the set's map, as a seam does; a set
+        # filled across one turns into itself (`symmetric_layout`).
+        f, v = patch_turn(forest)[2] ?
+               seamtables(T, parities, nothing, Int(nvars), Val(D); half=halfturns) :
+               seamtables(T, parities, (rotations, rotations, rotations), Int(nvars), Val(D))
+        todevice(backend, f), todevice(backend, v)
     elseif ispatched(forest)
         # A glued face carries each variable onto itself (M17).
         f = hasreflecting(forest) ? todevice(backend, parityfactors(T, parities, Val(D))) :
@@ -605,6 +612,10 @@ mirrorcolumn(state::NTuple{D,<:Integer}) where {D} =
 # (M14) every layout turns into itself, since it exchanges no dimensions.
 function symmetric_layout(forest::Forest, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
     ishalfturn(forest) && return true
+    # Across a turned glue (M21) the glue's own check refuses a layout its
+    # axis map does not carry (`check_glue_layout`), so a set that is
+    # filled there turns into itself.
+    patch_turn(forest) === nothing || return true
     d1, d2 = rotating_dims(forest)
     return G[d1] == G[d2] && c[d1] == c[d2]
 end
@@ -618,10 +629,12 @@ symmetric_layout(fs::FieldSet) = symmetric_layout(fs.forest, fs.G, staggers(fs))
 # by `RotationPair`.
 function rotations_of(rotation, forest::Forest{D}, nvars::Int, G::NTuple{D,Int},
                       c::NTuple{D,Int}, parities) where {D}
-    quarter = rotating_dims(forest) !== nothing
+    turn = patch_turn(forest)
+    quarter = rotating_dims(forest) !== nothing || (turn !== nothing && !turn[2])
+    seam = turn === nothing ? rotating_dims(forest) : turn[1]
     if rotation === nothing
         quarter && throw(ArgumentError(
-            "this forest has a rotating seam, rotating = $(rotating_dims(forest)), so " *
+            "this forest has a rotating seam, rotating = $seam, so " *
             "the field set needs `rotation`: one signed variable index per variable, " *
             "saying which variable, and with which sign, each one equals a quarter " *
             "turn away. How a variable turns — a scalar into itself, the x component " *
@@ -638,8 +651,7 @@ function rotations_of(rotation, forest::Forest{D}, nvars::Int, G::NTuple{D,Int},
             "rotation = $(Tuple(q)) turned four times is not the identity: four " *
             "quarter turns are no turn at all, so applying the map four times must " *
             "return every variable to itself with its sign. (This set's layout is " *
-            "symmetric in the seam's dimensions $(rotating_dims(forest)), so it " *
-            "turns into itself.)"))
+            "symmetric in the seam's dimensions $seam, so it turns into itself.)"))
         check_rotation_parity(forest, parities, parities, q, "rotation")
     end
     return q
@@ -673,9 +685,12 @@ end
 # over a half-turn forest, where its square must be the identity and it
 # must keep the parities; checked for its shape anywhere else.
 function halfturns_of(halfturn, forest::Forest, nvars::Int, parities)
+    turn = patch_turn(forest)
+    half = ishalfturn(forest) || (turn !== nothing && turn[2])
     if halfturn === nothing
-        ishalfturn(forest) && throw(ArgumentError(
-            "this forest has a half-turn seam, halfturn = $(halfturn_dims(forest)), " *
+        half && throw(ArgumentError(
+            "this forest has a half-turn seam, halfturn = " *
+            "$(turn === nothing ? halfturn_dims(forest) : turn[1]), " *
             "so the field set needs `halfturn`: one signed variable index per " *
             "variable, saying which variable, and with which sign, each one equals " *
             "at the turned point. How a variable turns — a scalar into itself, a " *
@@ -684,7 +699,7 @@ function halfturns_of(halfturn, forest::Forest, nvars::Int, parities)
         return nothing
     end
     q = signed_map(halfturn, nvars, "halfturn", "a half turn")
-    ishalfturn(forest) || return q
+    half || return q
     σ, s = composed_rotation((q, q), nvars)
     all(v -> σ[v] == v && s[v] == 1, 1:nvars) || throw(ArgumentError(
         "halfturn = $(Tuple(q)) applied twice is not the identity: two half turns " *

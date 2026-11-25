@@ -217,3 +217,199 @@ end
     # The label, not the dimension: no parity is needed under label 1.
     @test FieldSet(forest, 1; G=1, parity=[(NoParity, EvenParity)]) isa FieldSet
 end
+
+# --- Step 3: turns as glue entries -------------------------------------------
+
+# A brick's seam written as glue entries of the one patch it is: the quarter
+# turn's low face of axis 1 glued to the low face of axis 2 and back, turned
+# by 1 and 3; the half turn's low face of axis 1 glued to itself, reversed
+# along axis 2, turned by 2.
+function seam_glue(D, kind)
+    if kind === :quarter
+        σ = ntuple(e -> e == 1 ? -2 : e == 2 ? 1 : e, D)
+        τ = ntuple(e -> e == 1 ? 2 : e == 2 ? -1 : e, D)
+        return [(from=(1, 1, 1), to=(1, 2, 1), map=σ, turn=1),
+                (from=(1, 2, 1), to=(1, 1, 1), map=τ, turn=3)]
+    end
+    return [(from=(1, 1, 1), to=(1, 1, 1), map=ntuple(e -> e <= 2 ? -e : e, D), turn=2)]
+end
+
+# The brick with its seam, in 3D with a mirror at the low face of axis 3
+# beneath the turn, as an octant's, and the one patch with the same leaves.
+function seam_forests(D, kind; refine=false, N=4)
+    roots = ntuple(_ -> 2, D)
+    zlow = ntuple(d -> d == 3 ? (true, false) : (false, false), D)
+    turn = kind === :quarter ? (rotating=(1, 2),) : (halfturn=(1, 2),)
+    brick = Forest(roots; N=N, reflecting=zlow, turn...)
+    if refine
+        refine!(brick, brick.leaves[1])
+        balance!(brick)
+        refine!(brick, brick.leaves[end])
+        balance!(brick)
+    end
+    patched = Forest([(roots=roots, mirror=ntuple(d -> d == 3 ? (3, 0) : (0, 0), D))];
+                     N=N, glue=seam_glue(D, kind), leaves=brick.leaves, turn...)
+    return brick, patched
+end
+
+# Three variables, a scalar odd under the mirror of axis 3 and a vector in the
+# plane, with the map of each turn.
+seam_fieldset(forest, kind, C; walls=:half_open, G=1) =
+    FieldSet(forest, 3; G=G, centering=C, walls=walls,
+             parity=[ntuple(d -> d == 3 ? OddParity : EvenParity, length(C)),
+                     ntuple(_ -> EvenParity, length(C)), ntuple(_ -> EvenParity, length(C))],
+             (kind === :quarter ? (rotation=(1, -3, 2),) : (halfturn=(1, -2, -3),))...)
+seam_data(x) = (sin(x[1] + 2x[2] + x[end] / 3), cos(3x[1] - x[2]), x[1] * x[2] + x[end])
+seam_hook() = boundary_by_coordinates((x, v) -> seam_data(x)[v])
+
+function fill_seam!(fs, ops=PATCH_OPS)
+    fill!(fs.work, NaN)
+    fill_by_coordinates!((x, v) -> seam_data(x)[v], fs)
+    schedule = GhostSchedule(fs, ops)
+    fill_ghosts!(fs, schedule; boundary=seam_hook())
+    return schedule
+end
+
+@testset "A brick's seam written as a turned glue fills as the seam: D=$D, $kind" for
+        D in (2, 3), kind in (:quarter, :half)
+    # The glue form's whole oracle: the same leaves, the same data, every
+    # stored point equal bit for bit to the seam's, the corner at the axis
+    # (two turned faces composed) and the half turn's shifted slab included,
+    # uniform and refined at both ends of the seam, half-open and with
+    # symmetric walls. A turn's variable map or sign taken from the wrong
+    # column, a composition that differs from the seam's `r = 2`, or a slab
+    # partition that is not the image of the blocks' owned points, differs.
+    for refine in (false, true), C in (cellcentered(D), vertexcentered(D)),
+        walls in (:half_open, :symmetric)
+        walls === :symmetric && C[1] === :cell && continue
+        brick, patched = seam_forests(D, kind; refine=refine)
+        fb = seam_fieldset(brick, kind, C; walls=walls)
+        fp = seam_fieldset(patched, kind, C; walls=walls)
+        fill_seam!(fb)
+        sp = fill_seam!(fp)
+        @test isequal(fb.work, fp.work)
+        @test !any(isnan, fp.work)
+        @test any(g -> g.turned && g.orientation != 0, sp.phase1)
+    end
+end
+
+@testset "A brick's seam written as a turned glue regrids and evolves as the seam: $kind" for
+        kind in (:quarter, :half)
+    # The leaves on the seam refined by `regrid!`, conformity carrying each
+    # one's image with it on both forms, then coarsened back; between and
+    # after, three explicit Laplacian steps. The glue form must keep the
+    # seam's leaves and values bit for bit throughout.
+    D = 2
+    for C in (cellcentered(D), vertexcentered(D))
+        brick, patched = seam_forests(D, kind)
+        fb, fp = seam_fieldset(brick, kind, C), seam_fieldset(patched, kind, C)
+        fill_seam!(fb)
+        fill_seam!(fp)
+        for phase in (Refine, Coarsen)
+            flags(fs) = [phase == Refine ?
+                         (any(iszero, Base.front(Base.front((leafbox(fs.forest,
+                                                                     blockkey(fs, b))[1]...,
+                                                             0, 0)))[1:2]) ? Refine : Keep) :
+                         (level(blockkey(fs, b)) > 0 ? Coarsen : Keep) for b in 1:nblocks(fs)]
+            @test regrid!(brick, fb => GhostSchedule(fb, PATCH_OPS); flags=flags(fb),
+                          boundary=seam_hook())
+            @test regrid!(patched, fp => GhostSchedule(fp, PATCH_OPS); flags=flags(fp),
+                          boundary=seam_hook())
+            @test patched.leaves == brick.leaves
+            laplace_steps!(fb, GhostSchedule(fb, PATCH_OPS), seam_hook())
+            laplace_steps!(fp, GhostSchedule(fp, PATCH_OPS), seam_hook())
+            @test isequal(fb.work, fp.work)
+        end
+    end
+end
+
+@testset "A turned glue between two patches fills as the brick's seam" begin
+    # The quadrant cut into four patches, so that the seam joins patch 3's
+    # low face of axis 1 to patch 2's low face of axis 2, two different
+    # patches, beside patch 1's seam with itself, and four patches meet at
+    # the cut's corner, composed as the axis is. Every stored point must be
+    # the brick seam's at the same position, bit for bit, uniform and
+    # refined once everywhere.
+    cut, _ = brick_cut((2, 2), ((1,), (1,)))
+    kw = patch_keywords(cut)
+    glue = [[merge(g, (turn=0,)) for g in kw.glue];
+            [(from=(1, 1, 1), to=(1, 2, 1), map=(-2, 1), turn=1),
+             (from=(1, 2, 1), to=(1, 1, 1), map=(2, -1), turn=3),
+             (from=(3, 1, 1), to=(2, 2, 1), map=(-2, 1), turn=1),
+             (from=(2, 2, 1), to=(3, 1, 1), map=(2, -1), turn=3)]]
+    for refined in (false, true), C in (cellcentered(2), vertexcentered(2))
+        patched = Forest(kw.patches; N=4, glue=glue, rotating=(1, 2))
+        brick = Forest((2, 2); N=4, rotating=(1, 2))
+        if refined
+            patch_refine_all!(patched)
+            patch_refine_all!(brick)
+        end
+        fp, fb = seam_fieldset(patched, :quarter, C), seam_fieldset(brick, :quarter, C)
+        fill_seam!(fp)
+        fill_seam!(fb)
+        result = compare_matching_blocks(fp, fb)
+        @test result !== nothing && result[1] == 0 && result[2] > 0
+    end
+end
+
+@testset "A turned glue keeps conformity, and an interpolated set regrids freely at it" begin
+    # `balance!` must refine a leaf's image across a turned face, as across a
+    # brick's seam. And a turned glue is not a kinked one: an interpolated
+    # set copies across it, owns no appendix there, needs no atlas where no
+    # glue kinks, and is not held to M20's rule that a leaf on a glued face
+    # keeps its level — the central box of a symmetric ball regrids freely.
+    brick, patched = seam_forests(2, :quarter)
+    k = patched.leaves[findfirst(k -> leafbox(patched, k)[1] == (0, 1), patched.leaves)]
+    refine!(patched, k)
+    refine!(brick, k)
+    balance!(patched)
+    balance!(brick)
+    @test patched.leaves == brick.leaves
+    @test isbalanced(patched)
+    _, patched = seam_forests(2, :quarter; N=8)
+    fs = FieldSet(patched, 1; G=2, centering=vertexcentered(2), rotation=(1,),
+                  glue=:interpolate)
+    @test !TreeAMR.hasappendix(fs)
+    ops = Operators(prolongation=4, restriction=4, glue=4)
+    hook = boundary_by_coordinates((x, v) -> seam_data(x)[1])
+    fill_by_coordinates!((x, v) -> seam_data(x)[1], fs)
+    before = length(patched.leaves)
+    onseam = [any(iszero, leafbox(patched, blockkey(fs, b))[1]) ? Refine : Keep
+              for b in 1:nblocks(fs)]
+    @test regrid!(patched, fs => GhostSchedule(fs, ops); flags=onseam, boundary=hook)
+    @test length(patched.leaves) > before
+    @test any(k -> level(k) == 1 && any(iszero, leafbox(patched, k)[1]), patched.leaves)
+end
+
+@testset "A turn on patches is refused where it cannot be, with the reason" begin
+    # Each refusal names what the turn would contradict.
+    roots = (2, 2)
+    q = seam_glue(2, :quarter)
+    one(glue; kw...) = Forest([(roots=roots,)]; N=4, glue=glue, kw...)
+    @test_throws "declares no turn" one(q)
+    @test_throws "are both given" one(q; rotating=(1, 2), halfturn=(1, 2))
+    @test_throws "is not two different axes" one(q; rotating=(1, 1))
+    @test_throws "turn = 2, only" one(q; halfturn=(1, 2))
+    @test_throws "is not 0, 1, 2 or 3" one([merge(q[1], (turn=4,)), q[2]]; rotating=(1, 2))
+    @test_throws "turned by -r" one([q[1], merge(q[2], (turn=1,))]; rotating=(1, 2))
+    high = [(from=(1, 1, 2), to=(1, 2, 2), map=(2, -1), turn=1),
+            (from=(1, 2, 2), to=(1, 1, 2), map=(-2, 1), turn=3)]
+    @test_throws "glues a low face to a low face" one(high; rotating=(1, 2))
+    @test_throws "in the plane" Forest([(roots=(2, 2, 2), mirror=((0, 0), (0, 0), (2, 0)))];
+                                       N=4, glue=seam_glue(3, :quarter), rotating=(1, 2))
+    forest = one(q; rotating=(1, 2))
+    @test_throws "needs `rotation`" FieldSet(forest, 1; G=1)
+    # A half turn reversing a vertex-like axis whose faces are glued, here
+    # to each other, a wrap, so that the corner composes and the layout is
+    # what refuses.
+    glued = [seam_glue(2, :half);
+             patch_glue_both((1, 2, 2), (1, 2, 1), (1, 2))]
+    wrap = one(glued; halfturn=(1, 2))
+    fs = FieldSet(wrap, 1; G=1, centering=vertexcentered(2), halfturn=(1,))
+    @test_throws "not yet for glued ones" GhostSchedule(fs, PATCH_OPS)
+    # The keywords rebuild a turned forest, turns and plane included.
+    kw = patch_keywords(forest)
+    again = Forest(kw.patches; N=4, glue=kw.glue, rotating=kw.rotating)
+    @test ForestDigest(again, UInt(0), false).brick ==
+          ForestDigest(forest, UInt(0), false).brick
+end

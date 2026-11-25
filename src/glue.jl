@@ -155,7 +155,17 @@ end
 isglued(conn::Patches{D}, p::Integer, e::Integer, side::Integer) where {D} =
     conn.glue[glue_slot(p, e, side, D)].patch != 0
 
-# The glued faces of its patch that leaf `k` lies on, as `(dim, side)`.
+# A glued face whose maps kink, the kind this file interpolates across: an
+# ordinary glue. A turned one (M21) is a symmetry's seam, which meets the
+# face across node for node, so every set copies across it as across a
+# brick's seam, owns no appendix there, and regrids at it under conformity
+# alone ("Symmetries on patches" in CODE.md).
+iskinked(conn::Patches{D}, p::Integer, e::Integer, side::Integer) where {D} =
+    (entry = conn.glue[glue_slot(p, e, side, D)]; entry.patch != 0 && entry.turn == 0)
+
+# The kinked glued faces of its patch that leaf `k` lies on, as `(dim,
+# side)`: those M20 keeps levels at (a turned one is a symmetry's seam,
+# which keeps conformity alone; `iskinked`).
 function glued_faces(conn::Patches{D}, k::MortonKey{D}) where {D}
     lvl = level(k)
     p = searchsortedlast(conn.firstroot, Int(k.root))
@@ -163,7 +173,7 @@ function glued_faces(conn::Patches{D}, k::MortonKey{D}) where {D}
     rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
     g = ntuple(e -> (rootpos[e] << lvl) + Int(k.coords[e]), D)
     return [(e, s) for e in 1:D for s in 1:2
-            if (s == 1 ? g[e] == 0 : g[e] == (n[e] << lvl) - 1) && isglued(conn, p, e, s)]
+            if (s == 1 ? g[e] == 0 : g[e] == (n[e] << lvl) - 1) && iskinked(conn, p, e, s)]
 end
 
 # Along which dimensions leaf `k` owns its high face plane under closed
@@ -178,7 +188,7 @@ function appendix_dims(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int}) whe
     return ntuple(D) do e
         c[e] == 1 || return false
         g = (rootpos[e] << lvl) + Int(k.coords[e])
-        return g == (n[e] << lvl) - 1 && isglued(conn, p, e, 2)
+        return g == (n[e] << lvl) - 1 && iskinked(conn, p, e, 2)
     end
 end
 
@@ -191,7 +201,8 @@ function interpolated_region(conn::Patches{D}, k::MortonKey{D},
     ex = patch_exits(conn, k, δ)
     all(iszero, ex) && return false
     p = searchsortedlast(conn.firstroot, Int(k.root))
-    return all(e -> ex[e] == 0 || isglued(conn, p, e, ex[e]), 1:D)
+    return all(e -> ex[e] == 0 || isglued(conn, p, e, ex[e]), 1:D) &&
+           any(e -> ex[e] != 0 && iskinked(conn, p, e, ex[e]), 1:D)
 end
 
 # The refusal of a refinement boundary at a glue (M20): a face, edge or
@@ -239,15 +250,17 @@ function check_glue_interpolation(forest::Forest{D,R}, N::Int, G::NTuple{D,Int},
         "what a derivative stencil needs from its ghosts is the scheme's to say: a " *
         "second derivative of order 4 needs k = 6 (CODE.md, \"Finite differences " *
         "across a glue\")."))
-    atlas === nothing && throw(ArgumentError(
+    atlas === nothing && haskinked(forest) && throw(ArgumentError(
         "a field set with glue = :interpolate over a forest of patches needs the " *
         "application's atlas: pass `GhostSchedule(fs, operators; atlas)`. A ghost " *
         "across a glue lies where the target patch's map puts it, which only the " *
         "atlas knows."))
-    check_chart(chart_map, atlas, R, Val(D),
-                "a field set interpolated across a glue, whose ghosts lie where the map puts them,")
-    check_chart(chart_locate, atlas, R, Val(D),
-                "a field set interpolated across a glue, which locates its ghosts,")
+    if atlas !== nothing
+        check_chart(chart_map, atlas, R, Val(D),
+                    "a field set interpolated across a glue, whose ghosts lie where the map puts them,")
+        check_chart(chart_locate, atlas, R, Val(D),
+                    "a field set interpolated across a glue, which locates its ghosts,")
+    end
     for d in 1:D
         k <= 2 * (G[d] + c[d]) || throw(ArgumentError(
             "the glue order $k does not fit the field set's stored array along " *
@@ -255,10 +268,13 @@ function check_glue_interpolation(forest::Forest{D,R}, N::Int, G::NTuple{D,Int},
             "block reaches k ÷ 2 points beyond its owned range, so k ≤ 2(G + c) = " *
             "$(2 * (G[d] + c[d])) with G = $(G[d]) and c = $(c[d]) there"))
     end
-    any(f -> any(!=(OuterFace), f), getfield(forest, :faces)) && throw(ArgumentError(
+    # Every patch face, its own (M21) included; the fold of M21 step 4 is
+    # what lifts it.
+    haskinked(forest) && any(!=(OuterFace), (forest.conn::Patches{D}).kinds) &&
+        throw(ArgumentError(
         "a field set interpolated across a glue over a forest with reflecting or " *
         "outflow faces is not implemented: the edge regions beyond such a face and a " *
-        "glued one are neither mirrored nor located yet (M20 step 4)"))
+        "glued one are neither mirrored nor located yet (M21 step 4)"))
     return nothing
 end
 
@@ -753,7 +769,16 @@ end
 # Whether a field set has an appendix: interpolated across the glue of a
 # forest of patches, with a vertex-like dimension.
 hasappendix(fs::FieldSet) =
-    fs.glue === :interpolate && ispatched(fs.forest) && any(==(:vertex), fs.centering)
+    fs.glue === :interpolate && ispatched(fs.forest) && any(==(:vertex), fs.centering) &&
+    haskinked(fs.forest)
+
+# Whether a forest of patches has a kinked glue (`iskinked`), across which
+# an interpolated set interpolates and owns an appendix: a forest whose
+# glues are all turned (M21) has neither, and its interpolated sets copy
+# as any set does.
+haskinked(forest::Forest{D}) where {D} =
+    forest.conn isa Patches &&
+    any(e -> e.patch != 0 && e.turn == 0, (forest.conn::Patches{D}).glue)
 
 # The appendix of one field set over its forest's current leaves: per
 # local block its dimensions, its offset in the appendix and its number

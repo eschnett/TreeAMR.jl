@@ -40,7 +40,8 @@
 # the annulus and the cubed sphere, through a fill across their glued
 # faces with the patch handed to the callbacks; from M20 on ghosts
 # interpolated across a glue, on the kinked torus; from AMR-13 on the
-# public collectives, as an application calls them. The checkpoints moved to
+# public collectives, as an application calls them; from M21 on a brick's
+# seams written as turned glue entries, against the seams. The checkpoints moved to
 # TreeIOHDF5, whose own workload runs them.
 
 using TreeAMR
@@ -1281,6 +1282,45 @@ function glue_case(tag)
     return nothing
 end
 
+# A brick's seam written as glue entries of the one patch it is (M21): the
+# quarter turn and the half turn, a vertex-like set, filled, regridded at
+# the seam and filled again, every value equal to the brick seam's on the
+# same leaves. What is printed is the glue form's, and whether it is the
+# brick's, which does not depend on the rank count.
+function turn_case(tag)
+    for (name, turn, glue, map_) in
+        (("quarter", (rotating=(1, 2),),
+          [(from=(1, 1, 1), to=(1, 2, 1), map=(-2, 1), turn=1),
+           (from=(1, 2, 1), to=(1, 1, 1), map=(2, -1), turn=3)], (rotation=(1, -3, 2),)),
+         ("half", (halfturn=(1, 2),),
+          [(from=(1, 1, 1), to=(1, 1, 1), map=(-1, -2), turn=2)], (halfturn=(1, -2, -3),)))
+        brick = Forest((4, 4); N=4, comm=COMM, turn...)
+        patched = Forest([(roots=(4, 4),)]; N=4, glue=glue, comm=COMM, turn...)
+        f(x, v) = (sin(x[1] + 2x[2]), cos(3x[1] - x[2]), x[1] * x[2])[v]
+        hook = boundary_by_coordinates(f)
+        ops = Operators(prolongation=2, restriction=2)
+        sets = map((brick, patched)) do forest
+            fs = FieldSet(forest, 3; G=1, centering=vertexcentered(2), map_...)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=hook)
+            return fs
+        end
+        same() = gathered(brick, sets[1].work) == gathered(patched, sets[2].work)
+        emit(tag, name, "filled", digest(gathered(patched, sets[2].work)), same())
+        for (forest, fs) in zip((brick, patched), sets)
+            seam = [any(d -> block_extent(forest, blockkey(fs, b))[d][1] == 0, 1:2) ?
+                    Refine : Keep
+                    for b in 1:nblocks(fs)]
+            regrid!(forest, fs => GhostSchedule(fs, ops); flags=seam, boundary=hook)
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=hook)
+        end
+        emit(tag, name, "regridded", nleaves(patched), digest(string(patched.leaves)),
+             digest(gathered(patched, sets[2].work)), patched.leaves == brick.leaves,
+             same())
+    end
+    return nothing
+end
+
 # --- the refusals, which only a distributed run can show -------------------
 
 # A forest mutated on one rank only, a layout that differs on one rank,
@@ -1638,6 +1678,8 @@ function main()
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     # Ghosts interpolated across a glue (M20), on the kinked torus.
     glue_case("G2")
+    # Turns as glue entries (M21), against the brick's seams.
+    turn_case("T2")
     public_verbs("V")
     refusals()
     verbs()

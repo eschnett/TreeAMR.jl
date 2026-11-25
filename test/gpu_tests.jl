@@ -1196,3 +1196,41 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
     @test !any(isnan, duh) && dud == duh
     D == 2 && @test rd == rh
 end
+
+@testset "$bname: turned glue entries fill and regrid on the device: T=$T" for
+        (bname, backend, types) in BACKENDS, T in types
+    # M21. A brick's seams written as glue entries of the one patch they
+    # are: the turned copy's variable map and sign from the set's tables on
+    # the device, the corner at the axis composed, the half turn's shifted
+    # slab; then a regrid at the seam, which a turned glue allows. Nothing
+    # unwritten, and the CPU's numbers.
+    for (turn, glue, map_) in
+        (((rotating=(1, 2),), [(from=(1, 1, 1), to=(1, 2, 1), map=(-2, 1), turn=1),
+                                (from=(1, 2, 1), to=(1, 1, 1), map=(2, -1), turn=3)],
+          (rotation=(1, -3, 2),)),
+         ((halfturn=(1, 2),), [(from=(1, 1, 1), to=(1, 1, 1), map=(-1, -2), turn=2)],
+          (halfturn=(1, -2, -3),)))
+        f(x, v) = (sin(x[1] + 2x[2]), cos(3x[1] - x[2]), x[1] * x[2])[v]
+        ops = Operators(prolongation=2, restriction=2)
+        out = map((CPU(), backend)) do bk
+            forest = Forest{T}([(roots=(2, 2),)]; N=4, glue=glue, turn...)
+            fs = FieldSet{T}(forest, 3; G=1, centering=vertexcentered(2), backend=bk,
+                             map_...)
+            fill!(fs.work, T(NaN))
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+            filled = Array(fs.work)
+            seam = [any(d -> block_extent(forest, blockkey(fs, b))[d][1] == 0, 1:2) ?
+                    Refine : Keep for b in 1:nblocks(fs)]
+            regrid!(forest, fs => GhostSchedule(fs, ops); flags=seam,
+                    boundary=boundary_by_coordinates(f))
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
+            return filled, Array(fs.work), copy(forest.leaves)
+        end
+        @test !any(isnan, out[2][1]) && !any(isnan, out[2][2])
+        @test out[1][3] == out[2][3]
+        for i in 1:2
+            @test maximum(abs, out[1][i] - out[2][i]) <= 16 * gputol(T)
+        end
+    end
+end

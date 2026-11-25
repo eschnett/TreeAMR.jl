@@ -27,9 +27,12 @@ using TreeAMR: Crossing, OneBrick, Patches, ForestDigest, patch_keywords,
     ringglue = [patch_glue_both((1, 1, 2), (2, 1, 1), (1, 2));
                 patch_glue_both((2, 1, 2), (1, 1, 1), (1, 2))]
     pair = patch_glue_both((1, 1, 2), (2, 1, 1), (1, 2))
-    # The seams are the brick form's, and a wrap is a glue.
-    @test_throws "takes no seam" Forest(ring; N=4, glue=ringglue, rotating=(1, 2))
-    @test_throws "takes no seam" Forest(ring; N=4, glue=ringglue, halfturn=(2, 1))
+    # A turn's plane is the patches' own since M21 (`symmetry_tests.jl`
+    # has its refusals), and a wrap is a glue.
+    @test TreeAMR.patch_turn(Forest(ring; N=4, glue=ringglue, rotating=(1, 2))) ==
+          ((1, 2), false)
+    @test TreeAMR.patch_turn(Forest(ring; N=4, glue=ringglue, halfturn=(2, 1))) ==
+          ((2, 1), true)
     @test_throws "a wrap is a patch glued to its own opposite face" Forest(
         ring; N=4, glue=ringglue, periodic=(true, false))
     @test_throws "a wrap is a patch glued to its own opposite face" Forest(
@@ -328,13 +331,14 @@ end
     end
 end
 
-@testset "Cut at a patch corner, an element set fills as the brick: D=$D" for D in (2, 3)
-    # Cut along two dimensions, every patch has a patch corner. An element
-    # set is filled on faces only and never reaches one, so it must come
-    # back as the brick's; so must a set whose ghost widths leave the corner
-    # region empty. Any other is refused at schedule build, with its reason,
-    # rather than handed to the boundary hook as though the corner were an
-    # outer face.
+@testset "Cut at a patch corner, every set fills as the brick: D=$D" for D in (2, 3)
+    # Cut along two dimensions, every patch has a patch corner, where four
+    # patches meet. The two glues agree there, so the search composes them
+    # (M21) and the corner has one block across it, as the brick has: every
+    # set must come back as the brick's — an element set, filled on faces
+    # only; a set whose ghost widths leave the corner region empty; and
+    # every centering, the corner filled through the composed step, bit for
+    # bit. Before the composition each of the last was refused.
     roots = ntuple(d -> d == 1 ? 4 : 2, D)
     patched, place = brick_cut(roots, ((2,), (1,)))
     @test patched.conn.corners
@@ -353,13 +357,14 @@ end
         @test result !== nothing && result[1] == 0
     end
     for C in allcenterings(Val(D))
-        @test_throws "a patch corner" GhostSchedule(patch_fieldset(patched, C), PATCH_OPS)
+        fsp, fsb = patch_fieldset(patched, C), patch_fieldset(brick, C)
+        for fs in (fsp, fsb)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, PATCH_OPS); boundary=boundary_by_coordinates(f))
+        end
+        result = compare_matching_blocks(fsp, fsb)
+        @test result !== nothing && result[1] == 0
     end
-    # The low side of a vertex-like dimension with no ghosts has no region,
-    # but its high side has the shared plane.
-    vertex = ntuple(d -> d == 1 ? :vertex : :cell, D)
-    @test_throws "a patch corner" GhostSchedule(
-        patch_fieldset(patched, vertex; G=ntuple(d -> Int(d != 1), D)), PATCH_OPS)
 end
 
 @testset "Patches with swapped and reversed axes fill as the brick: $name" for (name, roots,
