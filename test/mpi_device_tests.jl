@@ -104,6 +104,12 @@ numbers(lines, words...) =
             @test messages > 0
             @test staged == (backend != "cpu" && !deviceaware ? messages : 0)
         end
+        # Ghosts interpolated across a glue (M20) crossed ranks, through host
+        # mirrors exactly where the stages' messages went through them.
+        received, sending, staged = only(numbers(filter(startswith("# G2"), out), "G2",
+                                                 "glue"))
+        @test received > 0 && sending > 0
+        @test staged == (backend != "cpu" && !deviceaware ? sending : 0)
         moved(name) = only(numbers(filter(startswith("# M"), out), name, "migrated"))
         @test moved("M4.refine")[1] > 0              # blocks moved up the ranks
         @test moved("M4.coarsen")[2] > 0             # and back down

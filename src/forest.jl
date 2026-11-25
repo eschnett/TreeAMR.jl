@@ -1184,8 +1184,9 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
             "$what was refused on rank(s) $(join(refused, ", ")) of $nranks, and so " *
             "on this one (rank $rank) too: the call is collective, and a rank that " *
             "went on would wait for the others in its first exchange. The reason is " *
-            "in the error on rank $(first(refused)); the arguments evidently differ " *
-            "between ranks, which they must not."))
+            "in the error on rank $(first(refused)): either the arguments differ " *
+            "between ranks, which they must not, or the refusal concerns blocks " *
+            "that rank holds."))
     end
     first_ = digests[1]
     diverged = [r - 1 for r in 2:nranks if !sameforest(digests[r], first_)]
@@ -1209,7 +1210,10 @@ function digest_verdict(digests::Vector{ForestDigest}, what::AbstractString,
         "regrid!, so must the field sets passed, their " *
         "variable counts, `buffer` and `transfer`; for interpolate, the basis, " *
         "`derivs`, `vars` and `exclude`; for locate, the type, the atlas and " *
-        "`outside`; for TreeIOHDF5's save_checkpoint and " *
+        "`outside`; for GhostSchedule of a set interpolated across a glue, the glue " *
+        "order and the atlas, compared by `hash` — an atlas holding an array or " *
+        "mutable state hashes by identity, differently in every process, and needs " *
+        "a `Base.hash` method over its values; for TreeIOHDF5's save_checkpoint and " *
         "load_checkpoint, " *
         "the path and every keyword but `data`, and for write_plain the item's " *
         "name), since a rank computes the data it sends with its own stencils and " *

@@ -207,7 +207,9 @@ thorough one, worth the minutes for anything that touches the exchange,
 the interface restriction or the operators, because it is the only
 place conservation at coarse-fine faces is exercised by a real scheme
 rather than by Burgers in `test/`. The same scratch-copy rule holds for
-it. What each downstream calls is under "Downstream applications" in
+it. `jobs/downstream.toml` runs either suite on one of Symmetry's AMD
+nodes, a study per downstream, from such a copy; its header has the
+steps. What each downstream calls is under "Downstream applications" in
 `CODE.md`.
 
 Companion checks. Before tagging any release, run TreeIOHDF5's suite
@@ -263,6 +265,16 @@ reductions they replace, at TreeGeneralizedHarmonic's analysis sizes by
 default (its quadrant refined about the origin, 22 variables, `32³`,
 vertex-centered); `jobs/fold.toml` runs it, then the suite, on an H200,
 or on the laptop's Metal. `HISTORY.md`'s M15 entry has the numbers.
+
+`bench/coupling/` is M20's prototype of the coupling across a glue,
+on plain arrays and without TreeAMR, standard library only: `torus.jl`,
+two patches on a torus whose map kinks at the glue, and `sphere.jl`, the
+cubed sphere's surface, each with the scripts behind the tables of M20
+in `HISTORY.md` (`*_checks.jl` verify the operators and the fill):
+
+```bash
+julia --startup-file=no -t 12 bench/coupling/sphere_study.jl
+```
 
 `bench/nested.jl` times the ghost fill of the downstream's nested mesh
 (eschnett/TreeGeneralizedHarmonic.jl#11) stage by stage and rank by
@@ -378,6 +390,12 @@ the one that says why.
   explicitly to whatever builds a stencil or a position, and form every
   position through `nodeposition` ("Centerings", *The element
   centering*).
+- **A set interpolated across a glue owns an appendix.** Under `glue =
+  :interpolate` the blocks' glued high face planes follow the cores in
+  the state vector: a new state-layer function must handle them, behind
+  `Base.inferencebarrier`, since the switch is a run-time field. Leaves
+  on a glued face, and those a glue stencil reads, keep their level
+  through `regrid!` ("Finite differences across a glue").
 - **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
   block at a low domain face has its own range start at `G+2` along that
   vertex-like dimension; the trim is part of `GroupKey` ("Centerings").

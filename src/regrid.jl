@@ -729,7 +729,8 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # interpolates.
     bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
     build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
-                                           operators, bounded(key); P=P, regrid=true), D)
+                                           operators, bounded(key); P=P, regrid=true,
+                                           top=key.top[d]), D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -762,6 +763,101 @@ function transfer_groups(::Type{T}, forest::Forest{D}, G::NTuple{D,Int},
                          newrange=1:nnew, nold=nold, nnew=nnew, oldowner=nothing,
                          newowner=nothing)
     return stage.locals
+end
+
+# The regrid of a set interpolated across a glue (M20). Every leaf on a
+# glued face keeps its level, so that the ghosts across a glue are never
+# interpolated across levels and a block's appendix only ever moves with
+# it (CODE.md, "Finite differences across a glue", *No refinement
+# boundary at a glue*).
+
+# Whether any set `regrid!` moves is interpolated across a glue of the
+# forest's patches.
+function glue_guarded(forest::Forest, sets)
+    ispatched(forest) || return false
+    for p in sets
+        x = p.first
+        any(fs -> fs.glue === :interpolate, x isa RotationPair ? (x.a, x.b) : (x,)) &&
+            return true
+    end
+    return false
+end
+
+# The leaves the glue stencils of the sets' schedules read, over every
+# rank: what a regrid must not change, beside the leaves on a glued face,
+# for the schedule to build again.
+function glue_read_leaves(forest::Forest, sets)
+    reads = Int[]
+    for p in sets
+        fs, sched = p.first, p.second
+        fs isa FieldSet && sched isa GhostSchedule && fs.glue === :interpolate || continue
+        append!(reads, sched.glueplan.reads)
+    end
+    isdistributed(forest) && (reads = allgatherv(forest.comm, reads))
+    return sort!(unique!(reads))
+end
+
+# Drop the marks of the leaves on a glued face and of those the glue
+# stencils read, whatever asked for them, the application or the buffer.
+function keep_glued!(marks::Vector{RegridFlag}, forest::Forest{D},
+                     read::Vector{Int}) where {D}
+    conn = forest.conn::Patches{D}
+    for (i, k) in enumerate(forest.leaves)
+        isempty(glued_faces(conn, k)) || (marks[i] = Keep)
+    end
+    foreach(i -> marks[i] = Keep, read)
+    return marks
+end
+
+# Refuse new leaves that change a leaf on a glued face or one the glue
+# stencils read: what 2:1 balance carried there from a refinement nearby.
+function check_glue_kept(forest::Forest{D}, newleaves::Vector{MortonKey{D}},
+                         read::Vector{Int}) where {D}
+    conn = forest.conn::Patches{D}
+    for i in read
+        k = forest.leaves[i]
+        insorted(k, newleaves) && continue
+        throw(ArgumentError(
+            "regrid! would change leaf $k of patch $(patch(forest, k)), which the " *
+            "interpolation across a glue reads (a source block, or a neighbor that fills " *
+            "the ghosts one reads): its own flag was dropped, but 2:1 balance carries a " *
+            "refinement nearby into it. A set interpolated across a glue keeps those " *
+            "blocks at their levels, so that the schedule builds again (CODE.md, " *
+            "\"Finite differences across a glue\"); keep the refinement further from the " *
+            "patches' glued faces"))
+    end
+    for k in forest.leaves
+        faces = glued_faces(conn, k)
+        isempty(faces) && continue
+        insorted(k, newleaves) && continue
+        e, s = first(faces)
+        throw(ArgumentError(
+            "regrid! would refine leaf $k of patch $(patch(forest, k)), which lies on the " *
+            "$(sidename(s)) face of dimension $e, a glued face: its own flag was dropped, " *
+            "but 2:1 balance carries a refinement nearby into it. A set interpolated " *
+            "across a glue keeps every block on a glued face at its level, so that no " *
+            "ghost is interpolated across levels (CODE.md, \"Finite differences across " *
+            "a glue\"); keep the refinement further from the patches' glued faces"))
+    end
+    return nothing
+end
+
+# The transfers of a set with an appendix: a copy into a block that owns
+# high face planes copies them too, under the `top` flag of its key. Any
+# other transfer into such a block is a bug, since the guard above keeps
+# it at its level.
+function appendix_pairs(pairs::TransferPairs{D}, forest::Forest{D},
+                        newleaves::Vector{MortonKey{D}}, c::NTuple{D,Int}) where {D}
+    out = TransferPairs{D}()
+    for (key, (targets, sources)) in pairs, i in eachindex(targets)
+        top = appendix_dims(forest, newleaves[targets[i]], c)
+        any(top) && key.kind !== :copy &&
+            error("a $(key.kind) into a block with an appendix; this is a bug")
+        k2 = GroupKey{D}(key.kind, key.direction, key.offset, key.level, key.mirror,
+                         key.orientation, key.glue, key.low, key.shift, top)
+        push!.(get!(out, k2, (Int32[], Int32[])), (targets[i], sources[i]))
+    end
+    return out
 end
 
 # The argument checks of `regrid!`, run on every rank before anything is
@@ -853,8 +949,8 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, eltype(fs.work),
-                   nameof(typeof(backend)), sched === nothing))
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, fs.glue,
+                   eltype(fs.work), nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
         "schedule was built for a different forest"))
@@ -874,6 +970,9 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
     fs.walls === sched.walls || throw(ArgumentError(
         "the field set has walls = :$(fs.walls) but its schedule was built for " *
         ":$(sched.walls); pair each field set with its own schedule"))
+    fs.glue === sched.glue || throw(ArgumentError(
+        "the field set has glue = :$(fs.glue) but its schedule was built for " *
+        ":$(sched.glue); pair each field set with its own schedule"))
     # What `fill_ghosts!` would refuse further down, refused here,
     # where the refusal is agreed between the ranks.
     eltype(fs.work) == scheduletype(sched) || throw(ArgumentError(
@@ -885,7 +984,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "own schedule"))
     ops = sched.operators
     push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded,
-                   ops.vertex_prolongation))
+                   ops.vertex_prolongation, ops.glue))
     return nothing
 end
 
@@ -962,6 +1061,13 @@ if regrid!(forest, fs => schedule; flags = flags)
 end
 ```
 
+Over a forest of patches, if any set moved is interpolated across a
+glue (`glue = :interpolate`), every block on a glued face keeps its
+level: its flag, or the buffer's, is dropped, and a refinement that 2:1
+balance would carry into it is refused, saying which block, so that no
+refinement boundary reaches a glue. Such a kept block's copy carries
+its appendix. See "Finite differences across a glue" in `CODE.md`.
+
 Set `transfer = false` to rebuild the mesh and storage without moving
 data at all — what the initial-data cycle wants, since it re-evaluates
 the initial data on the new mesh instead (see
@@ -1003,7 +1109,19 @@ function regrid!(forest::Forest{D}, pairs;
     allmarks = distributed ? allgatherv(comm, marks) : marks
 
     oldleaves = copy(forest.leaves)
-    newleaves = completed_leaves(forest, regrid_marks(forest, allmarks, marks, buffer))
+    flagged = regrid_marks(forest, allmarks, marks, buffer)
+    # A set interpolated across a glue (M20) keeps every leaf on a glued
+    # face at its level: their marks are dropped here, and a change that
+    # balance carries into one of them is refused. Replicated, so every
+    # rank decides alike.
+    guarded = ispatched(forest) && Base.inferencebarrier(glue_guarded)(forest, sets)::Bool
+    # So does every leaf the sets' glue stencils read, their sources and
+    # the neighbors that fill the ghosts they read.
+    read = guarded ? Base.inferencebarrier(glue_read_leaves)(forest, sets)::Vector{Int} :
+           Int[]
+    guarded && Base.inferencebarrier(keep_glued!)(flagged, forest, read)
+    newleaves = completed_leaves(forest, flagged)
+    guarded && Base.inferencebarrier(check_glue_kept)(forest, newleaves, read)
     newleaves == oldleaves && return false
 
     # The partitions before and after: this rank's old leaves, which its
@@ -1043,8 +1161,14 @@ function regrid!(forest::Forest{D}, pairs;
             sources === nothing && (sources = regrid_sources(oldleaves, newleaves;
                                                              oldrange=oldrange,
                                                              newrange=newrange))
+            # A block that owns its glued high face planes (M20) carries
+            # them through its copy.
+            setpairs = hasappendix(fs) ?
+                       Base.inferencebarrier(appendix_pairs)(sources, forest, newleaves,
+                                                             staggers(fs))::TransferPairs{D} :
+                       sources
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
-                                 sched.operators, backend, sources; P=fs.P,
+                                 sched.operators, backend, setpairs; P=fs.P,
                                  oldrange=oldrange,
                                  newrange=newrange, nold=nold, nnew=nnew,
                                  oldowner=oldowner, newowner=newowner)
@@ -1132,7 +1256,9 @@ The criterion is given exactly one of two ways:
 
 The schedule is rebuilt from `fs` itself, so it carries that field set's
 ghost width, element type and backend — a device-resident field set
-adapts without anything further.
+adapts without anything further. A set interpolated across a glue (M20)
+needs the application's atlas for its schedules: pass `atlas`, as to
+[`GhostSchedule`](@ref); the first and the third form take it.
 
 Over a forest with a rotating seam (M12) a set whose layout is not
 symmetric in the seam's plane, and that has ghosts there, adapts
@@ -1174,17 +1300,17 @@ without blocks, as all but one do from a single leaf.
 function adapt_to_initial_data!(fs::FieldSet{T,D}, operators::Operators;
                                 initial, flag=nothing, flags=nothing,
                                 buffer::Integer=0, maxpasses::Integer=10,
-                                boundary=nothing) where {T,D}
+                                boundary=nothing, atlas=nothing) where {T,D}
     criterion = adapt_criterion(flag, flags)
     forest = fs.forest
-    schedule = GhostSchedule(fs, operators)
+    schedule = GhostSchedule(fs, operators; atlas=atlas)
     fill_by_coordinates!(initial, fs)
 
     for pass in 1:maxpasses
         fill_ghosts!(fs, schedule; boundary=boundary)
         changed = regrid!(forest, fs => schedule; flags=criterion(fs), buffer=buffer,
                           boundary=boundary, transfer=false)
-        schedule = GhostSchedule(fs, operators)
+        schedule = GhostSchedule(fs, operators; atlas=atlas)
         fill_by_coordinates!(initial, fs)
         changed || return (schedule, pass, true)
     end
@@ -1226,12 +1352,13 @@ end
 # the forest regridded once per pass for all of them.
 function adapt_to_initial_data!(pairs::Tuple{Vararg{Pair}}; initial::Tuple,
                                 flag=nothing, flags=nothing, buffer::Integer=0,
-                                maxpasses::Integer=10, boundary=nothing)
+                                maxpasses::Integer=10, boundary=nothing, atlas=nothing)
     criterion = adapt_criterion(flag, flags)
     entries = adapt_entries(pairs, initial)
     sets = map(e -> e.fs, entries)
     forest = first(sets).forest
-    build() = map(e -> e.ops === nothing ? nothing : GhostSchedule(e.fs, e.ops), entries)
+    build() = map(e -> e.ops === nothing ? nothing :
+                       GhostSchedule(e.fs, e.ops; atlas=atlas), entries)
     refill() = foreach(e -> e.init === nothing || fill_by_coordinates!(e.init, e.fs),
                        entries)
     schedules = build()

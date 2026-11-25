@@ -282,6 +282,18 @@ its state gathers it after the fill. A cell-like dimension has no wall
 plane and is unaffected. See "Shared points and half-open ownership"
 under "Centerings" in `CODE.md`.
 
+`glue` says how the set's ghosts across a glued face of a forest of
+patches are filled (M20). With `glue = :copy`, the default, they are
+copied from the patch across, through the glue's axis map, which is what
+an element set needs and what is right where the patches' maps join
+smoothly. With `glue = :interpolate` they are interpolated in the patch
+across, at the physical point the target's own map names, located through
+an atlas the [`GhostSchedule`](@ref) is given: what a finite-difference
+scheme needs where the maps join with a kink, as a cubed sphere's do.
+Refused for an element set, whose face nodes are its coupling. On a
+brick it changes nothing. See "Finite differences across a glue" in
+`CODE.md`.
+
 `parity` gives each variable its [`Parity`](@ref) under a mirror, and
 is **required** when the forest has a reflecting face (M10): whether a
 variable changes sign in a mirror is physics, which the mesh cannot
@@ -376,6 +388,9 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # `:half_open` or `:symmetric`: whether the fill also writes the
     # owned low wall plane of a vertex-like dimension (AMR-8).
     const walls::Symbol
+    # `:copy` or `:interpolate`: how ghosts across a glued face are
+    # filled (M20).
+    const glue::Symbol
     const parity::Union{Nothing,Vector{NTuple{D,Parity}}}
     # The signed variable map of a rotating seam (M12), as checked by
     # `rotations_of`; `nothing` when none was given.
@@ -405,6 +420,12 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
     work::A
+    # The appendix's layout (M20) over the forest's current leaves, on the
+    # host and on the set's backend, built on first use after each change
+    # of the forest (`appendix_cache`); `nothing` until then and for a set
+    # without an appendix. Untyped, so that a set's type does not say
+    # whether it has one.
+    appendix::Any
 end
 
 # `G` as a sentinel-defaulted keyword rather than a required one, so that
@@ -416,10 +437,11 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D), P=nothing,
                      parity=nothing, rotation=nothing, halfturn=nothing,
-                     walls::Symbol=:half_open,
+                     walls::Symbol=:half_open, glue::Symbol=:copy,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
     check_walls(walls)
+    check_glue(glue)
     G === nothing && throw(ArgumentError(
         "FieldSet has no default ghost width: pass `G` explicitly. It follows " *
         "from what this field set stores and from the operator orders that read " *
@@ -430,6 +452,7 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     centers = centerings(centering, Val(D))
     stored = storedsize(forest.N, ghosts, staggers(centers))
     order = element_order(P, centers, forest.N, ghosts, forest)
+    check_glue_order(glue, order)
     parities = parities_of(parity, forest, Int(nvars))
     rotations = rotations_of(rotation, forest, Int(nvars), ghosts, staggers(centers),
                              parities)
@@ -462,8 +485,8 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # in `zerofill!` below.
     zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, order,
-                                        walls, parities, rotations, halfturns, factors,
-                                        rotvars, work)
+                                        walls, glue, parities, rotations, halfturns, factors,
+                                        rotvars, work, nothing)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
@@ -475,6 +498,22 @@ check_walls(walls::Symbol) =
         "walls must be :half_open (the owned low wall plane of a vertex-like " *
         "dimension is evolved, the high one filled) or :symmetric (both are " *
         "filled at the domain's faces), got :$walls"))
+
+check_glue(glue::Symbol) =
+    glue === :copy || glue === :interpolate || throw(ArgumentError(
+        "glue must be :copy (the ghosts across a glued face are copied from the " *
+        "patch across) or :interpolate (they are interpolated there, at the point " *
+        "the target's own map names), got :$glue"))
+
+# An element set couples across a face through its face nodes, which a
+# copy carries; interpolating them would read across the element's face.
+check_glue_order(glue::Symbol, order::Integer) =
+    glue === :interpolate && order > 0 && throw(ArgumentError(
+        "glue = :interpolate is refused for an element-centered set: its ghosts are " *
+        "the face nodes of the element across, which its scheme couples through, " *
+        "and a copy across the glue carries them exactly. Interpolated ghosts are " *
+        "for cell- and vertex-centered finite-difference sets (CODE.md, \"Finite " *
+        "differences across a glue\")."))
 
 # Validate a user-supplied `parity` into one `NTuple{D,Parity}` per
 # variable — the same shape `ghostwidths` gives `G` — against the faces
@@ -1272,7 +1311,10 @@ a face center, a vertex, an element's Gauss–Lobatto node, whatever this
 field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
 `v` the variable index. The ghosts and the shared boundary plane are
-left untouched: they are filled by the ghost exchange (M2).
+left untouched: they are filled by the ghost exchange (M2). A set
+interpolated across a glue (M20) owns the high face planes of its
+blocks at a glued face of their patch, its appendix, and those are
+filled too.
 
 `f` is called once per point from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
@@ -1318,6 +1360,8 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
                          ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(f, Val(fs.nvars), false, false), fs)
     return fs
 end
 
@@ -1336,6 +1380,8 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(w.f, Val(fs.nvars), true, false), fs)
     return fs
 end
 
@@ -1351,6 +1397,8 @@ function fill_by_coordinates!(w::WithPatch, fs::FieldSet{T,D}) where {T,D}
                          ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(w.f, Val(fs.nvars), false, true), fs)
     return fs
 end
 
@@ -1370,6 +1418,8 @@ function fill_by_coordinates!(w::WithPatch{<:AllVariables}, fs::FieldSet{T,D}) w
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)
+    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
+        AppendixCallback(f, Val(fs.nvars), true, true), fs)
     return fs
 end
 

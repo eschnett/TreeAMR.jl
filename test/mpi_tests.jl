@@ -138,6 +138,7 @@ end
                                                     !startswith(l, "E2") &&
                                                     !startswith(l, "N3") &&
                                                     !startswith(l, "P") &&
+                                                    !startswith(l, "G2") &&
                                                     !startswith(l, "L2"), lines))
     # Located batches on the uniform annulus (M19): some of the 211
     # physical points inside the ring and some outside, some flagged by
@@ -223,6 +224,10 @@ end
         @test all(t -> parse(Int, split(only(filter(startswith("# $t glued received"),
                                                     hashes)))[end]) > 0,
                   ("PR2 cell", "PR2 vertex", "PR2 element", "PS3 element"))
+        # Ghosts interpolated across a glue (M20) were evaluated by the rank
+        # owning their sources and sent to the target's.
+        @test parse(Int, split(only(filter(startswith("# G2 glue received"),
+                                           hashes)))[end]) > 0
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes
         @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes

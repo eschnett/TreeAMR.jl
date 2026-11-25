@@ -29,6 +29,7 @@ milestones were planned in, and the list below is in execution order.
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M18 — KernelAbstractions 0.10](#m18--kernelabstractions-010)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
+  - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
 
 ## Milestones
 
@@ -244,3 +245,198 @@ says it is done:
    horizon agrees with the analytic one at the element order.
 
 *Done when* steps 1–9 pass, and TreeAMR is released with it.
+
+### M20 — TreeMultiPatch, and finite differences on patches
+
+*(Proposed 2026-11-22; its design decisions taken 2026-11-23; the
+TreeAMR side designed in CODE.md, "Finite differences across a glue",
+and implemented in step 4.)*
+TreeWave's scalar wave, a finite-difference scheme, on the patch systems
+TreeWaveOLDG runs, as the simplified version of what
+TreeGeneralizedHarmonic needs. The patch systems move out of
+TreeWaveOLDG into a package of their own, **TreeMultiPatch**, which
+TreeWave and TreeWaveOLDG use now and TreeGeneralizedHarmonic and
+TreeGRRMHD later. Across a glue, TreeWave's ghosts are **interpolated**
+from the patch across rather than copied; why, and the couplings not
+taken, are under M20 in [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
+
+**The split.** TreeAMR keeps what moves data: the forest of patches, the
+glue and the ghost fill across it, interpolated ghosts included, point
+location by `PatchPoint`, and the atlas *interface* (`chart_locate`,
+`chart_map`, `chart_jacobian`, `chart_hessian`), whose design already
+leaves inverting a map to the package that owns the patch system
+("Interpolation on element sets and patches" in
+[CODE.md](CODE.md#interpolation-on-element-sets-and-patches)).
+TreeMultiPatch owns the patch systems, which TreeWaveOLDG's
+`geometry.jl` holds today:
+
+- each layout's roots, glue and forest builder, taking the forest's own
+  keywords (`N`, `comm`, …) rather than a scheme's `P` and `E`, and the
+  check that a forest is that layout;
+- the map to physical space, with its Jacobian, the area vectors
+  `S[d] = √g ∇ξ^d`, `√g`, and the second derivatives, generic in the
+  number type and isbits, so that kernels on a device and the
+  extended-precision tables evaluate them alike, and defined past each
+  patch's box by at least the widest ghost region, since an
+  interpolated ghost's position is the target's map there;
+- the atlas methods, the inverse map included;
+- `affine_patch` and `affine_map`, whether `√g` factorizes along a
+  dimension, and the largest logical speed of light for a time step.
+
+The scheme stays in the application: TreeWaveOLDG's flux coefficients,
+truncation tables, Cartesian gradient set and its rule that only affine
+patches refine, and every application's exact solutions and boundary
+hooks.
+
+Why a package and not TreeAMR: TreeAMR's coordinates stay logical ("A
+multi-patch forest" in [CODE.md](CODE.md#domain-and-boundaries)); the
+maps want ForwardDiff, StaticArrays and MultiFloats, none of which
+TreeAMR needs; and a new layout should not cost a TreeAMR release and
+the TreeIOHDF5 release that follows every one. TreeMultiPatch uses
+TreeAMR's exports only and takes an ordinary `[compat]` range, not exact
+versions as a companion does: needing an internal would mean the thing
+belongs in TreeAMR, exported. TreeAMR's tests keep their own glue lists
+and atlases in `test/helpers/` and do not depend on it.
+
+**Interpolated ghosts.** The TreeAMR side is designed under
+"Finite differences across a glue" in
+[CODE.md](CODE.md#finite-differences-across-a-glue) (proposed); what
+follows is the plan's summary of it. A ghost of a block at a glued
+face, edge or corner sits at the point the target patch's map, extended
+past its box, names. The schedule locates that point once, at build
+time, through the atlas and the search of M19's location step, in
+whichever patch holds it; each fill then evaluates a Lagrange stencil
+there. Between ranks the sender computes (decided): the rank that owns
+the source points applies the stencil and sends the value in the
+schedule's own point-to-point messages, laid out once when the schedule
+is built, as a copy's are. M19's routing, an `allgather` and an
+`alltoallv` on every `interpolate`, is for occasional batches and stays
+out of the fill. So no tree query and no collective enters the
+per-evaluation path, a patch corner has a source like any other ghost,
+and the refusals of a patch corner and of a reversed vertex-like axis
+across a glue do not apply to an interpolated set. The stencil reads
+the patch across's points, its face planes included, and its ghosts
+inside that patch, but not its ghosts across a glue, which are
+interpolated from this one; so the interpolation runs as a stage of its
+own, after phase 1 and the boundary hook and before phase 2. Copying
+stays what an element set does across a glue, since its
+face nodes are its coupling. Decided, and still to settle in step 4:
+
+- **Global components** (decided). TreeAMR interpolates each variable
+  as a scalar. The states hold global tensor components, Cartesian, as
+  TreeGeneralizedHarmonic's do today, so an interpolated value needs no
+  transformation, and TreeWave's `u` and `v` are scalars. Patch-local
+  components would need each interpolated tensor transformed into the
+  target patch's basis by the Jacobians of both maps at the point; that
+  callback is not in M20.
+- **Touching patches, not overlapping.** The patches tile, as M17 built
+  them, sharing only their face planes; overlap is the overset case
+  CODE.md rules out. The price is the off-centered stencil at the
+  patch's edge, which cost no accuracy in step 3b, and the dissipation
+  the patch corners need.
+- **The interpolation order**, a keyword with no default, since what a
+  derivative stencil of order `p` needs from its ghosts is the scheme's
+  to say.
+- **Closed ownership at glued faces** (decided). Every point on a
+  glued face is a degree of freedom of each patch holding it, evolved
+  by each with its own stencil: a block on a patch's high glued face
+  owns its high face plane too, `N + 1` planes along that dimension,
+  and a point on a patch edge or corner is evolved by every patch
+  there. The copies of a point differ by the scheme's error, as on
+  overlapping grids, and nothing averages them. Why, against the
+  alternatives, is under M20 in
+  [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches):
+  half-open ownership, a patch owning its low face planes only, leaves
+  two of the seven-patch ball's eight corner lines to no shell whatever
+  the orientation, and step 3b found them impossible to extrapolate
+  stably. Closed ownership owns them three times over, needs no
+  orientation rule, no averaging and no exchange back to an owner,
+  treats every glued face alike and so keeps the ball's symmetry, and
+  was stable in every test at `ε = 0.5`, the dissipation that the
+  corners where three patches meet need under any coupling. Overlap of
+  one plane or more failed at least one test.
+- **An appendix to the state** (decided). The core stays `N^D` per
+  block per variable ("Shared points and half-open ownership" in
+  [CODE.md](CODE.md#centerings)), and the high face planes that closed
+  ownership adds, on blocks at a patch's high glued face, follow the
+  cores in the state vector as an appendix. A brick has none, so
+  nothing changes for it, and the change is additive. The planes are
+  stored already, as every vertex-like set stores its non-owned high
+  plane; what changes is that they are evolved: `statelength`,
+  `scatter!` and `gather!` carry the appendix; `statearray` stays the
+  cores' array, and `statearray(u, fs; appendix = true)` the whole state;
+  `map_blocks!` on a set with an appendix requires `appendix = true` or
+  `false`, so that the application's right-hand side covers the planes
+  by choice; the fill skips them; the flat device launches, the MPI
+  message layouts and TreeIOHDF5's format learn of them. A fold or norm
+  counts a point once, at the copy of the lowest-numbered patch holding
+  it. A glue's low face plane,
+  owned under half-open ownership already, is unchanged. Closed
+  ownership was rejected for bricks because the copies of a point at a
+  coarse-fine face drift apart ([HISTORY.md](HISTORY.md#centerings));
+  across a kinked glue no copy can be exact anyway, step 3b measured the
+  drift stable, and the next item keeps coarse-fine faces away from it.
+- **No refinement boundary at a glue** (decided, for now). A
+  coarse-fine face, edge or corner never touches a glued face, and a
+  block on a glued face keeps its level through `regrid!`, so that
+  neither the interpolated ghosts nor the appendix meet a level
+  difference, and the appendix is never prolongated or restricted.
+  `GhostSchedule` refuses an interpolated set on a forest that breaks
+  this, and `regrid!` refuses a change that would, each saying why.
+  Lifting it, with interpolation from a leaf at another level and the
+  appendix in the regrid transfers, comes after M20.
+Each step has the test that says it is done:
+
+1. **TreeMultiPatch**, with `PolarAnnulus`, `SevenPatchBall` and
+   `ThirteenPatchBall` moved from TreeWaveOLDG, the balls' shells
+   reoriented with the radial axis outward, so that the outer sphere is
+   every shell's high face and the hook's, and the thirteen-patch ball's
+   atlas declaring its aligned coordinates (`chart_aligned`: the radius
+   between outer shells, both angles between an inner and an outer shell
+   over one face). *Done when* the
+   Jacobian, area vectors and second derivatives agree with
+   ForwardDiff's, past the box too; `Σ_d ∂_d S[d] = 0` holds to rounding
+   on every patch; `chart_locate` inverts `chart_map` at random points,
+   glued faces and patch corners included; every declared alignment
+   holds to rounding at random points past each box; each layout's `√g` integrates
+   to its physical volume; every layout's forest builds and passes its
+   check; and the maps run in a kernel on Metal.
+2. **TreeWaveOLDG on TreeMultiPatch**, its geometry code removed and the
+   scheme's kept. If M19's step 8 is not done by then, its atlases are
+   written in TreeMultiPatch, not TreeWaveOLDG. *Done when* the
+   annulus's, the seven-patch and the thirteen-patch ball's convergence
+   tables and energies are what they were.
+3. **TreeWave on the annulus.** Done 2026-11-24, before step 2, and
+   vertex-centred only (Erik's decision), on TreeWave's branch
+   `eschnett-claude/m20-annulus`: the rotating Bessel mode converges at
+   the operator's order, two. The record is under M20 in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
+3b. **A prototype of the coupling.** Done 2026-11-23, on two tori and the
+   cubed sphere's surface; closed ownership chosen. The record is in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
+4. **TreeAMR: closed ownership and interpolated ghosts across a glue.**
+   Done 2026-11-24, serially, over MPI and on a device, and TreeIOHDF5
+   saves the appendix (its branch `eschnett-claude/m20-appendix`); two
+   criteria restated by Erik. The design is in
+   [CODE.md](CODE.md#finite-differences-across-a-glue); the record and
+   the criteria as met in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
+5. **TreeWave on the seven-patch ball.** Done 2026-11-24, before step 2,
+   on TreeWave's branch `eschnett-claude/m20-annulus` against this
+   checkout: the plane wave converges at second order in L2 and near the
+   glues, the closed ball's energy falls over 33 crossings at `ε = 1/2`,
+   the quadrature gives the volume at second order, and both inversion
+   and the mirror hold to rounding. The record is under M20 in
+   [HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches).
+6. **The releases**: TreeAMR (TreeWave's and TreeHydro's suites against
+   the checkout); TreeIOHDF5 with the new version appended to its
+   `[compat]`; TreeMultiPatch registered; then TreeWaveOLDG and TreeWave.
+
+Not in M20: refinement boundaries at a glue; the transformation of
+patch-local components; per-patch face kinds, for a reflecting or
+outflow outer sphere (the face kinds are per `(dim, side)`, and a cubed
+sphere is glued on every one), which TreeWave's Dirichlet hook does not
+need and the GR codes' outer boundaries will; and
+TreeGeneralizedHarmonic and TreeGRRMHD on patches.
+
+*Done when* steps 1–6 pass.

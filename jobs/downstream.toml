@@ -1,0 +1,33 @@
+# The downstream checks before a release (CLAUDE.md, "Commands"): a
+# downstream package's test suite against this checkout, on one of
+# Symmetry's AMD nodes. The study's project is a scratch copy of the
+# downstream (never the real checkout, whose manifest would keep pointing
+# here), its committed state, with `[sources]` entries in its
+# `Project.toml` and `test/Project.toml` naming this checkout, and for
+# TreeHydro also the TreeIOHDF5 checkout it is to be released with:
+#
+#     git -C ~/src/jl/TreeWave archive HEAD | tar -x -C <copy>
+#     # add  TreeAMR = {path = "<this checkout>"}  under [sources] in both
+#     simlaunch snapshot <copy> --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/downstream.toml
+#     simlaunch submit <study> jobs/downstream.toml --site symmetry
+#
+# One study per downstream, the same spec: TreeWave's suite takes about
+# 1.5 min on the laptop, TreeHydro's about 5.
+name = "downstream"
+threads = 8
+
+[site.symmetry]                     # one AMD node
+time = "1:00:00"
+resources = { nodes = 1 }
+env = "test"                        # the suite's dependencies
+
+# TreeHydro's MPI test launches `mpiexec` inside the allocation: Hydra
+# forks the ranks rather than asking Slurm for a step, one job after the
+# other, and MPICH's shared-memory gather is off, which segfaults in the
+# first collective on the AMD nodes. TreeWave has no MPI test.
+[[run]]
+label = "tests"
+cmd = "test/runtests.jl"
+vars = { TREEHYDRO_TEST_MPI_CONCURRENT = "0", HYDRA_BOOTSTRAP = "fork",
+         MPIR_CVAR_CH4_SHM_POSIX_RELEASE_GATHER_ENABLE = "0" }

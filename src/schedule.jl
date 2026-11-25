@@ -398,7 +398,16 @@ struct GroupKey{D}
     glue::Int8
     low::NTuple{D,Bool}
     shift::NTuple{D,Int8}
+    # Along which dimensions the target owns its high face plane, the
+    # appendix of a set interpolated across a glue (M20): its own range
+    # runs to G+N+1 there, and the region beyond starts at G+N+2.
+    top::NTuple{D,Bool}
 end
+GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
+            mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8, low::NTuple{D,Bool},
+            shift::NTuple{D,Int8}) where {D} =
+    GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, low, shift,
+                ntuple(_ -> false, D))
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -423,7 +432,7 @@ kindrank(kind::Symbol) =
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
     (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
-     k.low, k.shift)
+     k.low, k.shift, k.top)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -648,6 +657,20 @@ two dimensions, never an element set, which is filled on faces only. So
 is one that the axis map does not carry onto itself, or that reverses a
 vertex-like dimension (see `check_glue_layout`).
 
+*Interpolated across a glue* (M20). A set built with `glue =
+:interpolate` takes its ghosts across a glue by Lagrange interpolation
+in the patch across, of the order `Operators(…; glue = k)` gives, at the
+point the target patch's map names: pass the application's atlas,
+`GhostSchedule(fs, operators; atlas)`, which the build calls
+(`chart_map`, `chart_locate`, and `chart_aligned` where it has one) and
+the fill never does. A patch corner is filled like any other ghost, and
+the set owns its glued high face planes, its appendix (see
+[`statearray`](@ref)). Over a distributed forest the ranks compare the
+atlas by `hash`, as the rest of the layout: an atlas holding an array or
+mutable state hashes by identity, differently in every process, and
+needs a `Base.hash` method of its own over its values. See "Finite
+differences across a glue" in `CODE.md`.
+
 *Element sets.* An element-centered set ([`elementcentered`](@ref),
 M16), whose schedule is built with the [`ElementLocal`](@ref) family, is
 filled on **faces only**: the one ghost plane across each face of a
@@ -664,7 +687,7 @@ and `phase2` and `levels` are empty.
 A schedule is tied to the forest's leaf array as it was when built. It
 must be rebuilt after any refinement, coarsening, or regridding.
 
-    GhostSchedule(fs::FieldSet, operators::Operators)
+    GhostSchedule(fs::FieldSet, operators::Operators; atlas = nothing)
 
 `operators` is required: interpolation order follows from the
 application's discretization, so there is no order the mesh could
@@ -706,6 +729,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     centering::NTuple{D,Symbol}                  # centering it was built for
     P::Int                                       # element order it was built for (M16)
     walls::Symbol                                # walls it was built for (AMR-8)
+    glue::Symbol                                 # glue mode it was built for (M20)
     operators::Operators
     backend::BK
     phase1::Vector{GRP}
@@ -716,17 +740,19 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     stages::Vector{ST}                           # phase 1, then phase 2 by level
     stagegroups::Vector{UnitRange{Int}}          # runs of `stages` that run together
     grouplocals::Vector{Vector{GRP}}             # each run's local groups, in stage order
+    glueplan::GluePlan{T,D}                      # the ghosts interpolated across a glue
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
-        forest, generation, G, centering, P, walls, operators, backend, phase1, phase2,
-        levels, boundaries, boundaryplan, stages, stagegroups) where {T,D,R,BK,GRP,BP,ST}
-        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls,
+        forest, generation, G, centering, P, walls, glue, operators, backend, phase1,
+        phase2, levels, boundaries, boundaryplan, stages, stagegroups,
+        glueplan) where {T,D,R,BK,GRP,BP,ST}
+        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls, glue,
                                        operators,
                                        backend, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
-                                       group_locals(stages, stagegroups))
+                                       group_locals(stages, stagegroups), glueplan)
     end
 end
 
@@ -809,8 +835,16 @@ end
 # (`G+2 : G+N` under 2), its halves meeting between `G+1+N/2` and
 # `G+2+N/2`, and the high region `G+N+2 : N+2G+c` (`G+N+1 : …` under 2).
 function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
-                      closed::Bool=false; low::Bool=false, shift::Integer=0)
+                      closed::Bool=false; low::Bool=false, shift::Integer=0,
+                      top::Bool=false)
     shift != 0 && return shifted_range(N, G, c, δd, od, halved, shift == 1)
+    if top
+        # The appendix (M20): the block owns its high face plane G+N+1.
+        (c == 1 && !halved) || error("an appendix plane asked for with stagger $c " *
+                                     "and halved = $halved; this is a bug")
+        δd == 1 && return (G + N + 2):(N + 2G + c)
+        δd == 0 && return (G + 1 + low):(G + N + 1)
+    end
     δd == 1 && return (G + N + 1):(N + 2G + c)
     δd == -1 && return 1:(G + low)
     top = closed ? c : 0                            # the shared plane, to the top half
@@ -835,8 +869,8 @@ end
 # neighbor's first *owned* point G+1 — which is the same point. So a copy
 # still reads interiors only, which is what makes phase 1 race free.
 function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int;
-                      low::Bool=false, shift::Integer=0) where {T}
-    rng = target_range(N, G, c, δd, 0, false; low=low, shift=shift)
+                      low::Bool=false, shift::Integer=0, top::Bool=false) where {T}
+    rng = target_range(N, G, c, δd, 0, false; low=low, shift=shift, top=top)
     srcstart = Int32[j - N * δd for j in rng]
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
@@ -1037,7 +1071,10 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
 # building a cell or vertex set's schedule does not compile them.
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
                       P::Integer, regrid::Bool=false, low::Bool=false,
-                      shift::Integer=0) where {T}
+                      shift::Integer=0, top::Bool=false) where {T}
+    # A block owns its high face plane only next to a glue, where every
+    # transfer is a same-level copy (M20).
+    top && kind !== :copy && error("an appendix plane asked for in a $kind; this is a bug")
     if P > 0
         c == 0 && !low && shift == 0 || error(
             "an element stencil asked for with stagger $c, low = $low, shift = " *
@@ -1047,7 +1084,7 @@ function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
         return Base.inferencebarrier(element_stencil)(T, N, G, kind, δd, od, Int(P),
                                                       regrid)::S
     end
-    kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift)
+    kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift, top=top)
     kind === :restrict &&
         return restriction_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
     return prolongation_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
@@ -1055,9 +1092,9 @@ end
 
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators,
                       mode::Int8; P::Integer, regrid::Bool=false, low::Bool=false,
-                      shift::Integer=0) where {T}
+                      shift::Integer=0, top::Bool=false) where {T}
     s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid, low=low,
-                     shift=shift)
+                     shift=shift, top=top)
     mode == BOUNDED_POINTVALUE || return s
     return stack_linear(s, kind_stencil(T, N, G, c, kind, δd, od, LINEAR_OPERATORS;
                                         P=P, regrid=regrid, low=low, shift=shift))
@@ -1294,23 +1331,29 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
-                        b::Int, dirs, symmetric::Bool=false) where {D}
+                        b::Int, dirs, symmetric::Bool=false;
+                        interpolated::Bool=false,
+                        glueregions::Vector{GlueRegion{D}}=GlueRegion{D}[]) where {D}
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
     walls = lowwalls(forest, k, c, symmetric)
+    # The high face planes this block owns (M20).
+    tops = interpolated ? appendix_dims(forest, k, c) : ntuple(_ -> false, D)
     for δ in dirs
         # Where this block's low wall plane is written (AMR-8), along every
         # dimension that does not step up.
         low = ntuple(d -> walls[d] && δ[d] != 1, D)
+        top = ntuple(d -> tops[d] && δ[d] != -1, D)
         shift = seam_shift(forest, k, c, δ, symmetric)
         record!(kind, offset, lvl, s, via::Crossing) =
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
-                                           via.turns, via.glue, low, shift),
+                                           via.turns, via.glue, low, shift, top),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false;
-                                                           low=low[d], shift=shift[d]),
+                                                           low=low[d], shift=shift[d],
+                                                           top=top[d]),
                                          D))
         # A cell-centered dimension with `G_d = 0` has no low slab and no
         # high one, so every direction that leaves the block along it has
@@ -1319,6 +1362,12 @@ function block_sources!(pairs::TransferPairs{D},
         # cannot empty it, so testing the unhalved region covers every
         # kind.)
         isempty(region) && continue
+        # Across a glue of a set interpolated there (M20): located through
+        # the atlas once the search is done, not searched for here.
+        if interpolated && interpolated_region(forest.conn, k, δ)
+            push!(glueregions, (b, δ, region))
+            continue
+        end
         δ′, faces = wall_direction(forest, k, δ)
         if any(!=(OuterFace), faces)
             mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, faces, region, low,
@@ -2101,14 +2150,15 @@ function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple
     return nothing
 end
 
-GhostSchedule(fs::FieldSet{T,D}, operators::Operators) where {T,D} =
+GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
-                  walls=fs.walls, T=T, backend=get_backend(fs.work))
+                  walls=fs.walls, glue=fs.glue, atlas=atlas, T=T,
+                  backend=get_backend(fs.work))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
                        centering=cellcentered(D), P::Integer=0,
-                       walls::Symbol=:half_open,
+                       walls::Symbol=:half_open, glue::Symbol=:copy, atlas=nothing,
                        T::Type=R, backend::Backend=CPU()) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
@@ -2122,17 +2172,30 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # `0` is the forest form's "no elements", as `FieldSet` stores it.
         order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
         check_operators(N, gs, cs, order, operators)
-        # What a forest of patches (M17) cannot fill: a region beyond a
-        # patch corner, which an element set's faces-only filter below
-        # never asks for, and a layout the glue's axis map does not keep.
-        check_patch_corners(forest.conn, N, gs, ss, order)
-        check_glue_layout(forest.conn, gs, cs, ss)
+        check_glue(glue)
+        check_glue_order(glue, order)
+        if glue === :interpolate && ispatched(forest)
+            # Interpolated across its glue (M20): a patch corner has a
+            # source like any other ghost, and the source is read in its
+            # own patch's frame, so neither refusal below applies.
+            # Behind a barrier, as everything only such a set runs.
+            Base.inferencebarrier(check_glue_interpolation)(forest, N, gs, ss, operators,
+                                                            atlas)
+            Base.inferencebarrier(check_glue_levels)(forest, blockrange(forest))
+        else
+            # What a forest of patches (M17) cannot fill: a region beyond a
+            # patch corner, which an element set's faces-only filter below
+            # never asks for, and a layout the glue's axis map does not keep.
+            check_patch_corners(forest.conn, N, gs, ss, order)
+            check_glue_layout(forest.conn, gs, cs, ss)
+        end
         check_floattype(T, backend)
         check_walls(walls)
         layout = layouthash(gs, cs, order, walls, Int(operators.family),
                             operators.prolongation,
                             operators.restriction, operators.bounded,
-                            operators.vertex_prolongation, T,
+                            operators.vertex_prolongation, glue, operators.glue,
+                            glue === :interpolate ? hash(atlas) : UInt(0), T,
                             nameof(typeof(backend)))
         return (gs, cs, ss, order), layout
     end
@@ -2162,10 +2225,13 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     chunks = threadchunks(nb)
     perpairs = [TransferPairs{D}() for _ in chunks]
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
+    interpolated = glue === :interpolate && ispatched(forest)
+    perglue = [GlueRegion{D}[] for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
             block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
-                           offset + b, dirs, symmetric)
+                           offset + b, dirs, symmetric;
+                           interpolated=interpolated, glueregions=perglue[c])
         end
     end
 
@@ -2179,14 +2245,25 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         merge_pairs!(pairs, perpairs[c])
         append!(boundaries, perboundaries[c])
     end
+    # Every rank builds it, regions or not: over a distributed forest the
+    # build is collective (M20).
+    glueplan = interpolated ?
+               Base.inferencebarrier(glue_plan)(T, forest,
+                                                reduce(vcat, perglue; init=GlueRegion{D}[]),
+                                                ghosts, stags, operators, atlas, owned,
+                                                backend)::GluePlan{T,D} : GluePlan{T,D}()
     # Over a distributed forest (M7) the transfers split three ways: the
     # local ones stay in `pairs`, in local block indices; those with a
     # remote source are received; and those this rank computes for a
     # remote target are sent, found by the target owner's own search.
     received = split_received!(pairs, owned, nleaves(forest))
     boundaries = localize_boundaries(boundaries, owned)
+    # A remote target's regions across a glue are its own rank's to
+    # locate, and its owned high face planes (M20) shape what it is sent,
+    # so the search for it runs in the same mode as its owner's.
     sent = sent_transfers(forest, owned) do into, j
-        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs, symmetric)
+        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs, symmetric;
+                       interpolated=interpolated, glueregions=GlueRegion{D}[])
     end
 
     # One dimension of a group's stencils. Along a wall dimension of a
@@ -2209,7 +2286,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # where the block's low wall is written.
         δs = state == 0 ? δd : 0
         s = kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
-                         P=order, low=state == 0 && low, shift=state == 0 ? shift : 0)
+                         P=order, low=state == 0 && low, shift=state == 0 ? shift : 0,
+                         top=state == 0 && key.top[d])
         state == 0 && return s
         state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd; low=low)
         return mirror_rows(s, N, ghosts[d], stags[d], δd)
@@ -2256,8 +2334,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
-        forest, generation(forest), ghosts, centers, order, walls, operators, backend,
-        phase1, phase2, levels, boundaries, bplan, stages, groups)
+        forest, generation(forest), ghosts, centers, order, walls, glue, operators,
+        backend, phase1, phase2, levels, boundaries, bplan, stages, groups, glueplan)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

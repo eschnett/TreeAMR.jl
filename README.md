@@ -31,7 +31,9 @@ M16's element centering), and M17's multi-patch forests are
 implemented and accepted downstream, pending their release; M19's
 point interpolation on element sets and forests of patches, through an
 application's atlas, is implemented, pending TreeWaveOLDG's
-acceptance. M7 is measured on a
+acceptance; M20's ghosts interpolated across a glue, for finite
+differences on a cubed sphere, are implemented, pending TreeWave's
+use. M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the

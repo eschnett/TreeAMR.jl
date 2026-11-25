@@ -1111,3 +1111,88 @@ end
     @test all(l2[i] > l2[i + 1] for i in 1:(length(l2) - 1))
     @test convergence_rate(Float64.(hs), Float64.(l2)) ≈ 2.0 atol = 0.15
 end
+
+# A right-hand side through the whole state (M20), written through
+# `statearray(…; appendix = true)` at every point of the closed range, the
+# planes a block does not own discarded.
+@kernel function glue_index!(du, ::Val{D}, ::Val{NV}) where {D,NV}
+    I = @index(Global, NTuple)
+    J = ntuple(d -> I[d], Val(D))
+    b = I[D + 1]
+    @inbounds for v in 1:NV
+        isowned(du, J..., v, b) && (du[J..., v, b] = v * sum(J) + 100b)
+    end
+end
+
+# A polynomial of degree five in each logical coordinate, different in
+# each patch, in the element type of the position.
+gpu_glue_poly(ξ::NTuple{2}, p) =
+    (u = ξ ./ 2; one(u[1]) / 2 + p * u[1]^5 + 2u[1]^3 * u[2]^4 - (p + 1) * u[2]^5 +
+                 u[1] * u[2])
+gpu_glue_poly(ξ::NTuple{3}, p) =
+    (u = ξ ./ 2; one(u[1]) / 2 + p * u[1]^5 + 2u[1]^3 * u[2]^4 * u[3]^2 -
+                 (p + 1) * u[3]^5 + u[1] * u[2] * u[3] + u[2]^5 / 3)
+
+@testset "$bname: ghosts across a glue and the appendix run on the device: T=$T, D=$D" for
+        (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
+    # M20. The glue plan's tables travel to the device at the build and
+    # its kernels run there; the appendix's tables are cached per set on
+    # its backend; an `AppendixArray` goes into a kernel. So the state
+    # round-trips through `scatter!` and `gather!` bit for bit, the fill
+    # leaves nothing unwritten and lands on the CPU's numbers, a fold over
+    # the state vector or the working array counts each glued face point
+    # once, a right-hand side written through the whole state reaches the
+    # appendix, and in 2D a regrid carries the appendix, all as on the CPU.
+    make() = D == 2 ? kinked_forest(2) : ball_forest(seven_ball(2, 1))
+    atlas = D == 2 ? KINKED : seven_ball(2, 1)
+    ops = D == 2 ? KINKED_OPS : BALL_OPS
+    hook = D == 2 ? nothing : CellBoundary(WithPatch((x, p, v, δ) -> v * gpu_glue_poly(x, p)))
+    out = map((CPU(), backend)) do bk
+        forest = make()
+        fs = FieldSet{T}(forest, 2; G=3, centering=vertexcentered(D), glue=:interpolate,
+                         backend=bk)
+        host = FieldSet{T}(make(), 2; G=3, centering=vertexcentered(D), glue=:interpolate)
+        fill_from_owned!(host, GhostSchedule(host, ops; atlas=atlas), gpu_glue_poly;
+                         boundary=hook)
+        uh = statevector(host)
+        gather!(uh, host)
+        u = statevector(fs)
+        copyto!(u, uh)
+        fill!(fs.work, T(NaN))
+        scatter!(fs, u)
+        back = statevector(fs)
+        gather!(back, fs)
+        sched = GhostSchedule(fs, ops; atlas=atlas)
+        fill_ghosts!(fs, sched; boundary=hook)
+        count1(acc, p) = acc + 1
+        folds = (mesh_fold(count1, +, 0, fs), mesh_fold(count1, +, 0, fs, u),
+                 mesh_mapreduce(x -> 1, +, 0, fs, u))
+        du = statevector(fs)
+        fill!(du, T(NaN))
+        map_blocks!(glue_index!, fs, statearray(du, fs; appendix=true), Val(D), Val(2);
+                    appendix=true)
+        regridded = nothing
+        if D == 2
+            rs = FieldSet{T}(kinked_forest(4), 2; G=3, centering=vertexcentered(D),
+                             glue=:interpolate, backend=bk)
+            ru = statevector(rs)
+            copyto!(ru, T.(1:statelength(rs)) ./ T(statelength(rs)))
+            scatter!(rs, ru)
+            regrid!(rs.forest, rs => GhostSchedule(rs, ops; atlas=atlas);
+                    flags=fill(Refine, nblocks(rs)))
+            rv = statevector(rs)
+            gather!(rv, rs)
+            regridded = Array(rv)
+        end
+        return (Array(back) == uh, Array(fs.work), folds, Array(du), Array(u), regridded)
+    end
+    (okh, wh, fh, duh, uh, rh), (okd, wd, fd, dud, ud, rd) = out
+    @test okh && okd
+    @test isnan.(wd) == isnan.(wh)
+    good = .!isnan.(wh)
+    @test maximum(abs, wd[good] - wh[good]) < gputol(T) * maximum(abs, wh[good])
+    @test fd == fh
+    @test fh[1] == fh[2] && fh[3] == 2 * fh[1]
+    @test !any(isnan, duh) && dud == duh
+    D == 2 && @test rd == rh
+end

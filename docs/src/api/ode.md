@@ -9,6 +9,7 @@ staterange
 statevector
 stateview
 statearray
+isowned
 scatter!
 gather!
 map_blocks!

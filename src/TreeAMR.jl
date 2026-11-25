@@ -12,6 +12,7 @@ module TreeAMR
 using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize,
                           Backend, CPU, allocate, supports_float64
 import KernelAbstractions
+import Adapt
 using Base.MultiplicativeInverses: SignedMultiplicativeInverse
 
 # Tree core (M1)
@@ -37,7 +38,7 @@ export Operators, OperatorFamily, PointValue, Conservative, ElementLocal,
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
-       block_mapreduce, mesh_mapreduce, volume_weighted_norm
+       block_mapreduce, mesh_mapreduce, volume_weighted_norm, isowned
 
 # Several field sets in one state vector (for TreeGRRMHD)
 export staterange, stateview
@@ -87,6 +88,7 @@ include("geometry.jl")
 include("elements.jl")
 include("storage.jl")
 include("operators.jl")
+include("glue.jl")
 include("schedule.jl")
 include("ghosts.jl")
 include("interfaces.jl")

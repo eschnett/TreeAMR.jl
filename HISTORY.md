@@ -62,6 +62,7 @@ of them. Each milestone's steps are listed in its record under
   - [M16 — Element centering](#m16--element-centering)
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
+  - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -4799,6 +4800,536 @@ M12 was decided with Erik, after M7 and before M9b.
     72.5 s, the difference being the new `L2` case (2.7 s of it the new
     locate, evaluation, chain-rule and lattice kernels).
 
+### M20 — TreeMultiPatch, and finite differences on patches
+
+- **M20 — TreeMultiPatch, and finite differences on patches.** *(Planned
+  with Erik on 2026-11-22 and 2026-11-23, designed on 2026-11-23, step 4
+  implemented on 2026-11-23 and 2026-11-24.)* The plan is in
+  [PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches).
+
+  - *Where the patch systems live (2026-11-22).* Erik asked whether the
+    multi-patch systems, then in TreeWaveOLDG, should become part of
+    TreeAMR or a package of their own, with TreeWave, TreeGeneralizedHarmonic
+    and TreeGRRMHD to use them. A package of their own, TreeMultiPatch,
+    was proposed: TreeAMR's coordinates stay logical, the maps need
+    ForwardDiff, StaticArrays and MultiFloats, and a new layout should not
+    cost a TreeAMR release and the TreeIOHDF5 release that follows it.
+  - *The coupling across a glue (2026-11-23).* Copying ghosts, which
+    TreeAMR does, is consistent only where the maps join smoothly. On a
+    cubed sphere `∂x/∂ξ` jumps at every glue, so a finite-difference
+    stencil that reads across one differentiates a function with a kink
+    in its own coordinate (argued, not yet measured; M20 step 4 measures
+    it). Erik listed the ways to couple patches: fluxes, as TreeHydro and
+    TreeWaveOLDG do; characteristics, awkward for the second-order
+    generalized harmonic equations; and interpolation, whose form
+    depends on whether the state holds global or patch-local tensor
+    components. He chose interpolation as the best option for
+    TreeGeneralizedHarmonic and TreeWave, its simplified version, with
+    switching TreeGeneralizedHarmonic to OLDG as the alternative. Two
+    candidates weighed before that were set aside with it: summation by
+    parts with penalties, which would have needed an exchange of each
+    side's own copy of the shared face plane, and copied ghosts with the
+    patch-corner and reversed-axis refusals lifted, which leaves the
+    kink.
+  - *Global components (2026-11-23).* The states hold global tensor
+    components, Cartesian, as TreeGeneralizedHarmonic's already do, so
+    TreeAMR interpolates every variable as a scalar. Erik chose this
+    over patch-local components, which would have needed a per-set
+    callback transforming each interpolated tensor by the Jacobians of
+    both maps.
+  - *Symmetry at glued faces (2026-11-23).* Erik raised the asymmetry
+    of half-open ownership in the central cube, and asked whether
+    orienting the patches could make the seven-patch ball symmetric. It
+    cannot: a coordinate reflection reverses every axis of the cube and
+    both tangential axes of every shell, and so swaps each one's owned
+    low face plane with its unowned high one, whatever the orientation.
+    As TreeWaveOLDG builds the ball, all patches aligned with the global
+    axes, the cube evolves its three low face planes and the shells its
+    three high ones, the shell-shell glues are high-to-high (no owner),
+    low-to-low (two) or mixed, and the outer sphere is evolved on three
+    shells and the hook's on the other three. Erik suggested filling the
+    owned low plane as a ghost during the inter-patch exchange, as
+    symmetric walls (AMR-8) do at a domain face; that is the proposal in
+    the plan, with the shells reoriented as mirror images, radial axis
+    outward, for the outer sphere.
+  - *One owner per face point (2026-11-23).* Erik decided that every
+    face point is owned by one patch, and that extrapolating a face
+    point, which writing both copies by the fill would have needed, is
+    not worth its cost or risk. He expected the cube's faces to work out
+    and asked what the best is between the shells: a rotational sense
+    for the equatorial ring with a north-south difference, "as symmetric
+    as possible", or averaging. Counting low faces settled it. The
+    shells own all six cube faces (radial axis outward). Each ring of
+    four shells around an axis has four low faces for four glues, so
+    every glue has exactly one low side and each ring a rotational
+    sense, all three rings and not only the equator; an enumeration of
+    the shells' tangential orientations finds exactly 8 that work. Each
+    leaves two antipodal corner lines of the eight owned by no shell,
+    since each shell has one corner with both lateral faces low. With
+    the same sense about each axis the pattern is symmetric under point
+    inversion and the 120° rotations about one body diagonal. Averaging
+    two evolved copies is not available under half-open ownership;
+    averaging the right-hand sides is, and was proposed. The two
+    unowned corner lines were left to Erik: extrapolation along them,
+    or closed ownership at glued faces.
+  - *Overlap points, and the prototype (2026-11-23).* Erik raised that
+    ghost stencils restricted to the owned points of the patch across
+    must be lop-sided or of lower order, and proposed a few overlap
+    points, owned by both patches past each glue, which would also
+    give the two corner lines owners. Step 3b's prototype, scripts on
+    plain arrays outside both suites (`bench/coupling/`, `torus.jl` and
+    the `torus_*.jl` that drive it), measured the couplings before any
+    TreeAMR change. *Setup:* a 2D torus of two patches, periodic along
+    `ζ`, glued at both normal faces, with `n` cells of logical spacing
+    `1/n` on each axis. Patch 1 is affine, `x = −1 + ξ`. Patch 2 is
+    `x = 0.8η + 0.4η²`, `y = ζ + 0.3η(1 − η)`, so the spacing jumps from
+    1 to 0.8 at one glue and to 1.6 at the other, and the grid lines meet
+    at an angle. The scheme is TreeGeneralizedHarmonic's: vertex-centered,
+    second-order form, `Δu = g^{ab}∂_a∂_b u + (Δξ^b)∂_b u` with
+    fourth-order centered stencils, mixed derivatives as products of
+    first ones, sixth-order Kreiss–Oliger dissipation `(ε/h)`, RK4 at
+    CFL 0.25 on the largest logical speed, `G = 3`, and 6-point Lagrange
+    ghosts per dimension unless noted. Checks: the Laplacian of exact
+    data converges at 4 on the kinked torus, the interpolated ghosts at
+    6, and on a torus without a kink every coupling gives the same
+    errors to the printed digits.
+
+    *Convergence*, a plane wave `(2, 1)` to `t = 2`, `ε = 0`, L2 error at
+    `n = 16, 32, 64, 128`:
+
+    | Coupling | n = 16 | 32 | 64 | 128 | Rates |
+    |---|---|---|---|---|---|
+    | copied ghosts | 1.30e−1 | 1.25e−1 | 1.23e−1 | 1.23e−1 | 0.06 0.02 0.00 |
+    | half-open | 2.27e−3 | 1.48e−4 | 9.53e−6 | 6.06e−7 | 3.94 3.95 3.98 |
+    | half-open, averaged | 2.39e−3 | 1.53e−4 | 9.70e−6 | 6.11e−7 | 3.97 3.98 3.99 |
+    | overlap `o = 0` | 2.51e−3 | 1.56e−4 | 9.92e−6 | 1.96e−5 | 4.01 3.97 −0.98 |
+    | overlap `o = 1` | 2.61e−3 | 1.59e−4 | 9.88e−6 | 6.17e−7 | 4.04 4.01 4.00 |
+    | overlap `o = 2` | 2.21e−3 | 1.62e−4 | 9.95e−6 | 6.19e−7 | 3.77 4.03 4.01 |
+    | overlap `o = 3` | 2.46e−3 | 1.66e−4 | 1.00e−5 | 6.20e−7 | 3.88 4.05 4.01 |
+
+    The L∞ error within four points of a glue converges at 4.0–4.1 for
+    every coupling but the copy and `o = 0`. Copied ghosts do not
+    converge at all, which confirms the argument about the kink. The
+    lop-sided stencils of half-open ownership cost nothing measurable in
+    accuracy against centered ones. `o = 0` was already growing at
+    `n = 128`.
+
+    *Stability*, random data of amplitude 10⁻³, energy
+    `Σ √g (v² + g^{ab}D_a u D_b u)` to `t = 200` (about 90 crossings),
+    as `E/E₀` at the end or the time it passed 10³:
+
+    | Coupling | n | ε = 0.02 | 0.05 | 0.1 | 0.2 | 0.4 |
+    |---|---|---|---|---|---|---|
+    | half-open | 32 | t = 55 | 1.4e−2 | 5.0e−3 | 3.0e−3 | 1.9e−3 |
+    | half-open | 64 | 3.1e2 | 3.8e−3 | 2.3e−3 | 1.4e−3 | 8.8e−4 |
+    | half-open, averaged | 32 | t = 30 | 9.4e−3 | 5.0e−3 | 3.0e−3 | 1.9e−3 |
+    | half-open, averaged | 64 | 5.4e−2 | 3.7e−3 | 2.3e−3 | 1.4e−3 | 8.7e−4 |
+    | half-open, 4-point | 32 | t = 140 | 9.9 | 8.1e−2 | 1.1e−2 | 3.2e−3 |
+    | half-open, 4-point | 64 | 1.5e2 | 6.4e−2 | 5.1e−3 | 2.1e−3 | 1.1e−3 |
+    | overlap `o = 1` | 32 | t = 40 | t = 60 | t = 108 | t = 140 | 4.8e2 |
+    | overlap `o = 1` | 64 | t = 30 | t = 62 | t = 136 | 2.0e1 | 9.2e−4 |
+    | overlap `o = 2` | 32 | t = 20 | t = 44 | t = 62 | t = 123 | 3.9e−3 |
+    | overlap `o = 2` | 64 | t = 16 | t = 34 | 1.3e2 | 2.4e−1 | 7.6e−3 |
+    | overlap `o = 2`, 4-point | 32 | t = 22 | t = 54 | t = 81 | 3.5e2 | 2.7e−3 |
+    | overlap `o = 2`, 4-point | 64 | t = 21 | t = 65 | 3.6 | 1.2e−2 | 2.1e−3 |
+
+    At `ε = 0.1`, `o = 0` blew up by `t = 12` and `o = 3` by `t = 94`;
+    copied ghosts blew up by `t = 29` at either `ε`. Restricting an
+    overlap's donors to the core of the patch across, never its overlap
+    points, changed neither its errors nor its stability (`o = 2` and
+    `o = 3`, blow-up by `t = 100` and `t = 196` at `ε = 0.2`). *Controls:*
+    without dissipation every coupling blows up, and so does the scheme
+    on a smoothly curved torus with no kink at all
+    (`x = σ + 0.2 sin πσ`, `y = ζ + 0.3 sin πσ`), by `t = 4`; at
+    `ε = 0.1` that torus and a flat one are stable under both
+    couplings. So `ε = 0` measures the scheme, not the coupling.
+
+    *What it says.* Half-open ownership with lop-sided 6-point ghosts
+    is the most stable coupling measured, from `ε = 0.05`, and averaging
+    the right-hand sides on the face planes changes neither accuracy nor
+    stability, so the symmetry it buys is free here. Overlap points are
+    not more stable but less: every width needs about `ε = 0.4`, eight
+    times as much, apparently because two independently evolved copies
+    of a point have a difference mode that only dissipation damps. The
+    measurement covers one 2D configuration of a linear scalar wave,
+    with no patch corner, no refinement and no 3D; it is evidence, not
+    proof.
+  - *More tests: a harsher torus and the cubed sphere (2026-11-23).*
+    Erik asked for more before choosing. *The torus, harder*: a second
+    map, `x = 0.6η + 0.9η²`, `y = ζ + 0.6η(1 − η)`, whose spacing jumps
+    from 1 to 0.6 and to 2.4; CFL 0.4; `n = 128`; and `t = 1000`.
+    Half-open ownership converges at 3.96–4.02 on the harsh map, as
+    overlap does, and stays stable in every case from `ε = 0.05`, except
+    the harsh map at `n = 32`, which needs `ε = 0.1`. Overlap `o = 2`
+    with 6-point ghosts blows up in every case below `ε = 0.2`, and on the
+    harsh map at `ε = 0.2` too. With 4-point ghosts, `o = 2` blows up on
+    the harsh map at `n = 32` even at `ε = 1` (by `t = 139`). Closed
+    ownership, `o = 0`, is stable on both maps from `ε = 0.5` with 6-point
+    ghosts and from `ε = 0.2` with 4-point ones.
+
+    *The cubed sphere* (`bench/coupling/sphere.jl` and the
+    `sphere_*.jl` that drive it): the surface of the unit sphere as six
+    gnomonic patches, the shells' tangential structure in the seven-patch ball,
+    with three patches at every corner and no outer boundary. The
+    Laplace–Beltrami operator, in each patch
+    `r²[(1+A²)u_AA + 2AB u_AB + (1+B²)u_BB + 2A u_A + 2B u_B]`, with the
+    same stencils, dissipation (`ε` over the logical spacing, as
+    TreeGeneralizedHarmonic scales it) and time stepping. The shells'
+    orientations are those of one owner per edge, all three rings
+    turning the same way: an enumeration finds 8, two per diagonal of
+    unowned corners. Checks: the Laplacian of exact data converges at
+    4, the interpolated ghosts at about 6.5, the face-plane copies are
+    exact, and the corner extrapolation converges at about 8. Exact
+    solution: a rotating harmonic of degree 3, `ω = √12`.
+
+    | Coupling (6-point ghosts unless noted) | L2 at t = 2, n = 16, 32, 64 (ε = 0.5) | ε = 0.1 | 0.2 | 0.5 | 1.0 |
+    |---|---|---|---|---|---|
+    | half-open, unowned corners extrapolated along their edges (3 points) | 4.3e−2 5.3e−3 6.5e−4 | t = 2 | t = 4 | t = 62 | t = 29 |
+    | half-open, every corner owned (hypothetical) | 1.5e−3 9.2e−5 5.6e−6 | t = 2 | t = 4 | 2.4e−3 | 1.5e−3 |
+    | the same, 4-point ghosts | 1.6e−3 1.1e−4 1.2e−5 | t = 3 | t = 10 | 2.4e−3 | 1.5e−3 |
+    | the same, averaged right-hand sides | 1.6e−3 9.2e−5 5.6e−6 | t = 2 | t = 5 | 2.4e−3 | 1.5e−3 |
+    | overlap `o = 0` | 1.5e−3 9.1e−5 5.6e−6 | t = 2 | t = 5 | 2.4e−3 | 1.5e−3 |
+    | overlap `o = 1` | 1.5e−3 9.2e−5 5.7e−6 | t = 7 | t = 8 | t = 18 | 1.4e−3 |
+    | overlap `o = 2` | 1.5e−3 9.2e−5 5.7e−6 | t = 11 | t = 39 | 1.8e2 | 1.5e−3 |
+    | overlap `o = 3` | 1.5e−3 9.1e−5 5.7e−6 | t = 7 | t = 10 | 1.2e2 | 4.8e−2 |
+    | overlap `o = 2`, 4-point ghosts | 1.2e−3 6.7e−5 4.0e−6 | t = 83 | 7.2e−3 | 2.4e−3 | 1.5e−3 |
+
+    The last four columns are random data at `n = 32` to `t = 100`,
+    final `E/E₀` or the blow-up time. Extrapolating the two unowned
+    corners is unstable at every order tried: 6, 4, 3 and 2 points, at
+    every `ε` up to 1. With 6 points it blows up by `t = 1` whatever `ε`.
+    The growth sits at the corner, whose value its own neighbours'
+    stencils feed back through extrapolation weights as large as 20.
+    Owning the corners, which TreeAMR's layout cannot (a hypothetical
+    here), removes that; what remains is a slower instability at the
+    owned corners, where three patches meet, which `ε = 0.5` damps and
+    a smaller CFL does not (a spatial instability). At `n = 64` to
+    `t = 50`, every coupling with owned corners is stable at `ε = 0.5`,
+    and at `ε = 0.2` only `o = 2` with 4-point ghosts is. The
+    asymmetry of data symmetric under inversion and under `x → −x`, at
+    `n = 32`, `ε = 0.5`: inversion stays exact in every variant, as the
+    ownership pattern predicts. The mirror asymmetry at `t = 50` is
+    3e−5 for half-open with owned corners and grows with time, 4e−7
+    with averaged right-hand sides, 1e−7 for `o = 0`, and 5e−6 for
+    `o = 2` with 4-point ghosts. *(Corrected the same day: these compare
+    a point with the owner of its image, and under closed ownership a
+    face point's image may be the other copy, which differs by the
+    scheme's error. Compared strictly inside the faces
+    (`bench/coupling/sphere_symmetry.jl`, `t = 10`), `o = 0` is
+    symmetric to 1.4e−15, while half-open ownership with owned corners
+    stays at 6.0e−6, and 1.1e−7 with averaged right-hand sides. So
+    closed ownership is mirror-symmetric to rounding, and no stencil
+    choice at a node was to blame, as the design had guessed.)*
+
+    *What it says.* Half-open ownership as TreeAMR's layout has it is
+    ruled out for vertex-centered finite differences on a cubed sphere:
+    the two unowned corner lines cannot be extrapolated stably. Some
+    layout change is needed either way. Two couplings survive every
+    test at `ε = 0.5`, within TreeGeneralizedHarmonic's range (it runs
+    near holes at `ε ≈ 0.5`). One is closed ownership, `o = 0`, which is
+    symmetric by construction. The other is half-open ownership with
+    averaged right-hand sides plus an owner for the corner lines alone,
+    which needs only `ε = 0.05` on the torus. Overlap of one or more
+    planes, at either stencil width, fails at least one test. The
+    corners, not the coupling, set the dissipation.
+  - *Closed ownership (2026-11-23).* Erik chose closed ownership, every
+    glued face point evolved by each patch holding it, over half-open
+    ownership with averaged right-hand sides and owned corner lines. It
+    replaces his earlier decision that each face point have one owner,
+    which the unowned corner lines made impossible without a layout
+    change anyway. With it go the shells' orientation rule, the rings'
+    rotational sense, the averaging and the exchange back to an owner;
+    the shells keep their radial axis outward, for the outer sphere.
+  - *The remaining decisions (2026-11-23).* Asked whether the plan had
+    every major decision, three were open, and Erik settled them. The
+    planes closed ownership adds are an appendix to the state vector,
+    after the `N^D` cores, rather than blocks of `N + 1` planes, so that
+    `statearray` and every brick stay as they are; Erik took this for
+    the way symmetry boundaries already work, which they do not quite:
+    symmetric walls (AMR-8) keep the layout and have the fill write an
+    owned plane, and no part of TreeAMR has a state appendix yet.
+    Interpolated ghosts cross ranks by the sender computing, in the
+    schedule's own point-to-point messages, since M19's routing is
+    collective on every call. And refinement boundaries stay away from
+    the glues for now, so that neither the ghosts nor the appendix meet
+    a level difference.
+  - *Aligned coordinates (2026-11-23).* Erik required that the
+    interpolation between the thirteen-patch ball's outer shells, whose
+    radial coordinate is the radius, be guaranteed two-dimensional, and
+    asked whether a check within rounding, a check after the patch
+    system is set up, or an explicit declaration should do it. He chose
+    the declaration, verified: the atlas names the aligned
+    coordinates per pair of patches (`chart_aligned`), the schedule
+    build checks every ghost against it to a thousandth of a spacing,
+    and the aligned coordinate is then taken exactly, so the stencil
+    there has width one. Rounding to a nearby node alone would depend on
+    the accuracy of the atlas's inverse map, and would also round ghosts
+    that are near a node only by coincidence. The same declaration makes
+    the interpolation across the middle sphere one-dimensional, since
+    the inner and outer shells over one cube face share both angles.
+  - *Step 4, the first slice (2026-11-23).* The keywords (`glue` on
+    `FieldSet`, `glue` on `Operators`, `atlas` on `GhostSchedule`), the
+    refusals at schedule build, the location with `chart_aligned`, and the
+    interpolated stage, serially and on the CPU, under half-open
+    ownership, in `src/glue.jl`. Two things changed from the design. The
+    alignment declaration became one flag per dimension of `q`, "a node
+    of `p` lands on a node of `q`", rather than the dimension of `p`
+    whose coordinate equals `q`'s: the annulus's angle is shifted by a
+    patch's length across each glue, not equal, and the flag form covers
+    it, the thirteen-patch ball's radius and angles alike. And the
+    accessor of the whole state became `statearray(u, fs; appendix =
+    true)`, since `stateview` names a set's segment of a several-set
+    state already. Implementing it showed that an atlas may give a ghost
+    on a shared face to either patch, its own included, where under
+    half-open ownership that plane is a ghost filled by the same stage;
+    such a point is carried across the glue by the glue's own map, to
+    the patch that owns the plane, until closed ownership owns it on
+    both sides. Measured on the kinked torus (`test/glue_tests.jl`): the
+    ghosts of a smooth function converge at 6 with 6-point stencils
+    (0.19, 3.5e−3, 5.7e−5 at 1, 2 and 4 roots per patch side), a patch's
+    polynomial of degree 5 is reproduced to rounding, and on the
+    annulus, declared aligned, the interpolated ghosts are the copied
+    ones bit for bit.
+  - *Step 4, the appendix (2026-11-23).* Closed ownership: a block at a
+    glued high face of its patch owns that face plane, which follows the
+    cores in the state vector; `GroupKey` carries a per-dimension `top`
+    flag, the mirror of symmetric walls' `low`, so that a block's own
+    range and every copy across a tangential face run to `G+N+1` there,
+    and the region beyond starts at `G+N+2`. With the plane owned the
+    interpolation reads it, so the window includes every vertex-like
+    high plane, and the half-open slice's carrying of a point across the
+    glue (`owned_side`) and its refusal of a plane glued high to high
+    went. The last cell below a glued high face is no longer
+    extrapolated: on the kinked torus the ghosts of the smooth function
+    now come out 1.0e−2, 1.3e−4, 2.2e−6 and 3.5e−8 at 1, 2, 4 and 8 roots
+    per patch side, rates 6.3, 5.9 and 5.9, against 0.19, 3.5e−3 and
+    5.7e−5 under half-open ownership.
+  - *Step 4, folds and the regrid guard (2026-11-24).* Folds,
+    reductions and norms visit the appendix and count each glued
+    face point once, at the copy with the lowest patch and position.
+    TreeMultiPatch's step 1 made it necessary sooner than planned: its
+    balls glue the cube's three low faces to the low faces of their
+    shells, where both cores hold the face points. The decision is one
+    bit per piece of a block, its glued low plane, its appendix plane
+    or neither along each dimension, since every point of a piece lies
+    on the same glued faces; a self-glue that splits a piece, which no
+    layout has, is refused. On the kinked torus a fold counts
+    `2(nN)²` points, as many as the torus has, and patch 1 holds
+    `(nN + 1) nN` of them; on two patches glued low to low it counts
+    `nN` fewer than the cores hold, and high to high `nN` more. A norm's
+    volume counts the same points, so a constant is its own norm. The
+    `regrid!` guard drops the marks of every leaf on a glued face, after
+    the buffer, and refuses what balance carries into one; a kept
+    block's copy carries its appendix under the `top` flag, which the
+    regrid test found missing at first (a kept block's appendix came
+    back zero).
+  - *Step 4, the balls (2026-11-24).* The seven- and thirteen-patch
+    balls, TreeMultiPatch's layouts copied into `test/helpers/ball.jl`,
+    in `test/glue_ball_tests.jl`. At two roots per cube side and `N = 8`
+    (44 928 interpolated ghosts on the seven-patch ball, 94 824 on the
+    thirteen-patch one) a patch's polynomial of degree 5 comes back to
+    `2e-14` at every ghost; a fold counts the distinct nodes, each once;
+    and the ghosts of data with the cube's symmetries keep them to
+    `1.6e-14` against an interpolation error of `5.5e-4`. A window
+    shifted one point off center leaves the polynomial exact and breaks
+    the symmetry, which is why the test is there. At one root per side
+    the build refuses: the cube's corner ghosts lie past the sphere, in
+    no patch, which `CODE.md` now states as a bound on the cube's
+    resolution, and which also corrected its claim that such a ghost is
+    the hook's.
+  - *Step 4, MPI (2026-11-24).* The sender computes, as designed, with
+    one change: the target's rank builds and checks every stencil before
+    the `alltoallv`, so that every refusal is agreed on before a rank
+    could wait in it, and the owner rebuilds the stencils of what it
+    receives with the same function. The glue round waits for its own
+    sends rather than handing them to the fill's last wait. Writing it
+    found that the phase-1 transfers a rank sends for another rank's
+    block were searched without the appendix's `top` flag, so the two
+    ends of a message disagreed on its layout as soon as a block owning
+    a glued high face plane had a remote neighbor; serially nothing
+    showed it. Over simulated ranks (2, 3 and 5) the kinked torus and
+    the seven-patch ball fill bit for bit as serially, with no
+    collective call in the fill; reverting the `top` fix fails the test,
+    and so does swapping two variables' slots in a message. Through MPI
+    at three ranks `test/mpi_workload.jl`'s `G2` matches the serial run
+    line for line, 1299 ghosts received across ranks.
+  - *Step 4, the device path (2026-11-24).* The glue plan's tables are
+    uploaded at the build and its message buffers live on the device,
+    staged through host mirrors as the stages' are; the appendix's
+    layout is cached per field set on its backend; and an
+    `AppendixArray` enters a kernel through `Adapt`, now a direct
+    dependency (it was already loaded by KernelAbstractions). On Metal,
+    Float32, `test/gpu_tests.jl` passes, the kinked torus and the
+    seven-patch ball against the CPU, and `test/mpi_device_tests.jl`
+    at 2 and 3 ranks with the glue's messages staged. The compile-time
+    check against `main` (`--trace-compile-timing` of `main`'s
+    `test/mpi_workload.jl`, Apple M3 Pro) found the branch at 69–72 s
+    against 62–65 s; by commit, from 61.0 s at the design to 62.7 s
+    after the first slice, 64.5 s after the appendix, 74.0 s after the
+    folds and 70.2 s after MPI. Most of it was every set compiling the
+    appendix's paths: `statearray` returned a union, so every kernel
+    taking it compiled twice, and `scatter!`, `gather!`, the fold masks,
+    the glue plan and `regrid!`'s guard were inferred for every set.
+    Behind barriers it came to 65–68 s, about 5 % over `main`, which
+    the `top` flag of `GroupKey` and laptop noise account for as far
+    as this machine can tell; a quieter measurement belongs on Symmetry.
+  - *Step 4, the review (2026-11-24).* A review of the design and the
+    code by a separate agent (`multipatch-review.md`) confirmed every
+    decision, Erik's and the implementer's, six of them with changes, and
+    found bugs the tests had missed, each reproduced before it was
+    fixed. `AppendixArray`'s accessors were not inlined and allocated on
+    the CPU (a fold over a state vector 71 ns and 148 B an entry, now
+    9 ns and none). `fill_by_coordinates!` left the appendix at zero, and
+    `adapt_to_initial_data!` could not pass an atlas. The overhang rule
+    did not count the high plane of a vertex-like dimension, so a stencil
+    reaching it next to a coarser neighbor read a ghost that phase 2
+    prolongates after the glue's stage, a fill behind (53 of 318 ghosts
+    on a stretched pair); it also refused a finer neighbor, whose ghosts
+    phase 1 restricts, so that `regrid!` could accept a mesh the schedule
+    then refused. The rule now counts the plane, accepts the same level
+    or finer, and `regrid!` keeps every leaf the stencils read. The
+    fold's copies followed a glue that turns the axes onto a dimension
+    of another centering, where the set has no point (496 of 512 counted
+    for cell×vertex). And the kernel looped over all `K^D` taps: as
+    nested loops over the widths, by owner on the CPU, it is 5.1× faster
+    at full width (545 → 106 ns per ghost and variable) and 13× and 70×
+    at 36 and 6 taps.
+  - *Step 4, the derivatives across a glue (2026-11-24).* PLAN.md's
+    criterion, measured in `test/glue_tests.jl` on the kinked pair (the
+    torus's two patches glued at one face, the hook outside, since a set
+    copying across the torus's glue meets its patch corners): the
+    fourth-order centered first and second derivatives at every core
+    point, along both dimensions, against the function's own. With
+    interpolated ghosts (`k = 6`) both converge at 4, the points next to
+    the glue included: the largest errors at 1, 2, 4 and 8 roots per side
+    fall at rates 3.84, 3.94 and 3.97 (first) and 4.35, 3.99 and 3.98
+    (second), to 4.0e−5 and 9.7e−5 at 8 roots. With copied ghosts the
+    first derivative's largest error stays 0.46, 0.38, 0.37, 0.37 and its
+    L2 error falls at 1/2, the kink's width; the second's largest error
+    grows as 1/h (6.3, 13.6, 27.4, 55.1) and its L2 error as h^(−1/2).
+  - *Step 4, the review's pre-release items (2026-11-24).* The stale
+    lines (the section's "not implemented", the entry's "not designed",
+    the state length) and an M20 rule in both rule lists; `isowned`,
+    exported, which a right-hand side asks of the `AppendixArray` to skip
+    the planes a block does not own (on a device too); the `appendix`
+    keyword of the multi-set `statearray`; the docstring saying that
+    `appendix = false` leaves `du`'s appendix as it was. Tests of every
+    centering, cell, vertex and both mixed, at orders 2, 4 and 6. The
+    plan's build: `hasmethod` asked once, the weights written in place,
+    what a stencil reads beyond its source checked once per source and
+    direction, and the location and the stencils threaded over chunks of
+    regions: on the seven-patch ball (44 928 ghosts) 4.97 µs and 5.4 kB a
+    ghost before, at any thread count, 3.83 µs and 2.8 kB at one thread
+    and 1.28 µs at four after (Apple M3 Pro). Reusing located ghosts
+    across regrids was left: at these costs a ball of 8 roots per side at
+    `N = 32` (about 5 million ghosts) builds in about a second per
+    schedule on Symmetry's 64 threads, if it scales. Of the review's
+    suspicions, the largest order on a vertex set, `k = 2(G + 1)`, with
+    ghosts landing on nodes at block boundaries, builds and fills (S4,
+    not reproduced); an atlas hashing by identity and a fill without the
+    hook are documented, in `GhostSchedule`'s and `fill_ghosts!`'s
+    docstrings and the refusal's message (S1, S3).
+  - *Step 4, two criteria restated (2026-11-24, Erik).* "A fold of a
+    constant gives the domain's volume" on the seven-patch ball became
+    "a fold counts each physical point once and sums a function of the
+    position over exactly the distinct points", which the tests check:
+    TreeAMR's fold sees logical positions, and a physical volume needs
+    the atlas's Jacobian and weights that split each shared face point
+    between its patches — a quadrature, the scheme's, so the volume moved
+    to step 5, the energy on the ball. "`--trace-compile-timing` no worse
+    than on `main`" became a cost measured and recorded: about 5 % on the
+    laptop (65–68 s against 62–65 s for `main`'s workload), after the
+    barriers of the device step, the rest attributed to `GroupKey`'s
+    `top` flag on every set's build path and to noise; accepted, as the
+    element sets' 2 % and the stage groups' cost were.
+  - *Step 4, the checkpoint (2026-11-24).* TreeIOHDF5 saves the appendix
+    as a dataset of its own in each part, beside the cores, with a
+    checksum per block — Erik's choice over closed `(N+1)^D` blocks
+    padded where a block does not own a plane, which would have reused
+    TreeIOHDF5's per-block streaming at 9.7–42 % more storage for such
+    sets in 3D (TreeIOHDF5's `HISTORY.md`, "M20: the appendix"). The
+    companion interface gained `hasappendix`, `corelength` and
+    `appendix_entries`, the last new, and the field `glue` of a
+    `FieldSet`.
+  - *Step 4, done (2026-11-24).* PLAN.md's criteria, as restated, and
+    where each is met:
+    - on the annulus, interpolated ghosts are the copied ones bit for
+      bit (`glue_tests.jl`);
+    - on the kinked pair, a smooth solution's fourth-order first and
+      second derivatives converge at 4 with interpolated ghosts and do
+      not with copied ones, the numbers above (`glue_tests.jl`);
+    - on the seven-patch ball, a patch's polynomial of the
+      interpolation's degree comes back to `2e-14` at every ghost,
+      faces, cube edges and patch corners included (`glue_ball_tests.jl`);
+    - on the seven-patch ball, the state holds each glued face point
+      once for each patch holding it, round-trips through `scatter!` and
+      `gather!`, a fold counts each physical point once and sums a
+      function of the position over exactly the distinct points, the
+      fill of symmetric data is symmetric to `1.6e-14`
+      (`glue_ball_tests.jl`), and a checkpoint round-trips byte for byte
+      (TreeIOHDF5's `checkpoint_tests.jl`, on its branch);
+    - on the thirteen-patch ball, the stencils have width one along the
+      shared coordinates, and a wrong declaration is refused
+      (`glue_ball_tests.jl`);
+    - on a brick nothing changed (the suite), and a refinement boundary
+      at a glue is refused by `GhostSchedule` and by `regrid!`
+      (`glue_tests.jl`);
+    - `fill_ghosts!` makes no collective call and at 3 ranks the ghosts
+      arrive in point-to-point messages from the sources' owners
+      (`glue_exchange_tests.jl`, `mpi_workload.jl`'s `G2`, 1299 ghosts);
+    - serially, at 1 and 3 ranks and on a device (Metal, `gpu_tests.jl`
+      and `mpi_device_workload.jl`'s `G2`), with the compile-time cost
+      measured and recorded, about 5 %.
+  - *Step 3, the annulus (2026-11-24).* Step 2, TreeWaveOLDG on
+    TreeMultiPatch, was set aside for the moment, since another session
+    was changing TreeWaveOLDG; step 3 went first. Erik decided that
+    TreeWave on patches is vertex-centred only: its cell-centred
+    derivatives, kept on the flat box as a comparison, are not carried
+    over. TreeWave (branch `eschnett-claude/m20-annulus`) writes the
+    Laplacian in conservative form through TreeMultiPatch's metric,
+    `(1/√g) ∂_a (A^{ab} ∂_b u)` with `A^{ab} = S[a] ⋅ S[b]/√g`, second
+    order, the cross terms included, and fills the metric at every
+    stored point from the maps rather than exchanging it, since the maps
+    are defined past each box. With the registered TreeAMR 0.2.10 and
+    copied ghosts, the rotating Bessel mode converges at second order on
+    the annulus: L2 rates 2.04 (`m = 1`) and 1.95 (`m = 3, n = 2`), L∞
+    1.99 and 1.94, over `N = 8, 16, 32`; the Laplacian alone converges at
+    2.0 on the annulus and, with its cross terms, at 1.8–2.0 on the
+    seven-patch ball. TreeWave's `CODE.md`, "Patches", has the scheme and
+    the numbers.
+  - *Step 5, the seven-patch ball (2026-11-24).* Also ahead of step 2,
+    on the same TreeWave branch, with this checkout through `[sources]`.
+    The ball's state is interpolated across every glue (`G = 2`, 4-point
+    ghosts, `glue = 4`), its right-hand side covers the appendix through
+    `map_blocks!(…; appendix = true)` and `isowned`, with fourth-order
+    Kreiss–Oliger dissipation `ε/(16h) δ⁴`, and the plane wave
+    `sin(k ⋅ x − |k|t + φ)` is its own Dirichlet data through a hook that
+    follows the time. The criteria, measured (`Lc = 1`, `R1 = 3`, one
+    root a patch, `cfl = 1/4`):
+    - the L2 error and the L∞ error within two spacings of a glue
+      converge at the operator's order, two: without dissipation L2
+      rates 2.02 and 2.01 and near the glues 2.21 and 2.16 over
+      `N = 8, 16, 32`; at `ε = 1/2` the errors fall by 5.2–6.0 a
+      doubling to `N = 64`, the dissipation's `O(εh³)` above the
+      scheme's error at these sizes;
+    - the closed ball's energy (random data, `u = v = 0` beyond the
+      sphere) falls at every sample to `t = 200`, about 33 crossings,
+      at `ε = 1/2` and `N = 8, 16`; it does at `ε = 0.2` and `0.1` too
+      (to `t = 100`), and grows by 1.3e27 by `t = 50` at `ε = 0`. So
+      the second-order scheme needs less dissipation than the
+      prototype's fourth-order one did;
+    - the energy and the volume come from each patch's trapezoidal rule
+      in its logical coordinates, a shared face point split between its
+      patches: the volume converges at 2.00 (−6.0e−3 to −9.4e−5 relative
+      over `N = 8 … 64`);
+    - a solution and its image under point inversion evolve into each
+      other's images to 6.0e−16 (`N = 16`, `t = 10`, values to 0.41);
+    - the mirror `x₁ → −x₁`, measured: 7.4e−16, rounding too, which
+      confirms the prototype's corrected finding that closed ownership
+      is mirror-symmetric.
+    TreeWave's `CODE.md`, "The seven-patch ball", has the scheme and the
+    numbers.
+
 ## Downstream checks
 
 **TreeWave.** The `[sources]` pins to `main` went when 0.1.1 was
@@ -4813,7 +5344,10 @@ nothing either, 310 tests in 1m17 against the M12 checkout (2026-10-03).
 M16 changed nothing for it: 349 tests in 1m41 against the M16 checkout
 (2026-10-31). Nor did M17: 349 tests in 3m19 against the M17 checkout
 (777a3b4, 2026-11-03), on Symmetry (job 588617, cn080, EPYC 7532), where
-the suite runs slower than on the laptop.
+the suite runs slower than on the laptop. Nor did M20's step 4, the
+appendix and interpolated ghosts across a glue: 349 tests in 2m47 at 8
+threads against the M20 checkout (4fcba03, 2026-11-24), on Symmetry (job
+610628, cn110, EPYC 7543), the first run of `jobs/downstream.toml`.
 
 **TreeHydro.** It is **implemented, not a sketch**: sixteen files in
 `src/`, fourteen test files, two viewers in `bin/`, its own CI and
@@ -4840,7 +5374,11 @@ checkout, at one thread (2026-10-02); nor did M12 (0.1.7), 12447 tests in
 5m28 against the M16 checkout (2026-10-31); nor did M17, 12679 tests in
 13m42 against the M17 checkout (777a3b4, 2026-11-03) on Symmetry (job
 588624, cn082, EPYC 7532), with TreeIOHDF5 taken from its M17 branch
-(787c3a9), since no registered TreeIOHDF5 accepts TreeAMR 0.2.7. Its own MPI port
+(787c3a9), since no registered TreeIOHDF5 accepts TreeAMR 0.2.7; nor
+did M20's step 4, 12713 tests in 11m28 at 8 threads against the M20
+checkout (4fcba03, 2026-11-24) on Symmetry (job 610629, cn103, EPYC
+7543, `jobs/downstream.toml`), with TreeIOHDF5 from its M20 branch
+(1a36b15), which saves the appendix. Its own MPI port
 (2026-10-02) found the one TreeAMR bug so far on a rank without blocks —
 the `AllVariables` boundary hook's length check, of which it is the only
 caller — so it needs TreeAMR 0.1.6, which has the fix.
