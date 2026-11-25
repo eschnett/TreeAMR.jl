@@ -896,9 +896,11 @@ declared up front:
     re-expressed as glue entries: the connectivity is a second mechanism
     beside them that reuses the same pieces, and a forest of patches
     takes no seam. **(open)** Whether the seams collapse into the glue
-    table, now that both exist, is Erik's call; their own rules — the
-    shifted seam slab, `RotationPair`, a vertex-like set's two owned seam
-    planes — do not fall out of the table as built.
+    table, now that both exist, is Erik's call, to be settled in M21's
+    design ([PLAN.md](PLAN.md#m21--symmetries-on-patches)), which puts
+    turns into glue entries on patches; their own rules — the shifted
+    seam slab, `RotationPair`, a vertex-like set's two owned seam planes
+    — do not fall out of the table as built.
 
   The forest refuses, each time saying why:
 
