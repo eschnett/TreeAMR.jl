@@ -22,11 +22,33 @@ its atlas; [`locate`](@ref) calls it for every point.
 It folds the domain's global topology itself, wrapping an angle or
 choosing which of a ball's patches a point is in, and returns a `ξ` in
 patch `p`'s closed box: a `ξ` outside it, but for one past a reflecting
-face, is refused as a broken contract, naming the atlas. On a brick,
+face, or past a symmetry's mirror face or turned glue of a patch (M21),
+is refused as a broken contract, naming the atlas.
+
+On a forest with a symmetry of its own patches the atlas may instead
+fold a point itself, returning `(ξ, p, (mirrors, turn))`: the position
+of the point's image, and the symmetry that carries the image back to
+the point — `mirrors` an `NTuple{D,Bool}` by mirror label, `turn` the
+quarter turns of the forest's turn. TreeAMR then applies that symmetry's
+variable map, sign and derivative transform, as for a fold of its own.
+An atlas returns one shape for every point, `(0, (false, …))` where it
+folds nothing, so that a kernel sees one type. On a brick,
 `p` is 1 and the brick's own folds apply to `ξ` as to a position. Inverting
 the map is the atlas's: TreeAMR offers no Newton iteration.
 """
 function chart_locate end
+
+# The symmetry an atlas reports with a located point (M21), as a fold's
+# mask of mirror labels and turns: none for `(ξ, p)`.
+@inline located_symmetry(c::Tuple{Any,Any}) = 0, 0
+@inline function located_symmetry(c::Tuple{Any,Any,Any})
+    mirrors, turn = c[3]
+    mask = 0
+    for k in 1:length(mirrors)
+        mirrors[k] && (mask |= 1 << (k - 1))
+    end
+    return mask, Int(turn)
+end
 
 """
     TreeAMR.chart_map(atlas, ξ, p) -> x

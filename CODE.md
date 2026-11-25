@@ -4138,8 +4138,23 @@ and reading the source's symmetry ghosts:
   and offset into the patch across. The fold is exact, since both maps
   are signed permutations of logical coordinates, and it collects the
   symmetry that carried the point: a mirror mask over labels and a turn
-  `r`. No new atlas method is needed, and no physical meaning of the
-  labels enters TreeAMR.
+  `r`.
+- *Or the atlas folds the point itself.* A point in the wedge of a
+  patch the reduction removed — on the octant, `x < 0` with `|x|` the
+  largest component, the `−x` shell's — lies past no kept patch's cut
+  within reach of that patch's map, so no logical fold reaches it. So
+  `chart_locate` may instead return `(ξ, p, (mirrors, turn))`: the
+  position of the point's image in a kept patch, and the symmetry that
+  carries the image back, its mirrors by label and its quarter turns.
+  TreeAMR composes it with any fold of its own — mirrors by label,
+  turns adding — and applies the result as for its own
+  (`located_symmetry`). TreeAMR trusts the atlas's encoding of the labels
+  and the turn; TreeMultiPatch's tests hold it against the full ball. An
+  atlas returns one shape for every point, so that a kernel sees one
+  type; it may report a symmetry on a forest with a symmetry of its own
+  patches, and `interpolate!` refuses a report elsewhere as a broken
+  contract. Erik chose this over leaving such points outside, since
+  extraction spheres at large radius put points in every direction.
 - *A ghost carries its symmetry.* The glue plan gains a column per
   ghost, the factor and `rotvars` column of the symmetry its fold
   collected, 0 for a ghost not folded. A ghost's value is the stencil's
@@ -4153,7 +4168,8 @@ and reading the source's symmetry ghosts:
   reflecting face or a turned entry when its source is a same-level
   block, as it accepts one inside the patch.
 
-`interpolate!` folds the same way on patches. On a forest with a
+`interpolate!` folds the same way on patches, an atlas's own fold
+included. On a forest with a
 symmetry of its own patches (`symmetric_patches`: a turn, or a patch's
 own face kinds) a located point past its patch's box is folded through a
 per-patch table (`patch_table`'s `FaceFold`s, plain bits for the

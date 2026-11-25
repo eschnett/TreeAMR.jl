@@ -1624,8 +1624,10 @@ end
 # then located in the patch it lands in; `miss` is the leaf a point past
 # its patch's box that does not come back in is marked with.
 @inline function locate_folded!(leaf, ys, codes, inside, leaves, g::PointGeometry{D,T},
-                                table, x, p, miss, j) where {D,T}
+                                table, x, p, miss, j, m0::Int=0, t0::Int=0) where {D,T}
     y, q, mask, turn, ok = patch_fold(table, x, p)
+    # Composed with a fold the atlas reported (M21).
+    mask, turn = mask ⊻ m0, (turn + t0) % 4
     gq, _, _, _ = point_geometry(g, table, PatchPoint{D,T}(y, q))
     _, _, _, inbox = fold_point(gq, y)
     ok &= inbox
@@ -1659,8 +1661,19 @@ end
     gp, ξ, p, known = point_geometry(g, table, pp)
     ξs[j] = ξ
     patch[j] = p % Int32
+    m0, t0 = located_symmetry(c)
     if g.patched && known && table !== nothing
-        locate_folded!(leaf, ys, codes, inside, leaves, g, table, ξ, p, Int32(-2), j)
+        locate_folded!(leaf, ys, codes, inside, leaves, g, table, ξ, p, Int32(-2), j, m0,
+                       t0)
+        return nothing
+    end
+    # A symmetry reported where the forest has none of its patches' own is
+    # a broken contract.
+    if m0 != 0 || t0 != 0
+        ys[j] = ξ
+        codes[j] = 0x00
+        inside[j] = false
+        leaf[j] = Int32(-2)
         return nothing
     end
     y, fold, r, ok = fold_point(gp, ξ)

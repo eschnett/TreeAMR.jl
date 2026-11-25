@@ -509,3 +509,36 @@ end
     q = interpolate(ff, xs, ElementPolynomial(); derivs=derivs)
     @test maximum(abs, p.values - q.values) < 1e-10 * maximum(abs, q.values)
 end
+
+@testset "An atlas may fold a point itself, reporting the symmetry: $sym" for
+        sym in (:ownmirror, :half)
+    # Erik's widening of the atlas contract: rather than a position past the
+    # plane, the atlas returns the image's position and the symmetry that
+    # carries it back, which TreeAMR applies as a fold of its own — so a
+    # point in a part of the domain no kept patch reaches past its cut, as
+    # a removed shell's wedge, folds too. The interpolated ghosts and the
+    # interpolation through it must be the full strip's, as through the
+    # atlas that returns positions past the plane.
+    folding = FoldingStrip(STRIP, sym === :half)
+    fsr, _ = strip_set(strip_forest(sym), sym, vertexcentered(2); atlas=folding)
+    fsf, _ = strip_set(strip_forest(:full), sym, vertexcentered(2); full=true)
+    worst, _ = strip_difference(fsr, fsf)
+    @test worst < 1e-12
+    function element_strip(forest, full)
+        nv = length(strip_data(Val(sym), (0.0, 0.0)))
+        fs = FieldSet(forest, nv; G=1, centering=elementcentered(2), P=3,
+                      (full ? (;) : strip_keywords(Val(sym)))...)
+        fill_by_coordinates!(WithPatch((ξ, p, v) ->
+                                           strip_data(Val(sym),
+                                                      TreeAMR.chart_map(STRIP, ξ, p))[v]), fs)
+        return fs
+    end
+    xs = [(-1.9 + 3.8 * ((7j) % 31) / 31, -0.75 + 1.5 * ((11j) % 29) / 29) for j in 1:60]
+    derivs = ((0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2))
+    r = interpolate(element_strip(strip_forest(sym), false), xs, ElementPolynomial();
+                    derivs=derivs, atlas=folding)
+    f = interpolate(element_strip(strip_forest(:full), true), xs, ElementPolynomial();
+                    derivs=derivs, atlas=STRIP)
+    @test maximum(abs, r.values - f.values) < 1e-10 * maximum(abs, f.values)
+end
+

@@ -5523,6 +5523,19 @@ M12 was decided with Erik, after M7 and before M9b.
     transform the identity, three of those fail; over simulated ranks bit
     for bit (645 assertions); on Metal, 2,718; the full suite 169,476 at
     eight threads with both MPI jobs; the docs build.
+  - *The atlas contract widened (Erik's decision, 2026-11-25).* Starting
+    step 5 showed that a reduced ball's points in the wedge of a removed
+    shell lie past no kept patch's cut within reach of its map, so the
+    logical fold of step 1's design cannot reach them, and step 5's
+    "folds every point of the full ball" could not hold. Offered: keep
+    the design and leave such points outside, or let `chart_locate`
+    return the image's position with the symmetry that carries it back —
+    the alternative step 1 had set aside so that TreeAMR would not trust
+    the atlas's encoding. Erik chose the second, for extraction spheres
+    at large radius. TreeAMR composes the reported symmetry with its own
+    fold; tested on the kinked strip with an atlas that folds every point
+    past the plane itself, ghosts within 1e-12 and interpolation within
+    1e-10 of the full strip.
 
 ## Downstream checks
 

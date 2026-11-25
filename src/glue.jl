@@ -508,7 +508,11 @@ function locate_glue_ghosts(forest::Forest{D,R}, regions, G::NTuple{D,Int},
             # either side: both own their face planes (closed ownership).
             # Past a symmetry plane, folded back into the domain (M21), the
             # ghost then the symmetry's image of the value there.
-            ξ′, q, mask, turn = fold_patch_point(forest, loc...)
+            # The atlas may have folded the point itself (M21), reporting the
+            # symmetry: the two compose, mirrors by label and turns adding.
+            m0, t0 = located_symmetry(loc)
+            ξ′, q, mask, turn = fold_patch_point(forest, loc[1], loc[2])
+            mask, turn = mask ⊻ m0, mod(turn + t0, 4)
             s = locate_point(forest, PatchPoint(ξ′, q))
             s === nothing && throw(ArgumentError(
                 "no leaf of patch $q holds $ξ′, where the atlas locates the ghost at $ξ " *

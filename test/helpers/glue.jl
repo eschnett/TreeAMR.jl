@@ -213,15 +213,15 @@ strip_keywords(::Val{:half}) = (halfturn=(1, -2, -3),)
 
 # A set over the strip filled from the data at its owned points, the
 # appendix included, and its ghosts filled, the outer faces by the data.
-function strip_set(forest, sym, C; full=false, T=Float64, backend=CPU())
+function strip_set(forest, sym, C; full=false, T=Float64, backend=CPU(), atlas=STRIP)
     nv = length(strip_data(Val(sym), (T(0), T(0))))
     kw = full ? (;) : strip_keywords(Val(sym))
     fs = FieldSet{T}(forest, nv; G=3, centering=C, glue=:interpolate, backend=backend, kw...)
     # Plain data only, for a device: the symmetry as a `Val`, the atlas in `T`.
-    sv, atlas = Val(sym), strip_in(T)
-    f(ξ, p, v) = strip_data(sv, TreeAMR.chart_map(atlas, ξ, p))[v]
+    sv, inT = Val(sym), strip_in(T)
+    f(ξ, p, v) = strip_data(sv, TreeAMR.chart_map(inT, ξ, p))[v]
     hook = CellBoundary(WithPatch((ξ, p, v, δ) -> f(ξ, p, v)))
-    sched = GhostSchedule(fs, KINKED_OPS; atlas=STRIP)
+    sched = GhostSchedule(fs, KINKED_OPS; atlas=atlas)
     G, N = fs.G, forest.N
     c = staggers(fs.centering)
     dims = TreeAMR.appendix_layout(fs).dims
@@ -258,3 +258,22 @@ function strip_difference(fsr, fsf)
     end
     return worst, n
 end
+
+# The strip's atlas folding a point past the reduced strip's plane itself
+# (M21): it locates the point's image in the upper half and reports the
+# symmetry that carries it back — label 2 mirrored, or two quarter turns
+# for the half turn — rather than a position past the plane.
+struct FoldingStrip{T}
+    strip::KinkedStrip{T}
+    half::Bool
+end
+TreeAMR.chart_map(t::FoldingStrip, ξ, p) = TreeAMR.chart_map(t.strip, ξ, p)
+TreeAMR.chart_jacobian(t::FoldingStrip, ξ, p) = TreeAMR.chart_jacobian(t.strip, ξ, p)
+TreeAMR.chart_hessian(t::FoldingStrip, ξ, p) = TreeAMR.chart_hessian(t.strip, ξ, p)
+function TreeAMR.chart_locate(t::FoldingStrip, x)
+    past = x[2] < 0
+    image = past ? (t.half ? (-x[1], -x[2]) : (x[1], -x[2])) : (x[1], x[2])
+    ξ, p = TreeAMR.chart_locate(t.strip, image)
+    return ξ, p, (t.half ? (false, false) : (false, past), t.half && past ? 2 : 0)
+end
+
