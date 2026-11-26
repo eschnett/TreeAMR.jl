@@ -51,21 +51,21 @@ const KINKED_OPS = Operators(prolongation=4, restriction=4, glue=6)
 
 # Every stored point of every block of `fs` beyond a glued face of its
 # patch and nowhere else, past the high face planes the block owns, with
-# its logical position and patch: what the glue plan fills.
+# its logical position and patch: what the glue plan fills. (A set with a
+# vertex-like dimension is refused over a glued forest until M22 step 8.)
 function glue_ghosts(fs)
     forest = fs.forest
     conn = forest.conn
     G, c = fs.G, staggers(fs.centering)
     D = length(G)
     out = Tuple{Int,NTuple{D,Int},NTuple{D,Float64},Int}[]
-    dims = TreeAMR.appendix_layout(fs).dims          # the owned high planes (M20)
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         p = patch(forest, k)
         for I in CartesianIndices(size(fs.work)[1:D])
             idx = Tuple(I)
             δ = ntuple(d -> idx[d] <= G[d] ? -1 :
-                            idx[d] > G[d] + fs.forest.N + dims[b][d] ? 1 : 0, D)
+                            idx[d] > G[d] + fs.forest.N + c[d] ? 1 : 0, D)
             all(iszero, δ) && continue
             TreeAMR.interpolated_region(conn, k, δ) || continue
             ξ = coordinates(floattype(forest), fs, b, idx)
@@ -75,7 +75,7 @@ function glue_ghosts(fs)
     return out
 end
 
-# Owned points of a set, the appendix included, from `f(ξ, p)` at their
+# Own points of a set, from `f(ξ, p)` at their
 # positions, times `v` for variable `v`, every other stored point NaN,
 # then the fill with `boundary`.
 function fill_from_owned!(fs, sched, f; boundary=nothing)
@@ -83,12 +83,11 @@ function fill_from_owned!(fs, sched, f; boundary=nothing)
     G, N = fs.G, forest.N
     D = length(G)
     c = staggers(fs.centering)
-    dims = TreeAMR.appendix_layout(fs).dims
     fs.work .= NaN
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         p = patch(forest, k)
-        for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), D))
+        for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D))
             ξ = coordinates(floattype(forest), fs, b, Tuple(I))
             for v in 1:fs.nvars
                 fs.work[I, v, b] = v * f(ξ, p)

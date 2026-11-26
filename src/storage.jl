@@ -420,12 +420,11 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
     work::A
-    # The appendix's layout (M20) over the forest's current leaves, on the
-    # host and on the set's backend, built on first use after each change
-    # of the forest (`appendix_cache`); `nothing` until then and for a set
-    # without an appendix. Untyped, so that a set's type does not say
-    # whether it has one.
-    appendix::Any
+    # The primary mask (M22) over the forest's current leaves, on the set's
+    # backend, built on first use after each change of the forest
+    # (`primary_mask`); `nothing` until then. Untyped, so that a set's type
+    # does not depend on it.
+    primary::Any
 end
 
 # `G` as a sentinel-defaulted keyword rather than a required one, so that
@@ -1346,10 +1345,7 @@ a face center, a vertex, an element's Gauss–Lobatto node, whatever this
 field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
 `v` the variable index. The ghosts and the shared boundary plane are
-left untouched: they are filled by the ghost exchange (M2). A set
-interpolated across a glue (M20) owns the high face planes of its
-blocks at a glued face of their patch, its appendix, and those are
-filled too.
+left untouched: they are filled by the ghost exchange (M2).
 
 `f` is called once per point from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
@@ -1398,8 +1394,6 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
                          ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(f, Val(fs.nvars), false, false), fs)
     return fs
 end
 
@@ -1419,8 +1413,6 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(w.f, Val(fs.nvars), true, false), fs)
     return fs
 end
 
@@ -1437,8 +1429,6 @@ function fill_by_coordinates!(w::WithPatch, fs::FieldSet{T,D}) where {T,D}
                          ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(w.f, Val(fs.nvars), false, true), fs)
     return fs
 end
 
@@ -1459,8 +1449,6 @@ function fill_by_coordinates!(w::WithPatch{<:AllVariables}, fs::FieldSet{T,D}) w
                          Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(f, Val(fs.nvars), true, true), fs)
     return fs
 end
 

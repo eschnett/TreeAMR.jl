@@ -505,8 +505,7 @@ end
     # kernel reads by — and order by it, or two faces' transfers would share
     # one group, or two ranks disagree on where a transfer's slot is.
     z = (Int8(0), Int8(0))
-    key(g) = TreeAMR.GroupKey{2}(:copy, (1, 0), (0, 0), 0, z, Int8(0), Int8(g),
-                                 (false, false), z)
+    key(g) = TreeAMR.GroupKey{2}(:copy, (1, 0), (0, 0), 0, z, Int8(0), Int8(g))
     @test key(1) != key(2)
     @test isless(key(1), key(2)) && !isless(key(2), key(1))
     @test isless(key(0), key(1))

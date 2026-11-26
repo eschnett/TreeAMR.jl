@@ -573,9 +573,7 @@ glue_poly_k(k) = (ξ, p) -> 0.5 + p * ξ[1]^(k - 1) - (p + 1) * ξ[2]^(k - 1) +
             return abs(fs.work[idx..., 1, b] - f(ξ′, q))
         end
         @test err < 1e-11
-        # Each patch's closed box, `nN + 1` points along a vertex-like
-        # dimension, beyond its `(nN)²` cores.
-        @test statelength(fs) - TreeAMR.corelength(fs) ==
-              2 * (prod(16 + (C[d] === :vertex) for d in 1:2) - 16^2)
+        # A cell-centered set's state is its blocks' owned points.
+        @test statelength(fs) == nblocks(fs) * fs.forest.N^2
     end
 end

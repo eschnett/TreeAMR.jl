@@ -408,7 +408,7 @@ end
             # planes too, once.
             ok = true
             for b in 1:nleaves(forest)
-                lw = TreeAMR.lowwalls(forest, forest.leaves[b], c, walls === :symmetric)
+                lw = oracle_lowwalls(forest, forest.leaves[b], c, walls === :symmetric)
                 for idx in CartesianIndices(size(counts)[1:D])
                     i = Tuple(idx)
                     inside = all(d -> G[d] + 1 + lw[d] <= i[d] <= G[d] + N, 1:D)

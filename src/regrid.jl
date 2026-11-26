@@ -738,8 +738,8 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # interpolates.
     bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
     build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
-                                           operators, bounded(key); P=P, regrid=true,
-                                           top=key.top[d]), D)
+                                           operators, bounded(key); P=P, regrid=true),
+                          D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -776,8 +776,7 @@ end
 
 # The regrid of a set interpolated across a glue (M20). Every leaf on a
 # glued face keeps its level, so that the ghosts across a glue are never
-# interpolated across levels and a block's appendix only ever moves with
-# it (CODE.md, "Finite differences across a glue", *No refinement
+# interpolated across levels (CODE.md, "Finite differences across a glue", *No refinement
 # boundary at a glue*).
 
 # Whether any set `regrid!` moves is interpolated across a glue of the
@@ -849,24 +848,6 @@ function check_glue_kept(forest::Forest{D}, newleaves::Vector{MortonKey{D}},
             "a glue\"); keep the refinement further from the patches' glued faces"))
     end
     return nothing
-end
-
-# The transfers of a set with an appendix: a copy into a block that owns
-# high face planes copies them too, under the `top` flag of its key. Any
-# other transfer into such a block is a bug, since the guard above keeps
-# it at its level.
-function appendix_pairs(pairs::TransferPairs{D}, forest::Forest{D},
-                        newleaves::Vector{MortonKey{D}}, c::NTuple{D,Int}) where {D}
-    out = TransferPairs{D}()
-    for (key, (targets, sources)) in pairs, i in eachindex(targets)
-        top = appendix_dims(forest, newleaves[targets[i]], c)
-        any(top) && key.kind !== :copy &&
-            error("a $(key.kind) into a block with an appendix; this is a bug")
-        k2 = GroupKey{D}(key.kind, key.direction, key.offset, key.level, key.mirror,
-                         key.orientation, key.glue, key.low, key.shift, top)
-        push!.(get!(out, k2, (Int32[], Int32[])), (targets[i], sources[i]))
-    end
-    return out
 end
 
 # The argument checks of `regrid!`, run on every rank before anything is
@@ -1083,8 +1064,7 @@ Over a forest of patches, if any set moved is interpolated across a
 glue (`glue = :interpolate`), every block on a glued face keeps its
 level: its flag, or the buffer's, is dropped, and a refinement that 2:1
 balance would carry into it is refused, saying which block, so that no
-refinement boundary reaches a glue. Such a kept block's copy carries
-its appendix. See "Finite differences across a glue" in `CODE.md`.
+refinement boundary reaches a glue. See "Finite differences across a glue" in `CODE.md`.
 
 Set `transfer = false` to rebuild the mesh and storage without moving
 data at all — what the initial-data cycle wants, since it re-evaluates
@@ -1179,14 +1159,8 @@ function regrid!(forest::Forest{D}, pairs;
             sources === nothing && (sources = regrid_sources(oldleaves, newleaves;
                                                              oldrange=oldrange,
                                                              newrange=newrange))
-            # A block that owns its glued high face planes (M20) carries
-            # them through its copy.
-            setpairs = hasappendix(fs) ?
-                       Base.inferencebarrier(appendix_pairs)(sources, forest, newleaves,
-                                                             staggers(fs))::TransferPairs{D} :
-                       sources
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
-                                 sched.operators, backend, setpairs; P=fs.P,
+                                 sched.operators, backend, sources; P=fs.P,
                                  oldrange=oldrange,
                                  newrange=newrange, nold=nold, nnew=nnew,
                                  oldowner=oldowner, newowner=newowner)

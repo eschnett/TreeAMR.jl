@@ -167,7 +167,7 @@ end
     @test works[1] == works[2]
 end
 
-@testset "A closed box with relative walls is mirror-symmetric" begin
+@pending 2 "A closed box with relative walls is mirror-symmetric" begin
     # TreeGRRMHD's case: the potentials' Dirichlet data in the field, with
     # symmetric walls, on a uniform box. Point-symmetric data and case fill
     # point-symmetrically, bit for bit.

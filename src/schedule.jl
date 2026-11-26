@@ -211,8 +211,7 @@ Two more fields serve the relative hook ([`Relative`](@ref), AMR-7),
 which sets a ghost from the value at its nearest evolved point. `clamps`
 is, per dimension, the stored index that point has along a component of
 the direction that leaves the domain through an outer face — `G + N` on
-the high side, `G + 1` on the low one, `G + 2` for a set with symmetric
-walls — and `0` along every other dimension, where the point keeps the
+the high side, `G + 1` on the low one — and `0` along every other dimension, where the point keeps the
 ghost's own index: across a block face, a reflecting or an outflow face,
 in the block's own ghosts, which transfers fill. `slot` is the tag of
 the stage after which those ghosts are filled: phase 1, or the
@@ -377,22 +376,6 @@ end
 # the index is the same on every rank by construction, and `keyorder`
 # stays a function of the keys alone.
 #
-# `low` marks, per dimension, a target whose owned low wall plane the
-# fill writes (a set with `walls = :symmetric`, a vertex-like dimension,
-# a block at a low domain face; AMR-8): there the low region is one plane
-# longer, `1 : G+1`, and the block's own range one plane shorter,
-# `G+2 : G+N`, as the high side always is. It changes the target range,
-# so it is part of the key. False everywhere for a half-open set, and
-# along a dimension whose `δ` is `+1`, which it does not change.
-#
-# `shift` moves the partition of a target's seam slab along the flipped
-# tangential dimension of a half turn (M14), where that dimension is
-# vertex-like: 1 moves every boundary between the regions up one plane,
-# so that each region is the image of one real block's owned points, and
-# 2 moves all but the upper one, at a block on the high face of `d2`
-# whose image there is a symmetric low wall (see `target_range`, and
-# *Half turns* in CODE.md). It changes the target range, so it is part of
-# the key. Zero everywhere else.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
@@ -401,18 +384,7 @@ struct GroupKey{D}
     mirror::NTuple{D,Int8}
     orientation::Int8
     glue::Int8
-    low::NTuple{D,Bool}
-    shift::NTuple{D,Int8}
-    # Along which dimensions the target owns its high face plane, the
-    # appendix of a set interpolated across a glue (M20): its own range
-    # runs to G+N+1 there, and the region beyond starts at G+N+2.
-    top::NTuple{D,Bool}
 end
-GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
-            mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8, low::NTuple{D,Bool},
-            shift::NTuple{D,Int8}) where {D} =
-    GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, low, shift,
-                ntuple(_ -> false, D))
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -422,8 +394,7 @@ GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
     GroupKey{D}(kind, direction, offset, level, mirror, Int8(0))
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int, mirror::NTuple{D,Int8}, orientation::Integer) where {D} =
-    GroupKey{D}(kind, direction, offset, level, mirror, Int8(orientation), Int8(0),
-                ntuple(_ -> false, D), ntuple(_ -> Int8(0), D))
+    GroupKey{D}(kind, direction, offset, level, mirror, Int8(orientation), Int8(0))
 
 # A total order over group keys (M7). Within a single rank the order in
 # which groups run does not matter, and phase 1's come out of a `Dict`.
@@ -436,8 +407,7 @@ kindrank(kind::Symbol) =
     kind === :copy ? 1 : kind === :restrict ? 2 : kind === :prolong ? 3 :
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
-    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
-     k.low, k.shift, k.top)
+    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -668,9 +638,9 @@ in the patch across, of the order `Operators(…; glue = k)` gives, at the
 point the target patch's map names: pass the application's atlas,
 `GhostSchedule(fs, operators; atlas)`, which the build calls
 (`chart_map`, `chart_locate`, and `chart_aligned` where it has one) and
-the fill never does. A patch corner is filled like any other ghost, and
-the set owns its glued high face planes, its appendix (see
-[`statearray`](@ref)). Over a distributed forest the ranks compare the
+the fill never does. A patch corner is filled like any other ghost. A
+set with a vertex-like dimension is refused over a glued forest until
+M22 step 8 (see "Closed blocks" in `CODE.md`). Over a distributed forest the ranks compare the
 atlas by `hash`, as the rest of the layout: an atlas holding an array or
 mutable state hashes by identity, differently in every process, and
 needs a `Base.hash` method of its own over its values. See "Finite
@@ -816,12 +786,6 @@ end
 
 # Target range of a transfer in dimension d.
 #
-# `low` is a target whose owned low wall plane `G + 1` the fill writes
-# (`walls = :symmetric`, AMR-8): its low region takes the wall,
-# `1 : G+1`, and its own range starts above it, `G+2`, the halved one's
-# low half included — the mirror image of the high side, where the wall
-# `G + N + 1` is the first plane of the high region.
-#
 # `closed` extends the block's *own* range (δd = 0) by the shared plane,
 # turning the owned range into the closed one and giving the top half of
 # a halved range the extra point. The ghost exchange never wants it — a
@@ -831,41 +795,13 @@ end
 # boundary line of a coarse-fine face is part of what must agree. Keeping
 # it here, rather than in a range the interface schedule derives for
 # itself, is what keeps this function the single source of truth.
-#
-# `shift` is a half turn's seam slab along its flipped vertex-like
-# tangential dimension (M14): the image of the real blocks' half-open
-# partition, every boundary between regions one plane up (1), or all but
-# the upper one (2, a block whose image above is a symmetric low wall).
-# Then the low region is `1 : G+1`, the block's own range `G+2 : G+N+1`
-# (`G+2 : G+N` under 2), its halves meeting between `G+1+N/2` and
-# `G+2+N/2`, and the high region `G+N+2 : N+2G+c` (`G+N+1 : …` under 2).
 function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
-                      closed::Bool=false; low::Bool=false, shift::Integer=0,
-                      top::Bool=false)
-    shift != 0 && return shifted_range(N, G, c, δd, od, halved, shift == 1)
-    if top
-        # The appendix (M20): the block owns its high face plane G+N+1.
-        (c == 1 && !halved) || error("an appendix plane asked for with stagger $c " *
-                                     "and halved = $halved; this is a bug")
-        δd == 1 && return (G + N + 2):(N + 2G + c)
-        δd == 0 && return (G + 1 + low):(G + N + 1)
-    end
+                      closed::Bool=false)
     δd == 1 && return (G + N + 1):(N + 2G + c)
-    δd == -1 && return 1:(G + low)
+    δd == -1 && return 1:G
     top = closed ? c : 0                            # the shared plane, to the top half
-    halved && return (G + 1 + od * (N ÷ 2) + (low && od == 0)):(G + od * (N ÷ 2) + N ÷ 2 +
-                                                                 od * top)
-    return (G + 1 + low):(G + N + top)
-end
-
-# The shifted ranges of `target_range` (M14); `up` moves the upper
-# boundary too.
-function shifted_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool, up::Bool)
-    δd == 1 && return (G + N + 1 + up):(N + 2G + c)
-    δd == -1 && return 1:(G + 1)
-    top = G + N + up
-    halved && return (G + 2 + od * (N ÷ 2)):(od == 0 ? G + 1 + N ÷ 2 : top)
-    return (G + 2):top
+    halved && return (G + 1 + od * (N ÷ 2)):(G + od * (N ÷ 2) + N ÷ 2 + od * top)
+    return (G + 1):(G + N + top)
 end
 
 # Same-level copy: a pure shift of N cells against the direction, for
@@ -873,9 +809,8 @@ end
 # plane longer and its first entry, the shared plane G+N+1, reads the
 # neighbor's first *owned* point G+1 — which is the same point. So a copy
 # still reads interiors only, which is what makes phase 1 race free.
-function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int;
-                      low::Bool=false, shift::Integer=0, top::Bool=false) where {T}
-    rng = target_range(N, G, c, δd, 0, false; low=low, shift=shift, top=top)
+function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    rng = target_range(N, G, c, δd, 0, false)
     srcstart = Int32[j - N * δd for j in rng]
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
@@ -890,10 +825,8 @@ end
 # and never has to shift — the circularity that forces the cell-centered
 # window inward cannot arise, because the coincident fine point is always
 # owned by the fine block (that is the `N ≥ 2G + 2` invariant).
-restrict_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
-                 p::Int; low::Bool=false, shift::Integer=0) where {T} =
-    restrict_stencil_over(T, target_range(N, G, c, δd, od, true; low=low, shift=shift),
-                          N, G, c, δd, od, p)
+restrict_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int, p::Int) where {T} =
+    restrict_stencil_over(T, target_range(N, G, c, δd, od, true), N, G, c, δd, od, p)
 
 # The body, over an explicit target range. The interface restriction
 # (M8b) is the same transfer over a different range — one plane in the
@@ -939,8 +872,8 @@ source_direction(δd::Int, od::Int) =
 # within its own parent, which fixes where the target's cells fall
 # inside the coarse frame.
 function prolong_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
-                         p::Int; low::Bool=false, shift::Integer=0) where {T}
-    rng = target_range(N, G, c, δd, od, false; low=low, shift=shift)
+                         p::Int) where {T}
+    rng = target_range(N, G, c, δd, od, false)
     stored = N + 2G + c
     srcstart = Vector{Int32}(undef, length(rng))
     weights = Matrix{T}(undef, p, length(rng))
@@ -1043,28 +976,21 @@ end
 # families: the conservative reconstruction along its cell-like
 # dimensions, point values of width `vertex_prolongation` along its
 # vertex-like ones.
-# `low` and `shift` only ever reach a vertex-like dimension (see
-# `target_range`).
-prolongation_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
-                     low::Bool=false, shift::Integer=0) where {T} =
+prolongation_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
     ops.family === Conservative && c == 0 ?
     conservative_prolong_stencil(T, N, G, c, δd, od, ops.prolongation) :
-    prolong_stencil(T, N, G, c, δd, od, vertex_order(ops); low=low, shift=shift)
+    prolong_stencil(T, N, G, c, δd, od, vertex_order(ops))
 
 # Conservative restriction is the exact volume average, which the
 # point-value builder already produces at order 2: its window is a
 # cell's own two children and its weights are 1/2.
-restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
-                    low::Bool=false, shift::Integer=0) where {T} =
-    restrict_stencil(T, N, G, c, δd, od, ops.restriction; low=low, shift=shift)
+restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
+    restrict_stencil(T, N, G, c, δd, od, ops.restriction)
 
 # One dimension of an unmirrored transfer of `kind`, as the ghost schedule
 # and the regrid transfer both build it. With `mode` the group's bound
 # (`boundedmode`), a bounded point-value group's stencil carries the
 # multilinear weights below its own (`stack_linear`).
-# `low` trims the target range for a symmetric wall, and `shift` moves it
-# in a half turn's seam slab (see `target_range`).
-#
 # `P` is the element order of the layout, `0` for none, and is required:
 # an element set stores and owns as a cell-centered one does, so nothing
 # else here can tell the two apart, and a caller that forgot it would
@@ -1075,34 +1001,25 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
 # element variants of the position kernels are (`with_nodes`), so that
 # building a cell or vertex set's schedule does not compile them.
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
-                      P::Integer, regrid::Bool=false, low::Bool=false,
-                      shift::Integer=0, top::Bool=false) where {T}
-    # A block owns its high face plane only next to a glue, where every
-    # transfer is a same-level copy (M20).
-    top && kind !== :copy && error("an appendix plane asked for in a $kind; this is a bug")
+                      P::Integer, regrid::Bool=false) where {T}
     if P > 0
-        c == 0 && !low && shift == 0 || error(
-            "an element stencil asked for with stagger $c, low = $low, shift = " *
-            "$shift; element sets are cell-like, with no symmetric wall and no " *
-            "rotating seam, so this is a bug")
+        c == 0 || error("an element stencil asked for with stagger $c; element sets are " *
+                        "cell-like, so this is a bug")
         S = Stencil1D{T,Vector{Int32},Matrix{T}}
         return Base.inferencebarrier(element_stencil)(T, N, G, kind, δd, od, Int(P),
                                                       regrid)::S
     end
-    kind === :copy && return copy_stencil(T, N, G, c, δd; low=low, shift=shift, top=top)
-    kind === :restrict &&
-        return restriction_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
-    return prolongation_stencil(T, N, G, c, δd, od, ops; low=low, shift=shift)
+    kind === :copy && return copy_stencil(T, N, G, c, δd)
+    kind === :restrict && return restriction_stencil(T, N, G, c, δd, od, ops)
+    return prolongation_stencil(T, N, G, c, δd, od, ops)
 end
 
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators,
-                      mode::Int8; P::Integer, regrid::Bool=false, low::Bool=false,
-                      shift::Integer=0, top::Bool=false) where {T}
-    s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid, low=low,
-                     shift=shift, top=top)
+                      mode::Int8; P::Integer, regrid::Bool=false) where {T}
+    s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid)
     mode == BOUNDED_POINTVALUE || return s
     return stack_linear(s, kind_stencil(T, N, G, c, kind, δd, od, LINEAR_OPERATORS;
-                                        P=P, regrid=regrid, low=low, shift=shift))
+                                        P=P, regrid=regrid))
 end
 
 # One dimension of a transfer of an element-centered set (M16; see
@@ -1235,17 +1152,13 @@ end
 #
 # over the whole ghost slab, which on the high side of a vertex-like
 # dimension includes the wall row `G + N + 1` that no block owns: it is
-# a ghost like the rows beyond it, and clamped like them. With a
-# symmetric low wall (`low`, AMR-8) the low side is the mirror of that:
-# the slab includes the owned wall row `G + 1`, and the nearest evolved
-# row is `G + 2`.
-clamp_range(N::Int, G::Int, c::Int, δd::Int; low::Bool=false) =
-    δd < 0 ? (1:(G + low)) : ((G + N + 1):(N + 2G + c))
+# a ghost like the rows beyond it, and clamped like them.
+clamp_range(N::Int, G::Int, c::Int, δd::Int) =
+    δd < 0 ? (1:G) : ((G + N + 1):(N + 2G + c))
 
-function clamp_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int;
-                    low::Bool=false) where {T}
-    rng = clamp_range(N, G, c, δd; low=low)
-    row = (δd < 0 ? G + 1 + low : G + N) - s.targetfirst + 1
+function clamp_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    rng = clamp_range(N, G, c, δd)
+    row = (δd < 0 ? G + 1 : G + N) - s.targetfirst + 1
     # The nearest owned row is on the wall side of the owned range, so
     # it lies inside whatever range the tangential stencil covers, halved
     # or not, as a mirror point does. A failure is a bug in the schedule.
@@ -1286,23 +1199,14 @@ end
 # Every source has its own wall at `G + N + 1` in its own frame, which
 # is why the row is the same whatever kind the transfer is. See "Ghost
 # filling" in CODE.md.
-#
-# `low` is the derived low wall row of a set with symmetric walls
-# (AMR-8): the wall `G + 1` from the points `G + 2 … G + 1 + h` above it,
-# the same weights in mirrored order. A source at a low domain face has
-# its own wall at `G + 1` in its own frame, as every source has its high
-# one at `G + N + 1`.
-function wall_stencil(::Type{T}, N::Int, G::Int, p::Int; low::Bool=false) where {T}
+function wall_stencil(::Type{T}, N::Int, G::Int, p::Int) where {T}
     h = p ÷ 2
     nodes = [Rational{Int}(i) for i in vcat(-h:-1, 1:h)]
     w = lagrange_weights(nodes, 0//1)
     weights = Matrix{T}(undef, h, 1)
     for i in 1:h
-        # Nodes -h … -1 ascending for the high wall; +1 … +h for the low
-        # one, whose weights are the same by symmetry.
-        weights[i, 1] = T(2 * (low ? w[h + i] : w[i]))
+        weights[i, 1] = T(2 * w[i])                # nodes -h … -1 ascending
     end
-    low && return Stencil1D{T}(G + 1, Int32[G + 2], weights)
     wall = G + N + 1
     return Stencil1D{T}(wall, Int32[wall - h], weights)
 end
@@ -1336,29 +1240,18 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
-                        b::Int, dirs, symmetric::Bool=false;
-                        interpolated::Bool=false,
+                        b::Int, dirs; interpolated::Bool=false,
                         glueregions::Vector{GlueRegion{D}}=GlueRegion{D}[]) where {D}
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
-    walls = lowwalls(forest, k, c, symmetric)
-    # The high face planes this block owns (M20).
-    tops = interpolated ? appendix_dims(forest, k, c) : ntuple(_ -> false, D)
     for δ in dirs
-        # Where this block's low wall plane is written (AMR-8), along every
-        # dimension that does not step up.
-        low = ntuple(d -> walls[d] && δ[d] != 1, D)
-        top = ntuple(d -> tops[d] && δ[d] != -1, D)
-        shift = seam_shift(forest, k, c, δ, symmetric)
         record!(kind, offset, lvl, s, via::Crossing) =
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
-                                           via.turns, via.glue, low, shift, top),
+                                           via.turns, via.glue),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
-        region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false;
-                                                           low=low[d], shift=shift[d],
-                                                           top=top[d]),
+        region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false),
                                          D))
         # A cell-centered dimension with `G_d = 0` has no low slab and no
         # high one, so every direction that leaves the block along it has
@@ -1375,13 +1268,12 @@ function block_sources!(pairs::TransferPairs{D},
         end
         δ′, faces = wall_direction(forest, k, δ)
         if any(!=(OuterFace), faces)
-            mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, faces, region, low,
-                            shift)
+            mirror_sources!(pairs, boundaries, forest, G, c, b, δ, δ′, faces, region)
             continue
         end
         crossing, nbrs = oriented_neighbors(forest, k, δ)
         if isempty(nbrs)
-            push!(boundaries, boundary_region(forest, k, b, δ, region, G, low, shift))
+            push!(boundaries, boundary_region(forest, k, b, δ, region, G))
             continue
         end
         nblevel = level(first(nbrs))
@@ -1419,8 +1311,7 @@ end
 # point is clamped along every component instead, so that the hook
 # never reads another hook region.
 function boundary_region(forest::Forest{D}, k::MortonKey{D}, b::Int, δ::NTuple{D,Int},
-                         region, G::NTuple{D,Int}, low::NTuple{D,Bool},
-                         shift::NTuple{D,Int8}=ntuple(_ -> Int8(0), D)) where {D}
+                         region, G::NTuple{D,Int}) where {D}
     N = forest.N
     exits = ntuple(D) do d
         δ[d] == 0 && return false
@@ -1441,49 +1332,12 @@ function boundary_region(forest::Forest{D}, k::MortonKey{D}, b::Int, δ::NTuple{
             end
         end
     end
-    # The nearest evolved point, where a half turn's shifted slab (M14)
-    # puts it: one plane up on either side under a full shift.
+    # The nearest evolved point.
     clamps = ntuple(D) do d
         exits[d] || return Int32(0)
-        return Int32(δ[d] > 0 ? G[d] + N + (shift[d] == 1) :
-                     G[d] + 1 + (low[d] || shift[d] != 0))
+        return Int32(δ[d] > 0 ? G[d] + N : G[d] + 1)
     end
     return BoundaryRegion{D}(Int32(b), δ, region, clamps, slot)
-end
-
-# Along which dimensions the fill writes block `k`'s owned low wall
-# plane (AMR-8): with symmetric walls, along every vertex-like dimension
-# whose low face is a face of the domain — one with no block across it.
-# That is an outer, reflecting or outflow face, never a periodic one nor
-# a rotating seam, both of which have neighbours.
-function lowwalls(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
-                  symmetric::Bool) where {D}
-    return ntuple(D) do d
-        symmetric && c[d] == 1 || return false
-        δ = ntuple(e -> e == d ? -1 : 0, D)
-        return isempty(oriented_neighbors(forest, k, δ)[2])
-    end
-end
-
-# The shift of block `k`'s target ranges in direction `δ` (M14; see
-# `GroupKey`): nonzero only across a half turn's seam — `δ[d1] = -1` from
-# a block on the low face of `d1` — and along its flipped dimension `d2`
-# where that is vertex-like. There the
-# partition is the image of the real blocks', every boundary one plane
-# up (1), except under symmetric walls on a block at the high face of
-# `d2`, whose upper boundary's image is a low wall the fill writes (2).
-function seam_shift(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int},
-                    δ::NTuple{D,Int}, symmetric::Bool) where {D}
-    zero = ntuple(_ -> Int8(0), D)
-    ishalfturn(forest) || return zero
-    d1, d2 = seam_plane(forest)
-    δ[d1] == -1 && c[d2] == 1 || return zero
-    lvl = level(k)
-    pos = root_position(forest, k.root)
-    (pos[d1] << lvl) + Int(k.coords[d1]) == 0 || return zero
-    g2 = (pos[d2] << lvl) + Int(k.coords[d2])
-    top = g2 == (forest.roots[d2] << lvl) - 1
-    return Base.setindex(zero, Int8(symmetric && top ? 2 : 1), d2)
 end
 
 # The child offset of a finer source as the target sees it: its own
@@ -1508,31 +1362,27 @@ function mirror_sources!(pairs::TransferPairs{D},
                          boundaries::Vector{BoundaryRegion{D}},
                          forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
                          b::Int, δ::NTuple{D,Int}, δ′::NTuple{D,Int},
-                         walls::NTuple{D,FaceKind}, region,
-                         low::NTuple{D,Bool}=ntuple(_ -> false, D),
-                         shift::NTuple{D,Int8}=ntuple(_ -> Int8(0), D)) where {D}
+                         walls::NTuple{D,FaceKind}, region) where {D}
     k = forest.leaves[b]
     zerooffset = ntuple(_ -> 0, D)
     mask = map(!=(OuterFace), walls)
     # A reflecting vertex-like dimension on the high side splits its
     # target into the derived wall row (state 2) and the mirrored rows
     # beyond it (state 1), which are batched apart because their parity
-    # factors differ. So does the low side of a set with symmetric walls
-    # (`low`, AMR-8), whose owned wall row is derived the same way. Each
-    # part may be empty — at `G = 0` only the wall row is left — and an
+    # factors differ. Each part may be empty — at `G = 0` only the wall row is left — and an
     # empty part records nothing. An outflow dimension clamps its whole
     # slab, wall row included (state 3).
     choices = ntuple(D) do d
         !mask[d] && return (Int8(0),)
         walls[d] == OutflowFace && return (Int8(3),)
-        c[d] == 1 && (δ[d] == 1 || (δ[d] == -1 && low[d])) || return (Int8(1),)
+        c[d] == 1 && δ[d] == 1 || return (Int8(1),)
         return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
     end
     states = vec(collect(Iterators.product(choices...)))
     record!(kind, offset, lvl, s, via::Crossing) =
         for state in states
             push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns,
-                                           via.glue, low, shift),
+                                           via.glue),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         end
@@ -1546,7 +1396,7 @@ function mirror_sources!(pairs::TransferPairs{D},
     # and then mirrored.
     crossing, nbrs = oriented_neighbors(forest, k, δ′)
     if isempty(nbrs)
-        push!(boundaries, boundary_region(forest, k, b, δ, region, G, low, shift))
+        push!(boundaries, boundary_region(forest, k, b, δ, region, G))
         return nothing
     end
     nblevel = level(first(nbrs))
@@ -2169,6 +2019,11 @@ function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Sym
     why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
           "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
           "(\"Closed blocks\" in CODE.md)"
+    walls === :symmetric && throw(ArgumentError(
+        "$what: walls = :symmetric is refused for $why. Closed blocks make every wall " *
+        "symmetric: an outer wall plane is the block's own on both sides, evolved by " *
+        "default; a wall the boundary hook prescribes is `CellBoundary(…; wall = " *
+        ":prescribed)`. The `walls` keyword goes in M22 step 4."))
     lvl = level(first(forest.leaves))
     any(k -> level(k) != lvl, forest.leaves) && throw(ArgumentError(
         "$what: the forest has leaves at more than one level, which is refused for " *
@@ -2243,7 +2098,6 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     end
     ghosts::NTuple{D,Int}, centers::NTuple{D,Symbol}, stags::NTuple{D,Int}, order::Int =
         checked
-    symmetric = walls === :symmetric
     # An element set is filled on faces only (M16): along a dimension with
     # `δd ≠ 0` an edge or corner ghost can land on an element face inside
     # a coarse block, where two values are stored, and the element-local
@@ -2272,7 +2126,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     threaded_chunks(nb) do c, range
         for b in range
             block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
-                           offset + b, dirs, symmetric;
+                           offset + b, dirs;
                            interpolated=interpolated, glueregions=perglue[c])
         end
     end
@@ -2304,7 +2158,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # locate, and its owned high face planes (M20) shape what it is sent,
     # so the search for it runs in the same mode as its owner's.
     sent = sent_transfers(forest, owned) do into, j
-        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs, symmetric;
+        block_sources!(into, BoundaryRegion{D}[], forest, ghosts, stags, j, dirs;
                        interpolated=interpolated, glueregions=GlueRegion{D}[])
     end
 
@@ -2314,24 +2168,21 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # nearest owned row at an outflow face), or the derived wall row.
     boundedof(key) = boundedmode(operators, key.kind, key.mirror, stags)
     function build1(key, d)
-        δd, od, state, low = key.direction[d], key.offset[d], key.mirror[d], key.low[d]
-        shift = key.shift[d]
+        δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
         mode = boundedof(key)
         if state == 2
-            # The derived wall row: the high one, or a symmetric low one.
-            wall = wall_stencil(T, N, ghosts[d], vertex_order(operators); low=δd < 0)
+            # The derived high wall row.
+            wall = wall_stencil(T, N, ghosts[d], vertex_order(operators))
             mode == BOUNDED_POINTVALUE || return wall
-            return stack_linear(wall, wall_stencil(T, N, ghosts[d], 2; low=δd < 0))
+            return stack_linear(wall, wall_stencil(T, N, ghosts[d], 2))
         end
         # Along a wall dimension the tangential stencil is built whole and
-        # its rows remapped; along any other the target range is trimmed
-        # where the block's low wall is written.
+        # its rows remapped.
         δs = state == 0 ? δd : 0
         s = kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
-                         P=order, low=state == 0 && low, shift=state == 0 ? shift : 0,
-                         top=state == 0 && key.top[d])
+                         P=order)
         state == 0 && return s
-        state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd; low=low)
+        state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd)
         return mirror_rows(s, N, ghosts[d], stags[d], δd)
     end
     # Memoized per key: over a distributed forest the stage builder asks

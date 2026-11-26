@@ -1765,6 +1765,15 @@ function undefined_halfturn_ghosts(::Val{D}; plane, other, C, p, T::Type=Float64
     return nnan, worst, schedule
 end
 
+# Along which dimensions a set with symmetric walls (AMR-8) had its owned
+# low wall plane written by the fill: every vertex-like dimension whose low
+# face has no block across it. The package's own version went with closed
+# blocks (M22), which refuse `walls = :symmetric` for such a set; a
+# cell-like dimension has no wall plane.
+oracle_lowwalls(forest::Forest{D}, k, c::NTuple{D,Int}, symmetric::Bool) where {D} =
+    ntuple(d -> symmetric && c[d] == 1 &&
+                isempty(neighbor_keys(forest, k, ntuple(e -> e == d ? -1 : 0, D))), D)
+
 """
 Set the owned low wall planes of a set with symmetric walls to `NaN`:
 plane `G + 1` along every vertex-like dimension whose low face is a face
@@ -1774,7 +1783,7 @@ function poison_low_walls!(fs::FieldSet{T,D}) where {T,D}
     c = staggers(fs.centering)
     work = fs.work
     for b in 1:nblocks(fs)
-        walls = TreeAMR.lowwalls(fs.forest, blockkey(fs, b), c, true)
+        walls = oracle_lowwalls(fs.forest, blockkey(fs, b), c, true)
         for d in 1:D
             walls[d] || continue
             idx = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : (:), D)
