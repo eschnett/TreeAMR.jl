@@ -5481,14 +5481,49 @@ M12 was decided with Erik, after M7 and before M9b.
     `P + 1`, and where `T` cannot hold them exactly (`Float32` beyond
     `2²⁴`) the sums round apart. The last node is now formed as the
     next element's first; the 1D mesh refined to level 21 checks it.
-  - *Fused multiply-add on a device.* A backend that fused consistently
-    would still give every copy one position, since scaling by two is
-    exact inside a fused product too; what it would break is equality
-    with the host. Measured on the laptop's Metal (M3 Pro), in
-    `Float32` on the refined 2D and 3D meshes of non-dyadic extents
-    and the level-21 1D mesh, cell, vertex and element sets through `P
-    = 3`: device and host positions are `===` at every owned point
-    (62,976 in 3D) and every hook-written ghost. CUDA is not measured.
+  - *Fused multiply-add on a device.* The design formed a position as a
+    multiplication and then an addition, never `muladd`, so that a
+    device and the host would round alike. A backend that fused
+    consistently would still give every copy one position, since
+    scaling by two is exact inside a fused product too; what it would
+    break is equality with the host. Measured on the laptop's Metal (M3
+    Pro), in `Float32` on the refined 2D and 3D meshes of non-dyadic
+    extents and the level-21 1D mesh, cell, vertex and element sets
+    through `P = 3`: device and host positions are `===` at every owned
+    point (62,976 in 3D) and every hook-written ghost. On CUDA (an H200
+    on Symmetry, CUDA.jl 6.4, jobs 612315 and 612335, Julia
+    1.14.0-beta1 and 1.13.4 alike) they are not: in `Float64` and
+    `Float32` 30–57 % of the owned points and up to half of the
+    hook-written ghosts differ, by up to 10–13 ulps, the most where
+    `lo + k·h` is near zero, and every differing device value is
+    exactly `fma(k, h, lo)` formed on the host. CUDA contracts the
+    product and the sum of its own accord, so the rule could not be
+    kept there. It was replaced by the one every backend can keep: an
+    explicit `fma`, the position correctly rounded, the cell-like form
+    as `fma(T(2k + 1), h/2, lo)`, which keeps the half one bit longer
+    than `T(k) + ½` would; an element's interior node rounds its
+    integer part plus its offset first. `MultiFloats`' types, which
+    have no `fma`, keep the product and the sum (`position_fma`). The
+    change found two positions formed outside `nodeposition`, both of
+    the `exclude` test: `stencil_position` of an equally spaced stencil
+    and of an `ElementStencil`; both call it now. A new testset checks
+    that every stored position is the exact `lo + k·h` rounded once.
+    One assertion changed with the rule: `element_tests.jl`'s statement of
+    the expression, now the two `fma` forms. Verified with it (Julia
+    1.13.4): on the laptop, the full suite at eight threads (175,952
+    tests in five processes, 13m41), `position_tests.jl` (6,566),
+    `gpu_tests.jl` on Metal (2,679), the Metal position check with no
+    differing point, and the docs build; on an H200 at Julia 1.13 (jobs
+    612445 and 612473), no differing point in `Float64` or `Float32`,
+    and `gpu_tests.jl` with the same two failures at line 1197 as
+    before the change and on step 1's parent (job 612364), a regridded
+    state across a glue compared bit for bit with the host's. The fill
+    of the positions on the H200, best of 20 over 64 blocks of `32³`,
+    takes 174 µs in `Float64` against 175 µs before, and in `Float32`
+    174 µs vertex-like and 193 µs cell-like against 174 and 175 µs; a
+    first form that converted in each branch separately took 214 µs in
+    both `Float32` cases (job 612445), and the stagger now picks the
+    integer before its one conversion.
   The point interpolator keeps inverting a position relative to the
   block's corner; its `exclude` stencil positions follow the new rule,
   through M11's six-argument `stencil_hits`, whose shape

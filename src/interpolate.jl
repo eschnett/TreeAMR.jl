@@ -278,8 +278,9 @@ end
 # The positions of an element stencil's nodes: node `k` (from 0) of the
 # element whose first node has the integer coordinate `base` along `d`,
 # at `lo + (base + o_k)·h` and the last node at `lo + (base + n)·h`,
-# `nodeposition`'s expressions, so that an `exclude` region flags a node
-# exactly when its `coordinates` are inside.
+# formed by `nodeposition` as owned index `k + 1` of a block whose corner
+# is `base`, so that an `exclude` region flags a node exactly when its
+# `coordinates` are inside.
 struct ElementStencil{D,T,n}
     lo::NTuple{D,T}
     h::T
@@ -288,8 +289,7 @@ struct ElementStencil{D,T,n}
 end
 
 @inline function stencil_position(s::ElementStencil{D,T,n}, d, k) where {D,T,n}
-    k == n - 1 && return s.lo[d] + oftype(s.h, s.base[d] + n) * s.h
-    return s.lo[d] + (oftype(s.h, s.base[d]) + s.offsets[k + 1]) * s.h
+    return nodeposition(s.lo[d], s.h, s.base[d], k + 1, 0, s.offsets)
 end
 
 @inline function stencil_place(b::ElementBasis{n}, lo::NTuple{D,T}, h, B, first,
@@ -420,13 +420,13 @@ end
     stencil_hits(region, s.lo, s.h, s.base, s.off, v)
 
 # M11's forms: stencil point `k` (from 0) along `d` at `lo + ((base + k) +
-# off)·h`, `UniformStencil`'s. `off` is zero or a half, and adding zero is
-# exact, so this is `nodeposition`'s `lo + k·h` and `lo + (k + ½)·h` bit
-# for bit.
+# off)·h`, `UniformStencil`'s. `off` is zero or a half, a vertex-like or a
+# cell-like dimension, and the position is `nodeposition`'s for that
+# stagger, bit for bit.
 @inline stencil_hits(::Nothing, lo, h, base, off, ::Val{n}) where {n} = false
 
 @inline stencil_position(lo, h, base, off, d, k) =
-    lo[d] + (oftype(h, base[d] + k) + off[d]) * h
+    nodeposition(lo[d], h, base[d] + k, 1, iszero(off[d]) ? 1 : 0, nothing)
 
 @inline function stencil_hits(region::Region, origin::NTuple{D}, h, base, off,
                               ::Val{n}) where {D,n}

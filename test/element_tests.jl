@@ -407,8 +407,9 @@ end
     # Guards a position formed from a block's own floating-point corner,
     # or with the shift subtracted in floating point: every position must
     # be `lo + k·h` or `lo + (k + ½)·h` for the point's integer coordinate
-    # `k`, the expression that puts every copy of a point at one position
-    # (CODE.md, "Positions" under "Centerings").
+    # `k`, rounded once by an explicit `fma` (the half as `2k + 1` half
+    # spacings), the expression that puts every copy of a point at one
+    # position (CODE.md, "Positions" under "Centerings").
     for T in (Float64, Float32), C in (cellcentered(D), vertexcentered(D),
                                        facecentered(D, 1)), G in (0, 2)
         forest = Forest{T}(ntuple(_ -> 3, D); N=6,
@@ -420,10 +421,10 @@ end
             lo = forest.extents
             B = TreeAMR.block_base(forest, k)
             h = spacing(T, forest, k)
-            kk = ntuple(d -> T(B[d] + I[d] - G - 1), D)
+            kk = ntuple(d -> B[d] + I[d] - G - 1, D)
             @test coordinates(fs, b, Tuple(I)) ===
-                  ntuple(d -> T(lo[d][1]) + (c[d] == 1 ? kk[d] : kk[d] + one(h) / 2) * h,
-                         D)
+                  ntuple(d -> c[d] == 1 ? fma(T(kk[d]), h, T(lo[d][1])) :
+                                          fma(T(2 * kk[d] + 1), h / 2, T(lo[d][1])), D)
         end
     end
 end
