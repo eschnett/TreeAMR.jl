@@ -265,7 +265,7 @@ function pseudorandom!(fs::FieldSet{T,D}) where {T,D}
 end
 
 function fill_case(tag, forest::Forest{D}, centerings; G, ops,
-                   walls::Symbol=:half_open, relative::Bool=false) where {D}
+                   relative::Bool=false) where {D}
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
     mirrored = findall(d -> any(TreeAMR.reflecting_faces(forest)[d]), 1:D)
     f = (x, v) -> sum(d -> (d + v) * x[d]^2 - x[d], 1:D) + v
@@ -273,7 +273,7 @@ function fill_case(tag, forest::Forest{D}, centerings; G, ops,
         parity = isempty(mirrored) ? nothing :
                  [ntuple(d -> d == first(mirrored) ? OddParity : EvenParity, D),
                   ntuple(_ -> EvenParity, D)]
-        fs = FieldSet(forest, 2; G=G, centering=C, parity=parity, walls=walls)
+        fs = FieldSet(forest, 2; G=G, centering=C, parity=parity)
         pseudorandom!(fs)
         sched = GhostSchedule(fs, ops)
         boundary = !hasouter(forest) ? nothing :
@@ -1572,15 +1572,12 @@ function main()
     # Staggered sets under the conservative family: averages along the
     # cell-like dimension, point values along the vertex-like one, the
     # derived wall row at the reflecting faces included.
-    # Symmetric walls: the owned low wall planes at the reflecting and the
-    # outflow faces are written by the fill, on whichever rank owns them.
-    pending_case("SW", 4)
     # The relative hook: the ghosts beyond the outer faces from the block's
     # own data, its corner rows read across block faces after the stage
-    # that fills them, on whichever rank holds them; with symmetric walls.
+    # that fills them, on whichever rank holds them.
     fill_case("RH", forest_of((3, 3), 8; outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
-              ("cell" => cellcentered(2),); G=2, ops=OPS4, walls=:symmetric, relative=true)
+              ("cell" => cellcentered(2),); G=2, ops=OPS4, relative=true)
     pending_case("RH vertex", 4)
     pending_case("CS", 4)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,

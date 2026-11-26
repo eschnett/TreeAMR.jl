@@ -97,7 +97,7 @@ end
     # What the serial reference prints while M22 is built: the cases
     # pending until a later step print one comment line each instead
     # (`pending_case`), and the regrids left are those of M32x2-.
-    NPENDING, NREGRIDS, NUNCHANGED = 20, 8, 1
+    NPENDING, NREGRIDS, NUNCHANGED = 19, 8, 1
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).

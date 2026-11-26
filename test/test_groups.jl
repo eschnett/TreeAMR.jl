@@ -35,7 +35,7 @@ const TEST_FILES = ["tree_tests" => 14, "ghost_tests" => 56, "centering_tests" =
                     "interpolate_exchange_tests" => 17, "allvariables_tests" => 6,
                     "state_tests" => 10, "fold_tests" => 8, "regrid_tests" => 14,
                     "bounded_tests" => 36, "staggered_conservative_tests" => 8,
-                    "walls_tests" => 10, "relative_tests" => 6, "wave_tests" => 25,
+                    "relative_tests" => 6, "wave_tests" => 25,
                     "wave_cell_tests" => 2, "burgers_tests" => 15, "imex_tests" => 15,
                     "type_tests" => 15, "thread_tests" => 67, "mpi_tests" => 70,
                     "gpu_tests" => 47]

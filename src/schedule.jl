@@ -757,7 +757,6 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     G::NTuple{D,Int}                             # ghost width it was built for
     centering::NTuple{D,Symbol}                  # centering it was built for
     P::Int                                       # element order it was built for (M16)
-    walls::Symbol                                # walls it was built for (AMR-8)
     glue::Symbol                                 # glue mode it was built for (M20)
     operators::Operators
     backend::BK
@@ -780,12 +779,12 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
-        forest, generation, G, centering, P, walls, glue, operators, backend, unify,
+        forest, generation, G, centering, P, glue, operators, backend, unify,
         phase1, phase2, levels, boundaries, boundaryplan, stages, stagegroups,
         stateunify, glueplan, selfimage, stateselfimage,
         parities) where {T,D,R,BK,GRP,BP,ST}
         p1 = findfirst(r -> any(i -> stages[i].tag == PHASE1_TAG, r), stagegroups)::Int
-        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls, glue,
+        return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, glue,
                                        operators,
                                        backend, unify, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
@@ -2545,17 +2544,12 @@ end
 # rank, and the refusal is raised inside `GhostSchedule`'s
 # `collective_checks`. Cell-centered and element sets have no shared
 # points and are not affected. `what` names the caller.
-function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Symbol,
+function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol},
                              what::AbstractString) where {D}
     any(==(:vertex), cs) || return nothing
     why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
           "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
           "(\"Closed blocks\" in CODE.md)"
-    walls === :symmetric && throw(ArgumentError(
-        "$what: walls = :symmetric is refused for $why. Closed blocks make every wall " *
-        "symmetric: an outer wall plane is the block's own on both sides, evolved by " *
-        "default; a wall the boundary hook prescribes is `CellBoundary(…; wall = " *
-        ":prescribed)`. The `walls` keyword goes in M22 step 4."))
     (hasrotating(forest) || ishalfturn(forest)) && throw(ArgumentError(
         "$what: the forest has a rotating seam, which is refused for $why: quarter " *
         "and half turns, and so a RotationPair, come back in M22 step 7."))
@@ -2570,14 +2564,14 @@ has_glue(conn::Patches) = any(e -> e.patch != 0, conn.glue)
 
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
-                  walls=fs.walls, glue=fs.glue, atlas=atlas, T=T,
+                  glue=fs.glue, atlas=atlas, T=T,
                   backend=get_backend(fs.work),
                   parity=something(fs.parity, NTuple{D,Parity}[]))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
                        centering=cellcentered(D), P::Integer=0,
-                       walls::Symbol=:half_open, glue::Symbol=:copy, atlas=nothing,
+                       glue::Symbol=:copy, atlas=nothing,
                        T::Type=R, backend::Backend=CPU(), parity=nothing) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
@@ -2609,10 +2603,9 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
             check_glue_layout(forest.conn, gs, cs, ss)
         end
         check_floattype(T, backend)
-        check_walls(walls)
         # After the refusals above, which keep their own reasons (M22).
-        check_closed_blocks(forest, cs, walls, "GhostSchedule")
-        layout = layouthash(gs, cs, order, walls, Int(operators.family),
+        check_closed_blocks(forest, cs, "GhostSchedule")
+        layout = layouthash(gs, cs, order, Int(operators.family),
                             operators.prolongation,
                             operators.restriction, operators.bounded,
                             operators.vertex_prolongation, glue, operators.glue,
@@ -2776,7 +2769,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     stateselfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol,
                                       axesof; ghosts=ghosts)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
-        forest, generation(forest), ghosts, centers, order, walls, glue, operators,
+        forest, generation(forest), ghosts, centers, order, glue, operators,
         backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups,
         stateunify, glueplan, selfimage, stateselfimage, parity)
 end

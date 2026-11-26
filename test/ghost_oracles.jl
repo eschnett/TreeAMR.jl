@@ -683,58 +683,6 @@ function undefined_ghosts(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
     return nnan, worst
 end
 
-"""
-The owned low wall planes of `fs` that a fill writes under symmetric
-walls (AMR-8), by the oracle's own geometry: every vertex-like dimension
-of every block whose box starts at the domain's non-periodic low face.
-Returns `(b, d)` pairs.
-"""
-function low_wall_planes(fs::FieldSet{T,D}) where {T,D}
-    forest = fs.forest
-    out = Tuple{Int,Int}[]
-    for b in 1:nblocks(fs), d in 1:D
-        fs.centering[d] === :vertex && !forest.periodic[d] || continue
-        block_extent(forest, blockkey(fs, b))[d][1] == forest.extents[d][1] &&
-            push!(out, (b, d))
-    end
-    return out
-end
-
-"""
-[`undefined_ghosts`](@ref) for a set with `walls`: every stored value
-`NaN`, the data written into the owned points, then the owned low wall
-planes a symmetric fill is to write set back to `NaN` before the fill.
-Returns `(nnan, worst, nwalls)`: with `walls = :symmetric` nothing may
-stay `NaN` and every value must be the data, which a wall read before it
-is written would spoil; with `:half_open` the walls are not the fill's,
-and stay `NaN`.
-"""
-function undefined_walls(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
-                         T::Type=Float64, p::Int=4, N::Int=8, walls::Symbol=:symmetric,
-                         backend=CPU(), bounded=false) where {D}
-    forest = faces_forest(kinds; T=T, N=N)
-    f, parity = parity_data(T, kinds, p)
-    ops = Operators(prolongation=p, restriction=p, bounded=bounded)
-    fs = FieldSet{T}(forest, 2; G=ghosts_for(C, p), centering=C, parity=parity,
-                     walls=walls, backend=backend)
-    fill!(fs.work, T(NaN))
-    fill_by_coordinates!(f, fs)
-    work = Array(fs.work)
-    planes = low_wall_planes(fs)
-    for (b, d) in planes
-        sel = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : Colon(), D)
-        work[sel..., :, b] .= T(NaN)
-    end
-    copyto!(fs.work, work)
-    fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
-    work = Array(fs.work)
-    worst = 0.0
-    for b in 1:nblocks(fs), v in 1:2, idx in CartesianIndices(size(work)[1:D])
-        x = coordinates(fs, b, Tuple(idx))
-        worst = max(worst, Float64(abs(work[idx, v, b] - f(x, v))))
-    end
-    return count(isnan, work), worst, length(planes)
-end
 
 """
 How many transfers of each kind the schedule *mirrors* across a
@@ -1739,18 +1687,14 @@ schedule)` after one fill of `NaN`-prefilled storage with the polynomial
 [`halfturn_data`](@ref).
 """
 function undefined_halfturn_ghosts(::Val{D}; plane, other, C, p, T::Type=Float64, N=8,
-                                   walls=:half_open, backend=CPU()) where {D}
+                                   backend=CPU()) where {D}
     forest = halfturn_forest(Val(D); plane=plane, other=other, T=T, N=N)
     f = halfturn_data(D, plane, other; poly=p)
-    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C, walls=walls,
+    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C,
                      halfturn=vector_halfturn(D, plane),
                      parity=vector_parity(D, plane, other), backend=backend)
     fill!(fs.work, T(NaN))
     fill_by_coordinates!(f, fs)
-    # Under symmetric walls the low wall planes are owned but written by
-    # the hook: `NaN` there catches a transfer that reads one before the
-    # hook has written it.
-    walls === :symmetric && poison_low_walls!(fs)
     schedule = GhostSchedule(fs, Operators(prolongation=p, restriction=p))
     fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
     work = Array(fs.work)
@@ -1763,34 +1707,6 @@ function undefined_halfturn_ghosts(::Val{D}; plane, other, C, p, T::Type=Float64
         end
     end
     return nnan, worst, schedule
-end
-
-# Along which dimensions a set with symmetric walls (AMR-8) had its owned
-# low wall plane written by the fill: every vertex-like dimension whose low
-# face has no block across it. The package's own version went with closed
-# blocks (M22), which refuse `walls = :symmetric` for such a set; a
-# cell-like dimension has no wall plane.
-oracle_lowwalls(forest::Forest{D}, k, c::NTuple{D,Int}, symmetric::Bool) where {D} =
-    ntuple(d -> symmetric && c[d] == 1 &&
-                isempty(neighbor_keys(forest, k, ntuple(e -> e == d ? -1 : 0, D))), D)
-
-"""
-Set the owned low wall planes of a set with symmetric walls to `NaN`:
-plane `G + 1` along every vertex-like dimension whose low face is a face
-of the domain, in the blocks on it.
-"""
-function poison_low_walls!(fs::FieldSet{T,D}) where {T,D}
-    c = staggers(fs.centering)
-    work = fs.work
-    for b in 1:nblocks(fs)
-        walls = oracle_lowwalls(fs.forest, blockkey(fs, b), c, true)
-        for d in 1:D
-            walls[d] || continue
-            idx = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : (:), D)
-            work[idx..., :, b] .= T(NaN)
-        end
-    end
-    return fs
 end
 
 """
@@ -1823,16 +1739,16 @@ hook from the same formula. Returns [`compare_matching_blocks`](@ref)'s
 `(worst, npoints)`, or `nothing`.
 """
 function halfturn_vs_doubled(::Val{D}; plane, centering::NTuple{D,Symbol},
-                             other=:periodic, N=8, p=4, walls=:half_open,
+                             other=:periodic, N=8, p=4,
                              ops=Operators(prolongation=p, restriction=p)) where {D}
     half = halfturn_forest(Val(D); plane=plane, other=other, N=N)
     full = halfturn_forest(Val(D); plane=plane, other=other, N=N, full=true)
     G = ghosts_for(centering, p)
     f = halfturn_data(D, plane, other)
     parity = vector_parity(D, plane, other)
-    fsh = FieldSet(half, D + 1; G=G, centering=centering, parity=parity, walls=walls,
+    fsh = FieldSet(half, D + 1; G=G, centering=centering, parity=parity,
                    halfturn=vector_halfturn(D, plane))
-    fsf = FieldSet(full, D + 1; G=G, centering=centering, parity=parity, walls=walls)
+    fsf = FieldSet(full, D + 1; G=G, centering=centering, parity=parity)
     for fs in (fsh, fsf)
         fill!(fs.work, NaN)
         fill_by_coordinates!(f, fs)

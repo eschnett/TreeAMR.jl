@@ -1255,10 +1255,9 @@ order, so that data equal to `f` come back as `f(x_g)` bit for bit.
 
 `x_r` is the ghost's point clamped, along each component of its region's
 direction that leaves the domain through an outer face, onto the block's
-last evolved point there: `G + N` on the high side — the shared high
-plane of a vertex-like dimension counts as a ghost — and `G + 1` on the
-low side, or `G + 2` for a set with symmetric walls, whose low wall
-plane the fill writes. Along every other component the point keeps the
+wall: `G + N + 1` on the high side of a vertex-like dimension, `G + N`
+of a cell-like one, and `G + 1` on the low side — the wall plane of a
+vertex-like dimension is the block's own on both sides (M22). Along every other component the point keeps the
 ghost's own index: in a corner region beyond an outer face along one
 dimension and across another block's face along another, `x_r` is the
 block's own ghost there, filled from the neighbour — never the block's
@@ -1791,10 +1790,6 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "for P = $(schedule.P) ($(schedule.P == 0 ? "no elements" : "elements")); " *
         "every node position and element stencil in it is wrong for this layout. " *
         "Build one with `GhostSchedule(fs, operators)`."))
-    fs.walls === schedule.walls || throw(ArgumentError(
-        "the field set has walls = :$(fs.walls) but this schedule was built for " *
-        ":$(schedule.walls); the target ranges at a low domain face differ between " *
-        "the two. Build one with `GhostSchedule(fs, operators)`."))
     schedule.parities === nothing || isempty(schedule.parities) ||
         schedule.parities == fs.parity ||
         throw(ArgumentError(

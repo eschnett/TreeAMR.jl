@@ -261,24 +261,12 @@ a fine block must cover whole parent elements; and a forest with a
 rotating seam. It is stored as the field `P`, `0` for a set that is not
 element-centered.
 
-`walls` says how a vertex-like dimension's two wall planes are filled at
-the domain's non-periodic faces (TreeGRRMHD's AMR-8). Ownership is
-half-open, so along a vertex-like dimension the domain's *high* wall plane
-`G+N+1` belongs to nobody and the fill derives it — by the boundary hook
-at an outer face, by the reflection at a reflecting one, by the clamp at
-an outflow one — while the *low* wall `G+1` is owned and evolved. With
-`walls = :half_open`, the default, that is what happens. With
-`walls = :symmetric` the fill also writes the owned low wall plane of
-every vertex-like dimension at a low domain face, by the rule the high
-wall gets at a high face of that kind: the hook's low region becomes
-`1 … G+1`, a reflecting face derives the wall as the high one is derived,
-and an outflow face clamps it with the ghosts beyond it from the nearest
-evolved point `G+2`. A closed box is then mirror-symmetric, which it is
-not under half-open walls. The wall stays an owned point — the state
-vector does not change — so an application that wants the filled value in
-its state gathers it after the fill. A cell-like dimension has no wall
-plane and is unaffected. See "Shared points and half-open ownership"
-under "Centerings" in `CODE.md`.
+At a face of the domain both wall planes of a vertex-like dimension are
+the block's own (M22, "Closed blocks" in `CODE.md`): evolved, with the
+boundary hook filling the ghosts beyond at an outer face, the mirror at
+a reflecting one and the clamp onto the wall at an outflow one, alike on
+both sides, so a closed box is mirror-symmetric. A cell-like dimension has
+no wall plane.
 
 `glue` says how the set's ghosts across a glued face of a forest of
 patches are filled (M20). With `glue = :copy`, the default, they are
@@ -342,8 +330,7 @@ block slots and rebuilds the storage.
     FieldSet(forest, nvars; G)          # element type = floattype(forest)
     FieldSet{Float32}(forest, nvars; G = (2, 0))
     FieldSet(forest, nvars; G = 0, centering = facecentered(3, 1))
-    FieldSet(forest, nvars; G = 1, centering = edgecentered(3, 1),
-             walls = :symmetric)
+    FieldSet(forest, nvars; G = 1, centering = edgecentered(3, 1))
     FieldSet{Float32}(forest, nvars; G = 2, backend = CUDABackend())
     FieldSet(octant, 4; G = 2,          # ρ, and a vector (vx, vy, vz)
              parity = [EvenParity, (OddParity, EvenParity, EvenParity),
@@ -383,9 +370,6 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # other: what every position, weight and element stencil of the set
     # is built from, so it is passed explicitly wherever those are.
     const P::Int
-    # `:half_open` or `:symmetric`: whether the fill also writes the
-    # owned low wall plane of a vertex-like dimension (AMR-8).
-    const walls::Symbol
     # `:copy` or `:interpolate`: how ghosts across a glued face are
     # filled (M20).
     const glue::Symbol
@@ -434,10 +418,9 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D), P=nothing,
                      parity=nothing, rotation=nothing, halfturn=nothing,
-                     walls::Symbol=:half_open, glue::Symbol=:copy,
+                     glue::Symbol=:copy,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
-    check_walls(walls)
     check_glue(glue)
     G === nothing && throw(ArgumentError(
         "FieldSet has no default ghost width: pass `G` explicitly. It follows " *
@@ -482,19 +465,13 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # in `zerofill!` below.
     zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, order,
-                                        walls, glue, parities, rotations, halfturns, factors,
+                                        glue, parities, rotations, halfturns, factors,
                                         rotvars, work, nothing)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
 
 staggers(fs::FieldSet) = staggers(fs.centering)
-
-check_walls(walls::Symbol) =
-    walls === :half_open || walls === :symmetric || throw(ArgumentError(
-        "walls must be :half_open (the owned low wall plane of a vertex-like " *
-        "dimension is evolved, the high one filled) or :symmetric (both are " *
-        "filled at the domain's faces), got :$walls"))
 
 check_glue(glue::Symbol) =
     glue === :copy || glue === :interpolate || throw(ArgumentError(
@@ -833,10 +810,6 @@ function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
         "dimensions, so every set turns into itself and fills its ghosts alone"))
     d1, d2 = rotating_dims(forest)
     swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
-    a.walls === b.walls || throw(ArgumentError(
-        "the two sets of a RotationPair must fill their walls alike, since each " *
-        "reads the other's points beside them: got walls = :$(a.walls) and " *
-        ":$(b.walls)"))
     (a.G == swap(b.G) && a.centering == swap(b.centering)) || throw(ArgumentError(
         "the two sets of a RotationPair must have each other's layout with the " *
         "seam's dimensions $d1 and $d2 exchanged, since a quarter turn of one is the " *

@@ -89,7 +89,7 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
             "the field set that holds the face quantity, whose centering is vertex-like " *
             "in the face dimension (`facecentered($D, d)`), not over the cell-centered " *
             "state."))
-        check_closed_blocks(forest, fs.centering, fs.walls, "UnifySchedule")
+        check_closed_blocks(forest, fs.centering, "UnifySchedule")
         return nothing, layouthash(ghosts, fs.centering, T, nameof(typeof(backend)))
     end
     # This rank's blocks, in global leaf indices, as in `GhostSchedule`.

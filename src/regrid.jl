@@ -939,7 +939,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, fs.glue,
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.glue,
                    eltype(fs.work), nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
@@ -957,9 +957,6 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "the field set has element order P = $(fs.P) but its schedule was built for " *
         "P = $(sched.P); the transfer's stencils follow from the element order, so " *
         "pair each field set with its own schedule"))
-    fs.walls === sched.walls || throw(ArgumentError(
-        "the field set has walls = :$(fs.walls) but its schedule was built for " *
-        ":$(sched.walls); pair each field set with its own schedule"))
     fs.glue === sched.glue || throw(ArgumentError(
         "the field set has glue = :$(fs.glue) but its schedule was built for " *
         ":$(sched.glue); pair each field set with its own schedule"))

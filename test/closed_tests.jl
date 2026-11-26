@@ -528,6 +528,29 @@ mirror_parity(kinds) = [ntuple(_ -> EvenParity, length(kinds)),
     end
 end
 
+@pending 6 "A closed box stays mirror-symmetric through a regrid that refines every block: D=$D" for
+        D in (1, 2, 3)
+    # Guards a regrid transfer with a direction-dependent rule (walls_tests'
+    # claim, on closed blocks): a regrid that refines every block keeps the
+    # box uniform, and the fill after it symmetric to rounding, a
+    # prolongation summing its window in mirrored order on the two sides.
+    L = D == 1 ? 3 : 2
+    f = point_symmetric(D, L)
+    ops = Operators(prolongation=4, restriction=4)
+    for kinds in mirror_boxes(D), C in closed_centerings(D)
+        forest = faces_forest(kinds; N=8, refined=false)
+        fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C,
+                      parity=any(==(:reflect_both), kinds) ? mirror_parity(kinds) : nothing)
+        hook = boundary_by_coordinates(f)
+        fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops); boundary=hook)
+        regrid!(forest, fs => GhostSchedule(fs, ops); flags=fill(Refine, nleaves(forest)),
+                boundary=hook)
+        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=hook)
+        err, n = point_mirror_error(fs, L)
+        @test n > 0 && err <= 64 * eps() * maximum(abs, fs.work)
+    end
+end
+
 # Every own point of `fs` on a reflecting wall plane of a vertex-like
 # dimension, as `(block, stored index)`.
 function mirror_plane_points(fs::FieldSet{T,D}) where {T,D}
@@ -965,12 +988,9 @@ end
     @test_throws "M22 step 7" GhostSchedule(FieldSet(quad, 1; G=1,
                                                      centering=vertexcentered(2),
                                                      rotation=(1,)), ops)
-    @test_throws "M22 step 4" GhostSchedule(FieldSet(uniform, 1; G=1,
-                                                     centering=vertexcentered(2),
-                                                     walls=:symmetric), ops)
-    @test_throws "wall = :prescribed" GhostSchedule(FieldSet(uniform, 1; G=1,
-                                                             centering=vertexcentered(2),
-                                                             walls=:symmetric), ops)
+    # `walls` is gone (M22 step 4): every wall is symmetric on closed blocks.
+    @test_throws MethodError FieldSet(uniform, 1; G=1, centering=vertexcentered(2),
+                                      walls=:symmetric)
     # Cell-centered sets are not affected.
     @test GhostSchedule(FieldSet(two, 1; G=1), ops) isa GhostSchedule
     @test GhostSchedule(FieldSet(walled, 1; G=1, parity=[EvenParity]), ops) isa GhostSchedule
