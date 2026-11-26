@@ -5412,7 +5412,7 @@ M12 was decided with Erik, after M7 and before M9b.
   each point once and a right-hand side skipping the secondaries are
   the same query, and that the first cannot wait; the design had put
   the second off as an optimization. So the primary mask is one
-  mechanism with both uses, built in step 1, and what is left to the
+  mechanism with both uses, built with the layout, and what is left to the
   measurement is only whether `map_blocks!` skips by itself, by launch
   range. Writing that out showed a gap in the prescribed wall: written
   on every copy after stage 0, a relative hook's coarse and fine copies
@@ -5428,6 +5428,20 @@ M12 was decided with Erik, after M7 and before M9b.
   showed that their kernels form positions themselves, from
   `block_origins` and `block_spacings`, so the rule reaches them only
   through a public `nodeposition` and two more per-block arrays.
+- *The steps revised before any code (2026-11-25).* Asked whether the
+  plan was enough for the implementation to start, the answer was that
+  the design was and the steps were not, in three ways, and Erik had
+  them revised. The first step bundled positions, the layout and the
+  fill; positions are independent and became a step of their own, on
+  `main`. Removing half-open ownership at once breaks every wall, seam,
+  glue and coarse-fine test until its step, and the plan had not said
+  how the suite stays green; it now has an integration branch, a
+  refusal for what is not rebuilt yet, and testsets pending by step.
+  And the measurement that settles the fill's partition came sixth,
+  after everything built on it; it moved to the first point at which
+  `bench/nested.jl`'s reflecting octant fills, after walls, with
+  regridding, seams and glues behind it. Each step now starts with a
+  written plan that settles what the design leaves to the implementer.
 - *What made closed ownership acceptable now.* M8 rejected it because
   two copies at a coarse-fine face see different ghosts and drift, and
   repairing that needed an exchange of `du`. The fill unifying `u`

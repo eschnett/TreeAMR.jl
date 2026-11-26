@@ -760,12 +760,12 @@ What stage 0 costs: in a uniform region it moves exactly the points
 phase 1 moves today as the first plane of every high region, so the
 fill copies the same number of points as before. What is new is a
 stage — in 3D about 7 groups of launches per level beside 26 — and a
-message round. **(open)** Whether that shows on the nested mesh at four ranks
-and on an H200 is to be measured before the partition is settled
-(`bench/nested.jl`, `bench/copies.jl`, `bench/mpi.jl`); the fallback is
-to merge stage 0 into phase 1, every transfer reading primaries only,
-at the price of target ranges that depend on who is primary around a
-block.
+message round. **(open)** Whether that shows on the nested mesh at four
+ranks and on an H200 is measured in M22's step 5, before regridding,
+seams and glues are built on the partition (`bench/nested.jl`,
+`bench/copies.jl`); the fallback is to merge stage 0 into phase 1,
+every transfer reading primaries only, at the price of target ranges
+that depend on who is primary around a block.
 
 **Walls.** A reflecting face mirrors the ghosts about the wall plane,
 `j* = 2(G+1) − j` below and `2(G+N+1) − j` above, and the wall is the
@@ -847,7 +847,7 @@ lowest patch. It has two uses, and they are the same query:
 **(open)** Whether `map_blocks!` should skip by itself, launching each
 block over the range of its primaries rather than testing per point —
 whole planes and whole rows, which is the form an explicitly vectorized
-kernel can use — is for the measurement of M22's step 6.
+kernel can use — is for the measurement of M22's step 5.
 
 **Invariants.** The high exchange region is `G` points, as the low one
 is, so its condition is `N ≥ 2G` in every dimension; whether anything
