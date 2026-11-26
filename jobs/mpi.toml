@@ -49,6 +49,7 @@ resources = { nodes = 4 }
 [site.trillium]                     # four nodes of 192 cores in 8 NUMA domains
 time = "1:00:00"
 resources = { nodes = 4 }
+queue = "compute"                   # not `debug`, which the rule picks first and is too short for the job
 
 [site.fir]                          # four nodes of 192 cores in 8 NUMA domains
 time = "1:00:00"
