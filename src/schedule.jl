@@ -1352,26 +1352,10 @@ childoffset(k::MortonKey{D}) where {D} = ntuple(d -> Int(k.coords[d]) & 1, D)
 # in the order the blocks were walked.
 const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 
-# The neighbor search for a single block: every transfer its ghosts
-# need, appended to `pairs`, plus the regions that face out of the
-# domain and so belong to the boundary hook instead. Depends on the tree
-# alone, which is what makes it the part that threads — each task owns
-# its own `pairs` and `boundaries`.
-#
-# Across a rotating seam (M12) the search returns the real leaves with
-# their orientation `r`, and a transfer is recorded as the target sees
-# it, in the *virtual* frame: a finer source's child offset is turned
-# into its virtual one, and `r` goes into the key, which the kernel reads
-# the real source by. Across a glued face (M17) the same, with the glue's
-# index in the key in place of `r`. A region whose image leaves through
-# an outer face is the hook's, as any other such region is; one that
-# crosses two glued faces at once, a patch corner, finds no neighbor
-# either, and `check_patch_corners` has refused every layout that has
-# one before the search begins.
 # The ghosts in direction `δ` of leaf `k`, whose neighbour there, global
-# leaf `coarse`, is coarser, split where M22's rule 1 asks (the review's
-# amendment of step 3's ghost stages): every stored copy of a point takes
-# the value of the finest level holding it. Along a tangential
+# leaf `coarse`, is coarser, split where M22's rule 1 asks ("Closed
+# blocks" in CODE.md): every stored copy of a point takes the value of
+# the finest level holding it. Along a tangential
 # vertex-like dimension `d` (`δ_d = 0`) the ghost region spans the
 # block's closed range, and its face-plane rows lie on the extension of
 # the block's face planes, where a block across `δ ± e_d` may hold them as
@@ -1470,6 +1454,22 @@ function ghost_plane_parts(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}
     return parts
 end
 
+# The neighbor search for a single block: every transfer its ghosts
+# need, appended to `pairs`, plus the regions that face out of the
+# domain and so belong to the boundary hook instead. Depends on the tree
+# alone, which is what makes it the part that threads — each task owns
+# its own `pairs` and `boundaries`.
+#
+# Across a rotating seam (M12) the search returns the real leaves with
+# their orientation `r`, and a transfer is recorded as the target sees
+# it, in the *virtual* frame: a finer source's child offset is turned
+# into its virtual one, and `r` goes into the key, which the kernel reads
+# the real source by. Across a glued face (M17) the same, with the glue's
+# index in the key in place of `r`. A region whose image leaves through
+# an outer face is the hook's, as any other such region is; one that
+# crosses two glued faces at once, a patch corner, finds no neighbor
+# either, and `check_patch_corners` has refused every layout that has
+# one before the search begins.
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},

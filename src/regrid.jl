@@ -798,11 +798,11 @@ end
 # lower. Every other pair already agrees. Created beside created: each
 # child's stencils read its parent's copy of the plane and the parent's
 # ghosts along it, and the fill before the regrid gives every stored copy
-# of a point the value of the finest level holding it (the review's
-# amendment of the ghost stages, `ghost_plane_parts`), so both parents
-# read the same values through the same weights. A created fine block
-# beside a kept coarser one is the finer, so the primary; a created
-# coarse block beside a kept finer one has the secondary. The pass reads the old storage, as the first
+# of a point the value of the finest level holding it
+# (`ghost_plane_parts`), so both parents read the same values through
+# the same weights. A created fine block beside a kept coarser one is
+# the finer, so the primary; a created coarse block beside a kept finer
+# one has the secondary. The pass reads the old storage, as the first
 # stage does, so it runs after it, into the same fresh array; its
 # targets are disjoint sub-pieces, each from one source, so its groups
 # never write the same point.
