@@ -421,18 +421,21 @@ function closed_values(fs::FieldSet{T,D}) where {T,D}
 end
 
 """
-The interface restriction computed by hand, as `(block, stored index) =>
-expected value` for every point it should touch.
+The coarse copies `unify!` restricts, computed by hand, as `(block, stored
+index) => expected value` (M22 rule 1).
 
-For every block, every vertex-like dimension and both sides,
-`neighbor_keys` says whether the neighbours across that face are finer;
-where they are, the block's boundary plane must come back as the average
-of the coincident fine values. *Which* fine values those are is decided
-by position and nothing else — a cell-like tangential dimension
+An own point of a block on one of its face planes along a vertex-like
+dimension is the coarse copy of a finer one wherever a block one level
+finer holds the point in its closed box — across a face, an edge or a
+corner, a diagonal finer block's included. Its value must come back as
+the average of the coincident fine values: a cell-like dimension
 contributes the two fine points half a fine spacing to either side, a
-vertex-like one the single coincident point — from the exact rational
-geometry of [`exact_point`](@ref), never from the package's stencils or
-target ranges.
+vertex-like one the single coincident point. Which points those are is
+decided by position and nothing else, from the exact rational geometry
+of [`exact_point`](@ref) and [`leafbox`](@ref), never from the package's
+stencils or target ranges. Same-level secondaries, which `unify!` also
+writes, are not listed: on data from [`arbitrary_value`](@ref) they keep
+their value.
 
 `values` is [`closed_values`](@ref) of the *pristine* field set, taken
 before the restriction runs.
@@ -441,54 +444,51 @@ function interface_targets(fs::FieldSet{T,D}, values) where {T,D}
     forest = fs.forest
     N, G, c = forest.N, fs.G, staggers(fs)
     wrap(d, x) = forest.periodic[d] ? mod(x, forest.roots[d]) : x
+    boxes = Dict(l => [leafbox(forest, k) for k in forest.leaves if level(k) == l]
+                 for l in unique(level.(forest.leaves)))
+    holds((lo, hi), p) = all(1:D) do d
+        any(x -> lo[d] <= x <= hi[d],
+            forest.periodic[d] ? (p[d], p[d] + forest.roots[d]) : (p[d],))
+    end
     out = Dict{Tuple{Int,NTuple{D,Int}},Vector{T}}()
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         l = level(k)
+        haskey(boxes, l + 1) || continue
         half = 1 // (2 * N * (1 << (l + 1)))        # half a fine spacing, in root cells
-        for d in 1:D
-            c[d] == 1 || continue
-            for s in (-1, 1)
-                δ = ntuple(e -> e == d ? s : 0, D)
-                nbrs = neighbor_keys(forest, k, δ)
-                (isempty(nbrs) || level(first(nbrs)) <= l) && continue
-                # 2:1 balance, so the finer side is exactly one level down.
-                @assert all(nbr -> level(nbr) == l + 1, nbrs)
-                plane = s == 1 ? G[d] + N + 1 : G[d] + 1
-                rng = ntuple(e -> e == d ? (plane:plane) :
-                             ((G[e] + 1):(G[e] + N + c[e])), D)
-                shifts = Iterators.product(ntuple(e -> (e != d && c[e] == 0) ?
-                                                  (-1, 1) : (0,), D)...)
-                for idx in CartesianIndices(rng)
-                    p = exact_point(fs, b, Tuple(idx))
-                    acc = zeros(T, fs.nvars)
-                    n = 0
-                    for sh in shifts
-                        q = ntuple(e -> wrap(e, p[e] + sh[e] * half), D)
-                        acc .+= values[(l + 1, q)]
-                        n += 1
-                    end
-                    out[(b, Tuple(idx))] = acc ./ n
-                end
+        shifts = Iterators.product(ntuple(e -> c[e] == 0 ? (-1, 1) : (0,), D)...)
+        for idx in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D))
+            I = Tuple(idx)
+            any(d -> c[d] == 1 && (I[d] == G[d] + 1 || I[d] == G[d] + N + 1), 1:D) ||
+                continue
+            p = exact_point(fs, b, I)
+            any(bx -> holds(bx, p), boxes[l + 1]) || continue
+            acc = zeros(T, fs.nvars)
+            n = 0
+            for sh in shifts
+                q = ntuple(e -> wrap(e, p[e] + sh[e] * half), D)
+                acc .+= values[(l + 1, q)]
+                n += 1
             end
+            out[(b, I)] = acc ./ n
         end
     end
     return out
 end
 
 """
-How many times each phase of an [`InterfaceSchedule`](@ref) writes each
-stored point: one count array per phase, in phase order.
+How many times the one stage of a [`UnifySchedule`](@ref) writes each
+stored point, as a one-element vector of count arrays.
 
-A phase must write every target exactly once — the fixup overwrites a
-block's own computed values, so a double write would make the result
-depend on which of two fine sources landed last.
+The stage must write every target exactly once — it overwrites a block's
+own computed values, so a double write would make the result depend on
+which of two sources landed last.
 """
-function interface_write_counts(isched::InterfaceSchedule{T,D}) where {T,D}
+function interface_write_counts(isched::UnifySchedule{T,D}) where {T,D}
     forest = isched.forest
     c = staggers(isched.centering)
     stored = ntuple(d -> forest.N + 2 * isched.G[d] + c[d], D)
-    return map(isched.phases) do groups
+    return map([isched.unify]) do groups
         counts = zeros(Int, stored..., nleaves(forest))
         for group in groups
             blen = boxsize(group)
@@ -505,13 +505,13 @@ function interface_write_counts(isched::InterfaceSchedule{T,D}) where {T,D}
 end
 
 """
-Every `(block, stored index)` an [`InterfaceSchedule`](@ref) writes and
-every one it reads, as two sets over all phases.
+Every `(block, stored index)` a [`UnifySchedule`](@ref) writes and every
+one it reads, as two sets.
 """
-function interface_touches(isched::InterfaceSchedule{T,D}) where {T,D}
+function interface_touches(isched::UnifySchedule{T,D}) where {T,D}
     targets = Set{Tuple{Int,NTuple{D,Int}}}()
     sources = Set{Tuple{Int,NTuple{D,Int}}}()
-    for groups in isched.phases, group in groups
+    for group in isched.unify
         blen = boxsize(group)
         tfirst = ntuple(d -> group.stencils[d].targetfirst, D)
         srcstart = ntuple(d -> group.stencils[d].srcstart, D)

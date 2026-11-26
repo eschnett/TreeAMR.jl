@@ -97,7 +97,7 @@ end
     # What the serial reference prints while M22 is built: the cases
     # pending until a later step print one comment line each instead
     # (`pending_case`), and the regrids left are those of M32x2-.
-    NPENDING, NREGRIDS, NUNCHANGED = 21, 8, 1
+    NPENDING, NREGRIDS, NUNCHANGED = 20, 8, 1
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -120,11 +120,12 @@ end
     @test count(startswith("packages "), lines) == 1
     @test !occursin(r" (Test|OrdinaryDiffEq\w*|IMEXRungeKutta)( |$)",
                     only(filter(startswith("# packages "), lines)))
-    @test count(l -> occursin(" state ", l), lines) >= 6   # 7 with B2 (M22)
+    @test count(l -> occursin(" state ", l), lines) >= 7
     @test count(l -> occursin(" filled ", l), lines) >= 13
-    # Burgers' fixup (B2), the regrid cycles (TP, BR, A2, M) and the ranks
-    # without blocks (E2) are pending until M22 steps 3 and 6, and so is
-    # what they assert: B2 and BR conserved, the regrid count, A2 converged.
+    @test any(l -> startswith(l, "B2 conserved true"), lines)
+    # The regrid cycles (TP, BR, A2, M) and the ranks without blocks (E2)
+    # are pending until M22 step 6, and so is what they assert: BR
+    # conserved, the regrid count, A2 converged.
     @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == NREGRIDS
     @test count(l -> occursin(" unchanged false", l), lines) == NUNCHANGED
     # Point interpolation (step 5): every point answered, some flagged.
@@ -233,7 +234,7 @@ end
         @test "# verbs agree on every rank true" in hashes
         @test startswith(refused("interface diverged"),
                          "# interface diverged refused on $n of $n ranks: the forest " *
-                         "differs between ranks, so InterfaceSchedule is refused")
+                         "differs between ranks, so UnifySchedule is refused")
         # regrid!'s checks are agreed in the digest gather (step 4): a bad
         # flag box on rank 1, a flag vector of the wrong length on rank 0,
         # another `buffer` on rank 1, a forest refined on rank 1.

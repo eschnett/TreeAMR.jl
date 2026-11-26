@@ -140,7 +140,7 @@ end
     @test all(r -> abs(r - 2) ≤ 0.15, rates)
 end
 
-@pending 3 "Burgers conserves mass to roundoff through IMEXRungeKutta's SSPRK33, by owner: D=$D" for
+@testset "Burgers conserves mass to roundoff through IMEXRungeKutta's SSPRK33, by owner: D=$D" for
         D in (1, 2)
     # M8b's claim on a static two-level mesh, past the breaking time: a
     # shock crosses the coarse-fine faces. It holds for any Runge–Kutta
@@ -169,7 +169,7 @@ end
     @test control.drift > 1e8 * r.drift
 end
 
-@pending 3 "Only the step limiter's correction reaches the conserved total: D=$D" for
+@testset "Only the step limiter's correction reaches the conserved total: D=$D" for
         D in (1, 2)
     # IMEXRungeKutta limits a stage value only for `f_exp!` to read and
     # builds the next stage from `uⁿ` and the tendencies, so a stage

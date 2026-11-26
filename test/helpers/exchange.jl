@@ -2,7 +2,7 @@
 # on its own: every test process includes all of `helpers/` ("Parallel
 # groups" in CODE.md).
 
-using TreeAMR: PHASE1_TAG, prolongation_tag, interface_tag, ntransfers, boxsize,
+using TreeAMR: PHASE1_TAG, UNIFY_TAG, prolongation_tag, ntransfers, boxsize,
                stagebuffers, segment_ranges, pack_stage!, unpack_stage!, run_phase!,
                apply_boundary!, exchange_ghosts!, exchange_interfaces!, leafowner,
                remote_neighbors, equalsplit_part, ntarget
@@ -306,7 +306,7 @@ function lockstep_interfaces(serial::Forest{D}, P, C, G, ::Type{T};
                       backend=backend)
     data = exchange_data(MersenneTwister(seed), T, size(sfs.work))
     copyto!(sfs.work, data)
-    restrict_interfaces!(sfs, InterfaceSchedule(sfs))
+    unify!(sfs, UnifySchedule(sfs))
     reference = Array(sfs.work)
     sets, scheds = [], []
     for r in 0:(P - 1)
@@ -315,7 +315,7 @@ function lockstep_interfaces(serial::Forest{D}, P, C, G, ::Type{T};
                          backend=backend)
         copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
         push!(sets, fs)
-        push!(scheds, InterfaceSchedule(fs))
+        push!(scheds, UnifySchedule(fs))
     end
     bad = lockstep!(sets, scheds, backend)
     nremote = sum(s -> sum(st -> st.remote === nothing ? 0 : length(st.remote.recvlayout),

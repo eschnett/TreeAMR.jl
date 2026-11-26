@@ -58,7 +58,7 @@ export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_
 export firing_boxes
 
 # Conservation at coarse-fine faces (M8)
-export InterfaceSchedule, restrict_interfaces!
+export UnifySchedule
 
 # The all-variables form of the coordinate callbacks (for TreeHydro)
 export AllVariables, WithPatch, Relative
@@ -97,8 +97,8 @@ include("storage.jl")
 include("operators.jl")
 include("glue.jl")
 include("schedule.jl")
+include("unify.jl")
 include("ghosts.jl")
-include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
 include("interpolate.jl")

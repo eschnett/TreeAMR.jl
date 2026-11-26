@@ -590,12 +590,12 @@ end
     broken = patch_ring(4, (2, 1))
     refine!(broken, broken.leaves[3])
     fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
-    @test_throws "not across a glue" InterfaceSchedule(fx)
-    @test_throws "this is a bug" InterfaceSchedule(fx)
+    @test_throws "not across a glue" UnifySchedule(fx)
+    @test_throws "this is a bug" UnifySchedule(fx)
     # Balanced, the same forest has coarse-fine faces inside its patches only.
     balance!(broken)
     fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
-    @test InterfaceSchedule(fx) isa InterfaceSchedule
+    @test UnifySchedule(fx) isa UnifySchedule
 end
 
 # --- The patch as a number (step 5) -------------------------------------------

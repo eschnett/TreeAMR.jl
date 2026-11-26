@@ -111,8 +111,7 @@ end
 transfers(forest, s::GhostSchedule) =
     transfers(forest, [s.unify; s.phase1; reduce(vcat, s.phase2; init=eltype(s.phase1)[])],
               s.stages)
-transfers(forest, s::InterfaceSchedule) =
-    transfers(forest, reduce(vcat, s.phases; init=eltype(eltype(s.phases))[]), s.stages)
+transfers(forest, s::UnifySchedule) = transfers(forest, s.unify, s.stages)
 
 # The reductions of one variable: exact ones as they are, sums marked.
 # A sum or a count takes each point once, at its primary, and a maximum
@@ -284,8 +283,8 @@ function fill_case(tag, forest::Forest{D}, centerings; G, ops,
         emit(tag, name, "transfers", transfers(forest, sched))
         emit(tag, name, "filled", digest(gathered(forest, fs.work)))
         any(==(:vertex), C) || continue
-        isched = InterfaceSchedule(fs)
-        restrict_interfaces!(fs, isched)
+        isched = UnifySchedule(fs)
+        unify!(fs, isched)
         emit(tag, name, "interfaces", transfers(forest, isched))
         emit(tag, name, "restricted", digest(gathered(forest, fs.work)))
     end
@@ -459,8 +458,8 @@ function burgers_rhs!(du, u, state, fluxes, sched, ischeds, spacings, ::Val{D},
     fill_ghosts!(state, sched)
     ntuple(Val(D)) do d
         map_blocks!(flux_kernel!, fluxes[d], fluxes[d].work, state.work, Val(D),
-                    Val(GU), Val(GF), Val(d); closed=true)
-        restrict_interfaces!(fluxes[d], ischeds[d])
+                    Val(GU), Val(GF), Val(d))
+        unify!(fluxes[d], ischeds[d])
         nothing
     end
     map_blocks!(divergence_kernel!, state, statearray(du, state),
@@ -474,7 +473,7 @@ function burgers_case(tag, forest::Forest{D}; G, ops, steps) where {D}
     fill_by_coordinates!(initial, state)
     sched = GhostSchedule(state, ops)
     fluxes = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d)), D)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
     emit(tag, "transfers", transfers(forest, sched))
     for d in 1:D
@@ -637,7 +636,7 @@ function burgers_regrid_case(tag; cycles, steps)
         after = total_mass(state, 1)
         conserved &= abs(after - before) <= 1e-13 * abs(before)
         sched = GhostSchedule(state, OPSC)
-        ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+        ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
         u = statevector(state)
         gather!(u, state)
         spacings = block_spacings(forest)
@@ -885,7 +884,7 @@ function empty_rank_case(tag)
 
     vfs = FieldSet(forest, 2; G=0, centering=vertexcentered(D), parity=EMPTY_PARITY)
     pseudorandom!(vfs)
-    restrict_interfaces!(vfs, InterfaceSchedule(vfs))
+    unify!(vfs, UnifySchedule(vfs))
     emit(tag, "restricted", digest(gathered(forest, vfs.work)))
 
     # Rank 0 asks for every point, beyond the wall too; the others for none.
@@ -1353,12 +1352,11 @@ function refusals()
                                          Operators(prolongation=2, restriction=2)))
     emit("# partial refused on", n, "of", NRANKS, "ranks:", msg)
 
-    # A diverged forest is refused by the interface schedule too: refined
-    # everywhere on rank 0, so that it has one level there, as a flux set
-    # needs on closed blocks until M22 step 3.
+    # A diverged forest is refused by the unify schedule too: refined
+    # everywhere on rank 0 only.
     forest = Forest((4, 4); N=8, comm=COMM)
     RANK == 0 && refine!(forest, copy(forest.leaves))
-    n, msg = attempt(() -> InterfaceSchedule(FieldSet(forest, 1; G=0,
+    n, msg = attempt(() -> UnifySchedule(FieldSet(forest, 1; G=0,
                                                       centering=facecentered(2, 1))))
     emit("# interface diverged refused on", n, "of", NRANKS, "ranks:", msg)
 
@@ -1548,7 +1546,8 @@ function main()
                                centre=(0.4, 0.5)); G=2,
               centering=cellcentered(2), ops=OPS4, steps=6, parity=parity)
     # Burgers' equation with the fixup at coarse-fine faces.
-    pending_case("B2 burgers", 3)
+    burgers_case("B2", forest_of((4, 4), 8; periodic=(true, true), centre=(1.6, 2.3));
+                 G=2, ops=OPSC, steps=4)
     # Every centering through one fill.
     fill_case("F2", forest_of((3, 3), 8; periodic=(true, false),
                               reflecting=((false, false), (true, true)),

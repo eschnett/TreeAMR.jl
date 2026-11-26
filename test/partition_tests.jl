@@ -145,7 +145,22 @@ end
         end
         @test crossing > 0            # so the filter had something to drop
     end
-    pending(3, "rank interface schedules, D=$D")
+    # The unify schedule the same way, over a face-centered flux, on the
+    # same refinement with outer faces for the reflecting ones (a closed
+    # set at a reflecting face comes back in M22 step 4).
+    serial = faces_forest(map(k -> k === :periodic ? :periodic : :outer, kinds); N=8)
+    flux(forest) = FieldSet(forest, 1; G=0, centering=facecentered(D, 1),
+                            parity=[EvenParity])
+    sisched = UnifySchedule(flux(serial))
+    sinterfaces = transfer_set(schedule_groups(sisched), 0)
+    @test !isempty(sinterfaces)
+    for P in (2, 3), r in 0:(P - 1)
+        forest = rank_forest(serial, r, P)
+        range = blockrange(forest)
+        isched = UnifySchedule(flux(forest))
+        @test transfer_set(schedule_groups(isched), first(range) - 1) ==
+              Set(t for t in sinterfaces if t[4] in range && t[5] in range)
+    end
 end
 
 @testset "What needs a message refuses a distributed forest, and says why" begin

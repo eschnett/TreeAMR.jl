@@ -22,10 +22,11 @@ M8 added the layout and the conservation. The ghost width `G` is a
 [`Forest`](@ref) one, and a field set also carries a **centering** —
 [`cellcentered`](@ref), [`vertexcentered`](@ref), [`facecentered`](@ref)
 or [`edgecentered`](@ref) — so a [`GhostSchedule`](@ref) belongs to a
-*layout* rather than to a forest. [`InterfaceSchedule`](@ref) and
-[`restrict_interfaces!`](@ref) then make a finite-volume scheme
-conservative across coarse-fine faces, which under one global `dt` needs
-nothing but a spatial flux fixup within each right-hand side.
+*layout* rather than to a forest. A flux fixup within each right-hand
+side then makes a finite-volume scheme conservative across coarse-fine
+faces, which under one global `dt` needs nothing else; on the `m22`
+branch it is [`unify!`](@ref) on the flux set with a
+[`UnifySchedule`](@ref).
 
 M10 added reflecting boundaries: a face declared `reflecting` on the
 forest is filled by the ghost exchange itself, with the parity each
@@ -548,18 +549,24 @@ the divergence.
 
 ```julia
 map_blocks!(flux_kernel!, flux, ...)                  # N+1 faces per dimension
-restrict_interfaces!(flux, isched)                    # the fixup
+unify!(flux, s)                                       # the fixup
 map_blocks!(divergence_kernel!, state, ...)
 ```
 
-[`InterfaceSchedule`](@ref) is built once per tree like a
-[`GhostSchedule`](@ref), and takes no [`Operators`](@ref): the transfer
-is injection and the exact two-cell average, fixed by the geometry, not
-interpolation. It is built over the *flux* field set — the one whose
-centering is vertex-like in the face dimension — and refuses a
-cell-centered one, which has no values lying on a block's face at all. It
-reads and writes closed-range values only, so a computed flux may carry
-`G = 0`.
+On closed blocks (M22, the `m22` branch) the fixup is stage 0 of a fill
+on the flux set: every block owns both of its face planes, so a face
+value at a coarse-fine face has a coarse copy and fine ones, and the
+coarse copy takes the restriction of the fine — injection along the
+normal, the exact two-cell average across it — while the two copies at a
+same-level face become one number, so conservation there is exact. The
+[`UnifySchedule`](@ref) `s = UnifySchedule(flux)` is built once per tree
+like a [`GhostSchedule`](@ref), and takes no [`Operators`](@ref): the
+restriction is fixed by the geometry, not chosen. It is built over the
+*flux* field set — the one whose centering is vertex-like in the face
+dimension — and refuses a cell-centered one, which has no values lying on
+a block's face at all. It reads and writes own values only, so a computed
+flux may carry `G = 0`. It replaces `InterfaceSchedule` and
+`restrict_interfaces!`.
 
 ## Time integration
 
@@ -972,8 +979,8 @@ at a time:
   [`coarsen!`](@ref), [`balance!`](@ref) — since each rank applies it
   to its own copy;
 - the schedule builds, [`GhostSchedule`](@ref) and
-  [`InterfaceSchedule`](@ref), and their use, [`fill_ghosts!`](@ref)
-  and [`restrict_interfaces!`](@ref);
+  [`UnifySchedule`](@ref), and their use, [`fill_ghosts!`](@ref)
+  and [`unify!`](@ref);
 - the reductions, [`mesh_mapreduce`](@ref),
   [`volume_weighted_norm`](@ref) and [`total_mass`](@ref);
 - [`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref);

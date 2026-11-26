@@ -534,9 +534,9 @@ end
 # Burgers' equation, which brings in everything the wave cycle above does
 # not: a second field set per dimension with a different centering and no
 # ghosts at all, a kernel launched over the *closed* range, and
-# `restrict_interfaces!` — whose phases are dealt out to threads by the
-# same `run_phase!` that fills ghosts, over target ranges one plane thick.
-# If the interface fixup's slices were ever combined out of order, or if
+# `unify!` — whose groups are dealt out to threads by the same
+# `run_phase!` that fills ghosts, over target ranges one plane thick. If
+# the fixup's slices were ever combined out of order, or if
 # its schedule's neighbour walk merged its per-task lists by anything but
 # block order, the mass line below would move with the thread count.
 #
@@ -588,8 +588,8 @@ function burgers_rhs!(du, u, state, fluxes, schedule, ischeds, spacings,
     fill_ghosts!(state, schedule)
     ntuple(Val(D)) do d
         map_blocks!(workload_flux_kernel!, fluxes[d], fluxes[d].work, state.work,
-                    Val(D), Val(GU), Val(GF), Val(d); closed=true)
-        restrict_interfaces!(fluxes[d], ischeds[d])
+                    Val(D), Val(GU), Val(GF), Val(d))
+        unify!(fluxes[d], ischeds[d])
         nothing
     end
     map_blocks!(workload_divergence_kernel!, state, statearray(du, state),
@@ -652,7 +652,7 @@ function burgers_workload(::Val{D}; roots, N, G, ops, steps, buffer,
         adapt_to_initial_data!(state, ops; initial=initial, flags=flags_now,
                                buffer=buffer, maxpasses=6)
     fluxes = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d)), D)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
 
     u = statevector(state)
     gather!(u, state)
@@ -666,7 +666,7 @@ function burgers_workload(::Val{D}; roots, N, G, ops, steps, buffer,
     changed = regrid!(forest, pairs; flags=flags_now(state), buffer=buffer)
     if changed
         schedule = GhostSchedule(state, ops)
-        ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+        ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     end
     u = statevector(state)
     gather!(u, state)

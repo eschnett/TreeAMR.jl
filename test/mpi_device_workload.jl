@@ -302,8 +302,8 @@ function burgers_rhs!(du, u, state, fluxes, sched, ischeds, spacings, ::Val{D},
     fill_ghosts!(state, sched)
     ntuple(Val(D)) do d
         map_blocks!(flux_kernel!, fluxes[d], fluxes[d].work, state.work, Val(D),
-                    Val(GU), Val(GF), Val(d); closed=true)
-        restrict_interfaces!(fluxes[d], ischeds[d])
+                    Val(GU), Val(GF), Val(d))
+        unify!(fluxes[d], ischeds[d])
         nothing
     end
     map_blocks!(divergence_kernel!, state, statearray(du, state),
@@ -325,7 +325,7 @@ function burgers_case(tag, forest::Forest{D}; G, ops, steps) where {D}
     sched = GhostSchedule(state, ops)
     fluxes = ntuple(d -> FieldSet{T}(forest, 1; G=0, centering=facecentered(D, d),
                                      backend=BACKEND), D)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
     u = statevector(state)
     gather!(u, state)
@@ -573,7 +573,9 @@ function main()
     wave_case("W3c", forest_of((2, 2, 2), 4; periodic=(true, true, true),
                                centre=(0.7, 0.8, 1.2)); G=1, centering=cellcentered(3),
               ops=Operators(prolongation=2, restriction=2), steps=3)
-    pending_case("B2", 3)
+    burgers_case("B2", forest_of((4, 4), 8; periodic=(true, true), centre=(1.6, 2.3));
+                 G=2, ops=Operators(family=Conservative, prolongation=3, restriction=2),
+                 steps=4)
     pending_case("TP", 6)
     pending_case("M", 6)
     pending_case("G2", 8)

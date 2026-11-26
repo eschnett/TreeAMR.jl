@@ -8,7 +8,7 @@
 #
 #   * **Total mass is conserved to roundoff**, with a shock crossing a
 #     refined region that follows it and regrids in between. The
-#     negative control -- the identical run with `restrict_interfaces!`
+#     negative control -- the identical run with `unify!`
 #     skipped -- is what makes the claim a measurement rather than a
 #     tautology.
 #   * **The interface-order rule carries over to the conservative
@@ -31,7 +31,7 @@
     # is a same-level face, and the two blocks sharing one compute its
     # flux from the same four cell values — their own and their ghosts,
     # which are bit-for-bit copies — with the same kernel. So mass is
-    # already conserved to roundoff there, `restrict_interfaces!` or not,
+    # already conserved to roundoff there, `unify!` or not,
     # and everything the fixup is measured on below is attributable to
     # the coarse-fine faces alone.
     #
@@ -46,7 +46,7 @@
     end
 end
 
-@pending 3 "The fixup is what conserves at a coarse-fine face: D=$D" for D in (1, 2, 3)
+@testset "The fixup is what conserves at a coarse-fine face: D=$D" for D in (1, 2, 3)
     # The claim in its cheapest, most direct form, and the only one that
     # runs in 3D: the M3 static two-level mesh, a smooth solution short
     # of the breaking time, no regridding and no limiter — so the fixup
@@ -130,7 +130,7 @@ end
     end
 end
 
-@pending 3 "The interface-order rule for the conservative family: D=$D" for D in (1, 2)
+@testset "The interface-order rule for the conservative family: D=$D" for D in (1, 2)
     # CODE.md's prediction, measured. A flux divergence divides an
     # `O(hᵖ)` ghost error by `h` once, so the interface caps the global
     # rate at `p - 1 + 1 = p`; against a second-order scheme that is 1 at
@@ -241,7 +241,7 @@ end
           l1_difference(unbuffered.reduced, fine.reduced)
 end
 
-@pending 3 "The conservative RHS is a pure function of the state" begin
+@testset "The conservative RHS is a pure function of the state" begin
     # The integrator's `u` is authoritative; the working arrays — the
     # state's and all `D` flux sets' — are scratch. A right-hand side
     # that wrote back into `u`, or that carried state between calls,

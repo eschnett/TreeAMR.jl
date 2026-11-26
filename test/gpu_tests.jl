@@ -408,7 +408,7 @@ end
     @test results[1][2] == results[2][2]
 end
 
-@pending 3 "$bname: the interface fixup runs on the device: T=$T, D=$D" for
+@testset "$bname: the interface fixup runs on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2, 3)
     # M8b. The fixup adds no kernel of its own — it is the transfer
     # kernel over one-plane target ranges — so what has to hold on a
@@ -435,7 +435,7 @@ end
         hostfs.work[Tuple(idx)..., v, b] = sum(x) + T(v)
     end
     linear = copy(hostfs.work)
-    restrict_interfaces!(hostfs, InterfaceSchedule(hostfs))
+    unify!(hostfs, UnifySchedule(hostfs))
     @test maximum(abs, hostfs.work .- linear) < gputol(T)
 
     # The same schedule over structureless data, on both backends. What
@@ -443,11 +443,11 @@ end
     # does, so the assertion does not depend on the RNG stream.
     noise = T.(rand(MersenneTwister(42), size(linear)...))
     copyto!(hostfs.work, noise)
-    restrict_interfaces!(hostfs, InterfaceSchedule(hostfs))
+    unify!(hostfs, UnifySchedule(hostfs))
 
     fs = FieldSet{T}(forest, 2; G=0, centering=C, backend=backend)
     copyto!(fs.work, noise)
-    restrict_interfaces!(fs, InterfaceSchedule(fs))
+    unify!(fs, UnifySchedule(fs))
     @test Array(fs.work) == hostfs.work
 end
 
@@ -476,7 +476,7 @@ end
     @test same && bad == 0 && nremote > 0
 end
 
-@pending 3 "$bname: the conservative cycle conserves on the device: T=$T, D=$D" for
+@testset "$bname: the conservative cycle conserves on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # M8b's acceptance claim, on whatever backend: the three-step
     # right-hand side of `burgers.jl` over the M3 two-level mesh keeps the

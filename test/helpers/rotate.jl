@@ -69,7 +69,7 @@ end
 
 """
 The state, flux, velocity and schedules of the rigid-rotation advection
-on a rotating quadrant; `fixup = false` drops `restrict_interfaces!`.
+on a rotating quadrant; `fixup = false` drops `unify!`.
 """
 function advection_problem(forest::Forest{D}; fixup::Bool) where {D}
     d1, d2 = TreeAMR.rotating_dims(forest)
@@ -92,7 +92,7 @@ function advection_problem(forest::Forest{D}; fixup::Bool) where {D}
         end
     end
     return (; state, fluxes, vel, fixup, schedule=GhostSchedule(state, ROT_OPS4),
-            ischeds=ntuple(d -> InterfaceSchedule(fluxes[d]), D),
+            ischeds=ntuple(d -> UnifySchedule(fluxes[d]), D),
             spacings=block_spacings(forest, Float64),
             hook=CellBoundary((x, v, δ) -> zero(eltype(x))))
 end
@@ -104,7 +104,7 @@ function advect_rhs!(du, u, p)
     ntuple(Val(D)) do d
         map_blocks!(advect_flux_kernel!, p.fluxes[d], p.fluxes[d].work, p.state.work,
                     p.vel[d].work, Val(D), Val(p.state.G), Val(d))
-        p.fixup && restrict_interfaces!(p.fluxes[d], p.ischeds[d])
+        p.fixup && unify!(p.fluxes[d], p.ischeds[d])
         nothing
     end
     map_blocks!(advect_divergence_kernel!, p.state, statearray(du, p.state),

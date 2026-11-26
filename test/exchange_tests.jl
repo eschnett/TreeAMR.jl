@@ -14,7 +14,7 @@
 #
 # This file's definitions are in `helpers/exchange.jl`.
 
-using TreeAMR: PHASE1_TAG, prolongation_tag, interface_tag, ntransfers, boxsize,
+using TreeAMR: PHASE1_TAG, UNIFY_TAG, prolongation_tag, ntransfers, boxsize,
                stagebuffers, segment_ranges, pack_stage!, unpack_stage!, run_phase!,
                apply_boundary!, exchange_ghosts!, exchange_interfaces!, leafowner,
                remote_neighbors, equalsplit_part, ntarget
@@ -157,13 +157,13 @@ end
         serial = faces_forest(kinds; N=8)
         G = ntuple(d -> C[d] === :vertex ? 0 : 1, D)
         flux(forest) = FieldSet(forest, 1; G=G, centering=C, parity=[OddParity])
-        isched = InterfaceSchedule(flux(serial))
-        @test [st.tag for st in isched.stages] == interface_tag.(isched.dimensions)
+        isched = UnifySchedule(flux(serial))
+        @test [st.tag for st in isched.stages] == [UNIFY_TAG]
         stransfers = serial_transfers(isched)
         stored = ntuple(d -> serial.N + 2G[d] + (C[d] === :vertex), D)
         scounts = stage_write_counts([isched], stored, nleaves(serial))
         for P in 1:5
-            scheds = [InterfaceSchedule(flux(rank_forest(serial, r, P))) for r in 0:(P - 1)]
+            scheds = [UnifySchedule(flux(rank_forest(serial, r, P))) for r in 0:(P - 1)]
             locals, remote, unmatched, bad, nsent = distributed_transfers(scheds)
             @test bad == 0
             @test unmatched == 0
@@ -328,16 +328,16 @@ end
         sflux = FieldSet(serial, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
         fdata = exchange_data(MersenneTwister(8), Float64, size(sflux.work))
         copyto!(sflux.work, fdata)
-        restrict_interfaces!(sflux, InterfaceSchedule(sflux))
+        unify!(sflux, UnifySchedule(sflux))
         fluxes = map(forests) do forest
             fs = FieldSet(forest, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
             copyto!(fs.work, fdata[ntuple(_ -> :, D + 1)..., blockrange(forest)])
             fs
         end
-        ischeds = [InterfaceSchedule(fs) for fs in fluxes]
+        ischeds = [UnifySchedule(fs) for fs in fluxes]
         before = box.nmessages
         @sync for r in 1:P
-            @async restrict_interfaces!(fluxes[r], ischeds[r])
+            @async unify!(fluxes[r], ischeds[r])
         end
         @test box.nmessages > before
         @test all(r -> bitwise_equal(fluxes[r].work,

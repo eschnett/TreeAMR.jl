@@ -764,8 +764,6 @@ end
     ops = Operators(prolongation=2, restriction=2)
     two = Forest((2, 2); N=8)
     refine!(two, two.leaves[1])
-    @test_throws "M22 step 3" InterfaceSchedule(FieldSet(two, 1; G=0,
-                                                         centering=facecentered(2, 1)))
     walled = Forest((2, 2); N=8, reflecting=((true, false), (false, false)))
     @test_throws "M22 step 4" GhostSchedule(FieldSet(walled, 1; G=1,
                                                      centering=vertexcentered(2),

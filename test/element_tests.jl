@@ -784,7 +784,7 @@ end
     # conservative element scheme would need as mortar fluxes instead.
     forest = element_levels_forest(2, 8, 2)
     fs = FieldSet(forest, 1; G=0, centering=elementcentered(2), P=3)
-    @test_throws "mortar fluxes" InterfaceSchedule(fs)
+    @test_throws "mortar fluxes" UnifySchedule(fs)
 end
 
 # --- The regrid ---------------------------------------------------------

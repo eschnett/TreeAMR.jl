@@ -717,15 +717,15 @@ end
         rotation = d == 1 ? (-1,) : (1,)
         fr = FieldSet(forest, 1; G=0, centering=facecentered(D, d), rotation=rotation)
         fp = FieldSet(plain, 1; G=0, centering=facecentered(D, d))
-        is = InterfaceSchedule(fr)
+        is = UnifySchedule(fr)
         groups = collect(Iterators.flatten(is.phases))
         @test all(g -> g.orientation == 0, groups)
         @test !occursin("rotated", sprint(show, is))
         nrestrict += sum(ntransfers, groups; init=0)
         fr.work .= randn(rng, size(fr.work))
         fp.work .= fr.work
-        restrict_interfaces!(fr, is)
-        restrict_interfaces!(fp, InterfaceSchedule(fp))
+        unify!(fr, is)
+        unify!(fp, UnifySchedule(fp))
         @test fr.work == fp.work
     end
     @test nrestrict > 0
@@ -736,7 +736,7 @@ end
     broken = Forest((2, 2); N=8, rotating=(1, 2))
     refine!(broken, only(filter(k -> leafbox(broken, k)[1] == (1, 0), broken.leaves)))
     fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
-    @test_throws "this is a bug" InterfaceSchedule(fx)
+    @test_throws "this is a bug" UnifySchedule(fx)
 end
 
 @pending 7 "Rigid rotation conserves mass through the seam and coarse-fine faces" begin

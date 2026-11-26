@@ -137,8 +137,10 @@ end
     @test length(ghostgroups) > 1
     @test all(g -> issorted(g.targetblocks), ghostgroups)
 
-    # The interface fixup's at coarse-fine faces comes back with M22 step 3.
-    pending(3, "interface groups in block order, D=$D")
+    isched = UnifySchedule(FieldSet(forest, 1; G=0, centering=facecentered(D, 1)))
+    facegroups = isched.unify
+    @test sum(ntransfers, facegroups; init=0) > 0
+    @test all(g -> issorted(g.targetblocks), facegroups)
 
     finest = maxlevel(forest)
     flags = [level(k) == finest ? Coarsen : level(k) == 0 ? Refine : Keep

@@ -24,7 +24,7 @@ Every forest mutation and every schedule build is then collective, and
 every block index of a field set is local: [`blockkey`](@ref)`(fs, b)`
 names block `b`'s leaf, and [`nblocks`](@ref)`(fs)` sizes a per-block
 array, while [`nleaves`](@ref) and `forest.leaves` are the whole mesh. A
-[`GhostSchedule`](@ref) or [`InterfaceSchedule`](@ref) built over forests
+[`GhostSchedule`](@ref) or [`UnifySchedule`](@ref) built over forests
 that differ between ranks — a `refine!` made on one rank only, say — is
 refused on every rank together, with the reason, as is one built for a
 different layout on some rank. [`interpolate`](@ref) is collective too:
@@ -96,8 +96,8 @@ TreeAMR.hoststaging
 
 ## The distributed schedule
 
-Not exported. Over a distributed forest a [`GhostSchedule`](@ref) or an
-[`InterfaceSchedule`](@ref) holds its exchange as stages, one per
+Not exported. Over a distributed forest a [`GhostSchedule`](@ref) or a
+[`UnifySchedule`](@ref) holds its exchange as stages, one per
 ordering point of the serial one, and each stage what this rank computes
 for another rank's targets and what it receives for its own, with the
 layout both ends of each message derive from the replicated forest.

@@ -1617,8 +1617,8 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
 end
 
 """
-    unify!(fs::FieldSet, schedule::GhostSchedule)
-    unify!(v::AbstractVector, fs::FieldSet, schedule::GhostSchedule)
+    unify!(fs::FieldSet, schedule)
+    unify!(v::AbstractVector, fs::FieldSet, schedule)
     unify!(sets::Tuple, schedules::Tuple)
     unify!(v::AbstractVector, sets::Tuple, schedules::Tuple)
 
@@ -1626,8 +1626,18 @@ Give every secondary copy of a shared point its primary's value: stage 0
 of the fill alone (M22, "Closed blocks" in `CODE.md`). A set with a
 vertex-like dimension owns both face planes of its blocks, so a point on
 a block face has a copy on every block that holds it, and one of them,
-the copy on the block lying lowest along the dimensions the point is
-shared in, is the primary ([`isprimary`](@ref)).
+the copy on the finest level holding it, there on the block lying lowest
+along the dimensions the point is shared in, is the primary
+([`isprimary`](@ref)). A copy on a coarser block takes the fine value by
+the set's restriction: injection along a vertex-like dimension, the
+restriction stencil along a cell-like one.
+
+`schedule` is a [`GhostSchedule`](@ref), whose stage 0 restricts with its
+operators' restriction, or a [`UnifySchedule`](@ref), which holds stage 0
+alone with the restriction the geometry fixes (the exact two-cell
+average) and is what a flux set takes: `unify!(flux, s)` is the
+interface restriction of a conservative scheme ("Conservation at
+coarse-fine faces" in `CODE.md`).
 
 The first form unifies the field set's working array: what a set without
 ghosts, a flux computed on every block's own range, needs before its
@@ -1659,8 +1669,18 @@ function unify!(fs::FieldSet, schedule::GhostSchedule)
     return fs
 end
 
-function unify!(v::AbstractVector, fs::FieldSet, schedule::GhostSchedule)
-    backend = check_fill(fs, schedule)
+function unify!(fs::FieldSet, schedule::UnifySchedule)
+    backend = check_unify(fs, schedule)
+    forest = schedule.forest
+    sends = run_stages!(fs, schedule.stages, 1:1, schedule.unify, forest, backend, nothing)
+    sends === nothing || waitall(forest.comm, sends)
+    return fs
+end
+
+function unify!(v::AbstractVector, fs::FieldSet,
+                schedule::Union{GhostSchedule,UnifySchedule})
+    backend = schedule isa GhostSchedule ? check_fill(fs, schedule) :
+              check_unify(fs, schedule)
     stages = schedule.stateunify
     isempty(stages) && return v
     A = statearray(v, fs)
@@ -1685,6 +1705,41 @@ function unify!(v::AbstractVector, sets::Tuple{Vararg{FieldSet}}, schedules::Tup
     end
     return v
 end
+
+# A `UnifySchedule`'s layout checks, as `check_fill`'s for a ghost
+# schedule: every target range and stencil in it is the layout's.
+function check_unify(fs::FieldSet{T,D}, schedule::UnifySchedule{T,D}) where {T,D}
+    schedule.forest === fs.forest || throw(ArgumentError(
+        "unify schedule was built for a different forest than the field set"))
+    isstale(schedule) && throw(ArgumentError(
+        "the forest changed since this unify schedule was built (generation " *
+        "$(schedule.generation) -> $(generation(schedule.forest))); rebuild it"))
+    nblocks(fs) == length(blockrange(schedule.forest)) || throw(ArgumentError(
+        "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
+        "$(length(blockrange(schedule.forest))) on this rank; rebuild both"))
+    fs.G == schedule.G || throw(ArgumentError(
+        "the field set has ghost width G=$(fs.G) but this unify schedule was built " *
+        "for G=$(schedule.G); every target range in it is wrong for this layout. " *
+        "Build one with `UnifySchedule(fs)`."))
+    fs.centering == schedule.centering || throw(ArgumentError(
+        "the field set has centering $(fs.centering) but this unify schedule was " *
+        "built for $(schedule.centering); which points are shared, the target ranges " *
+        "and the one-dimensional stencils all follow from the centering. Build one " *
+        "with `UnifySchedule(fs)`."))
+    backend = get_backend(fs.work)
+    samebackend(backend, schedule.backend) || throw(ArgumentError(
+        "the field set lives on $(nameof(typeof(backend))) but this unify schedule " *
+        "was built for $(nameof(typeof(schedule.backend))); its stencils are in the " *
+        "wrong memory. Build it with `UnifySchedule(fs)` from a field set on the " *
+        "backend you mean to run on."))
+    return backend
+end
+
+# As for `fill_ghosts!`: the transfer accumulates in `eltype(dest)`.
+check_unify(fs::FieldSet{T}, schedule::UnifySchedule{S}) where {T,S} =
+    throw(ArgumentError(
+        "the field set stores $T but this unify schedule carries $S weights; build " *
+        "the schedule from the field set itself, `UnifySchedule(fs)`"))
 
 check_unify_tuple(sets, schedules) =
     length(sets) == length(schedules) || throw(ArgumentError(

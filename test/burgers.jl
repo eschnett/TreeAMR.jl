@@ -13,7 +13,7 @@
 #
 #     scatter! -> fill_ghosts!                     # (0) the state's ghosts
 #     map_blocks!(flux_kernel!, F_d)               # (i) fluxes, N+1 per dim
-#     restrict_interfaces!(F_d, isched[d])         # (ii) the fixup
+#     unify!(F_d, isched[d])         # (ii) the fixup
 #     map_blocks!(divergence_kernel!, state, du)   # (iii) the divergence
 #
 # -- and step (ii) is what makes the two sides of every coarse-fine face
@@ -94,7 +94,7 @@ end
 # Launched over the *flux* set, whose own range is closed, so `I[d]` runs over
 # `1 … N+1` and the other indices over `1 … N`: a block computes the flux
 # on both of its own faces, and making the two sides of a coarse-fine face
-# agree afterwards is `restrict_interfaces!`'s job.
+# agree afterwards is `unify!`'s job.
 @kernel function burgers_flux_kernel!(flux, @Const(work), ::Val{D}, ::Val{GU},
                                       ::Val{GF}, ::Val{d}, lim) where {D,GU,GF,d}
     I = @index(Global, NTuple)                     # (i1..iD, block)
@@ -148,7 +148,7 @@ state set and its ghost schedule, the `D` flux sets and their interface
 schedules, and the per-block spacings on whatever backend the data lives
 on.
 
-`fixup = false` skips [`restrict_interfaces!`](@ref) and nothing else --
+`fixup = false` skips [`unify!`](@ref) and nothing else --
 the negative control for the conservation test, and the only difference
 between a scheme that conserves to roundoff and one that does not.
 
@@ -162,7 +162,7 @@ struct BurgersProblem{T,D,GU,GF,LIM,FS,FL,S,IS,V}
     state::FS
     fluxes::FL                   # NTuple{D,FieldSet}, facecentered(D, d)
     schedule::S
-    ischeds::IS                  # NTuple{D,InterfaceSchedule}
+    ischeds::IS                  # NTuple{D,UnifySchedule}
     spacings::V                  # per block, wherever the kernels run
     fixup::Bool
     valD::Val{D}
@@ -189,7 +189,7 @@ function BurgersProblem(state::FieldSet{T,D}, ops::Operators;
              ntuple(d -> FieldSet{T}(forest, 1; G=Gf, centering=facecentered(D, d),
                                      backend=backend), D) : fluxes
     schedule = GhostSchedule(state, ops)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     spacings = to_backend(backend, block_spacings(forest, T))
     GU = state.G
     GF = first(fluxes).G
@@ -214,7 +214,7 @@ function burgers_rhs!(du, u, p::BurgersProblem{T,D}, t) where {T,D}
     ntuple(Val(D)) do d
         map_blocks!(burgers_flux_kernel!, p.fluxes[d], p.fluxes[d].work,
                     p.state.work, p.valD, p.valGU, p.valGF, Val(d), p.limiter)
-        p.fixup && restrict_interfaces!(p.fluxes[d], p.ischeds[d])
+        p.fixup && unify!(p.fluxes[d], p.ischeds[d])
         nothing
     end
     map_blocks!(burgers_divergence_kernel!, p.state, statearray(du, p.state),

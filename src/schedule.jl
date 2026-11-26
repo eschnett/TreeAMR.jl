@@ -589,7 +589,6 @@ end
 const UNIFY_TAG = 0                                       # stage 0 (M22)
 const PHASE1_TAG = 1
 prolongation_tag(level::Integer) = 2 + Int(level)       # 2 … 2 + MAX_LEVEL
-interface_tag(d::Integer) = 40 + Int(d)                  # one per face dimension
 const REGRID_TAG = 50                                     # the regrid transfer
 
 # The stage a ghost transfer of group key `key` runs in, for a layout of
@@ -794,11 +793,11 @@ end
 
 """
     isstale(schedule::GhostSchedule)
-    isstale(schedule::InterfaceSchedule)
+    isstale(schedule::UnifySchedule)
 
 Whether the forest has changed since `schedule` was built, in which case
-it must be rebuilt before [`fill_ghosts!`](@ref) — or
-[`restrict_interfaces!`](@ref) — will accept it.
+it must be rebuilt before [`fill_ghosts!`](@ref) — or [`unify!`](@ref) —
+will accept it.
 """
 isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 
@@ -2044,6 +2043,38 @@ function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, locals
               for tag in tags]
 end
 
+# Stage 0 for `unify!` on a state-shaped array (M22), which has no ghosts:
+# the same transfers, groups and messages as the fill's stage 0, with every
+# stencil moved down by the ghost width, which a stage 0 transfer allows,
+# since it reads and writes own points only. Its own buffers, its own
+# stage; the tag is stage 0's, since the two never run at once. `pairs`,
+# `sent` and `received` are a schedule's local, sent and received transfers,
+# `stageof` its stage of each.
+function state_unify_stages(::Type{ST}, ::Type{GRP}, ::Type{T}, backend, forest::Forest{D},
+                            owned, ghosts::NTuple{D,Int}, pairs::TransferPairs{D},
+                            sent::TransferPairs{D}, received::TransferPairs{D}, build,
+                            factorcol, axesof, bounded, stageof) where {ST,GRP,T,D}
+    unghost(key) = ntuple(D) do d
+        st = build(key)[d]::Stencil1D{T,Vector{Int32},Matrix{T}}
+        Stencil1D{T}(st.targetfirst - ghosts[d], st.srcstart .- Int32(ghosts[d]),
+                     st.weights, st.unit, st.single)
+    end
+    ulocal = GRP[todevice(backend, TransferGroup{T,D}(key.kind, unghost(key), targets,
+                                                      sources, factorcol(key),
+                                                      key.orientation, axesof(key),
+                                                      bounded(key)::Int8))
+                 for (key, (targets, sources)) in pairs if stageof(key) == UNIFY_TAG]
+    nopairs = TransferPairs{D}()
+    owner(i) = leafowner(forest, i)
+    uremote = remote_stage(remotetype(ST), T, backend,
+                           get(bystage(stageof, sent), UNIFY_TAG, nopairs),
+                           get(bystage(stageof, received), UNIFY_TAG, nopairs), unghost,
+                           factorcol; targetowner=owner, sourceowner=owner,
+                           targetrange=owned, sourcerange=owned, axesof=axesof,
+                           bounded=bounded)
+    return ST[ST(UNIFY_TAG, ulocal, uremote)]
+end
+
 # --- Stage groups ----------------------------------------------------------
 #
 # Which phase-2 stages run together on this rank (`GhostSchedule`'s
@@ -2615,32 +2646,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                           bystage(stageof, received), build, factorcol, forest;
                           required=closed ? [UNIFY_TAG, PHASE1_TAG] : [PHASE1_TAG],
                           axesof=axesof, bounded=boundedof)
-    # Stage 0 again for `unify!` on a state-shaped array (M22), which has
-    # no ghosts: the same transfers, groups and messages, with every
-    # stencil moved down by the ghost width. Its own buffers, its own
-    # stage; the tag is stage 0's, since the two never run at once.
-    stateunify = ST[]
-    if closed
-        unghost(key) = ntuple(D) do d
-            st = build(key)[d]::Stencil1D{T,Vector{Int32},Matrix{T}}
-            Stencil1D{T}(st.targetfirst - ghosts[d], st.srcstart .- Int32(ghosts[d]),
-                         st.weights, st.unit, st.single)
-        end
-        ulocal = GRP[todevice(backend, TransferGroup{T,D}(key.kind, unghost(key), targets,
-                                                          sources, factorcol(key),
-                                                          key.orientation, axesof(key),
-                                                          boundedof(key)::Int8))
-                     for (key, (targets, sources)) in pairs if stageof(key) == UNIFY_TAG]
-        nopairs = TransferPairs{D}()
-        owner(i) = leafowner(forest, i)
-        uremote = remote_stage(remotetype(ST), T, backend,
-                               get(bystage(stageof, sent), UNIFY_TAG, nopairs),
-                               get(bystage(stageof, received), UNIFY_TAG, nopairs), unghost,
-                               factorcol; targetowner=owner, sourceowner=owner,
-                               targetrange=owned, sourcerange=owned, axesof=axesof,
-                               bounded=boundedof)
-        push!(stateunify, ST(UNIFY_TAG, ulocal, uremote))
-    end
+    # Stage 0 again for `unify!` on a state-shaped array (M22).
+    stateunify = closed ? state_unify_stages(ST, GRP, T, backend, forest, owned, ghosts,
+                                             pairs, sent, received, build, factorcol,
+                                             axesof, boundedof, stageof) : ST[]
     # Which of them may run together here, from the host stencils.
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)

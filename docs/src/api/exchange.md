@@ -22,6 +22,5 @@ Relative
 ## Conservation at coarse-fine faces
 
 ```@docs
-InterfaceSchedule
-restrict_interfaces!
+UnifySchedule
 ```

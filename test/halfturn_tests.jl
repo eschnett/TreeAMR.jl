@@ -643,14 +643,14 @@ end
         halfturn = d in plane ? (-1,) : (1,)
         fh = FieldSet(forest, 1; G=0, centering=facecentered(D, d), halfturn=halfturn)
         fp = FieldSet(plain, 1; G=0, centering=facecentered(D, d))
-        is = InterfaceSchedule(fh)
+        is = UnifySchedule(fh)
         groups = collect(Iterators.flatten(is.phases))
         @test all(g -> g.orientation == 0, groups)
         nrestrict += sum(ntransfers, groups; init=0)
         fh.work .= randn(rng, size(fh.work))
         fp.work .= fh.work
-        restrict_interfaces!(fh, is)
-        restrict_interfaces!(fp, InterfaceSchedule(fp))
+        unify!(fh, is)
+        unify!(fp, UnifySchedule(fp))
         @test fh.work == fp.work
     end
     @test nrestrict > 0
@@ -659,7 +659,7 @@ end
     broken = Forest((1, 2); N=8, halfturn=(1, 2))
     refine!(broken, only(filter(k -> leafbox(broken, k)[1] == (0, 0), broken.leaves)))
     fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1), halfturn=(-1,))
-    @test_throws "this is a bug" InterfaceSchedule(fx)
+    @test_throws "this is a bug" UnifySchedule(fx)
 end
 
 """
@@ -684,7 +684,7 @@ function halfturn_advection_problem(forest::Forest{D}; fixup::Bool) where {D}
         end
     end
     return (; state, fluxes, vel, fixup, schedule=GhostSchedule(state, HALF_OPS4),
-            ischeds=ntuple(d -> InterfaceSchedule(fluxes[d]), D),
+            ischeds=ntuple(d -> UnifySchedule(fluxes[d]), D),
             spacings=block_spacings(forest, Float64),
             hook=CellBoundary((x, v, δ) -> zero(eltype(x))))
 end
