@@ -5700,9 +5700,31 @@ M12 was decided with Erik, after M7 and before M9b.
     vertex 37 + 152 / 82 / 152, face 1 + 8, edge 7 + 40; the nested mesh
     of `bench/nested.jl` with outer faces, cell 0 / 63 / 273, vertex 19 +
     61 / 63 / 273. Schedule build, best of three: a uniform periodic
-    `8³` vertex set 0.046 s at the step-2 head against 0.14 s now (the
-    sub-piece search, `5^v` sub-pieces a block); on the nested mesh a
-    vertex set 0.082 s against a cell set's 0.008 s, which is unchanged.
+    `8³` vertex set (`N = 16`, `G = 2`) took 0.046 s at the step-2 head
+    and 0.14 s after the sub-piece search (`5^v` sub-pieces a block); on
+    the nested mesh a vertex set 0.082 s against a cell set's 0.008 s,
+    which is unchanged.
+  - *The build made cheap again* (2026-11-26, after the step's commits,
+    at Erik's request, since regridding rebuilds the schedule): each
+    block looks up its neighbours across a direction once
+    (`NeighbourTable`, at most `3^D − 1` searches) instead of once a
+    sub-piece; a block without a finer neighbour decides each piece once;
+    and `piece_copies` walks its steps by a binary count instead of a
+    product of unequal tuples, which did not infer and was most of the
+    cost. Every schedule came out the same: the groups, stencils,
+    targets, sources, stage groups, boundary regions and message layouts
+    of 1,572 `GhostSchedule`s and `UnifySchedule`s (the closed and
+    refined test meshes and the nested mesh, `D = 1, 2, 3`, every closed
+    centering, serially and at two and three simulated ranks), compared
+    byte for byte, a rank's local groups as sorted lists — their order
+    follows `hash(::GroupKey)`, which includes the type's object id and
+    so moves with any change to the package's code. Build times, best of
+    three, at one thread and at eight (laptop, smoke), before → after: a
+    uniform periodic `8³` vertex set, `N = 8`, `G = 1`, 151 → 37 ms and 30
+    → 9 ms; a periodic `4³` brick with one root refined, `N = 16`, `G =
+    2`, cell 2.9 → 3.0 and 2.8 → 2.7 ms, vertex 21 → 6.9 and 6.4 → 3.0 ms;
+    the nested mesh, cell 7.7 → 8.0 and 4.9 → 4.6 ms, vertex 84 → 23 and
+    31 → 8.4 ms.
     The refined box's fill is mirror-symmetric to 6.7 × 10⁻¹⁶ in 2D and
     2.4 × 10⁻¹⁵ in 3D at a data scale of 2, against 4.7 × 10⁻⁵ under
     half-open ownership.

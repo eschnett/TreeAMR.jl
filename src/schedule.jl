@@ -1492,31 +1492,79 @@ piece_representative(cls::NTuple{D,Int}, c::NTuple{D,Int}) where {D} =
 # across, chosen along each dimension the step leaves alone by which half
 # the sub-piece lies in, both at the mid-plane. A coarser neighbour's copy
 # never wins, and is left out.
-function piece_copies(forest::Forest{D}, j::Int, sub::NTuple{D,Int},
-                      c::NTuple{D,Int}) where {D}
-    k = forest.leaves[j]
-    zero = ntuple(_ -> 0, D)
-    cls = piece_of(sub)
-    copies = Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int}}[
-        (level(k), j, cls, zero, zero)]
-    steps = ntuple(d -> c[d] == 1 && cls[d] != 1 ? (0, cls[d] == 0 ? -1 : 1) : (0,), D)
-    for δ in Iterators.product(steps...)
-        all(iszero, δ) && continue
-        crossing, nbrs = oriented_neighbors(forest, k, δ)
-        isempty(nbrs) && continue                   # an outer face
+piece_copies(forest::Forest{D}, j::Int, sub::NTuple{D,Int}, c::NTuple{D,Int}) where {D} =
+    piece_copies(NeighbourTable(forest, j), sub, c)
+
+# The neighbours of global leaf `j` across each direction, looked up once a
+# block: a block's sub-pieces, up to `5^D`, step in at most `3^D - 1`
+# directions, and each lookup searches the tree. Filled lazily, so that a
+# direction no sub-piece steps in is never searched. An entry is the
+# neighbours' level, `-1` across an outer face, and each one's global leaf
+# and child offset.
+const NeighbourEntry{D} = Tuple{Int,Vector{Tuple{Int,NTuple{D,Int}}}}
+
+struct NeighbourTable{D,F<:Forest{D}}
+    forest::F
+    j::Int
+    level::Int
+    entries::Vector{Union{Nothing,NeighbourEntry{D}}}
+end
+NeighbourTable(forest::Forest{D}, j::Int) where {D} =
+    NeighbourTable{D,typeof(forest)}(forest, j, level(forest.leaves[j]),
+                                     Union{Nothing,NeighbourEntry{D}}[nothing for _ in 1:3^D])
+
+function neighbours(t::NeighbourTable{D}, δ::NTuple{D,Int}) where {D}
+    i = 1 + sum(ntuple(d -> (δ[d] + 1) * 3^(d - 1), D))
+    e = t.entries[i]
+    e === nothing || return e
+    crossing, nbrs = oriented_neighbors(t.forest, t.forest.leaves[t.j], δ)
+    if isempty(nbrs)                                # an outer face
+        e = (-1, Tuple{Int,NTuple{D,Int}}[])
+    else
         crossing.turns == 0 && crossing.glue == 0 || error(
             "a copy of a point across a rotating seam or a glue asked for; those come " *
             "back in M22 steps 7 and 8, and GhostSchedule refuses them until then, so " *
             "this is a bug")
+        e = (level(first(nbrs)),
+             Tuple{Int,NTuple{D,Int}}[(find_leaf(t.forest, nbr), childoffset(nbr))
+                                      for nbr in nbrs])
+    end
+    t.entries[i] = e
+    return e
+end
+
+# Whether any block across a face, edge or corner of `t`'s block along the
+# vertex-like dimensions of staggers `c` is finer: where none is, every
+# sub-piece of a piece has the primary its piece has.
+function hasfiner(t::NeighbourTable{D}, c::NTuple{D,Int}) where {D}
+    steps = ntuple(d -> c[d] == 1 ? (-1, 0, 1) : (0,), D)
+    return any(Iterators.product(steps...)) do δ
+        !all(iszero, δ) && neighbours(t, δ)[1] > t.level
+    end
+end
+
+function piece_copies(t::NeighbourTable{D}, sub::NTuple{D,Int},
+                      c::NTuple{D,Int}) where {D}
+    zero = ntuple(_ -> 0, D)
+    cls = piece_of(sub)
+    copies = Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int}}[
+        (t.level, t.j, cls, zero, zero)]
+    # The steps across the faces the sub-piece lies on, every nonempty
+    # subset of them, dimension 1 varying fastest; counted in binary
+    # rather than as a product of unequal tuples, which does not infer.
+    side = ntuple(d -> c[d] == 1 && cls[d] != 1 ? (cls[d] == 0 ? -1 : 1) : 0, D)
+    for m in 1:((1 << D) - 1)
+        any(d -> (m >> (d - 1)) & 1 == 1 && side[d] == 0, 1:D) && continue
+        δ = ntuple(d -> (m >> (d - 1)) & 1 == 1 ? side[d] : 0, D)
+        lvl, nbrs = neighbours(t, δ)
+        lvl < 0 && continue                         # an outer face
         across = ntuple(d -> δ[d] == 0 ? cls[d] : 2 - cls[d], D)
-        lvl = level(first(nbrs))
-        lvl < level(k) && continue                  # coarser: never the primary
-        if lvl == level(k)
-            push!(copies, (lvl, find_leaf(forest, only(nbrs)), across, δ, zero))
+        lvl < t.level && continue                   # coarser: never the primary
+        if lvl == t.level
+            push!(copies, (lvl, first(only(nbrs)), across, δ, zero))
             continue
         end
-        for nbr in nbrs
-            o = childoffset(nbr)
+        for (leaf, o) in nbrs
             # Along a dimension the step leaves alone the child holds the
             # sub-piece when it lies in the child's half, the mid-plane in
             # both; its class there is the sub-class seen from that half.
@@ -1529,7 +1577,7 @@ function piece_copies(forest::Forest{D}, j::Int, sub::NTuple{D,Int},
                 sub[d] == 2 && return o[d] == 0 ? 2 : 0
                 return sub[d] == 0 || sub[d] == 4 ? cls[d] : 1
             end
-            push!(copies, (lvl, find_leaf(forest, nbr), fcls, δ, o))
+            push!(copies, (lvl, leaf, fcls, δ, o))
         end
     end
     return copies
@@ -1544,9 +1592,9 @@ piece_primary(copies) = argmin(x -> (-x[1], map(-, x[3])), copies)
 # piece, since the answer is the same along a piece.
 function primary_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}) where {D}
     bits = UInt32(0)
+    t = NeighbourTable(forest, j)
     for cls in closed_pieces(c)
-        _, s, scls, _, _ = piece_primary(piece_copies(forest, j,
-                                                      piece_representative(cls, c), c))
+        _, s, scls, _, _ = piece_primary(piece_copies(t, piece_representative(cls, c), c))
         s == j && scls == cls && (bits |= UInt32(1) << piece_index(cls))
     end
     return bits
@@ -1562,9 +1610,16 @@ function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,
                         b::Int) where {D}
     entries = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int}}[]
     lvl = level(forest.leaves[b])
+    t = NeighbourTable(forest, b)
+    # Without a finer neighbour a piece's sub-pieces share its primary,
+    # decided once a piece.
+    bypiece = !hasfiner(t, c)
+    cache = Dict{NTuple{D,Int},Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int}}}()
     for sub in closed_subpieces(c, forest.N)
         all(==(1), piece_of(sub)) && continue       # the open interior: no copies
-        slvl, s, scls, δ, o = piece_primary(piece_copies(forest, b, sub, c))
+        slvl, s, scls, δ, o = bypiece ?
+            get!(() -> piece_primary(piece_copies(t, sub, c)), cache, piece_of(sub)) :
+            piece_primary(piece_copies(t, sub, c))
         s == b && scls == piece_of(sub) && continue
         push!(entries, (sub, slvl == lvl ? :copy : :restrict, s, δ, o))
     end
