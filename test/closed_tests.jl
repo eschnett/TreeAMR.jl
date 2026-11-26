@@ -314,6 +314,78 @@ end
 end
 
 
+@testset "A closed box is mirror-symmetric, its walls evolved or prescribed: D=$D" for
+        D in (1, 2)
+    # Guards a wall treated by which way an axis runs: symmetric data in
+    # a box of outer faces stay symmetric to rounding, whether the hook
+    # fills the ghosts beyond an evolved wall, prescribes the wall plane,
+    # or does either relative to the data.
+    # Three roots of unit width, so that the mirror image of a block is a
+    # block whose corner is exact, and a pulse about the centre.
+    L = 3.0
+    forest = Forest(ntuple(_ -> 3, D); N=8, extents=ntuple(_ -> (0.0, L), D))
+    pulse = x -> exp(-sum(d -> (x[d] - L / 2)^2, 1:D) / 0.2)
+    data = (x, v) -> v == 1 ? pulse(x) : zero(x[1])
+    hooks = ("evolved" => boundary_by_coordinates(data),
+             "prescribed" => boundary_by_coordinates(data; wall=:prescribed),
+             "relative" => CellBoundary(Relative(AllVariables(x -> (pulse(x), 0.0)))),
+             "relative prescribed" =>
+                 CellBoundary(Relative(AllVariables(x -> (pulse(x), 0.0)));
+                              wall=:prescribed))
+    for (name, hook) in hooks
+        fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
+        sched = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
+        fill_by_coordinates!(data, fs)
+        u = statevector(fs)
+        gather!(u, fs)
+        closed_rk4!(u, fs, sched, hook, 0.25 * minimum_spacing(forest), 20)
+        scatter!(fs, u)
+        fill_ghosts!(fs, sched; boundary=hook)
+        result = point_mirror_error(fs, L)
+        @test result !== nothing
+        worst, count = result
+        @test count > 0
+        @test worst < 1e-13
+        @test maximum(abs, u) > 0.1                       # the pulse is still there
+    end
+end
+
+@testset "A prescribed wall takes the hook's value at every copy, an evolved one keeps its own: D=$D" for
+        D in (1, 2, 3)
+    # Guards stage W: a hook declared to prescribe the wall writes every
+    # wall point, through its primary and stage 0 at every other copy, and
+    # one that does not leaves the wall to the state.
+    for C in closed_centerings(D)
+        c = staggers(C)
+        forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(d -> d == D && D > 1, D))
+        data = (x, v) -> 7.0 + v + sum(x)
+        for (wall, prescribed) in ((:evolved, false), (:prescribed, true))
+            fs = FieldSet(forest, 2; G=1, centering=C)
+            fs.work .= randn(Xoshiro(5), size(fs.work))
+            before = copy(fs.work)
+            sched = GhostSchedule(fs, closed_ops(1))
+            fill_ghosts!(fs, sched; boundary=boundary_by_coordinates(data; wall=wall))
+            nwall, ok = 0, true
+            for b in 1:nblocks(fs), I in CartesianIndices(TreeAMR.interiorranges(fs))
+                x = coordinates(fs, b, Tuple(I))
+                onwall = any(d -> c[d] == 1 && !forest.periodic[d] &&
+                                  (x[d] == 0.0 || x[d] == forest.roots[d]), 1:D)
+                onwall || continue
+                # A copy across a periodic wrap is a period from its
+                # primary, whose value it takes: the hook's at the primary.
+                any(d -> forest.periodic[d] && x[d] == forest.roots[d], 1:D) && continue
+                nwall += 1
+                for v in 1:2
+                    prescribed ? (fs.work[I, v, b] == data(x, v) || (ok = false)) :
+                                 (fs.work[I, v, b] != data(x, v) || (ok = false))
+                end
+            end
+            @test ok
+            @test nwall > 0 || all(==(0), c[1:max(1, D - 1)])
+        end
+    end
+end
+
 @testset "Skipping the secondaries with unify! is the full run at the primaries: D=$D" for
         D in (1, 2)
     # Guards `unify!` on a state vector: a right-hand side that computes
@@ -412,4 +484,5 @@ end
     # The keywords closed blocks replace say what replaced them.
     @test_throws "own range" map_blocks!((args...) -> nothing, vs; closed=true)
     @test_throws "appendix" statearray(statevector(vs), vs; appendix=true)
+    @test_throws "wall must be" CellBoundary((x, v, δ) -> 0.0; wall=:symmetric)
 end

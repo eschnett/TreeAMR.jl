@@ -926,6 +926,9 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     groups = schedule.stagegroups
     locals = schedule.grouplocals
     p1 = schedule.phase1group
+    # Stage W (M22): a hook that prescribes the wall writes the wall's
+    # primaries first, so that stage 0 carries them to every other copy.
+    boundary === nothing || wall_boundary!(fs, boundary, schedule, backend)
     # Stage 0 (M22): every secondary copy of a shared point from its
     # primary, which no transfer of the stage writes; before anything
     # reads a copy.
@@ -1183,6 +1186,23 @@ it.
     fill_ghosts!(fs, schedule;                         # nvars == 2
                  boundary = CellBoundary(AllVariables((x, δ) -> (x[1], -x[1]))))
 
+At an outer face of a vertex-like dimension the wall plane is an own
+point of every block that holds it (M22, "Closed blocks" in `CODE.md`):
+in the state, and by default **evolved** by the application, while the
+hook fills the `G` ghosts beyond it, alike on both sides of the domain.
+That is the default, `wall = :evolved`, because the wall is in the state
+and so the application's to evolve, as a radiative condition wants; a
+cell-centered set has no wall plane and is not affected.
+`CellBoundary(g; wall = :prescribed)` declares that the hook prescribes
+the wall plane as well, a Dirichlet condition: every fill then writes
+the wall's primaries from the hook first, in any of the forms above, the
+relative one from the point one plane in, and gives every other copy
+their value, so that the copies of a prescribed point are one number.
+The entries of `du` at a prescribed wall are the application's to write,
+zero or the hook's time derivative. Any other `wall` is refused.
+
+    fill_ghosts!(fs, schedule; boundary = CellBoundary(g; wall = :prescribed))
+
 !!! note "Callbacks on a device"
     The callback becomes a kernel argument, so everything it closes over
     must be `isbits`. A captured `Type` is the usual trip: write
@@ -1191,9 +1211,23 @@ it.
     the one the callback is already given) and any mutable state, which
     the purity requirement rules out anyway.
 """
-struct CellBoundary{F}
+struct CellBoundary{F,W}
     g::F
+    CellBoundary{F,W}(g) where {F,W} = new{F,W}(g)
 end
+
+function CellBoundary(g; wall::Symbol=:evolved)
+    wall === :evolved || wall === :prescribed || throw(ArgumentError(
+        "wall must be :evolved (the wall plane of a vertex-like dimension is an own point " *
+        "of the state, evolved by the application, and the hook fills the ghosts beyond " *
+        "it) or :prescribed (the hook gives the wall plane its value too, a Dirichlet " *
+        "condition), got :$wall"))
+    return CellBoundary{typeof(g),wall === :prescribed}(g)
+end
+
+# Whether a hook prescribes the wall planes (M22): stage W runs for one.
+prescribes_wall(::CellBoundary{F,W}) where {F,W} = W
+prescribes_wall(hook) = false
 
 """
     Relative(f)
@@ -1259,9 +1293,10 @@ apply_boundary!(fs::FieldSet{T,D}, hook::CellBoundary, schedule::GhostSchedule{T
                 backend::CPU) where {T,D} = cell_boundary!(fs, hook, schedule, backend)
 
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
@@ -1282,30 +1317,33 @@ end
 # `boundary_after_stage!`.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative},
                         schedule::GhostSchedule{T,D}, backend;
-                        slot::Int=PHASE1_TAG) where {T,D}
+                        slot::Int=PHASE1_TAG,
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     f = hook.g.f
     fs.nvars == 1 || throw(ArgumentError(
         "CellBoundary(Relative(f)) sets one variable from `f(x)`, but the field set " *
         "has nvars = $(fs.nvars); for several, wrap the function in AllVariables, " *
         "`CellBoundary(Relative(AllVariables(x -> (u1, u2, ...))))`"))
-    return relative_launch!(relative_kernel!(backend), fs, f, schedule, backend, slot)
+    return relative_launch!(relative_kernel!(backend), fs, f, schedule, backend, slot,
+                            batches)
 end
 
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative{<:AllVariables}},
                         schedule::GhostSchedule{T,D}, backend;
-                        slot::Int=PHASE1_TAG) where {T,D}
+                        slot::Int=PHASE1_TAG,
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     f = hook.g.f.f
     check_allvariables(f(allvariables_sample(fs)), fs, "boundary hook")
     return relative_launch!(relative_all_kernel!(backend), fs, f, schedule, backend, slot,
-                            Val(fs.nvars))
+                            batches, Val(fs.nvars))
 end
 
-function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot,
+function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot, batches,
                           nv...) where {T,D}
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         batch.slot == slot || continue
         n = nregions(batch)
         n == 0 && continue
@@ -1330,14 +1368,15 @@ boundary_after_stage!(fs::FieldSet, hook::CellBoundary{<:Relative}, schedule, ba
 # at, and no boundary to fill; the hook is not collective, so returning
 # alone is safe.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     g = hook.g.f
     δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
     check_allvariables(g(allvariables_sample(fs), δ), fs, "boundary hook")
 
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
@@ -1356,9 +1395,10 @@ end
 # The forms with the patch (M17). As above, but for the patch the plan
 # holds per block; the all-variables check hands the sample point's.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch},
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
@@ -1374,14 +1414,15 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch},
 end
 
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch{<:AllVariables}},
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     g = hook.g.f.f
     δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
     check_allvariables(g(allvariables_sample(fs), allvariables_sample_patch(fs), δ), fs,
                        "boundary hook")
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
@@ -1400,13 +1441,30 @@ end
 # with the patch: say so here, on the host, rather than call the wrapper
 # inside a kernel.
 cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative{<:WithPatch}},
-               schedule::GhostSchedule{T,D}, backend; slot::Int=PHASE1_TAG) where {T,D} =
+               schedule::GhostSchedule{T,D}, backend; slot::Int=PHASE1_TAG,
+               batches=nothing) where {T,D} =
     throw(ArgumentError(
         "CellBoundary(Relative(WithPatch(f))) is not a form the package has: the " *
         "relative hook calls `f` at the ghost and at the nearest evolved point, by " *
         "position alone, and is not handed the patch. WithPatch takes the hooks that " *
         "set a ghost outright, CellBoundary(WithPatch((x, p, v, δ) -> …)) and " *
         "boundary_by_coordinates(WithPatch((x, p, v) -> …))"))
+
+# Stage W (M22): a hook that prescribes the wall planes writes the wall's
+# primaries, `wall_regions!`'s, before stage 0. Any other hook does
+# nothing here, and a cell-centered set has no such region.
+wall_boundary!(fs, hook, schedule, backend) = nothing
+function wall_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{F,true},
+                        schedule::GhostSchedule{T,D}, backend) where {T,D,F}
+    walls = schedule.boundaryplan.walls
+    isempty(walls) && return nothing
+    if hook isa CellBoundary{<:Relative}
+        cell_boundary!(fs, hook, schedule, backend; slot=UNIFY_TAG, batches=walls)
+    else
+        cell_boundary!(fs, hook, schedule, backend; batches=walls)
+    end
+    return nothing
+end
 
 # The region form. It may do anything to the region it is handed, which
 # is exactly why it cannot be run on a device on the caller's behalf: a
@@ -1784,8 +1842,11 @@ handed the patch of the ghost's block (M17), as
 [`fill_by_coordinates!`](@ref) hands it, so that the same callback sets
 the initial data and the boundary values of a forest of patches.
 """
-boundary_by_coordinates(f) = CellBoundary((x, v, δ) -> f(x, v))
-boundary_by_coordinates(w::AllVariables) = CellBoundary(AllVariables((x, δ) -> w.f(x)))
-boundary_by_coordinates(w::WithPatch) = CellBoundary(WithPatch((x, p, v, δ) -> w.f(x, p, v)))
-boundary_by_coordinates(w::WithPatch{<:AllVariables}) =
-    CellBoundary(WithPatch(AllVariables((x, p, δ) -> w.f.f(x, p))))
+boundary_by_coordinates(f; wall::Symbol=:evolved) =
+    CellBoundary((x, v, δ) -> f(x, v); wall=wall)
+boundary_by_coordinates(w::AllVariables; wall::Symbol=:evolved) =
+    CellBoundary(AllVariables((x, δ) -> w.f(x)); wall=wall)
+boundary_by_coordinates(w::WithPatch; wall::Symbol=:evolved) =
+    CellBoundary(WithPatch((x, p, v, δ) -> w.f(x, p, v)); wall=wall)
+boundary_by_coordinates(w::WithPatch{<:AllVariables}; wall::Symbol=:evolved) =
+    CellBoundary(WithPatch(AllVariables((x, p, δ) -> w.f.f(x, p))); wall=wall)

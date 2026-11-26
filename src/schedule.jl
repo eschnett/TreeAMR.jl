@@ -289,6 +289,7 @@ is exactly what a schedule is rebuilt for.
 struct BoundaryPlan{D,BT<:BoundaryBatch{D},VL<:AbstractVector,VB<:AbstractVector,
                     VS<:AbstractVector,VP<:AbstractVector,VN}
     batches::Vector{BT}
+    walls::Vector{BT}       # stage W (M22): the wall primaries a hook may prescribe
     lows::VL                # `block_lows`
     bases::VB               # `block_bases`
     spacings::VS
@@ -307,7 +308,22 @@ end
 # hook may run them and by shape, then move the result to wherever the
 # kernels will run.
 function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
-                      boundaries::Vector{BoundaryRegion{D}}, P::Int) where {T,D}
+                      boundaries::Vector{BoundaryRegion{D}}, P::Int,
+                      walls::Vector{BoundaryRegion{D}}=BoundaryRegion{D}[]) where {T,D}
+    batches = boundary_batches(backend, boundaries)
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
+    spacings = todevice(backend, block_spacings(forest, T))
+    patches = todevice(backend, block_patches(forest))
+    nodes = node_offsets(backend, T, P)
+    return BoundaryPlan{D,eltype(batches),typeof(lows),typeof(bases),typeof(spacings),
+                        typeof(patches),typeof(nodes)}(batches,
+                                                       boundary_batches(backend, walls),
+                                                       lows, bases, spacings, patches,
+                                                       nodes)
+end
+
+function boundary_batches(backend::Backend, boundaries::Vector{BoundaryRegion{D}}) where {D}
     byshape = Dict{Tuple{Int,NTuple{D,Int}},
                    Tuple{Vector{Int32},Vector{NTuple{D,Int8}},Vector{NTuple{D,Int32}},
                          Vector{NTuple{D,Int32}}}}()
@@ -326,16 +342,8 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
     # Concretely typed even when empty — a fully periodic domain has no
     # outward-facing regions at all, which is the common case.
     BT = batchtype(backend, Val(D))
-    batches = BT[todevice(backend, BoundaryBatch{D}(k[2], k[1], byshape[k]...))
-                 for k in keys_]
-    lows = todevice(backend, block_lows(forest, T))
-    bases = todevice(backend, block_bases(forest))
-    spacings = todevice(backend, block_spacings(forest, T))
-    patches = todevice(backend, block_patches(forest))
-    nodes = node_offsets(backend, T, P)
-    return BoundaryPlan{D,eltype(batches),typeof(lows),typeof(bases),typeof(spacings),
-                        typeof(patches),typeof(nodes)}(batches, lows, bases, spacings,
-                                                       patches, nodes)
+    return BT[todevice(backend, BoundaryBatch{D}(k[2], k[1], byshape[k]...))
+              for k in keys_]
 end
 
 # What one ghost region of one block needs, as found by the neighbor
@@ -1440,6 +1448,42 @@ function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,
     return nothing
 end
 
+# The regions of stage W (M22) on global leaf `j`, local block `b`: every
+# piece of its closed box that lies on an outer face of a vertex-like
+# dimension and whose copy is the primary, the piece's own range, with the
+# outward direction along the outer faces it lies on. A hook that
+# prescribes the wall writes these before stage 0, which carries them to
+# every other copy, so that the copies of a prescribed point are one
+# number. The relative hook's nearest evolved point is one plane in from
+# the wall along each such dimension, `G + 2` or `G + N`: a point held by
+# the same blocks as the wall point, since neither has a neighbour along
+# the normal, and so a primary of this same block, which stage W does not
+# write. It needs `N ≥ 2`, which every layout has.
+function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
+                       G::NTuple{D,Int}, c::NTuple{D,Int}, j::Int, b::Int) where {D}
+    k = forest.leaves[j]
+    N = forest.N
+    outer = ntuple(D) do d
+        lo = c[d] == 1 && isempty(oriented_neighbors(forest, k,
+                                                     ntuple(e -> e == d ? -1 : 0, D))[2])
+        hi = c[d] == 1 && isempty(oriented_neighbors(forest, k,
+                                                     ntuple(e -> e == d ? 1 : 0, D))[2])
+        (lo, hi)
+    end
+    any(o -> o[1] || o[2], outer) || return walls
+    bits = primary_bits(forest, j, c)
+    for cls in closed_pieces(c)
+        δ = ntuple(d -> cls[d] == 0 && outer[d][1] ? -1 : cls[d] == 2 && outer[d][2] ? 1 : 0,
+                   D)
+        all(iszero, δ) && continue
+        (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+        region = CartesianIndices(ntuple(d -> piece_range(N, G[d], c[d], cls[d]), D))
+        clamps = ntuple(d -> Int32(δ[d] < 0 ? G[d] + 2 : δ[d] > 0 ? G[d] + N : 0), D)
+        push!(walls, BoundaryRegion{D}(Int32(b), δ, region, clamps, UNIFY_TAG))
+    end
+    return walls
+end
+
 # A hook region of block `b` (key `k`) in direction `δ`, with what the
 # relative hook needs (see `BoundaryRegion`). A component of `δ` leaves
 # through an outer face when the single step along it does: there is no
@@ -2364,7 +2408,14 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
-    bplan = BoundaryPlan(backend, T, forest, boundaries, order)
+    # Stage W's regions (M22), for a hook that prescribes the walls.
+    wallregs = BoundaryRegion{D}[]
+    if any(==(1), stags)
+        for b in 1:nb
+            wall_regions!(wallregs, forest, ghosts, stags, offset + b, b)
+        end
+    end
+    bplan = BoundaryPlan(backend, T, forest, boundaries, order, wallregs)
 
     # Stage 0 (M22) for a layout with a vertex-like dimension, phase 1,
     # and one stage per phase-2 target level. Serially each stage is one
