@@ -13,6 +13,7 @@ using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize,
                           Backend, CPU, allocate, supports_float64
 import KernelAbstractions
 import Adapt
+using PrecompileTools: @setup_workload, @compile_workload
 using Base.MultiplicativeInverses: SignedMultiplicativeInverse
 
 # Tree core (M1)
@@ -104,5 +105,6 @@ include("regrid.jl")
 include("interpolate.jl")
 include("atlas.jl")
 include("grids.jl")
+include("precompile.jl")
 
 end
