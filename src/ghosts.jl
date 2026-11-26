@@ -1812,8 +1812,9 @@ primary among them may be the partner's, so the two are unified
 together, as the paired fill does: stage P of both members, so that a
 primary on a reflecting wall plane is projected before any copy reads it,
 then `a`'s stage 0 and `b`'s, each reading the other through the pair's
-tables. The result does not depend on which member is `a`. The second form unifies a state-shaped vector of the
-two sets, laid out as [`stateview`](@ref) lays out `(a, b)`.
+tables. The result does not depend on which member is `a`. The second
+form unifies a state-shaped vector of the two sets, laid out as
+[`stateview`](@ref) lays out `(a, b)`.
 """
 function unify!(pair::RotationPair, schedules::Tuple)
     a, b = pair.a, pair.b
