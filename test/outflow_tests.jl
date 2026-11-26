@@ -14,8 +14,9 @@ const OUTFLOW_KINDS = (:outflow_lo, :outflow_hi, :outflow_both)
 
 """
 The stored index whose value the ghost `idx` of block `b` holds: `idx`
-itself clamped into the owned range along every dimension in which it
-lies beyond an outflow face of the domain — or `nothing` when it lies
+itself clamped into the own range along every dimension in which it
+lies beyond an outflow face of the domain — onto the wall plane along a
+vertex-like dimension, the block's own on both sides (M22) — or `nothing` when it lies
 beyond an outer face, which makes it the boundary hook's, holding the
 data at its own position. Beyond a periodic or a reflecting face the
 data themselves are periodic or of definite parity, so the index stays.
@@ -25,14 +26,15 @@ function outflow_source(fs::FieldSet{T,D}, b, idx::NTuple{D,Int}) where {T,D}
     N = forest.N
     ext = block_extent(forest, blockkey(fs, b))
     hook = false
+    c = staggers(fs)
     j = ntuple(D) do d
         G = fs.G[d]
         lo = idx[d] <= G && ext[d][1] == forest.extents[d][1]
-        hi = idx[d] >= G + N + 1 && ext[d][2] == forest.extents[d][2]
+        hi = idx[d] >= G + N + c[d] + 1 && ext[d][2] == forest.extents[d][2]
         (lo || hi) && !forest.periodic[d] || return idx[d]
         kind = facekind(forest, d, lo ? 1 : 2)
         kind == OuterFace && (hook = true)
-        return kind == OutflowFace ? (lo ? G + 1 : G + N) : idx[d]
+        return kind == OutflowFace ? (lo ? G + 1 : G + N + c[d]) : idx[d]
     end
     return hook ? nothing : j
 end
@@ -140,14 +142,12 @@ end
                                 4)
         Cs = D == 3 ? [centerings[mod1(i, length(centerings))]] : centerings
         for C in Cs
-            vertexlike(C) && continue               # M22 step 4, below
             nnan, worst = outflow_deviation(forest, C, f, parity)
             (nnan == 0 && worst < 1e-12) || push!(bad, (kinds, C, nnan, worst))
         end
     end
     @test isempty(bad)
     isempty(bad) || foreach(println, bad)
-    pending(4, "outflow ghost repeats nearest owned point, vertex-like centerings, D=$D")
 end
 
 @testset "Every ghost is defined and none is read undefined at outflow faces: D=$D" for
@@ -168,14 +168,12 @@ end
     for (i, kinds) in enumerate(cases)
         Cs = D == 3 ? [centerings[mod1(i, length(centerings))]] : centerings
         for C in Cs
-            vertexlike(C) && continue               # M22 step 4, below
             nnan, worst = undefined_ghosts(kinds, C)
             (nnan == 0 && worst < 1e-10) || push!(bad, (kinds, C, nnan, worst))
         end
     end
     @test isempty(bad)
     isempty(bad) || foreach(println, bad)
-    pending(4, "every ghost defined at outflow faces, vertex-like centerings, D=$D")
 end
 
 @testset "Outflow and periodic faces need no boundary hook: D=$D" for D in (1, 2, 3)
@@ -184,7 +182,6 @@ end
     kinds = ntuple(d -> d == 1 ? :outflow_both : :periodic, D)
     forest = faces_forest(kinds)
     for C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(4, "outflow needs no hook, $C, D=$D"); continue)
         fs = FieldSet(forest, 1; G=ghosts_for(C, 4), centering=C)
         schedule = GhostSchedule(fs, OPS4)
         @test isempty(schedule.boundaries)

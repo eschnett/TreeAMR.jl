@@ -202,53 +202,49 @@ end
                        ((:reflect_hi, :reflect_lo), vertexcentered(2)),
                        ((:outer, :reflect_hi), facecentered(2, 2)),
                        ((:reflect_lo, :periodic), cellcentered(2)))
-    if vertexlike(C)
-        pending(4, "beyond a reflecting face, kinds=$kinds, C=$C")
-    else
-        # A symmetric run's horizon finder asks for points across the wall.
-        # The answer is the mirror image's value times the variable's parity,
-        # and a derivative across the wall flips once more per order — so
-        # `∂ₓ²` across a wall in x does not flip and `∂ₓ∂ᵧ` does; getting a
-        # sign wrong gives a gradient pointing the wrong way at the wall, or a
-        # curvature of the wrong sign.
-        D = length(kinds)
-        forest = faces_forest(kinds)
-        roots = D == 1 ? 3 : 2
-        walls = ntuple(d -> kinds[d] === :reflect_hi ? Float64(roots) : 0.0, D)
-        fac(x, v, d) = parity_factor(kinds[d], v, d, x[d], walls[d])
-        f(x, v) = prod(fac(x, v, d)[1] for d in 1:D)
-        dm(x, v, m) = prod(fac(x, v, d)[m[d] + 1] for d in 1:D)
-        single(k) = k === :reflect_lo || k === :reflect_hi
-        parity = [ntuple(d -> single(kinds[d]) ? (v == 1 ? EvenParity : OddParity) :
-                              kinds[d] === :reflect_both ? EvenParity : NoParity, D)
-                  for v in 1:2]
-        fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C, parity=parity)
-        fill_by_coordinates!(f, fs)
-        fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
-                     boundary=boundary_by_coordinates(f))
-        rng = Xoshiro(17 + D)
-        xs = map(1:80) do _
-            ntuple(D) do d
-                k = kinds[d]
-                k === :reflect_lo ? -roots / 2 + (3roots / 2) * rand(rng) :
-                k === :reflect_hi ? (3roots / 2) * rand(rng) :
-                k === :periodic ? -roots + 3roots * rand(rng) : roots * rand(rng)
-            end
+    # A symmetric run's horizon finder asks for points across the wall.
+    # The answer is the mirror image's value times the variable's parity,
+    # and a derivative across the wall flips once more per order — so
+    # `∂ₓ²` across a wall in x does not flip and `∂ₓ∂ᵧ` does; getting a
+    # sign wrong gives a gradient pointing the wrong way at the wall, or a
+    # curvature of the wrong sign.
+    D = length(kinds)
+    forest = faces_forest(kinds)
+    roots = D == 1 ? 3 : 2
+    walls = ntuple(d -> kinds[d] === :reflect_hi ? Float64(roots) : 0.0, D)
+    fac(x, v, d) = parity_factor(kinds[d], v, d, x[d], walls[d])
+    f(x, v) = prod(fac(x, v, d)[1] for d in 1:D)
+    dm(x, v, m) = prod(fac(x, v, d)[m[d] + 1] for d in 1:D)
+    single(k) = k === :reflect_lo || k === :reflect_hi
+    parity = [ntuple(d -> single(kinds[d]) ? (v == 1 ? EvenParity : OddParity) :
+                          kinds[d] === :reflect_both ? EvenParity : NoParity, D)
+              for v in 1:2]
+    fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C, parity=parity)
+    fill_by_coordinates!(f, fs)
+    fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                 boundary=boundary_by_coordinates(f))
+    rng = Xoshiro(17 + D)
+    xs = map(1:80) do _
+        ntuple(D) do d
+            k = kinds[d]
+            k === :reflect_lo ? -roots / 2 + (3roots / 2) * rand(rng) :
+            k === :reflect_hi ? (3roots / 2) * rand(rng) :
+            k === :periodic ? -roots + 3roots * rand(rng) : roots * rand(rng)
         end
-        push!(xs, ntuple(d -> walls[d] + (single(kinds[d]) ? (walls[d] > 0 ? 0.3 : -0.3) : 0.7), D))
-        derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
-        r = interpolate(fs, xs, Lagrange(4); derivs=derivs)
-        worst = errors_by_order(r.values, xs, derivs, dm)
-        showerrors() && @info "reflecting" kinds C worst = Tuple(worst)
-        @test worst[1] < 1e-11
-        @test worst[2] < 1e-10
-        @test worst[3] < 1e-9
-        @test split_matches(fs, xs, Lagrange(4); derivs=derivs)
-        # A point beyond the wall by more than the domain is still outside.
-        far = ntuple(d -> single(kinds[d]) ? (walls[d] > 0 ? 3roots + 0.5 : -2roots - 0.5) :
-                                             0.5, D)
-        @test_throws "outside the domain" interpolate(fs, [far], Lagrange(4))
     end
+    push!(xs, ntuple(d -> walls[d] + (single(kinds[d]) ? (walls[d] > 0 ? 0.3 : -0.3) : 0.7), D))
+    derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
+    r = interpolate(fs, xs, Lagrange(4); derivs=derivs)
+    worst = errors_by_order(r.values, xs, derivs, dm)
+    showerrors() && @info "reflecting" kinds C worst = Tuple(worst)
+    @test worst[1] < 1e-11
+    @test worst[2] < 1e-10
+    @test worst[3] < 1e-9
+    @test split_matches(fs, xs, Lagrange(4); derivs=derivs)
+    # A point beyond the wall by more than the domain is still outside.
+    far = ntuple(d -> single(kinds[d]) ? (walls[d] > 0 ? 3roots + 0.5 : -2roots - 0.5) :
+                                         0.5, D)
+    @test_throws "outside the domain" interpolate(fs, [far], Lagrange(4))
 end
 
 @testset "An excluded region flags exactly the stencils that reach into it" begin

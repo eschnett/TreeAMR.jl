@@ -87,14 +87,12 @@ end
     for (i, kinds) in enumerate(cases)
         Cs = D == 3 ? [centerings[mod1(i, length(centerings))]] : centerings
         for C in Cs
-            vertexlike(C) && continue               # M22 step 4, below
             nnan, worst = undefined_ghosts(kinds, C)
             (nnan == 0 && worst < 1e-10) || push!(bad, (kinds, C, nnan, worst))
         end
     end
     @test isempty(bad)
     isempty(bad) || foreach(println, bad)
-    pending(4, "every ghost defined at reflecting faces, vertex-like centerings, D=$D")
 end
 
 @testset "Parity polynomials are exact across a reflecting face: D=$D" for D in (1, 2, 3)
@@ -107,7 +105,6 @@ end
     # (In 3D order 4 is left to the NaN test above, which asserts the
     # same exactness over the same walls.)
     for C in allcenterings(Val(D)), p in (D == 3 ? (2,) : (2, 4))
-        vertexlike(C) && (pending(4, "parity polynomials exact, $C, p = $p, D=$D"); continue)
         for kinds in Iterators.product(ntuple(_ -> (:reflect_lo, :reflect_hi), D)...)
             nnan, worst = undefined_ghosts(kinds, C; p=p)
             @test nnan == 0
@@ -167,7 +164,6 @@ end
     N = 8                                        # order 4 restricts from N >= 5
     for (side, C) in ((:lo, cellcentered(D)), (:hi, cellcentered(D)),
                       (:lo, vertexcentered(D)))
-        vertexlike(C) && (pending(4, "mirrored doubled domain, $C, D=$D"); continue)
         result = reflecting_vs_doubled(Val(D); side=side, centering=C, N=N)
         @test result !== nothing
         result === nothing && continue
@@ -190,13 +186,12 @@ end
         forest = faces_forest(ks; N=N)
         _, parity = parity_data(Float64, ks, 4)
         for C in allcenterings(Val(D))
-            vertexlike(C) && (pending(4, "partition at reflecting faces, $C, $ks"); continue)
             G = ghosts_for(C, 4)
             c = staggers(C)
             fs = FieldSet(forest, 2; G=G, centering=C, parity=parity)
             schedule = GhostSchedule(fs, OPS4)
             counts = write_counts(schedule)
-            owned = ntuple(d -> (G[d] + 1):(G[d] + N), D)
+            owned = ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D)
             ok = true
             for b in 1:nleaves(forest), idx in CartesianIndices(size(counts)[1:D])
                 inside = all(d -> Tuple(idx)[d] in owned[d], 1:D)
@@ -313,7 +308,6 @@ end
     # point, an O(h⁴) interpolant read through an h⁻² stencil — the same
     # budget as a prolongated ghost's, so it may not cost the rate.
     for C in (vertexcentered(D), cellcentered(D))
-        vertexlike(C) && (pending(4, "reflecting wave converges, $C, D=$D"); continue)
         for (exact, par) in ((wave_exact, OddParity), (wave_exact_even, EvenParity))
             hs, l2, linf = Float64[], Float64[], Float64[]
             for N in (8, 16, 32)

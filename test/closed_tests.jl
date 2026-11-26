@@ -765,12 +765,6 @@ end
     two = Forest((2, 2); N=8)
     refine!(two, two.leaves[1])
     walled = Forest((2, 2); N=8, reflecting=((true, false), (false, false)))
-    @test_throws "M22 step 4" GhostSchedule(FieldSet(walled, 1; G=1,
-                                                     centering=vertexcentered(2),
-                                                     parity=[EvenParity]), ops)
-    out = Forest((2, 2); N=8, outflow=((true, false), (false, false)))
-    @test_throws "M22 step 4" GhostSchedule(FieldSet(out, 1; G=1,
-                                                     centering=vertexcentered(2)), ops)
     uniform = Forest((2, 2); N=8)
     vs = FieldSet(uniform, 1; G=1, centering=vertexcentered(2))
     @test_throws "M22 step 6" regrid!(uniform, vs => GhostSchedule(vs, ops);

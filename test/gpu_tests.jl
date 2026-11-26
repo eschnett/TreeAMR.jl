@@ -202,7 +202,7 @@ end
     end
 end
 
-@pending 4 "$bname: reflecting faces are filled on the device: T=$T, D=$D" for
+@testset "$bname: reflecting faces are filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # Mirrored transfers are ordinary groups with a parity factor, so on
     # a device they run in the same kernel as every other transfer, with
@@ -218,7 +218,7 @@ end
     end
 end
 
-@pending 4 "$bname: bounded point values are clamped on the device: T=$T, D=$D" for
+@testset "$bname: bounded point values are clamped on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The clamp is a branch of the one transfer kernel, its bracket read
     # off stencil rows uploaded with the rest. On a device it must leave
@@ -451,7 +451,7 @@ end
     @test Array(fs.work) == hostfs.work
 end
 
-@pending 4 "$bname: packing and unpacking on the device reproduce the serial fill: T=$T" for
+@testset "$bname: packing and unpacking on the device reproduce the serial fill: T=$T" for
         (bname, backend, types) in BACKENDS, T in types
     # M7's exchange on a device. A pack's destination and an unpack's
     # source are a message buffer, which reaches the transfer kernel as a

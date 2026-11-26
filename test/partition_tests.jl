@@ -121,8 +121,6 @@ end
     ops = Operators(prolongation=4, restriction=4)
     parity = [EvenParity, OddParity]
     for C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(4, "rank schedules at reflecting faces, $C, D=$D");
-                          continue)
         sched = GhostSchedule(FieldSet(serial, 2; G=2, centering=C, parity=parity), ops)
         stransfers = transfer_set(schedule_groups(sched), 0)
         sbounds = Set((Int(r.block), r.direction, r.region) for r in sched.boundaries)

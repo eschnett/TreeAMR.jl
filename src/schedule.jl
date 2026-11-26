@@ -47,9 +47,8 @@ point, weight exactly one. A group whose stencils are all unit is
 launched with a flag that skips them, so that a copy does no stencil
 arithmetic (see `copy_load`). It is decided from the weights themselves on the
 host, where they are built, and carried to a device with them. It is
-not the group's kind: a mirrored copy at a vertex-like high wall derives
-the wall plane it does not own by interpolation (`wall_stencil`), and a
-vertex-centered `PointValue` restriction is an injection, which is unit.
+not the group's kind: a vertex-centered `PointValue` restriction is an
+injection, which is unit.
 
 `single[i]` is the row of column `i`'s only nonzero weight, or zero when
 the column has more than one (or none). Along that dimension the CPU's
@@ -1238,26 +1237,25 @@ end
 # --- Clamped stencils (outflow faces) -------------------------------------
 #
 # A ghost row `j` beyond an outflow face holds the value at the nearest
-# owned row — zero-gradient extrapolation — which is what the ordinary
+# own row — zero-gradient extrapolation — which is what the ordinary
 # tangential transfer writes there. So, as for a mirror, the clamped
 # stencil is the tangential stencil with its target rows remapped:
 #
 #   low face   j* = G + 1
-#   high face  j* = G + N
+#   high face  j* = G + N + c
 #
-# over the whole ghost slab, which on the high side of a vertex-like
-# dimension includes the wall row `G + N + 1` that no block owns: it is
-# a ghost like the rows beyond it, and clamped like them.
+# over the whole ghost slab. Along a vertex-like dimension the wall row is
+# the block's own on both sides (M22), evolved, and the ghosts beyond it
+# take its value.
 clamp_range(N::Int, G::Int, c::Int, δd::Int) =
-    δd < 0 ? (1:G) : ((G + N + 1):(N + 2G + c))
+    δd < 0 ? (1:G) : ((G + N + c + 1):(N + 2G + c))
 
 function clamp_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
-    c == 0 || error(step4_bug("clamped rows"))
     rng = clamp_range(N, G, c, δd)
-    row = (δd < 0 ? G + 1 : G + N) - s.targetfirst + 1
-    # The nearest owned row is on the wall side of the owned range, so
-    # it lies inside whatever range the tangential stencil covers, halved
-    # or not, as a mirror point does. A failure is a bug in the schedule.
+    row = (δd < 0 ? G + 1 : G + N + c) - s.targetfirst + 1
+    # The nearest own row is on the wall side of the own range, so it
+    # lies inside whatever range the tangential stencil covers, halved or
+    # not, as a mirror point does. A failure is a bug in the schedule.
     1 <= row <= ntarget(s) || error(
         "clamped row $row falls outside the tangential stencil's $(ntarget(s)) " *
         "targets (N=$N, G=$G, c=$c, δ=$δd)")
@@ -1265,9 +1263,11 @@ function clamp_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
     return Stencil1D{T}(first(rng), s.srcstart[rows], s.weights[:, rows])
 end
 
-# Target range of the mirrored rows: the whole ghost slab, less the wall
-# row itself on the high side of a vertex-like dimension (that row is
-# `wall_stencil`'s).
+# Target range of the mirrored rows: the whole ghost slab. Along a
+# vertex-like dimension the mirror is about the wall plane, the block's
+# own point on both sides (M22): ghost `j` takes own point `2(G+1) − j`
+# below and `2(G+N+1) − j` above; along a cell-like one the mirror is
+# about the face between two cells.
 mirror_range(N::Int, G::Int, c::Int, δd::Int) =
     δd < 0 ? (1:G) : ((G + N + 1 + c):(N + 2G + c))
 
@@ -1275,47 +1275,37 @@ mirror_index(N::Int, G::Int, c::Int, δd::Int, j::Int) =
     δd < 0 ? 2G + 1 + c - j : 2(G + N) + 1 + c - j
 
 function mirror_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
-    c == 0 || error(step4_bug("mirrored rows"))
     rng = mirror_range(N, G, c, δd)
     rows = Int[mirror_index(N, G, c, δd, j) - s.targetfirst + 1 for j in rng]
-    # Every mirror point lies inside the owned range, within the half on
-    # the wall side — `N ≥ 2G + 2c` is exactly what guarantees it — and
-    # so inside whatever range the tangential stencil covers, halved or
-    # not. A failure here is a bug in the schedule, not in the input.
+    # Every mirror point lies inside the own range, within `G` points of
+    # the wall — `N ≥ 2G` keeps it in the half on the wall side — and so
+    # inside whatever range the tangential stencil covers, halved or not
+    # (a mirrored restriction covers its child's closed half, see
+    # `mirror_restriction`). A failure here is a bug in the schedule, not
+    # in the input.
     all(r -> 1 <= r <= ntarget(s), rows) || error(
         "mirror rows $rows fall outside the tangential stencil's " *
         "$(ntarget(s)) targets (N=$N, G=$G, c=$c, δ=$δd)")
     return Stencil1D{T}(first(rng), s.srcstart[rows], s.weights[:, rows])
 end
 
-# The derived upper wall row of a vertex-like dimension at a reflecting
-# face: the symmetric Lagrange interpolant at the wall through the `p`
-# points `±1, …, ±p/2` beside it, folded by symmetry onto the `p/2`
-# one-sided points with doubled weights — `(4u₁ − u₂)/3` at `p = 4`. The
-# parity factor is `(1 + σ)/2`, so an odd variable gets exactly zero.
-# Every source has its own wall at `G + N + 1` in its own frame, which
-# is why the row is the same whatever kind the transfer is. See "Ghost
-# filling" in CODE.md.
-function wall_stencil(::Type{T}, N::Int, G::Int, p::Int) where {T}
-    error(step4_bug("a derived wall row"))
-    h = p ÷ 2
-    nodes = [Rational{Int}(i) for i in vcat(-h:-1, 1:h)]
-    w = lagrange_weights(nodes, 0//1)
-    weights = Matrix{T}(undef, h, 1)
-    for i in 1:h
-        weights[i, 1] = T(2 * w[i])                # nodes -h … -1 ascending
-    end
-    wall = G + N + 1
-    return Stencil1D{T}(wall, Int32[wall - h], weights)
+# The tangential restriction a mirrored or clamped row is taken from, along
+# a vertex-like wall dimension: over the finer source's closed half,
+# `G+1 … G+1+N/2` for the lower child and `G+1+N/2 … G+N+1` for the upper,
+# both with the mid-plane. The halved range phase 1 restricts into gives the
+# mid-plane to the lower child only, and at `N = 2G` the outermost ghost
+# beyond a high wall mirrors onto the mid-plane, which the wall-side source
+# is the upper child; it holds the point at its low plane, a secondary
+# there, final after stage 0, which is when phase 1 reads it. The read is
+# in the stencil, so `stage_groups` sees it.
+function mirror_restriction(::Type{T}, N::Int, G::Int, od::Int, p::Int,
+                            mode::Int8) where {T}
+    h = N ÷ 2
+    rng = od == 0 ? ((G + 1):(G + 1 + h)) : ((G + 1 + h):(G + N + 1))
+    s = restrict_stencil_over(T, rng, N, G, 1, 0, od, p)
+    mode == BOUNDED_POINTVALUE || return s
+    return stack_linear(s, restrict_stencil_over(T, rng, N, G, 1, 0, od, 2))
 end
-
-# The mirror and the clamp above, and the derived wall row, are those of
-# half-open ownership along a vertex-like dimension; M22 step 4 rebuilds
-# them about the wall plane, and a set with a vertex-like dimension is
-# refused over reflecting and outflow faces until then.
-step4_bug(what) = "$what along a vertex-like dimension asked for; reflecting and " *
-                  "outflow faces of such a set come back in M22 step 4, and " *
-                  "GhostSchedule refuses them until then, so this is a bug"
 
 # --- Schedule construction -----------------------------------------------
 
@@ -1795,26 +1785,14 @@ function mirror_sources!(pairs::TransferPairs{D},
     k = forest.leaves[b]
     zerooffset = ntuple(_ -> 0, D)
     mask = map(!=(OuterFace), walls)
-    # A reflecting vertex-like dimension on the high side splits its
-    # target into the derived wall row (state 2) and the mirrored rows
-    # beyond it (state 1), which are batched apart because their parity
-    # factors differ. Each part may be empty — at `G = 0` only the wall row is left — and an
-    # empty part records nothing. An outflow dimension clamps its whole
-    # slab, wall row included (state 3).
-    choices = ntuple(D) do d
-        !mask[d] && return (Int8(0),)
-        walls[d] == OutflowFace && return (Int8(3),)
-        c[d] == 1 && δ[d] == 1 || return (Int8(1),)
-        return G[d] == 0 ? (Int8(2),) : (Int8(1), Int8(2))
-    end
-    states = vec(collect(Iterators.product(choices...)))
+    # A reflecting dimension mirrors its slab (state 1), an outflow one
+    # clamps it (state 3); along a vertex-like dimension the wall plane is
+    # the block's own on both sides (M22), so the slab is ghosts only.
+    state = ntuple(d -> !mask[d] ? Int8(0) : walls[d] == OutflowFace ? Int8(3) : Int8(1), D)
     record!(kind, offset, lvl, s, via::Crossing) =
-        for state in states
-            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns,
-                                           via.glue),
-                        (Int32[], Int32[])),
-                   (Int32(b), Int32(s)))
-        end
+        push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns, via.glue),
+                    (Int32[], Int32[])),
+               (Int32(b), Int32(s)))
 
     if δ′ == zerooffset
         record!(:copy, zerooffset, 0, b, Crossing())
@@ -2490,11 +2468,6 @@ function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Sym
         "symmetric: an outer wall plane is the block's own on both sides, evolved by " *
         "default; a wall the boundary hook prescribes is `CellBoundary(…; wall = " *
         ":prescribed)`. The `walls` keyword goes in M22 step 4."))
-    any(f -> f[1] != OuterFace || f[2] != OuterFace, getfield(forest, :faces)) &&
-        throw(ArgumentError(
-            "$what: the forest has a reflecting or an outflow face, which is refused " *
-            "for $why: the mirror and the clamp about the wall plane come back in M22 " *
-            "step 4."))
     (hasrotating(forest) || ishalfturn(forest)) && throw(ArgumentError(
         "$what: the forest has a rotating seam, which is refused for $why: quarter " *
         "and half turns, and so a RotationPair, come back in M22 step 7."))
@@ -2626,8 +2599,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
 
     # One dimension of a group's stencils. Along a wall dimension of a
     # mirror transfer the stencil is the ordinary *tangential* one with
-    # its target rows remapped across the wall (or clamped onto the
-    # nearest owned row at an outflow face), or the derived wall row.
+    # its target rows remapped across the wall, or clamped onto the wall
+    # row at an outflow face.
     boundedof(key) = boundedmode(operators, key.kind, key.mirror, stags)
     function build1(key, d)
         # A span of stage 0 (M22): a copy or a restriction into the
@@ -2636,16 +2609,13 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                                              operators.restriction, boundedof(key))
         δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
         mode = boundedof(key)
-        if state == 2
-            # The derived high wall row.
-            wall = wall_stencil(T, N, ghosts[d], vertex_order(operators))
-            mode == BOUNDED_POINTVALUE || return wall
-            return stack_linear(wall, wall_stencil(T, N, ghosts[d], 2))
-        end
         # Along a wall dimension the tangential stencil is built whole and
-        # its rows remapped.
+        # its rows remapped; a restriction along a vertex-like one over its
+        # child's closed half (`mirror_restriction`).
         δs = state == 0 ? δd : 0
-        s = kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
+        s = state != 0 && key.kind === :restrict && stags[d] == 1 && order == 0 ?
+            mirror_restriction(T, N, ghosts[d], od, operators.restriction, mode) :
+            kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
                          P=order)
         state == 0 && return s
         state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd)

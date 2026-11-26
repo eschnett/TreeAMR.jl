@@ -314,10 +314,11 @@ end
     parity = [ntuple(_ -> EvenParity, D)]
     for C in (vertexcentered(D), cellcentered(D))
         # The octant reflects, and is refined.
-        vertexlike(C) && (pending(4, "independent levels, $C, D=$D"); continue)
         s = GhostSchedule(FieldSet(octant, 1; G=3, centering=C, parity=parity), ops)
         @test s.levels == [1, 2, 3]
-        @test s.stagegroups == [1:1, 2:4]
+        # Stage 0 (M22), where there is one, and phase 1 alone in front.
+        p1 = s.phase1group
+        @test s.stagegroups == [[i:i for i in 1:p1]; [(p1 + 1):(p1 + 3)]]
         @test occursin("levels 1-3 run together", sprint(show, s))
     end
     # A level with rotated prolongations runs alone, and so does every
@@ -519,9 +520,12 @@ end
     two = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
     refine!(two, two.leaves[1]); balance!(two)
     push!(setups, FieldSet(two, 3; G=2))
-    # A vertex-centered set on the refined mesh (M22 step 3) and at a
-    # reflecting face (step 4), whose high wall plane is derived.
-    pending(4, "flat launch and copy path, vertex-centered, D=$D")
+    push!(setups, FieldSet(two, 3; G=2, centering=vertexcentered(D)))
+    kinds = ntuple(d -> d == 1 ? :reflect_hi : :periodic, D)
+    walls = faces_forest(kinds; N=N)
+    push!(setups, FieldSet(walls, 2; G=2, centering=vertexcentered(D),
+                           parity=[ntuple(d -> d == 1 ? OddParity : NoParity, D),
+                                   ntuple(d -> d == 1 ? EvenParity : NoParity, D)]))
     if D >= 2
         quad = rotating_forest(Val(D); rotating=(1, 2), N=N)
         push!(setups, FieldSet(quad, D + 1; G=2, centering=cellcentered(D),

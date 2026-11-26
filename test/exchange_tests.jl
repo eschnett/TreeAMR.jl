@@ -30,7 +30,7 @@ using MultiFloats: Float32x2
     end
 end
 
-@pending 4 "The candidate remote targets are every remote leaf touching this rank: D=$D" for
+@testset "The candidate remote targets are every remote leaf touching this rank: D=$D" for
         D in (1, 2, 3)
     # A missing candidate is a remote target whose ghosts this rank never
     # packs, and its owner then waits for a message that is never sent.
@@ -70,7 +70,6 @@ end
     for kinds in EXCHANGE_KINDS[D], C in allcenterings(Val(D)),
         family in (all(==(:cell), C) ? (PointValue, Conservative) : (PointValue,))
         # Refined, and reflecting but in D = 1 (M22 steps 3 and 4).
-        vertexlike(C) && (pending(4, "rank transfers, $C, $kinds"); continue)
         serial = faces_forest(kinds; N=8)
         n = nleaves(serial)
         ops = exchange_operators(C, family)
@@ -89,9 +88,12 @@ end
             @test Set(locals) ∪ Set(remote) == stransfers
             P == 1 ? (@test nsent == 0) : (nonempty += nsent > 0)
             # A stage's local groups run in the order the serial phases
-            # did: the tags ascend, and phase 1 is there on every rank.
+            # did: the tags ascend, and stage 0 (M22, for a set with a
+            # vertex-like dimension) and phase 1 are there on every rank.
+            first_tag = any(==(:vertex), C) ? UNIFY_TAG : PHASE1_TAG
             @test all(s -> issorted([st.tag for st in s.stages]) &&
-                           first(s.stages).tag == PHASE1_TAG, scheds)
+                           first(s.stages).tag == first_tag &&
+                           any(st -> st.tag == PHASE1_TAG, s.stages), scheds)
         end
     end
     @test nonempty > 0
@@ -103,7 +105,6 @@ end
     # for element — the same transfers in the same order at the same
     # offsets — or every ghost after the first disagreement is another's.
     for kinds in EXCHANGE_KINDS[D], C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(4, "message layouts, $C, $kinds"); continue)
         serial = faces_forest(kinds; N=8)
         G = exchange_ghosts(C, PointValue)
         for P in 2:5
@@ -126,7 +127,6 @@ end
     # that stage, at most one per point — which the serial write counts
     # (exactly one per ghost, `ghost_tests.jl`) then make exactly one.
     for kinds in EXCHANGE_KINDS[D], C in allcenterings(Val(D))
-        vertexlike(C) && (pending(4, "every ghost written once, $C, $kinds"); continue)
         serial = faces_forest(kinds; N=8)
         G = exchange_ghosts(C, PointValue)
         stored = ntuple(d -> serial.N + 2G[d] + (C[d] === :vertex), D)
@@ -144,7 +144,7 @@ end
     end
 end
 
-@pending 4 "The interface stages hold the serial restrictions, split by rank: D=$D" for
+@testset "The interface stages hold the serial restrictions, split by rank: D=$D" for
         D in (1, 2, 3)
     # The interface restriction is the other exchange that crosses
     # ranks: a coarse-fine face whose fine side is another rank's. The
@@ -209,7 +209,6 @@ end
         counts = T === Float64 ? (D == 1 ? (1, 2, 3, 5, nleaves(serial) + 1) : (2, 3, 5)) :
                  (3,)
         for C in centers, P in counts
-            vertexlike(C) && (pending(4, "lockstep fill, $C, $kinds, P = $P, $T"); continue)
             ran = true
             same, nz, nm, bad = lockstep_ghost_fill(serial, P, C, PointValue, T)
             @test same
@@ -229,7 +228,6 @@ end
             # off the multilinear rows the pack keeps; vertex-centered, so
             # that the derived wall row is bounded too.
             for C in (cellcentered(D), vertexcentered(D))
-                vertexlike(C) && (pending(4, "bounded lockstep fill, $C, $kinds"); continue)
                 same, _, _, bad = lockstep_ghost_fill(serial, 3, C, PointValue, T;
                                                       bounded=true)
                 @test same && bad == 0
@@ -248,7 +246,7 @@ end
     D == 1 || !ran || @test nmirror > 0
 end
 
-@pending 4 "The staged interface restriction reproduces the serial one bitwise: D=$D, T=$T" for
+@testset "The staged interface restriction reproduces the serial one bitwise: D=$D, T=$T" for
         D in (1, 2, 3), T in (Float64, Float32x2)
     # The interface restriction overwrites a coarse block's own face
     # values with the fine side's, so a fine side on another rank is a
@@ -292,7 +290,6 @@ end
     serial = faces_forest(kinds; N=8)
     nvars = length(EXCHANGE_PARITY)
     for C in (cellcentered(D), vertexcentered(D)), P in (3, 5)
-        vertexlike(C) && (pending(4, "staged driver, $C, P = $P, D=$D"); continue)
         G = exchange_ghosts(C, PointValue)
         sfs = FieldSet(serial, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
         data = exchange_data(MersenneTwister(7), Float64, size(sfs.work))
@@ -363,7 +360,6 @@ end
     f = (x, v) -> sin(sum(x)) + x[1]^2
     for (C, hook) in ((vertexcentered(D), CellBoundary(Relative(x -> cos(sum(x))))),
                       (cellcentered(D), boundary_by_coordinates(f))), P in (2, 3)
-        vertexlike(C) && (pending(4, "grouped stages, $C, P = $P, D=$D"); continue)
         sfs = FieldSet(serial, 1; G=3, centering=C, parity=parity)
         data = rand(MersenneTwister(11), size(sfs.work)...) .- 0.5
         copyto!(sfs.work, data)
