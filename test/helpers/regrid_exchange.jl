@@ -3,7 +3,7 @@
 # groups" in CODE.md).
 
 using TreeAMR: regrid_sources, regrid_stage, split_regrid, equalsplit, MAX_LEVEL,
-               regrid_kept_pairs, regrid_kept_stage, leaves_view
+               regrid_kept_pairs, regrid_kept_stage, leaves_view, kept_candidates
 
 # Refine the coarsest leaves and coarsen the finest, so that a regrid
 # has copies, prolongations and restrictions at once.
@@ -132,6 +132,17 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
     if any(==(1), staggers(fs))
         kpairs = regrid_kept_pairs(leaves_view(forest, newleaves), oldleaves, newleaves,
                                    staggers(fs))
+        # Each rank classifies only its candidates (`kept_candidates`), as
+        # `regrid!` does; what it keeps of them must be what it keeps of
+        # the whole classification.
+        newview = leaves_view(forest, newleaves)
+        for r in 1:P
+            mine = regrid_kept_pairs(newview, oldleaves, newleaves, staggers(fs);
+                                     among=kept_candidates(newview, oldleaves,
+                                                           oldranges[r], newranges[r]))
+            bad += split_regrid(mine, oldranges[r], newranges[r]) !=
+                   split_regrid(kpairs, oldranges[r], newranges[r])
+        end
         kstages = [regrid_kept_stage(T, serial.N, fs.G, staggers(fs), CPU(), kpairs;
                                      oldrange=oldranges[r], newrange=newranges[r],
                                      nold=nold, nnew=nnew,

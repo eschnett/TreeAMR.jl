@@ -28,8 +28,14 @@ stores, with `b` the local block index and `key` its [`MortonKey`](@ref)
 
 `f` may return either a bare [`RegridFlag`](@ref) or a
 `(flag, box)` pair, where `box::NTuple{D,UnitRange{Int}}` is the
-bounding box of the cells that fired, in that block's own interior
-indices `1:N`. Reporting a box is what makes a block a source of the
+bounding box of the cells that fired, in that block's own cell indices
+`1:N`. Along a vertex-like dimension, whose own points are the `N + 1`
+nodes of the closed range (M22), a box built by hand from firing nodes
+`lo … hi` (in `1:N+1`, as [`interiorview`](@ref) indexes them) is the
+cells touching them, `max(1, lo - 1):min(N, hi)`, as
+[`firing_boxes`](@ref) reports it; node `N + 1` is not a cell index, and
+clamping it to `N` would recruit across one face and not the other.
+Reporting a box is what makes a block a source of the
 regrid buffer, so the form carries meaning beyond the flag — see
 [`buffered_flags`](@ref). The two forms may be mixed within one vector.
 
@@ -150,7 +156,6 @@ hi)`. That box is mirror-symmetric — the mirror image of a firing
 pattern gives the mirror image of its box — and a node on a face fires
 in every block holding it, so a face point flags both sides alike and
 the buffer reaches across neither face more than the other. The
-
 blocks are the ones this rank stores (see [`blockrange`](@ref)), so over
 a distributed forest the result is this rank's part of the flags, which
 is what [`regrid!`](@ref) takes; nothing is communicated.
@@ -790,11 +795,14 @@ end
 # values where the kept block holds evolved ones, and stage 0 of the
 # next fill would carry whichever copy the class rule makes the primary
 # to the others: the interpolated one, where the created block is the
-# lower. Every other pair already agrees: created beside created, each
-# from its own parent's copy of the plane, which the old fill unified;
-# a created fine block beside a kept coarser one, which is the finer and
-# so the primary; a created coarse block beside a kept finer one, whose
-# copy is the primary. The pass reads the old storage, as the first
+# lower. Every other pair already agrees. Created beside created: each
+# child's stencils read its parent's copy of the plane and the parent's
+# ghosts along it, and the fill before the regrid gives every stored copy
+# of a point the value of the finest level holding it (the review's
+# amendment of the ghost stages, `ghost_plane_parts`), so both parents
+# read the same values through the same weights. A created fine block
+# beside a kept coarser one is the finer, so the primary; a created
+# coarse block beside a kept finer one has the secondary. The pass reads the old storage, as the first
 # stage does, so it runs after it, into the same fresh array; its
 # targets are disjoint sub-pieces, each from one source, so its groups
 # never write the same point.
@@ -806,26 +814,38 @@ end
 # exactly that.
 #
 # `view` is a serial forest holding the new leaves, for the neighbour
-# lookups; the pairs are classified over every created block on every
-# rank, the decision being replicated, and `split_regrid` keeps this
+# lookups. A created block's pairs depend on it and the tree alone, so
+# each rank classifies only the created blocks among `among` — every new
+# leaf serially; over a distributed forest the ones it receives for and
+# the ones it sends to (`kept_candidates`) — and `split_regrid` keeps this
 # rank's ends, so the sender and the receiver find the same transfers.
 # Its sources are old leaf indices, its keys same-level copies over the
 # spans `merged_transfers` gives.
 function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
                            newleaves::AbstractVector{MortonKey{D}},
-                           c::NTuple{D,Int}) where {D}
+                           c::NTuple{D,Int}; among=nothing) where {D}
     pairs = TransferPairs{D}()
     any(==(1), c) || return pairs
     oldindex(k) = (i = searchsortedfirst(oldleaves, k);
                    i <= length(oldleaves) && oldleaves[i] == k ? i : 0)
     kept = [oldindex(k) for k in newleaves]
-    created = findall(iszero, kept)
+    created = among === nothing ? findall(iszero, kept) :
+              [j for j in among if kept[j] == 0]
     allowed = closed_subpieces(c, view.N).iterators
     perblock = [Pair{GroupKey{D},Int32}[] for _ in created]
     threaded_chunks(length(created)) do _, chunk
         for i in chunk
             j = created[i]
             t = NeighbourTable(view, j)
+            # A kept holder on this block's level is a neighbour across a
+            # face, edge or corner of a vertex-like dimension; most created
+            # blocks have none, and are skipped before their sub-pieces.
+            steps = ntuple(d -> c[d] == 1 ? (-1, 0, 1) : (0,), D)
+            any(Iterators.product(steps...)) do δ
+                all(iszero, δ) && return false
+                lv, nbrs = neighbours(t, δ)
+                lv == t.level && any(x -> kept[x[1]] != 0, nbrs)
+            end || continue
             entries = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int}}[]
             for sub in closed_subpieces(c, view.N)
                 all(==(1), piece_of(sub)) && continue      # the open interior
@@ -848,6 +868,26 @@ function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{
         push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(j), s))
     end
     return pairs
+end
+
+# The new leaves whose kept-over-created pairs this rank needs, over a
+# distributed forest: the ones it stores after the regrid, `newrange`, for
+# the pairs it receives or keeps, and every new leaf sharing a point with
+# a kept block it stored before, `oldrange`, for the pairs whose source it
+# sends. A pair's target holds a point with its source, so it is a
+# neighbour of the source across a face, edge or corner.
+function kept_candidates(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
+                         oldrange::UnitRange{Int}, newrange::UnitRange{Int}) where {D}
+    cand = Set{Int}(newrange)
+    dirs = alldirections(Val(D))
+    for i in oldrange
+        k = oldleaves[i]
+        find_leaf(view, k) === nothing && continue          # not kept
+        for δ in dirs, nbr in neighbor_keys(view, k, δ)
+            push!(cand, find_leaf(view, nbr)::Int)
+        end
+    end
+    return sort!(collect(cand))
 end
 
 # The leaves `leaves` over `forest`'s geometry, as one serial forest: what
@@ -1121,9 +1161,12 @@ copied, newly refined blocks prolongated from their parent, coarsened
 blocks restricted from their children.
 
 `flags` holds a [`RegridFlag`](@ref) or a `(flag, box)` pair per leaf,
-as [`flag_blocks`](@ref) produces; `buffer` is a width in cells, the
-application's choice (feature speed × regrid cadence), and defaults to
-no buffering.
+as [`flag_blocks`](@ref) produces; a box is in cell indices `1:N`, and
+along a vertex-like dimension one built by hand from the own points
+(nodes `lo … hi` in `1:N+1`) is the cells touching them, `max(1, lo -
+1):min(N, hi)`, as [`firing_boxes`](@ref) reports it. `buffer` is a
+width in cells, the application's choice (feature speed × regrid
+cadence), and defaults to no buffering.
 
 `pairs` is one `fs => schedule` or a collection of them, each field set
 over `forest` and each schedule the current one *for that field set*
@@ -1149,8 +1192,10 @@ The target of every transfer is the new block's **own** range, whatever
 the centering: along a vertex-like dimension its closed range, both face
 planes (M22, "Closed blocks" in `CODE.md`); its ghosts are left to the
 next [`fill_ghosts!`](@ref), as ghosts always are. A created block takes
-its face planes from its parent, or its children, whose copies of them
-the fill before the transfer unified; where a *kept* block holds the
+its face planes from its parent, or its children, and two created
+blocks agree on a common plane, since the fill before the transfer gives
+every stored copy of a point, own or ghost, the value of the finest
+level holding it; where a *kept* block holds the
 same point at the finest level holding it, a second pass gives the
 created copy the kept block's value, which is evolved where the created
 one is interpolated. Stages P and 0 are not run: the first
@@ -1160,7 +1205,7 @@ runs them, so the order is regrid, rebuild the schedule, fill or
 copy as the transfer left it: the copies of a point on one level equal,
 a coarse copy its fine primary's restriction only to the operators'
 order along a cell-like dimension (exactly along a vertex-like one), and
-an odd variable on a reflecting wall zero, of either sign.
+an odd variable on a reflecting wall zero.
 
 An element-centered set (M16, [`ElementLocal`](@ref) operators) is
 refined by its elements' polynomials evaluated at the fine nodes and
@@ -1317,8 +1362,12 @@ function regrid!(forest::Forest{D}, pairs;
             # first stage, which wrote those points too.
             c = staggers(fs)
             if any(==(1), c)
-                pairs = get!(() -> regrid_kept_pairs(leaves_view(forest, newleaves),
-                                                     oldleaves, newleaves, c), kept, c)
+                pairs = get!(kept, c) do
+                    view = leaves_view(forest, newleaves)
+                    among = distributed ? kept_candidates(view, oldleaves, oldrange,
+                                                          newrange) : nothing
+                    regrid_kept_pairs(view, oldleaves, newleaves, c; among=among)
+                end
                 second = regrid_kept_stage(eltype(fs.work), forest.N, fs.G, c, backend,
                                            pairs; oldrange=oldrange, newrange=newrange,
                                            nold=nold, nnew=nnew, oldowner=oldowner,
