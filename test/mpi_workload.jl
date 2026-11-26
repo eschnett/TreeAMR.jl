@@ -115,18 +115,23 @@ transfers(forest, s::InterfaceSchedule) =
     transfers(forest, reduce(vcat, s.phases; init=eltype(eltype(s.phases))[]), s.stages)
 
 # The reductions of one variable: exact ones as they are, sums marked.
+# A sum or a count takes each point once, at its primary, and a maximum
+# or a minimum every copy (M22); a set without a vertex-like dimension
+# ignores the keyword.
 function reductions(tag, fs, u)
-    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs))
+    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs; primaries=true))
     emit(tag, "linf", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
-    emit(tag, "min", @sprintf("%.17g", mesh_mapreduce(identity, min, Inf, fs; vars=1)))
+    emit(tag, "min", @sprintf("%.17g", mesh_mapreduce(identity, min, Inf, fs; vars=1,
+                                                      primaries=false)))
     emit(tag, "negmax",
-         @sprintf("%.17g", mesh_mapreduce(x -> -abs(x) - 1, max, -Inf, fs; vars=1)))
+         @sprintf("%.17g", mesh_mapreduce(x -> -abs(x) - 1, max, -Inf, fs; vars=1,
+                                          primaries=false)))
     # An `init` that is not neutral, under a weight: every block's value
     # is `0.5 max(1, …) = 0.5`, so a rank with no blocks must contribute
     # nothing rather than its `init`, or this would print 1.
     emit(tag, "initmax",
          @sprintf("%.17g", mesh_mapreduce(x -> -abs(x), max, 1.0, fs; vars=1,
-                                          weight=k -> 0.5)))
+                                          weight=k -> 0.5, primaries=false)))
     emit(tag, "sum l2", @sprintf("%.17g", volume_weighted_norm(fs, u)))
     emit(tag, "sum mass", @sprintf("%.17g", total_mass(fs, 1)))
     # A fold over points (M15): several results from one sweep and one
@@ -134,7 +139,7 @@ function reductions(tag, fs, u)
     # points in a slab of the domain, are exact at any rank count; the sum
     # of squares is marked as a sum.
     init = (n = Sum(0), hi = Max(-Inf), lo = Min(Inf), slab = Sum(0), sq = Sum(0.0))
-    r = mesh_fold(TreeAMR.combine, init, fs; vars=1) do acc, p
+    r = mesh_fold(TreeAMR.combine, init, fs; vars=1, primaries=true) do acc, p
         q = p.u[1]
         return TreeAMR.combine(acc, (n = Sum(1), hi = Max(q), lo = Min(q),
                                      slab = Sum(Int(p.x[1] < 0.5)), sq = Sum(q * q)))

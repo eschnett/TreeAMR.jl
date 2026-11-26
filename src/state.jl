@@ -401,6 +401,117 @@ function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
     return nothing
 end
 
+# --- The primary mask (M22) ----------------------------------------------------
+
+"""
+    PrimaryMask
+
+Which own points of a field set are **primaries**: of the copies of a
+point that several blocks hold, on a face plane of a vertex-like
+dimension, the one on the block first in the forest's leaf order (M22,
+"Closed blocks" in `CODE.md`). One bit per piece of a block's closed box —
+along each vertex-like dimension its low face plane, its open interior or
+its high face plane, `3^D` pieces — since every point of a piece lies on
+the same block faces, and so has its copies on the same blocks. Every
+point of a cell-centered or element set is a primary.
+
+Built by [`primary_mask`](@ref) and asked by [`isprimary`](@ref); it is
+`isbits` once on its backend, so a kernel takes it as an argument.
+"""
+struct PrimaryMask{D,V<:AbstractVector{UInt32}}
+    pieces::V                      # per local block, bit `Σ cls_d 3^(d-1)`
+    N::Int
+    c::NTuple{D,Int8}
+end
+
+Adapt.adapt_structure(to, m::PrimaryMask) =
+    PrimaryMask(Adapt.adapt(to, m.pieces), m.N, m.c)
+
+"""
+    isprimary(mask::PrimaryMask, i1, …, iD, b) -> Bool
+
+Whether own point `(i1, …, iD)` of local block `b` is the primary copy of
+its point (see [`PrimaryMask`](@ref)): the indices are those
+[`map_blocks!`](@ref) hands a kernel, each in `1:N`, or `1:N+1` along a
+vertex-like dimension, and those of [`statearray`](@ref). A right-hand side
+that computes the primaries only returns early where this is `false`, and
+must then call [`unify!`](@ref) on `du`, which gives every secondary its
+primary's value; a reduction that takes each point once asks it through
+its `primaries` keyword. It costs a load and a few comparisons, and works
+in a device kernel.
+"""
+@inline function isprimary(m::PrimaryMask{D}, I::Vararg{Integer}) where {D}
+    length(I) == D + 1 || throw(ArgumentError(
+        "isprimary takes a point's $D own indices and its block, (i1, …, iD, b), " *
+        "the global index of a map_blocks! kernel; got $(length(I)) numbers"))
+    cls = ntuple(d -> m.c[d] == 0 ? 1 : I[d] == 1 ? 0 : I[d] == m.N + 1 ? 2 : 1, Val(D))
+    piece = sum(ntuple(d -> cls[d] * 3^(d - 1), Val(D)))
+    return (@inbounds(m.pieces[Int(I[D + 1])]) >> piece) & 0x1 == 0x1
+end
+
+"""
+    primary_mask(fs::FieldSet) -> PrimaryMask
+
+The [`PrimaryMask`](@ref) of `fs`'s blocks, on its backend: built from the
+forest's topology and the set's centering once per change of the forest
+and kept with the set. Over a distributed forest each rank's mask is its
+own blocks', decided from the replicated forest by global leaf position,
+so every rank agrees on every point.
+"""
+function primary_mask(fs::FieldSet{T,D}) where {T,D}
+    backend = get_backend(fs.work)
+    V = typeof(todevice(backend, UInt32[]))
+    g = generation(fs.forest)
+    cached = fs.primary
+    cached !== nothing && cached[1] == g && return cached[2]::PrimaryMask{D,V}
+    forest = fs.forest
+    # The primaries across levels, mirrors, seams and glues come with the
+    # steps that rebuild those (M22); refused until then, as the fill is.
+    check_closed_blocks(forest, fs.centering, :half_open, "primary_mask")
+    c = staggers(fs)
+    range = blockrange(forest)
+    pieces = Vector{UInt32}(undef, length(range))
+    threaded_foreach(length(range)) do b
+        pieces[b] = primary_bits(forest, first(range) + b - 1, c)
+    end
+    mask = PrimaryMask{D,V}(todevice(backend, pieces), forest.N, map(Int8, c))
+    fs.primary = (g, mask)
+    return mask
+end
+
+# The mask of a reduction that takes every own point, and the test of one.
+struct NoMask end
+@inline counted(::NoMask, I, b) = true
+@inline counted(m::PrimaryMask, I, b) = isprimary(m, I..., b)
+
+# Whether a reduction over `fs` takes the primaries only (M22): `primaries`
+# is required for a set with a vertex-like dimension, where a sum or a
+# count that silently took a shared point at every copy is the mistake to
+# prevent, and means nothing for any other set, every point of which is a
+# primary.
+function count_primaries(fs::FieldSet, primaries, what::AbstractString)
+    any(==(:vertex), fs.centering) || return false
+    primaries === nothing && throw(ArgumentError(
+        "$what over a set with a vertex-like dimension (centering $(fs.centering)) " *
+        "needs `primaries = true` or `false`: such a set's blocks own both face planes " *
+        "(M22, \"Closed blocks\" in CODE.md), so a point on a block face has a copy on " *
+        "every block that holds it. `true` takes each point once, at its primary — " *
+        "what a sum or a count wants; `false` takes every copy, which is right for a " *
+        "maximum or a minimum."))
+    return primaries::Bool
+end
+
+# The reduction masked to the primaries, as a fold: point by point, every
+# selected variable at a point in turn. Behind a barrier, so that no set
+# without a vertex-like dimension compiles it.
+function primary_mapreduce(f, op, init, array, fs::FieldSet, g, vars::UnitRange{Int})
+    rf(acc, p) = foldvalues(f, op, acc, p.u)
+    return _block_fold(rf, op, init, array, fs, g, vars, nothing; mask=primary_mask(fs))
+end
+@inline foldvalues(f, op, acc, ::Tuple{}) = acc
+@inline foldvalues(f, op, acc, u::Tuple) =
+    foldvalues(f, op, op(acc, f(first(u))), Base.tail(u))
+
 # Per-block reductions.
 #
 # Every diagnostic in the package has the same shape: one value per
@@ -604,19 +715,24 @@ reproducible from run to run, since the lane fold has a fixed order.
     `oftype(x, 2)` rather than closing over `T` and calling `T(2)`. The
     same rule covers captured arrays and any mutable state.
 """
-function block_mapreduce(f, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars) where {T,D}
-    return _block_mapreduce(f, op, init, fs.work, fs, fs.G,
-                            _varrange(vars, fs.nvars))
+function block_mapreduce(f, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars,
+                         primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_mapreduce")
+    return _block_mapreduce(f, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars),
+                            once)
 end
 
 function block_mapreduce(f, op, init, fs::FieldSet{T,D}, u::AbstractVector;
-                         vars=1:fs.nvars) where {T,D}
+                         vars=1:fs.nvars, primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_mapreduce")
     return _block_mapreduce(f, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
-                            _varrange(vars, fs.nvars))
+                            _varrange(vars, fs.nvars), once)
 end
 
 function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
-                          vars::UnitRange{Int}) where {R,T,D}
+                          vars::UnitRange{Int}, once::Bool=false) where {R,T,D}
+    once && return Base.inferencebarrier(primary_mapreduce)(f, op, init, array, fs, g,
+                                                            vars)::Vector{R}
     backend = get_backend(array)
     return backend isa CPU ?
            _block_mapreduce_host(f, op, init, array, fs, g, vars) :
@@ -658,14 +774,15 @@ mass = mesh_mapreduce(identity, +, zero(T), fs; vars=2,
                       weight=key -> spacing(T, fs.forest, key)^D)
 ```
 """
-function mesh_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars, weight=nothing)
-    values = block_mapreduce(f, op, init, fs; vars=vars)
+function mesh_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars, weight=nothing,
+                        primaries=nothing)
+    values = block_mapreduce(f, op, init, fs; vars=vars, primaries=primaries)
     return combine_blocks(op, init, fs, values, weight)
 end
 
 function mesh_mapreduce(f, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars,
-                        weight=nothing)
-    values = block_mapreduce(f, op, init, fs, u; vars=vars)
+                        weight=nothing, primaries=nothing)
+    values = block_mapreduce(f, op, init, fs, u; vars=vars, primaries=primaries)
     return combine_blocks(op, init, fs, values, weight)
 end
 
@@ -868,7 +985,7 @@ end
 @kernel function fold_points_kernel!(partials, @Const(array), rf, init,
                                      @Const(lows), @Const(bases), @Const(spacings), nodes,
                                      @Const(levels),
-                                     tags, firstvar::Int,
+                                     tags, mask, firstvar::Int,
                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{E}, ::Val{NV},
                                      ::Val{W}) where {D,G,C,E,NV,W}
     g = @index(Global)
@@ -879,6 +996,7 @@ end
     acc = init
     for j in l:W:length(cells)
         I = Tuple(cells[j])
+        counted(mask, I, b) || continue
         x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
         c = ntuple(d -> I[d] + G[d], Val(D))
         u = ntuple(v -> array[c..., firstvar + v - 1, b], Val(NV))
@@ -924,8 +1042,12 @@ end
 # state array at `g = 0` — with `W` lanes per block: 1 on the CPU, and
 # `fold_lanes(R)` on a device unless the caller says otherwise, which the
 # tests do to reach the device path on `CPU()`.
+#
+# `mask` is `NoMask()` for every own point, or the set's `PrimaryMask` for
+# the primaries only (M22).
 function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
-                     vars::UnitRange{Int}, tag, lanes=nothing) where {R,T,D}
+                     vars::UnitRange{Int}, tag, lanes=nothing;
+                     mask=NoMask()) where {R,T,D}
     forest = fs.forest
     backend = get_backend(array)
     tags = fold_tags(backend, tag, forest)
@@ -940,7 +1062,7 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
     partials = allocate(backend, R, (W, n))
     launch_fold!(backend, partials, array, rf, init, lows, bases, spacings, levels, tags,
-                 fs, first(vars), g, Val(NV), Val(W))
+                 mask, fs, first(vars), g, Val(NV), Val(W))
     if W == 1
         synchronize(backend)
         return tohost(vec(partials))
@@ -952,11 +1074,12 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
 end
 
 function launch_fold!(backend, partials, array, rf, init, lows, bases, spacings,
-                      levels, tags, fs::FieldSet{T,D}, firstvar::Int, g::NTuple{D,Int},
+                      levels, tags, mask, fs::FieldSet{T,D}, firstvar::Int,
+                      g::NTuple{D,Int},
                       nv::Val, w::Val{W}) where {T,D,W}
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, lows,
-                         bases, spacings, nodes, levels, tags, firstvar, Val(D),
+                         bases, spacings, nodes, levels, tags, mask, firstvar, Val(D),
                          Val(g), Val(staggers(fs)), Val(ownextents(fs)), nv, w;
                          ndrange=(W * nblocks(fs),))
     end
@@ -974,15 +1097,26 @@ is the per-block half of [`mesh_fold`](@ref), which says what `rf`, `op`,
 for [`block_mapreduce`](@ref).
 """
 function block_fold(rf, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars,
-                    tag=nothing) where {T,D}
-    return _block_fold(rf, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars), tag)
+                    tag=nothing, primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_fold")
+    return fold_masked(once, rf, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars),
+                       tag)
 end
 
 function block_fold(rf, op, init, fs::FieldSet{T,D}, u::AbstractVector; vars=1:fs.nvars,
-                    tag=nothing) where {T,D}
-    return _block_fold(rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
+                    tag=nothing, primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_fold")
+    return fold_masked(once, rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
                        _varrange(vars, fs.nvars), tag)
 end
+
+# The fold over every own point, or behind a barrier over the primaries,
+# so that no set without a vertex-like dimension compiles the masked one.
+fold_masked(once::Bool, rf, op, init::R, args...) where {R} =
+    once ? Base.inferencebarrier(fold_primaries)(rf, op, init, args...)::Vector{R} :
+    _block_fold(rf, op, init, args...)
+fold_primaries(rf, op, init, array, fs, g, vars, tag) =
+    _block_fold(rf, op, init, array, fs, g, vars, tag; mask=primary_mask(fs))
 
 """
     mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
@@ -1058,14 +1192,15 @@ l2 = sqrt(r.sq[1].value / r.n.value)
     accumulator lives in each lane's registers; a large one spills,
     which costs time but not correctness.
 """
-function mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
-    values = block_fold(rf, op, init, fs; vars=vars, tag=tag)
+function mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing,
+                   primaries=nothing)
+    values = block_fold(rf, op, init, fs; vars=vars, tag=tag, primaries=primaries)
     return combine_blocks(op, init, fs, values, nothing)
 end
 
 function mesh_fold(rf, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars,
-                   tag=nothing)
-    values = block_fold(rf, op, init, fs, u; vars=vars, tag=tag)
+                   tag=nothing, primaries=nothing)
+    values = block_fold(rf, op, init, fs, u; vars=vars, tag=tag, primaries=primaries)
     return combine_blocks(op, init, fs, values, nothing)
 end
 
@@ -1094,7 +1229,7 @@ thread counts as well.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
     R = float(real(T))
-    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u)
+    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u; primaries=false)
     total, volume = norm_parts(fs, u, p)
     volume == 0 && return zero(R)
     # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
@@ -1150,6 +1285,27 @@ function element_quadrature(f, ::Type{R}, array, fs::FieldSet{T,D}, g::NTuple{D,
     return _block_fold(rf, +, zero(R), array, fs, g, vars, nothing)
 end
 
+# The trapezoid's quadrature of a set with a vertex-like dimension (M22),
+# per block: `Σ w f(u)` over the own points of `array` and the variables
+# `vars`, `w` the product over the vertex-like dimensions of ½ on a face
+# plane and 1 between. Summed over the blocks, a shared point then has its
+# weight in the composite rule — two halves on a plane between blocks, a
+# half at a wall — so a constant is its own norm with no mask. The block's
+# `hᴰ` is left to `combine_blocks`, as for a cell-centered set.
+function trapezoid_quadrature(f, ::Type{R}, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
+                              vars::UnitRange{Int}) where {R,T,D}
+    c, N = staggers(fs), fs.forest.N
+    function rf(acc, p)
+        half = one(acc) / 2
+        w = prod(ntuple(d -> c[d] == 1 && (p.I[d] == 1 || p.I[d] == N + 1) ? half :
+                             one(acc), Val(D)))
+        return acc + w * sum(f, p.u)
+    end
+    return _block_fold(rf, +, zero(R), array, fs, g, vars, nothing)
+end
+trapezoid_quadrature_barrier(f, ::Type{R}, args...) where {R} =
+    Base.inferencebarrier(trapezoid_quadrature)(f, R, args...)::Vector{R}
+
 # `element_quadrature` behind `Base.inferencebarrier`, for the callers
 # that branch on `fs.P` at run time: inferred, the element branch would
 # compile a second fold kernel for every cell or vertex set's norm and
@@ -1174,7 +1330,12 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     # returns `Any`, which cost the norm a dynamic dispatch per block
     # (found in review, measured at 2x the host time on 1.10.12).
     cellvolume(key) = spacing(float(real(T)), forest, key)^D
-    total = if fs.P == 0
+    total = if any(==(:vertex), fs.centering)
+        # The trapezoid's weights along a vertex-like dimension (M22).
+        values = trapezoid_quadrature_barrier(x -> abs(x)^q, R, statearray(u, fs), fs,
+                                              ntuple(_ -> 0, D), 1:(fs.nvars))
+        combine_blocks(+, zero(R), fs, values, cellvolume)
+    elseif fs.P == 0
         mesh_mapreduce(x -> abs(x)^q, +, zero(R), fs, u; weight=cellvolume)
     else
         # The nodes are not equally spaced, so each gets its quadrature
@@ -1186,7 +1347,9 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
 
     # The domain volume as the sum of the block volumes, through the same
     # combination as everything else — so `sum`'s association from M3 is
-    # kept, and M7 has one place to reduce across ranks.
+    # kept, and M7 has one place to reduce across ranks. `N^D` per block
+    # whatever the centering: the trapezoid's weights of a vertex-like
+    # dimension sum to `N` too.
     volumes = Vector{R}(undef, nblocks(fs))
     for b in 1:nblocks(fs)
         volumes[b] = cellvolume(blockkey(fs, b)) * (forest.N^D * fs.nvars)

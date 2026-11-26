@@ -52,7 +52,7 @@ end
          wrong = Sum(Int(p.h != spacing(Float64, forest, blockkey(fs, p.b))) +
                      Int(p.level != level(blockkey(fs, p.b)))),
          Ilo = Min(minimum(p.I)), Ihi = Max(maximum(p.I))))
-    r = mesh_fold(rf, combine, init, fs)
+    r = mesh_fold(rf, combine, init, fs; primaries=false)
     own = prod(d -> forest.N + staggers(fs)[d], 1:D)         # closed blocks (M22)
     @test r.n.value == nblocks(fs) * own
     @test r.xerr.value == 0                        # bit for bit
@@ -62,13 +62,13 @@ end
 
     # Per block, the count is the block's and `p.b` is the block.
     counts = block_fold((acc, p) -> combine(acc, (Sum(1), Max(p.b))), combine,
-                        (Sum(0), Max(0)), fs)
+                        (Sum(0), Max(0)), fs; primaries=false)
     @test [c[1].value for c in counts] == fill(own, nblocks(fs))
     @test [c[2].value for c in counts] == 1:nblocks(fs)
 
     # No poison: the largest value read is a normal deviate's.
     @test mesh_fold((acc, p) -> combine(acc, Max(maximum(abs, p.u))), combine,
-                    Max(0.0), fs).value < 10
+                    Max(0.0), fs; primaries=false).value < 10
 end
 
 @testset "A fold sees several variables at once, from either array: D=$D" for D in (1, 2, 3)
@@ -154,7 +154,7 @@ end
     end
     # Not `r`: `rf` assigns an `r` of its own, which a local `r` here would
     # turn into one variable shared by every thread running `rf`.
-    res = mesh_fold(rf, combine, init, fs)
+    res = mesh_fold(rf, combine, init, fs; primaries=false)
 
     n = zeros(Int, 3, K)
     sq = zeros(3, K)
@@ -272,7 +272,7 @@ end
     fs = fold_fieldset(Val(2), 1, vertexcentered; T=Float32)
     init = (Max(-Inf32), Sum(0.0f0))
     rf(acc, p) = combine(acc, (Max(p.x[1]), Sum(p.u[1] * p.h^2)))
-    r = @inferred mesh_fold(rf, combine, init, fs)
+    r = @inferred mesh_fold(rf, combine, init, fs; primaries=false)
     @test r isa Tuple{Max{Float32},Sum{Float32}}
     @test r[1].value == maximum(b -> coordinates(fs, b, ntuple(d -> fs.G[d] + fs.forest.N + 1,
                                                                 2))[1],

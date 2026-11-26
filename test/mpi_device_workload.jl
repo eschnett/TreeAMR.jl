@@ -143,9 +143,10 @@ end
 fmt(x) = T === Float64 ? @sprintf("%.17g", x) : @sprintf("%.9g", x)
 
 function reductions(tag, fs, u)
-    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs))
+    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs; primaries=true))
     emit(tag, "linf", fmt(volume_weighted_norm(fs, u; p=Inf)))
-    emit(tag, "max", fmt(mesh_mapreduce(identity, max, T(-Inf), fs; vars=1)))
+    emit(tag, "max", fmt(mesh_mapreduce(identity, max, T(-Inf), fs; vars=1,
+                                        primaries=false)))
     emit(tag, "sum l2", fmt(volume_weighted_norm(fs, u)))
     emit(tag, "sum mass", fmt(total_mass(fs, 1)))
     return nothing

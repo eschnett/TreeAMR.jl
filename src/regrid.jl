@@ -1466,6 +1466,12 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     # where the lanes split the cells differently.
     # `float(real(T))` inline, not the local `R`: see `volume_weighted_norm`.
     cellvolume(key) = spacing(float(real(T)), forest, key)^D
+    # The trapezoid's weights along a vertex-like dimension (M22).
+    any(==(:vertex), fs.centering) &&
+        return combine_blocks(+, zero(R), fs,
+                              trapezoid_quadrature_barrier(identity, R, fs.work, fs, fs.G,
+                                                           _varrange(var, fs.nvars)),
+                              cellvolume)
     fs.P == 0 && return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
                                        weight=cellvolume)
     # An element set's nodes are weighted by the GLL quadrature (M16).

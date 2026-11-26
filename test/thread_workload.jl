@@ -86,7 +86,7 @@ digest(s::AbstractString) = digest(codeunits(s))
 function workload_fold(fs, u)
     bin = (n = Sum(0), sq = Sum(0.0), peak = Max(0.0))
     init = (bins = ntuple(_ -> bin, 4), low = Min(Inf))
-    r = mesh_fold(TreeAMR.combine, init, fs, u; vars=1) do acc, p
+    r = mesh_fold(TreeAMR.combine, init, fs, u; vars=1, primaries=true) do acc, p
         q = p.u[1]
         return (bins = addto(acc.bins, min(p.level + 1, 4),
                              (n = Sum(1), sq = Sum(q * q), peak = Max(abs(q)))),

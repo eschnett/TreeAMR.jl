@@ -95,8 +95,8 @@ end
             fill_by_coordinates!(AllVariables(x -> (f(x, 1), f(x, 2))), fs)
             @test fs.work == sfs.work[ntuple(_ -> :, D + 1)..., range]
             # The per-block reductions are per local block.
-            @test block_mapreduce(abs, max, 0.0, fs) ==
-                  block_mapreduce(abs, max, 0.0, sfs)[range]
+            @test block_mapreduce(abs, max, 0.0, fs; primaries=false) ==
+                  block_mapreduce(abs, max, 0.0, sfs; primaries=false)[range]
         end
         @test reduce(vcat, collect.(ranges); init=Int[]) == collect(1:n)
         P > n && @test count(isempty, ranges) == P - n

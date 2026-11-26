@@ -351,10 +351,16 @@ end
     for (i, fs) in enumerate(sets)
         own = gather!(statevector(fs), fs)
         seg = stateview(u, sets, i)
-        @test block_mapreduce(abs2, +, 0.0, fs, seg) ==
-              block_mapreduce(abs2, +, 0.0, fs, own)
-        @test mesh_mapreduce(abs, max, 0.0, fs, seg) ==
-              mesh_mapreduce(abs, max, 0.0, fs, own)
+        # (`primaries`, which a vertex-like set requires, M22.)
+        if vertexlike(fs)
+            # Each point once, on this refined mesh: M22 step 3.
+            pending(3, "a sum over a segment of a vertex-like set, $(fs.centering)")
+        else
+            @test block_mapreduce(abs2, +, 0.0, fs, seg) ==
+                  block_mapreduce(abs2, +, 0.0, fs, own)
+        end
+        @test mesh_mapreduce(abs, max, 0.0, fs, seg; primaries=false) ==
+              mesh_mapreduce(abs, max, 0.0, fs, own; primaries=false)
         @test volume_weighted_norm(fs, seg) == volume_weighted_norm(fs, own)
         @test volume_weighted_norm((fs,), own) == volume_weighted_norm(fs, own)
     end
