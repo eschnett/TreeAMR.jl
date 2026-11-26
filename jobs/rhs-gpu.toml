@@ -1,0 +1,46 @@
+# `jobs/rhs.toml` on one H200: `bench/rhs.jl`, the right-hand side on
+# closed blocks three ways, on the device, Float64, on the uniform
+# periodic mesh and the nested one at `N = 16` and `32`.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/rhs-gpu.toml
+#     simlaunch submit <study> jobs/rhs-gpu.toml --site symmetry
+name = "rhs-gpu"
+env = "test+cuda"                   # KernelAbstractions, and CUDA
+threads = 1
+vars = { TREEAMR_BENCH_BACKEND = "cuda" }
+
+[site.symmetry]                     # one H200
+julia = "1.13"                      # the project's floor, on Symmetry only: an Alliance
+                                    # site's MPI recipe names its own patched Julia,
+                                    # which cannot be combined with `julia`
+time = "1:00:00"
+resources = { gpus = 1 }
+
+[site.trillium-gpu]                 # one H100
+time = "1:00:00"
+resources = { gpus = 1 }
+
+[site.fir]                          # one H100
+time = "1:00:00"
+resources = { gpus = 1 }
+
+[[run]]
+label = "uniform-n16"
+vars = { TREEAMR_BENCH_MESH = "uniform", TREEAMR_BENCH_N = "16" }
+cmd = "bench/rhs.jl"
+
+[[run]]
+label = "uniform-n32"
+vars = { TREEAMR_BENCH_MESH = "uniform", TREEAMR_BENCH_N = "32" }
+cmd = "bench/rhs.jl"
+
+[[run]]
+label = "nested-n16"
+vars = { TREEAMR_BENCH_MESH = "nested", TREEAMR_BENCH_N = "16" }
+cmd = "bench/rhs.jl"
+
+[[run]]
+label = "nested-n32"
+vars = { TREEAMR_BENCH_MESH = "nested", TREEAMR_BENCH_N = "32" }
+cmd = "bench/rhs.jl"

@@ -46,6 +46,14 @@ vars = { TREEAMR_BENCH_D = "3", TREEAMR_BENCH_ROOTS = "4", TREEAMR_BENCH_REPS = 
 time = "1:00:00"
 resources = { nodes = 4 }
 
+[site.trillium]                     # four nodes of 192 cores in 8 NUMA domains
+time = "1:00:00"
+resources = { nodes = 4 }
+
+[site.fir]                          # four nodes of 192 cores in 8 NUMA domains
+time = "1:00:00"
+resources = { nodes = 4 }
+
 [after]
 cmd = '''
 log() { for d in $SIMLAUNCH_JOBDIRS; do case $d in */"$SPEC-$1"/*) echo "$d/output.log" ;; esac; done; }

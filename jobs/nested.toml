@@ -9,13 +9,22 @@
 #     simlaunch prepare <study> --site symmetry --spec jobs/nested.toml
 #     simlaunch submit <study> jobs/nested.toml --site symmetry
 #
-# Three stages, by the labels' first word (`submit --run` picks runs):
+# Five stages, by the labels' first word (`submit --run` picks runs):
 #
 # - `compile-`: the `--trace-compile-timing` comparison of
-#   `test/mpi_workload.jl`, serial on domain 0, three runs of each version
-#   (CLAUDE.md's rule for a change to a launch path). The tables sum the
-#   compile times from the trace in each run's `output.log` and compare the
-#   rest of the outputs line for line.
+#   `bench/firstcall.jl`, serial on domain 0, three runs of each version
+#   (CLAUDE.md's rule for a change to a launch path): the same steps under
+#   both versions, on the API every TreeAMR since 0.2 has, since the
+#   study's `test/mpi_workload.jl` calls what a half-open baseline lacks
+#   (`UnifySchedule`; M22 step 5's `compile-base-` runs failed on it). The
+#   tables sum the compile times from the trace in each run's `output.log`.
+# - `firstcall-`: `bench/nested.jl` with `TREEAMR_BENCH_FIRSTCALL=1`,
+#   serial on domain 0, three runs of each version: the first and second
+#   call of `GhostSchedule` and of `fill_ghosts!` on the nested mesh in a
+#   fresh process, the same code under both versions.
+# - `build-`: `bench/schedule_build.jl`, the cost of building a schedule
+#   on the uniform and the nested mesh, cell- and vertex-centered, on
+#   domain 0 at 1 and 8 threads.
 # - `ghosts-`: `bench/ghosts.jl`, cell-centered (where the single-tap
 #   columns of M13 change nothing: the control), on domain 0 at 1 and 8
 #   threads.
@@ -32,18 +41,21 @@
 # add variants and runs; the version is the label's second word.
 # `jobs/nested-gpu.toml` is the same on H200s.
 name = "nested"
-env = "test"                        # SHA and MultiFloats, for the compile workload
+env = "test"                        # the bench scripts' dependencies
 domains_per_rank = 1                # one domain a rank at any rank count; serial runs on domain 0
 vars = { TREEAMR_BENCH_N = "16" }
 
 [site.symmetry]                     # 64 cores in 8 NUMA domains
-time = "1:00:00"
+julia = "1.13"                      # the project's floor, on Symmetry only: an Alliance
+                                    # site's MPI recipe names its own patched Julia,
+                                    # which cannot be combined with `julia`
+time = "2:00:00"                   # past amddebugq's hour
 resources = { nodes = 1 }
 
 [after]
 cmd = 'bash "$PROJECT"/bench/nested_tables.sh "$SPEC" $SIMLAUNCH_JOBDIRS'
 
-# The compile timing of test/mpi_workload.jl, serial, on domain 0.
+# The compile timing of bench/firstcall.jl, serial, on domain 0.
 
 [[run]]
 label = "compile-base-1"
@@ -51,21 +63,21 @@ variant = "base"
 threads = 1
 placement = "numa"
 julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
-cmd = "test/mpi_workload.jl"
+cmd = "bench/firstcall.jl"
 
 [[run]]
 label = "compile-new-1"
 threads = 1
 placement = "numa"
 julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
-cmd = "test/mpi_workload.jl"
+cmd = "bench/firstcall.jl"
 
 [[run]]
 label = "compile-new-2"
 threads = 1
 placement = "numa"
 julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
-cmd = "test/mpi_workload.jl"
+cmd = "bench/firstcall.jl"
 
 [[run]]
 label = "compile-base-2"
@@ -73,7 +85,7 @@ variant = "base"
 threads = 1
 placement = "numa"
 julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
-cmd = "test/mpi_workload.jl"
+cmd = "bench/firstcall.jl"
 
 [[run]]
 label = "compile-base-3"
@@ -81,14 +93,89 @@ variant = "base"
 threads = 1
 placement = "numa"
 julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
-cmd = "test/mpi_workload.jl"
+cmd = "bench/firstcall.jl"
 
 [[run]]
 label = "compile-new-3"
 threads = 1
 placement = "numa"
 julia_args = ["--trace-compile=stderr", "--trace-compile-timing"]
-cmd = "test/mpi_workload.jl"
+cmd = "bench/firstcall.jl"
+
+# The first calls of bench/nested.jl, serial, on domain 0.
+
+[[run]]
+label = "firstcall-base-1"
+variant = "base"
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_FIRSTCALL = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl"
+
+[[run]]
+label = "firstcall-new-1"
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_FIRSTCALL = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl"
+
+[[run]]
+label = "firstcall-new-2"
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_FIRSTCALL = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl"
+
+[[run]]
+label = "firstcall-base-2"
+variant = "base"
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_FIRSTCALL = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl"
+
+[[run]]
+label = "firstcall-base-3"
+variant = "base"
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_FIRSTCALL = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl"
+
+[[run]]
+label = "firstcall-new-3"
+threads = 1
+placement = "numa"
+vars = { TREEAMR_BENCH_FIRSTCALL = "1", TREEAMR_BENCH_LABEL = "1x1" }
+cmd = "bench/nested.jl"
+
+# The schedule build, on domain 0, at 1 and 8 threads.
+
+[[run]]
+label = "build-base-r1"
+variant = "base"
+threads = [1, 8]
+placement = "numa"
+cmd = "bench/schedule_build.jl"
+
+[[run]]
+label = "build-new-r1"
+threads = [1, 8]
+placement = "numa"
+cmd = "bench/schedule_build.jl"
+
+[[run]]
+label = "build-new-r2"
+threads = [1, 8]
+placement = "numa"
+cmd = "bench/schedule_build.jl"
+
+[[run]]
+label = "build-base-r2"
+variant = "base"
+threads = [1, 8]
+placement = "numa"
+cmd = "bench/schedule_build.jl"
 
 # bench/ghosts.jl on domain 0, at 1 and 8 threads.
 

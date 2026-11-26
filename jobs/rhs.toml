@@ -1,0 +1,47 @@
+# A right-hand side on closed blocks three ways (`bench/rhs.jl`, M22
+# step 5) on one AMD node: every own point; every own point behind
+# `isprimary`, then `unify!(du)`; the primaries only, a launch over each
+# block's primary boxes, then `unify!(du)`. On the uniform periodic mesh
+# and the nested one, at `N = 16` and `32`, on 1 and 8 pinned threads.
+# There is no baseline: the forms exist only on closed blocks. Each run
+# checks the three agree bit for bit before it times anything.
+# `jobs/rhs-gpu.toml` is the same on an H200: a job takes either whole
+# CPU nodes or GPUs, so the two are two specs.
+#
+#     simlaunch snapshot . --study <study>
+#     simlaunch prepare <study> --site symmetry --spec jobs/rhs.toml
+#     simlaunch submit <study> jobs/rhs.toml --site symmetry
+name = "rhs"
+env = "test"
+pin = true
+
+[site.symmetry]                     # 64 cores in 8 NUMA domains
+julia = "1.13"                      # the project's floor, on Symmetry only: an Alliance
+                                    # site's MPI recipe names its own patched Julia,
+                                    # which cannot be combined with `julia`
+time = "1:00:00"
+resources = { nodes = 1 }
+
+[[run]]
+label = "uniform-n16"
+threads = [1, 8]
+vars = { TREEAMR_BENCH_MESH = "uniform", TREEAMR_BENCH_N = "16" }
+cmd = "bench/rhs.jl"
+
+[[run]]
+label = "uniform-n32"
+threads = [1, 8]
+vars = { TREEAMR_BENCH_MESH = "uniform", TREEAMR_BENCH_N = "32" }
+cmd = "bench/rhs.jl"
+
+[[run]]
+label = "nested-n16"
+threads = [1, 8]
+vars = { TREEAMR_BENCH_MESH = "nested", TREEAMR_BENCH_N = "16" }
+cmd = "bench/rhs.jl"
+
+[[run]]
+label = "nested-n32"
+threads = [1, 8]
+vars = { TREEAMR_BENCH_MESH = "nested", TREEAMR_BENCH_N = "32" }
+cmd = "bench/rhs.jl"
