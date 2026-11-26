@@ -84,12 +84,11 @@ numbers(lines, words...) =
     backend, T, deviceaware = header[5], header[7], header[9] == "true"
     rtol = T == "Float32" ? 1e-5 : 1e-12
     @info "reference" backend T deviceaware lines = length(serial)
-    # Q2v and QP2 (M22 step 7) and G2 (step 8) are pending, each a `#`
-    # line.
+    # G2 (M22 step 8) is pending, a `#` line.
     @test count(l -> occursin(" state ", l), serial) >= 4
     @test "B2 conserved true" in serial
     @test "M conserved true" in serial
-    @test count(startswith("# pending until M22 step "), serial) == 3
+    @test count(startswith("# pending until M22 step "), serial) == 1
     for n in RANKCOUNTS
         out = workload(n)
         @test split(first(out))[1:3] == ["#", "ranks", string(n)]
@@ -100,7 +99,7 @@ numbers(lines, words...) =
         # Every stage with messages went through host mirrors on a device
         # that is not handed to MPI directly, and none did otherwise.
         stages = [l for l in out if occursin(" stages messages ", l)]
-        @test length(stages) == 5                    # W2v, R2c, W3c, B2 and TP
+        @test length(stages) == 7          # W2v, R2c, Q2v, QP2, W3c, B2 and TP
         for l in stages
             w = split(l)
             messages, staged = parse(Int, w[end - 2]), parse(Int, w[end])

@@ -416,8 +416,6 @@ end
     for (rot, other) in cases, p in (2, 4),
         C in (rot == cases[1][1] ? symmetric_centerings(D, rot) :
               [cellcentered(D), vertexcentered(D)])
-        vertexlike(C) && (pending(7, "rotated ghosts defined, $C, $rot, p = $p, D=$D");
-                          continue)
         nnan, worst, schedule = undefined_rotated_ghosts(Val(D); rotating=rot,
                                                          other=other, C=C, p=p)
         (nnan == 0 && worst < 1e-10) || push!(bad, (rot, other, C, p, nnan, worst))
@@ -446,7 +444,6 @@ end
             [((1, 2), :periodic), ((2, 1), :reflect_lo), ((3, 1), :outer)]
     worst = 0.0
     for (rot, other) in cases, C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(7, "rotating quadrant, $C, $rot, D=$D"); continue)
         result = rotating_vs_quadrupled(Val(D); rotating=rot, centering=C, other=other)
         @test result !== nothing
         result === nothing && continue
@@ -472,7 +469,6 @@ end
     for (rot, other) in cases
         for (Ca, Ga, p) in ((facecentered(D, rot[1]), nothing, 4),
                             (cellcentered(D), ntuple(d -> d == rot[1] ? 2 : 1, D), 2))
-            vertexlike(Ca) && (pending(7, "RotationPair, $Ca, $rot, D=$D"); continue)
             G = Ga === nothing ? ghosts_for(Ca, p) : Ga
             result = rotating_pair_vs_quadrupled(Val(D); rotating=rot, other=other, p=p,
                                                  Ca=Ca, Ga=G)
@@ -508,13 +504,14 @@ end
         Cf = facecentered(D, d1)
         push!(layouts, (Cf, ghosts_for(Cf, 4)), (swap(Cf), swap(ghosts_for(Cf, 4))))
         for (C, G) in layouts
-            vertexlike(C) && (pending(7, "partition across the seam, $C, $rot"); continue)
             fs = FieldSet(forest, D + 1; G=G, centering=C,
                           rotation=vector_rotation(D, rot),
                           parity=vector_parity(D, rot, other))
             schedule = GhostSchedule(fs, ROT_OPS4)
             counts = write_counts(schedule)
-            owned = ntuple(d -> (G[d] + 1):(G[d] + N), D)
+            # The own range, closed along a vertex-like dimension (M22).
+            c = staggers(C)
+            owned = ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D)
             ok = true
             for b in 1:nleaves(forest), idx in CartesianIndices(size(counts)[1:D])
                 inside = all(d -> Tuple(idx)[d] in owned[d], 1:D)
@@ -526,7 +523,7 @@ end
     end
 end
 
-@pending 7 "An asymmetric set is refused alone where its ghosts are its partner's" begin
+@testset "An asymmetric set is refused alone where its ghosts are its partner's" begin
     # Filled alone, a set whose layout is not symmetric in the plane would
     # read its own data where its partner's belongs, the wrong component
     # in the wrong layout; the plain fill refuses it and says what to do.
@@ -585,8 +582,6 @@ end
         for (label, kw) in (("cell", (; C=cellcentered(D))),
                             ("vertex", (; C=vertexcentered(D))),
                             ("pair", (; pair=true)))
-            label == "cell" ||
-                (pending(7, "regrid across the seam, $label, $rot, D=$D"); continue)
             results = rotating_regrid_vs_quadrupled(Val(D); rotating=rot, other=other,
                                                     passes=passes, kw...)
             counts = [r.nleaves for r in results]
@@ -607,7 +602,7 @@ end
     end
 end
 
-@pending 7 "regrid! refuses an asymmetric set alone and takes a pair with its schedules" begin
+@testset "regrid! refuses an asymmetric set alone and takes a pair with its schedules" begin
     # Moved alone, a set whose ghosts across the seam are its partner's
     # would be filled from its own data before the transfer; the regrid
     # must refuse it with the hint, as the fill does, and agree on it on
@@ -642,7 +637,7 @@ end
                        boundary=CellBoundary((x, v, δ) -> zero(eltype(x)))) === pair
 end
 
-@pending 7 "The initial-data cycle adapts a rotating quadrant, alone or as a pair" begin
+@testset "The initial-data cycle adapts a rotating quadrant, alone or as a pair" begin
     # The cycle fills ghosts before it flags, and a pair's ghosts across
     # the seam are each other's; it must converge to a conforming mesh
     # and leave data that a fill reproduces exactly.
@@ -699,47 +694,57 @@ end
     @test worst < 1e-10
 end
 
-@pending 7 "The interface schedule records nothing across the conforming seam: D=$D" for
+@testset "A flux pair's unify! makes the seam's copies one number through the turn: D=$D" for
         D in (2, 3)
-    # A coarse-fine face across the seam would need a turned restriction,
-    # which the interface schedule does not build; conformity rules it
-    # out. So a rotating forest's schedule must hold no rotated transfer,
-    # and elsewhere restrict exactly as the same leaves without the seam,
-    # whose seam faces are outer faces that nothing restricts either.
+    # Guards the interface restriction across the seam on closed blocks
+    # (M22): a flux normal to `d1` and one normal to `d2` turn into each
+    # other, so a point of the seam plane has its copies in both, and
+    # `unify!` of the pair must make them one number through the turn,
+    # `F_{d1}(0, y) = −F_{d2}(y, 0)`, bit for bit; away from the seam the
+    # pair restricts as the same leaves without the seam do; and a member
+    # alone is refused, since its seam copies are its partner's.
     rot = (1, 2)
     other = D == 2 ? :none : :periodic
     forest = rotating_forest(Val(D); rotating=rot, other=other)
     plain = Forest(forest.roots; N=forest.N, periodic=forest.periodic,
                    extents=forest.extents, leaves=copy(forest.leaves))
     rng = Xoshiro(12)
-    nrestrict = 0
-    for d in 1:D
-        rotation = d == 1 ? (-1,) : (1,)
-        fr = FieldSet(forest, 1; G=0, centering=facecentered(D, d), rotation=rotation)
-        fp = FieldSet(plain, 1; G=0, centering=facecentered(D, d))
-        is = UnifySchedule(fr)
-        groups = collect(Iterators.flatten(is.phases))
-        @test all(g -> g.orientation == 0, groups)
-        @test !occursin("rotated", sprint(show, is))
-        nrestrict += sum(ntransfers, groups; init=0)
-        fr.work .= randn(rng, size(fr.work))
-        fp.work .= fr.work
-        unify!(fr, is)
-        unify!(fp, UnifySchedule(fp))
-        @test fr.work == fp.work
+    fx = FieldSet(forest, 1; G=0, centering=facecentered(D, 1), rotation=(-1,))
+    fy = FieldSet(forest, 1; G=0, centering=facecentered(D, 2), rotation=(1,))
+    px = FieldSet(plain, 1; G=0, centering=facecentered(D, 1))
+    py = FieldSet(plain, 1; G=0, centering=facecentered(D, 2))
+    @test_throws "Unify it as a RotationPair" unify!(fx, UnifySchedule(fx))
+    for (f, q) in ((fx, px), (fy, py))
+        f.work .= randn(rng, size(f.work))
+        q.work .= f.work
+        unify!(q, UnifySchedule(q))
     end
-    @test nrestrict > 0
-
-    # A seam that is not conforming is a bug the schedule reports, not a
-    # restriction it skips: refine one leaf on the low face of d2 without
-    # balancing, so that its image across the low face of d1 is coarser.
-    broken = Forest((2, 2); N=8, rotating=(1, 2))
-    refine!(broken, only(filter(k -> leafbox(broken, k)[1] == (1, 0), broken.leaves)))
-    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
-    @test_throws "this is a bug" UnifySchedule(fx)
+    unify!(RotationPair(fx, fy), (UnifySchedule(fx), UnifySchedule(fy)))
+    # The own points by position, off the seam against the plain forest,
+    # and on it against the image in the partner.
+    function points(f)
+        out = Dict{Any,Float64}()
+        for b in 1:nblocks(f), I in CartesianIndices(size(f.work)[1:D])
+            out[coordinates(f, b, Tuple(I))] = f.work[I, 1, b]
+        end
+        return out
+    end
+    bits(x) = reinterpret(UInt64, x)
+    X, Y, PX, PY = points(fx), points(fy), points(px), points(py)
+    turn(x) = Base.setindex(Base.setindex(x, x[2], 1), x[1], 2)
+    nseam = 0
+    @test all(X) do (x, v)
+        if x[1] == 0
+            nseam += 1
+            return bits(v) == bits(-Y[turn(x)] + 0.0)     # a turned zero is +0
+        end
+        return x[2] == 0 || bits(v) == bits(PX[x])
+    end
+    @test all(((y, v),) -> y[2] == 0 || y[1] == 0 || bits(v) == bits(PY[y]), Y)
+    @test nseam > 0
 end
 
-@pending 7 "Rigid rotation conserves mass through the seam and coarse-fine faces" begin
+@testset "Rigid rotation conserves mass through the seam and coarse-fine faces" begin
     # The seam's two faces must exchange exactly the flux one loses and
     # the other gains, and the coarse-fine faces inside the quadrant need
     # the fixup, as anywhere: a leak at the seam or at an interface shows
@@ -787,8 +792,6 @@ end
     worst_poly, worst_full = 0.0, 0.0
     worst_direct = Dict(:cell => 0.0, :vertex => 0.0)
     for (rot, other) in cases, C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(7, "interpolation beyond the seam, $C, $rot, D=$D");
-                          continue)
         d1, d2 = rot
         z = outofplane(D, rot)
         mirrors = other === :reflect_lo
@@ -913,7 +916,7 @@ end
     println("Float32 beyond the seam: within $(maximum(abs.(res[2] .- res[1]))) of Float64")
 end
 
-@pending 7 "A turned point reads variables it was not asked for" begin
+@testset "A turned point reads variables it was not asked for" begin
     # The failure mode: the turn takes a requested component to one that is
     # not in `vars` — the metric's g_xz to g_yz — and an implementation that
     # only loaded the requested variables would read the wrong one. The
@@ -942,7 +945,7 @@ end
     @test a == [-b[1], b[3], -b[2], -b[4], -b[7], b[6], -b[5]]
 end
 
-@pending 7 "A set that turns into its partner refuses points beyond the seam" begin
+@testset "A set that turns into its partner refuses points beyond the seam" begin
     # A face-centered set's value beyond the seam is its partner's, turned;
     # read from itself it would be the wrong component in the wrong
     # layout, so the point is refused with the reason, after the launch,
@@ -1011,7 +1014,6 @@ end
     # same points, and must keep them equal.
     rotation = rotwave_rotation(K, (1, 2))
     for C in (cellcentered(2), vertexcentered(2))
-        vertexlike(C) && (pending(7, "wave on a quadrant, $C, K=$K"); continue)
         full = rotating_wave(; N=16, C=C, K=K, full=true)
         quad = rotating_wave(; N=16, C=C, K=K, full=false)
         @test quad.nsteps == full.nsteps
@@ -1046,7 +1048,6 @@ end
     # half-turned edge) shows as a rate below 2 long before a single fill
     # looks wrong.
     for C in (cellcentered(2), vertexcentered(2)), K in (1, 2)
-        vertexlike(C) && (pending(7, "quadrant wave converges, $C, K=$K"); continue)
         hs, l2, linf = Float64[], Float64[], Float64[]
         for N in (8, 16, 32)
             r = rotating_wave(; N=N, C=C, K=K, full=false)

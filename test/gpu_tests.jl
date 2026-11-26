@@ -300,7 +300,7 @@ end
     end
 end
 
-@pending 7 "$bname: a rotating seam is filled on the device: T=$T, D=$D" for
+@testset "$bname: a rotating seam is filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
     # M12. Turned transfers are ordinary groups too, read through the
     # axis map and the variable table, both of which travel to the
@@ -346,7 +346,7 @@ end
     end
 end
 
-@pending 7 "$bname: a half-turn seam is filled on the device: T=$T, D=$D" for
+@testset "$bname: a half-turn seam is filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
     # M14. Orientation 2 about the centre line, with the vertex-centered
     # seam slab partitioned one plane up: nothing unwritten or read before

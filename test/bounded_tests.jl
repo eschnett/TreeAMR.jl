@@ -438,8 +438,6 @@ end
     # the doubled one, the quadrant not the fold of the full plane, and an
     # outflow or reflecting corner would read a ghost before it is written.
     for (C, sides) in ((cellcentered(D), (:lo, :hi)), (vertexcentered(D), (:lo,)))
-        vertexlike(C) && (pending(7, "bounded mirrored, turned, clamped, $C, D=$D");
-                          continue)
         for side in sides
             result = reflecting_vs_doubled(Val(D); side=side, centering=C, N=8,
                                            ops=BOUNDED_PV)

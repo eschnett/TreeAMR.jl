@@ -207,8 +207,7 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
                     exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
     println(tag, " interp-split ", digest(vec(s.values)), " ", count(s.excluded),
             " ", isequal(s.values, r.values))
-    # The face-centered pair across the seam: M22 step 7.
-    rotating === nothing || pending_case("$tag pair", 7)
+    rotating === nothing || rotating_pair(forest, tag, rotating, ops)
     return nothing
 end
 
@@ -283,11 +282,13 @@ workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12,
 # interpolation points spread over the whole plane.
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          rotating=(1, 2), x0=0.3)
-pending_case("D2ovq", 7)
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2), rotating=(1, 2), x0=0.3)
 
 # A half-turn seam (M14): orientation 2 about the middle of the low x₁
 # face, with the vertex-centered seam slab partitioned one plane up.
-pending_case("D2ovh", 7)
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2), halfturn=(1, 2), x0=0.3)
 
 function closed_workload(::Val{D}; roots, N, periodic, steps) where {D}
     forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> periodic, D),

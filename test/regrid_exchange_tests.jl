@@ -637,7 +637,7 @@ end
 
 # --- Rotating seams (M12) ---------------------------------------------------
 
-@pending 7 "regrid! over a distributed rotating quadrant is the serial regrid: D=$D" for
+@testset "regrid! over a distributed rotating quadrant is the serial regrid: D=$D" for
         D in (2, 3)
     # A pair is filled as a pair before its transfers, each member's
     # ghosts across the seam being the other's data, and the conforming
@@ -707,7 +707,7 @@ end
     end
 end
 
-@pending 7 "adapt_to_initial_data! over a distributed rotating quadrant, alone or as a pair" begin
+@testset "adapt_to_initial_data! over a distributed rotating quadrant, alone or as a pair" begin
     # From a single leaf at the axis, every rank but one starts empty and
     # the leaf is its own neighbor across the seam three times over. The
     # cycle — a fill, the flags, the regrid, the data re-evaluated — must
@@ -764,7 +764,7 @@ end
     end
 end
 
-@pending 7 "regrid! over a distributed half plane is the serial regrid: D=$D" for D in (2, 3)
+@testset "regrid! over a distributed half plane is the serial regrid: D=$D" for D in (2, 3)
     # The seam is kept conforming by the replicated completion, and a
     # prolongation reads its parent's ghosts across the seam. Over 3 and
     # 5 ranks, a cell- and a vertex-centered set regridded together —

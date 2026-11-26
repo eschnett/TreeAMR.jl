@@ -194,7 +194,7 @@ function seam_points(rng, forest::Forest{D}; nrandom=160) where {D}
     return xs
 end
 
-@pending 7 "A distributed interpolate through a rotating seam is the serial one: D=$D" for
+@testset "A distributed interpolate through a rotating seam is the serial one: D=$D" for
         D in (2, 3)
     # Routing turns a point beyond the seam back into the quadrant on the
     # host, to find its owner, and the owner's kernel turns it again to
@@ -237,7 +237,7 @@ end
     end
 end
 
-@pending 7 "A point beyond the seam of a set that turns into its partner is refused on every rank" begin
+@testset "A point beyond the seam of a set that turns into its partner is refused on every rank" begin
     # The value there is the partner's, which `interpolate` does not read.
     # The host marks such a point when it locates it, before anything is
     # routed, so a point on one rank only must be refused on every rank
@@ -270,7 +270,7 @@ end
     end
 end
 
-@pending 7 "A distributed interpolate through a half-turn seam is the serial one: D=$D" for
+@testset "A distributed interpolate through a half-turn seam is the serial one: D=$D" for
         D in (2, 3)
     # Routing turns a point beyond the seam back about the centre line on
     # the host, to find its owner, and the owner's kernel turns it again;

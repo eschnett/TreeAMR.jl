@@ -549,7 +549,7 @@ end
 # values bit for bit — for a set that turns into itself and for a
 # `RotationPair`, whose stages are merged by (stage, member).
 
-@pending 7 "Across a rotating seam the ranks hold the serial transfers, laid out alike and written once: D=$D" for
+@testset "Across a rotating seam the ranks hold the serial transfers, laid out alike and written once: D=$D" for
         D in (2, 3)
     # A rotated transfer lost between ranks leaves a ghost unwritten; one
     # whose orientation a rank derives differently from its peer reads
@@ -590,17 +590,16 @@ end
     @test nrotated > 0
 end
 
-@pending 7 "Packing and unpacking across a rotating seam reproduces the serial fill bitwise: D=$D" for
+@testset "Packing and unpacking across a rotating seam reproduces the serial fill bitwise: D=$D" for
         D in (2, 3)
-    # The values. A pack that applied the turn's sign would turn the
-    # serial fill's `−0` — a component that is zero, negated by the turn
-    # — into `+0`; one that read the wrong member of a pair, or turned
-    # the wrong way, a whole region. So every rank's working array,
-    # ghosts included, must equal the serial fill on its blocks bit for
-    # bit, the hook between the stages included, for a set that turns into
-    # itself (its `v_{d2}` zero) and for a pair (the second variable of
-    # each member zero), with `−0` present and rotated transfers received
-    # across rank boundaries.
+    # The values. A pack that applied the turn's sign twice, read the wrong
+    # member of a pair, or turned the wrong way, shows on a whole region.
+    # So every rank's working array, ghosts included, must equal the serial
+    # fill on its blocks bit for bit, the hook between the stages included,
+    # for a set that turns into itself (its `v_{d2}` zero) and for a pair
+    # (the second variable of each member zero), with rotated transfers
+    # received across rank boundaries. A turned zero is `+0` (the factor
+    # path adds `+0`, M22 step 6), so the serial fill holds no `−0`.
     N = D == 3 ? 4 : 8
     p = D == 3 ? 2 : 4
     ops = Operators(prolongation=p, restriction=p)
@@ -665,12 +664,11 @@ end
             nrot += nrotated_remote(schedsa) + nrotated_remote(schedsb)
         end
     end
-    @test nnegzero > 0
-    @test npairzero > 0
+    @test nnegzero == 0 && npairzero == 0
     @test nrot > 0
 end
 
-@pending 7 "The staged driver over a communicator fills across a rotating seam: D=$D" for
+@testset "The staged driver over a communicator fills across a rotating seam: D=$D" for
         D in (2, 3)
     # The composition through the communicator verbs, every rank its own
     # task: the single fill of a set that turns into itself, and the
@@ -742,14 +740,15 @@ end
 # --- Half-turn seams (M14) --------------------------------------------------
 #
 # A half turn's transfers are orientation 2, packed and unpacked as a
-# quarter turn's are; what is new is the shifted seam slab of a
-# vertex-like `d2`, whose ranges both ends of a message must derive alike.
+# quarter turn's are; what is new is the reversed tangent `d2`, which on
+# closed blocks (M22) carries the own range onto itself, so both ends of a
+# message derive the ordinary ranges alike.
 # The half plane of `halfturn_forest` (`ghost_oracles.jl`), refined at the
 # axis and off it, split over 2, 3 and 5 ranks: the transfers, the layouts,
-# one write per point, and the values bit for bit, with `−0` from the
-# negated component.
+# one write per point, and the values bit for bit; the negated component's
+# zeros are `+0` (M22 step 6).
 
-@pending 7 "Across a half-turn seam the ranks hold the serial transfers and its values bitwise: D=$D" for
+@testset "Across a half-turn seam the ranks hold the serial transfers and its values bitwise: D=$D" for
         D in (2, 3)
     # A shifted slab whose range one end derives differently from the other
     # misplaces a whole message; a pack that applied the sign turns the
@@ -805,7 +804,7 @@ end
         end
     end
     @test nrotated > 0
-    @test nnegzero > 0
+    @test nnegzero == 0
     @test nrot > 0
 end
 

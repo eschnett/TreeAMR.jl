@@ -331,8 +331,6 @@ halfturn_centerings(D) =
     for (plane, other) in cases, p in (2, 4),
         C in (plane == cases[1][1] ? halfturn_centerings(D) :
               [cellcentered(D), vertexcentered(D)])
-        vertexlike(C) && (pending(7, "half-turn ghosts defined, $C, $plane, p = $p, " *
-                                     "D=$D"); continue)
         nnan, worst, schedule = undefined_halfturn_ghosts(Val(D); plane=plane,
                                                           other=other, C=C, p=p)
         (nnan == 0 && worst < 1e-10) || push!(bad, (plane, other, C, p, nnan, worst))
@@ -365,7 +363,6 @@ end
     worst = Dict(:cell => 0.0, :vertex => 0.0)
     for (plane, other) in cases,
         C in (cellcentered(D), vertexcentered(D), facecentered(D, plane[1]))
-        vertexlike(C) && (pending(7, "half plane, $C, $plane, D=$D"); continue)
         result = halfturn_vs_doubled(Val(D); plane=plane, centering=C, other=other)
         @test result !== nothing
         result === nothing && continue
@@ -391,8 +388,6 @@ end
     for (plane, other) in cases
         forest = halfturn_forest(Val(D); plane=plane, other=other, N=N)
         for C in halfturn_centerings(D)
-            vertexlike(C) && (pending(7, "partition across the half turn, $C, " *
-                                         "$plane"); continue)
             G = ghosts_for(C, 4)
             fs = FieldSet(forest, D + 1; G=G, centering=C,
                           halfturn=vector_halfturn(D, plane),
@@ -439,8 +434,6 @@ end
     worst_full = Dict(:cell => 0.0, :vertex => 0.0)
     worst_direct = Dict(:cell => 0.0, :vertex => 0.0)
     for (plane, other) in cases, C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(7, "interpolation beyond the half turn, $C, $plane, " *
-                                     "D=$D"); continue)
         d1, d2 = plane
         z = outofplane(D, plane)
         mirrors = other === :reflect_lo
@@ -571,8 +564,6 @@ end
                   (f, k) -> level(k) >= 2 ? Coarsen : Keep,
                   (f, k) -> seamface(f, k, d2) && level(k) < 2 ? Refine : Keep]
         for C in (cellcentered(D), vertexcentered(D))
-            vertexlike(C) && (pending(7, "regrid across the half turn, $C, $plane, D=$D");
-                              continue)
             results = halfturn_regrid_vs_doubled(Val(D); plane=plane, other=other,
                                                  passes=passes, C=C)
             counts = [r.nleaves for r in results]
@@ -620,39 +611,42 @@ end
     @test worst < 1e-10
 end
 
-@pending 7 "The interface schedule records nothing across the conforming half-turn seam: D=$D" for
+@testset "A flux's unify! makes the half-turn seam's copies one number: D=$D" for
         D in (2, 3)
-    # A coarse-fine face across the seam would need a turned restriction,
-    # which conformity rules out; elsewhere the schedule restricts exactly
-    # as the same leaves without the seam.
+    # Guards the interface restriction across the seam on closed blocks
+    # (M22): a flux normal to `d1` holds the seam plane at `x_{d2}` and at
+    # its image `lo + hi − x_{d2}`, which the half turn makes the negated
+    # copies of one value, so `unify!` must make them one number through
+    # the turn, bit for bit; away from the seam it restricts as the same
+    # leaves without the seam do.
     plane = (1, 2)
     other = D == 2 ? :none : :periodic
     forest = halfturn_forest(Val(D); plane=plane, other=other)
     plain = Forest(forest.roots; N=forest.N, periodic=forest.periodic,
                    extents=forest.extents, leaves=copy(forest.leaves))
     rng = Xoshiro(13)
-    nrestrict = 0
+    bits(x) = reinterpret(UInt64, x)
+    lo, hi = forest.extents[2]
     for d in 1:D
         halfturn = d in plane ? (-1,) : (1,)
         fh = FieldSet(forest, 1; G=0, centering=facecentered(D, d), halfturn=halfturn)
         fp = FieldSet(plain, 1; G=0, centering=facecentered(D, d))
-        is = UnifySchedule(fh)
-        groups = collect(Iterators.flatten(is.phases))
-        @test all(g -> g.orientation == 0, groups)
-        nrestrict += sum(ntransfers, groups; init=0)
         fh.work .= randn(rng, size(fh.work))
         fp.work .= fh.work
-        unify!(fh, is)
+        unify!(fh, UnifySchedule(fh))
         unify!(fp, UnifySchedule(fp))
-        @test fh.work == fp.work
+        values(f) = Dict(coordinates(f, b, Tuple(I)) => f.work[I, 1, b]
+                         for b in 1:nblocks(f) for I in CartesianIndices(size(f.work)[1:D]))
+        H, Q = values(fh), values(fp)
+        nseam = 0
+        @test all(H) do (x, v)
+            x[1] == 0 || return bits(v) == bits(Q[x])
+            nseam += 1
+            image = Base.setindex(x, lo + hi - x[2], 2)
+            return bits(v) == bits(halfturn[1] * H[image] + 0.0)
+        end
+        d == 1 && @test nseam > 0
     end
-    @test nrestrict > 0
-
-    # A seam that is not conforming is a bug the schedule reports.
-    broken = Forest((1, 2); N=8, halfturn=(1, 2))
-    refine!(broken, only(filter(k -> leafbox(broken, k)[1] == (0, 0), broken.leaves)))
-    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1), halfturn=(-1,))
-    @test_throws "this is a bug" UnifySchedule(fx)
 end
 
 """
@@ -722,7 +716,7 @@ function halfturn_advect(forest::Forest{D}; fixup::Bool, nsteps::Int,
     return mass0, mass1, crossed
 end
 
-@pending 7 "Rigid rotation conserves mass through the half-turn seam and coarse-fine faces" begin
+@testset "Rigid rotation conserves mass through the half-turn seam and coarse-fine faces" begin
     # Mass that leaves the half plane through the seam above the axis
     # enters it through the seam below, and the two parts of the face
     # exchange exactly the flux one loses and the other gains only because
@@ -815,8 +809,13 @@ function halfturn_wave(; N, C, K, plane=(1, 2), full::Bool, p=4, cfl=0.25, perio
     fill_by_coordinates!(halfwave_exact(K, plane, t_end), exact)
     uexact = statevector(exact)
     gather!(uexact, exact)
-    err = sol.u[end] .- uexact
-    scatter!(fs, sol.u[end])
+    # A secondary's state entry is integrated along and never read (M22,
+    # "Closed blocks" in CODE.md): `unify!` gives it its primary's value,
+    # the seam's and the axis's included, as an application's output would.
+    u = copy(sol.u[end])
+    unify!(u, fs, schedule)
+    err = u .- uexact
+    scatter!(fs, u)
     fill_ghosts!(fs, schedule;
                  boundary=boundary_by_coordinates(halfwave_exact(K, plane, t_end)))
     return (l2=volume_weighted_norm(fs, err), linf=volume_weighted_norm(fs, err; p=Inf),
@@ -888,7 +887,6 @@ end
     # levels meet along the seam they drift apart by the scheme's error,
     # within the full plane's own defect.
     for C in (cellcentered(2), vertexcentered(2))
-        vertexlike(C) && (pending(7, "wave on a half plane, $C, K=$K"); continue)
         full = halfturn_wave(; N=16, C=C, K=K, full=true)
         half = halfturn_wave(; N=16, C=C, K=K, full=false)
         @test half.nsteps == full.nsteps
@@ -923,7 +921,6 @@ end
     # quadrant; an inconsistency at the seam (a ghost off by one plane in
     # the shifted slab, say) shows as a lower rate.
     for C in (cellcentered(2), vertexcentered(2)), K in (1, 2)
-        vertexlike(C) && (pending(7, "half-plane wave converges, $C, K=$K"); continue)
         hs, l2, linf = Float64[], Float64[], Float64[]
         for N in (8, 16, 32)
             r = halfturn_wave(; N=N, C=C, K=K, full=false)

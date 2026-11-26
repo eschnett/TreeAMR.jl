@@ -1400,8 +1400,17 @@ function refusals()
     # that turns into its partner, which `interpolate` does not read; and
     # such a set regridded alone on rank 1, where the others regrid the
     # pair. Each refused on every rank, rank 1 with its own reason.
-    # (Over a face-centered pair: M22 step 7.)
-    pending_case("rotating refusals", 7)
+    forest = Forest((2, 2); N=8, rotating=(1, 2), comm=COMM)
+    _, pair = quad_sets(forest)
+    n, msg = attempt(() -> interpolate(pair.a, RANK == 1 ? [(0.5, 0.5), (-0.5, 0.7)] :
+                                               [(0.5, 0.5)], Lagrange(4)))
+    emit("# rotating interpolate refused on", n, "of", NRANKS, "ranks:", msg)
+    pscheds = (GhostSchedule(pair.a, ops4), GhostSchedule(pair.b, ops4))
+    nb = length(blockrange(forest))
+    n, msg = attempt(() -> regrid!(forest, RANK == 1 ?
+                                           (pair.a => pscheds[1], pair.b => pscheds[2]) :
+                                           (pair => pscheds,); flags=fill(Keep, nb)))
+    emit("# rotating regrid refused on", n, "of", NRANKS, "ranks:", msg)
 
     # An element set of another order on rank 1 only (M16): its stencils
     # and its fill differ, so its schedule is refused on every rank.
@@ -1629,14 +1638,15 @@ function main()
     # a set that turns into itself and a pair through a fill, a regrid and
     # interpolation; and a single leaf at the axis, which
     # leaves every rank but one without blocks.
-    pending_case("Q2v", 7)
+    wave_case("Q2v", forest_of((3, 3), 8; rotating=(1, 2), centre=(0.4, 0.5)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6, rotation=(1, 2))
     wave_case("Q3c", forest_of((2, 2, 2), 4; rotating=(1, 2),
                                reflecting=((false, false), (false, false), (true, false)),
                                centre=(0.5, 0.6, 0.4)); G=1,
               centering=cellcentered(3), ops=OPS2, steps=3, rotation=(1, 2),
               parity=[ntuple(_ -> EvenParity, 3), ntuple(_ -> EvenParity, 3)])
-    pending_case("Q2", 7)
-    pending_case("QE2", 7)
+    rotating_case("Q2")
+    rotating_empty_case("QE2")
     # The nested octant, whose prolongation levels every rank runs as one
     # group of stages.
     grouped_case("N3")
@@ -1653,8 +1663,9 @@ function main()
     # A half plane (M14): the vertex-centered wave, whose seam slab is
     # partitioned one plane up, and two sets through a fill, a regrid and
     # interpolation beyond the seam.
-    pending_case("H2v", 7)
-    pending_case("H2", 7)
+    wave_case("H2v", forest_of((2, 4), 8; halfturn=(1, 2), centre=(0.4, 2.9)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6, halfturn=(1, 2))
+    halfturn_case("H2")
     # Forests of patches (M17): the annulus in every centering, and the
     # cubed sphere's element set, whose glue turns what it sends.
     patch_case("PR2", annulus_of(8),

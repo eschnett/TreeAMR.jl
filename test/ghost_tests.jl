@@ -323,7 +323,15 @@ end
     end
     # A level with rotated prolongations runs alone, and so does every
     # level of a schedule printed as before.
-    pending(7, "a rotated level runs alone, vertex-centered, D=$D")
+    quad = rotating_forest(Val(D); rotating=(1, 2))
+    s = GhostSchedule(FieldSet(quad, 1; G=2, centering=vertexcentered(D), rotation=[1]),
+                      Operators(prolongation=4, restriction=4))
+    @test length(s.levels) == 2
+    @test all(gs -> any(g -> g.orientation != 0, gs), s.phase2)
+    # Stage 0 (M22) and phase 1 alone in front, then each level alone.
+    p1 = s.phase1group
+    @test s.stagegroups == [[i:i for i in 1:p1]; [(p1 + 1):(p1 + 1), (p1 + 2):(p1 + 2)]]
+    @test !occursin("run together", sprint(show, s))
 end
 
 @testset "A level that reads what the level below writes runs after it" begin
@@ -388,7 +396,7 @@ end
                   levels=(1, 3)) == apart
 end
 
-@pending 7 "A grouped fill is the same in any order within the group: D=$D" for D in (2, 3)
+@testset "A grouped fill is the same in any order within the group: D=$D" for D in (2, 3)
     # The oracle for the dependency check. Run in reverse, a level that
     # read a ghost the level below writes would read it before it was
     # written — NaN here, from the prefill — and a level that read a
@@ -582,7 +590,6 @@ end
     nsingle = 0
     for (C, ops, p) in configs
         # At reflecting and outflow faces (M22 step 4), and across a seam (7).
-        vertexlike(C) && (pending(7, "zero-weight taps, $C, p = $p, D=$D"); continue)
         G = ghosts_for(C, p)
         _, parity = parity_data(Float64, kinds, p)
         setups = Any[FieldSet(faces_forest(kinds; N=N), 2; G=G, centering=C,
@@ -615,8 +622,12 @@ end
                 @test fillwith(g; flat=false) == full
                 @test fillwith(g; flat=true) == full
             end
-            # The vertex-centered prolongations are what the skip is for.
-            ops.family === PointValue && C[1] === :vertex && @test vertexprolong > 0
+            # The vertex-centered prolongations are what the skip is for:
+            # a coarse node's coincident ghost, which on closed blocks (M22)
+            # needs a tangential dimension or a second ghost row, the first
+            # one beyond a face lying between two coarse nodes.
+            ops.family === PointValue && C[1] === :vertex && (D >= 2 || G[1] >= 2) &&
+                @test vertexprolong > 0
         end
     end
     @test nsingle > 0                              # the one-tap path was taken
