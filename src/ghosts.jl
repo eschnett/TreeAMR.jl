@@ -671,7 +671,9 @@ end
 # The members of a set of targets, as `mean_gather_kernel!` reads them, on
 # a backend, with the targets themselves (`blocks`, `points`) and the same
 # for a state-shaped array, every point moved down by the ghost widths
-# (`statepoints`, `mstatepoint`).
+# (`statepoints`, `mstatepoint`). `buffer` holds the means, `nvars × n`,
+# made on the first use and kept, remade only when the variable count or
+# the element type changes, as stage A's buffers are kept with its plan.
 struct MeanPoints{VB,VP,MB,MP,MR}
     blocks::VB
     points::VP
@@ -683,8 +685,18 @@ struct MeanPoints{VB,VP,MB,MP,MR}
     mr::MR
     mcount::VB
     paired::Bool
+    buffer::Base.RefValue{Any}
 end
 Base.length(p::MeanPoints) = length(p.blocks)
+
+# The means buffer of `p` for `nvars` variables of type `T` on `backend`.
+function means_buffer!(p::MeanPoints, ::Type{T}, nvars::Integer, backend) where {T}
+    buf = p.buffer[]
+    (buf isa AbstractMatrix{T} && size(buf) == (Int(nvars), length(p))) && return buf
+    buf = allocate(backend, T, (Int(nvars), length(p)))
+    p.buffer[] = buf
+    return buf
+end
 
 # The tables of `n` targets of up to `M` members each, on the host, filled
 # by the builder; then moved to `backend`.
@@ -692,14 +704,14 @@ function host_means(::Val{D}, n::Int, M::Int, paired::Bool) where {D}
     z = ntuple(_ -> Int32(1), D)
     return MeanPoints(zeros(Int32, n), fill(z, n), fill(z, n), zeros(Int32, M, n),
                       fill(z, M, n), fill(z, M, n), zeros(Int32, M, n), zeros(Int8, M, n),
-                      zeros(Int32, n), paired)
+                      zeros(Int32, n), paired, Ref{Any}(nothing))
 end
 todevice(backend, p::MeanPoints) =
     MeanPoints(todevice(backend, p.blocks), todevice(backend, p.points),
                todevice(backend, p.statepoints), todevice(backend, p.mblock),
                todevice(backend, p.mpoint), todevice(backend, p.mstatepoint),
                todevice(backend, p.mslot), todevice(backend, p.mr),
-               todevice(backend, p.mcount), p.paired)
+               todevice(backend, p.mcount), p.paired, Ref{Any}(nothing))
 
 # The means of `p`'s targets in `A`, a working array or, with `state`, a
 # state-shaped one, into `buf` (`nvars × length(p)`), `recv` holding what
@@ -723,14 +735,14 @@ function write_means!(A, buf, p::MeanPoints, nvars::Integer, backend; state::Boo
 end
 
 # Project the axis points of `axis` in `A`, a working array or, with
-# `state`, a state-shaped one. The buffer of the means, `nvars × n`, is
-# made per call; nothing is received, so the buffer stands in for `recv`,
-# which no member reads.
+# `state`, a state-shaped one, through the means buffer the points keep;
+# nothing is received, so the buffer stands in for `recv`, which no member
+# reads.
 function axis_project!(A::AbstractArray{T}, axis::MeanPoints, nvars::Integer, factors,
                        rotvars, backend; state::Bool=false) where {T}
     n = length(axis)
     n == 0 && return nothing
-    buf = allocate(backend, T, (Int(nvars), n))
+    buf = means_buffer!(axis, T, nvars, backend)
     gather_means!(buf, A, buf, axis, nvars, factors, rotvars, backend; state=state)
     write_means!(A, buf, axis, nvars, backend; state=state)
     synchronize(backend)

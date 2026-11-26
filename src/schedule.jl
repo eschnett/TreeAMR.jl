@@ -2462,8 +2462,9 @@ noaxes(key::GroupKey{D}) where {D} = identity_axes(Val(D))
 # copy.
 # Returns `nothing` when the stage has no messages here.
 function remote_stage(::Type{RS}, ::Type{T}, backend::Backend,
-                      sent::TransferPairs{D}, received::TransferPairs{D}, stencils,
-                      factorcol; targetowner, sourceowner, targetrange::UnitRange{Int},
+                      sent::TransferPairs{D}, received::TransferPairs{D},
+                      @nospecialize(stencils), @nospecialize(factorcol); targetowner,
+                      sourceowner, targetrange::UnitRange{Int},
                       sourcerange::UnitRange{Int}, @nospecialize(axesof=noaxes),
                       @nospecialize(bounded=nobound)) where {RS<:RemoteStage,T,D}
     isempty(sent) && isempty(received) && return nothing
@@ -2523,9 +2524,10 @@ remotetype(::Type{ExchangeStage{GRP,RS}}) where {GRP,RS} = RS
 # groups (possibly none) and `sentby` / `receivedby` the remote transfers
 # filed by stage. `required` tags are present even when empty here, as
 # phase 1 is, after which the boundary hook runs.
-function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags, localsof,
-                      sentby::Dict{Int,TransferPairs{D}},
-                      receivedby::Dict{Int,TransferPairs{D}}, stencils, factorcol,
+function build_stages(::Type{ST}, ::Type{T}, backend::Backend, localtags,
+                      @nospecialize(localsof), sentby::Dict{Int,TransferPairs{D}},
+                      receivedby::Dict{Int,TransferPairs{D}}, @nospecialize(stencils),
+                      @nospecialize(factorcol),
                       forest::Forest{D}; required=Int[], @nospecialize(axesof=noaxes),
                       @nospecialize(bounded=nobound)) where {ST,T,D}
     owned = blockrange(forest)
@@ -2550,8 +2552,10 @@ end
 # `stageof` its stage of each.
 function state_unify_stages(::Type{ST}, ::Type{GRP}, ::Type{T}, backend, forest::Forest{D},
                             owned, ghosts::NTuple{D,Int}, pairs::TransferPairs{D},
-                            sent::TransferPairs{D}, received::TransferPairs{D}, build,
-                            factorcol, axesof, bounded, stageof) where {ST,GRP,T,D}
+                            sent::TransferPairs{D}, received::TransferPairs{D},
+                            @nospecialize(build), @nospecialize(factorcol),
+                            @nospecialize(axesof), @nospecialize(bounded),
+                            @nospecialize(stageof)) where {ST,GRP,T,D}
     unghost(key) = ntuple(D) do d
         st = build(key)[d]::Stencil1D{T,Vector{Int32},Matrix{T}}
         Stencil1D{T}(st.targetfirst - ghosts[d], st.srcstart .- Int32(ghosts[d]),
@@ -2711,7 +2715,8 @@ end
 # schedule's `build`, `factorcol` and `axesof`; with `ghosts` given, every
 # stencil moved down by it, for a state-shaped array.
 function selfimage_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend,
-                          pairs::TransferPairs{D}, build, factorcol, axesof;
+                          pairs::TransferPairs{D}, @nospecialize(build),
+                          @nospecialize(factorcol), @nospecialize(axesof);
                           ghosts=nothing) where {GRP,T,D}
     shifted(key) = ntuple(D) do d
         st = build(key)[d]::Stencil1D{T,Vector{Int32},Matrix{T}}
@@ -2961,7 +2966,9 @@ end
 # showed as 448 bytes more per build.) `bounded(key)` is the group's
 # bound, `boundedmode`, and `stageof(key)` its stage, `transfer_stage`.
 function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::TransferPairs{D},
-                      build, factorcol, axesof, bounded, stageof) where {GRP,T,D}
+                      @nospecialize(build), @nospecialize(factorcol),
+                      @nospecialize(axesof), @nospecialize(bounded),
+                      @nospecialize(stageof)) where {GRP,T,D}
     unify, phase1 = GRP[], GRP[]
     bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
