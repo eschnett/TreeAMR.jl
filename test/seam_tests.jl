@@ -446,3 +446,58 @@ end
         @test maxlevel(forest) == 2
     end
 end
+
+@testset "A pair's unify! projects the wall plane before the seam reads it, in either order" begin
+    # Guards the order of a pair's stages in `unify!` (M22): a member's
+    # seam copies on a reflecting wall plane take its partner's primaries
+    # through the turn, so stage P must have projected both members before
+    # stage 0 of either reads them, as the paired fill does; otherwise the
+    # member unified first copies its partner's unprojected values, and
+    # the result depends on which member is `a`. An edge-centered pair on
+    # a quadrant with a reflecting low `z` wall, its variable odd in `z`,
+    # with random values on the wall plane.
+    forest = seam_forest(3; other=:reflect_lo)
+    parity = [(EvenParity, EvenParity, OddParity)]
+    fa = FieldSet(forest, 1; G=2, centering=(:vertex, :cell, :vertex), rotation=(-1,),
+                  parity=parity)
+    fb = FieldSet(forest, 1; G=2, centering=(:cell, :vertex, :vertex), rotation=(1,),
+                  parity=parity)
+    sa, sb = GhostSchedule(fa, SEAM_OPS), GhostSchedule(fb, SEAM_OPS)
+    @test !isempty(sa.selfimage) && !isempty(sb.selfimage)
+    start = (randn(Xoshiro(60), size(fa.work)), randn(Xoshiro(61), size(fb.work)))
+    own(fs) = ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N + staggers(fs)[d]), 3)
+    function onwall(fs)
+        vals = Float64[]
+        for b in 1:nblocks(fs), I in CartesianIndices(own(fs))
+            coordinates(fs, b, Tuple(I))[3] == 0 && push!(vals, fs.work[I, 1, b])
+        end
+        return vals
+    end
+    reset!() = (fa.work .= start[1]; fb.work .= start[2])
+    # Both orders of the pair, working arrays.
+    reset!()
+    unify!(RotationPair(fa, fb), (sa, sb))
+    ab = (copy(fa.work), copy(fb.work))
+    @test all(iszero, onwall(fa)) && all(iszero, onwall(fb))
+    @test !isempty(onwall(fa))
+    unify!(RotationPair(fa, fb), (sa, sb))
+    @test bitwise_equal(fa.work, ab[1]) && bitwise_equal(fb.work, ab[2])
+    reset!()
+    unify!(RotationPair(fb, fa), (sb, sa))
+    @test bitwise_equal(fa.work, ab[1]) && bitwise_equal(fb.work, ab[2])
+    # The state form, both orders, against the working arrays' own points.
+    ownof(fs, A) = [A[I, 1, b] for b in 1:nblocks(fs) for I in CartesianIndices(own(fs))]
+    for (x, y, sx, sy) in ((fa, fb, sa, sb), (fb, fa, sb, sa))
+        reset!()
+        v = gather!(statevector((x, y)), (x, y))
+        unify!(v, RotationPair(x, y), (sx, sy))
+        scatter!((x, y), v)
+        @test ownof(fa, fa.work) == ownof(fa, ab[1]) && ownof(fb, fb.work) == ownof(fb, ab[2])
+    end
+    # And the paired fill leaves the same own points.
+    reset!()
+    hook = boundary_by_coordinates((x, v) -> 0.0)
+    fill_ghosts!(RotationPair(fa, fb), (sa, sb); boundary=hook)
+    @test bitwise_equal(ownof(fa, fa.work), ownof(fa, ab[1]))
+    @test bitwise_equal(ownof(fb, fb.work), ownof(fb, ab[2]))
+end

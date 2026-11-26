@@ -1761,10 +1761,26 @@ end
 # or a `RotationPair`'s partner's (M12).
 function unify_arrays!(A, alt, fs::FieldSet, factors, rotvars, schedule, backend;
                        state::Bool=false)
+    unify_stage_p!(A, fs, factors, rotvars, schedule, backend; state=state)
+    unify_stage_0!(A, alt, fs, factors, rotvars, schedule, backend; state=state)
+    return nothing
+end
+
+# Stage P alone: the wall planes' and the axis's projections, on the
+# primaries.
+function unify_stage_p!(A, fs::FieldSet, factors, rotvars, schedule, backend;
+                        state::Bool=false)
     selfimage = state ? schedule.stateselfimage : schedule.selfimage
     isempty(selfimage) ||
         run_phase!(A, A, selfimage, fs.nvars, backend; factors=factors, rotvars=rotvars)
     run_axis!(A, fs, schedule.axis, backend; state=state)
+    return nothing
+end
+
+# Stage 0 alone: every secondary takes its primary's value, which stage P
+# has projected, a partner's included.
+function unify_stage_0!(A, alt, fs::FieldSet, factors, rotvars, schedule, backend;
+                        state::Bool=false)
     forest = schedule.forest
     sends = nothing
     if state
@@ -1793,16 +1809,20 @@ end
 `unify!` for the two sets of a [`RotationPair`](@ref): a member's copies of
 a point on its seam plane are its partner's turned (M22 rule 2), and the
 primary among them may be the partner's, so the two are unified
-together, `a`'s stage 0 and then `b`'s, each reading the other through
-the pair's tables. The second form unifies a state-shaped vector of the
+together, as the paired fill does: stage P of both members, so that a
+primary on a reflecting wall plane is projected before any copy reads it,
+then `a`'s stage 0 and `b`'s, each reading the other through the pair's
+tables. The result does not depend on which member is `a`. The second form unifies a state-shaped vector of the
 two sets, laid out as [`stateview`](@ref) lays out `(a, b)`.
 """
 function unify!(pair::RotationPair, schedules::Tuple)
     a, b = pair.a, pair.b
     sa, sb = check_pair_unify(pair, schedules)
     backend = get_backend(a.work)
-    unify_arrays!(a.work, b.work, a, pair.afactors, pair.arotvars, sa, backend)
-    unify_arrays!(b.work, a.work, b, pair.bfactors, pair.brotvars, sb, backend)
+    unify_stage_p!(a.work, a, pair.afactors, pair.arotvars, sa, backend)
+    unify_stage_p!(b.work, b, pair.bfactors, pair.brotvars, sb, backend)
+    unify_stage_0!(a.work, b.work, a, pair.afactors, pair.arotvars, sa, backend)
+    unify_stage_0!(b.work, a.work, b, pair.bfactors, pair.brotvars, sb, backend)
     return pair
 end
 
@@ -1813,8 +1833,10 @@ function unify!(v::AbstractVector, pair::RotationPair, schedules::Tuple)
     backend = get_backend(a.work)
     A = statearray(stateview(v, (a, b), 1), a)
     B = statearray(stateview(v, (a, b), 2), b)
-    unify_arrays!(A, B, a, pair.afactors, pair.arotvars, sa, backend; state=true)
-    unify_arrays!(B, A, b, pair.bfactors, pair.brotvars, sb, backend; state=true)
+    unify_stage_p!(A, a, pair.afactors, pair.arotvars, sa, backend; state=true)
+    unify_stage_p!(B, b, pair.bfactors, pair.brotvars, sb, backend; state=true)
+    unify_stage_0!(A, B, a, pair.afactors, pair.arotvars, sa, backend; state=true)
+    unify_stage_0!(B, A, b, pair.bfactors, pair.brotvars, sb, backend; state=true)
     return v
 end
 

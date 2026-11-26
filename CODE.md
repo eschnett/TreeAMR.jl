@@ -1070,6 +1070,19 @@ through the turn (rule 2):
   kernel reads them through the axis map, `rotvars` and the sign column,
   as every turned transfer does, and `ghost_plane_parts` copies a
   turned diagonal the same way.
+- *A limitation: copies equal to rounding where the plane is
+  cell-like.* A set cell-like in both plane dimensions but vertex-like
+  across them — in 3D the face set normal to the axis, `(:cell, :cell,
+  :vertex)` — has its seam copies one number only to rounding, at most
+  16 ulp of the data in `seam_tests.jl`, not bit for bit: where its
+  primary is finer, stage 0 restricts across the seam with the
+  restriction stencil along the cell-like plane dimensions, and the turn
+  reverses one of them, so the turned copy sums the same window in the
+  reverse order. A set vertex-like in the plane injects and agrees bit
+  for bit. Making it exact would need the restriction to sum in an order
+  that does not depend on the axis direction (pairwise from the window's
+  ends); nothing reads the difference, which stays at rounding and does
+  not grow, so it is left.
 - *The axis* is its own image (rule 3): each variable there becomes the
   mean of its images under the orbit's powers of the set's map, `¼ Σ_r
   Qʳ u` for a quarter turn, `½ (u + Q u)` for a half turn, summed in
@@ -1103,6 +1116,10 @@ through the turn (rule 2):
   regridded only as a `RotationPair` (`seam_partnered`), its stage 0 of
   odd orientation reading the partner through the pair's tables; a flux
   with `G = 0` included, which before closed blocks needed no partner.
+  The fill, `unify!` and the lockstep helpers run stage P of both members
+  before stage 0 of either: a member's seam copies on a reflecting wall
+  plane read the partner's primaries there, which must be projected
+  first, or the result would depend on which member is `a`.
   A member's mask marks its own primaries, so a sum over one member
   alone with `primaries = true` leaves out its seam plane where the
   partner holds the primary, and the two members' sums together count
@@ -7739,6 +7756,8 @@ Remaining, none blocking before their milestone:
     `d2` would be consistent with the flip, a symmetry of the torus, and
     needs the real node wrapped after it is turned. All refused, as for
     the quarter turn.
+  - *Seam copies of a set cell-like in the plane* are one number to
+    rounding only (*Seams* under [Closed blocks](#closed-blocks)).
   - *Interpolation of a paired set beyond the seam.* The value there is
     the partner's, so the kernel would need both working arrays, or the
     host would route the folded point to the partner and swap the

@@ -6132,6 +6132,26 @@ M12 was decided with Erik, after M7 and before M9b.
   take too, "the count's lowest patch" deciding where positions do not;
   `seam_partnered`'s pairs, which a turn written as a glue entry (M21
   step 3) must keep; and step 5's cluster numbers, still to be taken.
+- *Step 7's review: a pair's stage order in `unify!` (2026-11-26).* The
+  review, by Claude and not by Erik, verified step 7 by its own probe (a
+  fourfold-symmetric scalar on four quadrant forests, concave corners on
+  the seam and at the axis: every ghost beyond the seam its image's own
+  value bit for bit, the two seam faces 3.6 × 10⁻¹⁵ apart after a
+  five-point stencil and 0 after `unify!`) and found one defect by
+  reading the code: `unify!` of a `RotationPair`, in both forms, ran
+  stages P and 0 of `a` and then of `b`, so where `a`'s seam copies lie
+  on a reflecting wall plane they took `b`'s primaries before `b`'s
+  stage P had projected them, and the result depended on which member
+  was `a`. The paired fill already ran P of both before 0 of either.
+  Fixed (`unify_stage_p!`, `unify_stage_0!`); `regrid!` fills a pair
+  through the paired fill and the lockstep helper ran P of both first,
+  so neither changed. The new testset, an edge-centered pair on a 3D
+  quadrant with a reflecting low `z` wall and a variable odd in `z`,
+  fails 5 of its 9 assertions on the old order: the wall plane not zero,
+  the two orders differing, the state form and the paired fill
+  disagreeing with `unify!`. CODE.md now states the order, and the
+  rounding-only seam copies of a set cell-like in the plane as a
+  limitation.
 
 ## Downstream checks
 
