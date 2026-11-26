@@ -5665,11 +5665,27 @@ M12 was decided with Erik, after M7 and before M9b.
   - *The vertex rates moved* (`L2`, `N = 8 … 32`, the half-open checkout
     7d99187 run the same day beside): `D = 1`, order 2: 0.99 → 0.97;
     order 4: 1.99 → 1.92; `D = 2`, order 2: 1.01 → 1.04; order 4: 1.99 →
-    1.95. Both faces of the refined region now carry the fine face's
-    defect, where one did; the local rates at order 4 in `D = 1` are
-    1.90, then 1.94. Recorded in CODE.md as **(open)** until Erik has
-    reviewed them. The Burgers interface-order table and its static
-    drift rows came out the same to the last digit.
+    1.95. The review continued both checkouts (this one and the
+    half-open 02bf9d1) to `N = 256` in `D = 1` and `N = 64` in `D = 2`,
+    L2 error and local rate, closed against half-open:
+
+    | `D`, order | `N = 8` | `N = 32` | finest | local rate at the finest |
+    |---|---|---|---|---|
+    | 1, 2 | 7.36e-2 / 5.43e-2 | 1.91e-2 / 1.37e-2 | 2.430e-3 / 1.724e-3 | 0.996 / 0.999 |
+    | 1, 4 | 2.96e-3 / 3.35e-3 | 2.06e-4 / 2.12e-4 | 3.331e-6 / 3.343e-6 | 1.993 / 1.998 |
+    | 2, 2 | 5.87e-2 / 3.86e-2 | 1.39e-2 / 9.46e-3 | 6.881e-3 / 4.720e-3 | 1.014 / 1.003 |
+    | 2, 4 | 3.83e-3 / 4.15e-3 | 2.58e-4 / 2.63e-4 | 6.530e-5 / 6.592e-5 | 1.981 / 1.995 |
+
+    So the order is the same and the error's size moved in opposite
+    directions: at order 2 the L2 error is `√2` larger throughout (both
+    faces of the refined region now carry the fine face's defect, where
+    one did) with the L∞ error unchanged, and at order 4 it is smaller
+    on coarse meshes and equal on fine ones, which is what lowers the
+    fit over `N = 8 … 32`. The implementation's first reading, a larger
+    constant at both orders, was wrong at order 4. Recorded in CODE.md
+    as **(open)** until Erik has reviewed them. The Burgers
+    interface-order table and its static drift rows came out the same
+    to the last digit.
   - *A ghost-free vertex-like dimension has no hook region*, so the 1D
     vertex case of the all-variables hook test takes one ghost; tests
     gated in step 2 that sized a state as `N^D` a block (the IMEX

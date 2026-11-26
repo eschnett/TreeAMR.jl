@@ -3042,13 +3042,26 @@ step 3), with the fine block evolving both of its faces at a coarse-fine
 face and the final state unified before it is measured, the same study
 gives `0.97 / 0.97 / 1.92 / 1.92` in `D = 1` and `1.04 / 1.04 / 1.95 /
 1.95` in `D = 2`, against the table's, which the half-open checkout
-reproduced the same day: both faces of the refined region now carry the
-fine face's Laplacian defect next to a prolongated ghost, where one did
-before, which raises the error's constant over `N = 8 … 32` (the local
-rates at `p = 4` in `D = 1` are 1.90, then 1.94, rising). The rows still
-come in identical pairs, and `G = 1` is still the whole requirement. The
-table takes these numbers once Erik has reviewed them; the tests assert
-the same tolerances on either.
+reproduced the same day. The order has not moved, only the fit over `N =
+8 … 32`: continued to `N = 256` in `D = 1` the local rate reaches 0.996
+at `p = 2` and 1.993 at `p = 4` (half-open: 0.999 and 1.998), and to `N =
+64` in `D = 2`, 1.014 and 1.981 (1.003 and 1.995). What moved is the
+error's size, in opposite directions:
+
+- at `p = 2`, where the interface limits the rate, the L2 error is
+  larger at every resolution, by 1.41 in `D = 1` and 1.46 in `D = 2`,
+  and the L∞ error is the same (within 1 % in `D = 1`, to five digits in
+  `D = 2`): both faces of the refined region now carry the fine face's
+  Laplacian defect next to a prolongated ghost, where one did, and two
+  equal errors are `√2` of one in L2 and no more than one in L∞;
+- at `p = 4`, where the interior limits it, the L2 error is *smaller*
+  on coarse meshes (by 12 % at `N = 8` and 3 % at `N = 32` in `D = 1`,
+  8 % and 2 % in `D = 2`) and the same within 0.4 % at `N = 256`, so the
+  fitted rate is lower because its coarse end improved.
+
+The rows still come in identical pairs, and `G = 1` is still the whole
+requirement. The table takes these numbers once Erik has reviewed them;
+the tests assert the same tolerances on either.
 
 The `+2` is the second-derivative case, `m = 2`. A flux divergence has
 `m = 1`, so a first-order-in-derivatives scheme needs `p` to exceed its
