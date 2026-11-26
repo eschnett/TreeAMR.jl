@@ -71,7 +71,7 @@ end
     @test control.drift > 1e-5 * control.scale
 end
 
-@pending 6 "Total mass is conserved to roundoff across coarse-fine faces: D=$D" for
+@testset "Total mass is conserved to roundoff across coarse-fine faces: D=$D" for
         D in (1, 2)
     # The M8b acceptance test. A sine steepens into a shock, the refined
     # region follows it, the mesh is rebuilt between chunks, and the
@@ -112,7 +112,7 @@ end
     @test control.drift > 1e-5 * control.scale
 end
 
-@pending 6 "Conservation survives Float32" begin
+@testset "Conservation survives Float32" begin
     # The bound is relative to the precision, not an absolute constant:
     # the fixup adds no arithmetic, only target ranges, so the drift is
     # still an ulp of the total mass. The control's drift, by contrast,
@@ -204,7 +204,7 @@ end
     @test leaky.linf ≈ 1.0 atol = 0.25
 end
 
-@pending 6 "A tracked shock matches the uniformly fine reference" begin
+@testset "A tracked shock matches the uniformly fine reference" begin
     # M4's claim on a conservative scheme: "tracks the shock without
     # artifacts" means the adaptive run agrees with the *uniformly finest*
     # mesh — the one at its own finest level — at fewer cells, while the

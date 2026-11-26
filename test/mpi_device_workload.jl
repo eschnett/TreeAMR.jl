@@ -576,8 +576,8 @@ function main()
     burgers_case("B2", forest_of((4, 4), 8; periodic=(true, true), centre=(1.6, 2.3));
                  G=2, ops=Operators(family=Conservative, prolongation=3, restriction=2),
                  steps=4)
-    pending_case("TP", 6)
-    pending_case("M", 6)
+    tracked_pulse_case("TP"; cycles=2, steps=3)
+    moving_blocks_case("M")
     pending_case("G2", 8)
     return nothing
 end

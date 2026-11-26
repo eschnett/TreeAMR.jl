@@ -128,7 +128,7 @@ end
     @test r.linf < 0.2
 end
 
-@pending 6 "A moving refined region tracks a propagating pulse" begin
+@testset "A moving refined region tracks a propagating pulse" begin
     # M4's claim, on the staggered layout: "without artifacts" means the
     # adaptive run matches the *uniformly finest* mesh, so a moving
     # coarse-fine interface that reflected or smeared the pulse would

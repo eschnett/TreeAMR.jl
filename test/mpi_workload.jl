@@ -1600,10 +1600,10 @@ function main()
     # `regrid_exchange_tests.jl`, and Float32x2 is the element type MPI
     # sends through a derived datatype, so it is the one that adds a code
     # path.
-    pending_case("TP", 6)
-    pending_case("BR", 6)
-    pending_case("A2", 6)
-    pending_case("M", 6)
+    tracked_pulse_case("TP"; cycles=3, steps=4)
+    burgers_regrid_case("BR"; cycles=3, steps=3)
+    adapt_case("A2")
+    moving_blocks_case("M", Float64)
     moving_blocks_case("M32x2-", Float32x2; full=false)
     # Closed blocks (M22 step 2), uniform: the vertex-centered wave in a box
     # of outer faces, its walls evolved, and on a periodic box one root
@@ -1623,7 +1623,7 @@ function main()
     # PatchPoints, and the element lattice.
     located_case("L2")
     # A rank without blocks through everything, at three ranks.
-    pending_case("E2", 6)
+    empty_rank_case("E2")
     # A rotating quadrant (M12): the vertex-centered wave in 2D, and in 3D
     # cell-centered over a reflecting low face below the plane, an octant;
     # a set that turns into itself and a pair through a fill, a regrid and

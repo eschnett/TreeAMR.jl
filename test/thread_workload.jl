@@ -132,11 +132,17 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     outer = !periodic && !all(w -> w[1] && w[2], walls)
     boundary = outer ? boundary_by_coordinates(initial) : nothing
 
-    # Flags that report a box, so the buffer dilation runs too.
+    # Flags that report a box, so the buffer dilation runs too: in cell
+    # indices, along a vertex-like dimension the cells touching the firing
+    # nodes, as `firing_boxes` reports them (M22).
+    c = staggers(fs)
     function flag(b, k)
         fired = findall(x -> abs(x) > 0.05, interiorview(fs, b, 1))
         isempty(fired) && return level(k) > 0 ? Coarsen : Keep
-        box = ntuple(d -> minimum(i -> i[d], fired):maximum(i -> i[d], fired), D)
+        box = ntuple(D) do d
+            lo, hi = minimum(i -> i[d], fired), maximum(i -> i[d], fired)
+            c[d] == 1 ? (max(1, lo - 1):min(N, hi)) : (lo:hi)
+        end
         return level(k) >= 1 ? (Keep, box) : (Refine, box)
     end
 
@@ -254,8 +260,10 @@ workload(Val(3); roots=4, N=4, G=1, ops=OPS2, periodic=true, σ=0.03, steps=6, b
 # injection, and narrows the prolongation window, so the parallel loops
 # `run_phase!` deals out are differently shaped ones. `G = 1` is what
 # order 4 needs along a stagger, which also keeps these cheap.
-pending_case("D1pv", 6)                    # it regrids
-pending_case("D2ov", 6)
+workload(Val(1); roots=8, N=8, G=1, ops=OPS4, periodic=true, σ=0.04, steps=24, buffer=3,
+         centering=vertexcentered(1))
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2))
 
 # Reflecting faces (M10): the mirrored transfers are ordinary groups in
 # the same phases, so a slice dealt out of order would show here as it
@@ -265,7 +273,8 @@ pending_case("D2ov", 6)
 # dimension, which brings in the derived upper wall row.
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          reflecting=((true, false), (true, false)), x0=0.12)
-pending_case("D2ovr", 6)
+workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
+         centering=vertexcentered(2), reflecting=((true, true), (true, true)), x0=0.12)
 
 # A rotating seam (M12): the turned transfers are ordinary groups in the
 # same phases too, but read through the axis map and the variable map,
@@ -685,6 +694,7 @@ end
 
 const OPSC = Operators(family=Conservative, prolongation=3, restriction=2)
 
-# Its face-centered fluxes on a refined mesh, regridded: M22 steps 3 and 6.
-pending_case("B1", 6)
-pending_case("B2", 6)
+burgers_workload(Val(1); roots=8, N=8, G=2, ops=OPSC, steps=40, buffer=4,
+                 threshold=0.15, width=0.2)
+burgers_workload(Val(2); roots=4, N=8, G=2, ops=OPSC, steps=24, buffer=1,
+                 threshold=0.6, width=0.08)

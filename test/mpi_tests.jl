@@ -96,8 +96,9 @@ end
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
     # What the serial reference prints while M22 is built: the cases
     # pending until a later step print one comment line each instead
-    # (`pending_case`), and the regrids left are those of M32x2-.
-    NPENDING, NREGRIDS, NUNCHANGED = 12, 8, 1
+    # (`pending_case`), and the regrids of the rotating quadrant and the
+    # half plane (Q2, QE2, H2: M22 step 7) with them, 24 regrids in all.
+    NPENDING, NREGRIDS, NUNCHANGED = 7, 20, 3
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -123,10 +124,11 @@ end
     @test count(l -> occursin(" state ", l), lines) >= 7
     @test count(l -> occursin(" filled ", l), lines) >= 13
     @test any(l -> startswith(l, "B2 conserved true"), lines)
-    # The regrid cycles (TP, BR, A2, M) and the ranks without blocks (E2)
-    # are pending until M22 step 6, and so is what they assert: BR
-    # conserved, the regrid count, A2 converged.
+    # The regrid cycles changed the mesh every time, Burgers' conserved
+    # mass through them, and both initial-data cycles converged.
     @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == NREGRIDS
+    @test "BR conserved true" in lines
+    @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
     @test count(l -> occursin(" unchanged false", l), lines) == NUNCHANGED
     # Point interpolation (step 5): every point answered, some flagged.
     @test count(startswith("I2"), lines) == 5
@@ -153,8 +155,12 @@ end
     @test words("L2 lattice")[3] == "256"
     @test words("N3 leaves")[3:4] == ["232", "3"]
     @test "# N3 largest groups 3 with messages 0" in lines
-    # The ranks without blocks (E2, M22 step 6), the rotating quadrant (Q2)
-    # and the half plane (H2, step 7) are pending.
+    # The ranks without blocks (E2): everything ran, and both initial-data
+    # cycles refined and converged.
+    @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
+              filter(startswith("E2 adapted "), lines))
+    # The rotating quadrant (Q2) and the half plane (H2, M22 step 7) and
+    # the glues (step 8) are pending.
     @test count(startswith("# pending until M22 step "), lines) == NPENDING
     # Element sets (M16): one stage, and the GLL mass conserved through
     # both regrids.
@@ -197,6 +203,10 @@ end
         @test isempty(bad)
         hashes = filter(startswith("#"), workload_lines(out))
         refused(what) = only(filter(startswith("# $what refused on"), hashes))
+        # E2's two leaves leave one of three ranks without a block, before
+        # its regrids and after them.
+        @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
+        @test "# E2 empty ranks after the regrids $(n == 3 ? 1 : 0)" in hashes
         # An element set's prolongations crossed ranks, in its one stage.
         @test all(t -> parse(Int, split(only(filter(startswith("# $t prolongations"),
                                                     hashes)))[end]) > 0,
@@ -270,7 +280,9 @@ end
         # block's children had more than one owner, in every element type.
         migrated(what) = parse.(Int, split(only(filter(startswith("# $what migrated"),
                                                      hashes)))[[4, 6, 8]])
-        @test migrated("M32x2-2.coarsen")[3] > 0     # M: M22 step 6
+        @test migrated("M4.refine")[1] > 0
+        @test migrated("M4.coarsen")[2] > 0
+        @test all(t -> migrated("$t.coarsen")[3] > 0, ("M2", "M32x2-2"))
     end
 end
 
