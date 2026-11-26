@@ -792,6 +792,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     selfimage::Vector{GRP}                       # stage P (M22): wall-plane projection
     stateselfimage::Vector{GRP}                  # stage P on a state, for `unify!`
     parities::Vector{NTuple{D,Parity}}           # stage P's parities; empty: unknown
+    axis::Any                                    # stage P's axis points, or `nothing`
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
@@ -799,7 +800,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
         forest, generation, G, centering, P, glue, operators, backend, unify,
         phase1, phase2, levels, boundaries, boundaryplan, stages, stagegroups,
         stateunify, glueplan, selfimage, stateselfimage,
-        parities) where {T,D,R,BK,GRP,BP,ST}
+        parities, axis) where {T,D,R,BK,GRP,BP,ST}
         p1 = findfirst(r -> any(i -> stages[i].tag == PHASE1_TAG, r), stagegroups)::Int
         return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, glue,
                                        operators,
@@ -807,7 +808,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
                                        boundaryplan, stages, stagegroups,
                                        group_locals(stages, stagegroups), p1,
                                        stateunify, glueplan, selfimage, stateselfimage,
-                                       parities)
+                                       parities, axis)
     end
 end
 
@@ -1368,31 +1369,33 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 # face with the coarse neighbour two levels apart, which balance forbids,
 # and that is checked. Returns `nothing` where nothing splits, the case
 # of every block but those at a concave corner of a refined region;
-# otherwise the parts as `(kind, direction, span, source)`: the
+# otherwise the parts as `(kind, direction, span, source, crossing)`: the
 # prolongation over the rest, by boxes of the tangential pieces (classes
 # 0, 1 and 2 per dimension, as spans `0:0`, `1:3` and `4:4`), and a copy
 # per piece from its holder, the direction carrying the step `s` along
-# each dimension it steps in. `δlook` is the direction the sources are
+# each dimension it steps in and the crossing the holder lies across,
+# turned across a rotating seam, where the holder is found in the
+# virtual frame as every source is. `δlook` is the direction the sources are
 # found in: `δ` itself, or a mirrored ghost's `δ′` (`mirror_sources!`).
 function ghost_plane_parts(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int},
                            δlook::NTuple{D,Int}, c::NTuple{D,Int}, coarse::Int) where {D}
     tdims = [d for d in 1:D if δ[d] == 0 && c[d] == 1]
     isempty(tdims) && return nothing
     l = level(k)
-    found = Dict{NTuple{D,Int},Union{Nothing,Tuple{Int,Int}}}()
+    found = Dict{NTuple{D,Int},Union{Nothing,Tuple{Int,Int,Crossing}}}()
     function holder(dir)
         get!(found, dir) do
             crossing, nbrs = oriented_neighbors(forest, k, dir)
             isempty(nbrs) && return nothing
-            crossing.turns == 0 && crossing.glue == 0 || error(
-                "a ghost's face-plane row across a rotating seam or a glue asked for; " *
-                "GhostSchedule refuses those until M22 steps 7 and 8, so this is a bug")
+            crossing.glue == 0 || error(
+                "a ghost's face-plane row across a glue asked for; GhostSchedule refuses " *
+                "glues until M22 step 8, so this is a bug")
             lv = level(first(nbrs))
             lv > l && error(
                 "the ghost of $k in direction $δ has a face-plane row held by a finer " *
                 "block across $dir than the block itself, next to a coarser neighbour " *
                 "across $δ; 2:1 balance forbids that, so this is a bug")
-            return (lv, find_leaf(forest, first(nbrs)))
+            return (lv, find_leaf(forest, first(nbrs)), crossing)
         end
     end
     pieces = vec(collect(Iterators.product(ntuple(_ -> 0:2, length(tdims))...)))
@@ -1410,17 +1413,17 @@ function ghost_plane_parts(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}
             end
             h = holder(dir)
             h === nothing && continue
-            lv, j = h
+            lv, j, via = h
             j == coarse && continue
-            lv == l && best === nothing && (best = (m, j))
+            lv == l && best === nothing && (best = (m, j, via))
         end
         best === nothing && return nothing
-        m, j = best
+        m, j, via = best
         dir = δ
         for (i, (d, s)) in enumerate(plane)
             (m >> (i - 1)) & 1 == 1 && (dir = Base.setindex(dir, s, d))
         end
-        return (dir, j)
+        return (dir, j, via)
     end
     all(isnothing, sources) && return nothing
     code(cls) = cls == 0 ? span_code(0, 0) : cls == 1 ? span_code(1, 3) : span_code(4, 4)
@@ -1428,7 +1431,7 @@ function ghost_plane_parts(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}
         i = findfirst(==(d), tdims)
         i === nothing ? Int8(-1) : code(cls[i])
     end
-    parts = Tuple{Symbol,NTuple{D,Int},NTuple{D,Int8},Int}[]
+    parts = Tuple{Symbol,NTuple{D,Int},NTuple{D,Int8},Int,Union{Nothing,Crossing}}[]
     rest = [cls for (cls, s) in zip(pieces, sources) if s === nothing]
     if !isempty(rest)
         lo = ntuple(i -> minimum(p -> p[i], rest), length(tdims))
@@ -1440,16 +1443,16 @@ function ghost_plane_parts(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int}
                 i = findfirst(==(d), tdims)
                 i === nothing ? Int8(-1) : span_code(first_sub(lo[i]), last_sub(hi[i]))
             end
-            push!(parts, (:prolong, δ, span, coarse))
+            push!(parts, (:prolong, δ, span, coarse, nothing))
         else
             for cls in rest
-                push!(parts, (:prolong, δ, spanof(cls), coarse))
+                push!(parts, (:prolong, δ, spanof(cls), coarse, nothing))
             end
         end
     end
     for (cls, s) in zip(pieces, sources)
         s === nothing && continue
-        push!(parts, (:copy, s[1], spanof(cls), s[2]))
+        push!(parts, (:copy, s[1], spanof(cls), s[2], s[3]))
     end
     return parts
 end
@@ -1523,10 +1526,10 @@ function block_sources!(pairs::TransferPairs{D},
             if parts === nothing
                 record!(:prolong, childoffset(k), level(k), src, crossing)
             else
-                for (kind, dir, span, s) in parts
+                for (kind, dir, span, s, via) in parts
                     kind === :prolong ?
                         record!(:prolong, childoffset(k), level(k), s, crossing; span=span) :
-                        record!(:copy, zerooffset, 0, s, crossing; dir=dir, span=span)
+                        record!(:copy, zerooffset, 0, s, via; dir=dir, span=span)
                 end
             end
         else
@@ -1621,15 +1624,21 @@ piece_representative(cls::NTuple{D,Int}, c::NTuple{D,Int}) where {D} =
     ntuple(d -> c[d] == 0 ? 1 : 2 * cls[d], D)
 
 # Every copy of the sub-piece `sub` of global leaf `j` (staggers `c`) on
-# `j`'s level or a finer one, as `(level, leaf, class, direction, offset)`:
-# the leaf holding it, at which piece of its own, the direction from `j`
-# to it, and, for a finer leaf, its child offset in its parent (what a
-# restriction from it is keyed by); `j`'s own copy first. On `j`'s level
-# the copies are the neighbours across the faces the sub-piece lies on,
-# the class flipped along each step; on the finer level the children
-# across, chosen along each dimension the step leaves alone by which half
-# the sub-piece lies in, both at the mid-plane. A coarser neighbour's copy
-# never wins, and is left out.
+# `j`'s level or a finer one, as `(level, leaf, class, direction, offset,
+# orientation, position)`: the leaf holding it, at which piece of its own,
+# in that leaf's own frame, the direction from `j` to it, and, for a finer
+# leaf, its child offset in its parent as `j` sees it (what a restriction
+# from it is keyed by), the orientation it lies in across a rotating seam
+# (0 off it), and the real position of the sub-piece's midpoint in that
+# leaf (`real_position`); `j`'s own copy first. On `j`'s level the copies
+# are the neighbours across the faces the sub-piece lies on, the class
+# flipped along each step; on the finer level the children across, chosen
+# along each dimension the step leaves alone by which half the sub-piece
+# lies in, both at the mid-plane. A coarser neighbour's copy never wins,
+# and is left out. Across a seam the neighbours are found in the virtual
+# frame, where the asking block sees them, and their classes and positions
+# taken back into the real one, so that every block holding a point
+# decides its primary from the same real copies.
 piece_copies(forest::Forest{D}, j::Int, sub::NTuple{D,Int}, c::NTuple{D,Int}) where {D} =
     piece_copies(NeighbourTable(forest, j), sub, c)
 
@@ -1637,9 +1646,10 @@ piece_copies(forest::Forest{D}, j::Int, sub::NTuple{D,Int}, c::NTuple{D,Int}) wh
 # block: a block's sub-pieces, up to `5^D`, step in at most `3^D - 1`
 # directions, and each lookup searches the tree. Filled lazily, so that a
 # direction no sub-piece steps in is never searched. An entry is the
-# neighbours' level, `-1` across an outer face, and each one's global leaf
-# and child offset.
-const NeighbourEntry{D} = Tuple{Int,Vector{Tuple{Int,NTuple{D,Int}}}}
+# neighbours' level, `-1` across an outer face, and each one's global
+# leaf, child offset as the asking block sees it (`seam_offset`) and
+# orientation across a rotating seam.
+const NeighbourEntry{D} = Tuple{Int,Vector{Tuple{Int,NTuple{D,Int},Int}}}
 
 struct NeighbourTable{D,F<:Forest{D}}
     forest::F
@@ -1659,13 +1669,13 @@ function neighbours(t::NeighbourTable{D}, δ::NTuple{D,Int}) where {D}
     if isempty(nbrs)                                # an outer face
         e = (-1, Tuple{Int,NTuple{D,Int}}[])
     else
-        crossing.turns == 0 && crossing.glue == 0 || error(
-            "a copy of a point across a rotating seam or a glue asked for; those come " *
-            "back in M22 steps 7 and 8, and GhostSchedule refuses them until then, so " *
-            "this is a bug")
+        crossing.glue == 0 || error(
+            "a copy of a point across a glue asked for; glues come back in M22 step 8, " *
+            "and GhostSchedule refuses them until then, so this is a bug")
         e = (level(first(nbrs)),
-             Tuple{Int,NTuple{D,Int}}[(find_leaf(t.forest, nbr), childoffset(nbr))
-                                      for nbr in nbrs])
+             Tuple{Int,NTuple{D,Int},Int}[(find_leaf(t.forest, nbr),
+                                           seam_offset(t.forest, nbr, crossing),
+                                           Int(crossing.turns)) for nbr in nbrs])
     end
     t.entries[i] = e
     return e
@@ -1685,8 +1695,9 @@ function piece_copies(t::NeighbourTable{D}, sub::NTuple{D,Int},
                       c::NTuple{D,Int}) where {D}
     zero = ntuple(_ -> 0, D)
     cls = piece_of(sub)
-    copies = Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int}}[
-        (t.level, t.j, cls, zero, zero)]
+    forest = t.forest
+    vpos = subpiece_position(forest, forest.leaves[t.j], sub)
+    copies = PieceCopy{D}[(t.level, t.j, cls, zero, zero, 0, vpos)]
     # The steps across the faces the sub-piece lies on, every nonempty
     # subset of them, dimension 1 varying fastest; counted in binary
     # rather than as a product of unequal tuples, which does not infer.
@@ -1699,10 +1710,12 @@ function piece_copies(t::NeighbourTable{D}, sub::NTuple{D,Int},
         across = ntuple(d -> δ[d] == 0 ? cls[d] : 2 - cls[d], D)
         lvl < t.level && continue                   # coarser: never the primary
         if lvl == t.level
-            push!(copies, (lvl, first(only(nbrs)), across, δ, zero))
+            leaf, _, r = only(nbrs)
+            push!(copies, (lvl, leaf, real_classes(forest, across, r), δ, zero, r,
+                           real_position(forest, vpos, r, t.level)))
             continue
         end
-        for (leaf, o) in nbrs
+        for (leaf, o, r) in nbrs
             # Along a dimension the step leaves alone the child holds the
             # sub-piece when it lies in the child's half, the mid-plane in
             # both; its class there is the sub-class seen from that half.
@@ -1715,15 +1728,64 @@ function piece_copies(t::NeighbourTable{D}, sub::NTuple{D,Int},
                 sub[d] == 2 && return o[d] == 0 ? 2 : 0
                 return sub[d] == 0 || sub[d] == 4 ? cls[d] : 1
             end
-            push!(copies, (lvl, leaf, fcls, δ, o))
+            push!(copies, (lvl, leaf, real_classes(forest, fcls, r), δ, o, r,
+                           real_position(forest, vpos, r, t.level)))
         end
     end
     return copies
 end
 
-# The primary among `piece_copies`: the finest level, then the greatest
-# class tuple.
-piece_primary(copies) = argmin(x -> (-x[1], map(-, x[3])), copies)
+const PieceCopy{D} =
+    Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int},Int,NTuple{D,Int}}
+
+# The midpoint of sub-piece `sub` of leaf `k`, in global coordinates at
+# `k`'s level in units of a quarter of a block's edge (`N/4` cells): a
+# sub-class is a multiple of the quarter, 0 the low face plane, 2 the
+# mid-plane, 4 the high face plane, 1 and 3 the halves between. Exact,
+# and the same for every leaf of the level, so that two copies' positions
+# compare as their points do.
+function subpiece_position(forest::Forest{D}, k::MortonKey{D},
+                           sub::NTuple{D,Int}) where {D}
+    lvl = level(k)
+    rootpos = root_position(forest.roots, k.root)
+    return ntuple(d -> 4 * ((rootpos[d] << lvl) + Int(k.coords[d])) + sub[d], D)
+end
+
+# The real position of a point at virtual position `p` (`subpiece_position`
+# units, at level `lvl`) in orientation `r` across a rotating seam: the
+# naive point mapped back as the seam's tables map a naive node (`r = 1`
+# takes `(a, b)` along `(d1, d2)` to `(b, -a)`, `r = 3` to `(-b, a)`, `r =
+# 2` to `(-a, -b)`, a half turn's `r = 2` to `(-a, L - b)` with `L` the
+# extent of `d2`). Copies off the seam keep the asking block's position,
+# so they compare equal, a periodic wrap included: only the turn tells
+# the members of an orbit apart.
+function real_position(forest::Forest{D}, p::NTuple{D,Int}, r::Int,
+                       lvl::Int) where {D}
+    r == 0 && return p
+    d1, d2 = seam_plane(forest)
+    a, b = p[d1], p[d2]
+    a2, b2 = r == 1 ? (b, -a) : r == 3 ? (-b, a) :
+             ishalfturn(forest) ? (-a, 4 * (forest.roots[d2] << lvl) - b) : (-a, -b)
+    return Base.setindex(Base.setindex(p, a2, d1), b2, d2)
+end
+
+# A piece's classes `cls` seen in the virtual frame of orientation `r`,
+# taken into the real leaf's own frame: classes turn as positions do
+# (`real_position`), a class `x` along a reversed axis becoming `2 - x`.
+function real_classes(forest::Forest{D}, cls::NTuple{D,Int}, r::Int) where {D}
+    r == 0 && return cls
+    d1, d2 = seam_plane(forest)
+    a, b = cls[d1], cls[d2]
+    a2, b2 = r == 1 ? (b, 2 - a) : r == 3 ? (2 - b, a) : (2 - a, 2 - b)
+    return Base.setindex(Base.setindex(cls, a2, d1), b2, d2)
+end
+
+# The primary among `piece_copies` (M22 rules 1 and 2): the finest level;
+# there the copy at the lexicographically greatest real position, which
+# picks one member of a seam point's orbit (the point and its images
+# under the turn) and is no choice at all off a seam, where every copy is
+# at one position; then the greatest class tuple in the copy's own frame.
+piece_primary(copies) = argmin(x -> (-x[1], map(-, x[7]), map(-, x[3])), copies)
 
 # One bit per piece of global leaf `j`'s closed box, set where its copy is
 # the primary, for a set of staggers `c`: decided at one sub-piece of each
@@ -1746,28 +1808,32 @@ end
 # says, and keyed by the spans each writes.
 function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
                         b::Int) where {D}
-    entries = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int}}[]
+    entries = StageEntry{D}[]
     lvl = level(forest.leaves[b])
     t = NeighbourTable(forest, b)
     # Without a finer neighbour a piece's sub-pieces share its primary,
     # decided once a piece.
     bypiece = !hasfiner(t, c)
-    cache = Dict{NTuple{D,Int},Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int}}}()
+    cache = Dict{NTuple{D,Int},PieceCopy{D}}()
     for sub in closed_subpieces(c, forest.N)
         all(==(1), piece_of(sub)) && continue       # the open interior: no copies
-        slvl, s, scls, δ, o = bypiece ?
+        slvl, s, scls, δ, o, r, _ = bypiece ?
             get!(() -> piece_primary(piece_copies(t, sub, c)), cache, piece_of(sub)) :
             piece_primary(piece_copies(t, sub, c))
         s == b && scls == piece_of(sub) && continue
-        push!(entries, (sub, slvl == lvl ? :copy : :restrict, s, δ, o))
+        push!(entries, (sub, slvl == lvl ? :copy : :restrict, s, δ, o, r))
     end
-    for (kind, s, δ, o, spans) in merged_transfers(entries,
-                                                   closed_subpieces(c, forest.N).iterators)
-        key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(0), Int8(0), spans)
+    for (kind, s, δ, o, r, spans) in merged_transfers(entries,
+                                                      closed_subpieces(c, forest.N).iterators)
+        key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(r), Int8(0), spans)
         push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
     end
     return nothing
 end
+
+# A secondary sub-piece's source, as `merged_transfers` takes it:
+# `(sub-piece, kind, source, direction, offset, orientation)`.
+const StageEntry{D} = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int},Int}
 
 # Stage 0's merging policy, the one place it is decided: the transfers,
 # as `(kind, source, direction, offset, spans)`, that write one target's
@@ -1785,15 +1851,14 @@ end
 # piece facing finer blocks takes one transfer a child, with spans that do
 # not depend on what lies around it. Sorted, so that the transfers follow
 # no `Dict` order.
-function merged_transfers(entries::Vector{Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},
-                                                NTuple{D,Int}}}, allowed) where {D}
-    bysource = Dict{Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int}},Vector{NTuple{D,Int}}}()
-    for (sub, kind, s, δ, o) in entries
-        push!(get!(bysource, (kindrank(kind), s, δ, o), NTuple{D,Int}[]), sub)
+function merged_transfers(entries::Vector{StageEntry{D}}, allowed) where {D}
+    bysource = Dict{Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},Int},Vector{NTuple{D,Int}}}()
+    for (sub, kind, s, δ, o, r) in entries
+        push!(get!(bysource, (kindrank(kind), s, δ, o, r), NTuple{D,Int}[]), sub)
     end
-    out = Tuple{Symbol,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int8}}[]
+    out = Tuple{Symbol,Int,NTuple{D,Int},NTuple{D,Int},Int,NTuple{D,Int8}}[]
     for g in sort!(collect(keys(bysource)))
-        rank, s, δ, o = g
+        rank, s, δ, o, r = g
         kind = rank == kindrank(:copy) ? :copy : :restrict
         subs = unique(bysource[g])
         spans = kind === :copy ? box_spans(subs, allowed) : nothing
@@ -1803,18 +1868,19 @@ function merged_transfers(entries::Vector{Tuple{NTuple{D,Int},Symbol,Int,NTuple{
                 spans = box_spans(part, allowed)
                 if spans === nothing
                     for p in part
-                        push!(out, (kind, s, δ, o, map(x -> span_code(x, x), p)))
+                        push!(out, (kind, s, δ, o, r, map(x -> span_code(x, x), p)))
                     end
                 else
-                    push!(out, (kind, s, δ, o, spans))
+                    push!(out, (kind, s, δ, o, r, spans))
                 end
             end
         else
-            push!(out, (kind, s, δ, o, spans))
+            push!(out, (kind, s, δ, o, r, spans))
         end
     end
     return out
 end
+
 
 # The span codes of the bounding box of the distinct sub-pieces `subs`
 # where they fill it, or `nothing`.
@@ -1966,10 +2032,10 @@ function mirror_sources!(pairs::TransferPairs{D},
         if parts === nothing
             record!(:prolong, childoffset(k), level(k), src, crossing)
         else
-            for (kind, dir, span, s) in parts
+            for (kind, dir, span, s, via) in parts
                 kind === :prolong ?
                     record!(:prolong, childoffset(k), level(k), s, crossing; span=span) :
-                    record!(:copy, zerooffset, 0, s, crossing; dir=dir, span=span)
+                    record!(:copy, zerooffset, 0, s, via; dir=dir, span=span)
             end
         end
     else
@@ -2318,6 +2384,65 @@ function selfimage_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTupl
         end
     end
     return nothing
+end
+
+# The points of a rotating seam's axis on this rank's blocks (M22 rule 3):
+# the axis is its own image under the turn, so each variable there is
+# the mean of its images under the orbit's powers of the set's map,
+# `¼ Σ_r Q^r u` for a quarter turn and `½ (u + Q u)` for a half turn, a
+# turned vector's in-plane components zero and a tensor's mixed. Taken at
+# the primaries only, as stored points `points` of local blocks `blocks`,
+# and as the same points of a state, `statepoints`; stage 0 carries the
+# result to the other copies. `orbit` is 4 or 2, the orientations of the
+# images `0:3`, or `0` and `2`, the half turn's.
+struct AxisPoints{VB,VP}
+    blocks::VB
+    points::VP
+    statepoints::VP
+    orbit::Int
+end
+
+# A forest's axis points for a set of ghost widths `G` and staggers `c`,
+# or `nothing` where it has none: the axis needs a vertex-like `d1` and
+# `d2`, and lies on the blocks at the low corner of the plane under a
+# quarter turn, and on those at the low face of `d1` that meet the centre
+# plane of `d2` under a half turn. A block's axis pieces count where the
+# block's copy is the primary (`primary_bits`).
+function axis_points(forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
+                     backend) where {D}
+    d1, d2 = seam_plane(forest)
+    c[d1] == 1 && c[d2] == 1 || return nothing
+    half = ishalfturn(forest)
+    N = forest.N
+    blocks = Int32[]
+    points = NTuple{D,Int32}[]
+    statepoints = NTuple{D,Int32}[]
+    range = blockrange(forest)
+    for b in eachindex(range)
+        j = first(range) + b - 1
+        k = forest.leaves[j]
+        lvl = level(k)
+        rootpos = root_position(forest.roots, k.root)
+        g = ntuple(d -> (rootpos[d] << lvl) + Int(k.coords[d]), D)
+        g[d1] == 0 || continue
+        n2 = forest.roots[d2] << lvl
+        cls2 = !half ? (g[d2] == 0 ? 0 : -1) :
+               g[d2] == n2 ÷ 2 ? 0 : g[d2] + 1 == n2 ÷ 2 ? 2 : -1
+        cls2 < 0 && continue
+        bits = primary_bits(forest, j, c)
+        for cls in closed_pieces(c)
+            cls[d1] == 0 && cls[d2] == cls2 || continue
+            (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+            rng = ntuple(d -> piece_range(N, G[d], c[d], piece_span(cls[d])), D)
+            for I in CartesianIndices(rng)
+                push!(blocks, Int32(b))
+                push!(points, ntuple(d -> Int32(I[d]), D))
+                push!(statepoints, ntuple(d -> Int32(I[d] - G[d]), D))
+            end
+        end
+    end
+    return AxisPoints(todevice(backend, blocks), todevice(backend, points),
+                      todevice(backend, statepoints), half ? 2 : 4)
 end
 
 # The parities a schedule built from `fs` takes for stage P: the set's over
@@ -2714,9 +2839,6 @@ function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol},
     why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
           "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
           "(\"Closed blocks\" in CODE.md)"
-    (hasrotating(forest) || ishalfturn(forest)) && throw(ArgumentError(
-        "$what: the forest has a rotating seam, which is refused for $why: quarter " *
-        "and half turns, and so a RotationPair, come back in M22 step 7."))
     ispatched(forest) && has_glue(forest.conn) && throw(ArgumentError(
         "$what: the forest is a forest of patches with a glued face, which is " *
         "refused for $why: glues come back in M22 step 8."))
@@ -2933,10 +3055,14 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     selfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol, axesof)
     stateselfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol,
                                       axesof; ghosts=ghosts)
+    # Stage P on a rotating seam's axis (M22 rule 3), behind a barrier, so
+    # that a forest without an axis compiles none of it.
+    axis = closed && hasrotating(forest) ?
+           Base.inferencebarrier(axis_points)(forest, ghosts, stags, backend) : nothing
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, order, glue, operators,
         backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups,
-        stateunify, glueplan, selfimage, stateselfimage, parity)
+        stateunify, glueplan, selfimage, stateselfimage, parity, axis)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

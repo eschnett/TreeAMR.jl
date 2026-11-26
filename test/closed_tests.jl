@@ -1028,14 +1028,10 @@ end
     vs = FieldSet(uniform, 1; G=1, centering=vertexcentered(2))
     # A regrid of a vertex-like set is back (M22 step 6): a mesh kept as it is.
     @test !regrid!(uniform, vs => GhostSchedule(vs, ops); flags=fill(Keep, 4))
+    # Seams are back (M22 step 7): a quadrant's vertex set fills.
     quad = Forest((2, 2); N=8, rotating=(1, 2))
-    @test_throws "M22 step 7" firing_boxes((w, i, b, x) -> true,
-                                           FieldSet(quad, 1; G=1,
-                                                    centering=vertexcentered(2),
-                                                    rotation=(1,)))
-    @test_throws "M22 step 7" GhostSchedule(FieldSet(quad, 1; G=1,
-                                                     centering=vertexcentered(2),
-                                                     rotation=(1,)), ops)
+    @test GhostSchedule(FieldSet(quad, 1; G=1, centering=vertexcentered(2), rotation=(1,)),
+                        ops) isa GhostSchedule
     # `walls` is gone (M22 step 4): every wall is symmetric on closed blocks.
     @test_throws MethodError FieldSet(uniform, 1; G=1, centering=vertexcentered(2),
                                       walls=:symmetric)
@@ -1182,7 +1178,8 @@ end
             n = nleaves(forest)
             kp = TreeAMR.regrid_kept_pairs(TreeAMR.leaves_view(forest, forest.leaves),
                                            oldleaves, forest.leaves, staggers(fs))
-            ncross += count(((t, s),) -> equalsplit_part(length(oldleaves), P, Int(s)) !=
+            # The pass reads the new arrays: a source's owner is its new one.
+            ncross += count(((t, s),) -> equalsplit_part(n, P, Int(s)) !=
                                          equalsplit_part(n, P, Int(t)),
                             [(t, s) for (ts, ss) in values(kp) for (t, s) in zip(ts, ss)])
             comms = gather_ranks(P)

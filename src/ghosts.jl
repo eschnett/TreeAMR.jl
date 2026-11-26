@@ -596,6 +596,78 @@ run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
     run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors,
                rotvars=fs.rotvars)
 
+# --- Stage P on a rotating seam's axis (M22) -------------------------------
+#
+# A point on the axis is its own image under the turn, so each of its
+# variables becomes the mean of its images under the orbit's powers of the
+# set's map (`AxisPoints`): read through the same tables as a turned
+# transfer, `rotvars[v, r + 1]` and the sign at column `1 + 3^D·r`, but
+# summed over the orbit. Every other transfer writes a variable from one
+# source variable, so one kernel serves them all; this one writes a
+# variable from several, which an in-place transfer would race on between
+# the variables of a point, so it gathers into a buffer first and writes
+# second, the one kernel of the fill that is not `transfer_kernel!`. It
+# sits behind a barrier, so that a forest without an axis compiles none
+# of it, and runs only for a set whose map turns some variable, where the
+# mean is not the identity.
+@kernel function axis_gather_kernel!(buf, @Const(src), @Const(blocks), @Const(points),
+                                     @Const(factors), @Const(rotvars), orbit::Int,
+                                     ncol::Int)
+    i, v = @index(Global, NTuple)
+    @inbounds begin
+        b = Int(blocks[i])
+        p = points[i]
+        term(r) = factors[v, 1 + ncol * r] * src[p..., r == 0 ? v : Int(rotvars[v, r + 1]),
+                                                b]
+        # Summed in pairs a half turn apart, `(t₀ + t₂) + (t₁ + t₃)`: a
+        # component the half turn negates cancels exactly within its pair,
+        # and the images of one variable sum the same pairs in swapped
+        # order, which addition does not see, so the projection is exact
+        # under the map and idempotent bit for bit.
+        acc = term(0) + term(2)
+        orbit == 4 && (acc += term(1) + term(3))
+        buf[i, v] = acc / orbit
+    end
+end
+
+@kernel function axis_write_kernel!(dest, @Const(buf), @Const(blocks), @Const(points))
+    i, v = @index(Global, NTuple)
+    @inbounds dest[points[i]..., v, Int(blocks[i])] = buf[i, v]
+end
+
+# Project the axis points of `axis` in `A`, a working array or, with
+# `state`, a state-shaped one.
+function axis_project!(A::AbstractArray{T}, axis::AxisPoints, nvars::Integer, factors,
+                       rotvars, backend; state::Bool=false) where {T}
+    n = length(axis.blocks)
+    n == 0 && return nothing
+    points = state ? axis.statepoints : axis.points
+    buf = allocate(backend, T, (n, Int(nvars)))
+    ncol = 3^(ndims(A) - 2)
+    axis_gather_kernel!(backend)(buf, A, axis.blocks, points, factors, rotvars,
+                                 axis.orbit, ncol; ndrange=(n, Int(nvars)))
+    axis_write_kernel!(backend)(A, buf, axis.blocks, points; ndrange=(n, Int(nvars)))
+    synchronize(backend)
+    return nothing
+end
+
+# Whether `fs`'s map across its forest's seam turns any variable: where it
+# does not, the axis projection is the identity and is not launched.
+function turns_variables(fs::FieldSet)
+    map = ishalfturn(fs.forest) ? fs.halfturn : fs.rotation
+    return map !== nothing && map != 1:fs.nvars
+end
+
+# Stage P's axis part on `A` (`fs`'s working array, or a state with
+# `state`), for a schedule's axis points `axis`.
+function run_axis!(A, fs::FieldSet, axis, backend; state::Bool=false)
+    axis === nothing && return nothing
+    turns_variables(fs) || return nothing
+    Base.inferencebarrier(axis_project!)(A, axis, fs.nvars, fs.factors, fs.rotvars,
+                                         backend; state=state)
+    return nothing
+end
+
 # --- Stages (M7) -----------------------------------------------------------
 #
 # The driver of a staged exchange. Every ordering point of the serial
@@ -939,6 +1011,8 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     # image, projected onto its parity, at the primaries, after stage W so
     # that a prescribed value there is projected too.
     isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
+    # And a rotating seam's axis, its own image under the turn.
+    run_axis!(fs.work, fs, schedule.axis, backend)
     # Stage 0 (M22): every secondary copy of a shared point from its
     # primary, which no transfer of the stage writes; before anything
     # reads a copy.
@@ -1613,15 +1687,7 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     # dimension of the plane — every block on a seam face then has a
     # region beyond it — which is a property of the layout, the same on
     # every rank.
-    if hasrotating(fs.forest) && !symmetric_layout(fs) && seam_ghosts(fs)
-        throw(ArgumentError(
-            "this field set's layout is not symmetric in the rotating seam's " *
-            "dimensions $(rotating_dims(fs.forest)) (G = $(fs.G), centering " *
-            "$(fs.centering)), so its ghosts across the seam are a quarter turn of " *
-            "another set's data, which a fill of this set alone does not have. Fill " *
-            "it as a RotationPair with the set of the exchanged layout: " *
-            "`fill_ghosts!(RotationPair(a, b), (schedule_a, schedule_b))`."))
-    end
+    check_unpartnered(fs, "fill_ghosts!")
     return exchange_ghosts!(fs, schedule, boundary, backend)
 end
 
@@ -1667,24 +1733,15 @@ fill is.
 """
 function unify!(fs::FieldSet, schedule::GhostSchedule)
     backend = check_fill(fs, schedule)
-    isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
-    p1 = schedule.phase1group
-    forest = schedule.forest
-    sends = nothing
-    for k in 1:(p1 - 1)
-        sends = run_stages!(fs, schedule.stages, schedule.stagegroups[k],
-                            schedule.grouplocals[k], forest, backend, sends)
-    end
-    sends === nothing || waitall(forest.comm, sends)
+    check_unpartnered(fs, "unify!")
+    unify_arrays!(fs.work, fs.work, fs, fs.factors, fs.rotvars, schedule, backend)
     return fs
 end
 
 function unify!(fs::FieldSet, schedule::UnifySchedule)
     backend = check_unify(fs, schedule)
-    isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
-    forest = schedule.forest
-    sends = run_stages!(fs, schedule.stages, 1:1, schedule.unify, forest, backend, nothing)
-    sends === nothing || waitall(forest.comm, sends)
+    check_unpartnered(fs, "unify!")
+    unify_arrays!(fs.work, fs.work, fs, fs.factors, fs.rotvars, schedule, backend)
     return fs
 end
 
@@ -1692,17 +1749,112 @@ function unify!(v::AbstractVector, fs::FieldSet,
                 schedule::Union{GhostSchedule,UnifySchedule})
     backend = schedule isa GhostSchedule ? check_fill(fs, schedule) :
               check_unify(fs, schedule)
-    stages = schedule.stateunify
-    isempty(stages) && return v
+    check_unpartnered(fs, "unify!")
     A = statearray(v, fs)
-    forest = schedule.forest
-    isempty(schedule.stateselfimage) ||
-        run_phase!(A, A, schedule.stateselfimage, fs.nvars, backend; factors=fs.factors,
-                   rotvars=fs.rotvars)
-    sends = run_stages!(A, A, fs.nvars, fs.factors, stages, 1:1, stages[1].locals, forest,
-                        backend, nothing, A, fs.rotvars)
-    sends === nothing || waitall(forest.comm, sends)
+    unify_arrays!(A, A, fs, fs.factors, fs.rotvars, schedule, backend; state=true)
     return v
+end
+
+# Stages P and 0 of `schedule` on `A`, `fs`'s working array or, with
+# `state`, a state-shaped one, through the tables `factors` and `rotvars`,
+# a turned transfer of odd orientation reading `alt`: the set's own array,
+# or a `RotationPair`'s partner's (M12).
+function unify_arrays!(A, alt, fs::FieldSet, factors, rotvars, schedule, backend;
+                       state::Bool=false)
+    selfimage = state ? schedule.stateselfimage : schedule.selfimage
+    isempty(selfimage) ||
+        run_phase!(A, A, selfimage, fs.nvars, backend; factors=factors, rotvars=rotvars)
+    run_axis!(A, fs, schedule.axis, backend; state=state)
+    forest = schedule.forest
+    sends = nothing
+    if state
+        stages = schedule.stateunify
+        isempty(stages) && return nothing
+        sends = run_stages!(A, A, fs.nvars, factors, stages, 1:1, stages[1].locals, forest,
+                            backend, nothing, alt, rotvars)
+    elseif schedule isa GhostSchedule
+        for k in 1:(schedule.phase1group - 1)
+            sends = run_stages!(A, A, fs.nvars, factors, schedule.stages,
+                                schedule.stagegroups[k], schedule.grouplocals[k], forest,
+                                backend, sends, alt, rotvars)
+        end
+    else
+        sends = run_stages!(A, A, fs.nvars, factors, schedule.stages, 1:1, schedule.unify,
+                            forest, backend, nothing, alt, rotvars)
+    end
+    sends === nothing || waitall(forest.comm, sends)
+    return nothing
+end
+
+"""
+    unify!(pair::RotationPair, (schedule_a, schedule_b))
+    unify!(v::AbstractVector, pair::RotationPair, (schedule_a, schedule_b))
+
+`unify!` for the two sets of a [`RotationPair`](@ref): a member's copies of
+a point on its seam plane are its partner's turned (M22 rule 2), and the
+primary among them may be the partner's, so the two are unified
+together, `a`'s stage 0 and then `b`'s, each reading the other through
+the pair's tables. The second form unifies a state-shaped vector of the
+two sets, laid out as [`stateview`](@ref) lays out `(a, b)`.
+"""
+function unify!(pair::RotationPair, schedules::Tuple)
+    a, b = pair.a, pair.b
+    sa, sb = check_pair_unify(pair, schedules)
+    backend = get_backend(a.work)
+    unify_arrays!(a.work, b.work, a, pair.afactors, pair.arotvars, sa, backend)
+    unify_arrays!(b.work, a.work, b, pair.bfactors, pair.brotvars, sb, backend)
+    return pair
+end
+
+function unify!(v::AbstractVector, pair::RotationPair, schedules::Tuple)
+    a, b = pair.a, pair.b
+    sa, sb = check_pair_unify(pair, schedules)
+    check_statelength(v, (a, b))
+    backend = get_backend(a.work)
+    A = statearray(stateview(v, (a, b), 1), a)
+    B = statearray(stateview(v, (a, b), 2), b)
+    unify_arrays!(A, B, a, pair.afactors, pair.arotvars, sa, backend; state=true)
+    unify_arrays!(B, A, b, pair.bfactors, pair.brotvars, sb, backend; state=true)
+    return v
+end
+
+function check_pair_unify(pair::RotationPair, schedules::Tuple)
+    length(schedules) == 2 || throw(ArgumentError(
+        "unify! of a RotationPair takes a tuple of two schedules, one per set; got " *
+        "$(length(schedules))"))
+    sa, sb = schedules
+    for (fs, s) in ((pair.a, sa), (pair.b, sb))
+        s isa GhostSchedule ? check_fill(fs, s) : s isa UnifySchedule ? check_unify(fs, s) :
+        throw(ArgumentError("unify! takes a GhostSchedule or a UnifySchedule per set; " *
+                            "got $(typeof(s))"))
+    end
+    return sa, sb
+end
+
+# A set whose layout is not symmetric in a rotating seam's plane has its
+# copies of the seam plane's points in its partner, turned (M22 rule 2),
+# when it has a vertex-like dimension of the plane, and its ghosts across
+# the seam there when it has ghosts along one (M12): either way it is
+# filled and unified as a `RotationPair`. Decided from the layout, the same
+# on every rank.
+function seam_partnered(fs::FieldSet)
+    hasrotating(fs.forest) && !ishalfturn(fs.forest) || return false
+    symmetric_layout(fs) && return false
+    d1, d2 = rotating_dims(fs.forest)
+    c = staggers(fs)
+    return seam_ghosts(fs) || c[d1] == 1 || c[d2] == 1
+end
+
+function check_unpartnered(fs::FieldSet, what::AbstractString)
+    seam_partnered(fs) || return nothing
+    throw(ArgumentError(
+        "this field set's layout is not symmetric in the rotating seam's dimensions " *
+        "$(rotating_dims(fs.forest)) (G = $(fs.G), centering $(fs.centering)), so its " *
+        "copies of the seam's points, or its ghosts across the seam, are a quarter " *
+        "turn of another set's data, which $what of this set alone does not have. " *
+        "$(what == "unify!" ? "Unify" : "Fill") it as a RotationPair with the set of " *
+        "the exchanged layout: " *
+        "`$what(RotationPair(a, b), (schedule_a, schedule_b))`."))
 end
 
 function unify!(sets::Tuple{Vararg{FieldSet}}, schedules::Tuple)
@@ -1850,9 +2002,10 @@ function fill_ghosts!(pair::RotationPair, schedules::Tuple{GhostSchedule,GhostSc
 end
 
 # The paired fill (M12), once its checks have passed: the two schedules'
-# stages merged by (stage, member). Phase 1 of `a` and then of `b`, then
-# the two hooks, then each phase-2 target level of `a` and then of `b`,
-# a stage that only one member has running alone. A rotated
+# stages merged by (stage, member). Stages W and P of each (M22), then
+# stage 0 and phase 1 of `a` and then of `b`, then the two hooks, then
+# each phase-2 target level of `a` and then of `b`, a stage that only one
+# member has running alone. A rotated
 # prolongation of one member may read its partner's coarser ghosts,
 # which the partner's earlier stages, phase 1 or a coarser level, have
 # filled by then, as its own coarser ghosts are in a single fill. Under
@@ -1863,24 +2016,37 @@ function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule
                         backend)
     a, b = pair.a, pair.b
     forest = sa.forest
-    # A pair's sets are refused with a vertex-like dimension until M22
-    # step 7, so neither has a stage 0, and phase 1 is each one's first.
-    sa.phase1group == sb.phase1group == 1 || error(
-        "a RotationPair with a stage 0 asked for; rotating seams of a set with a " *
-        "vertex-like dimension come back in M22 step 7, and GhostSchedule refuses them " *
-        "until then, so this is a bug")
     runa(i, sends) = run_stages!(a.work, a.work, a.nvars, pair.afactors, sa.stages, i:i,
                                  sa.stages[i].locals, forest, backend, sends, b.work,
                                  pair.arotvars)
     runb(i, sends) = run_stages!(b.work, b.work, b.nvars, pair.bfactors, sb.stages, i:i,
                                  sb.stages[i].locals, forest, backend, sends, a.work,
                                  pair.brotvars)
-    sends = runa(1, nothing)
-    sends = runb(1, sends)
+    # Stages W and P (M22) on each member's own primaries; the axis is a
+    # symmetric layout's alone, and a pair's members are not symmetric.
+    hooks[1] === nothing || wall_boundary!(a, hooks[1], sa, backend)
+    hooks[2] === nothing || wall_boundary!(b, hooks[2], sb, backend)
+    isempty(sa.selfimage) ||
+        run_phase!(a.work, a.work, sa.selfimage, a.nvars, backend; factors=pair.afactors,
+                   rotvars=pair.arotvars)
+    isempty(sb.selfimage) ||
+        run_phase!(b.work, b.work, sb.selfimage, b.nvars, backend; factors=pair.bfactors,
+                   rotvars=pair.brotvars)
+    # Then stage 0 and phase 1 of each, in that order, merged by member: a
+    # member's secondaries on its seam plane are its partner's primaries
+    # turned, which stage 0 reads where they are final; then the hooks,
+    # and the prolongations level by level.
+    sends = nothing
+    for tag in (UNIFY_TAG, PHASE1_TAG)
+        i = findfirst(st -> st.tag == tag, sa.stages)
+        i === nothing || (sends = runa(i, sends))
+        j = findfirst(st -> st.tag == tag, sb.stages)
+        j === nothing || (sends = runb(j, sends))
+    end
     hooks[1] === nothing || apply_boundary!(a, hooks[1], sa, backend)
     hooks[2] === nothing || apply_boundary!(b, hooks[2], sb, backend)
-    tags = sort!(unique!([[st.tag for st in sa.stages[2:end]];
-                          [st.tag for st in sb.stages[2:end]]]))
+    tags = sort!(unique!(filter(>(PHASE1_TAG), [[st.tag for st in sa.stages];
+                                                [st.tag for st in sb.stages]])))
     for tag in tags
         i = findfirst(st -> st.tag == tag, sa.stages)
         i === nothing || (sends = runa(i, sends))

@@ -214,6 +214,9 @@ function lockstep!(sets, scheds, backend; between=nothing)
     for r in 1:P
         hasproperty(scheds[r], :selfimage) && !isempty(scheds[r].selfimage) &&
             run_phase!(sets[r], scheds[r].selfimage, backend)
+        # And a rotating seam's axis.
+        hasproperty(scheds[r], :axis) &&
+            TreeAMR.run_axis!(sets[r].work, sets[r], scheds[r].axis, backend)
     end
     tags = sort!(unique!([st.tag for sched in scheds for st in sched.stages]))
     stageat(r, tag) = (i = findfirst(st -> st.tag == tag, scheds[r].stages);
@@ -453,6 +456,13 @@ function lockstep_pair!(pairs, schedsa, schedsb, backend; hooks)
     stageat(sched, tag) = (i = findfirst(st -> st.tag == tag, sched.stages);
                            i === nothing ? nothing : sched.stages[i])
     tags = sort!(unique!([st.tag for s in [schedsa; schedsb] for st in s.stages]))
+    # Stage P (M22) of each member, local, before every stage.
+    for r in 1:P, m in 1:2
+        fs, alt, factors, rotvars, sched = member(r, m)
+        isempty(sched.selfimage) ||
+            run_phase!(fs.work, fs.work, sched.selfimage, fs.nvars, backend;
+                       factors=factors, rotvars=rotvars)
+    end
     bad = 0
     for (k, tag) in enumerate(tags), m in 1:2
         for r in 1:P

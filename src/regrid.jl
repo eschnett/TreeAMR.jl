@@ -802,10 +802,13 @@ end
 # (`ghost_plane_parts`), so both parents read the same values through
 # the same weights. A created fine block beside a kept coarser one is
 # the finer, so the primary; a created coarse block beside a kept finer
-# one has the secondary. The pass reads the old storage, as the first
-# stage does, so it runs after it, into the same fresh array; its
-# targets are disjoint sub-pieces, each from one source, so its groups
-# never write the same point.
+# one has the secondary. The pass runs once every set has moved, reading
+# the new arrays, where the first stage copied each kept block's points
+# bit for bit, and across a rotating seam the turned copy of a
+# `RotationPair`'s partner; its targets are disjoint sub-pieces, each
+# from one source, so its groups never write the same point. Its keys
+# carry the orientation of a copy across the seam, with the turn's axis
+# map and sign column (`regrid_kept_stage`).
 #
 # The kept block's value is the evolved one only if the old storage is
 # unified — every copy of a point at its level equal, a coarse copy its
@@ -819,7 +822,7 @@ end
 # leaf serially; over a distributed forest the ones it receives for and
 # the ones it sends to (`kept_candidates`) — and `split_regrid` keeps this
 # rank's ends, so the sender and the receiver find the same transfers.
-# Its sources are old leaf indices, its keys same-level copies over the
+# Its sources are new leaf indices, its keys same-level copies over the
 # spans `merged_transfers` gives.
 function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
                            newleaves::AbstractVector{MortonKey{D}},
@@ -846,7 +849,7 @@ function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{
                 lv, nbrs = neighbours(t, δ)
                 lv == t.level && any(x -> kept[x[1]] != 0, nbrs)
             end || continue
-            entries = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int}}[]
+            entries = StageEntry{D}[]
             for sub in closed_subpieces(c, view.N)
                 all(==(1), piece_of(sub)) && continue      # the open interior
                 copies = piece_copies(t, sub, c)
@@ -854,13 +857,15 @@ function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{
                 t.level == finest || continue
                 holders = filter(x -> x[1] == finest && kept[x[2]] != 0, copies)
                 isempty(holders) && continue
-                _, s, _, δ, o = argmax(x -> x[3], holders)
-                push!(entries, (sub, :copy, s, δ, o))
+                # The kept holder that would be the primary among them, by
+                # the rule of `piece_primary`.
+                _, s, _, δ, o, r, _ = piece_primary(holders)
+                push!(entries, (sub, :copy, s, δ, o, r))
             end
-            for (kind, s, δ, o, spans) in merged_transfers(entries, allowed)
-                key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(0),
+            for (kind, s, δ, o, r, spans) in merged_transfers(entries, allowed)
+                key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(r),
                                   Int8(0), spans)
-                push!(perblock[i], key => Int32(kept[s]))
+                push!(perblock[i], key => Int32(s))
             end
         end
     end
@@ -873,16 +878,18 @@ end
 # The new leaves whose kept-over-created pairs this rank needs, over a
 # distributed forest: the ones it stores after the regrid, `newrange`, for
 # the pairs it receives or keeps, and every new leaf sharing a point with
-# a kept block it stored before, `oldrange`, for the pairs whose source it
-# sends. A pair's target holds a point with its source, so it is a
+# a kept block it stores, for the pairs whose source it sends (the pass
+# reads the new arrays, so a source's owner is its new one). A pair's target holds a point with its source, so it is a
 # neighbour of the source across a face, edge or corner.
-function kept_candidates(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
-                         oldrange::UnitRange{Int}, newrange::UnitRange{Int}) where {D}
+function kept_candidates(view::Forest{D}, newleaves::AbstractVector{MortonKey{D}},
+                         oldleaves::AbstractVector{MortonKey{D}},
+                         newrange::UnitRange{Int}) where {D}
     cand = Set{Int}(newrange)
     dirs = alldirections(Val(D))
-    for i in oldrange
-        k = oldleaves[i]
-        find_leaf(view, k) === nothing && continue          # not kept
+    for j in newrange
+        k = newleaves[j]
+        i = searchsortedfirst(oldleaves, k)
+        i <= length(oldleaves) && oldleaves[i] == k || continue   # not kept
         for δ in dirs, nbr in neighbor_keys(view, k, δ)
             push!(cand, find_leaf(view, nbr)::Int)
         end
@@ -901,28 +908,32 @@ leaves_view(forest::Forest{D,T}, leaves::Vector{MortonKey{D}}) where {D,T} =
 # The kept-over-created pass as a stage (tag `REGRID_KEPT_TAG`), from its
 # pairs, built as `regrid_stage` builds the first: same-level copies over
 # stage 0's spans, with no factor, mirror or bound.
-function regrid_kept_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
-                           backend::Backend, pairs::TransferPairs{D};
-                           oldrange::UnitRange{Int}, newrange::UnitRange{Int},
-                           nold::Int, nnew::Int, oldowner, newowner) where {T,D}
+function regrid_kept_stage(::Type{T}, view::Forest{D}, G::NTuple{D,Int},
+                           c::NTuple{D,Int}, backend::Backend, pairs::TransferPairs{D};
+                           newrange::UnitRange{Int}, nnew::Int, newowner) where {T,D}
+    N = view.N
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> ntuple(d -> copy_stencil(T, N, G[d], c[d], key.direction[d];
                                                         span=key.span[d]), D),
                          built, key)
-    serial = oldrange == 1:nold && newrange == 1:nnew
+    # Across a rotating seam, the turn's sign column and axis map (M12).
+    factorcol(key) = key.orientation == 0 ? 0 :
+                     mirrorcolumn(ntuple(_ -> 0, D)) + 3^D * Int(key.orientation)
+    serial = newrange == 1:nnew
     local_, sent, received = serial ? (pairs, nothing, nothing) :
-                             split_regrid(pairs, oldrange, newrange)
+                             split_regrid(pairs, newrange, newrange)
     GRP = grouptype(backend, T, Val(D))
     locals = GRP[todevice(backend, TransferGroup{T,D}(:copy, stencils(key), targets,
-                                                      sources, 0, 0, identity_axes(Val(D)),
-                                                      UNBOUNDED))
+                                                      sources, factorcol(key),
+                                                      key.orientation,
+                                                      group_axes(view, key), UNBOUNDED))
                  for (key, (targets, sources)) in local_]
     ST = stagetype(backend, T, Val(D))
     remote = serial ? nothing :
-             remote_stage(remotetype(ST), T, backend, sent, received, stencils, key -> 0;
-                          targetowner=newowner, sourceowner=oldowner,
-                          targetrange=newrange, sourcerange=oldrange,
-                          bounded=key -> UNBOUNDED)
+             remote_stage(remotetype(ST), T, backend, sent, received, stencils, factorcol;
+                          targetowner=newowner, sourceowner=newowner,
+                          targetrange=newrange, sourcerange=newrange,
+                          axesof=key -> group_axes(view, key), bounded=key -> UNBOUNDED)
     return ST(REGRID_KEPT_TAG, locals, remote)
 end
 
@@ -1060,8 +1071,7 @@ function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer:
             check_regrid_set!(layout, forest, fs, sched)
             # What `fill_ghosts!` would refuse before the transfer, refused
             # here, where the refusal is agreed between the ranks.
-            transfer && sched !== nothing && hasrotating(forest) &&
-                !symmetric_layout(fs) && seam_ghosts(fs) && throw(ArgumentError(
+            transfer && sched !== nothing && seam_partnered(fs) && throw(ArgumentError(
                     "this field set's layout is not symmetric in the rotating seam's " *
                     "dimensions $(rotating_dims(forest)) (G = $(fs.G), centering " *
                     "$(fs.centering)), so the fill before its transfer needs its " *
@@ -1307,6 +1317,7 @@ function regrid!(forest::Forest{D}, pairs;
     oldowner(i) = equalsplit_part(nold, P, Int(i)) - 1
     newowner(j) = equalsplit_part(nnew, P, Int(j)) - 1
     sources = nothing                            # classified once, on first use
+    keptsets = FieldSet[]                        # the sets the second stage runs on
     # The kept-over-created pairs, per set of staggers, on first use.
     kept = Dict{NTuple{D,Int},TransferPairs{D}}()
 
@@ -1356,30 +1367,43 @@ function regrid!(forest::Forest{D}, pairs;
             # forest's pool now that nothing is in flight, for the next
             # field set's stage or the next regrid to take.
             stage.remote === nothing || release_stage!(forest, stage.remote)
-            # A set with a vertex-like dimension (M22): the kept blocks'
-            # copies of a shared point over the created blocks' at the
-            # finest level holding it (`regrid_kept_pairs`), after the
-            # first stage, which wrote those points too.
-            c = staggers(fs)
-            if any(==(1), c)
-                pairs = get!(kept, c) do
-                    view = leaves_view(forest, newleaves)
-                    among = distributed ? kept_candidates(view, oldleaves, oldrange,
-                                                          newrange) : nothing
-                    regrid_kept_pairs(view, oldleaves, newleaves, c; among=among)
-                end
-                second = regrid_kept_stage(eltype(fs.work), forest.N, fs.G, c, backend,
-                                           pairs; oldrange=oldrange, newrange=newrange,
-                                           nold=nold, nnew=nnew, oldowner=oldowner,
-                                           newowner=newowner)
-                sends = run_stages!(fresh, fs.work, fs.nvars, nothing, [second], 1:1,
-                                    second.locals, forest, backend, nothing, fs.work,
-                                    nothing)
-                sends === nothing || waitall(comm, sends)
-                second.remote === nothing || release_stage!(forest, second.remote)
-            end
+            any(==(1), staggers(fs)) && push!(keptsets, fs)
         end
         fs.work = fresh
+    end
+
+    # A set with a vertex-like dimension (M22): the kept blocks' copies of a
+    # shared point over the created blocks' at the finest level holding it
+    # (`regrid_kept_pairs`), once every set has moved, from the new arrays,
+    # where a kept block's points are its old ones bit for bit; across a
+    # rotating seam an odd orientation reads a `RotationPair`'s partner,
+    # through the pair's tables, which is why the pass waits for both.
+    if !isempty(keptsets)
+        view = leaves_view(forest, newleaves)
+        tables = IdDict{Any,Any}()
+        for p in sets
+            x = p.first
+            x isa RotationPair || continue
+            tables[x.a] = (x.afactors, x.arotvars, x.b)
+            tables[x.b] = (x.bfactors, x.brotvars, x.a)
+        end
+        for fs in keptsets
+            c = staggers(fs)
+            backend = get_backend(fs.work)
+            pairs = get!(kept, c) do
+                among = distributed ? kept_candidates(view, newleaves, oldleaves, newrange) :
+                        nothing
+                regrid_kept_pairs(view, oldleaves, newleaves, c; among=among)
+            end
+            second = regrid_kept_stage(eltype(fs.work), view, fs.G, c, backend, pairs;
+                                       newrange=newrange, nnew=nnew, newowner=newowner)
+            factors, rotvars, partner = get(tables, fs, (fs.factors, fs.rotvars, fs))
+            sends = run_stages!(fs.work, fs.work, fs.nvars, factors, [second], 1:1,
+                                second.locals, forest, backend, nothing, partner.work,
+                                rotvars)
+            sends === nothing || waitall(comm, sends)
+            second.remote === nothing || release_stage!(forest, second.remote)
+        end
     end
 
     rebuild_leaves!(forest, newleaves)

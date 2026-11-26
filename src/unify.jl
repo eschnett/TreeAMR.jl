@@ -68,6 +68,7 @@ struct UnifySchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},ST<:ExchangeStage
     selfimage::Vector{GRP}                       # stage P (M22), local
     stateselfimage::Vector{GRP}                  # stage P on a state
     parities::Vector{NTuple{D,Parity}}           # stage P's parities; empty: none
+    axis::Any                                    # stage P's axis points, or `nothing`
 end
 
 isstale(s::UnifySchedule) = generation(s.forest) != s.generation
@@ -129,9 +130,11 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     # dimension, the exact two-cell average, order 2, along a cell-like one.
     build(key) = ntuple(d -> unify_stencil(T, N, ghosts[d], stags[d], key, d, 2, UNBOUNDED),
                         D)
-    # Stage P's groups take the parity projection's column; every other is
-    # a plain copy or restriction.
-    factorcol(key) = any(==(Int8(2)), key.mirror) ? mirrorcolumn(key.mirror) : 0
+    # Stage P's groups take the parity projection's column, and a transfer
+    # across a rotating seam the turn's sign column (M12); every other is a
+    # plain copy or restriction.
+    factorcol(key) = any(==(Int8(2)), key.mirror) || key.orientation != 0 ?
+                     mirrorcolumn(key.mirror) + 3^D * Int(key.orientation) : 0
     axesof(key) = group_axes(forest, key)
     bounded(key) = UNBOUNDED
     stageof(key) = UNIFY_TAG
@@ -155,9 +158,12 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     selfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol, axesof)
     stateselfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol,
                                       axesof; ghosts=ghosts)
+    # And on a rotating seam's axis (M22 rule 3).
+    axis = hasrotating(forest) ?
+           Base.inferencebarrier(axis_points)(forest, ghosts, stags, backend) : nothing
     return UnifySchedule{T,D,floattype(forest),typeof(backend),GRP,ST}(
         forest, generation(forest), ghosts, fs.centering, backend, unify, stages,
-        stateunify, selfimage, stateselfimage, parities)
+        stateunify, selfimage, stateselfimage, parities, axis)
 end
 
 function Base.show(io::IO, s::UnifySchedule{T,D}) where {T,D}

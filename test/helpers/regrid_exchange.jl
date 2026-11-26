@@ -79,11 +79,11 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
     ncrossing = 0
     # One stage over every rank in lockstep; the transfers of the first,
     # the regrid's own, are collected.
-    function lockstep!(stages, collect::Bool)
+    function lockstep!(stages, collect::Bool; srcs=olds, srcranges=oldranges, nsrc=nold)
         bufs(r) = stagebuffers(stages[r].remote, nvars, CPU())
         for r in 1:P
             stages[r].remote === nothing && continue
-            pack_stage!(olds[r], stages[r].remote, bufs(r), nvars, CPU())
+            pack_stage!(srcs[r], stages[r].remote, bufs(r), nvars, CPU())
         end
         for r in 1:P
             remote = stages[r].remote
@@ -106,8 +106,8 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
         end
         for r in 1:P
             st = stages[r]
-            run_phase!(fresh[r], olds[r], st.locals, nvars, CPU())
-            toff, soff = first(newranges[r]) - 1, first(oldranges[r]) - 1
+            run_phase!(fresh[r], srcs[r], st.locals, nvars, CPU())
+            toff, soff = first(newranges[r]) - 1, first(srcranges[r]) - 1
             collect && for g in st.locals, t in 1:ntransfers(g)
                 push!(transfers, (g.kind, Int(g.targetblocks[t]) + toff,
                                   Int(g.sourceblocks[t]) + soff))
@@ -116,10 +116,10 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
             unpack_stage!(fresh[r], st.remote, bufs(r), nvars, nothing, CPU())
             for e in st.remote.recvlayout
                 collect && push!(transfers, (e.key.kind, e.target, e.source))
-                bad += e.peer != equalsplit_part(nold, P, e.source) - 1
+                bad += e.peer != equalsplit_part(nsrc, P, e.source) - 1
                 bad += !(e.target in newranges[r])
             end
-            bad += any(e -> !(e.source in oldranges[r]) ||
+            bad += any(e -> !(e.source in srcranges[r]) ||
                             e.peer != equalsplit_part(nnew, P, e.target) - 1,
                        st.remote.sendlayout)
             collect && (ncrossing += length(st.remote.recvlayout))
@@ -128,28 +128,26 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
     end
     lockstep!(stages, true)
     # A set with a vertex-like dimension (M22): the kept-over-created pass,
-    # its pairs classified once and split per rank.
+    # its pairs classified once and split per rank, reading the new arrays,
+    # where the first stage left each kept block's points.
     if any(==(1), staggers(fs))
-        kpairs = regrid_kept_pairs(leaves_view(forest, newleaves), oldleaves, newleaves,
-                                   staggers(fs))
+        newview = leaves_view(forest, newleaves)
+        kpairs = regrid_kept_pairs(newview, oldleaves, newleaves, staggers(fs))
         # Each rank classifies only its candidates (`kept_candidates`), as
         # `regrid!` does; what it keeps of them must be what it keeps of
         # the whole classification.
-        newview = leaves_view(forest, newleaves)
         for r in 1:P
             mine = regrid_kept_pairs(newview, oldleaves, newleaves, staggers(fs);
-                                     among=kept_candidates(newview, oldleaves,
-                                                           oldranges[r], newranges[r]))
-            bad += split_regrid(mine, oldranges[r], newranges[r]) !=
-                   split_regrid(kpairs, oldranges[r], newranges[r])
+                                     among=kept_candidates(newview, newleaves, oldleaves,
+                                                           newranges[r]))
+            bad += split_regrid(mine, newranges[r], newranges[r]) !=
+                   split_regrid(kpairs, newranges[r], newranges[r])
         end
-        kstages = [regrid_kept_stage(T, serial.N, fs.G, staggers(fs), CPU(), kpairs;
-                                     oldrange=oldranges[r], newrange=newranges[r],
-                                     nold=nold, nnew=nnew,
-                                     oldowner=i -> equalsplit_part(nold, P, i) - 1,
+        kstages = [regrid_kept_stage(T, newview, fs.G, staggers(fs), CPU(), kpairs;
+                                     newrange=newranges[r], nnew=nnew,
                                      newowner=j -> equalsplit_part(nnew, P, j) - 1)
                    for r in 1:P]
-        lockstep!(kstages, false)
+        lockstep!(kstages, false; srcs=fresh, srcranges=newranges, nsrc=nnew)
     end
     same = all(r -> bitwise_equal(fresh[r], reference[colons..., newranges[r]]), 1:P)
     return same, transfers, bad, ncrossing, straddling(oldleaves, newleaves, P),
