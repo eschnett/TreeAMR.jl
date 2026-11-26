@@ -407,9 +407,12 @@ GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level
             mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8) where {D} =
     GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, nospan(Val(D)))
 
-# The `span` of a key that is not stage 0's, and the test for one that is.
+# The `span` of a key that is not stage 0's, and the test for one that is:
+# a span along every dimension. A ghost transfer may take a span along a
+# tangential vertex-like dimension (`ghost_plane_parts`), but never along
+# the dimensions its direction leaves the block by, which keep `-1`.
 nospan(::Val{D}) where {D} = ntuple(_ -> Int8(-1), Val(D))
-isunify(key::GroupKey) = key.span[1] >= 0
+isunify(key::GroupKey) = all(>=(0), key.span)
 
 # A span of sub-classes along one dimension, `lo:hi`, as one code, `8lo +
 # hi` (three bits a class). The sub-classes divide a block's closed range
@@ -983,9 +986,14 @@ source_direction(δd::Int, od::Int) =
 # Prolongation, coarse -> fine. `od` is the *target*'s child offset
 # within its own parent, which fixes where the target's cells fall
 # inside the coarse frame.
-function prolong_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int,
-                         p::Int) where {T}
-    rng = target_range(N, G, c, δd, od, false)
+prolong_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int, p::Int) where {T} =
+    prolong_stencil_over(T, target_range(N, G, c, δd, od, false), N, G, c, δd, od, p)
+
+# The body, over an explicit target range: a span of the target's own
+# range along a vertex-like dimension where a ghost's face-plane rows are
+# another block's (M22, `ghost_plane_parts`).
+function prolong_stencil_over(::Type{T}, rng::UnitRange{Int}, N::Int, G::Int, c::Int,
+                              δd::Int, od::Int, p::Int) where {T}
     stored = N + 2G + c
     srcstart = Vector{Int32}(undef, length(rng))
     weights = Matrix{T}(undef, p, length(rng))
@@ -1088,10 +1096,18 @@ end
 # families: the conservative reconstruction along its cell-like
 # dimensions, point values of width `vertex_prolongation` along its
 # vertex-like ones.
-prolongation_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
-    ops.family === Conservative && c == 0 ?
-    conservative_prolong_stencil(T, N, G, c, δd, od, ops.prolongation) :
-    prolong_stencil(T, N, G, c, δd, od, vertex_order(ops))
+function prolongation_stencil(::Type{T}, N, G, c, δd, od, ops::Operators;
+                              span::Integer=-1) where {T}
+    if span >= 0
+        # A span is taken along a vertex-like dimension only (M22).
+        c == 1 || error("a prolongation span along a cell-like dimension; this is a bug")
+        return prolong_stencil_over(T, piece_range(N, G, c, span), N, G, c, δd, od,
+                                    vertex_order(ops))
+    end
+    return ops.family === Conservative && c == 0 ?
+           conservative_prolong_stencil(T, N, G, c, δd, od, ops.prolongation) :
+           prolong_stencil(T, N, G, c, δd, od, vertex_order(ops))
+end
 
 # Conservative restriction is the exact volume average, which the
 # point-value builder already produces at order 2: its window is a
@@ -1113,7 +1129,7 @@ restriction_stencil(::Type{T}, N, G, c, δd, od, ops::Operators) where {T} =
 # element variants of the position kernels are (`with_nodes`), so that
 # building a cell or vertex set's schedule does not compile them.
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
-                      P::Integer, regrid::Bool=false) where {T}
+                      P::Integer, regrid::Bool=false, span::Integer=-1) where {T}
     if P > 0
         c == 0 || error("an element stencil asked for with stagger $c; element sets are " *
                         "cell-like, so this is a bug")
@@ -1121,17 +1137,18 @@ function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators;
         return Base.inferencebarrier(element_stencil)(T, N, G, kind, δd, od, Int(P),
                                                       regrid)::S
     end
-    kind === :copy && return copy_stencil(T, N, G, c, δd)
+    kind === :copy && return copy_stencil(T, N, G, c, δd; span=span)
     kind === :restrict && return restriction_stencil(T, N, G, c, δd, od, ops)
-    return prolongation_stencil(T, N, G, c, δd, od, ops)
+    return prolongation_stencil(T, N, G, c, δd, od, ops; span=span)
 end
 
 function kind_stencil(::Type{T}, N, G, c, kind::Symbol, δd, od, ops::Operators,
-                      mode::Int8; P::Integer, regrid::Bool=false) where {T}
-    s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid)
+                      mode::Int8; P::Integer, regrid::Bool=false,
+                      span::Integer=-1) where {T}
+    s = kind_stencil(T, N, G, c, kind, δd, od, ops; P=P, regrid=regrid, span=span)
     mode == BOUNDED_POINTVALUE || return s
     return stack_linear(s, kind_stencil(T, N, G, c, kind, δd, od, LINEAR_OPERATORS;
-                                        P=P, regrid=regrid))
+                                        P=P, regrid=regrid, span=span))
 end
 
 # One dimension of a transfer of an element-centered set (M16; see
@@ -1351,6 +1368,108 @@ const TransferPairs{D} = Dict{GroupKey{D},Tuple{Vector{Int32},Vector{Int32}}}
 # crosses two glued faces at once, a patch corner, finds no neighbor
 # either, and `check_patch_corners` has refused every layout that has
 # one before the search begins.
+# The ghosts in direction `δ` of leaf `k`, whose neighbour there, global
+# leaf `coarse`, is coarser, split where M22's rule 1 asks (the review's
+# amendment of step 3's ghost stages): every stored copy of a point takes
+# the value of the finest level holding it. Along a tangential
+# vertex-like dimension `d` (`δ_d = 0`) the ghost region spans the
+# block's closed range, and its face-plane rows lie on the extension of
+# the block's face planes, where a block across `δ ± e_d` may hold them as
+# own points. The coarse neighbour covers twice the block's tangential
+# extent, so on the side where the block sits inside it the block across
+# is the coarse block itself; on the side where the block sits at the
+# coarse block's edge it is another block. Where that block, or in 3D one
+# across `δ ± e_d ± e_d′`, is on this block's level, its rows are a copy
+# from it, not part of the prolongation. None is finer: it would share a
+# face with the coarse neighbour two levels apart, which balance forbids,
+# and that is checked. Returns `nothing` where nothing splits, the case
+# of every block but those at a concave corner of a refined region;
+# otherwise the parts as `(kind, direction, span, source)`: the
+# prolongation over the rest, by boxes of the tangential pieces (classes
+# 0, 1 and 2 per dimension, as spans `0:0`, `1:3` and `4:4`), and a copy
+# per piece from its holder, the direction carrying the step `s` along
+# each dimension it steps in. `δlook` is the direction the sources are
+# found in: `δ` itself, or a mirrored ghost's `δ′` (`mirror_sources!`).
+function ghost_plane_parts(forest::Forest{D}, k::MortonKey{D}, δ::NTuple{D,Int},
+                           δlook::NTuple{D,Int}, c::NTuple{D,Int}, coarse::Int) where {D}
+    tdims = [d for d in 1:D if δ[d] == 0 && c[d] == 1]
+    isempty(tdims) && return nothing
+    l = level(k)
+    found = Dict{NTuple{D,Int},Union{Nothing,Tuple{Int,Int}}}()
+    function holder(dir)
+        get!(found, dir) do
+            crossing, nbrs = oriented_neighbors(forest, k, dir)
+            isempty(nbrs) && return nothing
+            crossing.turns == 0 && crossing.glue == 0 || error(
+                "a ghost's face-plane row across a rotating seam or a glue asked for; " *
+                "GhostSchedule refuses those until M22 steps 7 and 8, so this is a bug")
+            lv = level(first(nbrs))
+            lv > l && error(
+                "the ghost of $k in direction $δ has a face-plane row held by a finer " *
+                "block across $dir than the block itself, next to a coarser neighbour " *
+                "across $δ; 2:1 balance forbids that, so this is a bug")
+            return (lv, find_leaf(forest, first(nbrs)))
+        end
+    end
+    pieces = vec(collect(Iterators.product(ntuple(_ -> 0:2, length(tdims))...)))
+    sources = map(pieces) do cls
+        plane = [(tdims[i], cls[i] == 0 ? -1 : 1) for i in eachindex(tdims) if cls[i] != 1]
+        best = nothing
+        # Every nonempty subset of the plane dimensions, fewest steps first,
+        # then in dimension order; each is checked for a finer holder.
+        subsets = sort!([m for m in 1:(2^length(plane) - 1)];
+                        by=m -> (count_ones(m), m))
+        for m in subsets
+            dir = δlook
+            for (i, (d, s)) in enumerate(plane)
+                (m >> (i - 1)) & 1 == 1 && (dir = Base.setindex(dir, s, d))
+            end
+            h = holder(dir)
+            h === nothing && continue
+            lv, j = h
+            j == coarse && continue
+            lv == l && best === nothing && (best = (m, j))
+        end
+        best === nothing && return nothing
+        m, j = best
+        dir = δ
+        for (i, (d, s)) in enumerate(plane)
+            (m >> (i - 1)) & 1 == 1 && (dir = Base.setindex(dir, s, d))
+        end
+        return (dir, j)
+    end
+    all(isnothing, sources) && return nothing
+    code(cls) = cls == 0 ? span_code(0, 0) : cls == 1 ? span_code(1, 3) : span_code(4, 4)
+    spanof(cls) = ntuple(D) do d
+        i = findfirst(==(d), tdims)
+        i === nothing ? Int8(-1) : code(cls[i])
+    end
+    parts = Tuple{Symbol,NTuple{D,Int},NTuple{D,Int8},Int}[]
+    rest = [cls for (cls, s) in zip(pieces, sources) if s === nothing]
+    if !isempty(rest)
+        lo = ntuple(i -> minimum(p -> p[i], rest), length(tdims))
+        hi = ntuple(i -> maximum(p -> p[i], rest), length(tdims))
+        if prod(ntuple(i -> hi[i] - lo[i] + 1, length(tdims))) == length(rest)
+            first_sub(x) = x == 0 ? 0 : x == 1 ? 1 : 4
+            last_sub(x) = x == 0 ? 0 : x == 1 ? 3 : 4
+            span = ntuple(D) do d
+                i = findfirst(==(d), tdims)
+                i === nothing ? Int8(-1) : span_code(first_sub(lo[i]), last_sub(hi[i]))
+            end
+            push!(parts, (:prolong, δ, span, coarse))
+        else
+            for cls in rest
+                push!(parts, (:prolong, δ, spanof(cls), coarse))
+            end
+        end
+    end
+    for (cls, s) in zip(pieces, sources)
+        s === nothing && continue
+        push!(parts, (:copy, s[1], spanof(cls), s[2]))
+    end
+    return parts
+end
+
 function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
@@ -1360,9 +1479,9 @@ function block_sources!(pairs::TransferPairs{D},
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
     for δ in dirs
-        record!(kind, offset, lvl, s, via::Crossing) =
-            push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, ntuple(_ -> Int8(0), D),
-                                           via.turns, via.glue),
+        record!(kind, offset, lvl, s, via::Crossing; dir=δ, span=nospan(Val(D))) =
+            push!.(get!(pairs, GroupKey{D}(kind, dir, offset, lvl, ntuple(_ -> Int8(0), D),
+                                           via.turns, via.glue, span),
                         (Int32[], Int32[])),
                    (Int32(b), Int32(s)))
         region = CartesianIndices(ntuple(d -> target_range(N, G[d], c[d], δ[d], 0, false),
@@ -1396,9 +1515,20 @@ function block_sources!(pairs::TransferPairs{D},
         elseif nblevel < level(k)
             # Coarser neighbor: this block's ghosts are prolongated. The
             # stencil geometry depends on where this block sits inside
-            # its own parent.
-            record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)),
-                    crossing)
+            # its own parent. The rows on the extension of a face plane
+            # that a block of this block's level holds are copied from it
+            # instead (M22, `ghost_plane_parts`).
+            src = find_leaf(forest, only(nbrs))
+            parts = any(==(1), c) ? ghost_plane_parts(forest, k, δ, δ, c, src) : nothing
+            if parts === nothing
+                record!(:prolong, childoffset(k), level(k), src, crossing)
+            else
+                for (kind, dir, span, s) in parts
+                    kind === :prolong ?
+                        record!(:prolong, childoffset(k), level(k), s, crossing; span=span) :
+                        record!(:copy, zerooffset, 0, s, crossing; dir=dir, span=span)
+                end
+            end
         else
             # Finer neighbors: each supplies one part of this block's
             # ghost region, selected by its offset within its parent —
@@ -1807,8 +1937,9 @@ function mirror_sources!(pairs::TransferPairs{D},
     # clamps it (state 3); along a vertex-like dimension the wall plane is
     # the block's own on both sides (M22), so the slab is ghosts only.
     state = ntuple(d -> !mask[d] ? Int8(0) : walls[d] == OutflowFace ? Int8(3) : Int8(1), D)
-    record!(kind, offset, lvl, s, via::Crossing) =
-        push!.(get!(pairs, GroupKey{D}(kind, δ, offset, lvl, state, via.turns, via.glue),
+    record!(kind, offset, lvl, s, via::Crossing; dir=δ, span=nospan(Val(D))) =
+        push!.(get!(pairs, GroupKey{D}(kind, dir, offset, lvl, state, via.turns, via.glue,
+                                       span),
                     (Int32[], Int32[])),
                (Int32(b), Int32(s)))
 
@@ -1828,8 +1959,19 @@ function mirror_sources!(pairs::TransferPairs{D},
     if nblevel == level(k)
         record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), crossing)
     elseif nblevel < level(k)
-        record!(:prolong, childoffset(k), level(k), find_leaf(forest, only(nbrs)),
-                crossing)
+        # As in `block_sources!`: the face-plane rows of the image that a
+        # block of this block's level holds are copied from it, mirrored.
+        src = find_leaf(forest, only(nbrs))
+        parts = any(==(1), c) ? ghost_plane_parts(forest, k, δ, δ′, c, src) : nothing
+        if parts === nothing
+            record!(:prolong, childoffset(k), level(k), src, crossing)
+        else
+            for (kind, dir, span, s) in parts
+                kind === :prolong ?
+                    record!(:prolong, childoffset(k), level(k), s, crossing; span=span) :
+                    record!(:copy, zerooffset, 0, s, crossing; dir=dir, span=span)
+            end
+        end
     else
         # Only the children on the wall side along every masked dimension
         # cover the mirror image; the others supply the half of the
@@ -2721,7 +2863,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         s = state != 0 && key.kind === :restrict && stags[d] == 1 && order == 0 ?
             mirror_restriction(T, N, ghosts[d], od, operators.restriction, mode) :
             kind_stencil(T, N, ghosts[d], stags[d], key.kind, δs, od, operators, mode;
-                         P=order)
+                         P=order, span=key.span[d])
         state == 0 && return s
         state == 3 && return clamp_rows(s, N, ghosts[d], stags[d], δd)
         return mirror_rows(s, N, ghosts[d], stags[d], δd)

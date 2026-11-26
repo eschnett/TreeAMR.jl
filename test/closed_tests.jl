@@ -1232,3 +1232,189 @@ end
         @test agree && nshared > 0
     end
 end
+
+# --- Ghosts on the extension of a face plane (the review's amendment) -------
+
+# A brick of `2^D` roots on `(0, 2)^D` with faces `kind` along every
+# dimension, every root refined but those whose low corner `coarse`
+# accepts: a refined region with concave edges and corners, where a fine
+# block's coarse neighbour across a face sits beside a fine block across
+# the edge, or in 3D only across the corner.
+function concave_forest(D, kind, coarse; N=8)
+    forest = Forest(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (0.0, 2.0), D),
+                    periodic=ntuple(_ -> kind === :periodic, D),
+                    reflecting=ntuple(_ -> kind === :reflect ? (true, true) : (false, false),
+                                      D))
+    lows(k) = ntuple(d -> block_extent(forest, k)[d][1], D)
+    refine!(forest, filter(k -> !coarse(lows(k)), forest.leaves))
+    balance!(forest)
+    return forest
+end
+
+# The concave forests of the tests, by dimension: in 2D one coarse root,
+# low in x or low in y; in 3D one coarse root column, and three coarse
+# roots around a fine one, whose fine blocks at the corner see their only
+# fine holder across a double diagonal.
+concave_cases(D) =
+    D == 1 ? [x -> x[1] >= 1] :
+    D == 2 ? [x -> x[1] < 1 && x[2] >= 1, x -> x[1] >= 1 && x[2] < 1] :
+    [x -> x[1] < 1 && x[2] >= 1,
+     x -> x[1] >= 1 && (x[2], x[3]) in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))]
+
+# How many ghosts in a non-mirrored direction split their face-plane rows
+# off a prolongation (`ghost_plane_parts`), and on how many sides: the
+# split is not vacuous.
+function plane_splits(forest::Forest{D}, c) where {D}
+    n = 0
+    for k in forest.leaves, δ in TreeAMR.alldirections(Val(D))
+        _, nbrs = TreeAMR.oriented_neighbors(forest, k, δ)
+        isempty(nbrs) && continue
+        level(first(nbrs)) < level(k) || continue
+        src = TreeAMR.find_leaf(forest, first(nbrs))
+        TreeAMR.ghost_plane_parts(forest, k, δ, δ, c, src) === nothing || (n += 1)
+    end
+    return n
+end
+
+# Every stored copy of a point on a level where some block owns the point
+# against that own copy: `(compared, differing)`.
+function same_level_copies(fs)
+    compared = differing = 0
+    for (p, copies) in closed_point_groups(fs)
+        owner = Dict{Int,Tuple{Int,NTuple{length(p),Int}}}()
+        for (b, idx, own) in copies
+            own && get!(owner, level(blockkey(fs, b)), (b, idx))
+        end
+        for (b, idx, own) in copies
+            o = get(owner, level(blockkey(fs, b)), nothing)
+            o === nothing && continue
+            compared += 1
+            all(v -> bits(fs.work[idx..., v, b]) == bits(fs.work[o[2]..., v, o[1]]),
+                1:fs.nvars) || (differing += 1)
+        end
+    end
+    return compared, differing
+end
+
+@testset "Every stored copy of a point is its level's own copy after a fill: D=$D" for
+        D in (1, 2, 3)
+    # Guards a ghost on the extension of a face plane that takes the
+    # coarse neighbour's interpolant where a block of its own level holds
+    # the point (the review's finding against step 3's ghost stages): two
+    # blocks of one level would store two values for one point, and a
+    # stencil over the two would differ. Random data, filled; every stored
+    # copy, own or ghost, of a point some block of its level owns must be
+    # that own copy bit for bit: the path is copies, injections and the
+    # same restriction weights. Concave refined regions with periodic
+    # faces (diagonals across the wrap too), outer faces and the hook, and
+    # reflecting faces, and the step-4 boxes refined at the walls.
+    ops(bounded) = Operators(prolongation=4, restriction=4, bounded=bounded)
+    forests = Any[]
+    for kind in (:periodic, :outer, :reflect), coarse in concave_cases(D)
+        push!(forests, (kind, concave_forest(D, kind, coarse)))
+    end
+    push!(forests, (:reflect, faces_forest(ntuple(_ -> :reflect_both, D); N=8)))
+    nsplit = 0
+    for (kind, forest) in forests, C in closed_centerings(D), bounded in (false, true)
+        parity = kind === :reflect ?
+                 [ntuple(_ -> EvenParity, D), ntuple(d -> d == 1 ? OddParity : EvenParity, D)] :
+                 nothing
+        fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C, parity=parity)
+        fs.work .= randn(Xoshiro(90 + D), size(fs.work))
+        hook = kind === :outer ? boundary_by_coordinates((x, v) -> x[1] + v) : nothing
+        fill_ghosts!(fs, GhostSchedule(fs, ops(bounded)); boundary=hook)
+        compared, differing = same_level_copies(fs)
+        @test compared > 0 && differing == 0
+        nsplit += plane_splits(forest, staggers(fs))
+    end
+    D >= 2 && @test nsplit > 0
+end
+
+@testset "A stencil pass and unify! keep a mirror-symmetric refined box symmetric" begin
+    # Guards the asymmetry M22 exists to remove, at a concave corner (the
+    # review's probe): blocks of one level sharing a plane computed from
+    # an interpolated ghost on one side and a copied one on the other, and
+    # stage 0 picked the lower block on both sides of the mirror, the
+    # interpolated value at one and the copied one at its image (1.6e-4).
+    D, N, G = 2, 8, (2, 2)
+    ops = Operators(prolongation=4, restriction=4)
+    forest = Forest((4, 2); N=N, periodic=(true, true), extents=((0.0, 4.0), (0.0, 2.0)))
+    coarse(k) = (e = block_extent(forest, k); e[2][1] >= 1 && e[1][1] in (0.0, 3.0))
+    refine!(forest, filter(!coarse, forest.leaves))
+    balance!(forest)
+    fs = FieldSet(forest, 1; G=G, centering=vertexcentered(2))
+    f(x, v) = cos(π * x[1] / 2) * sin(π * x[2] + 0.7) + 0.3 * cos(π * x[1])
+    fill_by_coordinates!(f, fs)
+    sched = GhostSchedule(fs, ops)
+    fill_ghosts!(fs, sched)
+    own = CartesianIndices(ntuple(q -> (G[q] + 1):(G[q] + N + 1), D))
+    w = copy(fs.work)
+    for b in 1:nblocks(fs), I in own
+        i, j = Tuple(I)
+        fs.work[i, j, 1, b] = w[i + 1, j, 1, b] + w[i - 1, j, 1, b] + w[i, j + 1, 1, b] +
+                              w[i, j - 1, 1, b] - 4w[i, j, 1, b]
+    end
+    unify!(fs, sched)
+    # The value at each point, from its finest own copy, against its
+    # mirror image about x = 2.
+    value = Dict{NTuple{2,Rational{Int}},Tuple{Int,Float64}}()
+    for b in 1:nblocks(fs), I in own
+        p = exact_point(fs, b, Tuple(I))
+        l = level(blockkey(fs, b))
+        get(value, p, (-1, 0.0))[1] <= l && (value[p] = (l, fs.work[I, 1, b]))
+    end
+    worst = maximum(p -> abs(value[p][2] - value[(mod(4 - p[1], 4), p[2])][2]), keys(value))
+    @test worst <= 64 * eps() * maximum(abs, fs.work)
+end
+
+@testset "Created blocks of different parents agree at a concave corner: D=$D" for
+        D in (2, 3)
+    # Guards step 6's claim that created blocks agree without a pass: two
+    # level-1 blocks below the concave corner refined in one regrid,
+    # their children's copies of the common plane bit for bit, before any
+    # fill, which holds once each parent's ghosts on the plane are its
+    # level's values (the review's finding: 1 of 113 points disagreed in
+    # 2D, 17 of 3912 in 3D).
+    for C in closed_centerings(D), bounded in (false, true)
+        ops = Operators(prolongation=4, restriction=4, bounded=bounded)
+        forest = concave_forest(D, :periodic, x -> x[1] < 1 && x[2] >= 1)
+        fs = FieldSet(forest, 1; G=ghosts_for(C, 4), centering=C)
+        fs.work .= randn(Xoshiro(95 + D), size(fs.work))
+        old = copy(forest.leaves)
+        flags = map(forest.leaves) do k
+            e = block_extent(forest, k)
+            level(k) == 1 && e[2] == (0.5, 1.0) && e[1] in ((0.5, 1.0), (1.0, 1.5)) &&
+                all(q -> e[q][1] == 0.0, 3:D) ? Refine : Keep
+        end
+        @test count(==(Refine), flags) == 2
+        regrid!(forest, fs => GhostSchedule(fs, ops); flags=flags)
+        nshared = 0
+        agree = all(closed_point_groups(fs)) do (p, copies)
+            own = [(b, idx) for (b, idx, o) in copies if o]
+            isempty(own) && return true
+            finest = maximum(x -> level(blockkey(fs, x[1])), own)
+            created = [(b, idx) for (b, idx) in own
+                       if level(blockkey(fs, b)) == finest && !(blockkey(fs, b) in old)]
+            length(created) >= 2 || return true
+            nshared += 1
+            b0, i0 = first(created)
+            all(((b, idx),) -> bits(fs.work[idx..., 1, b]) == bits(fs.work[i0..., 1, b0]),
+                created)
+        end
+        @test agree && nshared > 0
+    end
+end
+
+@testset "The face-plane rows of a concave corner are filled alike over simulated ranks: D=$D" for
+        D in (2, 3)
+    # Guards a split found by one end of a message only: the copies off the
+    # diagonal are found by the target's search and by the diagonal
+    # source's owner, whose candidates are its blocks' neighbours in every
+    # direction. Over 2 and 3 ranks the fill is the serial one bit for
+    # bit, with no mismatched segment.
+    for coarse in concave_cases(D), C in closed_centerings(D), P in (2, 3)
+        same, _, _, bad = lockstep_ghost_fill(concave_forest(D, :outer, coarse), P, C,
+                                              PointValue, Float64)
+        @test same && bad == 0
+    end
+end
