@@ -108,7 +108,9 @@ being built on the branch `m22`, which this documentation describes:
 step 2, the closed layout on uniform meshes with periodic and outer
 faces, step 3, coarse-fine faces on meshes refined once, step 4,
 reflecting and outflow faces, step 6, regridding, step 7, rotating
-seams, and step 8, glues, are implemented there. Next is visualization export (M9b).
+seams, step 8, glues, and step 9's finish are implemented there; what a
+downstream changes for it is in [Moving to closed blocks](migration.md).
+Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),

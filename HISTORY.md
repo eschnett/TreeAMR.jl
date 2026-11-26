@@ -5843,6 +5843,120 @@ M12 was decided with Erik, after M7 and before M9b.
   doctests pass. The pending tests by step, as call sites: step 6, 12
   testsets, 10 loops and 12 workload cases; step 7, 22, 18 and 11; step
   8, 26, 8 and 4; steps 3 and 4, none.
+- *Step 5, the first measurement (2026-11-26).* Measured on clusters,
+  each study a snapshot of the step-5 branch at 96c24f6 — closed blocks
+  through step 4, with the merging prototype of 60421d6 — against the
+  half-open baseline 02bf9d1 as a variant, run after run in one job.
+  The scripts and specs are f99e866 (`bench/rhs.jl`,
+  `bench/schedule_build.jl`, `bench/nested.jl`'s first calls and
+  stages, `jobs/rhs*.toml`); step 9 brought them to `m22` without the
+  prototype. The studies were submitted by the reviewing Claude session
+  after Erik's go-ahead ("Yes, submit the step 5 studies on Symmetry";
+  then, as the GPU study waited, "consider moving them to another
+  system" and "submit the jobs to multiple clusters. cancel the others
+  once one starts"). They predate steps 6–8, the ghost-plane amendment
+  of step 6's review and step 9's schedule build; step 9 repeats them on
+  the finished branch.
+  - *Where, and the moves.* The CPU study ran on Symmetry's cn092, an
+    EPYC 7532, job 613483 (`jobs/nested.toml`); the copy kernels on one
+    H200, job 613493 (`jobs/copies.toml`); the suite on CUDA on one
+    H200, job 613500 (`jobs/gpu.toml`); the right-hand sides on an AMD
+    node and an H200, jobs 613511 and 613512 (`jobs/rhs.toml`,
+    `jobs/rhs-gpu.toml`). The four-GPU study (`jobs/nested-gpu.toml`)
+    first waited on Symmetry (613488, `QOSGrpGRES`, its start estimated
+    a day later), was moved to Trillium's GPU cluster (1415645, whose
+    estimate kept slipping), then was queued on Symmetry (613916),
+    Trillium and Fir at once; Fir started within ten minutes, and the
+    others were cancelled through `simlaunch cancel`. It ran on Fir's
+    fc10113, an EPYC 9454 with four H100s, job 6364092, under a site
+    profile of the session's own (`base = "fir"`, Erik's untouched): its
+    `mpiabi` recipe the cluster's Open MPI 4.1.5 through
+    mpi_abi_wrapper, started by the wrapper's `mpiexec` with
+    `--bind-to none`, modules `StdEnv/2023` and `cuda/12.9`, the patched
+    Julia the Alliance sites need, and `sbatch_args = ["--nodes=1"]`;
+    SimLaunch refuses `srun` for a GPU job's ranks there. Both message
+    paths, staged and direct, ran.
+  - *Two spec defects.* `julia = "1.13"`, added to run at the project's
+    floor rather than a site's newer default, cannot be combined with an
+    Alliance site's MPI recipe, which names its own Julia: Trillium
+    refused `jobs/nested-gpu.toml` until the line went (step 9 moved it
+    into `[site.symmetry]`). And the `compile-base-` runs failed: the
+    study's `test/mpi_workload.jl` uses `UnifySchedule`, which the
+    half-open baseline lacks (step 9's `bench/firstcall.jl` replaces it
+    there).
+  - *The nested mesh on the CPU* (232 leaves, `N = 16`, 20 variables,
+    `G = 3`, order 6; slowest rank, least over two rounds, ms):
+
+    | ranks × threads | base | new | new/base | stage 0 | stage P |
+    |---|---|---|---|---|---|
+    | 1 × 1 | 787.8 | 793.0 | 1.007 | 58.3 | 14.6 |
+    | 2 × 1 | 418.1 | 417.6 | 0.999 | 29.3 | 6.9 |
+    | 4 × 1 | 256.8 | 254.7 | 0.992 | 15.3 | 2.7 |
+    | 8 × 8 | 50.7 | 47.1 | 0.929 | 2.1 | 0.4 |
+
+    Phase 1 is 0.935 of the baseline's and phase 2 0.879 at one rank;
+    stage 0's packs and unpacks at two ranks 1.05 and 0.99 ms. The
+    prototype merging stage 0's restrictions across pieces (80 groups to
+    56) gave 1.006, 0.998, 0.997 and 1.003 of the default: nothing, so it
+    was not kept. `bench/ghosts.jl`, the cell-centered control, moved by
+    under 2 %.
+  - *Schedule build* (best, ms, base → new, one thread and eight):
+    uniform 512 leaves cell 7.24 → 6.83 and 1.32 → 1.35, vertex 7.15 →
+    90.97 (12.7×) and 1.44 → 15.06 (10.5×); nested cell 37.59 → 36.00 and
+    34.81 → 32.67, vertex 29.95 → 63.92 (2.13×) and 27.08 → 35.60
+    (1.31×). Step 9 took this up.
+  - *First calls* (least over three fresh processes, s, base → new):
+    the schedule's compile 4.122 → 5.922 (1.44×), the fill's 4.772 →
+    5.213 (1.09×), start to the first fill 22.546 → 27.308 (1.21×). The
+    traced `test/mpi_workload.jl` of the new version: 154.6–158.5 s over
+    1,446 methods, TreeAMR's 61.5–62.9 s over 758.
+  - *The copy kernels on one H200* (`bench/copies.jl`, uniform, vertex,
+    20 variables, `G = 3`; `fill_ghosts!`, base → new, 26 → 33 groups):
+    512 blocks of `16³` 1.750 → 2.060 ms (+18 %), 512 of `32³` 5.050 →
+    6.284 ms (+24 %), 8 of `128³` 1.024 → 1.316 ms (+29 %), the same
+    ghost points written; `scatter!` and `gather!` unchanged per own
+    point.
+  - *The nested mesh on Fir's four H100s* (`N = 32`; ms, base → new;
+    stage 0, stage P): one GPU 8.269 → 9.285 (1.123; 0.875, 0.159); two
+    staged 8.567 → 9.226 (1.077; 1.199, 0.102), direct 10.675 → 11.526
+    (1.080; 1.666, 0.101); four staged 16.674 → 16.008 (0.960; 1.709,
+    0.069), direct 10.699 → 10.292 (0.962; 1.398, 0.070).
+  - *The suite on CUDA* (one H200, Float64 and Float32): 182,062 passed,
+    468 pending, none failed, in 21 minutes, the first CUDA run of steps
+    2–4.
+  - *A right-hand side three ways* (`bench/rhs.jl`, ns an own point; a
+    at every own point, b behind `isprimary` then `unify!`, c over the
+    primaries' boxes then `unify!`; all three agree bit for bit at every
+    primary):
+
+    | mesh, backend | a | b + unify | c + unify | unify |
+    |---|---|---|---|---|
+    | uniform 16, 1 thread | 539.6 | 484.5 | 478.0 | 33.7 |
+    | uniform 32, 1 thread | 545.2 | 510.8 | 501.4 | 15.7 |
+    | nested 16, 1 thread | 541.0 | 506.2 | 494.5 | 34.9 |
+    | nested 32, 1 thread | 548.3 | 523.8 | 509.5 | 17.5 |
+    | uniform 16, 8 threads | 70.9 | 64.7 | 64.9 | 7.4 |
+    | uniform 32, 8 threads | 71.6 | 67.8 | 67.0 | 3.9 |
+    | nested 16, 8 threads | 71.0 | 67.6 | 82.5 | 7.1 |
+    | nested 32, 8 threads | 71.3 | 69.5 | 83.3 | 4.3 |
+    | uniform 16, H200 | 0.541 | 0.623 | 0.614 | 0.132 |
+    | uniform 32, H200 | 0.659 | 0.675 | 0.695 | 0.063 |
+    | nested 16, H200 | 0.560 | 1.131 | 1.336 | 0.621 |
+    | nested 32, H200 | 0.663 | 0.725 | 0.771 | 0.106 |
+
+  - *The review's reading*, its recommendations to Erik: on the CPU the
+    closed fill costs what the half-open one did; on a device it costs
+    8–12 % more on the nested mesh at one or two GPUs and 18–29 % on a
+    uniform mesh, which is stage 0's own launches; skipping
+    secondaries in a right-hand side saves 3–10 % on the CPU and loses
+    on the device in all four cases. It recommended keeping stage 0 a
+    stage of its own and not skipping by default.
+  - *Erik's decisions (2026-11-26)*, on these numbers: on stage 0 as its
+    own stage, "yes, for now. revisit this later, after stage 9"; on
+    whether `map_blocks!` skips secondaries, "no skipping by default".
+    Both are the review's recommendations. Merging stage 0 into phase 1
+    is step 9a of PLAN.md, after step 9's repeat; skipping stays the
+    caller's choice through the mask, with no keyword of its own.
 - *Step 6, regridding (2026-11-26).* Implemented on `m22` in four
   commits after a written plan reviewed as the earlier steps' were, by
   Claude and not by Erik: flagging over the closed box; the transfer with
@@ -6298,6 +6412,123 @@ M12 was decided with Erik, after M7 and before M9b.
     schedule for any of them: TreeMultiPatch's vertex sets interpolate
     across their glues, TreeWave's copying ball set builds none, and
     TreeWaveOLDG's are element sets.
+- *Step 9, what was left in TreeAMR (2026-11-26).* Implemented on
+  `m22`'s step-9 branch after a written plan the review approved, by
+  Claude and not by Erik, in seven commits: step 8's record corrected;
+  the schedule build; compile time and the axis buffer; step 5's scripts
+  and specs; `interpolate!`'s windows tested; the documents; and
+  PrecompileTools, alone and last, for Erik to take or drop. The
+  review's decisions on the plan: a build target of at most 2× a cell
+  set's on the uniform mesh and 1.3× on the nested one, with schedules
+  byte-identical before and after and across thread counts and a memo
+  key that is complete; `@nospecialize` and barriers on host-side
+  builders, PrecompileTools as a separable commit; the axis buffer kept
+  like stage A's; step 5's scripts without the prototype; the migration
+  note in the docs.
+  - *The schedule build.* A profile (laptop, uniform `8³`, 20
+    variables, `G = 3`, order 6, one thread) put 97 % of a vertex set's
+    build in stage 0's search, block by block over 125 sub-pieces, and
+    within it a boxed closure in the sub-piece walk and products of
+    tuples of unequal lengths that did not infer. Now: a block whose
+    neighbourhood an earlier block had takes its transfers relabelled
+    (`UnifyMemo`, keyed by `neighbourhood_signature`: per direction the
+    neighbours' relative level, labels that tell repeated leaves apart,
+    child offsets; a block with a neighbour across a seam or a copying
+    glue is searched, never memoised); the ghost search hands its
+    lookups to stage 0's (`remember!`); a piece without a finer copy is
+    decided once for its sub-pieces; the search returns the mask's bits
+    for stages W and P; `GroupKey` hashes through `keyorder`. Best of
+    10–20 builds (`bench/schedule_build.jl`), against c58f07d:
+
+    | mesh | threads | vertex, before → after | cell | after / cell |
+    |---|---|---|---|---|
+    | uniform `8³` | 1 | 39.6 → 6.4 ms | 3.1–3.3 ms | 1.95–2.08 |
+    | uniform `8³` | 8 | 9.4 → 1.7 ms | 0.9 ms | 1.9 |
+    | nested | 1 | 30.2 → 14.1 ms | 10.9–11.0 ms | 1.28–1.30 |
+    | nested | 8 | 15.0 → 8.9 ms | 9.3–9.4 ms | 0.95 |
+
+    The remaining time on the uniform mesh is the ghost search shared
+    with a cell set and stage 0's lookups and signatures, a fifth of it;
+    on the nested mesh, the stencils of the extra prolongation keys
+    (`ghost_plane_parts`' spans) and the search of 155 distinct
+    neighbourhoods among 232 blocks. The schedules are the same: a
+    canonical dump of 1,826 schedules — the closed, refined, nested and
+    reflecting forests, both seams and four forests of patches, 1 to 3
+    simulated ranks, a `GhostSchedule` and a `UnifySchedule` each — is
+    byte-identical before and after and at 1 and 8 threads
+    (`closed_tests.jl` tests the memo).
+  - *Compile time.* The builders that take the build's closures
+    (`local_groups`, `state_unify_stages`, `selfimage_groups`,
+    `build_stages`, `remote_stage`) take them `@nospecialize`.
+    `bench/firstcall.jl`, the least of three fresh processes (laptop):
+    start to end 19.7 s on `main` (d24d518), 24.4 s on c58f07d, 24.5 s
+    after; the schedules' first calls 2.88, 4.76, 4.87 s; TreeAMR's
+    compile time in the trace 15.1 s over 200 methods, 19.5 s over 268,
+    19.4 s over 286. The closures' specializations were fewer than
+    expected (one a dimension), so the gain is small; PrecompileTools is
+    the larger lever (below).
+  - *The axis buffer* is kept with its points (`MeanPoints.buffer`), as
+    stage A's buffers are kept with their plan.
+  - *Step 5's scripts and specs* came in without the prototype; the
+    specs take `julia = "1.13"` on Symmetry only, gain `[site.fir]` and
+    `[site.trillium-gpu]` sections where they can run there, and the
+    `compile-` runs time `bench/firstcall.jl`, which every TreeAMR since
+    0.2 runs.
+  - *`interpolate!`'s windows* needed no change: a vertex-like stored
+    array, `G | N + 1 | G`, is symmetric under reversal. A new testset
+    checks that mirror-symmetric data interpolates to one value at a
+    point and its image, to 16 ulp, D = 1–3; on `main` it fails in 2D
+    and 3D by 4.4e-10. Left out: a point exactly on a coarse-fine face,
+    which `locate_point`'s half-open rule reads from the fine block on
+    one side and the coarse one at its image, and an odd number of
+    points, whose window sits half a node low by design.
+  - *The documents.* CODE.md's "Closed blocks" is in the present tense,
+    its per-step blocks become *Stage 0, the mask and the hook* and
+    *Across levels*, with step 5's numbers and Erik's two decisions; the
+    migration note for downstream authors is `docs/src/migration.md`,
+    linked from README.md and CODE.md; PLAN.md's step 5 is done, step 9a
+    names the revisit of stage 0, and step 10 the ball wave of step 8.
+  - *The repeat of step 5 on the finished branch*, for the review to
+    submit (the baseline variant a checkout of 02bf9d1, as in step 5;
+    `<base>` its path):
+
+        simlaunch snapshot . --study m22-step9-nested --variant base=<base>
+        simlaunch prepare m22-step9-nested --site symmetry --spec jobs/nested.toml
+        simlaunch submit m22-step9-nested jobs/nested.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-nested-gpu --variant base=<base>
+        simlaunch prepare m22-step9-nested-gpu --site fir --spec jobs/nested-gpu.toml
+        simlaunch submit m22-step9-nested-gpu jobs/nested-gpu.toml --site fir
+        simlaunch snapshot . --study m22-step9-copies --variant base=<base>
+        simlaunch prepare m22-step9-copies --site symmetry --spec jobs/copies.toml
+        simlaunch submit m22-step9-copies jobs/copies.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-gpu
+        simlaunch prepare m22-step9-gpu --site symmetry --spec jobs/gpu.toml
+        simlaunch submit m22-step9-gpu jobs/gpu.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-rhs
+        simlaunch prepare m22-step9-rhs --site symmetry --spec jobs/rhs.toml
+        simlaunch submit m22-step9-rhs jobs/rhs.toml --site symmetry
+        simlaunch prepare m22-step9-rhs --site symmetry --spec jobs/rhs-gpu.toml
+        simlaunch submit m22-step9-rhs jobs/rhs-gpu.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-mpi
+        simlaunch prepare m22-step9-mpi --site trillium --spec jobs/mpi.toml
+        simlaunch submit m22-step9-mpi jobs/mpi.toml --site trillium
+        simlaunch snapshot . --study m22-step9-mpi-gpu
+        simlaunch prepare m22-step9-mpi-gpu --site trillium-gpu --spec jobs/mpi-gpu.toml
+        simlaunch submit m22-step9-mpi-gpu jobs/mpi-gpu.toml --site trillium-gpu
+
+  - *Verified* on the laptop (M3 Pro, Julia 1.13.4): the full suite at
+    eight threads after the schedule build's commit, 199,039 tests and
+    none pending, and at the end, with PrecompileTools, 199,057 at eight
+    threads in 13m29 and 199,005 at one in 12m29, both MPI jobs
+    included; `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32),
+    26,909 tests; `mpi_device_tests.jl` on Metal at two and three ranks,
+    65 tests; the docs build and their doctests.
+  - *Still the review's, unconfirmed by Erik*: the amendments of steps
+    4–8 (the ghost stages' finest-level rows, step 6's review; the
+    orbit's primary and the axis kernel, step 7; map-coded keys, the
+    mean of stage A and the wider patch-corner refusal, step 8; the
+    memo, step 9); the vertex convergence table of step 3; and
+    PrecompileTools as a hard dependency.
 
 ## Downstream checks
 

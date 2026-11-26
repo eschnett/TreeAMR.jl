@@ -640,7 +640,7 @@ Steps:
    outer face, the wall evolved or prescribed (stage W), on uniform
    meshes with periodic and outer faces; what later steps rebuild is
    refused until then, its tests pending. The design text is under
-   [Closed blocks](CODE.md#closed-blocks) (*What step 2 implements*),
+   [Closed blocks](CODE.md#closed-blocks) (*Stage 0, the mask and the hook*),
    the record, with what the code corrected in the design, is step 2 in
    [HISTORY.md](HISTORY.md#m22--closed-blocks).
 3. **Coarse-fine faces.** Stage 0's injections, the mask across
@@ -672,16 +672,14 @@ Steps:
    otherwise. The design text is under [Closed blocks](CODE.md#closed-blocks)
    (*Walls*, *Stage P*), the record step 4 in
    [HISTORY.md](HISTORY.md#m22--closed-blocks).
-5. **The first measurement, and the partition settled.** Against
-   `main`: `bench/nested.jl` at four ranks and on H200s, staged and
-   direct; `bench/copies.jl`; `--trace-compile-timing` of
-   `test/mpi_workload.jl`'s cases that are back; a right-hand side
-   computing every copy against one that tests `isprimary` and one
-   launched over each block's primaries. *Done when* the numbers are
-   recorded and Erik has settled, on them, whether stage 0 stays a
-   stage of its own or merges into phase 1, and whether `map_blocks!`
-   skips the secondaries by itself; if either changes, when steps 2–4
-   pass again in the new form.
+5. **The first measurement, and the partition settled** — done: measured
+   on Symmetry and Fir against the half-open baseline, and Erik decided
+   on 2026-11-26 that stage 0 stays a stage of its own and that
+   `map_blocks!` does not skip secondaries by default. The numbers are
+   under [Closed blocks](CODE.md#closed-blocks), the record M22 step 5
+   in [HISTORY.md](HISTORY.md#m22--closed-blocks). Merging stage 0 into
+   phase 1 is to be revisited after step 9's repeated measurements
+   (step 9a below).
 6. **Regridding** — done on `m22`, ahead of step 5's cluster numbers
    (the review's decision): transfers over closed boxes, the kept
    blocks' copies over the created ones, flagging over the closed box
@@ -701,19 +699,28 @@ Steps:
    checked when the downstream is ported. The design text is *Glues*
    under [Closed blocks](CODE.md#closed-blocks), the record M22 step 8
    in [HISTORY.md](HISTORY.md#m22--closed-blocks).
-9. **What is left in TreeAMR**: `interpolate!`'s windows;
-   `bench/mpi.jl` and the device suite on CUDA and Metal against
-   `main`, with step 5's measurements repeated on the finished branch;
-   the documentation, this file's and `CODE.md`'s sections rewritten
-   for the current state. *Done when* no testset is pending, the full
-   suite passes at one thread and at eight with both MPI jobs, the
-   numbers are recorded, and the docs build.
+9. **What is left in TreeAMR** — implemented on `m22` but for its
+   measurements: `interpolate!`'s windows, the schedule build of a
+   vertex-like set made about as fast as a cell set's, the compile time
+   cut, the documentation with the [migration
+   note](docs/src/migration.md); no testset is pending. Outstanding: step
+   5's measurements, `bench/mpi.jl` and the device suite on CUDA
+   repeated on the finished branch (the studies are listed in M22 step
+   9's record in [HISTORY.md](HISTORY.md#m22--closed-blocks)). *Done
+   when* their numbers are recorded and replace step 5's in
+   [CODE.md](CODE.md#closed-blocks).
+   - 9a. **Stage 0 revisited**: on those numbers, whether stage 0 merges
+     into phase 1 (Erik's decision of step 5, "revisit this later").
 10. **TreeIOHDF5 and the downstreams**: the closed format feature and
     what a file of half-open blocks becomes; TreeWave, TreeHydro and
     TreeGRRMHD (which drops `walls_to_state!` and its symmetry
     testset's bound), then the others, sized by `N .+ staggers(fs)`
-    and forming their kernels' positions through `nodeposition`. *Done
-    when* each suite passes against the branch from a scratch copy.
+    and forming their kernels' positions through `nodeposition`, as
+    the [migration note](docs/src/migration.md) lists. Step 8's last
+    done-when item comes here: TreeWave's wave on the seven-patch ball
+    stays bounded at M20's dissipation, once its right-hand side no
+    longer uses the appendix. *Done when* each suite passes against the
+    branch from a scratch copy.
 11. **The releases**: `m22` merged, TreeAMR 0.3.0 first, and M21
     resumed on it.
 
