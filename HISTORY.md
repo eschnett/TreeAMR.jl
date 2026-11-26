@@ -5546,15 +5546,16 @@ M12 was decided with Erik, after M7 and before M9b.
   TreeWave passes 349 tests in 1m38 and TreeIOHDF5 1088 in 2m36 (its
   pin widened to 0.2.12 in the copy).
 - *Step 2, the layout, the uniform fill and outer faces (2026-11-25).*
-  Implemented on `m22` in seven commits after a written plan Erik
-  reviewed: the refusals of what later steps rebuild and the pending
+  Implemented on `m22` in seven commits after a written plan reviewed
+  by Claude, in the session that designed M22 with Erik, not by Erik
+  himself: the refusals of what later steps rebuild and the pending
   tests; the half-open work-arounds deleted (symmetric walls' trim, the
   half turn's shifted slab, the appendix with `AppendixArray`,
   `isowned`, `corelength`, `hasappendix`, `appendix_entries` and
   `FoldMask`); the closed own range with stage 0 and the symmetric
   partition; the primary mask and the reductions; `unify!`; stage W and
-  `CellBoundary(…; wall)`; the workloads and documents. Erik's decisions
-  on the plan: the piece in the key rather than one flag, accepted; the
+  `CellBoundary(…; wall)`; the workloads and documents. The review's
+  decisions on the plan, which Erik has not confirmed: the piece in the key rather than one flag, accepted; the
   primary's order by global leaf position, never a rank-local index,
   tested over simulated ranks; the self-neighbour case verified rather
   than assumed; `walls = :symmetric` refused for a vertex-like set rather
@@ -5633,11 +5634,13 @@ M12 was decided with Erik, after M7 and before M9b.
     | edge, D = 3 | 16 → 3 / 26 | 16 → 3 / 26 | 5 → 3 / 26 | 7 → 5 / 26 |
 
 - *Step 3, coarse-fine faces (2026-11-26).* Implemented on `m22` in four
-  commits after a written plan Erik reviewed: the primary across levels,
+  commits after a written plan reviewed as step 2's was, by Claude and
+  not by Erik: the primary across levels,
   by sub-piece, with the mask; stage 0's restrictions and the ghost
   stages on refined meshes, with `N ≥ 2G`; `UnifySchedule` and `unify!`
   in place of `InterfaceSchedule` and `restrict_interfaces!`; the
-  workloads and documents. Erik's decisions on the plan: five sub-classes
+  workloads and documents. The review's decisions on the plan, which Erik
+  has not confirmed: five sub-classes
   a vertex-like dimension, the primary rule unchanged and the mask one
   `UInt32` a block; the mid-plane to the lower fine block, in stage 0
   and in phase 1's halved ranges alike; restrictions merged only within
@@ -5705,7 +5708,7 @@ M12 was decided with Erik, after M7 and before M9b.
     the nested mesh a vertex set 0.082 s against a cell set's 0.008 s,
     which is unchanged.
   - *The build made cheap again* (2026-11-26, after the step's commits,
-    at Erik's request, since regridding rebuilds the schedule): each
+    at the review's request, since regridding rebuilds the schedule): each
     block looks up its neighbours across a direction once
     (`NeighbourTable`, at most `3^D − 1` searches) instead of once a
     sub-piece; a block without a finer neighbour decides each piece once;
@@ -5741,9 +5744,11 @@ M12 was decided with Erik, after M7 and before M9b.
   12, 10 and 12; step 7, 22, 18 and 11; step 8, 26, 8 and 4; step 3,
   none.
 - *Step 4, reflecting and outflow faces (2026-11-26).* Implemented on
-  `m22` in four commits after a written plan Erik reviewed: the mirror
+  `m22` in four commits after a written plan reviewed as step 2's was,
+  by Claude and not by Erik: the mirror
   and the clamp about the wall plane; stage P; `walls` removed; the
-  workloads and documents. Erik's decisions on the plan:
+  workloads and documents. The review's decisions on the plan, which
+  Erik has not confirmed (the stage order amends the design he approved):
   - *The stage order is A → W → P → 0*, not A → P → W → 0 as the design
     had it. At an edge where an outer face meets a reflecting one a value
     the hook prescribes lies on the mirror plane, and so does the point
