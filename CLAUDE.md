@@ -293,9 +293,18 @@ script). SimLaunch snapshots the checkout, builds and precompiles the
 environments on the site (`env = "test+cuda"` and the like; a baseline
 checkout is a variant), writes the batch script with a SimWatch file per
 run, and prints the tables of a spec's `[after]` command into the job's
-log. Submitting is visible to others: ask Erik first, each time. So is
-cancelling: cancel a SimLaunch job with `simlaunch cancel`, never a
-plain `scancel`, which leaves SimWatch showing its runs as lost.
+log.
+
+The jobs run on shared systems, so using them is visible to others:
+Symmetry at Perimeter, and the Alliance's Fir, Nibi and Trillium.
+**Before the first job of a piece of work, ask Erik whether these
+systems may be used for it**, naming the systems and whether it is for
+tests, for benchmarks or for both. His answer holds for that work,
+sub-agents briefed on it included, with no further asking per job; if
+he has given a standing answer, it says what it covers. Without an
+answer, submit nothing. Cancel only a job of your own, and with
+`simlaunch cancel`, never a plain `scancel`, which leaves SimWatch
+showing its runs as lost; a job that is not yours is Erik's to cancel.
 
 ```bash
 simlaunch snapshot . --study <study> --variant base=<baseline checkout>
