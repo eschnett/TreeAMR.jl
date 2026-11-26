@@ -84,11 +84,10 @@ numbers(lines, words...) =
     backend, T, deviceaware = header[5], header[7], header[9] == "true"
     rtol = T == "Float32" ? 1e-5 : 1e-12
     @info "reference" backend T deviceaware lines = length(serial)
-    # G2 (M22 step 8) is pending, a `#` line.
     @test count(l -> occursin(" state ", l), serial) >= 4
     @test "B2 conserved true" in serial
     @test "M conserved true" in serial
-    @test count(startswith("# pending until M22 step "), serial) == 1
+    @test count(startswith("# pending until M22 step "), serial) == 0
     for n in RANKCOUNTS
         out = workload(n)
         @test split(first(out))[1:3] == ["#", "ranks", string(n)]
@@ -121,6 +120,11 @@ numbers(lines, words...) =
             @test a1 > 0 && a2 == a1 && m2 == m1
             @test (m1 > 0) == (backend != "cpu" && !deviceaware)
         end
-        # The glue's messages (G2) come back with M22 step 8.
+        # Ghosts interpolated across a glue (M20) crossed ranks, through host
+        # mirrors exactly where the stages' messages went through them.
+        received, sending, staged = only(numbers(filter(startswith("# G2"), out), "G2",
+                                                 "glue"))
+        @test received > 0 && sending > 0
+        @test staged == (backend != "cpu" && !deviceaware ? sending : 0)
     end
 end

@@ -233,6 +233,24 @@ end
                    u[2] == 0 && u[3] == 0 && u[4] == u[5] && u[6] == 0
         end
         @test ok
+        # The projection's sum is step 7's, `(t₀ + t₂) + (t₁ + t₃)` over 4,
+        # or `t₀ + t₂` over 2, bit for bit, now that the axis and stage A
+        # share one kernel (M22 step 8): formed here as the step-7 kernel
+        # formed it, on random data.
+        A = randn(Xoshiro(42), size(fs.work))
+        B = copy(A)
+        run_axis!(B, fs, axis, CPU())
+        ncol = 3^D
+        @test all(eachindex(Array(axis.blocks))) do i
+            b, p = Int(axis.blocks[i]), Tuple(axis.points[i])
+            all(1:fs.nvars) do v
+                t(r) = fs.factors[v, 1 + ncol * r] *
+                       A[p..., r == 0 ? v : Int(fs.rotvars[v, r + 1]), b]
+                acc = t(0) + t(2)
+                half || (acc += t(1) + t(3))
+                isequal(B[p..., v, b], acc / (half ? 2 : 4))
+            end
+        end
         if D == 3
             # The two projections in either order.
             fs.work .= randn(Xoshiro(41), size(fs.work))

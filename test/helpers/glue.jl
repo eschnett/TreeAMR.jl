@@ -50,9 +50,9 @@ end
 const KINKED_OPS = Operators(prolongation=4, restriction=4, glue=6)
 
 # Every stored point of every block of `fs` beyond a glued face of its
-# patch and nowhere else, past the high face planes the block owns, with
-# its logical position and patch: what the glue plan fills. (A set with a
-# vertex-like dimension is refused over a glued forest until M22 step 8.)
+# patch and nowhere else, past the block's own range, closed along a
+# vertex-like dimension (M22), with its logical position and patch: what
+# the glue plan fills.
 function glue_ghosts(fs)
     forest = fs.forest
     conn = forest.conn

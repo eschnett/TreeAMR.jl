@@ -503,12 +503,11 @@ function glue_state(fs)
     N = forest.N
     host = zeros(T, statelength(fs))
     A = statearray(host, FieldSet{T}(forest, fs.nvars; G=fs.G, centering=fs.centering,
-                                     glue=:interpolate); appendix=true)
-    dims = TreeAMR.appendix_layout(fs).dims
+                                     glue=:interpolate))
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         p = patch(forest, k)
-        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2)), v in 1:fs.nvars
+        for I in CartesianIndices((N + 1, N + 1)), v in 1:fs.nvars
             x = TreeAMR.chart_map(GlueTorus(),
                                   coordinates(floattype(forest), fs, b, Tuple(I) .+ fs.G), p)
             A[Tuple(I)..., v, b] = T(v * (0.5 + sin(2π * (2x[1] / (1 + GA + GB) + x[2]))))
@@ -530,8 +529,8 @@ function glue_messages(forest, sched)
 end
 
 # The kinked torus interpolated across its glues on the device: a fill,
-# the reductions, a regrid that keeps the glued blocks and carries their
-# appendix, and the fill again.
+# stage A's means (M22) among it, the reductions, a regrid that keeps the
+# glued blocks and carries their points, and the fill again.
 function glue_case(tag)
     forest = glue_torus(4)
     ops = Operators(prolongation=4, restriction=4, glue=6)
@@ -579,7 +578,7 @@ function main()
                  steps=4)
     tracked_pulse_case("TP"; cycles=2, steps=3)
     moving_blocks_case("M")
-    pending_case("G2", 8)
+    glue_case("G2")
     return nothing
 end
 

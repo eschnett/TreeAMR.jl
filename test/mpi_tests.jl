@@ -94,10 +94,10 @@ function workload_mismatches(ref, out; rtol=1e-12)
 end
 
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
-    # What the serial reference prints while M22 is built: the cases
-    # pending until a later step print one comment line each instead
-    # (`pending_case`): the kinked glue's (G2, M22 step 8).
-    NPENDING, NREGRIDS, NUNCHANGED = 1, 24, 3
+    # What the serial reference prints while M22 is built: a case pending
+    # until a later step prints one comment line instead (`pending_case`);
+    # none is left.
+    NPENDING, NREGRIDS, NUNCHANGED = 0, 24, 3
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -218,6 +218,9 @@ end
         @test parse(Int, split(only(filter(startswith("# Q2 rotated received"),
                                            hashes)))[end]) > 0
         @test parse(Int, split(only(filter(startswith("# H2 rotated received"),
+                                           hashes)))[end]) > 0
+        # The kinked torus (M20): interpolated ghosts crossed ranks.
+        @test parse(Int, split(only(filter(startswith("# G2 glue received"),
                                            hashes)))[end]) > 0
         @test "# QE2 empty ranks $(n - 1)" in hashes
         @test "# QE2 empty ranks after refining 0" in hashes

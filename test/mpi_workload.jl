@@ -1265,18 +1265,17 @@ glue_torus(n) =
 
 const OPSG = Operators(prolongation=4, restriction=4, glue=6)
 
-# Every owned point, the appendix included, from a smooth function of the
-# physical point, through the state vector.
+# Every own point, closed (M22), from a smooth function of the physical
+# point, through the state vector.
 function glue_state(fs)
     forest = fs.forest
     N = forest.N
     u = statevector(fs)
-    A = statearray(u, fs; appendix=true)
-    dims = TreeAMR.appendix_layout(fs).dims
+    A = statearray(u, fs)
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         p = patch(forest, k)
-        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2)), v in 1:fs.nvars
+        for I in CartesianIndices((N + 1, N + 1)), v in 1:fs.nvars
             x = TreeAMR.chart_map(GlueTorus(), coordinates(fs, b, Tuple(I) .+ fs.G), p)
             A[Tuple(I)..., v, b] = v * (0.5 + sin(2π * (2x[1] / (1 + GA + GB) + x[2]) + 0.3))
         end
@@ -1290,10 +1289,10 @@ glue_received(forest, sched) =
     sum(TreeAMR.allgather(forest.comm, length(sched.glueplan.recvtarget)))
 
 # The kinked torus, vertex-centered and interpolated across its glues:
-# one fill, digested with its ghosts, and the reductions, which count each
-# glued face point once; then a regrid that refines the interior and
-# keeps every block on a glued face, carrying its appendix between ranks,
-# and the fill again on the new partition.
+# one fill, digested with its ghosts and stage A's means (M22), and the
+# reductions, which count each glued face point once; then a regrid that
+# refines the interior and keeps every block on a glued face, carrying its
+# points between ranks, and the fill again on the new partition.
 function glue_case(tag)
     forest = glue_torus(4)
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
@@ -1677,7 +1676,7 @@ function main()
                 ("element", elementcentered(2), 1, 3, OPSE)))
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     # Ghosts interpolated across a glue (M20), on the kinked torus.
-    pending_case("G2", 8)
+    glue_case("G2")
     public_verbs("V")
     refusals()
     verbs()

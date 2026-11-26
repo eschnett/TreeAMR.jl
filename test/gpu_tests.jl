@@ -1134,15 +1134,14 @@ end
     @test convergence_rate(Float64.(hs), Float64.(l2)) ≈ 2.0 atol = 0.15
 end
 
-# A right-hand side through the whole state (M20), written through
-# `statearray(…; appendix = true)` at every point of the closed range, the
-# planes a block does not own discarded.
+# A right-hand side through the whole state, written at every own point,
+# the closed range (M22).
 @kernel function glue_index!(du, ::Val{D}, ::Val{NV}) where {D,NV}
     I = @index(Global, NTuple)
     J = ntuple(d -> I[d], Val(D))
     b = I[D + 1]
     @inbounds for v in 1:NV
-        isowned(du, J..., v, b) && (du[J..., v, b] = v * sum(J) + 100b)
+        du[J..., v, b] = v * sum(J) + 100b
     end
 end
 
@@ -1155,16 +1154,16 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
     (u = ξ ./ 2; one(u[1]) / 2 + p * u[1]^5 + 2u[1]^3 * u[2]^4 * u[3]^2 -
                  (p + 1) * u[3]^5 + u[1] * u[2] * u[3] + u[2]^5 / 3)
 
-@pending 8 "$bname: ghosts across a glue and the appendix run on the device: T=$T, D=$D" for
+@testset "$bname: ghosts across a glue and stage A run on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
-    # M20. The glue plan's tables travel to the device at the build and
-    # its kernels run there; the appendix's tables are cached per set on
-    # its backend; an `AppendixArray` goes into a kernel. So the state
+    # M20 and M22. The glue plan's tables and stage A's travel to the
+    # device at the build and their kernels run there. So the state
     # round-trips through `scatter!` and `gather!` bit for bit, the fill
-    # leaves nothing unwritten and lands on the CPU's numbers, a fold over
-    # the state vector or the working array counts each glued face point
-    # once, a right-hand side written through the whole state reaches the
-    # appendix, and in 2D a regrid carries the appendix, all as on the CPU.
+    # leaves nothing unwritten and lands on the CPU's numbers, stage A's
+    # means included, a fold over the primaries of the state vector or the
+    # working array counts each glued face point once, a right-hand side
+    # reaches every own point, and in 2D a regrid moves the closed blocks,
+    # all as on the CPU.
     make() = D == 2 ? kinked_forest(2) : ball_forest(seven_ball(2, 1))
     atlas = D == 2 ? KINKED : seven_ball(2, 1)
     ops = D == 2 ? KINKED_OPS : BALL_OPS
@@ -1187,12 +1186,12 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
         sched = GhostSchedule(fs, ops; atlas=atlas)
         fill_ghosts!(fs, sched; boundary=hook)
         count1(acc, p) = acc + 1
-        folds = (mesh_fold(count1, +, 0, fs), mesh_fold(count1, +, 0, fs, u),
-                 mesh_mapreduce(x -> 1, +, 0, fs, u))
+        folds = (mesh_fold(count1, +, 0, fs; primaries=true),
+                 mesh_fold(count1, +, 0, fs, u; primaries=true),
+                 mesh_mapreduce(x -> 1, +, 0, fs, u; primaries=true))
         du = statevector(fs)
         fill!(du, T(NaN))
-        map_blocks!(glue_index!, fs, statearray(du, fs; appendix=true), Val(D), Val(2);
-                    appendix=true)
+        map_blocks!(glue_index!, fs, statearray(du, fs), Val(D), Val(2))
         regridded = nothing
         if D == 2
             rs = FieldSet{T}(kinked_forest(4), 2; G=3, centering=vertexcentered(D),

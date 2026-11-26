@@ -4,10 +4,16 @@
 using TreeAMR: GluePlan, chart_aligned
 
 # A polynomial of degree five in each logical coordinate, different in
-# each patch, which a six-point stencil reproduces exactly.
-glue_poly(ξ, p) = 0.5 + p * ξ[1]^5 + 2ξ[1]^3 * ξ[2]^4 - (p + 1) * ξ[2]^5 + ξ[1] * ξ[2]
+# each patch, which a six-point stencil reproduces exactly. Its terms that
+# differ between the patches vanish on the glued faces `ξ₁ ∈ {0, 1}`, and
+# every term in `ξ₂` at the wrap's `ξ₂ ∈ {0, 1}`, so that the copies of a
+# glued point agree bit for bit and stage A's mean (M22) leaves them as
+# they are.
+glue_poly(ξ, p) = 0.5 + p * ξ[1]^4 * (1 - ξ[1]) +
+                  2ξ[1]^3 * (1 - ξ[1])^2 * ξ[2]^3 * (1 - ξ[2])^2 -
+                  3ξ[2]^4 * (1 - ξ[2]) + ξ[1] * (1 - ξ[1]) * ξ[2] * (1 - ξ[2])
 
-@pending 8 "Interpolated ghosts across a kinked glue reproduce a patch's polynomial exactly" begin
+@testset "Interpolated ghosts across a kinked glue reproduce a patch's polynomial exactly" begin
     # Guards the stencil: the window, its clamping into the patch across,
     # the weights and the source block's index arithmetic. Data that is a
     # polynomial of degree glue - 1 in each patch's logical coordinates is
@@ -19,8 +25,8 @@ glue_poly(ξ, p) = 0.5 + p * ξ[1]^5 + 2ξ[1]^3 * ξ[2]^4 - (p + 1) * ξ[2]^5 + 
         fill_from_owned!(fs, sched, glue_poly)
         ghosts = glue_ghosts(fs)
         @test length(ghosts) == length(sched.glueplan)
-        # Each patch has its own polynomial, and owns its face planes, so
-        # a ghost on a glued face takes the value of the patch the atlas
+        # Each patch has its own polynomial, equal on the glued faces, so a
+        # ghost on a glued face takes the value of the patch the atlas
         # gives it to.
         err = maximum(ghosts) do (b, idx, ξ, p)
             ξ′, q = TreeAMR.chart_locate(KINKED, TreeAMR.chart_map(KINKED, ξ, p))
@@ -30,7 +36,7 @@ glue_poly(ξ, p) = 0.5 + p * ξ[1]^5 + 2ξ[1]^3 * ξ[2]^4 - (p + 1) * ξ[2]^5 + 
     end
 end
 
-@pending 8 "Interpolated ghosts across a kinked glue converge at the glue order" begin
+@testset "Interpolated ghosts across a kinked glue converge at the glue order" begin
     # Guards the location: a ghost read at the wrong physical point stays
     # wrong at every resolution. Six-point stencils converge at 6.
     errs = map((1, 2, 4)) do n
@@ -58,7 +64,7 @@ ring8() = Forest([(roots=(2, 1),) for _ in 1:4]; N=8,
                  glue=reduce(vcat, [patch_glue_both((p, 1, 2), (mod1(p + 1, 4), 1, 1),
                                                     (1, 2)) for p in 1:4]))
 
-@pending 8 "On the annulus interpolated ghosts are the copied ones bit for bit" begin
+@testset "On the annulus interpolated ghosts are the copied ones bit for bit" begin
     # Guards the alignment: along an aligned dimension the stencil has
     # width one and weight one, so where the maps join smoothly the
     # interpolation is the copy, exactly.
@@ -77,7 +83,7 @@ ring8() = Forest([(roots=(2, 1),) for _ in 1:4]; N=8,
     @test isequal(fi.work, fc.work)
 end
 
-@pending 8 "An alignment the maps do not have is refused" begin
+@testset "An alignment the maps do not have is refused" begin
     # Guards the declaration's check: a wrong declaration would read a
     # node that is not where the ghost lies.
     struct WronglyAligned end
@@ -88,7 +94,7 @@ end
     @test_throws "not at a node" GhostSchedule(fs, KINKED_OPS; atlas=WronglyAligned())
 end
 
-@pending 8 "A set interpolated across a glue refuses what it cannot fill" begin
+@testset "A set interpolated across a glue refuses what it cannot fill" begin
     # Guards the refusals of the schedule build, each with its reason.
     forest = kinked_forest(1)
     fs = kinked_set(forest)
@@ -137,76 +143,22 @@ end
     @test fi.work == fc.work
 end
 
-@pending 8 "Closed ownership adds each patch's glued high face planes to the state, once" begin
-    # Guards the appendix's layout: a patch of n × n roots of N points owns
-    # (nN + 1)² points under closed ownership against (nN)² in its cores,
-    # every point of the planes once, the edge point included.
-    for n in (1, 2)
-        forest = kinked_forest(n)
-        fs = FieldSet(forest, 3; G=3, centering=vertexcentered(2), glue=:interpolate)
-        N = forest.N
-        @test statelength(fs) - TreeAMR.corelength(fs) == 3 * 2 * (2n * N + 1)
-        @test statelength(FieldSet(forest, 3; G=3, centering=vertexcentered(2))) ==
-              TreeAMR.corelength(fs)
-        # A cell-centered set has no face plane to own.
-        @test statelength(FieldSet(forest, 3; G=3, glue=:interpolate)) ==
-              TreeAMR.corelength(fs)
-    end
-end
-
-@pending 8 "The appendix round-trips through scatter!, gather! and statearray" begin
-    # Guards the order of the appendix: scatter! and gather! move each
-    # entry to the stored point statearray(…; appendix = true) names.
+@testset "A kinked set's state holds every copy of a glued face's point" begin
+    # Guards the closed layout across a kinked glue (M22): no appendix, every
+    # block's closed box in the state, `(N + 1)²` points a block, and a
+    # state that round-trips through `scatter!` and `gather!`; the
+    # appendix's keyword is refused with its reason.
     forest = kinked_forest(2)
     fs = FieldSet(forest, 2; G=3, centering=vertexcentered(2), glue=:interpolate)
+    N = forest.N
+    @test statelength(fs) == 2 * nblocks(fs) * (N + 1)^2
     u = collect(1.0:statelength(fs))
     scatter!(fs, u)
     w = zero(u)
     gather!(w, fs)
     @test w == u
-    A = statearray(u, fs; appendix=true)
-    L = TreeAMR.appendix_layout(fs)
-    N, G = forest.N, fs.G
-    seen = 0
-    for b in 1:nblocks(fs), v in 1:2,
-        I in CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))
-        @test A[Tuple(I)..., v, b] == fs.work[(Tuple(I) .+ G)..., v, b]
-        seen += 1
-    end
-    @test seen == length(u)
-    @test statearray(u, fs) == reshape(u[1:TreeAMR.corelength(fs)], N, N, 2, nblocks(fs))
-    # A write to a point a block does not own is dropped.
-    b = findfirst(e -> !e[1], L.dims)
-    A[N + 1, 1, 1, b] = -1.0
-    @test u == collect(1.0:statelength(fs))
-end
-
-@kernel function glue_position_kernel!(du, @Const(origins), @Const(h), ::Val{G}) where {G}
-    I = @index(Global, NTuple)
-    b = I[3]
-    du[I[1], I[2], 1, b] = origins[b][1] + (I[1] - 1) * h[b] + 10 * (origins[b][2] + (I[2] - 1) * h[b])
-end
-
-@pending 8 "map_blocks! with appendix = true writes every point the state owns" begin
-    # Guards the launch over the closed range: a right-hand side written
-    # once reaches the appendix, and a set with one must say whether.
-    forest = kinked_forest(2)
-    fs = FieldSet(forest, 1; G=3, centering=vertexcentered(2), glue=:interpolate)
-    du = fill(NaN, statelength(fs))
-    origins = [block_origin(forest, k) for k in forest.leaves]
-    h = [spacing(forest, k) for k in forest.leaves]
-    @test_throws "needs `appendix = true` or `false`" map_blocks!(
-        glue_position_kernel!, fs, statearray(du, fs; appendix=true), origins, h, Val(fs.G))
-    map_blocks!(glue_position_kernel!, fs, statearray(du, fs; appendix=true), origins, h,
-                Val(fs.G); appendix=true)
-    @test !any(isnan, du)
-    A = statearray(du, fs; appendix=true)
-    L = TreeAMR.appendix_layout(fs)
-    N = forest.N
-    @test all(b -> all(I -> A[Tuple(I)..., 1, b] ==
-                            origins[b][1] + (I[1] - 1) * h[b] + 10 * (origins[b][2] + (I[2] - 1) * h[b]),
-                       CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))),
-              1:nblocks(fs))
+    @test size(statearray(u, fs)) == (N + 1, N + 1, 2, nblocks(fs))
+    @test_throws "no longer takes `appendix`" statearray(u, fs; appendix=true)
 end
 
 # Two patches of `n × n` roots side by side along dimension 1, glued at
@@ -218,70 +170,57 @@ function folded_pair(n, side; N=8)
     return Forest(patches; N=N, glue=glue)
 end
 
-# A state vector holding, at every owned point, the patch and the owned
-# index, so that a fold can tell which copy it read.
+# A state vector holding, at every own point, the patch of its block, so
+# that a fold can tell which copy it read.
 function patch_state(fs)
     u = fill(NaN, statelength(fs))
-    A = statearray(u, fs; appendix=true)
-    dims = TreeAMR.appendix_layout(fs).dims
-    N = fs.forest.N
+    A = statearray(u, fs)
     for b in 1:nblocks(fs)
-        p = patch(fs.forest, fs.forest.leaves[b])
-        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2))
-            A[Tuple(I)..., 1, b] = p
-        end
+        A[:, :, 1, b] .= patch(fs.forest, fs.forest.leaves[b])
     end
     return u
 end
 
-@pending 8 "A fold counts every glued face point once, at its lowest patch" begin
-    # Guards the count under closed ownership: the cores alone count a
-    # point on a low face glued to a low face twice and one on a high face
-    # glued to a high face not at all, and the appendix holds the high
-    # planes. Each point is read at the copy of the lowest patch, which
-    # here is patch 1 wherever it holds the point.
+@testset "A fold over the primaries counts every glued point once, at its lowest patch" begin
+    # Guards the mask across a kinked glue (M22): every copy of a point is
+    # stored, on each patch holding it and on each block holding it there,
+    # and `primaries = true` takes each point once, at the copy of the
+    # lowest patch, which is the one stage A's mean is the same in.
     count1(acc, p) = acc + 1
     for n in (1, 2)
         # The torus: 2(nN)² distinct points; patch 1 holds both of its
         # glued planes along dimension 1, (nN + 1) nN points, and the wrap
-        # along dimension 2 counts its low plane.
+        # along dimension 2 counts one plane.
         forest = kinked_forest(n)
         N = forest.N
         fs = kinked_set(forest)
         u = patch_state(fs)
-        @test mesh_fold(count1, +, 0, fs, u) == 2 * (n * N)^2
-        ones1 = mesh_fold((acc, p) -> acc + (p.u[1] == 1), +, 0, fs, u; vars=1)
+        @test mesh_fold(count1, +, 0, fs, u; primaries=true) == 2 * (n * N)^2
+        ones1 = mesh_fold((acc, p) -> acc + (p.u[1] == 1), +, 0, fs, u; vars=1,
+                          primaries=true)
         @test ones1 == (n * N + 1) * n * N
-        @test mesh_mapreduce(x -> 1, +, 0, fs, u) == 2 * (n * N)^2
-        @test mesh_mapreduce(identity, max, 0.0, fs, u) == 2
-        # The working array after scatter! counts the same points.
+        @test mesh_mapreduce(x -> 1, +, 0, fs, u; primaries=true) == 2 * (n * N)^2
+        @test mesh_mapreduce(identity, max, 0.0, fs, u; primaries=false) == 2
         scatter!(fs, u)
-        @test mesh_fold(count1, +, 0, fs) == 2 * (n * N)^2
-        @test mesh_mapreduce(x -> 1, +, 0, fs) == 2 * (n * N)^2
-        # The device's lane split, on the CPU, visits the same points.
-        @test sum(TreeAMR._block_fold(count1, +, 0, fs.work, fs, fs.G, 1:1, nothing,
-                                      4)) == 2 * (n * N)^2
-        # A fold visits the appendix: its owned index reaches N + 1.
-        @test mesh_fold((acc, p) -> max(acc, maximum(p.I)), max, 0, fs, u) == N + 1
-        # Low face to low face: patch 2's low plane is patch 1's.
-        for (side, total, mine) in ((1, 2 * (n * N)^2 - n * N, (n * N)^2),
-                                    (2, 2 * (n * N)^2 + n * N, (n * N)^2 + n * N))
+        @test mesh_fold(count1, +, 0, fs; primaries=true) == 2 * (n * N)^2
+        # A low face glued to a low face and a high face to a high face:
+        # (nN + 1)² points a patch, one plane of them shared, patch 1's.
+        for side in (1, 2)
             fp = FieldSet(folded_pair(n, side), 1; G=3, centering=vertexcentered(2),
                           glue=:interpolate)
             v = patch_state(fp)
-            @test mesh_fold(count1, +, 0, fp, v) == total
-            @test mesh_fold((acc, p) -> acc + (p.u[1] == 1), +, 0, fp, v) == mine
-            # Without the appendix the cores count the shared plane twice
-            # or not at all.
-            fc = FieldSet(folded_pair(n, side), 1; G=3, centering=vertexcentered(2))
-            @test mesh_fold(count1, +, 0, fc, zeros(statelength(fc))) == 2 * (n * N)^2
+            @test mesh_fold(count1, +, 0, fp, v; primaries=true) ==
+                  2 * (n * N + 1)^2 - (n * N + 1)
+            @test mesh_fold((acc, p) -> acc + (p.u[1] == 1), +, 0, fp, v;
+                            primaries=true) == (n * N + 1)^2
         end
     end
 end
 
-@pending 8 "Norms over a set with an appendix weight the points the fold counts" begin
-    # Guards the norm's volume: a constant has its own value as its norm,
-    # which needs the volume to count the points the sum counts.
+@testset "Norms over a kinked set weight each copy by its share" begin
+    # Guards the trapezoid's weights across a kinked glue (M22): a point on
+    # a glued face is half on each patch's side, so a constant has its own
+    # value as its norm and the torus's two unit patches a mass of 2.
     for side in (1, 2)
         fs = FieldSet(folded_pair(2, side), 2; G=3, centering=vertexcentered(2),
                       glue=:interpolate)
@@ -300,23 +239,24 @@ end
 # The leaves of `forest` on a glued face of their patch.
 on_glue(forest, k) = !isempty(TreeAMR.glued_faces(forest.conn, k))
 
-@pending 8 "regrid! keeps every leaf on a glued face at its level, and its appendix" begin
+@testset "regrid! keeps every leaf on a glued face at its level, and its points" begin
     # Guards the regrid of a set interpolated across a glue: a flag on a
-    # glued face is dropped, the interior refines, the owned points of the
-    # kept blocks, their appendix planes included, come through
-    # unchanged, and the schedule builds again, with no refinement
-    # boundary at a glue.
+    # glued face is dropped, the interior refines, the own points of the
+    # kept blocks, their face planes included, come through unchanged, and
+    # the schedule builds again, with no refinement boundary at a glue.
     forest = kinked_forest(4)
     N = forest.N
     fs = kinked_set(forest)
     sched = GhostSchedule(fs, KINKED_OPS; atlas=KINKED)
-    owned(u) = let A = statearray(u, fs; appendix=true), L = TreeAMR.appendix_layout(fs)
-        Dict(k => [A[Tuple(I)..., 1, b]
-                   for I in CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))]
+    owned(u) = let A = statearray(u, fs)
+        Dict(k => vec(A[:, :, 1, b])
              for (b, k) in enumerate(forest.leaves) if on_glue(forest, k))
     end
-    u = collect(1.0:statelength(fs))
-    scatter!(fs, u)
+    # Unified data, as a fill leaves it: the regrid fills before its
+    # transfer, which would otherwise move the copies to their mean.
+    fill_from_owned!(fs, sched, (ξ, p) -> glue_poly(ξ, p))
+    u = statevector(fs)
+    gather!(u, fs)
     before = owned(u)
     # A flag on a glued face alone changes nothing.
     flags = [on_glue(forest, k) ? Refine : Keep for k in forest.leaves]
@@ -341,31 +281,10 @@ on_glue(forest, k) = !isempty(TreeAMR.glued_faces(forest.conn, k))
                                                                    flags=flags)
 end
 
-@pending 8 "Reading a state through its appendix allocates nothing" begin
-    # Guards the inlining of AppendixArray's accessors: a call per point
-    # allocated its index tuples, 150 B and 70 ns an entry, in every fold
-    # and norm over a state vector and every right-hand side written
-    # through `appendix = true`.
-    fs = kinked_set(kinked_forest(2))
-    u = collect(1.0:statelength(fs))
-    A = statearray(u, fs; appendix=true)
-    function total(A, N, nb)
-        s = 0.0
-        for b in 1:nb, j in 1:N, i in 1:N
-            s += A[i, j, 1, b]
-            A[i, j, 1, b] = s
-        end
-        return s
-    end
-    total(A, fs.forest.N, nblocks(fs))
-    @test (@allocated total(A, fs.forest.N, nblocks(fs))) == 0
-    @test eltype(A) === Float64
-end
-
-@pending 8 "fill_by_coordinates! fills the appendix in every form" begin
-    # Guards the initial-data path of a set with an appendix: the owned
-    # high face planes are state too, and were left at zero. Each form of
-    # the callback fills every owned point with the same numbers.
+@testset "fill_by_coordinates! fills every own point of a kinked set in every form" begin
+    # Guards the initial-data path across a kinked glue: the face planes
+    # are state too. Each form of the callback fills every own point with
+    # the same numbers.
     forest = kinked_forest(2)
     N = forest.N
     f(x, v) = v + x[1] - 3x[2]
@@ -376,12 +295,11 @@ end
         fill_by_coordinates!(form, fs)
         u = statevector(fs)
         gather!(u, fs)
-        A = statearray(u, fs; appendix=true)
-        L = TreeAMR.appendix_layout(fs)
+        A = statearray(u, fs)
         @test all(1:nblocks(fs)) do b
             k = blockkey(fs, b)
             o, h = block_origin(forest, k), spacing(forest, k)
-            all(CartesianIndices(ntuple(d -> 1:(N + L.dims[b][d]), 2))) do I
+            all(CartesianIndices((N + 1, N + 1))) do I
                 x = (o[1] + (I[1] - 1) * h, o[2] + (I[2] - 1) * h)
                 A[I[1], I[2], 1, b] == f(x, 1) && A[I[1], I[2], 2, b] == f(x, 2)
             end
@@ -395,30 +313,38 @@ end
     @test converged && passes == 1 && length(sched.glueplan) > 0
 end
 
-@pending 8 "A fold counts mixed centerings once across a glue that turns the axes" begin
+@testset "A fold counts mixed centerings once across a glue that turns the axes" begin
     # Guards the search for a point's copies: a glue that sends dimension
     # 1 of one patch onto dimension 2 of the other carries a vertex-like
     # face onto a cell-like one, where the set has no point, and the fold
-    # counted a copy there that does not exist.
+    # counted a copy there that does not exist. Over the primaries a patch
+    # of a vertex-like dimension `i` holds `(nN + 1)` points along it, a
+    # cell-like one `nN`, and only a vertex set shares the glued plane.
     n, N = 2, 8
     forest = Forest([(roots=(n, n),), (roots=(n, n),)]; N=N,
                     glue=patch_glue_both((1, 1, 2), (2, 2, 1), (2, -1)))
-    for (cen, shared) in (((:vertex, :vertex), n * N), ((:vertex, :cell), 0),
-                          ((:cell, :vertex), 0))
+    m = n * N
+    for (cen, total) in (((:vertex, :vertex), 2 * (m + 1)^2 - (m + 1)),
+                         ((:vertex, :cell), 2 * (m + 1) * m),
+                         ((:cell, :vertex), 2 * m * (m + 1)))
         fs = FieldSet(forest, 1; G=3, centering=cen, glue=:interpolate)
-        @test mesh_fold((acc, p) -> acc + 1, +, 0, fs, zeros(statelength(fs))) ==
-              statelength(fs) - shared
+        @test mesh_fold((acc, p) -> acc + 1, +, 0, fs, zeros(statelength(fs));
+                        primaries=true) == total
     end
 end
 
-@pending 8 "A glue stencil reads only what phase 1 and the hook have filled" begin
+@testset "A glue stencil reads only what phase 1 and the hook have filled" begin
     # Guards the overhang rule. A ghost that lands deep in the patch across
-    # reads its source block's high plane, which a coarser neighbor fills
-    # by prolongation only in phase 2, after the glue's stage: the build
-    # refuses it rather than leave the ghost a fill behind. A finer
-    # neighbor's ghosts are restricted in phase 1, and are read.
+    # reads its source block's ghosts past its high plane, which a coarser
+    # neighbor fills by prolongation only in phase 2, after the glue's
+    # stage: the build refuses it rather than leave the ghost a fill
+    # behind. A finer neighbor's ghosts are restricted in phase 1, and are
+    # read. The high plane itself is the block's own (M22), so a stencil
+    # that reaches it and no further is accepted: `a = 0.22` lands the
+    # deepest ghost 13.6 spacings into the patch, its window `11 … 16`
+    # ending on that plane, and `a = 0.2` at 15, its window `13 … 18`.
     ops = Operators(prolongation=4, restriction=4, glue=6)
-    for (a, refused) in ((0.22, true), (0.8, false))
+    for (a, refused) in ((0.2, true), (0.22, false), (0.8, false))
         forest = stretched_forest(2)
         for k in copy(forest.leaves)
             p, pos = patch(forest, k), TreeAMR.root_position(forest, k.root)[1]
@@ -501,7 +427,7 @@ function kinked_derivative_errors(n, glue)
     return e1, e2
 end
 
-@pending 8 "A smooth solution's derivatives converge at the operator's order across a kink" begin
+@testset "A smooth solution's derivatives converge at the operator's order across a kink" begin
     # Guards what the interpolation is for: a fourth-order derivative read
     # across a glue where the map kinks. With interpolated ghosts the first
     # and second derivatives converge at 4 everywhere, the points next to
@@ -518,48 +444,23 @@ end
     @test all(<(-0.9), rate(copied, 2))
 end
 
-@pending 8 "isowned names the points a block owns, and a multi-set state reaches its appendix" begin
-    # Guards the closed range's bookkeeping a right-hand side relies on:
-    # the points `isowned` accepts are exactly the state's, so a kernel
-    # that skips the others computes every owned point once; and a set
-    # with an appendix inside a state vector of several sets reads and
-    # writes it through the same `appendix` keyword.
-    forest = kinked_forest(2)
-    N = forest.N
-    fs = kinked_set(forest)
-    other = FieldSet(forest, 2; G=1)
-    u = collect(1.0:statelength(fs))
-    A = statearray(u, fs; appendix=true)
-    owned = count(isowned(A, Tuple(I)..., 1, b)
-                  for b in 1:nblocks(fs) for I in CartesianIndices((1:(N + 1), 1:(N + 1))))
-    @test owned == statelength(fs)
-    @test isowned(statearray(u, fs), N, N, 1, 1) && !isowned(statearray(u, fs), N + 1, 1, 1, 1)
-    sets = (other, fs)
-    w = statevector(sets)
-    W = statearray(w, sets, 2; appendix=true)
-    @test W isa TreeAMR.AppendixArray
-    for b in 1:nblocks(fs), I in CartesianIndices((1:(N + 1), 1:(N + 1)))
-        isowned(W, Tuple(I)..., 1, b) && (W[Tuple(I)..., 1, b] = A[Tuple(I)..., 1, b])
-    end
-    @test stateview(w, sets, 2) == u
-    @test statearray(w, sets, 2) isa AbstractArray{Float64,4}
-end
-
 # A polynomial of degree `k - 1` in each logical coordinate, different in
-# each patch, which a `k`-point stencil reproduces exactly.
-glue_poly_k(k) = (ξ, p) -> 0.5 + p * ξ[1]^(k - 1) - (p + 1) * ξ[2]^(k - 1) +
-                           ξ[1]^(k ÷ 2) * ξ[2]^(k ÷ 2 - 1)
+# each patch, which a `k`-point stencil reproduces exactly; its terms that
+# differ between the patches vanish on the glued faces, and its terms in
+# `ξ₂` at the wrap, as `glue_poly`'s do.
+glue_poly_k(k) = (ξ, p) -> 0.5 + (ξ[1] * (1 - ξ[1]) * ξ[2] * (1 - ξ[2]))^(k ÷ 2 - 1) +
+                           (k >= 4 ? p * ξ[1]^(k - 2) * (1 - ξ[1]) -
+                                     3ξ[2]^(k - 2) * (1 - ξ[2]) : 0.0)
 
 @testset "Interpolated ghosts are exact for every centering and order" begin
     # Guards the stencil's window and weights away from the one layout the
-    # other tests use: a cell-like dimension has no point on a face and no
-    # appendix, a mixed set has one along one dimension only, and the
+    # other tests use: a cell-like dimension has no point on a face, a
+    # mixed set has one along one dimension only, and the
     # window's clamping and centering change with the order. Each patch's
     # polynomial of degree `k - 1` comes back to rounding at every ghost
     # across the kinked torus's glues and wrap, patch corners included.
     for C in ((:cell, :cell), (:vertex, :cell), (:cell, :vertex), (:vertex, :vertex)),
         k in (2, 4, 6)
-        vertexlike(C) && (pending(8, "interpolated ghosts exact, $C, k = $k"); continue)
         forest = kinked_forest(2)
         fs = FieldSet(forest, 1; G=3, centering=C, glue=:interpolate)
         sched = GhostSchedule(fs, Operators(prolongation=4, restriction=4, glue=k);
@@ -573,7 +474,9 @@ glue_poly_k(k) = (ξ, p) -> 0.5 + p * ξ[1]^(k - 1) - (p + 1) * ξ[2]^(k - 1) +
             return abs(fs.work[idx..., 1, b] - f(ξ′, q))
         end
         @test err < 1e-11
-        # A cell-centered set's state is its blocks' owned points.
-        @test statelength(fs) == nblocks(fs) * fs.forest.N^2
+        # A block's state is its own points, closed along a vertex-like
+        # dimension.
+        c = staggers(fs)
+        @test statelength(fs) == nblocks(fs) * prod(ntuple(d -> fs.forest.N + c[d], 2))
     end
 end
