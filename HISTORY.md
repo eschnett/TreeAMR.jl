@@ -5772,7 +5772,14 @@ M12 was decided with Erik, after M7 and before M9b.
     from `GhostSchedule`'s forest form; every wall is symmetric. A set
     that read the high wall plane of a vertex-like dimension as filled now
     evolves it, and an odd variable on a mirror plane is zero after every
-    fill. TreeIOHDF5 reads `fs.walls` for its `symmetric_walls` feature
+    fill. Over a forest with reflecting faces a `GhostSchedule` or a
+    `UnifySchedule` built from a field set now serves only sets with that
+    set's parities, and refuses another with the reason; before step 4
+    one schedule served every set of the same layout, so an application
+    that shares one schedule between sets of different parities builds
+    one per set (or a `GhostSchedule` from the forest form without
+    `parity`, which builds stage P for every reflecting wall piece).
+    TreeIOHDF5 reads `fs.walls` for its `symmetric_walls` feature
     (`hdf5.jl`), which goes in step 10.
   - *The done-when's bitant norm* was mis-stated: the volume-weighted
     norm is normalized, so the bitant's equals the full domain's, and its
@@ -5782,10 +5789,14 @@ M12 was decided with Erik, after M7 and before M9b.
   What the code showed against the design:
   - *The schedule needs the variables' parities* to leave out stage P
     for even variables, so `GhostSchedule`'s forest form takes `parity`,
-    and the field-set form passes the set's; the fill refuses a set with
-    other parities. Passed as a `Union` it cost the schedule its inferred
-    type (element_tests' `@inferred` caught it); an empty vector stands
-    for "unknown".
+    and the field-set form passes the set's over a forest with reflecting
+    faces; the fill refuses a set with other parities. Passed as a
+    `Union` it cost the schedule its inferred type (element_tests'
+    `@inferred` caught it); an empty vector, the forest form's default,
+    stands for "unknown", and the field is concretely typed. The review
+    found that `UnifySchedule` was built by the parities but did not check
+    them, so a set with an odd variable kept its wall value under a
+    schedule built for an even one; it stores and checks them now.
   - *A closure's local `parity` in the factor column reassigned the new
     keyword*, which Julia captures; renamed `signs`.
   - *The tests' lockstep fill had no stage P*, and the device's packing

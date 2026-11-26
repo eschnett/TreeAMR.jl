@@ -732,6 +732,19 @@ out instead, for a caller with no field set in hand, and an
 element-centered layout (M16) its order `P` as well, which is `0`, no
 elements, by default.
 
+Over a forest with reflecting faces a schedule also belongs to the
+variables' parities, which a field set declares (`parity`): stage P
+projects a reflecting wall plane of a vertex-like dimension onto each
+variable's parity, and has no transfer for a piece whose variables are
+all even there (M22, "Closed blocks" in `CODE.md`). A schedule built from
+a field set therefore serves only sets with that set's parities, which
+[`fill_ghosts!`](@ref) checks; before M22 step 4 one schedule served
+every set of the same layout. The forest form takes them as `parity`,
+one `NTuple{D,Parity}` per variable; left empty, the default, the parities
+are unknown, stage P has a transfer for every reflecting wall piece, and
+the schedule serves any parities, the factor table of the set it fills
+deciding what each variable becomes.
+
 `backend` must be the backend of every field set the schedule is
 replayed over (M6). The stencil weights and index vectors are read
 *inside* the transfer kernel, so they have to live where it runs; they
@@ -774,7 +787,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     glueplan::GluePlan{T,D}                      # the ghosts interpolated across a glue
     selfimage::Vector{GRP}                       # stage P (M22): wall-plane projection
     stateselfimage::Vector{GRP}                  # stage P on a state, for `unify!`
-    parities::Any                                # the parities stage P was built for
+    parities::Vector{NTuple{D,Parity}}           # stage P's parities; empty: unknown
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
@@ -1298,10 +1311,10 @@ end
 # `G+1 … G+1+N/2` for the lower child and `G+1+N/2 … G+N+1` for the upper,
 # both with the mid-plane. The halved range phase 1 restricts into gives the
 # mid-plane to the lower child only, and at `N = 2G` the outermost ghost
-# beyond a high wall mirrors onto the mid-plane, which the wall-side source
-# is the upper child; it holds the point at its low plane, a secondary
-# there, final after stage 0, which is when phase 1 reads it. The read is
-# in the stencil, so `stage_groups` sees it.
+# beyond a high wall mirrors onto the mid-plane, whose wall-side source is
+# the upper child: it holds the point at its low plane, a secondary there,
+# final after stage 0, which is when phase 1 reads it. The read is in the
+# stencil, so `stage_groups` sees it.
 function mirror_restriction(::Type{T}, N::Int, G::Int, od::Int, p::Int,
                             mode::Int8) where {T}
     h = N ÷ 2
@@ -2111,6 +2124,13 @@ function state_unify_stages(::Type{ST}, ::Type{GRP}, ::Type{T}, backend, forest:
 end
 
 # --- Stage P: the self-image projection (M22) -----------------------------
+
+# The parities a schedule built from `fs` takes for stage P: the set's over
+# a forest with reflecting faces, and none elsewhere, where no stage P is
+# built and a schedule serves every set of its layout as before.
+stage_p_parities(fs::FieldSet{T,D}) where {T,D} =
+    hasreflecting(fs.forest) ? something(fs.parity, NTuple{D,Parity}[]) :
+    NTuple{D,Parity}[]
 #
 # A point on a reflecting wall plane of a vertex-like dimension is its own
 # mirror image, and rule 3 of "One value per point" (CODE.md, "Closed
@@ -2131,10 +2151,11 @@ end
 # reflecting dimensions it lies on (`mirror` 2 there) and its span; the
 # pieces of one key merge into one box where they fill one. A piece whose
 # factor is 1 for every variable is left out when the variables' parities
-# are known (`parities`; `nothing` or empty when they are not), so a set of
-# even variables has no stage P.
+# are known (`parities`, empty when they are not), so a set of even
+# variables has no stage P.
 function selfimage_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
-                            j::Int, b::Int, parities) where {D}
+                            j::Int, b::Int,
+                            parities::Vector{NTuple{D,Parity}}) where {D}
     any(==(1), c) || return nothing
     k = forest.leaves[j]
     face(d, s) = wall_direction(forest, k, ntuple(e -> e == d ? s : 0, D))[2][d]
@@ -2148,7 +2169,7 @@ function selfimage_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTupl
         state = ntuple(d -> (cls[d] == 0 && refl[d][1]) || (cls[d] == 2 && refl[d][2]) ?
                             Int8(2) : Int8(0), D)
         any(!iszero, state) || continue
-        (parities === nothing || isempty(parities)) ||
+        isempty(parities) ||
             any(p -> any(d -> state[d] == 2 && p[d] === OddParity, 1:D), parities) ||
             continue
         push!(get!(bystate, state, NTuple{D,Int}[]), cls)
@@ -2566,13 +2587,14 @@ GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
                   glue=fs.glue, atlas=atlas, T=T,
                   backend=get_backend(fs.work),
-                  parity=something(fs.parity, NTuple{D,Parity}[]))
+                  parity=stage_p_parities(fs))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
                        centering=cellcentered(D), P::Integer=0,
                        glue::Symbol=:copy, atlas=nothing,
-                       T::Type=R, backend::Backend=CPU(), parity=nothing) where {D,R}
+                       T::Type=R, backend::Backend=CPU(),
+                       parity::Vector{NTuple{D,Parity}}=NTuple{D,Parity}[]) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
     # agree that their forests and layouts are the same, and a refusal

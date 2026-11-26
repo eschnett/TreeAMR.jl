@@ -1729,6 +1729,11 @@ function check_unify(fs::FieldSet{T,D}, schedule::UnifySchedule{T,D}) where {T,D
         "the field set has ghost width G=$(fs.G) but this unify schedule was built " *
         "for G=$(schedule.G); every target range in it is wrong for this layout. " *
         "Build one with `UnifySchedule(fs)`."))
+    isempty(schedule.parities) || schedule.parities == fs.parity ||
+        throw(ArgumentError(
+            "the field set's variables have the parities $(fs.parity) but this unify " *
+            "schedule was built for $(schedule.parities); its stage P projects the " *
+            "wall planes by them. Build one with `UnifySchedule(fs)`."))
     fs.centering == schedule.centering || throw(ArgumentError(
         "the field set has centering $(fs.centering) but this unify schedule was " *
         "built for $(schedule.centering); which points are shared, the target ranges " *
@@ -1790,8 +1795,7 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "for P = $(schedule.P) ($(schedule.P == 0 ? "no elements" : "elements")); " *
         "every node position and element stencil in it is wrong for this layout. " *
         "Build one with `GhostSchedule(fs, operators)`."))
-    schedule.parities === nothing || isempty(schedule.parities) ||
-        schedule.parities == fs.parity ||
+    isempty(schedule.parities) || schedule.parities == fs.parity ||
         throw(ArgumentError(
             "the field set's variables have the parities $(fs.parity) but this " *
             "schedule was built for $(schedule.parities); its stage P projects the wall " *

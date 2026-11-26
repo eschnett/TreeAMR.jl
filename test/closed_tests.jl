@@ -634,6 +634,34 @@ end
     end
 end
 
+@testset "A schedule refuses a set with other parities than it was built for" begin
+    # Guards stage P's parities: a schedule built for even variables has no
+    # transfer on a reflecting wall plane, and handed a set whose variable
+    # is odd there would leave its wall value standing.
+    forest = Forest((2, 2); N=8, reflecting=((true, true), (true, true)))
+    even = [(EvenParity, EvenParity)]
+    odd = [(OddParity, EvenParity)]
+    for C in (vertexcentered(2), facecentered(2, 1))
+        a = FieldSet(forest, 1; G=C === vertexcentered(2) ? 1 : 0, centering=C, parity=even)
+        b = FieldSet(forest, 1; G=a.G, centering=C, parity=odd)
+        u = statevector(b)
+        us = UnifySchedule(a)
+        @test_throws "parities" unify!(b, us)
+        @test_throws "parities" unify!(u, b, us)
+        if C === vertexcentered(2)
+            gs = GhostSchedule(a, closed_ops(1))
+            @test_throws "parities" fill_ghosts!(b, gs)
+            @test_throws "parities" unify!(b, gs)
+            @test_throws "parities" unify!(u, b, gs)
+        end
+        # Without reflecting faces a schedule serves every set of its layout.
+        plain = Forest((2, 2); N=8)
+        p1 = FieldSet(plain, 1; G=a.G, centering=C, parity=even)
+        p2 = FieldSet(plain, 1; G=a.G, centering=C, parity=odd)
+        @test unify!(p2, UnifySchedule(p1)) === p2
+    end
+end
+
 @testset "A bitant's mass is half the full domain's, and its norm the same: D=$D" for
         D in (1, 2, 3)
     # Guards the trapezoid's weights at a mirror plane: half weight on the

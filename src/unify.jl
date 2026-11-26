@@ -42,6 +42,13 @@ restriction is not interpolation, and there is no order to choose. A
 restriction, and [`unify!`](@ref) takes either. The set needs no ghosts,
 and nothing outside a block's own range is read or written.
 
+Over a forest with reflecting faces it also holds stage P, which projects
+a reflecting wall plane onto each variable's parity and has no transfer
+for a piece whose variables are all even there; so it serves only sets
+with the parities of the set it was built from, which `unify!` checks.
+Before M22 step 4 one interface schedule served every set of the same
+layout.
+
 A cell-centered set has no shared point and is refused, and so is an
 element set (P > 0), whose conservative scheme needs mortar fluxes; a
 forest with what a later step of M22 rebuilds is refused as
@@ -60,6 +67,7 @@ struct UnifySchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},ST<:ExchangeStage
     stateunify::Vector{ST}                       # stage 0 on a state, for `unify!`
     selfimage::Vector{GRP}                       # stage P (M22), local
     stateselfimage::Vector{GRP}                  # stage P on a state
+    parities::Vector{NTuple{D,Parity}}           # stage P's parities; empty: none
 end
 
 isstale(s::UnifySchedule) = generation(s.forest) != s.generation
@@ -140,15 +148,16 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     # parity, at the primaries, before stage 0; a flux normal to the wall
     # is odd there, and becomes zero.
     ppairs = TransferPairs{D}()
+    parities = stage_p_parities(fs)
     for b in 1:nb
-        selfimage_sources!(ppairs, forest, stags, offset + b, b, fs.parity)
+        selfimage_sources!(ppairs, forest, stags, offset + b, b, parities)
     end
     selfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol, axesof)
     stateselfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol,
                                       axesof; ghosts=ghosts)
     return UnifySchedule{T,D,floattype(forest),typeof(backend),GRP,ST}(
         forest, generation(forest), ghosts, fs.centering, backend, unify, stages,
-        stateunify, selfimage, stateselfimage)
+        stateunify, selfimage, stateselfimage, parities)
 end
 
 function Base.show(io::IO, s::UnifySchedule{T,D}) where {T,D}
