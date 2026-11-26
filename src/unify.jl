@@ -98,7 +98,7 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
             "the field set that holds the face quantity, whose centering is vertex-like " *
             "in the face dimension (`facecentered($D, d)`), not over the cell-centered " *
             "state."))
-        check_closed_blocks(forest, fs.centering, "UnifySchedule")
+        check_closed_blocks(forest, fs.centering, "UnifySchedule"; glue=fs.glue)
         return nothing, layouthash(ghosts, fs.centering, T, nameof(typeof(backend)))
     end
     # This rank's blocks, in global leaf indices, as in `GhostSchedule`.
@@ -109,11 +109,13 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     # Threaded over blocks and merged in chunk order, so the schedule is
     # a function of the tree alone — the same argument as in
     # `GhostSchedule`, and the same bit-identity obligation.
+    # Across a glue the set is interpolated at, no copy (M22 step 8).
+    across = fs.glue !== :interpolate
     chunks = threadchunks(nb)
     perpairs = [TransferPairs{D}() for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            unify_sources!(perpairs[c], forest, stags, offset + b)
+            unify_sources!(perpairs[c], forest, stags, offset + b; acrossglue=across)
         end
     end
     pairs = TransferPairs{D}()
@@ -123,7 +125,7 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     # The three classes of a distributed forest (M7), as in `GhostSchedule`.
     received = split_received!(pairs, owned, nleaves(forest))
     sent = sent_transfers(forest, owned) do into, j
-        unify_sources!(into, forest, stags, j)
+        unify_sources!(into, forest, stags, j; acrossglue=across)
     end
 
     # The restriction the geometry fixes: injection along a vertex-like

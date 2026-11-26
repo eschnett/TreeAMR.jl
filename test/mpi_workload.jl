@@ -1208,10 +1208,13 @@ cubed_sphere_of(N) = Forest([(roots=(2, 2, 1), extents=((-1, 1), (-1, 1), (1, 2)
                              for _ in 1:6]; N=N, glue=cube_glue(), comm=COMM)
 
 # The transfers this rank receives from another across a glued face,
-# summed over the ranks: none serially.
+# summed over the ranks: none serially. Told by the patches of the target
+# and the source, global leaves both, since a key carries the glue's axis
+# map only (M22), which is the identity on the annulus.
 function glued_received(forest, sched)
-    n = sum(st -> st.remote === nothing ? 0 :
-                  count(e -> e.key.glue != 0, st.remote.recvlayout),
+    across(e) = patch(forest, forest.leaves[e.target]) !=
+                patch(forest, forest.leaves[e.source])
+    n = sum(st -> st.remote === nothing ? 0 : count(across, st.remote.recvlayout),
             sched.stages; init=0)
     return sum(TreeAMR.allgather(forest.comm, n))
 end
@@ -1670,8 +1673,8 @@ function main()
     # cubed sphere's element set, whose glue turns what it sends.
     patch_case("PR2", annulus_of(8),
                (("cell", cellcentered(2), 2, nothing, OPS4),
+                ("vertex", vertexcentered(2), 2, nothing, OPS4),
                 ("element", elementcentered(2), 1, 3, OPSE)))
-    pending_case("PR2 vertex", 8)
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     # Ghosts interpolated across a glue (M20), on the kinked torus.
     pending_case("G2", 8)

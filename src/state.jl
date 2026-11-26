@@ -469,7 +469,7 @@ function primary_mask(fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     # The primaries across levels, mirrors, seams and glues come with the
     # steps that rebuild those (M22); refused until then, as the fill is.
-    check_closed_blocks(forest, fs.centering, "primary_mask")
+    check_closed_blocks(forest, fs.centering, "primary_mask"; glue=fs.glue)
     c = staggers(fs)
     range = blockrange(forest)
     pieces = Vector{UInt32}(undef, length(range))

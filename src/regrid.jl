@@ -198,7 +198,7 @@ tree rather than the data.
 """
 function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
-    check_closed_blocks(forest, fs.centering, "firing_boxes")
+    check_closed_blocks(forest, fs.centering, "firing_boxes"; glue=fs.glue)
     backend = get_backend(fs.work)
     n = nblocks(fs)
     n == 0 && return Tuple{Int,NTuple{D,UnitRange{Int}}}[]   # a rank without blocks
@@ -826,7 +826,7 @@ end
 # spans `merged_transfers` gives.
 function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
                            newleaves::AbstractVector{MortonKey{D}},
-                           c::NTuple{D,Int}; among=nothing) where {D}
+                           c::NTuple{D,Int}; among=nothing, acrossglue::Bool=true) where {D}
     pairs = TransferPairs{D}()
     any(==(1), c) || return pairs
     oldindex(k) = (i = searchsortedfirst(oldleaves, k);
@@ -839,14 +839,14 @@ function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{
     threaded_chunks(length(created)) do _, chunk
         for i in chunk
             j = created[i]
-            t = NeighbourTable(view, j)
+            t = NeighbourTable(view, j; acrossglue=acrossglue)
             # A kept holder on this block's level is a neighbour across a
             # face, edge or corner of a vertex-like dimension; most created
             # blocks have none, and are skipped before their sub-pieces.
             steps = ntuple(d -> c[d] == 1 ? (-1, 0, 1) : (0,), D)
             any(Iterators.product(steps...)) do δ
                 all(iszero, δ) && return false
-                lv, nbrs = neighbours(t, δ)
+                lv, nbrs, _ = neighbours(t, δ)
                 lv == t.level && any(x -> kept[x[1]] != 0, nbrs)
             end || continue
             entries = StageEntry{D}[]
@@ -859,12 +859,12 @@ function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{
                 isempty(holders) && continue
                 # The kept holder that would be the primary among them, by
                 # the rule of `piece_primary`.
-                _, s, _, δ, o, r, _ = piece_primary(holders)
-                push!(entries, (sub, :copy, s, δ, o, r))
+                _, s, _, δ, o, r, _, _, g = piece_primary(holders)
+                push!(entries, (sub, :copy, s, δ, o, r, g))
             end
-            for (kind, s, δ, o, r, spans) in merged_transfers(entries, allowed)
-                key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(r),
-                                  Int8(0), spans)
+            for (kind, s, δ, o, r, g, spans) in merged_transfers(entries, allowed)
+                key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(r), g,
+                                  spans)
                 push!(perblock[i], key => Int32(s))
             end
         end
@@ -1151,7 +1151,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
                    ops.vertex_prolongation, ops.glue))
     # A set with a vertex-like dimension owns its closed range (M22); its
     # transfer across a seam or a glue comes back in steps 7 and 8.
-    check_closed_blocks(forest, fs.centering, "regrid!")
+    check_closed_blocks(forest, fs.centering, "regrid!"; glue=fs.glue)
     return nothing
 end
 
@@ -1319,7 +1319,7 @@ function regrid!(forest::Forest{D}, pairs;
     sources = nothing                            # classified once, on first use
     keptsets = FieldSet[]                        # the sets the second stage runs on
     # The kept-over-created pairs, per set of staggers, on first use.
-    kept = Dict{NTuple{D,Int},TransferPairs{D}}()
+    kept = Dict{Tuple{NTuple{D,Int},Bool},TransferPairs{D}}()
 
     for (fs, sched, fill, hook) in regrid_steps(sets)
         # Per field set, not once from the first one: nothing says two
@@ -1390,10 +1390,13 @@ function regrid!(forest::Forest{D}, pairs;
         for fs in keptsets
             c = staggers(fs)
             backend = get_backend(fs.work)
-            pairs = get!(kept, c) do
+            # A set interpolated across its glues has no copy across one.
+            across = fs.glue !== :interpolate
+            pairs = get!(kept, (c, across)) do
                 among = distributed ? kept_candidates(view, newleaves, oldleaves, newrange) :
                         nothing
-                regrid_kept_pairs(view, oldleaves, newleaves, c; among=among)
+                regrid_kept_pairs(view, oldleaves, newleaves, c; among=among,
+                                  acrossglue=across)
             end
             second = regrid_kept_stage(eltype(fs.work), view, fs.G, c, backend, pairs;
                                        newrange=newrange, nnew=nnew, newowner=newowner)

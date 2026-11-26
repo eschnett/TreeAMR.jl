@@ -1834,7 +1834,9 @@ Fill every owned point of every block of `fs` with [`arbitrary_value`](@ref) of
 patches over one logical box are given different data.
 """
 function fill_patch_arbitrary!(fs::FieldSet{T,D}, place) where {T,D}
-    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D))
+    # The own range, closed along a vertex-like dimension (M22).
+    c = staggers(fs)
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D))
     for b in 1:nblocks(fs)
         p = patch(fs.forest, blockkey(fs, b))
         for v in 1:fs.nvars, idx in owned
@@ -1913,7 +1915,11 @@ edge and corner ghosts are never written and are skipped too. Returns
 """
 function patch_ghost_mismatches(fs::FieldSet{T,D}, across) where {T,D}
     forest = fs.forest
-    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N), D))
+    # The own range, closed along a vertex-like dimension (M22): a point on
+    # a block face is own to every block holding it, all copies equal after
+    # a fill.
+    c = staggers(fs)
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N + c[d]), D))
     owners = Dict{Tuple{Int,NTuple{D,Rational{Int}}},Vector{T}}()
     for b in 1:nblocks(fs), idx in owned
         p = patch(forest, blockkey(fs, b))
@@ -1931,7 +1937,8 @@ function patch_ghost_mismatches(fs::FieldSet{T,D}, across) where {T,D}
             outside = count(d -> !(idx[d] in owned.indices[d]), 1:D)
             fs.P > 0 && outside > 1 && continue
             x = exact_point(fs, b, Tuple(idx))
-            exits = [(d, x[d] < 0 ? 1 : 2) for d in 1:D if !(0 <= x[d] < roots[d])]
+            exits = [(d, x[d] < 0 ? 1 : 2) for d in 1:D
+                     if !(0 <= x[d] < roots[d] || (c[d] == 1 && x[d] == roots[d]))]
             length(exits) > 1 && continue
             where_ = isempty(exits) ? (p, x) : across(p, x, only(exits)...)
             where_ === nothing && continue

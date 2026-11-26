@@ -248,7 +248,7 @@ end
     lines = split(serial, '\n')
     turned(tag) = parse.(Int, split(only(filter(startswith("$tag schedule "),
                                                 lines)))[(end - 1):end])
-    @test all(t -> turned(t) == [0, 0], ("PR2c", "PR2e"))   # PR2v: M22 step 8
+    @test all(t -> turned(t) == [0, 0], ("PR2c", "PR2v", "PR2e"))
     @test all(>(0), turned("PL2c"))
     @test turned("PS3e")[1] > 0
 

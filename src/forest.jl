@@ -1376,10 +1376,13 @@ isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) 
 # both. The glue is an index and not its axis map because two patches
 # glued with the identity map still differ from one brick: a coarse-fine
 # face may not cross the glue (conformity, `balance_slack`). The few
-# callers that need the map itself look it up, through `glue_axes`.
+# callers that need the map itself look it up, through `glue_axes`; a
+# transfer is keyed by the map alone (`axes_code`). The slot is an `Int32`:
+# a table holds `2D` slots a patch, which a multi-block forest's hundreds
+# of patches would overflow an `Int8` with.
 struct Crossing
     turns::Int8
-    glue::Int8
+    glue::Int32
 end
 Crossing() = Crossing(0, 0)
 

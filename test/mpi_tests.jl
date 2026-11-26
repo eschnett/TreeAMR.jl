@@ -96,8 +96,8 @@ end
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
     # What the serial reference prints while M22 is built: the cases
     # pending until a later step print one comment line each instead
-    # (`pending_case`): the glues' (M22 step 8).
-    NPENDING, NREGRIDS, NUNCHANGED = 2, 24, 3
+    # (`pending_case`): the kinked glue's (G2, M22 step 8).
+    NPENDING, NREGRIDS, NUNCHANGED = 1, 24, 3
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -179,7 +179,8 @@ end
     @test words("PR2 leaves")[3:4] == ["16", "0"]
     @test words("PS3 leaves")[3:4] == ["24", "0"]
     @test all(t -> length(filter(startswith(t), lines)) == 1,
-              ("PR2 cell filled", "PR2 element filled", "PS3 element filled"))
+              ("PR2 cell filled", "PR2 vertex filled", "PR2 element filled",
+               "PS3 element filled"))
     # The public collectives (AMR-13) hold their contract on the serial
     # reference too, so that the ranks' agreeing with it means something.
     @test "V public true 1" in lines
@@ -233,7 +234,7 @@ end
         # on either side of a glue had different owners.
         @test all(t -> parse(Int, split(only(filter(startswith("# $t glued received"),
                                                     hashes)))[end]) > 0,
-                  ("PR2 cell", "PR2 element", "PS3 element"))
+                  ("PR2 cell", "PR2 vertex", "PR2 element", "PS3 element"))
         # The nested octant (N3): some rank ran a group of levels with
         # messages, one of them at two ranks and more at three.
         nmessages = parse.(Int, split(only(filter(startswith("# N3 largest groups"),

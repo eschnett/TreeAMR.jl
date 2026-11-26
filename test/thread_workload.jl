@@ -529,7 +529,7 @@ end
 let ring = annulus()
     refine!(ring, copy(ring.leaves))
     patch_workload("PR2c", ring, cellcentered(2); G=2, ops=OPS4, layout=1, steps=8)
-    pending_case("PR2v", 8)
+    patch_workload("PR2v", ring, vertexcentered(2); G=2, ops=OPS4, layout=1, steps=8)
     patch_workload("PR2e", ring, elementcentered(2); G=1, P=3, ops=OPSE, layout=1, steps=0)
 end
 patch_workload("PL2c", laid_out(), cellcentered(2); G=2, ops=OPS4, layout=2, steps=8)
