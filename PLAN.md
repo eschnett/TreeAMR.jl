@@ -31,6 +31,7 @@ milestones were planned in, and the list below is in execution order.
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
   - [M21 — Symmetries on patches](#m21--symmetries-on-patches)
+  - [M22 — Closed blocks](#m22--closed-blocks)
 
 ## Milestones
 
@@ -449,6 +450,10 @@ TreeGeneralizedHarmonic and TreeGRRMHD on patches.
 ### M21 — Symmetries on patches
 
 *(Proposed 2026-11-25; Erik's decisions on refinement taken that day.)*
+*(On hold behind [M22](#m22--closed-blocks) since 2026-11-25: its steps
+1–5 are on eschnett/TreeAMR.jl#50 and resume on closed blocks, which
+remove the shifted slab at a glued axis, the turn's low-to-low rule and
+the appendix those steps work around.)*
 The symmetries a brick has — mirror planes (bitant, quadrant, octant)
 and turns about an axis by 90° and 180° (M12, M14), alone or with a
 mirror plane across the axis — on forests of patches, so that a
@@ -574,3 +579,110 @@ kinked glue, M20's rule; patch-local components; symmetries of a turn
 about any axis but the balls' `z`.
 
 *Done when* steps 1–7 pass.
+### M22 — Closed blocks
+
+*(Proposed 2026-11-25, with Erik's decisions of that day; the
+design is "Closed blocks" in [CODE.md](CODE.md#closed-blocks), the
+record under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
+Vertex-like dimensions own their closed range, `N + 1` points, so that
+domains, refined regions, seams and glues are symmetric by
+construction; shared points are stored by every block holding them and
+unified by the fill. It replaces half-open ownership and its
+work-arounds — symmetric walls, the derived wall row, the half turn's
+shifted slab, the appendix of a set interpolated across a glue, and the
+refusals that cite ownership — and it is a breaking release, 0.3.0,
+for TreeAMR, TreeIOHDF5 and every downstream.
+
+**Decided** (Erik): the state is uniform and holds every copy,
+`∏(N + c_d)` per block; at a coarse-fine face the fine block is the
+authority; half-open ownership is removed, not kept as an option; the
+copies across a kinked glue are averaged; an outer wall is evolved
+unless the hook prescribes it; unifying is a stage of its own in the
+fill, to be measured; `unify!` on a state vector is offered and
+optional; the interface restriction becomes `unify!` on a flux set;
+positions are formed from integer coordinates, so that every copy of a
+point is at one position bit for bit.
+
+Steps, each keeping the suite green on the CPU, over simulated ranks
+and under MPI for what it has reached:
+
+1. **The layout and the uniform fill.** Positions from integer
+   coordinates (`nodeposition`, `block_origin`, the kernels' geometry);
+   the own range, the state functions, `map_blocks!`,
+   `fill_by_coordinates!`, the trapezoid weights; the primary mask,
+   with the reductions that take each point once and `isprimary` for a
+   kernel that skips the secondaries; stage 0's same-level copies and
+   the symmetric ghost partition; `GroupKey` without `low`, `shift` and
+   `top`. *Done when*, in `D = 1, 2, 3` and for every centering:
+   - every copy of a point is at one position bit for bit, across
+     blocks and levels, in `Float64` and `Float32`, and
+     `fill_by_coordinates!` of an arbitrary function leaves every copy
+     equal without a fill;
+   - a periodic uniform mesh fills, evolves the test wave equation and
+     reduces as before, and every copy of a point is equal bit for bit
+     after a fill from random data;
+   - a constant is its own norm, and a count over a set is its number
+     of distinct points;
+   - the test wave run with a kernel that skips the secondaries and
+     `unify!(du, …)` is the run that computes them, bit for bit at the
+     primaries.
+2. **Coarse-fine faces and regridding.** Stage 0's injections;
+   prolongation into ghosts only; regrid transfers over closed boxes
+   with a kept block's copy over a created one's; flagging over the
+   closed box. *Done when* the fill of a refined periodic mesh is
+   mirror-symmetric to rounding for a vertex-centered set (4.7 × 10⁻⁵
+   today), the vertex convergence tables under
+   [Operators](CODE.md#operators) are re-measured and recorded, and a
+   regrid of mirror-symmetric data on a mirror-symmetric mesh stays
+   symmetric to rounding.
+3. **Walls.** Outer faces evolved or prescribed (stage W), reflecting
+   faces with stage P, outflow faces; `walls`, `wall_stencil` and
+   mirror state 2 deleted. *Done when* a closed box, uniform and
+   refined, is mirror-symmetric to rounding under every face kind
+   without a keyword, an odd variable is zero on its mirror plane, and
+   a bitant domain's norm is half the full domain's exactly.
+4. **Seams.** Quarter and half turns on the ordinary partition, the
+   seam's copies under rule 2 and the axis under rule 3; `seam_shift`
+   deleted. *Done when* the half plane's two seam halves agree to
+   rounding on the refined mesh (9 × 10⁻⁶ today), the full plane is an
+   oracle to rounding there for a vertex-like `d2`, and a quarter
+   domain's norm is a quarter of the full one's.
+5. **Glues.** A glue that copies, in any pairing and with reversed
+   axes, the refusals lifted; a kinked glue without the appendix, with
+   stage A; the appendix's code and names deleted. *Done when* the
+   patch tests fill every pairing bit for bit against a brick laid out
+   as patches, the kinked torus and both balls keep M20's convergence
+   and symmetry numbers with every copy of a glued point equal after a
+   fill, and the wave on the balls stays bounded at M20's dissipation.
+6. **The device paths and the measurement.** Stage 0 flat on a device;
+   `bench/nested.jl` at four ranks and on H200s, `bench/copies.jl`,
+   `bench/mpi.jl`, and `--trace-compile-timing` of
+   `test/mpi_workload.jl`, each against `main`; a right-hand side
+   computing every copy against one that tests `isprimary` and one
+   launched over each block's primaries. *Done when* the numbers are
+   recorded and Erik has settled, on them, whether stage 0 stays a
+   stage of its own or merges into phase 1, and whether `map_blocks!`
+   skips the secondaries by itself.
+7. **`unify!`, and what follows elsewhere**: `unify!` on state vectors
+   and tuples of sets; the interface restriction as `unify!` on a flux
+   set, with `InterfaceSchedule` and `restrict_interfaces!` removed;
+   `interpolate!`'s windows; the documentation, this file's and
+   `CODE.md`'s sections rewritten for the current state. *Done when* a
+   state stays unified to rounding through the test wave run with
+   `unify!(du, …)`; the interface and Burgers tests pass on `unify!`
+   with their conservation numbers, exact at same-level faces; an
+   edge-centered set's copies around an edge beside a diagonal finer
+   block are one number; and the docs build.
+8. **TreeIOHDF5 and the downstreams**: the closed format feature and
+   what a file of half-open blocks becomes; TreeWave, TreeHydro and
+   TreeGRRMHD (which drops `walls_to_state!` and its symmetry testset's
+   bound), then the others, sized by `N .+ staggers(fs)` and forming
+   their kernels' positions through `nodeposition`. *Done when* each
+   suite passes against the checkout from a scratch copy.
+9. **The releases**, TreeAMR 0.3.0 first, and M21 resumed on it.
+
+Not in M22: refinement at a kinked glue; a patch corner's ghosts for a
+set that copies; `map_blocks!` skipping the secondaries by itself,
+unless step 6's numbers ask for it.
+
+*Done when* steps 1–9 pass.

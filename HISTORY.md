@@ -63,6 +63,7 @@ of them. Each milestone's steps are listed in its record under
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
+  - [M22 — Closed blocks](#m22--closed-blocks)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -5358,6 +5359,83 @@ M12 was decided with Erik, after M7 and before M9b.
       its GitHub `main` through `[sources]` until it is registered; 370
       tests. No release yet: General refuses a package whose dependency
       it does not have.
+
+### M22 — Closed blocks
+
+- *Why (2026-11-25).* While symmetries were being put on patches (M21,
+  eschnett/TreeAMR.jl#50), half-open ownership came up again:
+  the half turn's shifted slab needed a third state where the reversed
+  axis' faces are glued, a turn had to join a low face to a low face so
+  that both seam planes were owned, and TreeMultiPatch had oriented its
+  shells for the appendix. Erik put M21 on hold and asked for a clean
+  resolution, in a breaking release if need be, with symmetric domains
+  and refined regions the default, efficiency on devices kept, and
+  duplicated points allowed if they are unified. An inventory of
+  `src/` found about 120 lines for symmetric walls, 750–800 for the
+  appendix, about 100 for the seam shifts with #50's, and three
+  refusals citing ownership; every downstream sizes its state as
+  `N^D`, and TreeGRRMHD carries a wall work-around of its own.
+- *The design, and Erik's decisions (2026-11-25).* "Closed blocks" in
+  [CODE.md](CODE.md#closed-blocks), proposed. Asked seven questions,
+  Erik chose:
+  - *The state is uniform and holds every copy*, `∏(N + c_d)` per
+    block. Set aside: every point once, in a state of non-uniform
+    blocks, which would make M20's appendix — index tables, an accessor
+    type, a discarded write — the layout of every vertex-like set,
+    bricks included; and the uniform state with a mask that lets the
+    right-hand side skip the copies, which saves most of the `D/N` work
+    for a branch or more launch groups on a device and leaves dead
+    entries in the state.
+  - *The fine block is the authority at a coarse-fine face*, over the
+    coarse one. Unifying is then copies and injections only, and
+    prolongation writes ghosts only; with the coarse block prolongation
+    would write into closed boxes in phase 2 and a fine block at a
+    refinement boundary would have slaved planes.
+  - *Half-open ownership is removed*, not kept as an option beside the
+    new partition.
+  - *The copies across a kinked glue are averaged*, replacing M20's
+    decision of 2026-11-23 to evolve them apart. Set aside: leaving
+    them independent, and making the lowest-numbered patch the primary,
+    which is not symmetric (6 × 10⁻⁶ in the prototype).
+  - *An outer wall is evolved unless the hook says it prescribes it.*
+    Set aside: always evolved, which would have every Dirichlet
+    downstream write the wall itself, and always prescribed, which
+    leaves no evolved wall for a radiative condition.
+  - *Unifying is a stage of its own in the fill*, to be measured on
+    Symmetry before it is settled, over merging it into phase 1 with
+    target ranges that depend on who is primary around each block.
+  - *`unify!` on a state vector is offered and optional*, over
+    requiring it in every right-hand side and over not offering it.
+- *After the first reading (2026-11-25).* Erik decided that
+  `restrict_interfaces!` becomes `unify!` on a flux set, which the
+  design had only proposed. He also pointed out that a reduction taking
+  each point once and a right-hand side skipping the secondaries are
+  the same query, and that the first cannot wait; the design had put
+  the second off as an optimization. So the primary mask is one
+  mechanism with both uses, built in step 1, and what is left to the
+  measurement is only whether `map_blocks!` skips by itself, by launch
+  range. Writing that out showed a gap in the prescribed wall: written
+  on every copy after stage 0, a relative hook's coarse and fine copies
+  of one wall point would have differed by the scheme's error. The hook
+  now writes the wall's primaries before stage 0, which carries them to
+  the other copies.
+- *One position per point (2026-11-25).* The design had left open that
+  the copies of a point see positions differing in the last bit, each
+  block forming `origin + (I − 1)h` from its own corner, and had kept
+  the cure out of M22 because it changes the last bit of every
+  position in the package. Erik took it in: positions are formed from
+  integer coordinates, `lo + k h`. Reading the downstreams for it
+  showed that their kernels form positions themselves, from
+  `block_origins` and `block_spacings`, so the rule reaches them only
+  through a public `nodeposition` and two more per-block arrays.
+- *What made closed ownership acceptable now.* M8 rejected it because
+  two copies at a coarse-fine face see different ghosts and drift, and
+  repairing that needed an exchange of `du`. The fill unifying `u`
+  before any read removes the feedback without one: the right-hand side
+  sees the unified state only, so a copy's deviation is integrated
+  along and never read ("Why copies cannot drift"). M8's other reason,
+  that a norm would count shared points twice, goes with the
+  trapezoid's weights.
 
 ## Downstream checks
 

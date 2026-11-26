@@ -25,6 +25,7 @@ tried, measurements that later ones replaced, and the milestone records
 - [Core concepts](#core-concepts)
   - [Blocks](#blocks)
   - [Centerings](#centerings)
+  - [Closed blocks](#closed-blocks)
   - [Tree structure](#tree-structure)
   - [Domain and boundaries](#domain-and-boundaries)
   - [Data layout](#data-layout)
@@ -169,7 +170,9 @@ depends on the centering *in that dimension* alone. A third kind,
 element; it is all-or-nothing across the dimensions, and is described
 under *The element centering* at the end of this section.
 
-**Shared points and half-open ownership**. A vertex-like
+**Shared points and half-open ownership**. *([Closed
+blocks](#closed-blocks) below proposes the replacement of this rule
+and of the work-arounds listed under it.)* A vertex-like
 dimension's boundary points are shared — block `b`'s point `N` is the
 next block's point `0` — and the state vector must hold every degree of
 freedom exactly once. In every dimension a block **owns its points
@@ -533,6 +536,369 @@ An element set couples across faces only, through what amounts to a
 mortar, which is how multi-block DG codes are built, and why it is the
 one set a cubed sphere's patch corners leave fillable (see "A
 multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
+
+### Closed blocks
+
+**(proposed)** *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the
+decisions are recorded under M22 in
+[HISTORY.md](HISTORY.md#m22--closed-blocks). Nothing of this section is
+implemented. It replaces "Shared points and half-open ownership" under
+[Centerings](#centerings), and everything this document derives from
+it, when it lands.)*
+
+**Why.** Half-open ownership is invisible at a same-level face inside a
+patch, where the right-hand side at a shared point is the same whoever
+computes it. It shows wherever ownership selects the *rule* that gives a
+point its value, and each such place has a rule that depends on which
+way an axis runs:
+
+- at a wall, the low plane is evolved and the high one is the hook's,
+  or derived, or clamped;
+- at a coarse-fine face, the fine block is the authority on its low
+  face and the coarse block on its high one, so a refined region is not
+  mirror-symmetric (4.7 × 10⁻⁵ in `test/walls_tests.jl`, 1.1 × 10⁻² in
+  TreeGRRMHD's refined closed box);
+- across a reversed axis — a half turn's `d2`, a glue's — the image of
+  an owned range is not owned;
+- at a patch corner, some points have no owner at all.
+
+Each has a work-around that adjusts target ranges case by case, and
+each is a field of `GroupKey`: `low` (symmetric walls), `top` (the
+appendix of a set interpolated across a glue), `shift` (the half turn's
+seam slab, with a third state once symmetries reach patches). Together
+with the appendix's own machinery they are about a thousand lines, and
+three refusals have ownership as their stated reason. Closed blocks
+remove the cause: the stored array of a vertex-like dimension, `G | N+1
+| G`, is symmetric under reversal already, and only the ownership drawn
+on it is not.
+
+**The model.** In a vertex-like dimension a block's **own range** is
+its closed range, `G+1 … G+N+1`: both boundary planes are the block's,
+with `G` ghosts beyond each. The stored layout does not change:
+
+| stored index `i` | role | count |
+|---|---|---|
+| `1 … G` | low ghosts | `G` |
+| `G+1 … G+N+c_d` | **own** (what the state vector holds) | `N + c_d` |
+| `G+N+c_d+1 … N+2G+c_d` | high ghosts | `G` |
+
+A point on a block face is then held by every block whose closed box
+contains it: it is a **shared point** with several **copies**. The
+state vector holds every copy, `∏_d (N + c_d)` values per block per
+variable, in block order, so that the layout stays uniform:
+`statearray` is a plain `reshape` to `(N+c_1, …, N+c_D, nvars,
+nblocks)`, `scatter!` and `gather!` are the shaped copies they are, and
+no accessor type or index table stands between a kernel and its data.
+Cell-centered and element sets (`c = 0`) are untouched. A face- or
+edge-centered set is closed along its staggers, which is the range its
+fluxes are computed over today (`closed = true`).
+
+The price is `(1 + 1/N)` per vertex-like dimension in the state and in
+the right-hand side's work, 9.7 % at `N = 32` in 3D, which is what
+`map_blocks!(…; appendix = true)` costs today. The alternatives — every
+point once in a state of non-uniform blocks, and a mask that lets the
+right-hand side skip the copies — are in HISTORY.md with the reasons
+they were set aside.
+
+**One value per point.** Every shared point has a *canonical value*,
+given by a rule that does not mention the orientation of an axis, and
+`fill_ghosts!` imposes it on every copy before anything reads one:
+
+1. *The finest level wins.* Where blocks of two levels hold a point
+   (2:1 balance, which counts edges and corners, allows no more), the
+   copies on the coarser blocks take the fine value by the set's own
+   restriction: injection along a vertex-like dimension, the
+   restriction stencil along a cell-like one. So a fine block evolves
+   its whole closed box, on all `2D` faces alike, reading prolongated
+   ghosts beyond a coarse-fine face, and a refined region is closed and
+   symmetric. Prolongation writes ghosts only.
+2. *Exact copies have one primary.* Among the finest copies, those
+   related by a map that carries the scheme into itself — neighbours in
+   one patch, a glue that copies, a rotating seam with its variable
+   map — are the same number for a covariant right-hand side. One of
+   them, the **primary**, is evolved in earnest, and the others, the
+   **secondaries**, are copied from it through the map. The primary is
+   the copy on the block that comes first in the forest's leaf order
+   (patch, then position on the curve). The choice is bookkeeping: it
+   decides which of several equal numbers is kept.
+3. *A point that is its own image is projected.* A point on a mirror
+   plane, or on a turn's axis, is unified with its image under the
+   symmetry's variable map, the mean of `Sᵏ u` over the symmetry's
+   powers, `(u + S u)/2` for a mirror: an odd
+   variable is zero on its mirror plane, an even one is untouched, and
+   a turned vector's in-plane components vanish on the axis.
+4. *Copies across a kinked glue are averaged.* Under `glue =
+   :interpolate` the patches holding a point evolve it by different
+   stencils, and their copies differ by the scheme's error. Each patch's
+   primary takes the mean over the patches holding the point, summed in
+   patch order. This is the prototype's "averaged right-hand sides"
+   coupling (M20 in HISTORY.md: stable at the dissipation the corners
+   need, mirror asymmetry 1 × 10⁻⁷), since the dynamics of a state whose
+   copies are averaged before every evaluation are those of the
+   averaged right-hand side. It requires the copies to be comparable
+   component by component, as the Cartesian components the patch
+   systems evolve are.
+5. *A prescribed wall is the hook's.* At an outer face the wall plane
+   is an ordinary own point by default: in the state, evolved, with the
+   hook filling the `G` ghosts beyond, on both sides alike. A hook may
+   declare that it prescribes the wall plane as well (a Dirichlet
+   condition), and then the fill writes it, on both sides alike: the
+   hook gives the wall's primaries their values, and rules 1 and 2
+   carry them to the other copies, so the copies of a prescribed point
+   are one number too.
+
+**Why copies cannot drift.** Write `U` for the map that imposes the
+canonical values; it is a projection, and linear but for a prescribed
+wall, whose values do not depend on the state's copies at all. A right-hand side
+evaluation scatters `u`, fills, and computes `du` from the working
+array, so it sees `U u` only: `du = k(U u)`, and for the linear
+combinations a Runge–Kutta method forms, `d(U u)/dt = U k(U u)`, a
+closed equation for the unified state. Whatever the state holds in the
+kernel of `U` — a secondary's deviation from its primary — is
+integrated along and never read. It grows at most linearly, by the
+scheme's error (the difference of two stencils' right-hand sides at one
+point), and it feeds nothing. That is what was missing in the closed
+ownership M8 rejected, where each copy was read by its own block and
+the copies drifted with feedback. The dynamics are those of the
+primaries, and they do not depend on what an application does with a
+secondary's `du`.
+
+**`unify!`** keeps the state itself tidy. `unify!(v, fs, schedule)`
+applies `U` to a state-shaped vector — `u`, or `du` at the end of a
+right-hand side — with copies, injections and the kinked glue's mean,
+and with one message round of face planes over a distributed forest.
+After it the secondaries of `du` are their primaries', so a state that
+starts unified stays so to rounding (exactly, where `U` copies). It is
+optional: without it nothing is wrong, and a secondary's state entry is
+meaningful only after `scatter!` and `fill_ghosts!`, which is how
+output and analysis read a state already ("Time integration"). The fill
+never trusts it: `fill_ghosts!` unifies on every call, because a state
+that was not unified would feed back. A prescribed wall's entries are
+the application's to write (zero, or the hook's time derivative). On a
+field set's working array it is `unify!(fs, schedule)`, stages A, P and
+0 alone, which is what a flux set needs (below).
+
+**One position per point.** The copies of a point must be at one
+position, bit for bit, or a right-hand side that reads it — a source
+term, a `1/r`, a gauge condition — gives them values that differ by
+rounding. Today a block forms a position from its own corner, `origin +
+(I − 1)h`, and `origin_A + N h` on one side of a face is not always the
+bits of `origin_B` on the other. Positions are formed from integers
+instead. Along each dimension a point has a coordinate `k`, counted
+from its patch's low face in units of its level's spacing: `k = b + I −
+1` for own index `I` of a block whose low corner is at `b = g N`, `g`
+the block's integer coordinate at its level. Its position is
+
+    lo + k·h              (vertex-like)
+    lo + (k + ½)·h        (cell-like)
+    lo + (b + q(P+1) + oᵢ)·h    (node i of element q)
+
+a multiplication and then an addition, never a fused one, which a
+device and a host would round differently. Every block holding a point
+at one level has the same `k`, `lo` and `h`; a level up `k` halves and
+`h` doubles, both exactly, so the product has the same bits; and an
+element's two face nodes at one position have the same integer part and
+the offsets `0` and `P + 1`. So every copy of a point is at one
+position, across blocks and levels, in every centering.
+
+`nodeposition` stays the only function that forms a position, and takes
+`lo`, `h` and `b` where it took `origin` and `h`. A block's corner is
+`lo + b·h` by the same rule, so `block_origin` is a node's position,
+`block_extent`s tile the domain bit for bit, and a domain's high face
+is at `lo + K·h` at every level, which may differ from the extent the
+forest was given in the last bit. What a kernel sees of the geometry
+gains two arrays indexed by block beside `block_spacings`, the patch's
+low corner and the block's integer corner (**(proposed)**
+`block_lows`, `block_bases`), and `nodeposition` becomes `public`:
+downstream kernels form positions from `block_origins` today, and get
+one position per point only through it. `block_origins` stays for what
+is not a node's position. The cost is an integer addition per position.
+
+With it a deterministic right-hand side gives the copies at a
+same-level face inside a patch the same `du` bit for bit, so on a
+uniform brick the state stays unified without `unify!`. It does not
+make a position and its mirror image exact negatives of each other,
+except about a plane at `lo = 0`. It changes the last bit of positions
+throughout, so numbers recorded in this document may move in their last
+digits.
+
+**The fill.** In order, each stage reading only what earlier ones wrote:
+
+| stage | writes | reads | messages |
+|---|---|---|---|
+| A (interpolated sets) | primaries at kinked glues | the same, through a buffer | one round |
+| P | self-image primaries | themselves | none |
+| W (a hook that prescribes walls) | wall primaries | the block's own primaries | none |
+| 0 | secondaries | primaries | one round |
+| 1 | ghosts: copies, restrictions | own points | one round |
+| hook | outer ghosts | as today | none |
+| glue | ghosts across a kinked glue | as today | one round |
+| 2 | ghosts: prolongations, by level | own points and ghosts | per group of levels |
+
+Stage 0 is race free for the reason phase 1 is: its sources, the
+primaries, are written by no transfer of the stage. Stage W runs
+before it and on primaries only, so that stage 0 carries a prescribed
+value to every copy, a coarse block's included; a relative hook reads
+the points beside the wall along its normal, which are held by the same
+blocks as the wall point and so are primaries of the same block.
+Stages 1 and 2
+write ghosts only and read closed boxes that are final, so the old
+invariant, "each reads only interior cells of other blocks", becomes
+"each reads only own points of other blocks", with nothing to exclude.
+Their target ranges are one symmetric partition per dimension — `1 …
+G`, `G+1 … G+N+c`, `G+N+c+1 … N+2G+c` — for every block, at a wall, a
+seam, a glue and a coarse-fine face alike. Stage 0's targets are the
+pieces of the closed box's boundary: per vertex-like dimension the low
+plane `G+1`, the open interior `G+2 … G+N` or the high plane `G+N+1`,
+not all interior. Its transfers are the kernel's copies and
+restrictions, mirrored, turned or across a glue as phase 1's are, and
+keyed as they are with one flag saying that the target is a piece of
+the box rather than the region beyond it. `low`, `shift` and `top`
+leave `GroupKey`.
+
+What stage 0 costs: in a uniform region it moves exactly the points
+phase 1 moves today as the first plane of every high region, so the
+fill copies the same number of points as before. What is new is a
+stage — in 3D about 7 groups of launches per level beside 26 — and a
+message round. **(open)** Whether that shows on the nested mesh at four ranks
+and on an H200 is to be measured before the partition is settled
+(`bench/nested.jl`, `bench/copies.jl`, `bench/mpi.jl`); the fallback is
+to merge stage 0 into phase 1, every transfer reading primaries only,
+at the price of target ranges that depend on who is primary around a
+block.
+
+**Walls.** A reflecting face mirrors the ghosts about the wall plane,
+`j* = 2(G+1) − j` below and `2(G+N+1) − j` above, and the wall is the
+block's own on both sides: an even variable is evolved there by a
+stencil whose two halves are images, and stage P sets an odd one to
+zero. The derived wall row, `wall_stencil` and mirror state 2 go. An
+outflow face clamps every ghost row to the wall row on both sides. An
+outer face is rule 5. `walls` leaves `FieldSet`, the schedule and the
+checkpoint: every wall is symmetric.
+
+**Seams.** The axis map reverses a stored index as `len + 1 − k`, which
+now carries an own range onto an own range, so a half turn's slab has
+the ordinary partition and `seam_shift` goes, in all its states. A
+seam's two planes are exact copies under the turn (rule 2), the axis is
+its own image (rule 3), and a norm counts the seam with half weight
+(below), so a quarter domain's norm is a quarter of the full one's.
+
+**Glues.** A glue that copies carries a closed range onto a closed
+range whatever it reverses and whichever faces it joins, so the two
+refusals of `check_glue_layout` go, and a turn need not join a low face
+to a low face. A set interpolated across a kinked glue has no appendix:
+the planes it owned there are every block's own. `AppendixArray`,
+`isowned`, `hasappendix`, `corelength`, `appendix_entries`, the
+`appendix` keywords of `statearray` and `map_blocks!`, and `FoldMask`
+go. "No refinement boundary at a glue" stays as it is, and so does the
+refusal of a patch corner's ghosts for a set that copies.
+
+**Regridding.** A transfer's target is the new block's closed box. A
+created fine block takes its face planes from its parent alone, whose
+closed box contains them; two created blocks agree on a common plane,
+since each parent's plane holds the same numbers. A created fine block
+beside a *kept* fine one does not: at the hanging nodes of their common
+plane the kept block holds evolved fine values and the created one
+interpolated ones. So `regrid!` ends its transfers with a pass in which
+a kept block's copy of a shared point replaces a created block's, and
+only then fills. (Today the plane goes to whichever block is the upper
+one.) Flagging sweeps the closed box, so a point on a face flags every
+block holding it, and a refinement criterion has no half-open bias.
+
+**Norms and reductions.** A volume-weighted reduction over a
+vertex-like dimension takes the trapezoid's weights within each block:
+½ at `I = 1` and at `I = N + 1`, 1 between, a product over the
+dimensions. Summed over the blocks every shared point then has its
+weight in the composite rule — two halves on an interior plane, a half
+at a wall, the fine and the coarse block's shares at a coarse-fine
+face — so `volume_weighted_norm` and `total_mass` need no mask and no
+topology, a constant is its own norm, and a domain cut by a mirror
+plane has exactly its share. `block_mapreduce`, `block_fold` and
+`mesh_mapreduce` visit every own point, which is right as it stands for
+`max`, `min` and their like; a sum or a count that must take each point
+once asks for the primaries only.
+
+**The primary mask** says which copies are primaries: one bit per piece
+of a block's closed box — along each vertex-like dimension its low
+plane, its open interior or its high plane, `3^D` pieces a block. One
+bit is enough because whether a block's copy is the primary is the same
+along a whole piece: a neighbour, coarser, level or finer, lies across
+all of a face or an edge, and a glue joins a whole face to a whole
+face. It is
+built from the forest's topology and the centering once per generation
+and kept in the field set, on its backend; it is also what the schedule
+builds stage 0 from, and at a kinked glue it marks the copy of the
+lowest patch. It has two uses, and they are the same query:
+
+- *A reduction that takes each point once.* `block_mapreduce`,
+  `block_fold` and `mesh_mapreduce` test it at each point when asked
+  to. **(proposed)** The keyword is required for a set with a
+  vertex-like dimension and has no default, since a sum that silently
+  counts a plane twice is the mistake to prevent.
+- *A right-hand side that skips the secondaries.* A kernel asks
+  `isprimary(mask, I…, b)`, as it asks `isowned` of an appendix today,
+  and returns early; the application passes the mask as it passes any
+  argument. The entries of `du` it leaves are then not defined, so
+  `unify!(du, …)` must follow, which gives every secondary its
+  primary's value: for such a right-hand side it is not optional. This
+  recovers most of the `D/N` that closed boxes cost, for a test per
+  point.
+
+**(open)** Whether `map_blocks!` should skip by itself, launching each
+block over the range of its primaries rather than testing per point —
+whole planes and whole rows, which is the form an explicitly vectorized
+kernel can use — is for the measurement of M22's step 6.
+
+**Invariants.** The high exchange region is `G` points, as the low one
+is, so its condition is `N ≥ 2G` in every dimension; whether anything
+else still needs `N ≥ 2G + 2` along a stagger is checked stencil by
+stencil when the builders change. Point-value prolongation still reads
+`p/2 − 1` planes past the face, `G ≥ p/2 − 1`.
+
+**What follows elsewhere.**
+
+- `map_blocks!` launches over the own range, and `closed` goes;
+  `interiorview` is the closed box and `closedview` goes; `staggers`
+  stays, for an application's own loops.
+- `interpolate!`'s windows are clamped into the closed box, centered
+  near a high face as near a low one.
+- **The interface restriction is `unify!`.** What
+  `restrict_interfaces!` does to a flux set
+  ([Conservation](#conservation-at-coarse-fine-faces)) is rule 1 on a
+  set without ghosts: the coarse copy of a point on a coarse-fine face
+  takes the fine values, injected along the stagger and averaged over
+  two cells across it. So `restrict_interfaces!(flux, isched)` becomes
+  `unify!(flux, s)`, and `InterfaceSchedule(flux)` becomes the
+  constructor of a schedule that holds stages A, P and 0 alone and
+  takes no `Operators`, its restriction being the one the geometry
+  fixes (**(proposed)** `UnifySchedule(fs)`); a `GhostSchedule` holds
+  the same stages built with its operators' restriction, and `unify!`
+  takes either. Three things change with it, each for the better:
+  - both sides of a face are treated alike, where the low side wrote an
+    owned plane and the high side a shared one;
+  - one stage and one message round replace a phase per face dimension,
+    since every secondary is written once, from its primary;
+  - an edge-centered set's coarse copies on a line that only a
+    *diagonal* finer block touches take the fine values as well, where
+    edge directions are left out today. Every block around an edge
+    then holds one electromotive force there, which is what a face
+    shared by two coarse blocks needs to evolve as one (TreeGRRMHD's
+    note on an edge owned by the diagonal coarse block).
+  It also copies between the two blocks of a same-level face, which
+  computed the same flux, so that they hold the same bits and
+  conservation there is exact rather than to rounding; that copy is
+  new work on a uniform mesh, a plane per face.
+- TreeIOHDF5 stores `(N+c_1, …, N+c_D, nvars, nblocks)` under a new
+  format feature, and decides what a file of half-open blocks becomes.
+- Every downstream sizes its state by `N .+ staggers(fs)` instead of
+  `N`, forms its kernels' positions through `nodeposition`, and
+  TreeGRRMHD's `walls_to_state!` and zeroed wall `du` go.
+- Symmetries on patches (M21) lose the shifted slab at a glued axis,
+  the turn's low-to-low rule and the appendix's part in both.
+
+**Open.**
+
+- Stage A's round for interpolated sets, beside stage 0's.
 
 ### Tree structure
 
