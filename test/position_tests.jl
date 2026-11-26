@@ -188,17 +188,16 @@ end
     # `coordinates` does not.
     forest = position_forest(T, D)
     for (C, P) in position_cases(D)
-        # The flagging sweep (M22 step 6) on a refined mesh (step 3).
-        vertexlike(C) && (pending(6, "kernels form coordinates' positions, $C, D=$D, $T");
-                          continue)
         fs = position_set(forest, D, C, P; G=1)
         fill_by_coordinates!((x, v) -> x[v], fs)
         N = forest.N
         @test all(b -> all(I -> ntuple(v -> fs.work[(Tuple(I) .+ fs.G)..., v, b], D) ===
                                 coordinates(fs, b, Tuple(I) .+ fs.G),
-                           CartesianIndices(ntuple(_ -> N, D))), 1:nblocks(fs))
+                           CartesianIndices(ntuple(d -> N + staggers(fs)[d], D))),
+                   1:nblocks(fs))
         mismatch(acc, p) = acc + (p.u === p.x ? 0 : 1)
-        @test mesh_fold(mismatch, +, 0, fs) == 0
+        # Every copy of a shared point (M22): a count of mismatches over all.
+        @test mesh_fold(mismatch, +, 0, fs; primaries=false) == 0
         @test sum(TreeAMR._block_fold(mismatch, +, 0, fs.work, fs, fs.G, 1:D, nothing,
                                       4)) == 0
         @test sum(first, firing_boxes((w, idx, b, x) ->

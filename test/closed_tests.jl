@@ -7,7 +7,7 @@
 
 using TreeAMR: UNIFY_TAG, PHASE1_TAG, primary_bits, piece_copies, piece_primary,
                facekind, ReflectingFace, ntransfers,
-               closed_pieces, run_group!
+               closed_pieces, run_group!, touching_cells
 
 # The vertex-like centerings, and a cell-centered control.
 closed_centerings(D) = vcat([vertexcentered(D)], [facecentered(D, d) for d in 1:D],
@@ -1011,8 +1011,11 @@ end
     vs = FieldSet(uniform, 1; G=1, centering=vertexcentered(2))
     @test_throws "M22 step 6" regrid!(uniform, vs => GhostSchedule(vs, ops);
                                       flags=fill(Keep, 4))
-    @test_throws "M22 step 6" firing_boxes((w, i, b, x) -> true, vs)
     quad = Forest((2, 2); N=8, rotating=(1, 2))
+    @test_throws "M22 step 7" firing_boxes((w, i, b, x) -> true,
+                                           FieldSet(quad, 1; G=1,
+                                                    centering=vertexcentered(2),
+                                                    rotation=(1,)))
     @test_throws "M22 step 7" GhostSchedule(FieldSet(quad, 1; G=1,
                                                      centering=vertexcentered(2),
                                                      rotation=(1,)), ops)
@@ -1026,4 +1029,49 @@ end
     @test_throws "own range" map_blocks!((args...) -> nothing, vs; closed=true)
     @test_throws "appendix" statearray(statevector(vs), vs; appendix=true)
     @test_throws "wall must be" CellBoundary((x, v, δ) -> 0.0; wall=:symmetric)
+end
+
+@testset "Flagging over the closed box is mirror-symmetric: D=$D" for D in (1, 2, 3)
+    # Guards the half-open bias in flagging (M22 step 6): a vertex-like
+    # dimension's firing nodes give the cells touching them, so a pattern
+    # mirror-symmetric across the domain's mid-plane gives mirror-image
+    # boxes, and through the buffer a mirror-symmetric forest. A clamp of
+    # node `N + 1` to cell `N` would recruit the high neighbour of a node
+    # at `I = N` and not the low one of its image at `I = 2`.
+    N = 8
+    @test all(lo -> all(hi -> touching_cells(lo, hi, N, 1) ==
+                              (N + 1) .- reverse(touching_cells(N + 2 - hi, N + 2 - lo, N, 1)),
+                        lo:(N + 1)), 1:(N + 1))
+    @test touching_cells(3, 5, N, 0) == 3:5
+    mirror(e) = (1 - e[2], 1 - e[1])               # about x₁ = 1/2
+    shape(forest) = Set(map(k -> (mirror(block_extent(forest, k)[1]),
+                                  Base.tail(block_extent(forest, k))...),
+                            forest.leaves)) ==
+                    Set(map(k -> block_extent(forest, k), forest.leaves))
+    # Dyadic positions and a pattern in `(x₁ − 1/2)²`, exact at every node,
+    # that fires near the mid-plane and in a ring off it.
+    f(x) = (x[1] - 0.5)^2 + sum(d -> (x[d] - 0.25)^2, 2:D; init=0.0)
+    fires(w, idx, b, x) = (y = w[idx..., 1, b]; y < 1 / 64 || 9 / 64 < y < 10 / 64)
+    for C in (vertexcentered(D), facecentered(D, 1)), buffer in (0, 1, 2)
+        forest = Forest(ntuple(_ -> 4, D); N=N, extents=ntuple(_ -> (0.0, 1.0), D))
+        for round in 1:2
+            fs = FieldSet(forest, 1; G=1, centering=C)
+            fill_by_coordinates!((x, v) -> f(x), fs)
+            boxes = firing_boxes(fires, fs)
+            @test any(g -> g[1] > 0, boxes) && any(g -> g[1] == 0, boxes)
+            # Each block's box is the mirror image of its image block's.
+            ext = [block_extent(forest, k) for k in forest.leaves]
+            for b in eachindex(ext)
+                m = findfirst(==((mirror(ext[b][1]), Base.tail(ext[b])...)), ext)
+                (nb, box), (nm, mbox) = boxes[b], boxes[m]
+                @test nb == nm
+                nb == 0 || @test box == ((N + 1) .- reverse(mbox[1]), Base.tail(mbox)...)
+            end
+            flags = [n == 0 ? Keep : (level(forest.leaves[b]) < 2 ? Refine : Keep, box)
+                     for (b, (n, box)) in enumerate(boxes)]
+            regrid!(forest, (fs => nothing,); flags=flags, buffer=buffer)
+            @test shape(forest)
+        end
+        @test maxlevel(forest) == 2
+    end
 end

@@ -96,14 +96,17 @@ end
     b, l = divrem(g - 1, W) .+ 1
     # `x0`, not `lo`: `lo` is the firing box below.
     x0, B, h = lows[b], bases[b], spacings[b]
-    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    # Every own point: `N + 1` along a vertex-like dimension, its closed
+    # range (M22), so that a point on a face fires in every block holding
+    # it.
+    cells = CartesianIndices(ntuple(d -> N + C[d], Val(D)))
 
     n = 0
-    lo = ntuple(_ -> Int32(N + 1), Val(D))
+    lo = ntuple(_ -> Int32(N + 2), Val(D))
     hi = ntuple(_ -> Int32(0), Val(D))
     for k in l:W:length(cells)
         c = Tuple(cells[k])
-        i = ntuple(d -> c[d], Val(D))                  # owned index, 1:N
+        i = ntuple(d -> c[d], Val(D))                  # own index, 1:N+c
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
         # The same expression `coordinates` forms, per centering.
         x = ntuple(d -> nodeposition(x0[d], h, B[d], i[d], C[d], nodes), Val(D))
@@ -137,13 +140,22 @@ end
 """
     firing_boxes(fires, fs::FieldSet) -> Vector{Tuple{Int,NTuple{D,UnitRange{Int}}}}
 
-Per block, how many interior cells satisfied `fires` and the bounding
-box of those cells, in that block's own interior indices `1:N`. The
+Per block, how many own points satisfied `fires` and the bounding box of
+the cells they lie in, in that block's own cell indices `1:N`. Along a
+cell-like dimension that is the box of the firing cells; along a
+vertex-like one, whose points are the `N + 1` nodes of the closed range
+(M22, "Closed blocks" in `CODE.md`), it is **the cells touching a firing
+point**: for firing nodes `lo … hi` the cells `max(1, lo − 1) … min(N,
+hi)`. That box is mirror-symmetric — the mirror image of a firing
+pattern gives the mirror image of its box — and a node on a face fires
+in every block holding it, so a face point flags both sides alike and
+the buffer reaches across neither face more than the other. The
+
 blocks are the ones this rank stores (see [`blockrange`](@ref)), so over
 a distributed forest the result is this rank's part of the flags, which
 is what [`regrid!`](@ref) takes; nothing is communicated.
 
-`fires(work, idx, b, x) -> Bool` is evaluated at every **owned** point of
+`fires(work, idx, b, x) -> Bool` is evaluated at every **own** point of
 every block from a kernel, so it runs on the field set's backend and
 must be a pure function of its arguments. `work` is the whole working
 array, `idx` the point's **stored** index (so `work[idx..., v, b]` reads
@@ -181,13 +193,7 @@ tree rather than the data.
 """
 function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
-    # A set with a vertex-like dimension owns its closed range (M22), and
-    # the flagging sweep covers it in step 6, with the regrid transfer.
-    any(==(:vertex), fs.centering) && throw(ArgumentError(
-        "firing_boxes does not yet sweep a set with a vertex-like dimension " *
-        "(centering $(fs.centering)): such a set owns its closed range, both boundary " *
-        "planes (\"Closed blocks\" in CODE.md), and flagging over the closed box " *
-        "comes with regridding in M22 step 6"))
+    check_closed_blocks(forest, fs.centering, "firing_boxes")
     backend = get_backend(fs.work)
     n = nblocks(fs)
     n == 0 && return Tuple{Int,NTuple{D,UnitRange{Int}}}[]   # a rank without blocks
@@ -211,11 +217,21 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
                                  ndrange=n)
     synchronize(backend)
 
+    c = staggers(fs)
     hc, hlo, hhi = tohost(counts), tohost(los), tohost(his)
-    return [(Int(hc[b]),
-             ntuple(d -> hc[b] == 0 ? (1:0) : Int(hlo[b][d]):Int(hhi[b][d]), D))
+    return [(Int(hc[b]), ntuple(d -> hc[b] == 0 ? (1:0) :
+                                     touching_cells(Int(hlo[b][d]), Int(hhi[b][d]),
+                                                    forest.N, c[d]), D))
             for b in 1:n]
 end
+
+# The cells of a block touching the firing points `lo … hi` along one
+# dimension: the points themselves along a cell-like one, and along a
+# vertex-like one the cells on either side of each firing node, `max(1,
+# lo − 1) … min(N, hi)`, so that node `I` and its mirror image `N + 2 −
+# I` give mirror-image boxes (`firing_boxes`).
+touching_cells(lo::Int, hi::Int, N::Int, c::Int) =
+    c == 1 ? (max(1, lo - 1):min(N, hi)) : (lo:hi)
 
 # Whatever a flagging function reported, reduced to its flag and to the
 # box of firing cells. An omitted box means the whole interior — the

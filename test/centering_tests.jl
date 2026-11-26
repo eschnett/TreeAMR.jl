@@ -218,11 +218,12 @@ end
     # that agreement, so comparing against what it stored is transitive.
     forest = nested_forest(Val(D); N=8)
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(6, "flagging kernel position, $C, D=$D"); continue)
         fs = FieldSet(forest, 1; G=1, centering=C)
         fill_by_coordinates!((x, v) -> x[1], fs)
         agrees(work, idx, b, x) = work[idx..., 1, b] == x[1]
-        @test all(g -> g[1] == forest.N^D, firing_boxes(agrees, fs))
+        # Every own point, `N + 1` along a vertex-like dimension (M22).
+        own = prod(d -> forest.N + staggers(C)[d], 1:D)
+        @test all(g -> g == (own, ntuple(_ -> 1:forest.N, D)), firing_boxes(agrees, fs))
     end
 end
 

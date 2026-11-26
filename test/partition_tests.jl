@@ -97,12 +97,12 @@ end
             # The per-block reductions are per local block.
             @test block_mapreduce(abs, max, 0.0, fs; primaries=false) ==
                   block_mapreduce(abs, max, 0.0, sfs; primaries=false)[range]
+            fires(work, idx, b, x) = x[1] < 0.6 * sum(serial.extents[1])
+            @test firing_boxes(fires, fs) == firing_boxes(fires, sfs)[range]
         end
         @test reduce(vcat, collect.(ranges); init=Int[]) == collect(1:n)
         P > n && @test count(isempty, ranges) == P - n
     end
-    # The flagging sweep of a vertex-like set comes back in M22 step 6.
-    pending(6, "firing_boxes per local block, $C, D=$D")
 end
 
 @testset "A rank's schedules hold exactly the serial transfers local to it: D=$D" for
