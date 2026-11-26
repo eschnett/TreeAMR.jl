@@ -113,9 +113,11 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     across = fs.glue !== :interpolate
     chunks = threadchunks(nb)
     perpairs = [TransferPairs{D}() for _ in chunks]
+    memos = [UnifyMemo{D}() for _ in chunks]
     threaded_chunks(nb) do c, range
         for b in range
-            unify_sources!(perpairs[c], forest, stags, offset + b; acrossglue=across)
+            unify_sources!(perpairs[c], forest, stags, offset + b; acrossglue=across,
+                           memo=memos[c])
         end
     end
     pairs = TransferPairs{D}()

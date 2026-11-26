@@ -497,6 +497,14 @@ keyorder(k::GroupKey) =
      k.span)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
+# Hashed through `keyorder`, the kind by its rank: the default hash of a
+# struct with a `Symbol` field calls `objectid`, which the schedule build,
+# a lookup a transfer, spent a quarter of its time in. Equal keys have
+# equal `keyorder`s, so this is a hash `==` agrees with; the order of a
+# `Dict` of keys changes, which nothing depends on (`keyorder` lays out
+# the messages).
+Base.hash(k::GroupKey, h::UInt) = hash(keyorder(k), h ⊻ 0x5ca1ab1e6b0ccc01)
+
 # --- Distributed stages (M7) ----------------------------------------------
 #
 # Over a forest distributed between ranks a transfer whose target and
@@ -1518,10 +1526,13 @@ function block_sources!(pairs::TransferPairs{D},
                         boundaries::Vector{BoundaryRegion{D}},
                         forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
                         b::Int, dirs; interpolated::Bool=false,
-                        glueregions::Vector{GlueRegion{D}}=GlueRegion{D}[]) where {D}
+                        glueregions::Vector{GlueRegion{D}}=GlueRegion{D}[],
+                        memo=nothing, bitsout=nothing) where {D}
     k = forest.leaves[b]
     N = forest.N
     zerooffset = ntuple(_ -> 0, D)
+    # What the search finds here, stage 0's search of the block reads again.
+    table = any(==(1), c) ? NeighbourTable(forest, b; acrossglue=!interpolated) : nothing
     for δ in dirs
         record!(kind, offset, lvl, s, via::Crossing; dir=δ, span=nospan(Val(D))) =
             push!.(get!(pairs, GroupKey{D}(kind, dir, offset, lvl, ntuple(_ -> Int8(0), D),
@@ -1549,13 +1560,17 @@ function block_sources!(pairs::TransferPairs{D},
             continue
         end
         crossing, nbrs = oriented_neighbors(forest, k, δ)
+        entry = table === nothing ? nothing : remember!(table, δ, crossing, nbrs)
         if isempty(nbrs)
             push!(boundaries, boundary_region(forest, k, b, δ, region, G, c))
             continue
         end
         nblevel = level(first(nbrs))
         if nblevel == level(k)
-            record!(:copy, zerooffset, 0, find_leaf(forest, only(nbrs)), crossing)
+            # The leaf the table found, where there is one: one tree query.
+            leaf = entry === nothing || isempty(entry[2]) ? find_leaf(forest, only(nbrs)) :
+                   only(entry[2])[1]
+            record!(:copy, zerooffset, 0, leaf, crossing)
         elseif nblevel < level(k)
             # Coarser neighbor: this block's ghosts are prolongated. The
             # stencil geometry depends on where this block sits inside
@@ -1584,7 +1599,13 @@ function block_sources!(pairs::TransferPairs{D},
         end
     end
     # The secondaries of the block's closed box, from their primaries (M22).
-    any(==(1), c) && unify_sources!(pairs, forest, c, b; acrossglue=!interpolated)
+    if table !== nothing
+        bits = unify_sources!(pairs, forest, c, b; acrossglue=!interpolated, memo=memo,
+                              table=table)
+        # The block's `primary_bits`, for stages W and P (`(bits, i)`: into
+        # `bits[i]`).
+        bitsout === nothing || (bitsout[1][bitsout[2]] = bits)
+    end
     return nothing
 end
 
@@ -1669,6 +1690,17 @@ closed_pieces(c::NTuple{D,Int}) where {D} =
 closed_subpieces(c::NTuple{D,Int}, N::Int) where {D} =
     Iterators.product(ntuple(d -> c[d] == 0 ? (1, 3) : N == 2 ? (0, 2, 4) : (0:4), D)...)
 piece_class(sub::Integer) = sub == 0 ? 0 : sub == 4 ? 2 : 1
+
+# The same sub-pieces as a concretely typed list, in the order
+# `closed_subpieces` iterates them (dimension 1 fastest): a product of
+# tuples of unequal lengths does not infer, and the search walks it for
+# every block.
+function subpiece_list(c::NTuple{D,Int}, N::Int) where {D}
+    vals = ntuple(d -> c[d] == 0 ? (1, 3, 0, 0, 0) : N == 2 ? (0, 2, 4, 0, 0) :
+                       (0, 1, 2, 3, 4), D)
+    counts = ntuple(d -> c[d] == 0 ? 2 : N == 2 ? 3 : 5, D)
+    return [ntuple(d -> vals[d][I[d]], D) for I in vec(CartesianIndices(counts))]
+end
 piece_of(sub::NTuple{D,Int}) where {D} = map(piece_class, sub)
 
 # A sub-piece of a piece, at which the piece's primary is decided: any
@@ -1722,15 +1754,25 @@ function neighbours(t::NeighbourTable{D}, δ::NTuple{D,Int}) where {D}
     i = 1 + sum(ntuple(d -> (δ[d] + 1) * 3^(d - 1), D))
     e = t.entries[i]
     e === nothing || return e
-    crossing, nbrs = oriented_neighbors(t.forest, t.forest.leaves[t.j], δ)
-    if isempty(nbrs) || (crossing.glue != 0 && !t.acrossglue)   # no copy across
-        e = (-1, Tuple{Int,NTuple{D,Int},Int}[], Crossing())
+    return remember!(t, δ, oriented_neighbors(t.forest, t.forest.leaves[t.j], δ)...)
+end
+
+# Enter the neighbours `nbrs` across `crossing` that the search found for
+# the table's block in direction `δ`, as `neighbours` would have looked
+# them up: the ghost search (`block_sources!`) hands the table what it
+# found, so that stage 0's search of the same block asks the tree again
+# only along the directions the ghost search skipped.
+function remember!(t::NeighbourTable{D}, δ::NTuple{D,Int}, crossing::Crossing,
+                   nbrs::Vector{MortonKey{D}}) where {D}
+    i = 1 + sum(ntuple(d -> (δ[d] + 1) * 3^(d - 1), D))
+    e = if isempty(nbrs) || (crossing.glue != 0 && !t.acrossglue)   # no copy across
+        (-1, Tuple{Int,NTuple{D,Int},Int}[], Crossing())
     else
-        e = (level(first(nbrs)),
-             Tuple{Int,NTuple{D,Int},Int}[(find_leaf(t.forest, nbr),
-                                           seam_offset(t.forest, nbr, crossing),
-                                           Int(crossing.turns)) for nbr in nbrs],
-             crossing)
+        (level(first(nbrs)),
+         Tuple{Int,NTuple{D,Int},Int}[(find_leaf(t.forest, nbr),
+                                       seam_offset(t.forest, nbr, crossing),
+                                       Int(crossing.turns)) for nbr in nbrs],
+         crossing)
     end
     t.entries[i] = e
     return e
@@ -1740,10 +1782,13 @@ end
 # vertex-like dimensions of staggers `c` is finer: where none is, every
 # sub-piece of a piece has the primary its piece has.
 function hasfiner(t::NeighbourTable{D}, c::NTuple{D,Int}) where {D}
-    steps = ntuple(d -> c[d] == 1 ? (-1, 0, 1) : (0,), D)
-    return any(Iterators.product(steps...)) do δ
-        !all(iszero, δ) && neighbours(t, δ)[1] > t.level
+    for m in 0:(3^D - 1)
+        δ = ntuple(d -> (m ÷ 3^(d - 1)) % 3 - 1, D)
+        any(d -> δ[d] != 0 && c[d] == 0, 1:D) && continue
+        all(iszero, δ) && continue
+        neighbours(t, δ)[1] > t.level && return true
     end
+    return false
 end
 
 function piece_copies(t::NeighbourTable{D}, sub::NTuple{D,Int},
@@ -1894,30 +1939,135 @@ end
 # of its own level, keyed by the direction to it, or a restriction from a
 # finer one, keyed by the direction to the finer block's parent node and
 # the finer block's child offset in it — merged as `merged_transfers`
-# says, and keyed by the spans each writes.
+# says, and keyed by the spans each writes. With a `memo`
+# (`UnifyMemo`), a block whose neighbourhood a block before it had
+# (`neighbourhood_signature`) takes that block's transfers, its sources
+# mapped to its own neighbours: the same transfers, in the same order, as
+# the search would find, found without it. Returns the block's
+# `primary_bits`, which the search decides on the way.
 function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
-                        b::Int; acrossglue::Bool=true) where {D}
-    entries = StageEntry{D}[]
-    lvl = level(forest.leaves[b])
-    t = NeighbourTable(forest, b; acrossglue=acrossglue)
-    # Without a finer neighbour a piece's sub-pieces share its primary,
-    # decided once a piece.
-    bypiece = !hasfiner(t, c)
-    cache = Dict{NTuple{D,Int},PieceCopy{D}}()
-    for sub in closed_subpieces(c, forest.N)
-        all(==(1), piece_of(sub)) && continue       # the open interior: no copies
-        slvl, s, scls, δ, o, r, _, _, g = bypiece ?
-            get!(() -> piece_primary(piece_copies(t, sub, c)), cache, piece_of(sub)) :
-            piece_primary(piece_copies(t, sub, c))
-        s == b && scls == piece_of(sub) && continue
-        push!(entries, (sub, slvl == lvl ? :copy : :restrict, s, δ, o, r, g))
+                        b::Int; acrossglue::Bool=true, memo=nothing,
+                        table=NeighbourTable(forest, b; acrossglue=acrossglue)) where {D}
+    t = table
+    sig = memo === nothing ? nothing : neighbourhood_signature(t, c)
+    if sig !== nothing
+        key, leaves = sig
+        found = get(memo, key, nothing)
+        if found !== nothing
+            transfers, bits = found
+            out = [(kind, leaves[l + 1], δ, o, r, g, spans)
+                   for (kind, l, δ, o, r, g, spans) in transfers]
+            # The order `merged_transfers` would give these sources: by
+            # source among the groups, a group's own order kept.
+            sort!(out; by=x -> (kindrank(x[1]), x[2], x[3], x[4], x[5], x[6]),
+                  alg=Base.Sort.MergeSort)
+            push_unify!(pairs, b, out)
+            return bits
+        end
     end
-    allowed = closed_subpieces(c, forest.N).iterators
-    for (kind, s, δ, o, r, g, spans) in merged_transfers(entries, allowed)
+    out, bits = unify_transfers(t, c)
+    if sig !== nothing
+        key, leaves = sig
+        label = Dict(j => i - 1 for (i, j) in enumerate(leaves))
+        memo[key] = ([(kind, label[s], δ, o, r, g, spans)
+                      for (kind, s, δ, o, r, g, spans) in out], bits)
+    end
+    push_unify!(pairs, b, out)
+    return bits
+end
+
+function push_unify!(pairs::TransferPairs{D}, b::Int, out) where {D}
+    for (kind, s, δ, o, r, g, spans) in out
         key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(r), g, spans)
         push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
     end
     return nothing
+end
+
+# The transfers of stage 0 into `t`'s block, as `merged_transfers` gives
+# them, found by the search, and the block's `primary_bits`, decided at
+# each piece's representative as `primary_bits` decides them.
+function unify_transfers(t::NeighbourTable{D}, c::NTuple{D,Int}) where {D}
+    forest = t.forest
+    b = t.j
+    entries = StageEntry{D}[]
+    lvl = t.level
+    # A piece none of whose copies is finer shares its primary with all of
+    # its sub-pieces (under 2:1 balance either every point of a piece has a
+    # finer copy or none has), decided once, at its representative; the
+    # sub-pieces of a piece facing finer blocks are decided each.
+    shared = fill(0, 3^D)                           # 0 unknown, 1 shared, 2 each
+    primaries = Vector{PieceCopy{D}}(undef, 3^D)
+    bits = UInt32(0)
+    for sub in subpiece_list(c, forest.N)
+        cls = piece_of(sub)
+        i = piece_index(cls) + 1
+        if shared[i] == 0
+            copies = piece_copies(t, piece_representative(cls, c), c)
+            primaries[i] = piece_primary(copies)
+            shared[i] = all(x -> x[1] == lvl, copies) ? 1 : 2
+            _, s, scls, _ = primaries[i]
+            s == b && scls == cls && (bits |= UInt32(1) << (i - 1))
+        end
+        all(==(1), cls) && continue                 # the open interior: no copies
+        slvl, s, scls, δ, o, r, _, _, g = shared[i] == 1 ? primaries[i] :
+                                          piece_primary(piece_copies(t, sub, c))
+        s == b && scls == cls && continue
+        push!(entries, (sub, slvl == lvl ? :copy : :restrict, s, δ, o, r, g))
+    end
+    return merged_transfers(entries, closed_subpieces(c, forest.N).iterators), bits
+end
+
+# Stage 0's transfers of the blocks searched so far, by neighbourhood
+# (`neighbourhood_signature`): per transfer `(kind, source label,
+# direction, offset, orientation, axes, spans)`, and the block's
+# `primary_bits`, in which the block is label 0. One a task of the build,
+# so that no two tasks write one; what it holds is a function of the
+# neighbourhood alone, so the schedule does not depend on how the blocks
+# were dealt out.
+const UnifyMemo{D} = Dict{Vector{Int},
+                         Tuple{Vector{Tuple{Symbol,Int,NTuple{D,Int},NTuple{D,Int},Int,
+                                            Int8,NTuple{D,Int8}}},UInt32}}
+
+# What stage 0's transfers into `t`'s block depend on, as a key and the
+# leaves its labels stand for, or `nothing` where a neighbour lies across
+# a rotating seam or a glue that copies. `unify_transfers` reads the
+# block only through its neighbour table, along the directions of its
+# vertex-like dimensions (staggers `c`; the forest's `N` is the same for
+# every block of a build): per direction, the neighbours' level relative
+# to the block's (`-1` where there is none to copy from, across an outer,
+# reflecting or outflow face, or a glue the set is interpolated at), and
+# each neighbour as a label, `0` for the block itself and the others
+# numbered as they first occur, with its child offset as the block sees
+# it. Positions, classes and patches enter its decisions only to compare
+# copies, which off a seam and a glue are all at the block's position in
+# its patch, so they need not enter the key; across a seam or a glue they
+# do, so such a block is searched, never memoised. Two blocks with one key
+# get the same transfers with their sources relabelled.
+function neighbourhood_signature(t::NeighbourTable{D}, c::NTuple{D,Int}) where {D}
+    leaves = [t.j]
+    # Flat, as integers, so that the key hashes and compares fast: per
+    # direction the level code and the number of neighbours, then per
+    # neighbour its label and its child offset.
+    key = Int[]
+    # Every direction along the vertex-like dimensions, dimension 1 fastest,
+    # counted in base 3 rather than as a product of unequal tuples, which
+    # does not infer.
+    for m in 0:(3^D - 1)
+        δ = ntuple(d -> (m ÷ 3^(d - 1)) % 3 - 1, D)
+        any(d -> δ[d] != 0 && c[d] == 0, 1:D) && continue
+        all(iszero, δ) && continue
+        lvl, nbrs, via = neighbours(t, δ)
+        iscrossing(via) && return nothing
+        push!(key, lvl < 0 ? -1 : lvl - t.level + 1, length(nbrs))
+        for (leaf, o, _) in nbrs
+            l = findfirst(==(leaf), leaves)
+            l === nothing && (push!(leaves, leaf); l = length(leaves))
+            push!(key, l - 1)
+            append!(key, o)
+        end
+    end
+    return key, leaves
 end
 
 # A secondary sub-piece's source, as `merged_transfers` takes it:
@@ -1996,7 +2146,7 @@ end
 # not write. It needs `N ≥ 2`, which every layout has.
 function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
                        G::NTuple{D,Int}, c::NTuple{D,Int}, j::Int, b::Int;
-                       acrossglue::Bool=true) where {D}
+                       acrossglue::Bool=true, bits=nothing) where {D}
     k = forest.leaves[j]
     N = forest.N
     outer = ntuple(D) do d
@@ -2007,7 +2157,7 @@ function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
         (lo, hi)
     end
     any(o -> o[1] || o[2], outer) || return walls
-    bits = primary_bits(forest, j, c; acrossglue=acrossglue)
+    bits = bits === nothing ? primary_bits(forest, j, c; acrossglue=acrossglue) : bits
     for cls in closed_pieces(c)
         δ = ntuple(d -> cls[d] == 0 && outer[d][1] ? -1 : cls[d] == 2 && outer[d][2] ? 1 : 0,
                    D)
@@ -2448,14 +2598,14 @@ end
 # variables has no stage P.
 function selfimage_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
                             j::Int, b::Int,
-                            parities::Vector{NTuple{D,Parity}}) where {D}
+                            parities::Vector{NTuple{D,Parity}}; bits=nothing) where {D}
     any(==(1), c) || return nothing
     k = forest.leaves[j]
     face(d, s) = wall_direction(forest, k, ntuple(e -> e == d ? s : 0, D))[2][d]
     refl = ntuple(d -> c[d] == 1 ? (face(d, -1) == ReflectingFace,
                                      face(d, 1) == ReflectingFace) : (false, false), D)
     any(r -> r[1] || r[2], refl) || return nothing
-    bits = primary_bits(forest, j, c)
+    bits = bits === nothing ? primary_bits(forest, j, c) : bits
     bystate = Dict{NTuple{D,Int8},Vector{NTuple{D,Int}}}()
     for cls in closed_pieces(c)
         (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
@@ -2984,11 +3134,16 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     perboundaries = [BoundaryRegion{D}[] for _ in chunks]
     interpolated = glue === :interpolate && ispatched(forest)
     perglue = [GlueRegion{D}[] for _ in chunks]
+    # Stage 0's transfers by neighbourhood, a memo a task (`UnifyMemo`).
+    memos = [UnifyMemo{D}() for _ in chunks]
+    # And each block's `primary_bits`, which stages W and P read.
+    allbits = zeros(UInt32, nb)
     threaded_chunks(nb) do c, range
         for b in range
             block_sources!(perpairs[c], perboundaries[c], forest, ghosts, stags,
                            offset + b, dirs;
-                           interpolated=interpolated, glueregions=perglue[c])
+                           interpolated=interpolated, glueregions=perglue[c],
+                           memo=memos[c], bitsout=(allbits, b))
         end
     end
 
@@ -3079,7 +3234,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     if any(==(1), stags)
         for b in 1:nb
             wall_regions!(wallregs, forest, ghosts, stags, offset + b, b;
-                          acrossglue=!interpolated)
+                          acrossglue=!interpolated, bits=allbits[b])
         end
     end
     bplan = BoundaryPlan(backend, T, forest, boundaries, order, wallregs)
@@ -3107,7 +3262,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     ppairs = TransferPairs{D}()
     if closed
         for b in 1:nb
-            selfimage_sources!(ppairs, forest, stags, offset + b, b, parity)
+            selfimage_sources!(ppairs, forest, stags, offset + b, b, parity;
+                               bits=interpolated ? nothing : allbits[b])
         end
     end
     selfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol, axesof)

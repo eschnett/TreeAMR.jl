@@ -1415,3 +1415,55 @@ end
         @test same && bad == 0
     end
 end
+
+@testset "Stage 0's memo by neighbourhood gives the search's transfers: D=$D" for D in (2, 3)
+    # Guards the memo of the schedule build (`neighbourhood_signature`,
+    # `UnifyMemo`): a block takes the transfers of an earlier block with
+    # its neighbourhood, its sources relabelled, so the key must hold
+    # everything the search reads. Two blocks that share a key must get
+    # the search's own transfers from the memo, and blocks that differ in
+    # one item each — a neighbour's level, which neighbours are the same
+    # leaf, a finer neighbour's child offset, an outer face for a block
+    # across, a neighbour across a rotating seam — must not share one; and
+    # over every forest here, in block order with one memo, each block's
+    # transfers and mask bits must be the search's.
+    using_memo(f, c, j, memo) = (p = TreeAMR.TransferPairs{D}();
+                                 bits = TreeAMR.unify_sources!(p, f, c, j; memo=memo);
+                                 (p, bits))
+    signature(f, c, j) = TreeAMR.neighbourhood_signature(TreeAMR.NeighbourTable(f, j), c)
+    c = ntuple(_ -> 1, D)
+    # Two interior blocks of a periodic brick share a key.
+    brick = Forest(ntuple(_ -> 4, D); N=4, periodic=ntuple(_ -> true, D))
+    @test signature(brick, c, 1)[1] == signature(brick, c, 7)[1]
+    memo = TreeAMR.UnifyMemo{D}()
+    using_memo(brick, c, 1, memo)
+    @test length(memo) == 1
+    @test using_memo(brick, c, 7, memo) == using_memo(brick, c, 7, nothing)
+    # One item different each.
+    nested = nested_forest(Val(D); N=4)
+    levels = [level(k) for k in nested.leaves]
+    fine = findfirst(==(maximum(levels)), levels)
+    coarse = findlast(==(minimum(levels)), levels)
+    one = Forest(ntuple(d -> d == 1 ? 1 : 2, D); N=4, periodic=ntuple(_ -> true, D))
+    two = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
+    outer = Forest(ntuple(_ -> 2, D); N=4)
+    seam = Forest(ntuple(_ -> 2, D); N=4, rotating=(1, 2))
+    pairs_ = [("a neighbour's level", (nested, fine), (nested, coarse)),
+              ("the same leaf twice", (one, 1), (two, 1)),
+              ("an outer face", (outer, 1), (two, 1)),
+              ("a finer neighbour's offset", (nested, fine), (nested, fine + 1))]
+    for (what, (f1, j1), (f2, j2)) in pairs_
+        s1, s2 = signature(f1, c, j1), signature(f2, c, j2)
+        @test s1 !== nothing && s2 !== nothing && s1[1] != s2[1]
+    end
+    @test signature(seam, c, 1) === nothing
+    # Every block of every forest, one memo in block order.
+    forests = vcat(closed_forests(D), refined_forests(D),
+                   [("brick", brick), ("seam", seam)])
+    for (name, f) in forests, cc in (c, ntuple(d -> d == 1 ? 1 : 0, D))
+        memo = TreeAMR.UnifyMemo{D}()
+        @test all(j -> using_memo(f, cc, j, memo) == using_memo(f, cc, j, nothing) &&
+                       using_memo(f, cc, j, nothing)[2] == primary_bits(f, j, cc),
+                  eachindex(f.leaves))
+    end
+end
