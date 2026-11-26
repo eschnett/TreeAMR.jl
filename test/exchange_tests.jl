@@ -193,13 +193,14 @@ end
     # an identity, so every rank's working array, ghosts included, must
     # equal the serial fill on its blocks bit for bit, the boundary hook
     # between the stages included. Two things could break that silently:
-    # a pack that applied the parity factor would turn the serial fill's
-    # `−0` from a mirrored zero into `+0` (so the data has an odd
-    # variable that is zero, and the test asserts that `−0` occurs and
-    # that mirrored transfers do cross ranks), and an unpack `0 + 1·x`
-    # that is not the identity on an element type — the reason for
-    # `Float32x2`, whose limbs must survive it. A rank with no blocks
-    # takes part too.
+    # a pack that applied the parity factor twice, which the mirrored
+    # transfers that cross ranks show on every nonzero value, and an
+    # unpack `0 + 1·x` that is not the identity on an element type — the
+    # reason for `Float32x2`, whose limbs must survive it. A mirrored zero
+    # is `+0` (the factor path adds `+0` after the factor, so that a fill
+    # is bitwise idempotent: the review's decision in M22 step 6), and the
+    # serial fill holds no `−0` at all, which is asserted. A rank with no
+    # blocks takes part too.
     nnegzero = nmirror = 0
     ran = false
     for kinds in EXCHANGE_KINDS[D]
@@ -234,12 +235,9 @@ end
             end
         end
     end
-    # MultiFloats' product returns `+0` for `0 · (−1)`, so the serial fill
-    # has no `−0` to preserve in `Float32x2`; what that type checks is
-    # that `0 + 1·x` returns the limbs of every value a pack produces.
-    # (Vacuous where every centering run here is pending, as in Float32
-    # in 3D, which runs the vertex-centered set alone: M22 step 4.)
-    T === Float32x2 || !ran || @test nnegzero > 0
+    # What `Float32x2` checks is that `0 + 1·x` returns the limbs of every
+    # value a pack produces.
+    @test nnegzero == 0
     # In 1D every mirrored region is the block's own reflection, which is
     # always local; from 2D on an edge region's mirror image lies in a
     # tangential neighbor, which may be another rank's.

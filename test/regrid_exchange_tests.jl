@@ -410,12 +410,9 @@ end
         buffers = [x for st in sched.stages if st.remote !== nothing
                    for x in st.remote.buffers[nvars]]
         ghosts_handed = copy(comm.handed)
-        # The same fill again, now that the mirrors exist. Bit for bit but
-        # for the sign of a zero: stage P writes an odd variable on a wall
-        # as its value times 0 (M22 step 4), whose sign is the value's.
+        # The same fill again, now that the mirrors exist.
         fill_ghosts!(fs, sched; boundary=hook)
-        again = size(fs.work) == size(work) &&
-                all(map((x, y) -> x === y || (iszero(x) && iszero(y)), fs.work, work)) &&
+        again = bitwise_equal(fs.work, work) &&
                 all(splat(===), zip(mirrors, [m for st in sched.stages
                                               if st.remote !== nothing
                                               for m in st.remote.mirrors[nvars]]))

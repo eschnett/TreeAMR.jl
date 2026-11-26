@@ -360,8 +360,14 @@ end
     end
 end
 
+# A transfer's value times its factor (a parity sign, a turn's sign, or
+# stage P's `(1 + σ)/2`), with `+ 0` after it: a factor of `-1` or `0`
+# applied to `+0`, or to a value of the other sign, would give `-0`, whose
+# sign depends on the data's history, and a fill applied twice would then
+# differ from once in the sign of a zero. `x + 0` is `+0` for `x = ±0` and
+# `x` otherwise, NaN included, and IEEE forbids folding it away.
 @inline scaled(acc, ::Nothing, v, col) = acc
-@inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
+@inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col] + zero(acc)
 
 @kernel function transfer_kernel!(shape, dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
