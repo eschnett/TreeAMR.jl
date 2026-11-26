@@ -109,7 +109,7 @@ function transfers(forest, groups, stages)
     return "$total balanced $balanced"
 end
 transfers(forest, s::GhostSchedule) =
-    transfers(forest, [s.phase1; reduce(vcat, s.phase2; init=eltype(s.phase1)[])],
+    transfers(forest, [s.unify; s.phase1; reduce(vcat, s.phase2; init=eltype(s.phase1)[])],
               s.stages)
 transfers(forest, s::InterfaceSchedule) =
     transfers(forest, reduce(vcat, s.phases; init=eltype(eltype(s.phases))[]), s.stages)
@@ -288,6 +288,28 @@ function fill_case(tag, forest::Forest{D}, centerings; G, ops,
         restrict_interfaces!(fs, isched)
         emit(tag, name, "interfaces", transfers(forest, isched))
         emit(tag, name, "restricted", digest(gathered(forest, fs.work)))
+    end
+    return nothing
+end
+
+# `unify!` on a state vector of pseudorandom copies (M22): every
+# secondary takes its primary's value, through one message round where
+# the primary's block is another rank's; the state, gathered, and the
+# count of points that changed, which a wrong primary would change.
+function unify_case(tag, forest::Forest{D}) where {D}
+    for (name, C) in ("vertex" => vertexcentered(D), "face1" => facecentered(D, 1))
+        fs = FieldSet(forest, 2; G=1, centering=C)
+        sched = GhostSchedule(fs, OPS2)
+        u = statevector(fs)
+        offset = first(blockrange(forest)) - 1
+        A = statearray(u, fs)
+        for b in 1:nblocks(fs), v in 1:2, I in CartesianIndices(size(A)[1:D])
+            A[I, v, b] = 2 * (hash((offset + b, Tuple(I), v)) / typemax(UInt64)) - 1
+        end
+        before = copy(u)
+        unify!(u, fs, sched)
+        changed = TreeAMR.allgather(forest.comm, count(u .!= before))
+        emit(tag, name, "unified", digest(gathered(forest, u)), sum(changed))
     end
     return nothing
 end
@@ -1575,6 +1597,18 @@ function main()
     pending_case("A2", 6)
     pending_case("M", 6)
     moving_blocks_case("M32x2-", Float32x2; full=false)
+    # Closed blocks (M22 step 2), uniform: the vertex-centered wave in a box
+    # of outer faces, its walls evolved, and on a periodic box one root
+    # wide along x, whose blocks are their own neighbours there; every
+    # vertex-like centering through one fill; and `unify!` on a state.
+    wave_case("U2v", forest_of((3, 3), 8); G=1, centering=vertexcentered(2), ops=OPS4,
+              steps=6)
+    wave_case("U2p", forest_of((1, 3), 8; periodic=(true, true)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6)
+    fill_case("U3", forest_of((2, 2, 3), 4; periodic=(true, false, false)),
+              ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
+               "edge1" => edgecentered(3, 1)); G=1, ops=OPS2)
+    unify_case("UU", forest_of((3, 2), 8; periodic=(false, true)))
     # Point interpolation, routed to the owners and back.
     interpolate_case("I2")
     # Located batches on a forest of patches (M19): through an atlas,

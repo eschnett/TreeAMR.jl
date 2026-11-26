@@ -5510,6 +5510,64 @@ M12 was decided with Erik, after M7 and before M9b.
   `nodeposition`'s pieces. Against this checkout, from scratch copies,
   TreeWave passes 349 tests in 1m38 and TreeIOHDF5 1088 in 2m36 (its
   pin widened to 0.2.12 in the copy).
+- *Step 2, the layout, the uniform fill and outer faces (2026-11-25).*
+  Implemented on `m22` in seven commits after a written plan Erik
+  reviewed: the refusals of what later steps rebuild and the pending
+  tests; the half-open work-arounds deleted (symmetric walls' trim, the
+  half turn's shifted slab, the appendix with `AppendixArray`,
+  `isowned`, `corelength`, `hasappendix`, `appendix_entries` and
+  `FoldMask`); the closed own range with stage 0 and the symmetric
+  partition; the primary mask and the reductions; `unify!`; stage W and
+  `CellBoundary(…; wall)`; the workloads and documents. Erik's decisions
+  on the plan: the piece in the key rather than one flag, accepted; the
+  primary's order by global leaf position, never a rank-local index,
+  tested over simulated ranks; the self-neighbour case verified rather
+  than assumed; `walls = :symmetric` refused for a vertex-like set rather
+  than left inert; `wall = :evolved` the default, because the wall is in
+  the state; `primaries` required and without a default for a vertex-like
+  set; the removed keywords (`closed`, `appendix`) throwing with what
+  replaced them; `N ≥ 2G + 2` kept until step 3. What the code showed
+  against the design:
+  - *One flag does not key a unify transfer.* Along a dimension with
+    `δ_d = 0` the target may be any piece: a block's high face plane
+    along `e` takes its value from the block beside it along `d`, at the
+    same index. `GroupKey.piece` holds the target piece's class per
+    dimension, `-1` for every other transfer.
+  - *A ghost-free vertex-like dimension has no hook region.* Under
+    half-open ownership a flux set's high wall plane was the hook's; on
+    closed blocks the wall is its own, and its fill is stage 0 alone. The
+    same takes away the patch-corner refusal of such a dimension, whose
+    test is pending until step 8.
+  - *`fill_by_coordinates!` agrees across copies at one position only.*
+    Across a periodic wrap the copies of a point are a period apart, and
+    a callback gets each its own position; the done-when item holds for
+    the copies at one position, which every shared point inside a period
+    is.
+  - *The relative hook's lockstep helper* ran the boundary hook after the
+    first stage; with stage 0 first it runs after phase 1.
+  - *A cell-centered assertion changed with a deleted name*: the element
+    set's `closedranges == interiorranges` is now `interiorranges` against
+    a cell set's, and the glue test's appendix length is the state length.
+  - *A doctest of what a later step rebuilds* — the rotating
+    `RotationPair` of face-centered sets in `docs/src/index.md` — is a
+    plain example until step 7.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes at
+  eight threads and at one, in five processes, 157,109 tests and 934
+  pending (Broken) in each, 4m35 and 4m22, both MPI jobs included;
+  `test/closed_tests.jl` among them (3,465 tests), which checks every
+  done-when item on the CPU, flat against shaped, and over simulated
+  ranks, and the MPI workload's U2v, U2p, U3 and UU cases, which check
+  them at two and three ranks against the serial run. The docs build and
+  their doctests pass. `gpu_tests.jl` with `closed_tests.jl` on Metal
+  (Float32) passes, 5,353 tests and 99 pending in 4m49. Compile time of
+  `test/mpi_workload.jl` (`--trace-compile-timing`, three alternating
+  rounds against `m22`'s head, 7d99187): 53.6, 53.0 and 52.4 s with 1384,
+  1368 and 1368 roots against 71.2, 71.7 and 72.0 s with 1764; not a
+  measure of the change, since the branch's workload has 22 cases pending
+  and 4 new. The pending tests by step, as call sites: step 3, 26 whole
+  testsets and 19 loops' vertex-like iterations, 4 workload cases; step 4,
+  13 and 20, 8; step 6, 12 and 10, 12; step 7, 22 and 18, 11; step 8, 26
+  and 8, 4.
 
 ## Downstream checks
 

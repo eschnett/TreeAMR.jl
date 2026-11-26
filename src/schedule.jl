@@ -598,9 +598,17 @@ The precomputed ghost exchange for one forest, replayed by
 
 The phasing follows `CODE.md`:
 
+- `unify` (M22, "Closed blocks" in `CODE.md`), for a layout with a
+  vertex-like dimension, holds stage 0: the copies that give every
+  secondary copy of a shared point, on a face plane of a block's closed
+  box, its primary's value. Each reads a primary, which no transfer of
+  the stage writes, so the stage is race free; it runs before phase 1,
+  alone, and `stateunify` holds the same transfers for `unify!` on a
+  state. A hook that prescribes the wall writes the wall's primaries
+  before it (`BoundaryPlan.walls`, stage W).
 - `phase1` holds all same-level copies and all restrictions. Each reads
-  only *interior* cells of other blocks and writes only ghosts, so the
-  whole phase is race free and order independent. For an
+  only *own* points of other blocks, final after stage 0, and writes
+  only ghosts, so the whole phase is race free and order independent. For an
   element-centered set (M16) it holds the prolongations too, which read
   owned points only (see *Element sets* below).
 - `phase2` holds the prolongations, grouped by target level and ordered
@@ -615,8 +623,8 @@ The phasing follows `CODE.md`:
   `boundaryplan` is the same information batched by region shape and
   resident on the backend, which is what the cell-wise hook form
   ([`CellBoundary`](@ref)) is launched over;
-- `stages` is the order [`fill_ghosts!`](@ref) runs them in: phase 1,
-  then one stage per phase-2 target level, each an
+- `stages` is the order [`fill_ghosts!`](@ref) runs them in: stage 0
+  where there is one, phase 1, then one stage per phase-2 target level, each an
   [`ExchangeStage`](@ref TreeAMR.ExchangeStage). Serially a stage's
   local groups are exactly `phase1` or one entry of `phase2`, and it has
   no messages. Over a forest distributed between ranks (M7), `phase1`,

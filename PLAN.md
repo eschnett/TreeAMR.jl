@@ -633,33 +633,16 @@ Steps:
    formed by `nodeposition` from integer coordinates ("Positions" under
    [Centerings](CODE.md#centerings)); the record is M22 step 1 in
    [HISTORY.md](HISTORY.md#m22--closed-blocks).
-2. **The layout, the uniform fill and outer faces.** The own range;
-   the state functions, `map_blocks!` and `fill_by_coordinates!` over
-   it; the trapezoid weights; the primary mask on one level, with the
-   reductions that take each point once and `isprimary`; stage 0's
-   same-level copies and the symmetric ghost partition; the hook at an
-   outer face, the wall evolved or prescribed (stage W); `unify!` on a
-   field set and on a state vector; `GroupKey` without `low`, `shift`
-   and `top`. The plan settles: how a unify transfer is keyed and where
-   `transfer_stage` puts it; the primary of a point a block shares
-   with itself across a periodic wrap; how `unify!` runs the fill's
-   groups on a state-shaped array; how a hook declares that it
-   prescribes the wall; the mask's layout on a backend. *Done when*, on
-   uniform meshes, periodic and with outer faces, in `D = 1, 2, 3` and
-   for every centering:
-   - every copy of a point is equal bit for bit after a fill from
-     random data, and `fill_by_coordinates!` leaves every copy equal
-     without a fill;
-   - the test wave equation converges at the orders recorded under
-     [Operators](CODE.md#operators), and a box with outer faces is
-     mirror-symmetric to rounding, its two walls evolved alike and
-     prescribed alike;
-   - a constant is its own norm, and a count over a set is its number
-     of distinct points;
-   - the wave run with a kernel that skips the secondaries and
-     `unify!(du, …)` is the run that computes them, bit for bit at the
-     primaries, and with `unify!(du, …)` alone the state stays unified
-     to rounding.
+2. **The layout, the uniform fill and outer faces** — done on `m22`:
+   the closed own range, stage 0 and the symmetric partition, the
+   primary mask with the reductions that take each point once and
+   `isprimary`, the trapezoid's weights, `unify!`, and the hook at an
+   outer face, the wall evolved or prescribed (stage W), on uniform
+   meshes with periodic and outer faces; what later steps rebuild is
+   refused until then, its tests pending. The design text is under
+   [Closed blocks](CODE.md#closed-blocks) (*What step 2 implements*),
+   the record, with what the code corrected in the design, is step 2 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
 3. **Coarse-fine faces.** Stage 0's injections, the mask across
    levels, prolongation into ghosts only, on meshes refined once and
    left alone; the interface restriction as `unify!` on a flux set,

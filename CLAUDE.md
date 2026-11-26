@@ -390,21 +390,18 @@ the one that says why.
   explicitly to whatever builds a stencil or a position, and form every
   position through `nodeposition` ("Centerings", *The element
   centering*).
-- **A set interpolated across a glue owns an appendix.** Under `glue =
-  :interpolate` the blocks' glued high face planes follow the cores in
-  the state vector: a new state-layer function must handle them, behind
-  `Base.inferencebarrier`, since the switch is a run-time field. Leaves
-  on a glued face, and those a glue stencil reads, keep their level
-  through `regrid!` ("Finite differences across a glue").
-- **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
-  block at a low domain face has its own range start at `G+2` along that
-  vertex-like dimension; the trim is part of `GroupKey` ("Centerings").
-- **A half turn shifts its seam slab.** Across a half-turn seam (M14) a
-  vertex-like `d2` has the target's partition one plane up, so that each
-  region is the image of one real block's owned points; the shift is
-  part of `GroupKey`. Read the seam through `seam_plane`, `ishalfturn`
-  and `seam_keywords`, never `forest.rotating` raw, whose second entry
-  is negative for a half turn ("Rotating seams", *Half turns*).
+- **Closed blocks (M22, on this branch).** A vertex-like dimension owns
+  its closed range, `G+1 … G+N+1`; the state holds every copy of a
+  shared point, `∏(N + c_d)` per block. Stage 0 of the fill gives every
+  secondary its primary's value (the copy on the first leaf, by *global*
+  leaf position), keyed by `GroupKey.piece`; the ghost stages use the
+  symmetric partition. A sum or a count over such a set takes
+  `primaries = true`. What later steps rebuild (two levels, reflecting
+  and outflow faces, `regrid!`, seams, glues) is refused with the step's
+  name, and its old code errors if reached: do not route around a
+  refusal ("Closed blocks", and the pending tests in
+  `test/helpers/pending.jl`). Read the seam through `seam_plane`,
+  `ishalfturn` and `seam_keywords`, never `forest.rotating` raw.
 - **Reflecting and outflow faces are transfers, not hooks**, and
   **rotating seams are oriented transfers**; the boundary hook sees only
   outer faces ("Domain and boundaries", "Ghost filling"). The face kinds

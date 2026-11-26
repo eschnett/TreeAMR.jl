@@ -102,8 +102,10 @@ through the application's atlas, physical ones ([`locate`](@ref),
 [`ElementPolynomial`](@ref)). M20, implemented in TreeAMR and awaiting
 TreeWave's use, fills a finite-difference set's ghosts across a glue by
 interpolation through the atlas, for the kinked maps of a cubed sphere
-(`glue = :interpolate` on a [`FieldSet`](@ref)). Next is visualization
-export (M9b).
+(`glue = :interpolate` on a [`FieldSet`](@ref)). M22, closed blocks, is
+being built on the branch `m22`, which this documentation describes:
+step 2, the closed layout on uniform meshes with periodic and outer
+faces, is implemented there. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -175,12 +177,14 @@ familiar names are spellings of that tuple — [`cellcentered`](@ref),
 and the stencil for dimension `d` depends on the centering in *that*
 dimension alone.
 
-A vertex-like dimension stores one plane more: the boundary plane a block
-**shares** with its high-side neighbor. Ownership is half-open — a block
-owns its points `0 … N−1` in every dimension, whatever the centering — so
-the state vector still holds `N^D` values per block per variable, and the
-shared plane is filled by the exchange exactly as a ghost is. A flux
-therefore needs no ghosts at all, only that one extra plane:
+A vertex-like dimension stores one plane more, and its blocks are
+**closed** (M22, on the `m22` branch): a block owns both of its face
+planes, `N + 1` points, so a point on a block face is held by every block
+that touches it, and the state vector holds every copy, `∏(N + c_d)`
+values per block per variable. One copy, on the block first in the
+forest's leaf order, is the primary, and every ghost fill first gives the
+others its value ([`isprimary`](@ref), [`unify!`](@ref)). A flux
+therefore needs no ghosts at all, only its own faces:
 
 ```jldoctest overview
 julia> flux = FieldSet(forest, 2; G = (0, 0), centering = facecentered(2, 1));
@@ -189,20 +193,22 @@ julia> size(flux.work)
 (9, 8, 2, 7)
 ```
 
-At a non-periodic face of the domain this makes the two walls of a
-vertex-like dimension differ: the high wall plane belongs to nobody and
-the fill derives it, while the low one is owned and evolved. A field set
-built with `walls = :symmetric` has the fill write the owned low wall
-too, by the rule the high wall gets at a face of that kind, so that a
-closed box stays mirror-symmetric; the state vector does not change.
+At an outer face of the domain both walls of a vertex-like dimension are
+own points, alike: evolved by default, with the boundary hook filling the
+ghosts beyond, or prescribed by the hook,
+`CellBoundary(g; wall = :prescribed)`. A closed box is therefore
+mirror-symmetric. A sum or a count over such a set says whether it takes
+each point once, `primaries = true`, and the norms weight a face plane by
+a half. Until later steps of M22 a set with a vertex-like dimension is
+refused on a mesh with two levels, at reflecting or outflow faces, across
+a rotating seam or a glue, and by `regrid!`.
 
-[`interiorview`](@ref) returns the owned points and [`closedview`](@ref)
-the owned points plus the shared plane — a block's `N+1` faces in the
-staggered dimension, which is what a flux kernel launched with
-`map_blocks!(...; closed = true)` writes. A third launch range,
+[`interiorview`](@ref) returns the own points — a block's `N+1` faces in
+a staggered dimension, which is what a flux kernel launched with
+`map_blocks!` writes. A second launch range,
 `map_blocks!(...; stored = true)`, covers every stored point, ghosts
 included; there the kernel's global index *is* the stored index, while
-the other two hand out an offset into the owned range that the kernel
+the default hands out an offset into the own range that the kernel
 shifts by `G`.
 
 In a vertex-like dimension the inter-grid operators change with it:
@@ -415,21 +421,19 @@ julia> fs.work[1, 2, :, 1]            # ρ = |x|² and v = x, turned from (0.125
 A set whose layout is not symmetric under exchanging `d1` and `d2` — a
 face-centered `B_x` beside `B_y`, as in constrained transport — turns
 into its partner, so the two are filled together as a
-[`RotationPair`](@ref), each `rotation` naming the partner's variables:
+[`RotationPair`](@ref), each `rotation` naming the partner's variables.
+(On the `m22` branch a set with a vertex-like dimension is refused over a
+rotating seam until M22's step 7, so this example does not run there.)
 
-```jldoctest rotating
-julia> a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),
-                    rotation = (-1,));                                  # B_x
-
-julia> b = FieldSet(quadrant, 1; G = (2, 1), centering = facecentered(2, 2),
-                    rotation = (1,));                                   # B_y
-
-julia> fill_by_coordinates!((x, v) -> -x[2], a); fill_by_coordinates!((x, v) -> x[1], b);
-
-julia> fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops)));
-
-julia> coordinates(a, 1, (2, 1)), a.work[2, 1, 1, 1]   # B = (−y, x) beyond the low face of y
-((0.0, -0.375), 0.375)
+```julia
+a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),
+             rotation = (-1,))                                          # B_x
+b = FieldSet(quadrant, 1; G = (2, 1), centering = facecentered(2, 2),
+             rotation = (1,))                                           # B_y
+fill_by_coordinates!((x, v) -> -x[2], a); fill_by_coordinates!((x, v) -> x[1], b)
+fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops)))
+coordinates(a, 1, (2, 1)), a.work[2, 1, 1, 1]   # B = (−y, x) beyond the low face of y:
+                                                # ((0.0, -0.375), 0.375)
 ```
 
 Regridding ([`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref) take
@@ -543,7 +547,7 @@ face set's closed range, restrict them at coarse-fine faces, then apply
 the divergence.
 
 ```julia
-map_blocks!(flux_kernel!, flux, ...; closed = true)   # N+1 faces per dimension
+map_blocks!(flux_kernel!, flux, ...)                  # N+1 faces per dimension
 restrict_interfaces!(flux, isched)                    # the fixup
 map_blocks!(divergence_kernel!, state, ...)
 ```

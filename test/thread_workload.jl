@@ -280,6 +280,39 @@ pending_case("D2ovq", 7)
 # face, with the vertex-centered seam slab partitioned one plane up.
 pending_case("D2ovh", 7)
 
+function closed_workload(::Val{D}; roots, N, periodic, steps) where {D}
+    forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> periodic, D),
+                    extents=ntuple(_ -> (0.0, 1.0), D))
+    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
+    initial = workload_pulse(D, 1.0, 0.35, 0.08, 0.0)
+    fill_by_coordinates!(initial, fs)
+    schedule = GhostSchedule(fs, OPS4)
+    boundary = periodic ? nothing : boundary_by_coordinates(initial)
+    tag = "C$(D)$(periodic ? "p" : "o")v"
+    println(tag, " schedule ", schedule)
+    u = statevector(fs)
+    gather!(u, fs)
+    rk4!(u, fs, schedule, 0.25 * minimum_spacing(forest), steps, Val(D), Val(fs.G),
+         boundary)
+    println(tag, " state ", digest(u))
+    unify!(u, fs, schedule)
+    println(tag, " unified ", digest(u))
+    scatter!(fs, u)
+    fill_ghosts!(fs, schedule; boundary=boundary)
+    println(tag, " work ", digest(vec(fs.work)))
+    println(tag, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
+    println(tag, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
+    println(tag, " fold ", workload_fold(fs, u))
+    return nothing
+end
+
+# Closed blocks (M22 step 2): stage 0's copies, the symmetric partition
+# and the hook at an outer face, on uniform vertex-centered boxes, the
+# evolution without a regrid, and `unify!` on the state; the norms take
+# the trapezoid's weights and the folds each point once.
+closed_workload(Val(2); roots=4, N=8, periodic=false, steps=12)
+closed_workload(Val(3); roots=2, N=4, periodic=true, steps=4)
+
 # --- element sets (M16) ----------------------------------------------------
 #
 # No evolution — an element scheme lives downstream — but an element

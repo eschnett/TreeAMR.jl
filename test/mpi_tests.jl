@@ -134,9 +134,11 @@ end
     @test 0 < parse(Int, split(only(filter(startswith("I2.F64 excluded"), lines)))[3]) < 301
     words(prefix) = split(only(filter(startswith(prefix * " "), lines)))
     # Three levels wherever they were asked for, and four in the nested
-    # octant, whose three prolongation levels run as one group.
+    # octant, whose three prolongation levels run as one group; the closed
+    # blocks' cases (U…, M22) are uniform.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p") &&
+                                                    !startswith(l, "U") &&
                                                     !startswith(l, "E2") &&
                                                     !startswith(l, "N3") &&
                                                     !startswith(l, "P") &&

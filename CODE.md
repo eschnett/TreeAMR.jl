@@ -10,8 +10,13 @@ implemented and accepted by TreeWaveOLDG, and awaits its release. M19,
 interpolation on element sets and forests of patches, has TreeAMR's
 steps 1–7 implemented; TreeWaveOLDG's acceptance remains. M20, finite
 differences on patches, has TreeAMR's step 4 implemented — ghosts
-interpolated across a glue and closed ownership's appendix; TreeWave on
-the patch systems remains. Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+interpolated across a glue; TreeWave on the patch systems remains. M22,
+closed blocks, is being built on the integration branch `m22`: step 1
+(positions from integer coordinates) is done, and step 2 — the closed
+layout, stage 0 and the primary mask on uniform meshes with periodic and
+outer faces — is implemented there; what later steps rebuild is refused
+for a set with a vertex-like dimension until then (the list is under
+[Closed blocks](#closed-blocks)). Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -170,105 +175,48 @@ depends on the centering *in that dimension* alone. A third kind,
 element; it is all-or-nothing across the dimensions, and is described
 under *The element centering* at the end of this section.
 
-**Shared points and half-open ownership**. *([Closed
-blocks](#closed-blocks) below proposes the replacement of this rule
-and of the work-arounds listed under it.)* A vertex-like
+**Shared points and closed ownership** (M22 step 2; the design and what
+later steps add are under [Closed blocks](#closed-blocks)). A vertex-like
 dimension's boundary points are shared — block `b`'s point `N` is the
-next block's point `0` — and the state vector must hold every degree of
-freedom exactly once. In every dimension a block **owns its points
-`0 … N−1`**, whatever the centering; the boundary point `N` belongs to the
-neighbor on that side. Geometrically a point belongs to the block whose
-half-open cell box contains it, and those boxes tile the domain exactly,
-so the rule is unambiguous at edges, corners and across levels with no
-tie-breaking. Consequences:
+next block's point `0` — and every block owns them: its **own range** in
+every dimension is its closed range, `0 … N` along a vertex-like
+dimension, `N + 1` points, and `0 … N − 1` along a cell-like one. A point
+on a block face is then held by every block whose closed box contains
+it, as several **copies**; one of them, the copy on the block first in
+the forest's leaf order (by global leaf position, the lower face plane
+where a block is its own neighbour across a periodic dimension of one
+root), is the **primary**, and the fill gives every other copy, a
+**secondary**, its value before anything reads one (stage 0, under
+[Ghost filling](#ghost-filling)). Consequences:
 
-- The state layout is `N^D` per block per variable for *every*
-  centering; `statelength`, `scatter!`, `gather!`, `statearray`,
-  `map_blocks!` and `volume_weighted_norm` do not change.
-- The non-owned boundary plane is stored and filled by the exchange
-  exactly as a ghost is — copy, prolongation or restriction — and the
-  block needs it: as a stencil source for its last owned point, and as
-  the place where its own high-face flux lives.
-- At a non-periodic boundary the domain's *upper* boundary points belong
-  to nobody; they are the first plane of an outward-facing region and the
-  boundary hook fills them, while the lower boundary points are owned and
-  evolved. A vertex-centered application with physical boundaries sees
-  this asymmetry; a periodic domain has no boundary and none. At a
-  *reflecting* upper face the exchange derives the wall points instead
-  of the hook (see [Ghost filling](#ghost-filling)), and the
-  asymmetry remains: the low wall evolves, the high one interpolates.
-  Accepted as the default: treating both boundary planes alike *in the
-  ownership* would have the lowest blocks own `N − 1` points in that
-  dimension and the uniform state layout would be gone.
-- **Symmetric walls** (`FieldSet(…; walls = :symmetric)`, TreeGRRMHD's
-  AMR-8) remove the asymmetry without touching ownership: the low wall
-  plane stays owned and in the state vector, and the fill writes it, by
-  the rule the high wall gets at a high face of that kind — the hook at
-  an outer face (the low region becomes `1 … G+1`), the derivation at a
-  reflecting one (a mirrored wall stencil reading `G+2 …`), the clamp at
-  an outflow one (from the nearest evolved point, `G+2`). A closed box is
-  then mirror-symmetric; under half-open walls it is not, by an error of
-  the scheme's order (1.3e−4 in a 16³ blast after three steps, measured
-  by TreeGRRMHD). The set opts in because the fill then writes owned
-  points, which an application must expect: it gathers the filled wall
-  into its state after the fill if it wants it there. Per field set,
-  since it is a property of what the set stores, and carried by the
-  schedule as `G` and the centering are; a schedule built for the other
-  kind is refused. A cell-like dimension has no wall plane.
-  *How.* For a block whose low face along a vertex-like dimension is a
-  domain face — one with no block across it, so outer, reflecting or
-  outflow, never periodic nor a rotating seam — the low region along it
-  is `1 : G+1` and the block's own range `G+2 : G+N`, the halved low
-  half included: the mirror image of the high side, where the wall is
-  the first plane of the high region. Widening the low region alone would
-  not do: the tangential regions of the other directions also cover
-  `G+1`, so two regions would write it in one phase, and a phase-1 copy
-  would read it while it is written. With the trim, copies and
-  restrictions read only `G+2 …` there, as they read only up to `G+N` on
-  the high side. The trimmed ranges differ from an interior block's with
-  the same direction and offset, so `GroupKey` carries a per-dimension
-  `low` flag, and it is part of the key's order, which is the message
-  layout's. `regrid!` is untouched: its targets are owned ranges, and the
-  wall is state. *Symmetric to what.* On a uniform mesh the fill is
-  mirror-symmetric bit for bit, except where two derived walls meet in a
-  corner (two reflecting vertex-like dimensions), whose four-term stencil
-  the two corners sum in mirrored order, to rounding. On a mesh refined
-  somewhere a vertex-like set is not mirror-symmetric under either kind
-  of wall, and AMR-8 does not change that: a plane on a coarse-fine face
-  is the fine block's owned plane when the face is its low face, and the
-  coarse block's, interpolated at the fine points between the coarse
-  ones, when it is its high face (4.7 × 10⁻⁵ on a refined unit-spacing
-  box with the point-symmetric data of `test/walls_tests.jl`; cell-
-  centered sets are symmetric to rounding there). **(open)** Whether
-  that half-open asymmetry at coarse-fine faces matters to an application
-  is not settled; nothing has asked.
-- **Across a glued face** (M17, "A multi-patch forest" under
-  [Domain and boundaries](#domain-and-boundaries)) a reversed axis does
-  not keep half-open ownership in a vertex-like dimension, as a half
-  turn's flip of `d2` does not (*Half turns* under "Rotating seams" in
-  [Ghost filling](#ghost-filling)). A cell-like dimension's stored range
-  is symmetric, and reversed it maps owned points onto owned points. A
-  vertex-like one is not: a block owns its low plane and not its high
-  one. Reversed along a tangent of the face, a ghost region's last plane
-  reads the shared high plane of the block across, a ghost of that
-  block's own, written in the same phase (the `NaN`-prefill test shows
-  it read unfilled). Reversed along the normal, a high face glued to a
-  high face leaves the plane on the face to neither block. A low face
-  glued to a low face owns the plane on both sides, as a quarter turn's
-  seam does, and evolves both copies from same-level ghosts that are
-  each other's images. So `GhostSchedule` refuses a layout that holds a
-  reversed axis of a glue vertex-like, except the normal of a low face
-  glued to a low face, saying why. It stays refused until the milestone
-  that lifts the patch-corner refusal for cell- and vertex-centered
-  sets, the first whose meshes need it, and is lifted with it. For
-  tangents that is M14's `seam_shift` generalised to a glue — the target's
-  partition one plane up along every reversed vertex-like tangent, so
-  that each region is the image of one real block's owned points — with
-  its cases for the hook's clamped regions and for symmetric walls; for
-  a high face glued to a high face it would need one block named owner
-  of the shared plane. Neither mesh M17 is for needs it: the annulus is
-  glued by the identity, and the cubed sphere's sets are element sets,
-  which store as cell-centered ones.
+- The state holds every copy, `∏_d (N + c_d)` values per block per
+  variable, in block order: `statelength`, `scatter!`, `gather!`,
+  `statearray` (a plain reshape), `map_blocks!` and the reductions run
+  over the own range, and the layout stays uniform. A cell-centered or
+  element set has `c = 0` and `N^D` as before.
+- A right-hand side computes `du` at every copy. The fill reads the
+  primaries only, so a secondary's deviation is integrated along and
+  never read ("Why copies cannot drift" under [Closed
+  blocks](#closed-blocks)); `unify!` makes `du` or `u` unified when an
+  application wants the state tidy, and is required after a right-hand
+  side that computes the primaries only (`isprimary`).
+- A sum or a count over such a set says whether it takes each point once
+  (`primaries = true`) or every copy (`false`), and the norms take the
+  trapezoid's weights (*Norms and reductions* under [Closed
+  blocks](#closed-blocks)).
+- At an outer face the wall plane is an own point on both sides, evolved
+  by default, the hook filling the `G` ghosts beyond; a hook may
+  prescribe it (`CellBoundary(…; wall = :prescribed)`). A domain with
+  outer faces is mirror-symmetric under every vertex-like centering.
+- What the half-open partition needed work-arounds for — symmetric walls,
+  the half turn's shifted seam slab, the appendix of a set interpolated
+  across a glue — is gone, and what later steps rebuild on the closed
+  layout is refused for a set with a vertex-like dimension until then
+  (the list is under [Closed blocks](#closed-blocks)). The sections on
+  reflecting and outflow faces, seams, glues and coarse-fine faces below
+  describe those features for cell-centered and element sets, and the
+  half-open treatment of a vertex-like dimension that the later steps
+  replace.
 
 **Stored layout.** Per dimension `d`, with `c_d = 1` for `:vertex` and
 `0` for `:cell`, a field set with ghost width `G_d` stores `N + 2G_d +
@@ -277,24 +225,24 @@ c_d` points (writing `G` for `G_d`):
 | stored index `i` | role | count |
 |---|---|---|
 | `1 … G` | low ghosts | `G` |
-| `G+1 … G+N` | **owned** (what the state vector holds) | `N` |
-| `G+N+1 … G+N+c_d` | shared boundary plane (vertex-like dimensions only) | `c_d` |
+| `G+1 … G+N+c_d` | **own** (what the state vector holds) | `N + c_d` |
 | `G+N+c_d+1 … N+2G+c_d` | high ghosts | `G` |
 
 at positions `lo + (k + ½)·h` (cell) or `lo + k·h` (vertex), `k = B + i −
-G − 1` the point's integer coordinate (*Positions* below). Three ranges have names: the **owned** range `G+1 … G+N` (what
-`interiorview` returns, unchanged); the **closed** range `G+1 … G+N+c_d`,
-the block's `N+1` faces or vertices including both boundary planes
-(`closedview`, and `map_blocks!(…; closed = true)`); and the **exchange**
-regions, `1 … G` below and `G+N+1 … N+2G+c_d` above — `G` and `G + c_d`
-points. Everything above the owned range is exchange-filled, so the
-asymmetry is bookkeeping in the target ranges and nothing more.
-`coordinates(fs, b, idx)` maps a stored index to a position for any
-centering; `fill_by_coordinates!` and
-`boundary_by_coordinates` evaluate their callbacks at the field set's own
-points — face centers for a face field.
+G − 1` the point's integer coordinate (*Positions* below). The **own**
+range is what `interiorview` returns and `map_blocks!` launches over;
+the **ghost** regions are `G` points on either side, the same partition
+for every block and every centering, so a stored array of a vertex-like
+dimension is symmetric under reversal, and so is the ownership drawn on
+it. `coordinates(fs, b, idx)` maps a stored index to a position for any
+centering; `fill_by_coordinates!` and `boundary_by_coordinates` evaluate
+their callbacks at the field set's own points — face centers for a face
+field.
 
-The alternatives rejected here — closed ownership, and one shape for every centering — are recorded with their reasons in [HISTORY.md](HISTORY.md#centerings).
+The alternatives rejected here — closed ownership as M8 tried it, one
+shape for every centering, and half-open ownership after M22 — are
+recorded with their reasons in [HISTORY.md](HISTORY.md#centerings) and
+under M22 there.
 
 **Positions.** Every position is formed from integers, so that every
 copy of a point — on a shared plane, in a ghost, a coarse point under a
@@ -369,14 +317,16 @@ them, and it is `public`.
   last bits when this rule replaced `origin + (I − 1)·h` (M22 step 1 in
   [HISTORY.md](HISTORY.md#m22--closed-blocks)).
 
-**Invariant.** The exchange region on a block's high side spans positions
-`N … N+G_d+c_d−1` and must lie within one ring of neighbors, including
-when those neighbors are finer and each spans only `N/2` coarse cells:
-`N/2 ≥ G_d + c_d`, i.e. **`N ≥ 2G_d + 2c_d`** — `N ≥ 2G` in a cell-centered
-dimension, `N ≥ 2G + 2` in a vertex-like one (`N` is even). It is the
-same condition as "restriction reads owned points only": the last coarse
-ghost at position `N+G` is fine point `2G`, stored at `3G + 1`, owned iff
-`3G + 1 ≤ G + N`. Checked when the field set is built.
+**Invariant.** **`N ≥ 2G_d + 2c_d`** is checked when the field set is
+built — `N ≥ 2G` in a cell-centered dimension, `N ≥ 2G + 2` in a
+vertex-like one (`N` is even): under half-open ownership a block's high
+exchange region spanned positions `N … N+G_d+c_d−1` and had to lie within
+one ring of finer neighbors spanning `N/2` coarse cells each. On closed
+blocks the high ghost region is `G` points, as the low one is, so on one
+level nothing needs more than `N ≥ G` (and the prescribed wall's relative
+hook `N ≥ 2`); whether anything still needs `N ≥ 2G + 2` along a stagger
+across levels is settled by M22's step 3, and the check stays as it is
+until then.
 
 **`G` is per dimension**: an `NTuple{D,Int}`, with a plain
 integer as the uniform shorthand. Nothing in the package needs the ghost
@@ -611,13 +561,79 @@ multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 
 ### Closed blocks
 
-**(proposed)** *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the
-decisions are recorded under M22 in
-[HISTORY.md](HISTORY.md#m22--closed-blocks). Nothing of this section is
-implemented but its positions from integer coordinates (step 1), which
-are current text under [Centerings](#centerings). It replaces "Shared points and half-open ownership" under
-[Centerings](#centerings), and everything this document derives from
-it, when it lands.)*
+*(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the decisions are
+recorded under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
+**On the `m22` branch, steps 1 and 2 are implemented**: positions from
+integer coordinates (*Positions* under [Centerings](#centerings)), and
+the closed layout, stage 0, the primary mask, `unify!`, the trapezoid's
+weights and the hook at an outer face, evolved or prescribed, on
+uniform meshes with periodic and outer faces (*What step 2 implements*
+below; "Shared points and closed ownership" under
+[Centerings](#centerings)). The rest of this section is **(proposed)**,
+and until its step lands a set with a vertex-like dimension is refused,
+with an `ArgumentError` naming the step:
+
+- by `GhostSchedule`, inside its collective checks: a forest with
+  leaves at more than one level (step 3), reflecting or outflow faces
+  (step 4), a rotating seam or half turn, and so a `RotationPair` (step
+  7), a forest of patches with a glued face (step 8), and `walls =
+  :symmetric` (closed blocks make every wall symmetric; the keyword goes
+  in step 4);
+- by `InterfaceSchedule`: a forest with more than one level (step 3,
+  which makes the interface restriction `unify!` on a flux set);
+- by `regrid!`, with the set's schedule, and so by
+  `adapt_to_initial_data!`, and by `firing_boxes` (step 6). `fs =>
+  nothing`, which only resizes a set, is accepted.
+
+The code of the half-open treatment that those steps replace — the
+mirror and clamp rows and the derived wall row along a vertex-like
+dimension, a halved own range, the interface restriction's stencils, a
+copy across a seam, a glue or a level in `piece_copies` — stays behind
+the refusals and throws an internal error if reached.
+
+**What step 2 implements**, and how the design came out against the
+code (the record is step 2 under M22 in
+[HISTORY.md](HISTORY.md#m22--closed-blocks)):
+
+- *The unify transfer's key.* Stage 0's transfers are copies keyed by
+  `GroupKey.piece`, the class of the target piece per dimension — 0 the
+  low face plane, 1 the open interior (always, along a cell-like
+  dimension), 2 the high face plane — and `-1` everywhere for any other
+  transfer. One flag, as first designed, does not say which piece a
+  dimension with `δ_d = 0` writes: a block's high face plane along `e`
+  is written from the block beside it along `d`. The piece is in
+  `keyorder`, so the message layout needs nothing more.
+- *Stage 0* has tag `UNIFY_TAG = 0`, before phase 1, in a schedule of a
+  layout with a vertex-like dimension (`schedule.unify`; a cell or
+  element schedule has no such stage and is unchanged). `stage_groups`
+  runs it and phase 1 alone, in front (`phase1group`).
+- *The primary* of a piece is decided by `piece_copies`, which lists
+  every copy as `(level, leaf, class, direction)`, and `piece_primary`,
+  the minimum of `(−level, global leaf, class)`; `primary_bits` packs a
+  block's `3^D` decisions, and both the mask and `unify_sources!` ask it.
+  Step 3 adds copies on other levels (the finer first, hence the negated
+  level) and step 8 copies across a glue (`glue_copies`).
+- *The mask* is `PrimaryMask` (`pieces`, one `UInt32` per local block,
+  `N`, the staggers), built by `primary_mask(fs)` once per forest
+  generation and kept in the field set on its backend; `isprimary(mask,
+  i1, …, iD, b)` takes `map_blocks!`'s index.
+- *`unify!`* on a field set runs stage 0 alone; on a state-shaped vector
+  it runs `schedule.stateunify`, stage 0's transfers with every stencil
+  moved down by `G`, since a state has no ghosts: the same kernels, its
+  own buffers, one message round over a distributed forest.
+- *The hook.* Every outer-face region is the `G` ghosts beyond the wall;
+  the relative hook clamps onto the wall on both sides. `CellBoundary(g;
+  wall = :prescribed)` (any form: plain, `AllVariables`, `WithPatch`,
+  `Relative`; `boundary_by_coordinates` forwards it) prescribes the wall
+  too: stage W writes the wall's primary pieces (`BoundaryPlan.walls`)
+  before stage 0, the relative form from the point one plane in, a
+  primary of the same block. `:evolved` is the default because the wall
+  is in the state.
+- *A set without ghosts* along a vertex-like dimension (a flux, `G = 0`)
+  has no hook region there: its wall is its own, and its fill is stage 0
+  alone.
+
+
 
 **Why.** Half-open ownership is invisible at a same-level face inside a
 patch, where the right-hand side at a shared point is the same whoever
@@ -1388,12 +1404,11 @@ declared up front:
 
 Two arrays exist:
 
-- the **state vector**: a flat vector of length `N^D · nvars · nblocks`
-  holding leaf interiors only — this is what ODE integrators see; a set
-  interpolated across a glue (M20) adds its blocks' owned glued high face
-  planes after all of those, its appendix ("Closed ownership and the
-  appendix" under [Finite differences across a
-  glue](#finite-differences-across-a-glue));
+- the **state vector**: a flat vector of length `∏_d (N + c_d) · nvars ·
+  nblocks` holding every block's own points, no ghosts — this is what
+  ODE integrators see; along a vertex-like dimension that is both face
+  planes, every copy of a shared point (M22, [Closed
+  blocks](#closed-blocks));
 - the **working array**: one big persistent `(D+2)`-dimensional array
   holding all leaf blocks including ghosts:
 
@@ -1401,8 +1416,8 @@ Two arrays exist:
 
   with `c_d = 1` in a vertex-like dimension and `0` in a cell-centered
   one, and `G_d` the field set's ghost width in dimension `d` (see
-  [Centerings](#centerings)). The state vector holds `N^D` per block per
-  variable for every centering.
+  [Centerings](#centerings)). The state vector holds `∏_d (N + c_d)` per
+  block per variable: `N^D` for a cell-centered or element set.
 
 - One array for all variables of one field set, not per-variable
   arrays. Variables that differ in centering, ghost width, or operator
@@ -1518,8 +1533,9 @@ Under 2:1 balance there are exactly three cases per ghost region:
 
 **In a vertex-like dimension** (see
 [Centerings](#centerings)) the three cases keep their names and change
-their one-dimensional stencils. A copy is a shift by `N` as before, with
-the high-side target one plane longer. Restriction is **injection**: a coarse point at
+their one-dimensional stencils. A copy is a shift by `N` as before; on
+closed blocks every ghost region is `G` points, and the copy reads the
+neighbour's own points beside the shared plane. Restriction is **injection**: a coarse point at
 position `X` coincides with fine point `2X`, the stencil has width one and
 weight one, it is exact for any data, carries no order, and never has to
 shift — the circularity that forces cell-centered restriction to shift
@@ -1548,9 +1564,15 @@ single tap on the CPU, and a device takes the full sum (see "A column
 with one nonzero weight takes one tap" under
 [What the ghost fill costs](#what-the-ghost-fill-costs)).
 
-Ghost filling is **phased**. Phase 1: all same-level copies and all
-restrictions (each reads only interior cells of other blocks — race
-free). Phase 2: prolongations, swept **level by level, coarsest targets
+Ghost filling is **phased**. For a layout with a vertex-like dimension
+(M22) it begins with stage W, where a hook that prescribes the wall
+writes the wall's primaries, and **stage 0**, which gives every
+secondary copy of a shared point its primary's value: copies into pieces
+of the closed box from the primaries, which no transfer of the stage
+writes — race free — with one message round (see [Closed
+blocks](#closed-blocks)). Phase 1: all same-level copies and all
+restrictions (each reads only own points of other blocks, final after
+stage 0 — race free). Phase 2: prolongations, swept **level by level, coarsest targets
 first**. The sweep is required because a prolongation stencil may read
 the coarse source block's own ghosts, which may themselves be
 prolongated from a still-coarser block (levels l−2, l−1, l side by side
@@ -4569,10 +4591,9 @@ out contiguously in tuple order — `statevector((hydro, Bx, By, Bz))`,
 `scatter!(sets, u)`, `gather!(u, sets)`, `staterange(sets, i)` for the
 `i`-th set's entries, `stateview(u, sets, i)` for its segment as a view
 and `statearray(du, sets, i)` for that segment in its set's array shape.
-Each set contributes `N^D · nvars · nblocks` entries whatever its
-centering, and a set with an appendix (M20) its appendix after them, its
-`statelength` in all; half-open ownership (see [Centerings](#centerings))
-is what makes this a plain concatenation. Each segment has exactly its set's
+Each set contributes its `statelength`, `∏_d (N + c_d) · nvars ·
+nblocks` entries (see [Centerings](#centerings)), so the vector is a
+plain concatenation. Each segment has exactly its set's
 single-set layout, so every single-set function applied to
 `stateview(u, sets, i)` and `sets[i]` — the reductions included —
 behaves as on a separate vector, and the tuple methods are loops over
@@ -4598,7 +4619,14 @@ ghost-fill first).
 
 Adaptive integrators need a volume-weighted `internalnorm` — the default
 norm weights fine regions more, simply because they contribute more
-entries per volume.
+entries per volume, and counts a shared point of a vertex-like set at
+every copy; `volume_weighted_norm`'s trapezoid weights count it once.
+
+A right-hand side on closed blocks (M22) computes `du` at every copy of a
+shared point, or at the primaries only, skipping the others with
+`isprimary` and then calling `unify!(du, fs, schedule)`, which gives every
+secondary its primary's value; `unify!` on `du` is optional otherwise,
+since the fill unifies the working array before anything reads it.
 
 ## Parallelism
 
@@ -5742,6 +5770,10 @@ the hook, then prolongations by target level, coarsest first. Each such
 ordering point becomes a *stage*, and a stage completes on a rank
 before the next one starts there:
 
+- stage 0 (M22), for a layout with a vertex-like dimension, is one
+  stage, tag 0, before phase 1, with stage W, which has no messages,
+  before it; `unify!` on a state runs the same transfers as a stage of
+  its own (`stateunify`), with the same tag, never at once with a fill;
 - phase 1 is one stage. The boundary hook then runs locally, on each
   rank's own blocks, after that stage's unpacks — exactly where it runs
   today;
@@ -6536,8 +6568,12 @@ The ideas that span several files and are easy to violate:
   CPU and compares bit for bit; a new copy-like kernel goes the same way.
   KA's CPU emitter only rewrites `@index` at statement level, so assign
   it before passing it to a function.
-- **Phased ghost fill.** Phase 1: copies and restrictions (they read
-  interiors only, so they are race free). Then the physical-boundary hook.
+- **Phased ghost fill.** For a layout with a vertex-like dimension,
+  stage W (a hook that prescribes the wall) and stage 0 (every secondary
+  copy of a shared point from its primary, `UNIFY_TAG`, keyed by
+  `GroupKey.piece`) run first, alone. Phase 1: copies and restrictions
+  (they read own points only, so they are race free). Then the
+  physical-boundary hook.
   Phase 2: prolongations, coarsest target level first, because a
   prolongation may read its coarse source's *own ghosts*, which an earlier
   sweep filled. The hook runs *between* the phases, not last: prolongation
@@ -6648,19 +6684,17 @@ The ideas that span several files and are easy to violate:
   nothing but `P` tells the two apart: pass `P` explicitly to whatever
   builds a stencil or a position, and form every position through
   `nodeposition`, never from the index directly.
-- **A set interpolated across a glue owns an appendix, and every state
-  function must know it** (M20, "Closed ownership and the appendix"
-  under [Finite differences across a
-  glue](#finite-differences-across-a-glue)). A set built with `glue =
-  :interpolate` holds its blocks' glued high face planes after the cores
-  in the state vector. A new function of the state layer handles it —
-  through `hasappendix`, `appendix_cache` or `statearray(u, fs;
-  appendix = true)` — and, so that no other set compiles it, behind
-  `Base.inferencebarrier`, the switch being a run-time field. Every leaf
-  on a glued face and every leaf a glue stencil reads keeps its level
-  through `regrid!` (`GluePlan.reads`), and a glue stencil reads only
-  what phase 1 and the hook fill (`check_overhang`).
-- **Interiors-only state vector.** An RHS is `scatter!` → `fill_ghosts!` →
+- **Closed blocks** (M22 step 2, [Closed blocks](#closed-blocks)). A
+  vertex-like dimension owns its closed range, and the state holds every
+  copy of a shared point. The primary is decided by global leaf
+  position (`piece_copies`, `primary_bits`), never a rank-local block
+  index, so that every rank and both ends of a message agree. A sum or a
+  count over such a set passes `primaries`. What later steps rebuild is
+  refused in `check_closed_blocks` (collective, in `GhostSchedule`), in
+  `InterfaceSchedule`, `regrid!` and `firing_boxes`, and the half-open
+  code behind those refusals errors if reached: a new path that reaches
+  it is a bug, not a case to handle.
+- **Own-points-only state vector.** An RHS is `scatter!` → `fill_ghosts!` →
   `map_blocks!`, with kernels writing `du` in state layout via `statearray`.
   `u` is never mutated; the working array is scratch. There is deliberately
   no `semidiscretize`-style wrapper.
@@ -6804,12 +6838,12 @@ The ideas that span several files and are easy to violate:
 
 Index conventions: per dimension `d`, stored indices run `1:N+2G_d+c_d`
 (`c_d = 1` in a vertex-like dimension, `0` in a cell-centered one); the
-**owned** range is `G_d+1:G_d+N` and the **closed** range `G_d+1:G_d+N+c_d`.
+**own** range is `G_d+1:G_d+N+c_d`, the closed range (M22).
 `coordinates(fs, b, idx)` — which replaced `cell_center` in M8, and takes the
-field set rather than the forest — takes **stored** indices, so owned point
+field set rather than the forest — takes **stored** indices, so own point
 `i` is `idx = i + G_d`. Kernels launched by `map_blocks!` get the global index
-`(i1, …, iD, b)` with each `i` in `1:N` (or `1:N+c_d` under `closed = true`)
-and add `G_d` to reach the working array — **except** under
+`(i1, …, iD, b)` with each `i` in `1:N+c_d`, the index of `statearray` and of
+`isprimary` too, and add `G_d` to reach the working array — **except** under
 `stored = true`, the third range, where the loop runs over `1:N+2G_d+c_d`
 and the global index already *is* the stored index, so the kernel adds
 nothing. A kernel written for one form is wrong under the other and still
@@ -6880,14 +6914,13 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
 - the partition and the threads: `equalsplit`, `equalsplit_part`,
   `threaded_foreach` (`threading.jl`);
 - the device: `tohost`, `samebackend` (`device.jl`);
-- the appendix of a set interpolated across a glue (M20): `hasappendix`,
-  `corelength`, the length of a state vector's cores, and
-  `appendix_entries(fs, j)`, the entries of global leaf `j`'s appendix
-  in the state vector, on any rank (`glue.jl`, `state.jl`). The state
-  vector is the cores, then the appendix block by block, so these place
-  every block's part of it; TreeIOHDF5 stores the cores as before and
-  the appendix in a dataset of its own, and reads the field `glue` of a
-  `FieldSet` to rebuild the set;
+- *on the `m22` branch, gone*: the appendix of a set interpolated
+  across a glue (M20), `hasappendix`, `corelength` and
+  `appendix_entries(fs, j)`, which closed blocks (M22) make every
+  block's own range. TreeIOHDF5 therefore does not load against the
+  branch; it is ported in M22's step 10, which stores a set with a
+  vertex-like dimension as `(N+c_1, …, N+c_D, nvars, nblocks)` under a
+  new format feature. It still reads the field `glue` of a `FieldSet`;
 - the face kinds: `reflecting_faces`, `outflow_faces` (`forest.jl`),
   each a `(lo, hi)` pair per dimension, in the shape of the `Forest`
   keywords;
@@ -6915,6 +6948,8 @@ which companion releases go with it.
 `test/runtests.jl` runs the test files, which are, in its order,
 `tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
 `element_tests.jl` (M16), `position_tests.jl` (M22 step 1),
+`closed_tests.jl` (M22 step 2: the closed layout, stage 0, the primary
+mask, the reductions, `unify!` and the hook at an outer face),
 `reflect_tests.jl` (M10), `outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
 `atlas_tests.jl` (M19), `glue_tests.jl`, `glue_ball_tests.jl` and
@@ -6929,6 +6964,17 @@ M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`,
 `type_tests.jl`, `thread_tests.jl`, `mpi_tests.jl` (M7) and
 `gpu_tests.jl` (M2–M8).
+
+**Pending tests** (M22). While M22 is built on its branch, a test that
+needs what a later step rebuilds is pending, marked with that step:
+`@pending step "name" …` in place of `@testset` for a whole testset, or
+`pending(step, name)` for the vertex-like iterations of a loop that also
+runs cell and element sets (`test/helpers/pending.jl`), each one Broken
+test in the summary under its name, so the count of what is pending is
+in every run. The thread and MPI workloads print `# pending until M22
+step N: CASE` in place of a pending case, a line the comparisons skip,
+and `mpi_tests.jl` asserts the count. The branch merges when nothing is
+pending.
 
 The M7 tests come in two kinds. **In process**, simulated ranks over
 test-only communicators, each answering only the verbs its test needs:
