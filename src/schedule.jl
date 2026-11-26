@@ -2124,13 +2124,6 @@ function state_unify_stages(::Type{ST}, ::Type{GRP}, ::Type{T}, backend, forest:
 end
 
 # --- Stage P: the self-image projection (M22) -----------------------------
-
-# The parities a schedule built from `fs` takes for stage P: the set's over
-# a forest with reflecting faces, and none elsewhere, where no stage P is
-# built and a schedule serves every set of its layout as before.
-stage_p_parities(fs::FieldSet{T,D}) where {T,D} =
-    hasreflecting(fs.forest) ? something(fs.parity, NTuple{D,Parity}[]) :
-    NTuple{D,Parity}[]
 #
 # A point on a reflecting wall plane of a vertex-like dimension is its own
 # mirror image, and rule 3 of "One value per point" (CODE.md, "Closed
@@ -2183,6 +2176,13 @@ function selfimage_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTupl
     end
     return nothing
 end
+
+# The parities a schedule built from `fs` takes for stage P: the set's over
+# a forest with reflecting faces, and none elsewhere, where no stage P is
+# built and a schedule serves every set of its layout as before.
+stage_p_parities(fs::FieldSet{T,D}) where {T,D} =
+    hasreflecting(fs.forest) ? something(fs.parity, NTuple{D,Parity}[]) :
+    NTuple{D,Parity}[]
 
 # The span codes of pieces `pieces` (classes 0, 1, 2 per dimension): one
 # box where they fill their bounding box, and otherwise one a piece.
