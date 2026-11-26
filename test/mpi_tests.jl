@@ -97,7 +97,7 @@ end
     # What the serial reference prints while M22 is built: the cases
     # pending until a later step print one comment line each instead
     # (`pending_case`), and the regrids left are those of M32x2-.
-    NPENDING, NREGRIDS, NUNCHANGED = 19, 8, 1
+    NPENDING, NREGRIDS, NUNCHANGED = 12, 8, 1
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -151,9 +151,10 @@ end
     @test 0 < parse(Int, words("L2 inside")[3]) < 211
     @test 0 < parse(Int, words("L2 excluded")[3])
     @test words("L2 lattice")[3] == "256"
-    # The nested octant (N3, M22 step 4), the ranks without blocks (E2,
-    # step 6), the rotating quadrant (Q2) and the half plane (H2, step 7)
-    # are pending.
+    @test words("N3 leaves")[3:4] == ["232", "3"]
+    @test "# N3 largest groups 3 with messages 0" in lines
+    # The ranks without blocks (E2, M22 step 6), the rotating quadrant (Q2)
+    # and the half plane (H2, step 7) are pending.
     @test count(startswith("# pending until M22 step "), lines) == NPENDING
     # Element sets (M16): one stage, and the GLL mass conserved through
     # both regrids.
@@ -205,6 +206,11 @@ end
         @test all(t -> parse(Int, split(only(filter(startswith("# $t glued received"),
                                                     hashes)))[end]) > 0,
                   ("PR2 cell", "PR2 element", "PS3 element"))
+        # The nested octant (N3): some rank ran a group of levels with
+        # messages, one of them at two ranks and more at three.
+        nmessages = parse.(Int, split(only(filter(startswith("# N3 largest groups"),
+                                                  hashes)))[(n + 7):end])
+        @test length(nmessages) == n && maximum(nmessages) >= n - 1
         # The negative control: one received ghost rewritten from a
         # corrupted message buffer changes the gathered digest.
         @test "# W2v perturbed-ghost-changes-digest true" in hashes

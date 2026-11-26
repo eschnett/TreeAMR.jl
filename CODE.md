@@ -14,9 +14,10 @@ interpolated across a glue; TreeWave on the patch systems remains. M22,
 closed blocks, is being built on the integration branch `m22`: step 1
 (positions from integer coordinates) is done, step 2 — the closed
 layout, stage 0 and the primary mask on uniform meshes with periodic and
-outer faces — is implemented there, and so is step 3, coarse-fine faces
+outer faces — is implemented there, and so are step 3, coarse-fine faces
 on meshes refined once and left alone, with the interface restriction
-as `unify!` on a flux set; what later steps rebuild is refused for a set
+as `unify!` on a flux set, and step 4, reflecting and outflow faces with
+a symmetric wall and no `walls` keyword; what later steps rebuild is refused for a set
 with a vertex-like dimension until then (the list is under
 [Closed blocks](#closed-blocks)). Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
@@ -601,7 +602,7 @@ multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 
 *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the decisions are
 recorded under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
-**On the `m22` branch, steps 1, 2 and 3 are implemented**: positions
+**On the `m22` branch, steps 1 to 4 are implemented**: positions
 from integer coordinates (*Positions* under [Centerings](#centerings));
 the closed layout, stage 0, the primary mask, `unify!`, the trapezoid's
 weights and the hook at an outer face, evolved or prescribed, on
@@ -609,24 +610,23 @@ uniform meshes with periodic and outer faces (*What step 2 implements*
 below; "Shared points and closed ownership" under
 [Centerings](#centerings)); and coarse-fine faces on meshes refined once
 and left alone, with the interface restriction as `unify!` on a flux set
-(*What step 3 implements* below). The rest of this section is **(proposed)**,
+(*What step 3 implements* below); and reflecting and outflow faces, the
+mirror and the clamp about the wall plane and stage P (*Walls* and *Stage
+P* below). The rest of this section is **(proposed)**,
 and until its step lands a set with a vertex-like dimension is refused,
 with an `ArgumentError` naming the step:
 
 - by `GhostSchedule`, `UnifySchedule` and `primary_mask`, inside their
-  collective checks (`check_closed_blocks`): reflecting or outflow faces
-  (step 4), a rotating seam or half turn, and so a `RotationPair` (step
-  7), a forest of patches with a glued face (step 8), and `walls =
-  :symmetric` (closed blocks make every wall symmetric; the keyword goes
-  in step 4);
+  collective checks (`check_closed_blocks`): a rotating seam or half
+  turn, and so a `RotationPair` (step 7), and a forest of patches with a
+  glued face (step 8);
 - by `regrid!`, with the set's schedule, and so by
   `adapt_to_initial_data!`, and by `firing_boxes` (step 6). `fs =>
   nothing`, which only resizes a set, is accepted.
 
-The code of the half-open treatment that those steps replace — the
-mirror and clamp rows and the derived wall row along a vertex-like
-dimension, a copy across a seam or a glue in `piece_copies` — stays
-behind the refusals and throws an internal error if reached.
+The code of the half-open treatment that those steps replace — a copy
+across a seam or a glue in `piece_copies` — stays behind the refusals
+and throws an internal error if reached.
 
 **What step 2 implements**, and how the design came out against the
 code (the record is step 2 under M22 in
@@ -910,8 +910,8 @@ for bit, so on a uniform brick the state stays unified without
 | stage | writes | reads | messages |
 |---|---|---|---|
 | A (interpolated sets) | primaries at kinked glues | the same, through a buffer | one round |
-| P | self-image primaries | themselves | none |
 | W (a hook that prescribes walls) | wall primaries | the block's own primaries | none |
+| P | self-image primaries | themselves | none |
 | 0 | secondaries | primaries | one round |
 | 1 | ghosts: copies, restrictions | own points | one round |
 | hook | outer ghosts | as today | none |
@@ -919,9 +919,14 @@ for bit, so on a uniform brick the state stays unified without
 | 2 | ghosts: prolongations, by level | own points and ghosts | per group of levels |
 
 Stage 0 is race free for the reason phase 1 is: its sources, the
-primaries, are written by no transfer of the stage. Stage W runs
-before it and on primaries only, so that stage 0 carries a prescribed
-value to every copy, a coarse block's included; a relative hook reads
+primaries, are written by no transfer of the stage. Stages W and P run
+before it and on primaries only, so that stage 0 carries a prescribed or
+projected value to every copy, a coarse block's included. P runs after
+W: at an edge where an outer face meets a reflecting one a prescribed
+value lies on the mirror plane, and so does the point one plane in a
+relative hook reads there, and P after W projects both, where P before W
+would let a prescribed nonzero odd value stand (HISTORY.md, M22 step 4).
+A relative hook reads
 the points beside the wall along its normal, which are held by the same
 blocks as the wall point, at the same classes along every other
 dimension and the open interior along the normal on each, so the rule
@@ -987,10 +992,33 @@ that depend on who is primary around a block.
 `j* = 2(G+1) − j` below and `2(G+N+1) − j` above, and the wall is the
 block's own on both sides: an even variable is evolved there by a
 stencil whose two halves are images, and stage P sets an odd one to
-zero. The derived wall row, `wall_stencil` and mirror state 2 go. An
-outflow face clamps every ghost row to the wall row on both sides. An
-outer face is rule 5. `walls` leaves `FieldSet`, the schedule and the
-checkpoint: every wall is symmetric.
+zero. An outflow face clamps every ghost row to the wall row on both
+sides. An outer face is rule 5. Every wall is symmetric, and `FieldSet`
+and the schedule have no `walls`.
+
+**Stage P** writes the primary pieces of a block's closed box that lie on
+a reflecting wall plane, each variable times `∏_d (1 + σ_d)/2` over the
+reflecting walls the piece lies on — zero for a variable odd across any
+of them, the value itself otherwise, a product since the mirrors commute
+— through the factor column of mirror state 2, which `parityfactors`
+holds as that projection. Its transfers copy a block's own points onto
+themselves: local, no message, disjoint targets, each reading only
+itself; an even variable is multiplied by one, which keeps its bits, and
+an odd one becomes `±0`, which compares equal to zero. A piece whose
+variables are all even there gets no transfer, so a set of even variables
+has no stage P (the schedule takes the set's parities and refuses a set
+with others). A wall point is no copy of anything — no block lies across
+the wall — so it stays a primary of its block, for the mask and the
+reductions alike. Where the wall meets a coarse-fine line the fine copy
+is the primary, which P writes and stage 0 injects into the coarse one;
+at an edge shared by two blocks the class rule picks one. `unify!` runs
+stage P on a field set and, shifted, on a state; a `UnifySchedule` holds
+it too, so a flux normal to the wall, odd across it, is zero there.
+Measured (`GhostSchedule`, 3D vertex set of three variables, `N = 16`,
+`G = 2`, a reflecting `4³` box): no stage P group for even variables, 56
+for a vector (one variable odd a dimension); stage 0 as the outer box's,
+19 + 0 uniform and 19 + 61 with one corner refined; the build 5.3 and
+7.2 ms against 5.3 and 6.9 ms (laptop).
 
 **Seams.** The axis map reverses a stored index as `len + 1 − k`, which
 now carries an own range onto an own range, so a half turn's slab has
@@ -1538,10 +1566,9 @@ declared up front:
   seam's; TreeIOHDF5 and the tests rebuild a forest through it.
 - **Physical** (per face, neither periodic, reflecting, outflow, a
   rotating seam nor glued): ghost cells are filled by a user-supplied boundary
-  condition hook. For a vertex-like dimension the domain's upper boundary plane
-  is the first plane of an outward-facing region and is filled by the
-  hook too, and under symmetric walls the owned lower one the last plane
-  of the low region (see [Centerings](#centerings)).
+  condition hook. For a vertex-like dimension both wall planes are the
+  block's own (M22), and the hook fills the `G` ghosts beyond each (see
+  [Centerings](#centerings)).
 
 ### Data layout
 
@@ -1781,9 +1808,8 @@ one pass over the transfers and the hook regions (`stage_groups`):
 Only the level just below can write what a level reads, but the test
 asks every pair of the group, which costs the same and needs no
 argument. Mirrored and clamped transfers keep their image's source
-columns, which are in the source's frame, and the derived wall row reads
-the source beside its own wall, so their windows are found the same
-way. Every write to a block is made on the block's own rank, so each
+columns, which are in the source's frame, so their windows are found
+the same way. Every write to a block is made on the block's own rank, so each
 rank decides alone, from what it holds; ranks may decide differently,
 which the messages allow (see "Deadlock freedom and message matching").
 A group is permission, not obligation: its stages run one after another
@@ -1814,8 +1840,8 @@ yet to fill.
 reads the block's own data and so has to run later in places. A ghost
 becomes `f(x_g) + (u(x_r) − f(x_r))`, `x_r` the nearest evolved point:
 clamped onto the block along each component of the region's direction
-that leaves the domain through an outer face (`G + N`, `G + 1`, or
-`G + 2` under symmetric walls), and the ghost's own index along every
+that leaves the domain through an outer face (`G + N + c` or `G + 1`,
+the wall itself along a vertex-like dimension), and the ghost's own index along every
 other one. In a corner region beyond an outer face along one dimension
 and across a block face along another, `x_r` is therefore the block's
 own ghost across that face, which a transfer fills — not the block's
@@ -1878,12 +1904,18 @@ result by a per-variable factor, the product of the variable's parities
 over the masked dimensions. It keeps a table of these factors on the
 field set, not in the schedule: a schedule still belongs to a layout,
 and parity belongs to the variables. The mirror image of a ghost slab
-lies inside the owned range and within its wall-side half, since
+lies inside the own range and within its wall-side half, since
 `G ≤ N/2`, which is `N ≥ 2G`, asserted when the field set is built.
-Along a stagger the mirror is rebuilt about the wall plane in M22 step 4
-(*Walls* under [Closed blocks](#closed-blocks)), and its image `2(G+1) −
-j ≤ 2G + 1` lies in the wall-side half of the closed range under the
-same bound.
+Along a vertex-like dimension the mirror is about the wall plane, the
+block's own on both sides (M22): its image `2(G+1) − j ≤ 2G + 1` lies in
+the wall-side half of the closed range under the same bound. A mirrored
+restriction along such a dimension reads its finer source over the
+child's closed half, mid-plane included (`mirror_restriction`): at
+`N = 2G` the outermost ghost beyond a high wall mirrors onto the
+mid-plane, which the halved range of phase 1 gives the lower child,
+while the wall-side source is the upper one; that child holds the point
+at its low plane, a secondary, final after stage 0, and the read is in
+the stencil, where `stage_groups` sees it.
 
 Phasing needs no new rule. A mirror copy or restriction reads interiors
 only and joins phase 1; a mirror prolongation targets the block's own
@@ -1898,13 +1930,11 @@ the tangential stencil's row at the nearest owned row,
 
 | | low face | high face |
 |---|---|---|
-| every centering | `j* = G + 1` | `j* = G + N` |
+| every centering | `j* = G + 1` | `j* = G + N + c` |
 
-over the whole ghost slab, which on the high side of a vertex-like
-dimension includes the unowned wall row `G + N + 1`: it is a ghost like
-the rows beyond it, and is clamped like them. Under symmetric walls the
-low side is the mirror of that: the slab includes the owned wall row
-`G + 1`, and every row of it takes `G + 2`. The source search, the
+over the whole ghost slab. Along a vertex-like dimension the wall row is
+the block's own on both sides, evolved, and the ghosts beyond it take
+its value. The source search, the
 wall-side children of a restriction and the phasing are the
 reflecting face's, unchanged — `wall_direction` returns the kind of
 each wall a direction crosses, `mirror_sources!` records a clamped
@@ -1916,33 +1946,15 @@ mirrored in another dimension carries that dimension's parity. A corner
 region crossing an outflow face and an outer one is the hook's, as for
 a reflecting face.
 
-**The upper wall point in a vertex-like dimension**. On a high reflecting face the wall plane `G + N + 1` belongs to
-nobody (see [Centerings](#centerings)), and the mirror maps it onto
-itself, so reflection alone does not determine it. It is derived:
-
-- An odd variable is exactly zero there.
-- An even variable takes the symmetric Lagrange interpolant at the wall
-  through the `p` points `±1, …, ±p/2` beside it. By symmetry that folds
-  to the `p/2` one-sided points with weights `2w_k`, which at `p = 4` is
-  `(4u₁ − u₂)/3`.
-
-`p` is the prolongation order, so the error is `O(h^p)`, the same as a
-prolongated ghost's, and the interface-order rule covers the point. Every
-source has its own wall at `G + N + 1` in its own frame, so the row is
-the same whatever kind the transfer is, and it reads the source's own
-points beside the wall. A coarser source's points are further apart,
-`O(H^p)`, as prolongation's are. The row is its own batch, because its
-parity factor is `(1 + s)/2` where the mirrored rows' is `s`. The low
-wall point is owned and evolved, as on any face, unless the set has
-symmetric walls. So a half-open vertex-centered reflecting box is not
-symmetric under exchanging its two walls: the low wall evolves, the high
-one interpolates. Nor is an odd variable's low wall point forced to zero.
-It stays zero if the right-hand side respects the parity, as a centered
-stencil does, since the mirrored ghosts give `u(−h) = −u(h)` exactly.
-Under symmetric walls (AMR-8) the low wall row is derived as the high one
-is, from `G + 2 … G + 1 + p/2` with the same weights in mirrored order
-(`wall_stencil(…; low = true)`), mirror state 2 on the low side; an odd
-variable's low wall is then zero, and the box is symmetric.
+**The wall plane in a vertex-like dimension** is the block's own on both
+sides (M22, "Closed blocks"), evolved, and the mirror maps it onto
+itself. Stage P makes it its own image: an odd variable is set to zero
+there, an even one is left as the state holds it — the projection `(1 +
+σ)/2` on the wall's primaries, before stage 0 carries it to every copy
+(*Stage P* under [Closed blocks](#closed-blocks)). A box is symmetric
+under exchanging its walls without a keyword. Half-open ownership
+derived the high wall point instead, by the folded interpolant `(4u₁ −
+u₂)/3` at order 4, and evolved the low one ([HISTORY.md](HISTORY.md#m22--closed-blocks)).
 
 **Rotating seams.**
 A rotating seam (see [Domain and boundaries](#domain-and-boundaries))
@@ -2946,12 +2958,8 @@ the order to first locally, as any bound must. The bound applies to
 every operator that interpolates: the prolongation, in the fill and the
 regrid; the restriction along a cell-like dimension at `restriction > 2`
 (at 2 it is the average, a convex combination, and along a vertex-like
-dimension it is injection), in the fill and in the regrid's coarsening;
-and the derived wall row of a reflecting vertex-like dimension, which is
-interpolated at the prolongation order whatever kind of transfer fills it.
-The wall row's bracket is the point beside the wall and its mirror image,
-so a bounded wall of an even variable is that point: a surface at the wall
-stays positive where `(4u₁ − u₂)/3` goes negative. Width 2 is bounded
+dimension it is injection), in the fill and in the regrid's coarsening.
+Width 2 is bounded
 already and takes the plain kernel, as conservative order 1 does
 (`boundedmode`), so an application can switch orders without touching
 the flag.
@@ -5856,7 +5864,7 @@ its leaves.
 - *Mirrored transfers need nothing extra.* A mirrored transfer's source
   is found across `δ′` from the target, so it is a neighbor or the
   target itself. A self-transfer — a block's reflection into its own
-  ghosts, the derived wall plane — is always local.
+  ghosts, stage P's projection of its wall plane — is always local.
 - *Three classes.* A *local* transfer has target and source on this
   rank; it is today's group, run as today. A *recv* transfer has a
   local target and a remote source, and becomes an unpack. A *send*
@@ -6785,12 +6793,14 @@ The ideas that span several files and are easy to violate:
   nothing but `P` tells the two apart: pass `P` explicitly to whatever
   builds a stencil or a position, and form every position through
   `nodeposition`, never from the index directly.
-- **Closed blocks** (M22 step 2, [Closed blocks](#closed-blocks)). A
+- **Closed blocks** (M22, [Closed blocks](#closed-blocks)). A
   vertex-like dimension owns its closed range, and the state holds every
   copy of a shared point. The primary is decided locally, the copy with
   the greatest class tuple (`piece_copies`, `piece_primary`,
   `primary_bits`), never by an index, so that every rank and both ends
-  of a message agree, and a block's secondaries share few directions. A sum or a
+  of a message agree, and a block's secondaries share few directions. A
+  reflecting wall plane is projected onto each variable's parity by stage
+  P, after stage W and before stage 0. A sum or a
   count over such a set passes `primaries`. What later steps rebuild is
   refused in `check_closed_blocks` (collective, in `GhostSchedule`,
   `UnifySchedule` and `primary_mask`), in `regrid!` and `firing_boxes`,
@@ -7031,9 +7041,10 @@ The names TreeIOHDF5 uses, all imported by name (`using TreeAMR: …`):
   `extents`, `leaves` and `comm` (`roots`, `periodic` and `extents` for
   a brick only: on a forest of patches they are patch 1's, and
   `patch_keywords` replaces them); of a `FieldSet`,
-  `work`, `nvars`, `G`, `centering`, `P`, `walls`, `glue`, `parity`,
-  `rotation`, `halfturn` and `forest` (`walls` since AMR-8, `halfturn`
-  since M14, `P` since M16, `glue` since M20: a checkpoint saves them, and a restart rebuilds the set
+  `work`, `nvars`, `G`, `centering`, `P`, `glue`, `parity`,
+  `rotation`, `halfturn` and `forest` (`halfturn` since M14, `P` since
+  M16, `glue` since M20; `walls`, from AMR-8, is gone on the `m22`
+  branch, M22 step 4: a checkpoint saves them, and a restart rebuilds the set
   with them; `centering` may then be `elementcentered(D)`, all
   `:element`, which `FieldSet` accepts only together with `P`);
   of a `MortonKey`, `root`, `level` and `coords`. A `GhostSchedule`
@@ -7051,10 +7062,11 @@ which companion releases go with it.
 `test/runtests.jl` runs the test files, which are, in its order,
 `tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
 `element_tests.jl` (M16), `position_tests.jl` (M22 step 1),
-`closed_tests.jl` (M22 steps 2 and 3: the closed layout, stage 0 and its
+`closed_tests.jl` (M22 steps 2 to 4: the closed layout, stage 0 and its
 group count, the primary mask, the reductions, `unify!` and the hook at
 an outer face, on uniform meshes and on meshes of two and three levels,
-with the mirror symmetry of a refined box and the bound `N = 2G`),
+with the bound `N = 2G`; the mirror symmetry of a closed box under every
+face kind, stage P, and a bitant's mass and norm),
 `reflect_tests.jl` (M10), `outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
 `atlas_tests.jl` (M19), `glue_tests.jl`, `glue_ball_tests.jl` and
@@ -7064,7 +7076,7 @@ M7 files `partition_tests.jl`, `exchange_tests.jl`,
 `regrid_exchange_tests.jl` and `interpolate_exchange_tests.jl`,
 `allvariables_tests.jl`, `state_tests.jl`, `fold_tests.jl` (M15),
 `regrid_tests.jl`, `bounded_tests.jl` (the bounded prolongation),
-`staggered_conservative_tests.jl`, `walls_tests.jl` (symmetric walls),
+`staggered_conservative_tests.jl`,
 `relative_tests.jl` (the relative boundary hook), `wave_tests.jl`,
 `wave_cell_tests.jl`, `burgers_tests.jl`, `imex_tests.jl`,
 `type_tests.jl`, `thread_tests.jl`, `mpi_tests.jl` (M7) and

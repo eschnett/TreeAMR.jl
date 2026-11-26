@@ -106,8 +106,8 @@ interpolation through the atlas, for the kinked maps of a cubed sphere
 (`glue = :interpolate` on a [`FieldSet`](@ref)). M22, closed blocks, is
 being built on the branch `m22`, which this documentation describes:
 step 2, the closed layout on uniform meshes with periodic and outer
-faces, and step 3, coarse-fine faces on meshes refined once, are
-implemented there. Next is visualization export (M9b).
+faces, step 3, coarse-fine faces on meshes refined once, and step 4,
+reflecting and outflow faces, are implemented there. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -204,9 +204,10 @@ each point once, `primaries = true`, and the norms weight a face plane by
 a half. On a mesh of several levels the finest copy of a point is the
 primary, and a coarser copy takes its value by the set's restriction, so
 a fine block evolves its whole closed box and a refined region is
-symmetric. Until later steps of M22 a set with a vertex-like dimension
-is refused at reflecting or outflow faces, across a rotating seam or a
-glue, and by `regrid!`.
+symmetric. At a reflecting face the ghosts are the mirror image about the
+wall plane and an odd variable is zero on it; at an outflow face they
+repeat the wall. Until later steps of M22 a set with a vertex-like
+dimension is refused across a rotating seam or a glue, and by `regrid!`.
 
 [`interiorview`](@ref) returns the own points — a block's `N+1` faces in
 a staggered dimension, which is what a flux kernel launched with

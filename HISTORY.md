@@ -5740,6 +5740,93 @@ M12 was decided with Erik, after M7 and before M9b.
   vertex-like iterations, workload cases): step 4, 13, 20 and 8; step 6,
   12, 10 and 12; step 7, 22, 18 and 11; step 8, 26, 8 and 4; step 3,
   none.
+- *Step 4, reflecting and outflow faces (2026-11-26).* Implemented on
+  `m22` in four commits after a written plan Erik reviewed: the mirror
+  and the clamp about the wall plane; stage P; `walls` removed; the
+  workloads and documents. Erik's decisions on the plan:
+  - *The stage order is A → W → P → 0*, not A → P → W → 0 as the design
+    had it. At an edge where an outer face meets a reflecting one a value
+    the hook prescribes lies on the mirror plane, and so does the point
+    one plane in that a relative hook reads there; P after W projects
+    both, where P before W would let a prescribed nonzero odd value
+    stand. CODE.md's fill table and *Ghost filling* say so.
+  - *A mirrored restriction at `N = 2G` reads its child's closed half.*
+    The outermost ghost beyond a high wall mirrors onto the mid-plane,
+    which the halved range of phase 1 gives the lower child while the
+    wall-side source is the upper one; the upper child's low plane is a
+    secondary, legal to read after stage 0, and the read is in the
+    stencil, where `stage_groups` sees it (`mirror_restriction`).
+  - *Stage P is a copy of a block's own wall pieces onto themselves*
+    through the factor column of mirror state 2, which `parityfactors`
+    already held as `(1 + σ)/2` for the derived wall row: the column
+    stays, with a new use. No group for a piece whose variables are all
+    even; `±0` for an odd variable is accepted; `scaled` is unchanged.
+  - *`walls` is removed outright*, keyword and field, as
+    `InterfaceSchedule` was. **Migration (for step 11's release notes):**
+    drop `walls = :symmetric` or `walls = :half_open` from `FieldSet` and
+    from `GhostSchedule`'s forest form; every wall is symmetric. A set
+    that read the high wall plane of a vertex-like dimension as filled now
+    evolves it, and an odd variable on a mirror plane is zero after every
+    fill. TreeIOHDF5 reads `fs.walls` for its `symmetric_walls` feature
+    (`hdf5.jl`), which goes in step 10.
+  - *The done-when's bitant norm* was mis-stated: the volume-weighted
+    norm is normalized, so the bitant's equals the full domain's, and its
+    `total_mass` is half; exactly on dyadic data, to a few ulp otherwise,
+    since the full domain's two halves sum their points in mirrored
+    order. PLAN.md is corrected.
+  What the code showed against the design:
+  - *The schedule needs the variables' parities* to leave out stage P
+    for even variables, so `GhostSchedule`'s forest form takes `parity`,
+    and the field-set form passes the set's; the fill refuses a set with
+    other parities. Passed as a `Union` it cost the schedule its inferred
+    type (element_tests' `@inferred` caught it); an empty vector stands
+    for "unknown".
+  - *A closure's local `parity` in the factor column reassigned the new
+    keyword*, which Julia captures; renamed `signs`.
+  - *The tests' lockstep fill had no stage P*, and the device's packing
+    test diverged from the serial fill until it ran it.
+  - *Oracles written for half-open ownership* counted `G+1 … G+N` as the
+    owned range and clamped an outflow ghost onto `G+N`; they count the
+    own range and the wall now, and the exchange tests expect stage 0 in
+    front of phase 1. A flat-launch setup at a reflecting face, gated in
+    step 2, comes back without the assertion that a copy at a high wall
+    derives the wall plane.
+  - *Three tests of the derived wall row are replaced*: reflect_tests'
+    "The upper wall point of a vertex-like dimension is derived" by "The
+    wall point of a vertex-like dimension is evolved, an odd variable
+    zero"; bounded_tests' "A bounded derived wall point stays in its
+    bracket" by the bounded cases of closed_tests' mirror-symmetry
+    testset; gpu_tests' "symmetric walls are written on the device" by
+    "stage P projects the mirror planes on the device". test/walls_tests.jl
+    is deleted: its symmetry claims are closed_tests' "A closed box fills
+    mirror-symmetrically under every face kind" and, through a regrid, a
+    testset pending until step 6; its partition claim the reflect, outflow
+    and centering partition testsets; its 4.7 × 10⁻⁵ is this record's.
+  - *Measured* (laptop M3 Pro, Julia 1.13.4): a closed box fills
+    point-symmetrically to 0 (bit for bit) uniform and to 2.2 × 10⁻¹⁶ (1D),
+    1.3 × 10⁻¹⁵ (2D) and 4.0 × 10⁻¹⁵ (3D) refined, under outer,
+    reflecting, outflow and mixed faces alike, at a data scale of about 3.
+    The reflecting vertex wave (L2 / L∞ rate, `N = 8 … 32`), half-open
+    7d99187 → closed: `D = 1` odd 1.91 / 1.95 → 1.92 / 1.95, even 2.02 /
+    2.00 → 1.99 / 2.00; `D = 2` odd 1.96 / 2.05 → 1.95 / 2.05, even 1.99 /
+    2.00 → 1.99 / 2.00 (CODE.md records none). Stage P groups on a
+    reflecting `4³` box, 3D vertex set of three variables, `N = 16`, `G =
+    2`: none for even variables, 56 for a vector; stage 0 as the outer
+    box's, 19 + 0 uniform and 19 + 61 with a corner refined; the build 5.3
+    and 7.2 ms against 5.3 and 6.9 ms.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  at eight threads, 180,434 tests and 456 pending (Broken) in 7m13, and
+  at one, 180,382 and 456 in 6m00, both MPI jobs included with the step-4
+  cases R2v, F2, F3, BP, RH, CS and N3 at two and three ranks; a first
+  eight-thread run stalled for over twenty minutes in type inference
+  (EscapeAnalysis on a top-level testset body) in the group holding
+  element, position, outflow, glue-ball, bounded, staggered-conservative
+  and GPU tests, which alone passed in 4m08, and was killed; the rerun
+  passed. `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32)
+  passes, 21,633 tests and 21 pending in 6m16. The docs build and their
+  doctests pass. The pending tests by step, as call sites: step 6, 12
+  testsets, 10 loops and 12 workload cases; step 7, 22, 18 and 11; step
+  8, 26, 8 and 4; steps 3 and 4, none.
 
 ## Downstream checks
 

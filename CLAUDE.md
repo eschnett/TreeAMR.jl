@@ -398,10 +398,11 @@ the one that says why.
   the set's restriction, keyed by `GroupKey.span`, merged only in
   `merged_transfers`; the ghost stages use the symmetric partition, the
   mid-plane of a halved range the lower child's. The interface
-  restriction is `unify!` with a `UnifySchedule`. `N ≥ 2G` in every
-  dimension. A sum or a count over such a set takes `primaries = true`.
-  What later steps rebuild (reflecting and outflow faces, `regrid!`,
-  seams, glues) is refused with the step's
+  restriction is `unify!` with a `UnifySchedule`. A reflecting wall
+  plane is projected onto each variable's parity by stage P, after stage
+  W and before stage 0. `N ≥ 2G` in every dimension. A sum or a count
+  over such a set takes `primaries = true`. What later steps rebuild
+  (`regrid!`, seams, glues) is refused with the step's
   name, and its old code errors if reached: do not route around a
   refusal ("Closed blocks", and the pending tests in
   `test/helpers/pending.jl`). Read the seam through `seam_plane`,

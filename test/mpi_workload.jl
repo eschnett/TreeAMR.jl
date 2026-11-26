@@ -1540,7 +1540,9 @@ function main()
     # only, cell-centered, with an outflow face and an outer one
     # opposite. The first variable is odd across the x₁ walls.
     parity = [(OddParity, EvenParity), (EvenParity, EvenParity)]
-    pending_case("R2v", 4)
+    wave_case("R2v", forest_of((3, 3), 8; reflecting=((true, true), (true, true)),
+                               centre=(0.4, 0.5)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6, parity=parity)
     wave_case("R2c", forest_of((3, 3), 8; reflecting=((true, false), (true, false)),
                                outflow=((false, true), (false, false)),
                                centre=(0.4, 0.5)); G=2,
@@ -1552,34 +1554,44 @@ function main()
     fill_case("F2", forest_of((3, 3), 8; periodic=(true, false),
                               reflecting=((false, false), (true, true)),
                               centre=(1.4, 0.5)),
-              ("cell" => cellcentered(2),); G=2, ops=OPS4)
-    pending_case("F2 vertex face1 face2", 4)
-    pending_case("F3", 4)
+              ("cell" => cellcentered(2), "vertex" => vertexcentered(2),
+               "face1" => facecentered(2, 1), "face2" => facecentered(2, 2));
+              G=2, ops=OPS4)
+    fill_case("F3", forest_of((2, 2, 2), 4; periodic=(true, false, false),
+                              reflecting=((false, false), (true, false), (false, false)),
+                              outflow=((false, false), (false, false), (false, true)),
+                              centre=(0.7, 0.4, 1.2)),
+              ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
+               "edge1" => edgecentered(3, 1));
+              G=1, ops=OPS2)
     # The bounded prolongation across ranks, mirrored and clamped
     # rows included: computed by the sender, read through the same columns.
     fill_case("B2", forest_of((3, 3), 8; reflecting=((true, false), (false, false)),
                               outflow=((false, true), (true, false)),
                               centre=(0.4, 0.5)),
               ("cell" => cellcentered(2),); G=1, ops=OPSCB)
-    # The bounded point-value interpolation across ranks: prolongations,
-    # interpolating restrictions and the derived wall row of a reflecting
-    # vertex-like face, each clamped by the sender into its bracket.
+    # The bounded point-value interpolation across ranks: prolongations and
+    # interpolating restrictions, mirrored at a reflecting vertex-like face,
+    # each clamped by the sender into its bracket.
     fill_case("BP", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
                               outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
-              ("cell" => cellcentered(2),); G=2, ops=OPS4B)
-    pending_case("BP vertex", 4)
-    # Staggered sets under the conservative family: averages along the
-    # cell-like dimension, point values along the vertex-like one, the
-    # derived wall row at the reflecting faces included.
+              ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4B)
     # The relative hook: the ghosts beyond the outer faces from the block's
     # own data, its corner rows read across block faces after the stage
     # that fills them, on whichever rank holds them.
     fill_case("RH", forest_of((3, 3), 8; outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
-              ("cell" => cellcentered(2),); G=2, ops=OPS4, relative=true)
-    pending_case("RH vertex", 4)
-    pending_case("CS", 4)
+              ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4,
+              relative=true)
+    # Staggered sets under the conservative family: averages along the
+    # cell-like dimension, point values along the vertex-like one, the wall
+    # planes of the reflecting faces evolved and projected by stage P.
+    fill_case("CS", forest_of((3, 3), 8; periodic=(true, false),
+                              reflecting=((false, false), (true, true)),
+                              centre=(1.4, 0.5)),
+              ("face1" => facecentered(2, 1), "face2" => facecentered(2, 2)); G=2,
+              ops=OPSCS)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,
     # the initial-data cycle from one leaf, and blocks moving between
     # ranks over several field sets, in Float64 and Float32x2. Float32 is
@@ -1627,7 +1639,7 @@ function main()
     pending_case("QE2", 7)
     # The nested octant, whose prolongation levels every rank runs as one
     # group of stages.
-    pending_case("N3", 4)
+    grouped_case("N3")
     # Element sets (M16), on three levels: order 3 over a periodic square
     # and over a reflecting wall with outer faces and the hook, order 1
     # over a periodic cube.

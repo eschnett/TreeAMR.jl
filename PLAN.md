@@ -661,12 +661,17 @@ Steps:
    1.99) and awaits Erik's review before [CODE.md](CODE.md#operators)
    records it; the step is done then. The record is step 3 in
    [HISTORY.md](HISTORY.md#m22--closed-blocks).
-4. **Reflecting and outflow faces.** The mirror about the wall plane,
-   stage P, the clamp to the wall row; `walls`, `wall_stencil` and
-   mirror state 2 deleted. *Done when* a closed box, uniform and
-   refined, is mirror-symmetric to rounding under every face kind
-   without a keyword, an odd variable is zero on its mirror plane, and
-   a bitant domain's norm is half the full domain's exactly.
+4. **Reflecting and outflow faces** — done on `m22`: the mirror about
+   the wall plane, stage P after stage W, the clamp to the wall row;
+   `walls`, `wall_stencil` and the derived wall row deleted. Its
+   done-when, as corrected: a closed box, uniform and refined, is
+   mirror-symmetric to rounding under every face kind without a
+   keyword; an odd variable is zero on its mirror plane; a bitant
+   domain's `total_mass` is half the full domain's and its
+   `volume_weighted_norm` equal, exactly on dyadic data and to a few ulp
+   otherwise. The design text is under [Closed blocks](CODE.md#closed-blocks)
+   (*Walls*, *Stage P*), the record step 4 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
 5. **The first measurement, and the partition settled.** Against
    `main`: `bench/nested.jl` at four ranks and on H200s, staged and
    direct; `bench/copies.jl`; `--trace-compile-timing` of
