@@ -596,57 +596,143 @@ run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
     run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors,
                rotvars=fs.rotvars)
 
-# --- Stage P on a rotating seam's axis (M22) -------------------------------
+# --- Means over a point's members: the axis and stage A (M22) ----------------
 #
-# A point on the axis is its own image under the turn, so each of its
-# variables becomes the mean of its images under the orbit's powers of the
-# set's map (`AxisPoints`): read through the same tables as a turned
-# transfer, `rotvars[v, r + 1]` and the sign at column `1 + 3^D·r`, but
-# summed over the orbit. Every other transfer writes a variable from one
-# source variable, so one kernel serves them all; this one writes a
+# Two places of the fill write a variable from several values of one
+# point: a rotating seam's axis (stage P), its own image under the turn,
+# whose variables become the mean of their images under the orbit's powers
+# of the set's map (`AxisPoints`), and stage A, where the copies of a point
+# on a kinked glue, the within-patch primaries of the patches holding it,
+# become their mean (`GlueMeans`). Every other transfer writes a variable
+# from one source variable, so one kernel serves them all; these write a
 # variable from several, which an in-place transfer would race on between
-# the variables of a point, so it gathers into a buffer first and writes
-# second, the one kernel of the fill that is not `transfer_kernel!`. It
-# sits behind a barrier, so that a forest without an axis compiles none
-# of it, and runs only for a set whose map turns some variable, where the
-# mean is not the identity.
-@kernel function axis_gather_kernel!(buf, @Const(src), @Const(blocks), @Const(points),
-                                     @Const(factors), @Const(rotvars), orbit::Int,
-                                     ncol::Int)
+# the variables of a point and between the members, so one kernel gathers
+# every target's mean into a buffer first and a second writes it back: the
+# one exception to "one kernel for every transfer". Both sit behind a
+# barrier, so that a forest without an axis or a kinked glue compiles none
+# of it.
+#
+# A target `i` has `mcount[i]` members, column `i` of the member tables: a
+# member is the stored point `mpoint[m, i]` of local block `mblock[m, i]`,
+# read through the set's tables in orientation `mr[m, i]` (`rotvars[v, r +
+# 1]` and the sign at column `1 + 3^D·r`, as a turned transfer reads; in
+# orientation 0 as stored, the tables then unread), or,
+# where `mblock` is 0, the value another rank sent, at column `mslot[m, i]`
+# of `recv`. Two rules of summation, one per use:
+#
+# - `paired`, the axis's: the members in pairs a half turn apart, `(t₀ +
+#   t₂) + (t₁ + t₃)`, so that a component the half turn negates cancels
+#   exactly within its pair, and the images of one variable sum the same
+#   pairs in swapped order, which addition does not see: exact under the
+#   map and idempotent bit for bit.
+# - otherwise stage A's: `x₁ + Σ_{m≥2} (x_m − x₁) / M`, in member order, the
+#   same on every rank, which gives `x₁` exactly when the members are equal,
+#   whatever their count, so that a second fill changes no bit; a mean of
+#   one member is the member itself, which is how a value is packed for
+#   another rank (`-0` kept).
+@kernel function mean_gather_kernel!(buf, @Const(src), @Const(recv), @Const(mblock),
+                                     @Const(mpoint), @Const(mslot), @Const(mr),
+                                     @Const(mcount), @Const(factors), @Const(rotvars),
+                                     ncol::Int, paired::Bool)
     i, v = @index(Global, NTuple)
     @inbounds begin
-        b = Int(blocks[i])
-        p = points[i]
-        term(r) = factors[v, 1 + ncol * r] * src[p..., r == 0 ? v : Int(rotvars[v, r + 1]),
-                                                b]
-        # Summed in pairs a half turn apart, `(t₀ + t₂) + (t₁ + t₃)`: a
-        # component the half turn negates cancels exactly within its pair,
-        # and the images of one variable sum the same pairs in swapped
-        # order, which addition does not see, so the projection is exact
-        # under the map and idempotent bit for bit.
-        acc = term(0) + term(2)
-        orbit == 4 && (acc += term(1) + term(3))
-        buf[i, v] = acc / orbit
+        M = Int(mcount[i])
+        # A member read in its own orientation (`mr` 0) is the stored
+        # value, whose sign column is one, as is every member of stage A.
+        term(m) = mblock[m, i] == 0 ? recv[v, Int(mslot[m, i])] :
+                  mr[m, i] == 0 ? src[mpoint[m, i]..., v, Int(mblock[m, i])] :
+                  factors[v, 1 + ncol * Int(mr[m, i])] *
+                  src[mpoint[m, i]..., Int(rotvars[v, Int(mr[m, i]) + 1]),
+                      Int(mblock[m, i])]
+        if paired
+            acc = term(1) + term(2)
+            M == 4 && (acc += term(3) + term(4))
+            buf[v, i] = acc / M
+        else
+            x1 = term(1)
+            if M == 1
+                buf[v, i] = x1
+            else
+                s = zero(x1)
+                for m in 2:M
+                    s += term(m) - x1
+                end
+                buf[v, i] = x1 + s / M
+            end
+        end
     end
 end
 
-@kernel function axis_write_kernel!(dest, @Const(buf), @Const(blocks), @Const(points))
+@kernel function mean_write_kernel!(dest, @Const(buf), @Const(blocks), @Const(points))
     i, v = @index(Global, NTuple)
-    @inbounds dest[points[i]..., v, Int(blocks[i])] = buf[i, v]
+    @inbounds dest[points[i]..., v, Int(blocks[i])] = buf[v, i]
+end
+
+# The members of a set of targets, as `mean_gather_kernel!` reads them, on
+# a backend, with the targets themselves (`blocks`, `points`) and the same
+# for a state-shaped array, every point moved down by the ghost widths
+# (`statepoints`, `mstatepoint`).
+struct MeanPoints{VB,VP,MB,MP,MR}
+    blocks::VB
+    points::VP
+    statepoints::VP
+    mblock::MB
+    mpoint::MP
+    mstatepoint::MP
+    mslot::MB
+    mr::MR
+    mcount::VB
+    paired::Bool
+end
+Base.length(p::MeanPoints) = length(p.blocks)
+
+# The tables of `n` targets of up to `M` members each, on the host, filled
+# by the builder; then moved to `backend`.
+function host_means(::Val{D}, n::Int, M::Int, paired::Bool) where {D}
+    z = ntuple(_ -> Int32(1), D)
+    return MeanPoints(zeros(Int32, n), fill(z, n), fill(z, n), zeros(Int32, M, n),
+                      fill(z, M, n), fill(z, M, n), zeros(Int32, M, n), zeros(Int8, M, n),
+                      zeros(Int32, n), paired)
+end
+todevice(backend, p::MeanPoints) =
+    MeanPoints(todevice(backend, p.blocks), todevice(backend, p.points),
+               todevice(backend, p.statepoints), todevice(backend, p.mblock),
+               todevice(backend, p.mpoint), todevice(backend, p.mstatepoint),
+               todevice(backend, p.mslot), todevice(backend, p.mr),
+               todevice(backend, p.mcount), p.paired)
+
+# The means of `p`'s targets in `A`, a working array or, with `state`, a
+# state-shaped one, into `buf` (`nvars × length(p)`), `recv` holding what
+# other ranks sent; and their write back.
+function gather_means!(buf, A, recv, p::MeanPoints, nvars::Integer, factors, rotvars,
+                       backend; state::Bool=false)
+    n = length(p)
+    n == 0 && return nothing
+    ncol = 3^(ndims(A) - 2)
+    mean_gather_kernel!(backend)(buf, A, recv, p.mblock, state ? p.mstatepoint : p.mpoint,
+                                 p.mslot, p.mr, p.mcount, factors, rotvars, ncol,
+                                 p.paired; ndrange=(n, Int(nvars)))
+    return nothing
+end
+function write_means!(A, buf, p::MeanPoints, nvars::Integer, backend; state::Bool=false)
+    n = length(p)
+    n == 0 && return nothing
+    mean_write_kernel!(backend)(A, buf, p.blocks, state ? p.statepoints : p.points;
+                                ndrange=(n, Int(nvars)))
+    return nothing
 end
 
 # Project the axis points of `axis` in `A`, a working array or, with
-# `state`, a state-shaped one.
-function axis_project!(A::AbstractArray{T}, axis::AxisPoints, nvars::Integer, factors,
+# `state`, a state-shaped one. The buffer of the means, `nvars × n`, is
+# made per call; nothing is received, so the buffer stands in for `recv`,
+# which no member reads.
+function axis_project!(A::AbstractArray{T}, axis::MeanPoints, nvars::Integer, factors,
                        rotvars, backend; state::Bool=false) where {T}
-    n = length(axis.blocks)
+    n = length(axis)
     n == 0 && return nothing
-    points = state ? axis.statepoints : axis.points
-    buf = allocate(backend, T, (n, Int(nvars)))
-    ncol = 3^(ndims(A) - 2)
-    axis_gather_kernel!(backend)(buf, A, axis.blocks, points, factors, rotvars,
-                                 axis.orbit, ncol; ndrange=(n, Int(nvars)))
-    axis_write_kernel!(backend)(A, buf, axis.blocks, points; ndrange=(n, Int(nvars)))
+    buf = allocate(backend, T, (Int(nvars), n))
+    gather_means!(buf, A, buf, axis, nvars, factors, rotvars, backend; state=state)
+    write_means!(A, buf, axis, nvars, backend; state=state)
     synchronize(backend)
     return nothing
 end
@@ -1004,6 +1090,10 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     groups = schedule.stagegroups
     locals = schedule.grouplocals
     p1 = schedule.phase1group
+    # Stage A (M22): the copies of a point on a glue the set is
+    # interpolated at, the patches' within-patch primaries, become their
+    # mean, before anything else reads or writes them.
+    run_stage_a!(fs.work, fs, schedule.means, backend, forest.comm)
     # Stage W (M22): a hook that prescribes the wall writes the wall's
     # primaries first, so that stage 0 carries them to every other copy.
     boundary === nothing || wall_boundary!(fs, boundary, schedule, backend)
@@ -1766,10 +1856,11 @@ function unify_arrays!(A, alt, fs::FieldSet, factors, rotvars, schedule, backend
     return nothing
 end
 
-# Stage P alone: the wall planes' and the axis's projections, on the
-# primaries.
+# Stages A and P alone: a kinked glue's means and the wall planes' and the
+# axis's projections, on the primaries.
 function unify_stage_p!(A, fs::FieldSet, factors, rotvars, schedule, backend;
                         state::Bool=false)
+    run_stage_a!(A, fs, schedule.means, backend, schedule.forest.comm; state=state)
     selfimage = state ? schedule.stateselfimage : schedule.selfimage
     isempty(selfimage) ||
         run_phase!(A, A, selfimage, fs.nvars, backend; factors=factors, rotvars=rotvars)

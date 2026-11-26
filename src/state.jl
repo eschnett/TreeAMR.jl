@@ -467,14 +467,18 @@ function primary_mask(fs::FieldSet{T,D}) where {T,D}
     cached = fs.primary
     cached !== nothing && cached[1] == g && return cached[2]::PrimaryMask{D,V}
     forest = fs.forest
-    # The primaries across levels, mirrors, seams and glues come with the
-    # steps that rebuild those (M22); refused until then, as the fill is.
-    check_closed_blocks(forest, fs.centering, "primary_mask"; glue=fs.glue)
     c = staggers(fs)
     range = blockrange(forest)
     pieces = Vector{UInt32}(undef, length(range))
+    # Across a glue the set is interpolated at, the copies of a point are
+    # the patches' within-patch primaries, of which the lowest patch's is
+    # the primary (M22 step 8, `glue_lowest_bits`).
+    kinked = fs.glue === :interpolate && ispatched(forest)
     threaded_foreach(length(range)) do b
-        pieces[b] = primary_bits(forest, first(range) + b - 1, c)
+        j = first(range) + b - 1
+        bits = primary_bits(forest, j, c; acrossglue=!kinked)
+        pieces[b] = kinked ? Base.inferencebarrier(glue_lowest_bits)(forest, j, c, fs.G,
+                                                                    bits)::UInt32 : bits
     end
     mask = PrimaryMask{D,V}(todevice(backend, pieces), forest.N, map(Int8, c))
     fs.primary = (g, mask)

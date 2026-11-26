@@ -7,8 +7,9 @@
 # then evaluates one tensor-product Lagrange stencil per ghost point and
 # variable. See "Finite differences across a glue" in CODE.md, which this
 # file implements serially and over a distributed forest, on the CPU and
-# on a device. A set with a vertex-like dimension is refused over a glued
-# forest until M22 step 8, which rebuilds the glue on closed blocks.
+# on a device. On closed blocks (M22) every patch holding a point of a
+# glued face holds a copy of it, and stage A, at the end of this file,
+# makes the copies their mean.
 
 """
     TreeAMR.chart_aligned(atlas, p, q) -> NTuple{D,Bool}
@@ -453,8 +454,7 @@ function glue_stencil!(weights::Vector{T}, at::Int, cache, forest::Forest{D,R}, 
         t = (S(ξ′[e]) - S(lo[e][1])) / S(h) - (c[e] == 1 ? 0 : S(1) / 2)
         n = (npts[e] << lvl) * N
         # The window: the patch's own points, its high face plane included
-        # along a vertex-like dimension, owned where it is glued (the
-        # appendix) and the hook's at an outer face.
+        # along a vertex-like dimension, every block's own (M22).
         hi = c[e] == 1 ? n : n - 1
         if al[e]
             r = round(Int, t)
@@ -477,14 +477,10 @@ function glue_stencil!(weights::Vector{T}, at::Int, cache, forest::Forest{D,R}, 
         1 <= first && last <= N + 2G[e] + c[e] || throw(ArgumentError(
             "the stencil of the ghost at $(where_()[1]) of patch $p reaches outside the " *
             "stored array of its source block $skey along dimension $e"))
-        # Beyond the owned range: the ghosts below, or from the high plane
-        # of a vertex-like dimension up, which the neighbor within the
-        # patch fills — except the plane at the patch's high face, which
-        # the block owns at a glue (the appendix) and the hook fills at an
-        # outer face, both before this stage.
-        top = c[e] == 1 && start[e] + N == n
+        # Beyond the own range, closed along a vertex-like dimension (M22):
+        # the ghosts, which the neighbor within the patch fills.
         overhang = Base.setindex(overhang,
-                                 first <= G[e] ? -1 : last > G[e] + N + top ? 1 : 0, e)
+                                 first <= G[e] ? -1 : last > G[e] + N + c[e] ? 1 : 0, e)
         fs = Base.setindex(fs, Int32(first), e)
         ws = Base.setindex(ws, Int8(w), e)
     end
@@ -725,8 +721,9 @@ end
 
 # --- The copies of a point across glues --------------------------------------
 #
-# What M22 step 8 builds the primary of a point on a glued face from: the
-# copies of a point across the glues of a forest of patches.
+# What stage A's members and the mask's primary at a kinked glue are found
+# from (M22): the copies of a point across the glues of a forest of
+# patches.
 
 # Every copy of the point at doubled coordinates `y` of patch `p` (twice
 # its position in spacings of level `lvl`, so that a cell center is odd
@@ -756,4 +753,281 @@ function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::In
         i += 1
     end
     return copies
+end
+
+# --- Stage A: the copies of a point on a kinked glue (M22) -------------------
+#
+# Across a glue a set is interpolated at (`glue = :interpolate`), the
+# patches holding a point of a glued face evolve it by different stencils,
+# and their copies differ by the scheme's error. Stage A makes them one
+# number, their mean (M22 rule 4; the prototype's "averaged right-hand
+# sides", M20 in HISTORY.md), before stages W, P and 0, which carry it to
+# every other copy inside each patch. The members of a point are the
+# within-patch primaries of the patches holding it, one a patch, or more
+# where a patch is glued to itself: found by following the glues of every
+# glued face the point lies on (`glue_copies`), in each patch's integer
+# coordinates, so exactly, and ordered by patch and then by position. Every
+# block holding a member writes the same mean, computed by every rank alike
+# from the members in that order (`mean_gather_kernel!`), so the copies are
+# one number bit for bit.
+#
+# Over a distributed forest the members another rank holds come in one
+# message round under `GLUE_MEAN_TAG`, the sender packing its members'
+# values unchanged; the means are computed where they are written, so no
+# second round is needed. Both ends derive the layout from the tree: per
+# peer, the entries sorted by the receiving member's global leaf and stored
+# index, then the sending member's, the variables of a value together.
+#
+# The buffers — the means, `nvars × n`; the values sent and received —
+# are made on the first fill and kept with the plan, remade when the
+# variable count changes, and freed with the schedule, as the glue plan's
+# are.
+
+# The tag of stage A's round, past the interpolated ghosts'.
+const GLUE_MEAN_TAG = 37
+
+mutable struct MeanBuffers
+    means::Any
+    send::Any
+    recv::Any
+    wiresend::Any
+    wirerecv::Any
+    nvars::Int
+end
+MeanBuffers() = MeanBuffers(nothing, nothing, nothing, nothing, nothing, 0)
+
+struct GlueMeans{MP}
+    targets::MP            # the members of this rank's within-patch primaries
+    sends::MP              # one member each: a value another rank needs
+    sendpeers::Vector{Int}
+    sendcounts::Vector{Int}
+    recvpeers::Vector{Int}
+    recvcounts::Vector{Int}
+    buffers::MeanBuffers
+end
+Base.isempty(g::GlueMeans) = length(g.targets) == 0 && length(g.sends) == 0
+
+# The doubled patch coordinates of stored index `idx` of leaf `k` (twice its
+# position in spacings of `k`'s level, a cell centre odd), as `glue_copies`
+# takes a point.
+function doubled_point(forest::Forest{D}, k::MortonKey{D}, idx::NTuple{D,Int},
+                       G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    lvl = level(k)
+    N = forest.N
+    rootpos = root_position(forest, k.root)
+    return ntuple(D) do e
+        g = (rootpos[e] << lvl) + Int(k.coords[e])
+        return 2 * (g * N + idx[e] - G[e] - 1) + 1 - c[e]
+    end
+end
+
+# The within-patch primary of the point at doubled coordinates `z` of patch
+# `q`, at level `lvl`: the global leaf holding it on its high planes where a
+# block lies below along a dimension it is shared in (the greatest class
+# tuple, as `piece_primary` decides inside a patch), and its stored index.
+# Every leaf within reach of a kinked glue is at one level (*No refinement
+# boundary at a glue*), so the leaf is at `lvl`.
+function patch_primary(forest::Forest{D}, q::Int, z::NTuple{D,Int}, lvl::Int,
+                       G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    N = forest.N
+    conn = forest.conn::Patches{D}
+    g = ntuple(e -> (c[e] == 1 && z[e] > 0 && z[e] % (2N) == 0) ? z[e] ÷ (2N) - 1 :
+                    z[e] ÷ (2N), D)
+    root, coords, _ = glued_node(conn, q, g, lvl, Crossing())
+    j = find_leaf(forest, MortonKey{D}(Int32(root), Int8(lvl), map(UInt32, coords)))
+    j === nothing && error(
+        "a point on a kinked glue at $z of patch $q has no leaf at level $lvl " *
+        "holding it; every leaf within reach of the glue is at one level, so this " *
+        "is a bug")
+    idx = ntuple(e -> (z[e] - (1 - c[e])) ÷ 2 - g[e] * N + G[e] + 1, D)
+    return j, idx
+end
+
+# The members of the point at stored index `idx` of global leaf `j`: every
+# patch's within-patch primary of it, as `(patch, doubled point, leaf,
+# stored index)`, by patch and then by position.
+function glue_members(forest::Forest{D}, j::Int, idx::NTuple{D,Int}, G::NTuple{D,Int},
+                      c::NTuple{D,Int}) where {D}
+    k = forest.leaves[j]
+    lvl = level(k)
+    y = doubled_point(forest, k, idx, G, c)
+    copies = sort!(glue_copies(forest.conn::Patches{D}, patch(forest, k), y, lvl,
+                               forest.N, c))
+    return [(q, z, patch_primary(forest, q, z, lvl, G, c)...) for (q, z) in copies]
+end
+
+# Stage A's plan for a set of ghost widths `G` and staggers `c` over a
+# forest of patches it is interpolated across, or `nothing` where no own
+# point lies on a glued face (a set cell-like along every glued normal).
+function glue_means(forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
+                    backend) where {D}
+    conn = forest.conn::Patches{D}
+    N = forest.N
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    me = commrank(forest.comm)
+    # This rank's members: per block on a glued face, the pieces of its
+    # closed box on that face whose copy is the within-patch primary.
+    targets = Tuple{Int,NTuple{D,Int},Vector{Tuple{Int,NTuple{D,Int},Int,NTuple{D,Int}}}}[]
+    for b in eachindex(owned)
+        j = offset + b
+        k = forest.leaves[j]
+        faces = filter(((e, s),) -> c[e] == 1, glued_faces(conn, k))
+        isempty(faces) && continue
+        bits = primary_bits(forest, j, c; acrossglue=false)
+        for cls in closed_pieces(c)
+            (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+            any(((e, s),) -> cls[e] == (s == 1 ? 0 : 2), faces) || continue
+            rng = ntuple(d -> piece_range(N, G[d], c[d], piece_span(cls[d])), D)
+            for I in CartesianIndices(rng)
+                idx = Tuple(I)
+                members = glue_members(forest, j, idx, G, c)
+                length(members) > 1 || continue
+                any(m -> m[3] == j && m[4] == idx, members) || error(
+                    "the within-patch primary at $idx of leaf $j is not among the " *
+                    "members of its point on a kinked glue; this is a bug")
+                push!(targets, (j, idx, members))
+            end
+        end
+    end
+    isempty(targets) && !isdistributed(forest) && return nothing
+    # What is sent and received: a member held elsewhere, per pair of a
+    # target and a member, keyed by both, so both ends sort alike.
+    Key = Tuple{Int,Int,NTuple{D,Int},Int,NTuple{D,Int}}
+    recv = Key[]
+    send = Key[]
+    for (j, idx, members) in targets, (_, _, mj, midx) in members
+        (mj == j && midx == idx) && continue
+        o = leafowner(forest, mj)
+        o == me && continue
+        # Received: member `(mj, midx)` of target `(j, idx)`, from `o`.
+        push!(recv, (o, j, idx, mj, midx))
+        # Sent: this target's value to `o`, for its target `(mj, midx)`,
+        # keyed as `o` keys the receive, so that both sort alike.
+        push!(send, (o, mj, midx, j, idx))
+    end
+    sort!(recv)
+    sort!(send)
+    M = isempty(targets) ? 1 : maximum(t -> length(t[3]), targets)
+    host = host_means(Val(D), length(targets), M, false)
+    slot = Dict{Tuple{Int,NTuple{D,Int},Int,NTuple{D,Int}},Int}(
+        (r[2], r[3], r[4], r[5]) => i for (i, r) in enumerate(recv))
+    for (i, (j, idx, members)) in enumerate(targets)
+        host.blocks[i] = Int32(j - offset)
+        host.points[i] = map(Int32, idx)
+        host.statepoints[i] = ntuple(d -> Int32(idx[d] - G[d]), D)
+        host.mcount[i] = Int32(length(members))
+        for (m, (_, _, mj, midx)) in enumerate(members)
+            if leafowner(forest, mj) == me
+                host.mblock[m, i] = Int32(mj - offset)
+                host.mpoint[m, i] = map(Int32, midx)
+                host.mstatepoint[m, i] = ntuple(d -> Int32(midx[d] - G[d]), D)
+            else
+                host.mslot[m, i] = Int32(slot[(j, idx, mj, midx)])
+            end
+        end
+    end
+    sends = host_means(Val(D), length(send), 1, false)
+    for (i, (_, _, _, j, idx)) in enumerate(send)
+        sends.mcount[i] = Int32(1)
+        sends.mblock[1, i] = Int32(j - offset)
+        sends.mpoint[1, i] = map(Int32, idx)
+        sends.mstatepoint[1, i] = ntuple(d -> Int32(idx[d] - G[d]), D)
+    end
+    function peers(list)
+        ps = unique(first.(list))
+        return ps, [count(x -> x[1] == p, list) for p in ps]
+    end
+    sendpeers, sendcounts = peers(send)
+    recvpeers, recvcounts = peers(recv)
+    return GlueMeans(todevice(backend, host), todevice(backend, sends), sendpeers,
+                     sendcounts, recvpeers, recvcounts, MeanBuffers())
+end
+
+# The buffers of a run of `nv` variables, made or remade when the count
+# changes.
+function mean_buffers!(g::GlueMeans, ::Type{T}, backend, comm, nv::Int) where {T}
+    bufs = g.buffers
+    if bufs.means === nothing || bufs.nvars != nv
+        ns, nr = sum(g.sendcounts; init=0), sum(g.recvcounts; init=0)
+        bufs.means = allocate(backend, T, (nv, length(g.targets)))
+        bufs.send = allocate(backend, T, (nv, ns))
+        bufs.recv = allocate(backend, T, (nv, nr))
+        staged = hoststaging(comm, vec(bufs.send))
+        bufs.wiresend = staged ? Vector{T}(undef, nv * ns) : vec(bufs.send)
+        bufs.wirerecv = staged ? Vector{T}(undef, nv * nr) : vec(bufs.recv)
+        bufs.nvars = nv
+    end
+    return bufs
+end
+
+# Stage A on `A`, `fs`'s working array or, with `state`, a state-shaped
+# one: the receives posted, this rank's members packed and sent, the
+# means formed once the receives are in and written back. Its sends are
+# waited for here, so the stages after it see nothing of this one.
+function run_glue_means!(A::AbstractArray{T}, fs::FieldSet, g::GlueMeans, backend, comm;
+                         state::Bool=false) where {T}
+    nv = fs.nvars
+    bufs = mean_buffers!(g, T, backend, comm, nv)
+    recvs = Any[]
+    for (peer, r) in zip(g.recvpeers, segment_ranges(g.recvcounts, nv))
+        push!(recvs, irecv(comm, view(bufs.wirerecv, r), peer, GLUE_MEAN_TAG))
+    end
+    sends = Any[]
+    # Every member is read as stored (orientation 0), so the set's sign
+    # and variable tables are not read; a set without a seam has none, and
+    # the means buffer stands in for them.
+    dummy = bufs.means
+    if !isempty(g.sendpeers)
+        gather_means!(bufs.send, A, bufs.recv, g.sends, nv, dummy, dummy, backend;
+                      state=state)
+        synchronize(backend)
+        bufs.wiresend === vec(bufs.send) || copyto!(bufs.wiresend, vec(bufs.send))
+        for (peer, r) in zip(g.sendpeers, segment_ranges(g.sendcounts, nv))
+            push!(sends, isend(comm, view(bufs.wiresend, r), peer, GLUE_MEAN_TAG))
+        end
+    end
+    if !isempty(recvs)
+        waitall(comm, recvs)
+        bufs.wirerecv === vec(bufs.recv) || copyto!(vec(bufs.recv), bufs.wirerecv)
+    end
+    gather_means!(bufs.means, A, bufs.recv, g.targets, nv, dummy, dummy, backend;
+                  state=state)
+    write_means!(A, bufs.means, g.targets, nv, backend; state=state)
+    synchronize(backend)
+    isempty(sends) || waitall(comm, sends)
+    return nothing
+end
+
+# Stage A where a schedule has one, behind a barrier, so that a forest
+# without a kinked glue compiles none of it.
+function run_stage_a!(A, fs::FieldSet, means, backend, comm; state::Bool=false)
+    means === nothing && return nothing
+    Base.inferencebarrier(run_glue_means!)(A, fs, means, backend, comm; state=state)
+    return nothing
+end
+
+# The mask's bits of global leaf `j` of a set interpolated across its
+# glues: of the within-patch primaries `bits`, those of a piece on a glued
+# face only where the block's copy is the member on the lowest patch,
+# then at the greatest position within it, which is the primary the
+# reductions count once. The patches holding a point are the same along a
+# piece, since a glue joins a whole face to a whole face.
+function glue_lowest_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}, G::NTuple{D,Int},
+                          bits::UInt32) where {D}
+    conn = forest.conn::Patches{D}
+    k = forest.leaves[j]
+    N = forest.N
+    faces = filter(((e, s),) -> c[e] == 1, glued_faces(conn, k))
+    isempty(faces) && return bits
+    for cls in closed_pieces(c)
+        (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+        any(((e, s),) -> cls[e] == (s == 1 ? 0 : 2), faces) || continue
+        idx = ntuple(d -> c[d] == 0 || cls[d] == 0 ? G[d] + 1 :
+                          cls[d] == 2 ? G[d] + N + 1 : G[d] + 1 + N ÷ 2, D)
+        members = glue_members(forest, j, idx, G, c)
+        _, _, mj, midx = argmin(m -> (m[1], map(-, m[2])), members)
+        mj == j && midx == idx || (bits &= ~(UInt32(1) << piece_index(cls)))
+    end
+    return bits
 end

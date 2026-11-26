@@ -738,8 +738,9 @@ point the target patch's map names: pass the application's atlas,
 `GhostSchedule(fs, operators; atlas)`, which the build calls
 (`chart_map`, `chart_locate`, and `chart_aligned` where it has one) and
 the fill never does. A patch corner is filled like any other ghost. A
-set with a vertex-like dimension is refused over a glued forest until
-M22 step 8 (see "Closed blocks" in `CODE.md`). Over a distributed forest the ranks compare the
+set with a vertex-like dimension holds a copy of a glued face's point on
+every patch holding it, and stage A makes them their mean (see "Closed
+blocks" in `CODE.md`). Over a distributed forest the ranks compare the
 atlas by `hash`, as the rest of the layout: an atlas holding an array or
 mutable state hashes by identity, differently in every process, and
 needs a `Base.hash` method of its own over its values. See "Finite
@@ -834,6 +835,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     stateselfimage::Vector{GRP}                  # stage P on a state, for `unify!`
     parities::Vector{NTuple{D,Parity}}           # stage P's parities; empty: unknown
     axis::Any                                    # stage P's axis points, or `nothing`
+    means::Any                                   # stage A (M22), or `nothing`
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
@@ -841,7 +843,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
         forest, generation, G, centering, P, glue, operators, backend, unify,
         phase1, phase2, levels, boundaries, boundaryplan, stages, stagegroups,
         stateunify, glueplan, selfimage, stateselfimage,
-        parities, axis) where {T,D,R,BK,GRP,BP,ST}
+        parities, axis, means) where {T,D,R,BK,GRP,BP,ST}
         p1 = findfirst(r -> any(i -> stages[i].tag == PHASE1_TAG, r), stagegroups)::Int
         return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, glue,
                                        operators,
@@ -849,7 +851,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
                                        boundaryplan, stages, stagegroups,
                                        group_locals(stages, stagegroups), p1,
                                        stateunify, glueplan, selfimage, stateselfimage,
-                                       parities, axis)
+                                       parities, axis, means)
     end
 end
 
@@ -2480,16 +2482,11 @@ end
 # the mean of its images under the orbit's powers of the set's map,
 # `¼ Σ_r Q^r u` for a quarter turn and `½ (u + Q u)` for a half turn, a
 # turned vector's in-plane components zero and a tensor's mixed. Taken at
-# the primaries only, as stored points `points` of local blocks `blocks`,
-# and as the same points of a state, `statepoints`; stage 0 carries the
-# result to the other copies. `orbit` is 4 or 2, the orientations of the
-# images `0:3`, or `0` and `2`, the half turn's.
-struct AxisPoints{VB,VP}
-    blocks::VB
-    points::VP
-    statepoints::VP
-    orbit::Int
-end
+# the primaries only, as the targets of a `MeanPoints` whose members are
+# the point itself in each orientation of the orbit, ordered so that the
+# paired sum adds the images a half turn apart first: `0, 2, 1, 3`, or
+# `0, 2` under a half turn. Stage 0 carries the result to the other
+# copies.
 
 # A forest's axis points for a set of ghost widths `G` and staggers `c`,
 # or `nothing` where it has none: the axis needs a vertex-like `d1` and
@@ -2503,9 +2500,7 @@ function axis_points(forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
     c[d1] == 1 && c[d2] == 1 || return nothing
     half = ishalfturn(forest)
     N = forest.N
-    blocks = Int32[]
-    points = NTuple{D,Int32}[]
-    statepoints = NTuple{D,Int32}[]
+    found = Tuple{Int,NTuple{D,Int}}[]
     range = blockrange(forest)
     for b in eachindex(range)
         j = first(range) + b - 1
@@ -2524,14 +2519,23 @@ function axis_points(forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
             (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
             rng = ntuple(d -> piece_range(N, G[d], c[d], piece_span(cls[d])), D)
             for I in CartesianIndices(rng)
-                push!(blocks, Int32(b))
-                push!(points, ntuple(d -> Int32(I[d]), D))
-                push!(statepoints, ntuple(d -> Int32(I[d] - G[d]), D))
+                push!(found, (b, Tuple(I)))
             end
         end
     end
-    return AxisPoints(todevice(backend, blocks), todevice(backend, points),
-                      todevice(backend, statepoints), half ? 2 : 4)
+    orbit = half ? (0, 2) : (0, 2, 1, 3)
+    host = host_means(Val(D), length(found), length(orbit), true)
+    for (i, (b, idx)) in enumerate(found)
+        p = map(Int32, idx)
+        sp = ntuple(d -> Int32(idx[d] - G[d]), D)
+        host.blocks[i], host.points[i], host.statepoints[i] = Int32(b), p, sp
+        host.mcount[i] = Int32(length(orbit))
+        for (m, r) in enumerate(orbit)
+            host.mblock[m, i], host.mpoint[m, i], host.mstatepoint[m, i] = Int32(b), p, sp
+            host.mr[m, i] = Int8(r)
+        end
+    end
+    return todevice(backend, host)
 end
 
 # The parities a schedule built from `fs` takes for stage P: the set's over
@@ -2903,30 +2907,6 @@ function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple
     return nothing
 end
 
-# What a set with a vertex-like dimension cannot be filled over yet (M22,
-# "Closed blocks"). Such a set owns its closed range, and the fill is
-# rebuilt on it step by step; what a later step rebuilds is refused until
-# then, with the step that brings it, rather than left half-working. Every
-# condition is a property of the forest and the layout, the same on every
-# rank, and the refusal is raised inside `GhostSchedule`'s
-# `collective_checks`. Cell-centered and element sets have no shared
-# points and are not affected. `what` names the caller.
-function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol},
-                             what::AbstractString; glue::Symbol=:copy) where {D}
-    any(==(:vertex), cs) || return nothing
-    why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
-          "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
-          "(\"Closed blocks\" in CODE.md)"
-    glue === :interpolate && ispatched(forest) && has_glue(forest.conn) &&
-        throw(ArgumentError(
-            "$what: the set is interpolated across the glued faces of a forest of " *
-            "patches, which is refused for $why: kinked glues come back in M22 step 8."))
-    return nothing
-end
-
-# Whether a forest of patches glues any face.
-has_glue(conn::Patches) = any(e -> e.patch != 0, conn.glue)
-
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
                   glue=fs.glue, atlas=atlas, T=T,
@@ -2969,8 +2949,6 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
             check_glue_layout(forest.conn, gs, cs, ss)
         end
         check_floattype(T, backend)
-        # After the refusals above, which keep their own reasons (M22).
-        check_closed_blocks(forest, cs, "GhostSchedule"; glue=glue)
         layout = layouthash(gs, cs, order, Int(operators.family),
                             operators.prolongation,
                             operators.restriction, operators.bounded,
@@ -3139,10 +3117,13 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # that a forest without an axis compiles none of it.
     axis = closed && hasrotating(forest) ?
            Base.inferencebarrier(axis_points)(forest, ghosts, stags, backend) : nothing
+    # Stage A on a kinked glue (M22 rule 4), behind a barrier too.
+    means = closed && interpolated ?
+            Base.inferencebarrier(glue_means)(forest, ghosts, stags, backend) : nothing
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, order, glue, operators,
         backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups,
-        stateunify, glueplan, selfimage, stateselfimage, parity, axis)
+        stateunify, glueplan, selfimage, stateselfimage, parity, axis, means)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

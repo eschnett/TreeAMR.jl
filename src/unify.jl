@@ -69,6 +69,7 @@ struct UnifySchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},ST<:ExchangeStage
     stateselfimage::Vector{GRP}                  # stage P on a state
     parities::Vector{NTuple{D,Parity}}           # stage P's parities; empty: none
     axis::Any                                    # stage P's axis points, or `nothing`
+    means::Any                                   # stage A (M22), or `nothing`
 end
 
 isstale(s::UnifySchedule) = generation(s.forest) != s.generation
@@ -98,7 +99,6 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
             "the field set that holds the face quantity, whose centering is vertex-like " *
             "in the face dimension (`facecentered($D, d)`), not over the cell-centered " *
             "state."))
-        check_closed_blocks(forest, fs.centering, "UnifySchedule"; glue=fs.glue)
         return nothing, layouthash(ghosts, fs.centering, T, nameof(typeof(backend)))
     end
     # This rank's blocks, in global leaf indices, as in `GhostSchedule`.
@@ -163,9 +163,12 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     # And on a rotating seam's axis (M22 rule 3).
     axis = hasrotating(forest) ?
            Base.inferencebarrier(axis_points)(forest, ghosts, stags, backend) : nothing
+    # And stage A on a glue the set is interpolated at (M22 rule 4).
+    means = !across && ispatched(forest) ?
+            Base.inferencebarrier(glue_means)(forest, ghosts, stags, backend) : nothing
     return UnifySchedule{T,D,floattype(forest),typeof(backend),GRP,ST}(
         forest, generation(forest), ghosts, fs.centering, backend, unify, stages,
-        stateunify, selfimage, stateselfimage, parities, axis)
+        stateunify, selfimage, stateselfimage, parities, axis, means)
 end
 
 function Base.show(io::IO, s::UnifySchedule{T,D}) where {T,D}

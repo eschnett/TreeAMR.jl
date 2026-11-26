@@ -198,7 +198,6 @@ tree rather than the data.
 """
 function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
-    check_closed_blocks(forest, fs.centering, "firing_boxes"; glue=fs.glue)
     backend = get_backend(fs.work)
     n = nblocks(fs)
     n == 0 && return Tuple{Int,NTuple{D,UnitRange{Int}}}[]   # a rank without blocks
@@ -1149,9 +1148,6 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
     ops = sched.operators
     push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded,
                    ops.vertex_prolongation, ops.glue))
-    # A set with a vertex-like dimension owns its closed range (M22); its
-    # transfer across a seam or a glue comes back in steps 7 and 8.
-    check_closed_blocks(forest, fs.centering, "regrid!"; glue=fs.glue)
     return nothing
 end
 
