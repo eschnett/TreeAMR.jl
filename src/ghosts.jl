@@ -1561,8 +1561,8 @@ plane held; fill such a set with its hook.
 A set with a vertex-like dimension owns its closed range (M22, "Closed
 blocks" in `CODE.md`): a point on a block face is held by every block
 whose closed box contains it, and the fill first gives every copy its
-primary's value, the copy on the block first in the leaf order (stage
-0), before anything reads one. At an outer face the wall plane is the
+primary's value, the copy on the block lying lowest along the dimensions
+the point is shared in (stage 0), before anything reads one. At an outer face the wall plane is the
 block's own on both sides, evolved, and the hook fills the `G` ghosts
 beyond it, so a set without ghosts along a vertex-like dimension (a
 flux, `G = 0`) has no hook region there at all: its wall is its own.
@@ -1626,8 +1626,8 @@ Give every secondary copy of a shared point its primary's value: stage 0
 of the fill alone (M22, "Closed blocks" in `CODE.md`). A set with a
 vertex-like dimension owns both face planes of its blocks, so a point on
 a block face has a copy on every block that holds it, and one of them,
-the copy on the block first in the forest's leaf order, is the primary
-([`isprimary`](@ref)).
+the copy on the block lying lowest along the dimensions the point is
+shared in, is the primary ([`isprimary`](@ref)).
 
 The first form unifies the field set's working array: what a set without
 ghosts, a flux computed on every block's own range, needs before its

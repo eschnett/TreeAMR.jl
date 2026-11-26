@@ -182,8 +182,9 @@ next block's point `0` — and every block owns them: its **own range** in
 every dimension is its closed range, `0 … N` along a vertex-like
 dimension, `N + 1` points, and `0 … N − 1` along a cell-like one. A point
 on a block face is then held by every block whose closed box contains
-it, as several **copies**; one of them, the copy on the block first in
-the forest's leaf order (by global leaf position, the lower face plane
+it, as several **copies**; one of them, the copy whose class tuple is
+greatest (the copy on the block lying lowest along the dimensions the
+point is shared in, for which it is on high face planes; the high plane
 where a block is its own neighbour across a periodic dimension of one
 root), is the **primary**, and the fill gives every other copy, a
 **secondary**, its value before anything reads one (stage 0, under
@@ -596,23 +597,42 @@ code (the record is step 2 under M22 in
 [HISTORY.md](HISTORY.md#m22--closed-blocks)):
 
 - *The unify transfer's key.* Stage 0's transfers are copies keyed by
-  `GroupKey.piece`, the class of the target piece per dimension — 0 the
-  low face plane, 1 the open interior (always, along a cell-like
-  dimension), 2 the high face plane — and `-1` everywhere for any other
-  transfer. One flag, as first designed, does not say which piece a
-  dimension with `δ_d = 0` writes: a block's high face plane along `e`
-  is written from the block beside it along `d`. The piece is in
-  `keyorder`, so the message layout needs nothing more.
+  `GroupKey.span`, per dimension a span `lo:hi` of the target's piece
+  classes — 0 the low face plane, 1 the open interior (always, along a
+  cell-like dimension), 2 the high face plane — coded `8lo + hi`
+  (`span_code`), and `-1` everywhere for any other transfer. One flag,
+  as first designed, does not say what a dimension with `δ_d = 0`
+  writes. The secondaries of a target with one source block and
+  direction merge into one transfer where they form a box
+  (`merged_spans`), which on one level they always do, so the spans
+  that occur are `0:0` (the low plane, from the block below), `1:2` (the
+  open interior and the high plane) and `0:2` (the whole own range, with
+  no block below) along a vertex-like dimension and `1:1` along a
+  cell-like one; pieces that do not form a box stay one transfer each.
+  Step 3 divides a vertex-like range at its mid-plane by numbering finer
+  classes, with the spans unchanged. The span is in `keyorder`, so the
+  message layout needs nothing more.
 - *Stage 0* has tag `UNIFY_TAG = 0`, before phase 1, in a schedule of a
   layout with a vertex-like dimension (`schedule.unify`; a cell or
   element schedule has no such stage and is unchanged). `stage_groups`
   runs it and phase 1 alone, in front (`phase1group`).
 - *The primary* of a piece is decided by `piece_copies`, which lists
   every copy as `(level, leaf, class, direction)`, and `piece_primary`,
-  the minimum of `(−level, global leaf, class)`; `primary_bits` packs a
-  block's `3^D` decisions, and both the mask and `unify_sources!` ask it.
-  Step 3 adds copies on other levels (the finer first, hence the negated
-  level) and step 8 copies across a glue (`glue_copies`).
+  the minimum of `(−level, −class)`, the class tuple compared dimension 1
+  first; `primary_bits` packs a block's `3^D` decisions, and both the
+  mask and `unify_sources!` ask it. On one level the copies of a piece
+  are its own and one across each nonempty set of the faces it lies on
+  that have a block across, the class flipped from 0 to 2 along each
+  step, so the classes tell them apart and the greatest is the copy high
+  along every shared dimension: the direction from a secondary to its
+  primary is `−1` where its class is the low plane and a block lies
+  below, `0` elsewhere, never `+1`. The rule asks for no index, so every
+  rank decides alike by construction (`closed_tests.jl` checks it over
+  simulated ranks), and a block's secondaries have at most `2^v − 1`
+  directions, `v` the number of vertex-like dimensions. Step 3 adds
+  copies on other levels (the finer first, hence the negated level) and
+  step 8 copies across a glue (`glue_copies`), with the patch an entry
+  of its own in the key.
 - *The mask* is `PrimaryMask` (`pieces`, one `UInt32` per local block,
   `N`, the staggers), built by `primary_mask(fs)` once per forest
   generation and kept in the field set on its backend; `isprimary(mask,
@@ -707,9 +727,15 @@ given by a rule that does not mention the orientation of an axis, and
    map — are the same number for a covariant right-hand side. One of
    them, the **primary**, is evolved in earnest, and the others, the
    **secondaries**, are copied from it through the map. The primary is
-   the copy on the block that comes first in the forest's leaf order
-   (patch, then position on the curve). The choice is bookkeeping: it
-   decides which of several equal numbers is kept.
+   the copy on the finest level, then (from step 8) on the first patch,
+   then the one whose class tuple is greatest: the copy on the block
+   lying lowest along the dimensions the point is shared in. The choice
+   is bookkeeping, as far as the values go: it decides which of several
+   equal numbers is kept. It is local, so that every rank decides alike
+   without an index, and the direction to a primary is decided per
+   dimension, so that stage 0 takes a transfer group per direction
+   (*What stage 0 costs*, below; HISTORY.md, M22 step 2, has the leaf
+   order it replaced).
 3. *A point that is its own image is projected.* A point on a mirror
    plane, or on a turn's axis, is unified with its image under the
    symmetry's variable map, the mean of `Sᵏ u` over the symmetry's
@@ -795,7 +821,10 @@ primaries, are written by no transfer of the stage. Stage W runs
 before it and on primaries only, so that stage 0 carries a prescribed
 value to every copy, a coarse block's included; a relative hook reads
 the points beside the wall along its normal, which are held by the same
-blocks as the wall point and so are primaries of the same block.
+blocks as the wall point, at the same classes along every other
+dimension and the open interior along the normal on each, so the rule
+ranks their copies as it ranks the wall point's and they are primaries
+of the same block.
 Stages 1 and 2
 write ghosts only and read closed boxes that are final, so the old
 invariant, "each reads only interior cells of other blocks", becomes
@@ -803,19 +832,35 @@ invariant, "each reads only interior cells of other blocks", becomes
 Their target ranges are one symmetric partition per dimension — `1 …
 G`, `G+1 … G+N+c`, `G+N+c+1 … N+2G+c` — for every block, at a wall, a
 seam, a glue and a coarse-fine face alike. Stage 0's targets are the
-pieces of the closed box's boundary: per vertex-like dimension the low
-plane `G+1`, the open interior `G+2 … G+N` or the high plane `G+N+1`,
-not all interior. Its transfers are the kernel's copies and
-restrictions, mirrored, turned or across a glue as phase 1's are, and
-keyed as they are with one flag saying that the target is a piece of
-the box rather than the region beyond it. `low`, `shift` and `top`
-leave `GroupKey`.
+pieces of the closed box's boundary, merged into boxes: per
+vertex-like dimension the low plane `G+1`, the open interior and the
+high plane `G+2 … G+N+1`, or the whole own range, not all interior. Its
+transfers are the kernel's copies and restrictions, mirrored, turned or
+across a glue as phase 1's are, and keyed as they are with a span per
+dimension saying which part of the box is the target rather than the
+region beyond it. `low`, `shift` and `top` leave `GroupKey`.
 
 What stage 0 costs: in a uniform region it moves exactly the points
 phase 1 moves today as the first plane of every high region, so the
 fill copies the same number of points as before. What is new is a
-stage — in 3D about 7 groups of launches per level beside 26 — and a
-message round. **(open)** Whether that shows on the nested mesh at four
+stage and a message round, and its groups, one launch each on a device.
+A periodic uniform mesh has one group per direction to a primary,
+`2^v − 1` for `v` vertex-like dimensions, beside phase 1's `3^D − 1`;
+outer faces double a direction's groups along each dimension it does
+not step in, where a block with no block below writes its whole own
+range, `3^v − 2^v` in all. Measured (`GhostSchedule`, `N = 8`, `G = 1`;
+stage 0 / phase 1):
+
+| set | periodic, 8, 2 or 1 roots a dimension | 8 roots, outer faces |
+|---|---|---|
+| vertex, D = 1 | 1 / 2 | 1 / 2 |
+| vertex, D = 2 | 3 / 8 | 5 / 8 |
+| vertex, D = 3 | 7 / 26 | 19 / 26 |
+| face, D = 3 | 1 / 26 | 1 / 26 |
+| edge, D = 3 | 3 / 26 | 5 / 26 |
+
+The rule first chosen, the primary first in leaf order, gave 98 groups
+for a vertex set in 3D (HISTORY.md, M22 step 2). **(open)** Whether that shows on the nested mesh at four
 ranks and on an H200 is measured in M22's step 5, before regridding,
 seams and glues are built on the partition (`bench/nested.jl`,
 `bench/copies.jl`); the fallback is to merge stage 0 into phase 1,
@@ -6571,7 +6616,7 @@ The ideas that span several files and are easy to violate:
 - **Phased ghost fill.** For a layout with a vertex-like dimension,
   stage W (a hook that prescribes the wall) and stage 0 (every secondary
   copy of a shared point from its primary, `UNIFY_TAG`, keyed by
-  `GroupKey.piece`) run first, alone. Phase 1: copies and restrictions
+  `GroupKey.span`) run first, alone. Phase 1: copies and restrictions
   (they read own points only, so they are race free). Then the
   physical-boundary hook.
   Phase 2: prolongations, coarsest target level first, because a
@@ -6686,9 +6731,10 @@ The ideas that span several files and are easy to violate:
   `nodeposition`, never from the index directly.
 - **Closed blocks** (M22 step 2, [Closed blocks](#closed-blocks)). A
   vertex-like dimension owns its closed range, and the state holds every
-  copy of a shared point. The primary is decided by global leaf
-  position (`piece_copies`, `primary_bits`), never a rank-local block
-  index, so that every rank and both ends of a message agree. A sum or a
+  copy of a shared point. The primary is decided locally, the copy with
+  the greatest class tuple (`piece_copies`, `piece_primary`,
+  `primary_bits`), never by an index, so that every rank and both ends
+  of a message agree, and a block's secondaries share few directions. A sum or a
   count over such a set passes `primaries`. What later steps rebuild is
   refused in `check_closed_blocks` (collective, in `GhostSchedule`), in
   `InterfaceSchedule`, `regrid!` and `firing_boxes`, and the half-open
@@ -6948,8 +6994,9 @@ which companion releases go with it.
 `test/runtests.jl` runs the test files, which are, in its order,
 `tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
 `element_tests.jl` (M16), `position_tests.jl` (M22 step 1),
-`closed_tests.jl` (M22 step 2: the closed layout, stage 0, the primary
-mask, the reductions, `unify!` and the hook at an outer face),
+`closed_tests.jl` (M22 step 2: the closed layout, stage 0 and its
+group count, the primary mask, the reductions, `unify!` and the hook at
+an outer face),
 `reflect_tests.jl` (M10), `outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
 `atlas_tests.jl` (M19), `glue_tests.jl`, `glue_ball_tests.jl` and

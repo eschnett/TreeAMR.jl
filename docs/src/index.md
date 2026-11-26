@@ -181,8 +181,8 @@ A vertex-like dimension stores one plane more, and its blocks are
 **closed** (M22, on the `m22` branch): a block owns both of its face
 planes, `N + 1` points, so a point on a block face is held by every block
 that touches it, and the state vector holds every copy, `∏(N + c_d)`
-values per block per variable. One copy, on the block first in the
-forest's leaf order, is the primary, and every ghost fill first gives the
+values per block per variable. One copy, on the block lying lowest along
+the dimensions the point is shared in, is the primary, and every ghost fill first gives the
 others its value ([`isprimary`](@ref), [`unify!`](@ref)). A flux
 therefore needs no ghosts at all, only its own faces:
 

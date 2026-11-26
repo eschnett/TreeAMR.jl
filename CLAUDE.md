@@ -393,8 +393,9 @@ the one that says why.
 - **Closed blocks (M22, on this branch).** A vertex-like dimension owns
   its closed range, `G+1 … G+N+1`; the state holds every copy of a
   shared point, `∏(N + c_d)` per block. Stage 0 of the fill gives every
-  secondary its primary's value (the copy on the first leaf, by *global*
-  leaf position), keyed by `GroupKey.piece`; the ghost stages use the
+  secondary its primary's value (the copy with the greatest class tuple,
+  on the block lowest along the shared dimensions: a local rule, no
+  index), one group per direction, keyed by `GroupKey.span`; the ghost stages use the
   symmetric partition. A sum or a count over such a set takes
   `primaries = true`. What later steps rebuild (two levels, reflecting
   and outflow faces, `regrid!`, seams, glues) is refused with the step's

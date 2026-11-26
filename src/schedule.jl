@@ -385,16 +385,15 @@ end
 # stays a function of the keys alone.
 #
 #
-# `piece` marks a transfer of stage 0 (M22, "Closed blocks" in CODE.md),
-# which writes a secondary copy of a point from its primary: per
-# dimension the class of the piece of the target's closed box it writes —
-# 0 the low face plane, 1 the open interior (always, along a cell-like
-# dimension), 2 the high face plane — and `-1` everywhere for any other
-# transfer, which writes the region beyond the box that `direction`
-# names. The direction alone does not fix the piece: along a dimension
-# with `δ_d = 0` the target may be any of the three, as a block's high
-# face plane is when its primary is the block beside it along another
-# dimension. It changes the target range, so it is part of the key.
+# `span` marks a transfer of stage 0 (M22, "Closed blocks" in CODE.md),
+# which writes secondary copies of points from their primaries: per
+# dimension the span of piece classes of the target's closed box it
+# writes (`span_code`), and `-1` everywhere for any other transfer, which
+# writes the region beyond the box that `direction` names. The direction
+# alone does not fix the span: along a dimension with `δ_d = 0` the
+# target is the open interior and the high face plane, or the whole own
+# range where no block lies below. It changes the target range, so it is
+# part of the key.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
@@ -403,15 +402,31 @@ struct GroupKey{D}
     mirror::NTuple{D,Int8}
     orientation::Int8
     glue::Int8
-    piece::NTuple{D,Int8}
+    span::NTuple{D,Int8}
 end
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
             mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8) where {D} =
-    GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, nopiece(Val(D)))
+    GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, nospan(Val(D)))
 
-# The `piece` of a key that is not stage 0's, and the test for one that is.
-nopiece(::Val{D}) where {D} = ntuple(_ -> Int8(-1), Val(D))
-isunify(key::GroupKey) = key.piece[1] >= 0
+# The `span` of a key that is not stage 0's, and the test for one that is.
+nospan(::Val{D}) where {D} = ntuple(_ -> Int8(-1), Val(D))
+isunify(key::GroupKey) = key.span[1] >= 0
+
+# A span of piece classes along one dimension, `lo:hi`, as one code,
+# `8lo + hi`. The classes are 0 the low face plane, 1 the open interior
+# (the only one along a cell-like dimension) and 2 the high face plane.
+# On one level a merged transfer of stage 0 writes `0:0` (the low plane,
+# from the block below), `1:2` (the open interior and the high plane, the
+# block below holding the primary of the low plane) or `0:2` (the whole
+# own range, where no block lies below) along a vertex-like dimension, and
+# `1:1` along a cell-like one; a single piece, `0:0`, `1:1` or `2:2`, is
+# written where pieces do not merge into a box (`merged_spans`). A
+# span rather than a list of shapes, so that M22 step 3, which divides a
+# vertex-like range at its mid-plane, can number finer classes — low
+# plane, lower half, mid-plane, upper half, high plane — and keep the
+# spans as they are; three bits a class leave it room.
+span_code(lo::Integer, hi::Integer) = Int8(8lo + hi)
+span_classes(code::Integer) = (Int(code) >> 3, Int(code) & 7)
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -435,7 +450,7 @@ kindrank(kind::Symbol) =
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
     (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
-     k.piece)
+     k.span)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -853,24 +868,25 @@ function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool)
     return (G + 1):(G + N + c)
 end
 
-# The stored range of a piece of a block's closed box along a dimension
-# (M22): class 0 the low face plane, 1 the open interior, 2 the high face
-# plane; along a cell-like dimension only class 1, the own range.
-function piece_range(N::Int, G::Int, c::Int, cls::Integer)
+# The stored range of a span of pieces of a block's closed box along a
+# dimension (M22, `span_code`): class 0 the low face plane, 1 the open
+# interior, 2 the high face plane; along a cell-like dimension only class
+# 1, the own range.
+function piece_range(N::Int, G::Int, c::Int, code::Integer)
     c == 0 && return (G + 1):(G + N)
-    cls == 0 && return (G + 1):(G + 1)
-    cls == 2 && return (G + N + 1):(G + N + 1)
-    return (G + 2):(G + N)
+    lo, hi = span_classes(code)
+    return (lo == 0 ? G + 1 : lo == 1 ? G + 2 : G + N + 1):(hi == 0 ? G + 1 :
+                                                             hi == 1 ? G + N : G + N + 1)
 end
 
 # Same-level copy: a pure shift of N cells against the direction, for
 # every centering. A ghost reads the neighbor's own points only, which
-# stage 0 has made equal to their primaries; a piece of stage 0 (`piece`
-# its class, M22) reads the same points of its primary's block, a face
+# stage 0 has made equal to their primaries; a span of stage 0 (`span`
+# its code, M22) reads the same points of its primary's block, a face
 # plane the block across's opposite one, which is the same point.
 function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int;
-                      piece::Integer=-1) where {T}
-    rng = piece >= 0 ? piece_range(N, G, c, piece) : target_range(N, G, c, δd, 0, false)
+                      span::Integer=-1) where {T}
+    rng = span >= 0 ? piece_range(N, G, c, span) : target_range(N, G, c, δd, 0, false)
     srcstart = Int32[j - N * δd for j in rng]
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
@@ -1374,22 +1390,34 @@ end
 # --- The primary of a shared point (M22) ---------------------------------
 #
 # A point on a block face of a vertex-like dimension is held by every block
-# whose closed box contains it. One copy is the primary, the copy on the
-# block first in the forest's leaf order, and the others take its value in
-# stage 0. A block's closed box falls into at most `3^D` pieces, by the
-# class of each dimension (0 low face plane, 1 open interior, 2 high face
-# plane; always 1 along a cell-like dimension), and every point of a piece
-# lies on the same faces of the block, so the same blocks hold it, each
-# at one piece of its own: whether a copy is the primary is decided per
-# piece, one bit.
+# whose closed box contains it. One copy is the primary, and the others
+# take its value in stage 0. A block's closed box falls into at most `3^D`
+# pieces, by the class of each dimension (0 low face plane, 1 open
+# interior, 2 high face plane; always 1 along a cell-like dimension), and
+# every point of a piece lies on the same faces of the block, so the same
+# blocks hold it, each at one piece of its own: whether a copy is the
+# primary is decided per piece, one bit.
 #
-# The order is by global leaf position, the index into the replicated
-# `forest.leaves`, never a rank-local block index, so that every rank —
-# both ends of a message, and every rank's mask — decides alike. A point
-# a block shares with itself, across a periodic dimension of one root,
-# has two copies on that block; the lower class, the low face plane, is
-# the primary. Step 3 adds copies on other levels, the finer winning
-# (hence the level first in the key, negated); step 8 those across a glue.
+# The primary is the copy whose class tuple is greatest, dimension 1
+# first: the copy on the block lying lowest along the dimensions the point
+# is shared in, for which the point is on high face planes. On one level
+# the copies of a piece are its own and one across each nonempty subset of
+# the faces it lies on that have a block across (a brick of roots, so a
+# block across each of two faces has one across their edge), the class
+# flipped, 0 to 2, along each step; distinct copies have distinct class
+# tuples, so the greatest is one copy, the one high along every shared
+# dimension. The direction from a secondary to its primary is then `-1`
+# exactly where its class is the low plane and a block lies below, and
+# never `+1`, across a periodic wrap too. A block that is its own
+# neighbour, across a periodic dimension of one root, holds two copies;
+# its high plane is the primary.
+#
+# The rule is local: it asks for no index, so every rank — both ends of a
+# message, and every rank's mask — decides alike by construction, and the
+# secondaries of a block share their few directions, which is what lets
+# stage 0 take one transfer group per direction (`merged_spans`). Step 3
+# adds copies on other levels, the finer winning (hence the level first
+# in the key, negated); step 8 those across a glue, by a patch entry.
 
 # The index of a piece among a block's `3^D`, `Σ cls_d 3^(d-1)`.
 piece_index(cls::NTuple{D,Int}) where {D} = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
@@ -1425,9 +1453,9 @@ function piece_copies(forest::Forest{D}, j::Int, cls::NTuple{D,Int}) where {D}
     return copies
 end
 
-# The primary among `piece_copies`: the finest level, then the lowest
-# global leaf, then the lowest class.
-piece_primary(copies) = argmin(x -> (-x[1], x[2], x[3]), copies)
+# The primary among `piece_copies`: the finest level, then the greatest
+# class tuple.
+piece_primary(copies) = argmin(x -> (-x[1], map(-, x[3])), copies)
 
 # One bit per piece of global leaf `j`'s closed box, set where its copy is
 # the primary, for a set of staggers `c`.
@@ -1441,19 +1469,42 @@ function primary_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}) where {D}
 end
 
 # Stage 0's transfers into global leaf `b`: every piece of its closed box
-# whose copy is a secondary, copied from the primary's piece, keyed by the
-# direction to the primary's block and the piece's classes.
+# whose copy is a secondary, copied from the primary's piece, the pieces
+# with one source block and direction merged into one transfer where they
+# form a box (`merged_spans`), keyed by the direction to the primary's
+# block and the spans.
 function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
                         b::Int) where {D}
+    bysource = Dict{Tuple{Int,NTuple{D,Int}},Vector{NTuple{D,Int}}}()
     for cls in closed_pieces(c)
         all(==(1), cls) && continue                 # the open interior: no copies
         _, s, scls, δ = piece_primary(piece_copies(forest, b, cls))
         s == b && scls == cls && continue
-        key = GroupKey{D}(:copy, δ, ntuple(_ -> 0, D), 0, ntuple(_ -> Int8(0), D), Int8(0),
-                          Int8(0), map(Int8, cls))
-        push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
+        push!(get!(bysource, (s, δ), NTuple{D,Int}[]), cls)
+    end
+    # Sorted, so that the transfers do not follow `Dict` order.
+    for (s, δ) in sort!(collect(keys(bysource)))
+        for spans in merged_spans(bysource[(s, δ)])
+            key = GroupKey{D}(:copy, δ, ntuple(_ -> 0, D), 0, ntuple(_ -> Int8(0), D),
+                              Int8(0), Int8(0), spans)
+            push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
+        end
     end
     return nothing
+end
+
+# The span codes of the transfers that write the pieces `pieces` of one
+# target from one source in one direction: one transfer over their
+# bounding box where they fill it, which on one level they always do (the
+# direction to the primary is decided per dimension, so the pieces are a
+# product of a span per dimension), and otherwise one per piece, rather
+# than a guess at a cover.
+function merged_spans(pieces::Vector{NTuple{D,Int}}) where {D}
+    lo = ntuple(d -> minimum(p -> p[d], pieces), D)
+    hi = ntuple(d -> maximum(p -> p[d], pieces), D)
+    prod(ntuple(d -> hi[d] - lo[d] + 1, D)) == length(unique(pieces)) &&
+        return [ntuple(d -> span_code(lo[d], hi[d]), D)]
+    return [map(x -> span_code(x, x), p) for p in unique(pieces)]
 end
 
 # The regions of stage W (M22) on global leaf `j`, local block `b`: every
@@ -1465,8 +1516,10 @@ end
 # number. The relative hook's nearest evolved point is one plane in from
 # the wall along each such dimension, `G + 2` or `G + N`: a point held by
 # the same blocks as the wall point, since neither has a neighbour along
-# the normal, and so a primary of this same block, which stage W does not
-# write. It needs `N ≥ 2`, which every layout has.
+# the normal, at the same classes along every other dimension and class 1
+# along the normal on each, so the rule ranks its copies as it ranks the
+# wall point's, and it is a primary of this same block, which stage W does
+# not write. It needs `N ≥ 2`, which every layout has.
 function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
                        G::NTuple{D,Int}, c::NTuple{D,Int}, j::Int, b::Int) where {D}
     k = forest.leaves[j]
@@ -1485,7 +1538,8 @@ function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
                    D)
         all(iszero, δ) && continue
         (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
-        region = CartesianIndices(ntuple(d -> piece_range(N, G[d], c[d], cls[d]), D))
+        region = CartesianIndices(ntuple(d -> piece_range(N, G[d], c[d],
+                                                          span_code(cls[d], cls[d])), D))
         clamps = ntuple(d -> Int32(δ[d] < 0 ? G[d] + 2 : δ[d] > 0 ? G[d] + N : 0), D)
         push!(walls, BoundaryRegion{D}(Int32(b), δ, region, clamps, UNIFY_TAG))
     end
@@ -2371,7 +2425,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         # A piece of stage 0 (M22): a copy into the target's closed box.
         isunify(key) &&
             return copy_stencil(T, N, ghosts[d], stags[d], key.direction[d];
-                                piece=key.piece[d])
+                                span=key.span[d])
         δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
         mode = boundedof(key)
         if state == 2

@@ -2,9 +2,11 @@
 # the uniform fill and outer faces. A vertex-like dimension owns its
 # closed range, `N + 1` points, so a point on a block face is held by
 # every block whose closed box contains it; the fill makes every copy
-# its primary's, the copy on the block first in the leaf order.
+# its primary's, the copy on the block lying lowest along the dimensions
+# the point is shared in.
 
-using TreeAMR: UNIFY_TAG, PHASE1_TAG, primary_bits, piece_copies, run_group!
+using TreeAMR: UNIFY_TAG, PHASE1_TAG, primary_bits, piece_copies, piece_primary,
+               closed_pieces, run_group!
 
 # The vertex-like centerings, and a cell-centered control.
 closed_centerings(D) = vcat([vertexcentered(D)], [facecentered(D, d) for d in 1:D],
@@ -32,10 +34,14 @@ function closed_point_groups(fs::FieldSet{T,D}) where {T,D}
     return groups
 end
 
-# The primary of a point among its own copies by the rule: the lowest
-# global leaf, and on that leaf the lowest own index, dimension 1 first.
-closed_primary(copies, offset) =
-    minimum((offset + b, idx) for (b, idx, own) in copies if own)
+# The primary of a point among its own copies by the rule: the greatest
+# class tuple, dimension 1 first, which is the greatest own index, since
+# the copies differ only along the dimensions the point is shared in, at
+# the low plane on one block and the high plane on the other.
+function closed_primary(copies, offset)
+    idx, b = maximum((idx, offset + b) for (b, idx, own) in copies if own)
+    return (b, idx)
+end
 
 bits(x) = reinterpret(UInt, x)
 
@@ -47,8 +53,8 @@ closed_ops(G) = G == 0 ?
 
 @testset "Every copy of a point is its primary's after a fill: D=$D" for D in (1, 2, 3)
     # Guards a copy left out of stage 0, a ghost read before its source
-    # was unified, or a primary chosen by another rule than the leaf
-    # order: random data on every own point, every copy different, and
+    # was unified, or a primary chosen by another rule than the greatest
+    # class: random data on every own point, every copy different, and
     # after the fill every stored copy of a point holds its primary's
     # value bit for bit — and the mask says which copy that is.
     rng = Xoshiro(2200 + D)
@@ -100,20 +106,57 @@ end
     end
 end
 
-@testset "A block that is its own neighbour has its low plane primary: D=$D" for
+@testset "A block that is its own neighbour has its high plane primary: D=$D" for
         D in (1, 2, 3)
-    # Guards the tie-break of a point a block shares with itself across a
-    # periodic dimension of one root: the low plane's copy is the primary,
-    # along each such dimension at once.
+    # Guards a point a block shares with itself across a periodic
+    # dimension of one root: its copies are distinct by class, and the high
+    # plane's copy is the primary, along each such dimension at once.
     forest = Forest(ntuple(_ -> 1, D); N=4, periodic=ntuple(_ -> true, D))
     for C in closed_centerings(D)
         c = staggers(C)
         b = primary_bits(forest, 1, c)
         for cls in Iterators.product(ntuple(d -> c[d] == 1 ? (0:2) : (1:1), D)...)
             piece = sum(cls[d] * 3^(d - 1) for d in 1:D)
-            @test ((b >> piece) & 1 == 1) == !any(==(2), cls)
+            @test ((b >> piece) & 1 == 1) == !any(==(0), cls)
             @test length(piece_copies(forest, 1, cls)) == 2^count(!=(1), cls)
         end
+    end
+end
+
+@testset "A secondary's primary lies below it, never above: D=$D" for D in (1, 2, 3)
+    # Guards the rule's locality: the direction from a secondary to its
+    # primary is -1 exactly where the piece is the low plane and a block
+    # lies below, across a periodic wrap too, and 0 everywhere else, so
+    # the secondaries of a block have few directions.
+    for (name, forest) in closed_forests(D), C in closed_centerings(D)
+        c = staggers(C)
+        for j in 1:nleaves(forest), cls in closed_pieces(c)
+            k = forest.leaves[j]
+            below = ntuple(D) do d
+                δ = ntuple(e -> e == d ? -1 : 0, D)
+                !isempty(TreeAMR.oriented_neighbors(forest, k, δ)[2])
+            end
+            _, _, _, δ = piece_primary(piece_copies(forest, j, cls))
+            @test δ == ntuple(d -> cls[d] == 0 && below[d] ? -1 : 0, D)
+        end
+    end
+end
+
+@testset "Stage 0 takes one transfer group per direction to a primary: D=$D" for
+        D in (1, 2, 3)
+    # Guards a launch per piece where one per direction serves: on a
+    # uniform mesh a set with `v` vertex-like dimensions has `2^v - 1`
+    # directions to a primary, and, periodic, one group each, its pieces
+    # merged into one box a block; with outer faces, a block with no block
+    # below along a dimension writes its whole own range there, a second
+    # span, so `3^v - 2^v`. Phase 1 keeps its `3^D - 1`.
+    for C in closed_centerings(D), (periodic, roots) in ((true, 8), (true, 1), (true, 2),
+                                                         (false, 3))
+        forest = Forest(ntuple(_ -> roots, D); N=4, periodic=ntuple(_ -> periodic, D))
+        sched = GhostSchedule(FieldSet(forest, 1; G=1, centering=C), closed_ops(1))
+        v = count(==(1), staggers(C))
+        @test length(sched.unify) == (periodic ? 2^v - 1 : 3^v - 2^v)
+        @test length(sched.phase1) == 3^D - 1
     end
 end
 
@@ -371,9 +414,10 @@ end
                 onwall = any(d -> c[d] == 1 && !forest.periodic[d] &&
                                   (x[d] == 0.0 || x[d] == forest.roots[d]), 1:D)
                 onwall || continue
-                # A copy across a periodic wrap is a period from its
-                # primary, whose value it takes: the hook's at the primary.
-                any(d -> forest.periodic[d] && x[d] == forest.roots[d], 1:D) && continue
+                # A copy across a periodic wrap, the low plane, is a period
+                # from its primary, whose value it takes: the hook's at the
+                # primary.
+                any(d -> forest.periodic[d] && x[d] == 0.0, 1:D) && continue
                 nwall += 1
                 for v in 1:2
                     prescribed ? (fs.work[I, v, b] == data(x, v) || (ok = false)) :

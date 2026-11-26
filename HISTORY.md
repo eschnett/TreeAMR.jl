@@ -5568,6 +5568,34 @@ M12 was decided with Erik, after M7 and before M9b.
   testsets and 19 loops' vertex-like iterations, 4 workload cases; step 4,
   13 and 20, 8; step 6, 12 and 10, 12; step 7, 22 and 18, 11; step 8, 26
   and 8, 4.
+  - *The primary by leaf order cost a launch per piece* (2026-11-25,
+    after the step's commits, from the coordinator's measurement of
+    `bench/copies.jl`). The first rule took the copy on the block first
+    in the forest's leaf order, by global leaf position, the low plane
+    where a block was its own neighbour. Its direction to a primary
+    depended on where the blocks sat on the curve, so a secondary piece
+    had, per vertex-like dimension, five combinations of class and
+    direction, and stage 0 one group per piece: 98 groups for a vertex
+    set on a uniform periodic mesh in 3D, `5³ − 3³`, beside phase 1's
+    26, each a launch on a device. The rule became the greatest class
+    tuple, the copy on the block lying lowest along the shared
+    dimensions: local, so every rank decides alike without an index (the
+    simulated-ranks test stays), and its direction to a primary is
+    decided per dimension, `−1` exactly at a low plane with a block below.
+    `GroupKey.piece` became `GroupKey.span`, a span of classes per
+    dimension, and a target's secondaries with one source and direction
+    merge into one box. A block that is its own neighbour now has its
+    high plane primary, and the prescribed-wall test skips the copies on
+    the low side of a periodic wrap rather than the high. Stage 0 / phase
+    1 groups (`GhostSchedule`, `N = 8`, `G = 1`), before and after:
+
+    | set | periodic, 8 roots | 2 roots | 1 root | 8 roots, outer |
+    |---|---|---|---|---|
+    | vertex, D = 1 | 2 → 1 / 2 | 2 → 1 / 2 | 1 → 1 / 2 | 1 → 1 / 2 |
+    | vertex, D = 2 | 16 → 3 / 8 | 16 → 3 / 8 | 5 → 3 / 8 | 7 → 5 / 8 |
+    | vertex, D = 3 | 98 → 7 / 26 | 98 → 7 / 26 | 19 → 7 / 26 | 37 → 19 / 26 |
+    | face, D = 3 | 2 → 1 / 26 | 2 → 1 / 26 | 1 → 1 / 26 | 1 → 1 / 26 |
+    | edge, D = 3 | 16 → 3 / 26 | 16 → 3 / 26 | 5 → 3 / 26 | 7 → 5 / 26 |
 
 ## Downstream checks
 

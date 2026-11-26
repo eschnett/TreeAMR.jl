@@ -408,8 +408,9 @@ end
 
 Which own points of a field set are **primaries**: of the copies of a
 point that several blocks hold, on a face plane of a vertex-like
-dimension, the one on the block first in the forest's leaf order (M22,
-"Closed blocks" in `CODE.md`). One bit per piece of a block's closed box —
+dimension, the one on the block lying lowest along the dimensions the
+point is shared in, for which it lies on high face planes (M22, "Closed
+blocks" in `CODE.md`). One bit per piece of a block's closed box —
 along each vertex-like dimension its low face plane, its open interior or
 its high face plane, `3^D` pieces — since every point of a piece lies on
 the same block faces, and so has its copies on the same blocks. Every
@@ -455,8 +456,8 @@ end
 The [`PrimaryMask`](@ref) of `fs`'s blocks, on its backend: built from the
 forest's topology and the set's centering once per change of the forest
 and kept with the set. Over a distributed forest each rank's mask is its
-own blocks', decided from the replicated forest by global leaf position,
-so every rank agrees on every point.
+own blocks', decided by a local rule that asks for no index, so every
+rank agrees on every point.
 """
 function primary_mask(fs::FieldSet{T,D}) where {T,D}
     backend = get_backend(fs.work)
