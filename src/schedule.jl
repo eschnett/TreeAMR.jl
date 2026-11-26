@@ -741,6 +741,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     stagegroups::Vector{UnitRange{Int}}          # runs of `stages` that run together
     grouplocals::Vector{Vector{GRP}}             # each run's local groups, in stage order
     phase1group::Int                             # the run that holds phase 1
+    stateunify::Vector{ST}                       # stage 0 on a state, for `unify!`
     glueplan::GluePlan{T,D}                      # the ghosts interpolated across a glue
 
     # The constructor the build calls, which derives `grouplocals`: inside
@@ -748,13 +749,14 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
         forest, generation, G, centering, P, walls, glue, operators, backend, unify,
         phase1, phase2, levels, boundaries, boundaryplan, stages, stagegroups,
-        glueplan) where {T,D,R,BK,GRP,BP,ST}
+        stateunify, glueplan) where {T,D,R,BK,GRP,BP,ST}
         p1 = findfirst(r -> any(i -> stages[i].tag == PHASE1_TAG, r), stagegroups)::Int
         return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls, glue,
                                        operators,
                                        backend, unify, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
-                                       group_locals(stages, stagegroups), p1, glueplan)
+                                       group_locals(stages, stagegroups), p1,
+                                       stateunify, glueplan)
     end
 end
 
@@ -2376,12 +2378,39 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                           bystage(stageof, received), build, factorcol, forest;
                           required=closed ? [UNIFY_TAG, PHASE1_TAG] : [PHASE1_TAG],
                           axesof=axesof, bounded=boundedof)
+    # Stage 0 again for `unify!` on a state-shaped array (M22), which has
+    # no ghosts: the same transfers, groups and messages, with every
+    # stencil moved down by the ghost width. Its own buffers, its own
+    # stage; the tag is stage 0's, since the two never run at once.
+    stateunify = ST[]
+    if closed
+        unghost(key) = ntuple(D) do d
+            st = build(key)[d]::Stencil1D{T,Vector{Int32},Matrix{T}}
+            Stencil1D{T}(st.targetfirst - ghosts[d], st.srcstart .- Int32(ghosts[d]),
+                         st.weights, st.unit, st.single)
+        end
+        ulocal = GRP[todevice(backend, TransferGroup{T,D}(key.kind, unghost(key), targets,
+                                                          sources, factorcol(key),
+                                                          key.orientation, axesof(key),
+                                                          boundedof(key)::Int8))
+                     for (key, (targets, sources)) in pairs if stageof(key) == UNIFY_TAG]
+        nopairs = TransferPairs{D}()
+        owner(i) = leafowner(forest, i)
+        uremote = remote_stage(remotetype(ST), T, backend,
+                               get(bystage(stageof, sent), UNIFY_TAG, nopairs),
+                               get(bystage(stageof, received), UNIFY_TAG, nopairs), unghost,
+                               factorcol; targetowner=owner, sourceowner=owner,
+                               targetrange=owned, sourcerange=owned, axesof=axesof,
+                               bounded=boundedof)
+        push!(stateunify, ST(UNIFY_TAG, ulocal, uremote))
+    end
     # Which of them may run together here, from the host stencils.
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, order, walls, glue, operators,
-        backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups, glueplan)
+        backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups,
+        stateunify, glueplan)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

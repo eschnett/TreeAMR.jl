@@ -45,7 +45,7 @@ export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
        block_mapreduce, mesh_mapreduce, volume_weighted_norm
 
 # Closed blocks (M22): the primaries of shared points
-export PrimaryMask, primary_mask, isprimary
+export PrimaryMask, primary_mask, isprimary, unify!
 
 # Several field sets in one state vector (for TreeGRRMHD)
 export staterange, stateview

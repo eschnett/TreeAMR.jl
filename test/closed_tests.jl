@@ -260,7 +260,7 @@ function closed_copy_spread(fs::FieldSet{T,D}, u) where {T,D}
     worst = 0.0
     for copies in values(closed_point_groups(fs)), v in 1:fs.nvars
         own = [fs.work[idx..., v, b] for (b, idx, o) in copies if o]
-        worst = max(worst, maximum(own) - minimum(own))
+        isempty(own) || (worst = max(worst, maximum(own) - minimum(own)))
     end
     return worst
 end
@@ -313,6 +313,67 @@ end
     @test convergence_rate(hs, l2) ≈ 2.0 atol = 0.15
 end
 
+
+@testset "Skipping the secondaries with unify! is the full run at the primaries: D=$D" for
+        D in (1, 2)
+    # Guards `unify!` on a state vector: a right-hand side that computes
+    # the primaries only and unifies `du` evolves the primaries exactly as
+    # one that computes every copy, and with `unify!` alone a state that
+    # starts unified stays so.
+    for (name, forest) in (("outer", Forest(ntuple(_ -> 3, D); N=8,
+                                            extents=ntuple(_ -> (0.0, 1.0), D))),
+                           ("periodic", Forest(ntuple(d -> d == 1 ? 1 : 3, D); N=8,
+                                               periodic=ntuple(_ -> true, D),
+                                               extents=ntuple(d -> (0.0, d == 1 ? 1.0 : 3.0),
+                                                              D))))
+        hook = boundary_by_coordinates(closed_pulse)
+        runs = map(((false, false), (true, true), (false, true))) do (skip, unify)
+            fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
+            sched = GhostSchedule(fs, Operators(prolongation=2, restriction=2))
+            fill_by_coordinates!(closed_pulse, fs)
+            # A unified state to start from: across a periodic wrap the
+            # copies of a point are a period apart, and the initial data
+            # put each its own value until a fill unifies them.
+            fill_ghosts!(fs, sched; boundary=hook)
+            u = statevector(fs)
+            gather!(u, fs)
+            closed_rk4!(u, fs, sched, hook, 0.2 / 24, 12; skip=skip, unify=unify)
+            (fs, u)
+        end
+        fs, full = runs[1]
+        mask = primary_mask(fs)
+        A, B = statearray(full, fs), statearray(runs[2][2], fs)
+        same = all(CartesianIndices(size(A)[1:D])) do I
+            all(b -> !isprimary(mask, Tuple(I)..., b) ||
+                     all(v -> bits(A[I, v, b]) == bits(B[I, v, b]), 1:2), 1:nblocks(fs))
+        end
+        @test same
+        @test closed_copy_spread(fs, runs[2][2]) == 0
+        @test closed_copy_spread(fs, runs[3][2]) <= 1e-14
+    end
+end
+
+@testset "unify! on a field set makes every copy its primary's: D=$D" for D in (1, 2, 3)
+    # Guards the flux set's use of stage 0: a set without ghosts, computed
+    # on every copy, unified.
+    for (name, forest) in closed_forests(D), C in closed_centerings(D)
+        fs = FieldSet(forest, 1; G=0, centering=C)
+        fs.work .= randn(Xoshiro(3), size(fs.work))
+        before = copy(fs.work)
+        sched = GhostSchedule(fs, closed_ops(0))
+        @test unify!(fs, sched) === fs
+        ok = all(values(closed_point_groups(fs))) do copies
+            pb, pidx = closed_primary(copies, 0)
+            all(((b, idx, o),) -> fs.work[idx..., 1, b] === before[pidx..., 1, pb], copies)
+        end
+        @test ok
+        # The state-vector form does the same on a state.
+        u = statevector(fs)
+        u .= randn(Xoshiro(4), length(u))
+        unify!(u, fs, sched)
+        @test closed_copy_spread(fs, u) == 0
+    end
+end
 
 @testset "What later steps rebuild is refused, naming the step" begin
     # Guards a half-open path left reachable on closed blocks.

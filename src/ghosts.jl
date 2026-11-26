@@ -1558,6 +1558,81 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     return exchange_ghosts!(fs, schedule, boundary, backend)
 end
 
+"""
+    unify!(fs::FieldSet, schedule::GhostSchedule)
+    unify!(v::AbstractVector, fs::FieldSet, schedule::GhostSchedule)
+    unify!(sets::Tuple, schedules::Tuple)
+    unify!(v::AbstractVector, sets::Tuple, schedules::Tuple)
+
+Give every secondary copy of a shared point its primary's value: stage 0
+of the fill alone (M22, "Closed blocks" in `CODE.md`). A set with a
+vertex-like dimension owns both face planes of its blocks, so a point on
+a block face has a copy on every block that holds it, and one of them,
+the copy on the block first in the forest's leaf order, is the primary
+([`isprimary`](@ref)).
+
+The first form unifies the field set's working array: what a set without
+ghosts, a flux computed on every block's own range, needs before its
+copies are read. The second unifies a state-shaped vector — `u`, or `du`
+at the end of a right-hand side — through the same transfers moved past
+the ghosts, which a state does not have, with one message round over a
+distributed forest: after it every secondary of `du` is its primary's,
+so a state that starts unified stays so, exactly where the copies are
+copies. It is optional, since [`fill_ghosts!`](@ref) unifies the working
+array on every call and a right-hand side reads nothing else, but not for
+a right-hand side that computes the primaries only, whose secondaries of
+`du` are otherwise undefined. The tuple forms run each set with its own
+schedule, a state's segments as [`stateview`](@ref) lays them out.
+
+On a set without a vertex-like dimension every point is a primary and
+nothing is done. The call is collective over a distributed forest, as a
+fill is.
+"""
+function unify!(fs::FieldSet, schedule::GhostSchedule)
+    backend = check_fill(fs, schedule)
+    p1 = schedule.phase1group
+    forest = schedule.forest
+    sends = nothing
+    for k in 1:(p1 - 1)
+        sends = run_stages!(fs, schedule.stages, schedule.stagegroups[k],
+                            schedule.grouplocals[k], forest, backend, sends)
+    end
+    sends === nothing || waitall(forest.comm, sends)
+    return fs
+end
+
+function unify!(v::AbstractVector, fs::FieldSet, schedule::GhostSchedule)
+    backend = check_fill(fs, schedule)
+    stages = schedule.stateunify
+    isempty(stages) && return v
+    A = statearray(v, fs)
+    forest = schedule.forest
+    sends = run_stages!(A, A, fs.nvars, fs.factors, stages, 1:1, stages[1].locals, forest,
+                        backend, nothing, A, fs.rotvars)
+    sends === nothing || waitall(forest.comm, sends)
+    return v
+end
+
+function unify!(sets::Tuple{Vararg{FieldSet}}, schedules::Tuple)
+    check_unify_tuple(sets, schedules)
+    foreach(unify!, sets, schedules)
+    return sets
+end
+
+function unify!(v::AbstractVector, sets::Tuple{Vararg{FieldSet}}, schedules::Tuple)
+    check_unify_tuple(sets, schedules)
+    check_statelength(v, sets)
+    for i in eachindex(sets)
+        unify!(stateview(v, sets, i), sets[i], schedules[i])
+    end
+    return v
+end
+
+check_unify_tuple(sets, schedules) =
+    length(sets) == length(schedules) || throw(ArgumentError(
+        "unify! takes one schedule per field set, in the sets' order; got " *
+        "$(length(sets)) sets and $(length(schedules)) schedules"))
+
 # Whether a set has ghost regions across a rotating seam: ghosts along
 # either dimension of the seam's plane. A set with none there, as a
 # flux's `G = 0` along a stagger, has only regions on the high side of

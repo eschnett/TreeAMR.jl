@@ -13,6 +13,7 @@ check_operators
 GhostSchedule
 isstale
 fill_ghosts!
+unify!
 boundary_by_coordinates
 CellBoundary
 Relative
