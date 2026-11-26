@@ -357,8 +357,13 @@ TreeAMR.stencil_hits(::OverridingRegion, origin::NTuple, h, base, off, ::Val{n})
     @test all(interpolate(fs, xs, Lagrange(4); exclude=OverridingRegion()).excluded)
     @test all(interpolate(fs, locate(fs.forest, xs), Lagrange(4);
                           exclude=OverridingRegion()).excluded)
-    @test TreeAMR.stencil_position((1.0, 2.0), 0.5, (1, 2), (0.5, 1.0), 2, 3) ==
-          2.0 + ((2 + 3) - 1.0) * 0.5
+    # Its arguments are `nodeposition`'s pieces (M22 step 1): the patch's
+    # low corner, the spacing, the first point's integer coordinate and
+    # the half a cell-like dimension adds.
+    @test TreeAMR.stencil_position((1.0, 2.0), 0.5, (1, 2), (0.5, 0.0), 2, 3) ===
+          TreeAMR.nodeposition(2.0, 0.5, 2, 4, 1, nothing)
+    @test TreeAMR.stencil_position((1.0, 2.0), 0.5, (1, 2), (0.5, 0.0), 1, 3) ===
+          TreeAMR.nodeposition(1.0, 0.5, 1, 4, 0, nothing)
 end
 
 @testset "One location serves every field set over the forest, bit for bit" begin

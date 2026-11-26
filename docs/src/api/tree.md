@@ -52,6 +52,9 @@ block_origin
 block_extent
 block_spacings
 block_origins
+block_lows
+block_bases
+TreeAMR.nodeposition
 patch
 block_patches
 ```

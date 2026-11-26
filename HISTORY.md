@@ -5450,6 +5450,66 @@ M12 was decided with Erik, after M7 and before M9b.
   along and never read ("Why copies cannot drift"). M8's other reason,
   that a norm would count shared points twice, goes with the
   trapezoid's weights.
+- *Step 1, positions from integer coordinates (2026-11-25).* Implemented
+  on `main` by itself, before any of the closed layout: `nodeposition(lo,
+  h, B, I, c, nodes)` forms every position as `lo + k·h` or `lo + (k +
+  ½)·h` from the integer `k = B + I − 1`, `block_origin` and
+  `block_extent` by the same rule, and `block_lows` and `block_bases`
+  reach the kernels beside `block_spacings` ("Positions" under
+  [Centerings](CODE.md#centerings)). The plan against the code found
+  three things the design had wrong or open:
+  - *The high face is not the given extent to the last bit only.* One
+    cell size serves every dimension and every patch, `root_spacing`
+    from patch 1's first dimension, while the old `block_origin` used
+    each dimension's own `(hi − lo)/roots`. The forest accepts extents
+    whose root widths agree to `4096 eps` (`check_brick`), so the domain's
+    high face `lo + K·h` differs from the given `hi` by rounding where
+    the extents are bitwise isotropic and by up to that tolerance where
+    they are not. Erik kept the one isotropic `h` and had the design
+    corrected. A node on the high face then lay an ulp past the given
+    box on a two-patch forest with non-dyadic extents (`Float64`: `ξ₂ =
+    −0.09999999999999998` against `−0.1`; `Float32`: `0.70000005f0`
+    against `0.7f0`), and the interpolator refused it as outside; the
+    new testset found it, and the point geometry now locates in each
+    patch's box widened to its high face, `(lo, max(hi, lo + K·h))`.
+    Extents in root units, as TreeMultiPatch builds them, have `lo + K·h
+    == hi` exactly for every `N` from 4 to 32, one to eight roots and
+    levels 0 to 6 (checked by hand).
+  - *An element's two face nodes do not share an integer part.* The
+    design said the two nodes at one position have "the same integer
+    part and the offsets `0` and `P + 1`"; their integer parts differ by
+    `P + 1`, and where `T` cannot hold them exactly (`Float32` beyond
+    `2²⁴`) the sums round apart. The last node is now formed as the
+    next element's first; the 1D mesh refined to level 21 checks it.
+  - *Fused multiply-add on a device.* A backend that fused consistently
+    would still give every copy one position, since scaling by two is
+    exact inside a fused product too; what it would break is equality
+    with the host. Measured on the laptop's Metal (M3 Pro), in
+    `Float32` on the refined 2D and 3D meshes of non-dyadic extents
+    and the level-21 1D mesh, cell, vertex and element sets through `P
+    = 3`: device and host positions are `===` at every owned point
+    (62,976 in 3D) and every hook-written ghost. CUDA is not measured.
+  The point interpolator keeps inverting a position relative to the
+  block's corner; its `exclude` stencil positions follow the new rule,
+  through M11's six-argument `stencil_hits`, whose shape
+  TreeGeneralizedHarmonic's override depends on and which keeps it, its
+  arguments reinterpreted as `nodeposition`'s pieces. `query_stencil`
+  keeps its seven-argument form, which TreeWaveOLDG's extraction calls.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  at one thread and at eight with no tolerance changed (175,852 and
+  175,904 tests in five processes, 7m33 and 8m00), the new `test/position_tests.jl`
+  among them (6,518 tests); `gpu_tests.jl` passes on Metal in `Float32`
+  (2,679 tests); the docs build and their doctests pass. The serial
+  `test/mpi_workload.jl` prints exactly what it printed before, `#`
+  lines aside, and compiles in 74.7, 74.6 and 77.9 s with 1746 roots
+  against 74.6, 73.5 and 73.6 s with 1740 for 2f52936
+  (`--trace-compile-timing`, three alternating rounds); the six new
+  roots are the `block_low` closure and three `ntuple`s. One existing
+  assertion changed with its meaning: the M11 test of
+  `stencil_position`'s formula, whose arguments are now
+  `nodeposition`'s pieces. Against this checkout, from scratch copies,
+  TreeWave passes 349 tests in 1m38 and TreeIOHDF5 1088 in 2m36 (its
+  pin widened to 0.2.12 in the copy).
 
 ## Downstream checks
 

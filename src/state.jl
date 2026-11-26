@@ -964,24 +964,24 @@ end
 # Lane `l` of block `b` folds points `l, l + W, …` of the block, in
 # linear order with the first dimension fastest, into its own slot. The
 # position is formed by `coordinates_kernel!`'s expression, on the same
-# origin and spacing in the same order, so it reproduces `coordinates`
+# corner and spacing in the same order, so it reproduces `coordinates`
 # bit for bit.
 @kernel function fold_points_kernel!(partials, @Const(array), rf, init,
-                                     @Const(origins), @Const(spacings), nodes,
+                                     @Const(lows), @Const(bases), @Const(spacings), nodes,
                                      @Const(levels),
                                      tags, masks, firstvar::Int,
                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}, ::Val{NV},
                                      ::Val{W}) where {D,G,C,N,NV,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
-    origin, h = origins[b], spacings[b]
+    lo, B, h = lows[b], bases[b], spacings[b]
     lev, tag, mask = levels[b], tags[b], masks[b]
     cells = CartesianIndices(ntuple(_ -> N + fold_extra(masks), Val(D)))
     acc = init
     for j in l:W:length(cells)
         I = Tuple(cells[j])
         counted(mask, I, N) || continue
-        x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+        x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
         c = ntuple(d -> I[d] + G[d], Val(D))
         u = ntuple(v -> array[c..., firstvar + v - 1, b], Val(NV))
         acc = rf(acc, FoldPoint(u, x, h, lev, tag, I, b))
@@ -1036,14 +1036,15 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     n = nblocks(fs)
     n == 0 && return R[]
     W = lanes !== nothing ? Int(lanes) : backend isa CPU ? 1 : fold_lanes(R)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
     partials = allocate(backend, R, (W, n))
     # A set with an appendix (M20) visits its appendix planes too, and a
     # glued face point at one copy only: its masks, behind a barrier, so
     # that no other set compiles that kernel.
-    args = (backend, partials, array, rf, init, origins, spacings, levels, tags, fs,
+    args = (backend, partials, array, rf, init, lows, bases, spacings, levels, tags, fs,
             first(vars), g, Val(NV), Val(W))
     if hasappendix(fs)
         Base.inferencebarrier(launch_fold!)(Base.inferencebarrier(fold_masks)(backend, fs),
@@ -1061,13 +1062,13 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     return tohost(values)
 end
 
-function launch_fold!(masks, backend, partials, array, rf, init, origins, spacings,
+function launch_fold!(masks, backend, partials, array, rf, init, lows, bases, spacings,
                       levels, tags, fs::FieldSet{T,D}, firstvar::Int, g::NTuple{D,Int},
                       nv::Val, w::Val{W}) where {T,D,W}
     with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
-                         spacings, nodes, levels, tags, masks, firstvar, Val(D), Val(g),
-                         Val(staggers(fs)), Val(fs.forest.N), nv, w;
+        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, lows,
+                         bases, spacings, nodes, levels, tags, masks, firstvar, Val(D),
+                         Val(g), Val(staggers(fs)), Val(fs.forest.N), nv, w;
                          ndrange=(W * nblocks(fs),))
     end
     return nothing

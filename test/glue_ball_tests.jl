@@ -94,9 +94,9 @@ ball_key(x) = round.(Int, x .* 1e9)
     distinct = Dict{NTuple{3,Int},Float64}()
     for b in 1:nblocks(fs)
         k = forest.leaves[b]
-        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
+        p = patch(forest, k)
         for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 3))
-            x = TreeAMR.chart_map(ball, ntuple(d -> o[d] + (I[d] - 1) * h, 3), p)
+            x = TreeAMR.chart_map(ball, coordinates(fs, b, Tuple(I) .+ fs.G), p)
             A[Tuple(I)..., 1, b] = g(x)
             distinct[ball_key(x)] = g(x)
         end

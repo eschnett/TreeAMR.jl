@@ -274,20 +274,24 @@ BoundaryBatch{D}(boxlen, slot, blocks::VB, directions::VD, firsts::VF,
 
 Everything the cell-wise boundary kernel reads that is not field data:
 the [`BoundaryBatch`](@ref TreeAMR.BoundaryBatch)es, and the per-block
-origin and spacing it turns a stored index into a position with, the
-per-block patch (M17, [`block_patches`](@ref)) that a
-[`WithPatch`](@ref) hook is handed, and for an element-centered layout
-(M16) the node offsets, empty otherwise, so that the plan's type, and
-the schedule's, does not depend on the layout.
+patch corner, integer corner and spacing ([`block_lows`](@ref),
+[`block_bases`](@ref), [`block_spacings`](@ref)) it turns a stored index
+into a position with through [`nodeposition`](@ref
+TreeAMR.nodeposition), the per-block patch (M17,
+[`block_patches`](@ref)) that a [`WithPatch`](@ref) hook is handed, and
+for an element-centered layout (M16) the node offsets, empty otherwise,
+so that the plan's type, and the schedule's, does not depend on the
+layout.
 
 The geometry is here rather than recomputed per fill for the same reason
 the exchange itself is precomputed: it depends only on the tree, which
 is exactly what a schedule is rebuilt for.
 """
-struct BoundaryPlan{D,BT<:BoundaryBatch{D},VO<:AbstractVector,VS<:AbstractVector,
-                    VP<:AbstractVector,VN}
+struct BoundaryPlan{D,BT<:BoundaryBatch{D},VL<:AbstractVector,VB<:AbstractVector,
+                    VS<:AbstractVector,VP<:AbstractVector,VN}
     batches::Vector{BT}
-    origins::VO
+    lows::VL                # `block_lows`
+    bases::VB               # `block_bases`
     spacings::VS
     patches::VP             # `block_patches`, all ones on a brick
     nodes::VN               # `node_offsets` of the layout, on the backend
@@ -325,12 +329,13 @@ function BoundaryPlan(backend::Backend, ::Type{T}, forest::Forest{D},
     BT = batchtype(backend, Val(D))
     batches = BT[todevice(backend, BoundaryBatch{D}(k[2], k[1], byshape[k]...))
                  for k in keys_]
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     patches = todevice(backend, block_patches(forest))
     nodes = node_offsets(backend, T, P)
-    return BoundaryPlan{D,eltype(batches),typeof(origins),typeof(spacings),
-                        typeof(patches),typeof(nodes)}(batches, origins, spacings,
+    return BoundaryPlan{D,eltype(batches),typeof(lows),typeof(bases),typeof(spacings),
+                        typeof(patches),typeof(nodes)}(batches, lows, bases, spacings,
                                                        patches, nodes)
 end
 

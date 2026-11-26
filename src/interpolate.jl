@@ -50,11 +50,14 @@ internal functions, which are everything the kernel asks of it:
   `n`-tuples;
 
 and `TreeAMR.check_derivative(basis, m)` if it cannot produce every
-derivative order below `n`, and `TreeAMR.stencil_place(basis, origin, h,
+derivative order below `n`, and `TreeAMR.stencil_place(basis, lo, h, B,
 first, Val(G), Val(C))` if its stencil points are not the stored points
 of an equally spaced set — the positions an `exclude` region is tested
-at. The position, rather than a stored index, is what the kernel hands
-a basis because an element set's stored index is not linear in it.
+at, formed from the patch's low corner `lo`, the spacing `h` and the
+block's integer corner `B` as
+[`nodeposition`](@ref TreeAMR.nodeposition) forms them. The
+position, rather than a stored index, is what the kernel hands a basis
+because an element set's stored index is not linear in it.
 """
 abstract type InterpolationBasis end
 
@@ -272,24 +275,27 @@ end
 @inline element_derivatives(c::NTuple{L,T}, λ::T) where {L,T} =
     ntuple(m -> T(factorial(m - 1)) * c[m] * λ, Val(L))
 
-# The positions of an element stencil's nodes: node `k` (from 0) of
-# element `q` along `d` at `origin + h·(q·n + o_k)`, `nodeposition`'s
-# expression, so that an `exclude` region flags a node exactly when its
-# `coordinates` are inside.
+# The positions of an element stencil's nodes: node `k` (from 0) of the
+# element whose first node has the integer coordinate `base` along `d`,
+# at `lo + (base + o_k)·h` and the last node at `lo + (base + n)·h`,
+# `nodeposition`'s expressions, so that an `exclude` region flags a node
+# exactly when its `coordinates` are inside.
 struct ElementStencil{D,T,n}
-    origin::NTuple{D,T}
+    lo::NTuple{D,T}
     h::T
-    q::NTuple{D,Int}
+    base::NTuple{D,Int}
     offsets::NTuple{n,T}
 end
 
-@inline stencil_position(s::ElementStencil{D,T,n}, d, k) where {D,T,n} =
-    s.origin[d] + s.h * (s.q[d] * n + s.offsets[k + 1])
+@inline function stencil_position(s::ElementStencil{D,T,n}, d, k) where {D,T,n}
+    k == n - 1 && return s.lo[d] + oftype(s.h, s.base[d] + n) * s.h
+    return s.lo[d] + (oftype(s.h, s.base[d]) + s.offsets[k + 1]) * s.h
+end
 
-@inline function stencil_place(b::ElementBasis{n}, origin::NTuple{D,T}, h, first,
+@inline function stencil_place(b::ElementBasis{n}, lo::NTuple{D,T}, h, B, first,
                                ::Val{G}, ::Val{C}) where {n,D,T,G,C}
-    return ElementStencil{D,T,n}(origin, h, ntuple(d -> (first[d] - G[d] - 1) ÷ n, Val(D)),
-                                 b.offsets)
+    base = ntuple(d -> B[d] + ((first[d] - G[d] - 1) ÷ n) * n, Val(D))
+    return ElementStencil{D,T,n}(lo, h, base, b.offsets)
 end
 
 # `floor(s)` as an `Int`, for the bounded arguments this file gives it (a
@@ -319,12 +325,15 @@ point inside it. [`Ellipsoid`](@ref) is the one implemented.
 A new region is an `isbits` subtype implementing `TreeAMR.inside(region,
 x)` for a point `x::NTuple{D,T}`, and `TreeAMR.convertregion(T, region)`
 if its parameters must be brought to the field set's type. It may also
-override `TreeAMR.stencil_hits(region, origin, h, base, off, Val(n))`
-with something cheaper than the default, which tests all `n^D` stencil
-points of an equally spaced set, point `k` (from 0) along dimension `d`
-at `TreeAMR.stencil_position(origin, h, base, off, d, k)`. An element
-set's stencil (M19), whose nodes are not equally spaced, is tested by
-`TreeAMR.stencil_hits(region, place, Val(n))` at
+override `TreeAMR.stencil_hits(region, lo, h, base, off, Val(n))` with
+something cheaper than the default, which tests all `n^D` stencil points
+of an equally spaced set, point `k` (from 0) along dimension `d` at
+`TreeAMR.stencil_position(lo, h, base, off, d, k)`. The arguments are
+what [`nodeposition`](@ref TreeAMR.nodeposition) forms the points'
+positions from, and an override should pass them on rather than read
+them: `stencil_position` reproduces [`coordinates`](@ref) bit for bit.
+An element set's stencil (M19), whose nodes are not equally spaced, is
+tested by `TreeAMR.stencil_hits(region, place, Val(n))` at
 `TreeAMR.stencil_position(place, d, k)`, whose default tests every
 point.
 """
@@ -378,25 +387,27 @@ end
 
 # The positions of a stencil's points, which an `exclude` region is
 # tested at: for an equally spaced set, stencil point `k` (from 0) along
-# `d` sits at `origin + ((base + k) − off)·h`, with `base = first − G` —
-# the expression `coordinates` evaluates, in the same order, so a stencil
-# point is flagged exactly when its `coordinates` are inside.
+# `d` sits at `lo + ((base + k) + off)·h`, with `base = B + first − G −
+# 1` the integer coordinate of the first point and `off` 0 along a
+# vertex-like dimension and ½ along a cell-like one — the expression
+# `nodeposition` evaluates, in the same order, so a stencil point is
+# flagged exactly when its `coordinates` are inside.
 struct UniformStencil{D,T}
-    origin::NTuple{D,T}
+    lo::NTuple{D,T}
     h::T
     base::NTuple{D,Int}
     off::NTuple{D,T}
 end
 
 @inline stencil_position(s::UniformStencil, d, k) =
-    stencil_position(s.origin, s.h, s.base, s.off, d, k)
+    stencil_position(s.lo, s.h, s.base, s.off, d, k)
 
 # The places of a basis's stencil; equally spaced unless the basis says
 # otherwise.
-@inline function stencil_place(basis, origin::NTuple{D,T}, h, first, ::Val{G},
+@inline function stencil_place(basis, lo::NTuple{D,T}, h, B, first, ::Val{G},
                                ::Val{C}) where {D,T,G,C}
-    return UniformStencil{D,T}(origin, h, ntuple(d -> first[d] - G[d], Val(D)),
-                               ntuple(d -> uniform_shift(h, C[d]), Val(D)))
+    return UniformStencil{D,T}(lo, h, ntuple(d -> B[d] + first[d] - G[d] - 1, Val(D)),
+                               ntuple(d -> C[d] == 1 ? zero(h) : one(h) / 2, Val(D)))
 end
 
 # Whether any point of the stencil at `place` lies in the region. An
@@ -406,14 +417,16 @@ end
 # a region seen through an atlas take the place itself.
 @inline stencil_hits(::Nothing, place, ::Val{n}) where {n} = false
 @inline stencil_hits(region::Region, s::UniformStencil, v::Val) =
-    stencil_hits(region, s.origin, s.h, s.base, s.off, v)
+    stencil_hits(region, s.lo, s.h, s.base, s.off, v)
 
-# M11's forms: stencil point `k` (from 0) along `d` at `origin + ((base +
-# k) − off)·h`, with `base = first − G`.
-@inline stencil_hits(::Nothing, origin, h, base, off, ::Val{n}) where {n} = false
+# M11's forms: stencil point `k` (from 0) along `d` at `lo + ((base + k) +
+# off)·h`, `UniformStencil`'s. `off` is zero or a half, and adding zero is
+# exact, so this is `nodeposition`'s `lo + k·h` and `lo + (k + ½)·h` bit
+# for bit.
+@inline stencil_hits(::Nothing, lo, h, base, off, ::Val{n}) where {n} = false
 
-@inline stencil_position(origin, h, base, off, d, k) =
-    origin[d] + ((base[d] + k) - off[d]) * h
+@inline stencil_position(lo, h, base, off, d, k) =
+    lo[d] + (oftype(h, base[d] + k) + off[d]) * h
 
 @inline function stencil_hits(region::Region, origin::NTuple{D}, h, base, off,
                               ::Val{n}) where {D,n}
@@ -445,7 +458,7 @@ end
 # The same two tests over a stencil whose points are not equally spaced,
 # read through `stencil_position(place, d, k)`.
 @inline function stencil_hits(region::Region, place, ::Val{n}) where {n}
-    D = length(place.origin)
+    D = length(place.lo)
     for J in CartesianIndices(ntuple(_ -> n, Val(D)))
         x = ntuple(d -> stencil_position(place, d, J[d] - 1), Val(D))
         inside(region, x) && return true
@@ -493,8 +506,7 @@ end
 # what everything but the location of a `PatchPoint` reads (the seam,
 # which a forest of patches does not have).
 function PointGeometry(::Type{T}, forest::Forest{D}) where {T,D}
-    return PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]),
-                                           T(forest.extents[d][2])), D),
+    return PointGeometry{D,T}(location_box(T, forest, 1),
                               forest.roots, forest.periodic, reflecting_faces(forest),
                               hasrotating(forest) ? seam_plane(forest) : (0, 0),
                               ishalfturn(forest), maxlevel(forest), 0)
@@ -542,13 +554,11 @@ end
 pointdims(x) = length(x)
 pointdims(x::PatchPoint) = length(x.ξ)
 
-# Each patch's box, roots and first root less one, as one isbits entry
-# per patch for a kernel; `nothing` on a brick.
+# Each patch's box (`location_box`), roots and first root less one, as
+# one isbits entry per patch for a kernel; `nothing` on a brick.
 function patch_table(::Type{T}, forest::Forest{D}) where {T,D}
     ispatched(forest) || return nothing
-    return [(ntuple(d -> (T(patch_extents(forest, p)[d][1]),
-                          T(patch_extents(forest, p)[d][2])), D),
-             patch_roots(forest, p), patch_firstroot(forest, p))
+    return [(location_box(T, forest, p), patch_roots(forest, p), patch_firstroot(forest, p))
             for p in 1:npatches(forest)]
 end
 
@@ -744,23 +754,33 @@ unknown_patch(forest::Forest, x, j) = ArgumentError(
 
 # The stencil of an in-domain query in block `b`: its first stored index
 # per dimension, the query's offset `ξ` from it in spacings, and the
-# places of its points. The position in spacings from the block's origin
-# is what the basis is handed (`stencilstart`), since an element set's
-# stored index is not linear in it.
-@inline function query_stencil(basis, x::NTuple{D,T}, origin, h, ::Val{G}, ::Val{C},
+# places of its points. The position in spacings from the block's corner
+# — `lo + B·h`, `block_origin`'s — is what the basis is handed
+# (`stencilstart`), since an element set's stored index is not linear in
+# it; the places are formed from `lo` and `B` as `nodeposition` forms
+# them.
+@inline function query_stencil(basis, x::NTuple{D,T}, lo, h, B, ::Val{G}, ::Val{C},
                                ::Val{S}) where {D,T,G,C,S}
+    origin = ntuple(d -> nodeposition(lo[d], h, B[d], 1, 1, nothing), Val(D))
     t = ntuple(d -> (x[d] - origin[d]) / h, Val(D))
     fξ = ntuple(d -> stencilstart(basis, t[d], G[d], C[d], S[d]), Val(D))
     first = ntuple(d -> fξ[d][1], Val(D))
     ξ = ntuple(d -> fξ[d][2], Val(D))
-    return first, ξ, stencil_place(basis, origin, h, first, Val(G), Val(C))
+    return first, ξ, stencil_place(basis, lo, h, B, first, Val(G), Val(C))
 end
+# The form with the block's corner alone, which TreeWaveOLDG's extraction
+# calls for the stencil and its weights: the same `first` and `ξ`, since
+# `lo + 0·h` is `origin` bit for bit, but places relative to the corner,
+# which are not `coordinates`' bits.
+@inline query_stencil(basis, x::NTuple{D,T}, origin, h, ::Val{G}, ::Val{C},
+                      ::Val{S}) where {D,T,G,C,S} =
+    query_stencil(basis, x, origin, h, ntuple(_ -> 0, Val(D)), Val(G), Val(C), Val(S))
 
 # The whole of one query, written into slot `j` of the outputs.
 #
 # `leaves` is the whole leaf array, replicated on every rank, so the
 # search answers in global leaf indices, which is what `blocks[j]`
-# records. `origins`, `spacings` and `work` are per local block, and
+# records. `lows`, `bases`, `spacings` and `work` are per local block, and
 # `boffset` is the global index of the leaf before this rank's first
 # block: zero serially, where the two coincide, and under M7 the shift a
 # point routed to the owner of its block takes to reach it ("Point
@@ -779,7 +799,7 @@ end
 # forest without a seam, where `r` is always 0, and for a set whose
 # layout is not symmetric in the plane, whose value beyond the seam is
 # its partner's: such a point is recorded as `-1` and refused by the host.
-@inline function interpolate_point!(values, excluded, blocks, xs, leaves, origins,
+@inline function interpolate_point!(values, excluded, blocks, xs, leaves, lows, bases,
                                     spacings, work, factors, rotvars, vars, region, basis,
                                     g::PointGeometry{D,T}, derivs::NTuple{K}, swapped,
                                     ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
@@ -795,7 +815,7 @@ end
     end
     b = locate_leaf(leaves, g, x)
     blocks[j] = b
-    evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
+    evaluate_point!(values, excluded, lows, bases, spacings, work, factors, rotvars, vars,
                     region, basis, g, derivs, swapped, Val(M), Val(G), Val(C), Val(S),
                     b - boffset, x, fold, r, j)
     return nothing
@@ -806,14 +826,13 @@ end
 # and turned by `r` quarter turns, contracted with the basis's weights.
 # Both the fused path above and the split one (`evaluate_kernel!`, which
 # reads what `locate` stored) call this, so the two agree bit for bit.
-@inline function evaluate_point!(values, excluded, origins, spacings, work, factors,
+@inline function evaluate_point!(values, excluded, lows, bases, spacings, work, factors,
                                  rotvars, vars, region, basis, g::PointGeometry{D,T},
                                  derivs::NTuple{K}, swapped, ::Val{M}, ::Val{G}, ::Val{C},
                                  ::Val{S}, b, x, fold, r, j) where {D,T,K,M,G,C,S}
-    origin = origins[b]
-    h = spacings[b]
+    lo, B, h = lows[b], bases[b], spacings[b]
     n = stencilwidth(basis)
-    first, ξ, place = query_stencil(basis, x, origin, h, Val(G), Val(C), Val(S))
+    first, ξ, place = query_stencil(basis, x, lo, h, B, Val(G), Val(C), Val(S))
     excluded[j] = stencil_hits(region, place, Val(n))
     W = ntuple(d -> basisweights(basis, ξ[d], Val(M)), Val(D))
 
@@ -952,12 +971,13 @@ end
 @inline paritysign(factors, v, col, ::Type{T}) where {T} = factors[v, col]
 
 @kernel function interpolate_kernel!(values, excluded, blocks, @Const(xs),
-                                     @Const(leaves), @Const(origins), @Const(spacings),
-                                     @Const(work), factors, rotvars, @Const(vars), region,
-                                     basis, g, ::Val{DV}, ::Val{DS}, ::Val{M}, ::Val{G},
-                                     ::Val{C}, ::Val{S}, boffset) where {DV,DS,M,G,C,S}
+                                     @Const(leaves), @Const(lows), @Const(bases),
+                                     @Const(spacings), @Const(work), factors, rotvars,
+                                     @Const(vars), region, basis, g, ::Val{DV}, ::Val{DS},
+                                     ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
+                                     boffset) where {DV,DS,M,G,C,S}
     j = @index(Global, Linear)
-    interpolate_point!(values, excluded, blocks, xs, leaves, origins, spacings, work,
+    interpolate_point!(values, excluded, blocks, xs, leaves, lows, bases, spacings, work,
                        factors, rotvars, vars, region, basis, g, DV, DS, Val(M), Val(G),
                        Val(C), Val(S), boffset, j)
 end
@@ -1333,7 +1353,8 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, u, xs, g, ba
     # Uploaded per call: this is an analysis-cadence operation, and on the
     # CPU the leaves are not copied at all.
     leaves = todevice(backend, forest.leaves)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     vs = todevice(backend, Int32[v for v in vars])
     blocks = allocate(backend, Int32, npts)
@@ -1353,7 +1374,7 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, u, xs, g, ba
               interpolate_kernel!(backend)
     rotvars = seam_rotvars(fs)
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
-    kernel!(values, excluded, blocks, xs, leaves, origins, spacings, src,
+    kernel!(values, excluded, blocks, xs, leaves, lows, bases, spacings, src,
             fs.factors, rotvars, vs, region, basis, g, Val(ms), Val(swapped), Val(M),
             Val(G), Val(staggers(fs)), Val(S), boffset; ndrange=npts)
     synchronize(backend)
@@ -1783,7 +1804,7 @@ end
 # `status[j]` is 1 for a point beyond a rotating seam that `rotvars` cannot
 # turn, 0 otherwise.
 @inline function evaluate_located!(values, excluded, status, leaf, ys, codes, inside,
-                                   patches, atlas, origins, spacings, work, factors,
+                                   patches, atlas, lows, bases, spacings, work, factors,
                                    rotvars, vars, region, basis, g::PointGeometry{D,T},
                                    derivs, swapped, ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
                                    boffset, fillvalue, j) where {D,T,M,G,C,S}
@@ -1800,7 +1821,7 @@ end
         status[j] = Int8(1)
         return nothing
     end
-    evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
+    evaluate_point!(values, excluded, lows, bases, spacings, work, factors, rotvars, vars,
                     mapped_region(region, atlas, patches[j]), basis, g, derivs, swapped,
                     Val(M), Val(G), Val(C), Val(S), Int(leaf[j]) - boffset, ys[j], fold, r,
                     j)
@@ -1809,13 +1830,14 @@ end
 
 @kernel function evaluate_kernel!(values, excluded, status, @Const(leaf), @Const(ys),
                                   @Const(codes), @Const(inside), @Const(patches), atlas,
-                                  @Const(origins), @Const(spacings), @Const(work), factors,
-                                  rotvars, @Const(vars), region, basis, g, ::Val{DV},
-                                  ::Val{DS}, ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
+                                  @Const(lows), @Const(bases), @Const(spacings),
+                                  @Const(work), factors, rotvars, @Const(vars), region,
+                                  basis, g, ::Val{DV}, ::Val{DS}, ::Val{M}, ::Val{G},
+                                  ::Val{C}, ::Val{S},
                                   boffset, fillvalue) where {DV,DS,M,G,C,S}
     j = @index(Global, Linear)
     evaluate_located!(values, excluded, status, leaf, ys, codes, inside, patches, atlas,
-                      origins, spacings, work, factors, rotvars, vars, region, basis, g,
+                      lows, bases, spacings, work, factors, rotvars, vars, region, basis, g,
                       DV, DS, Val(M), Val(G), Val(C), Val(S), boffset, fillvalue, j)
 end
 
@@ -1827,7 +1849,8 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::Located
     forest = fs.forest
     backend = get_backend(fs.work)
     npts = length(pts)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     vs = todevice(backend, Int32[v for v in vars])
     status = allocate(backend, Int8, npts)
@@ -1838,9 +1861,9 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::Located
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
     pointkernel(evaluate_kernel!, backend, npts)(
         values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, pts.patch,
-        pts.atlas, origins, spacings, src, fs.factors, rotvars, vs, region, basis, g, Val(ms),
-        Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset, fillvalue;
-        ndrange=npts)
+        pts.atlas, lows, bases, spacings, src, fs.factors, rotvars, vs, region, basis, g,
+        Val(ms), Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset,
+        fillvalue; ndrange=npts)
     synchronize(backend)
     return status
 end

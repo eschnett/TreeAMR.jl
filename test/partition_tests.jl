@@ -55,6 +55,7 @@ end
     @test serial.comm === SerialCommunicator()
     @test blockrange(serial) == 1:n
     sorigins = block_origins(serial)
+    slows, sbases = block_lows(serial), block_bases(serial)
     sspacings = block_spacings(serial)
     sflags = flag_blocks((b, k) -> (b, k), serial)
     f(x, v) = v + sum(d -> d * x[d]^2, 1:D)
@@ -75,6 +76,8 @@ end
             @test [blockkey(fs, b) for b in 1:m] == serial.leaves[range]
             @test_throws BoundsError blockkey(fs, m + 1)
             @test block_origins(forest) == sorigins[range]
+            @test block_lows(forest) == slows[range]
+            @test block_bases(forest) == sbases[range]
             @test block_spacings(forest) == sspacings[range]
             @test flag_blocks((b, k) -> (b, k), forest) ==
                   [(b - first(range) + 1, k) for (b, k) in sflags[range]]
@@ -135,7 +138,8 @@ end
                       for b in local_sched.boundaries) ==
                   Set(b for b in sbounds if b[1] in range)
             @test all(g -> issorted(g.targetblocks), schedule_groups(local_sched))
-            @test local_sched.boundaryplan.origins == block_origins(forest)
+            @test local_sched.boundaryplan.lows == block_lows(forest)
+            @test local_sched.boundaryplan.bases == block_bases(forest)
         end
         @test crossing > 0            # so the filter had something to drop
     end

@@ -506,10 +506,10 @@ function glue_state(fs)
     dims = TreeAMR.appendix_layout(fs).dims
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
-        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
+        p = patch(forest, k)
         for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2)), v in 1:fs.nvars
-            x = TreeAMR.chart_map(GlueTorus(), ntuple(d -> Float64(o[d] + (I[d] - 1) * h), 2),
-                                  p)
+            x = TreeAMR.chart_map(GlueTorus(),
+                                  coordinates(floattype(forest), fs, b, Tuple(I) .+ fs.G), p)
             A[Tuple(I)..., v, b] = T(v * (0.5 + sin(2π * (2x[1] / (1 + GA + GB) + x[2]))))
         end
     end

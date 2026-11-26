@@ -629,17 +629,10 @@ until the branch merges; the releases are step 11.
 
 Steps:
 
-1. **Positions from integer coordinates**, on `main`: `nodeposition`
-   with `lo`, `h` and the block's integer corner, `block_origin` and
-   `block_extent` by the same rule, the two per-block arrays, the
-   kernels' geometry, `nodeposition` made `public`. Ownership does not
-   change. *Done when*, in `D = 1, 2, 3`, for every centering, in
-   `Float64` and `Float32`, on a refined mesh: a point stored by
-   several blocks — a shared plane, a ghost, a coincident coarse and
-   fine point — is at one position bit for bit in each;
-   `block_extent`s tile bit for bit; the full suite passes with no
-   tolerance loosened; and the numbers in `CODE.md` that moved are
-   updated.
+1. **Positions from integer coordinates** — done: every position is
+   formed by `nodeposition` from integer coordinates ("Positions" under
+   [Centerings](CODE.md#centerings)); the record is M22 step 1 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
 2. **The layout, the uniform fill and outer faces.** The own range;
    the state functions, `map_blocks!` and `fill_by_coordinates!` over
    it; the trapezoid weights; the primary mask on one level, with the

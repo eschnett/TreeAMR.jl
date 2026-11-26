@@ -974,11 +974,12 @@ boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
 # a second, narrower form: a pure per-cell function, which the package
 # itself launches as a kernel. The offset arithmetic below is the same
 # as `transfer_kernel!`'s, and the position is formed exactly as
-# `coordinates` forms it, from the same origin and spacing, so the two
-# agree bit for bit.
+# `coordinates` forms it, through `nodeposition` from the same corner and
+# spacing, so the two agree bit for bit.
 @kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
-                                  @Const(firsts), @Const(origins), @Const(spacings),
-                                  nodes, ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+                                  @Const(firsts), @Const(lows), @Const(bases),
+                                  @Const(spacings), nodes, ::Val{D}, ::Val{G},
+                                  ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     v = I[D + 1]
     t = I[D + 2]
@@ -988,12 +989,12 @@ boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
 
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
-    @inbounds origin, h = origins[b], spacings[b]
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
     # The same expression `coordinates` forms, in the same order, from
-    # the same origin and spacing, so the two agree bit for bit — half a
+    # the same corner and spacing, so the two agree bit for bit — half a
     # cell in a cell-centered dimension, a whole one in a vertex-like
     # dimension, the face for an element set's ghost.
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     # `g` is the user's, and is deliberately *outside* the `@inbounds`
     # above: whatever it indexes is checked as it would be anywhere else.
     val = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
@@ -1005,7 +1006,7 @@ end
 # comes back. The index and position arithmetic is the same as above, so
 # the two forms write bit-for-bit the same numbers.
 @kernel function boundary_all_kernel!(work, g, @Const(blocks), @Const(directions),
-                                      @Const(firsts), @Const(origins),
+                                      @Const(firsts), @Const(lows), @Const(bases),
                                       @Const(spacings), nodes,
                                       ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
@@ -1017,8 +1018,8 @@ end
 
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
-    @inbounds origin, h = origins[b], spacings[b]
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     vals = g(x, ntuple(d -> Int(δ[d]), Val(D)))
     # Unrolled through `Val`, as in `coordinates_all_kernel!`.
     ntuple(Val(NV)) do v
@@ -1039,8 +1040,9 @@ end
     ntuple(d -> clamps[d] == 0 ? idx[d] : Int(clamps[d]), Val(D))
 
 @kernel function relative_kernel!(work, f, @Const(blocks), @Const(firsts),
-                                  @Const(clamps), @Const(origins), @Const(spacings),
-                                  nodes, ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+                                  @Const(clamps), @Const(lows), @Const(bases),
+                                  @Const(spacings), nodes, ::Val{D}, ::Val{G},
+                                  ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     t = I[D + 1]
     @inbounds b = blocks[t]
@@ -1048,16 +1050,16 @@ end
     @inbounds cl = clamps[t]
     idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
     r = relative_point(idx, cl, Val(D))
-    @inbounds origin, h = origins[b], spacings[b]
-    xg = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
-    xr = ntuple(d -> nodeposition(origin[d], h, r[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
+    xg = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
+    xr = ntuple(d -> nodeposition(lo[d], h, B[d], r[d] - G[d], C[d], nodes), Val(D))
     @inbounds ur = work[r..., 1, b]
     @inbounds work[idx..., 1, b] = f(xg) + (ur - f(xr))
 end
 
 @kernel function relative_all_kernel!(work, f, @Const(blocks), @Const(firsts),
-                                      @Const(clamps), @Const(origins), @Const(spacings),
-                                      nodes, ::Val{D}, ::Val{G}, ::Val{C},
+                                      @Const(clamps), @Const(lows), @Const(bases),
+                                      @Const(spacings), nodes, ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)
     t = I[D + 1]
@@ -1066,9 +1068,9 @@ end
     @inbounds cl = clamps[t]
     idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
     r = relative_point(idx, cl, Val(D))
-    @inbounds origin, h = origins[b], spacings[b]
-    xg = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
-    xr = ntuple(d -> nodeposition(origin[d], h, r[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
+    xg = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
+    xr = ntuple(d -> nodeposition(lo[d], h, B[d], r[d] - G[d], C[d], nodes), Val(D))
     fg = f(xg)
     fr = f(xr)
     ntuple(Val(NV)) do v
@@ -1078,12 +1080,12 @@ end
 end
 
 # The forms with the patch (M17), `WithPatch`: the two kernels above,
-# handed the region's block's patch from the plan beside its origin and
+# handed the region's block's patch from the plan beside its corner and
 # spacing, and passing it to the callback after the position.
 @kernel function boundary_patch_kernel!(work, g, @Const(blocks), @Const(directions),
-                                        @Const(firsts), @Const(origins), @Const(spacings),
-                                        @Const(patches), nodes, ::Val{D}, ::Val{G},
-                                        ::Val{C}) where {D,G,C}
+                                        @Const(firsts), @Const(lows), @Const(bases),
+                                        @Const(spacings), @Const(patches), nodes,
+                                        ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     v = I[D + 1]
     t = I[D + 2]
@@ -1091,14 +1093,14 @@ end
     @inbounds δ = directions[t]
     @inbounds f = firsts[t]
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
-    @inbounds origin, h, p = origins[b], spacings[b], Int(patches[b])
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     val = g(x, p, v, ntuple(d -> Int(δ[d]), Val(D)))
     @inbounds work[idx..., v, b] = val
 end
 
 @kernel function boundary_patch_all_kernel!(work, g, @Const(blocks), @Const(directions),
-                                            @Const(firsts), @Const(origins),
+                                            @Const(firsts), @Const(lows), @Const(bases),
                                             @Const(spacings), @Const(patches), nodes,
                                             ::Val{D}, ::Val{G}, ::Val{C},
                                             ::Val{NV}) where {D,G,C,NV}
@@ -1108,8 +1110,8 @@ end
     @inbounds δ = directions[t]
     @inbounds f = firsts[t]
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
-    @inbounds origin, h, p = origins[b], spacings[b], Int(patches[b])
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     vals = g(x, p, ntuple(d -> Int(δ[d]), Val(D)))
     ntuple(Val(NV)) do v
         @inbounds work[idx..., v, b] = vals[v]
@@ -1256,8 +1258,8 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
         blen = batch.boxlen
         with_nodes(plan.nodes) do nodes
             boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
-                                      batch.firsts, plan.origins, plan.spacings, nodes,
-                                      Val(D), Val(fs.G), Val(staggers(fs));
+                                      batch.firsts, plan.lows, plan.bases, plan.spacings,
+                                      nodes, Val(D), Val(fs.G), Val(staggers(fs));
                                       ndrange=(blen..., fs.nvars, n))
         end
     end
@@ -1299,8 +1301,9 @@ function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot
         n = nregions(batch)
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
-            kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
-                    plan.spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
+            kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.lows,
+                    plan.bases, plan.spacings, nodes, Val(D), Val(fs.G),
+                    Val(staggers(fs)), nv...;
                     ndrange=(batch.boxlen..., n))
         end
     end
@@ -1331,8 +1334,8 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
         blen = batch.boxlen
         with_nodes(plan.nodes) do nodes
             boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
-                                          batch.firsts, plan.origins, plan.spacings,
-                                          nodes, Val(D), Val(fs.G),
+                                          batch.firsts, plan.lows, plan.bases,
+                                          plan.spacings, nodes, Val(D), Val(fs.G),
                                           Val(staggers(fs)), Val(fs.nvars);
                                           ndrange=(blen..., n))
         end
@@ -1351,9 +1354,9 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch},
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
             boundary_patch_kernel!(backend)(fs.work, hook.g.f, batch.blocks,
-                                            batch.directions, batch.firsts, plan.origins,
-                                            plan.spacings, plan.patches, nodes, Val(D),
-                                            Val(fs.G), Val(staggers(fs));
+                                            batch.directions, batch.firsts, plan.lows,
+                                            plan.bases, plan.spacings, plan.patches, nodes,
+                                            Val(D), Val(fs.G), Val(staggers(fs));
                                             ndrange=(batch.boxlen..., fs.nvars, n))
         end
     end
@@ -1374,9 +1377,9 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch{<:AllV
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
             boundary_patch_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
-                                                batch.firsts, plan.origins, plan.spacings,
-                                                plan.patches, nodes, Val(D), Val(fs.G),
-                                                Val(staggers(fs)), Val(fs.nvars);
+                                                batch.firsts, plan.lows, plan.bases,
+                                                plan.spacings, plan.patches, nodes, Val(D),
+                                                Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
                                                 ndrange=(batch.boxlen..., n))
         end
     end

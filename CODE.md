@@ -281,8 +281,8 @@ c_d` points (writing `G` for `G_d`):
 | `G+N+1 … G+N+c_d` | shared boundary plane (vertex-like dimensions only) | `c_d` |
 | `G+N+c_d+1 … N+2G+c_d` | high ghosts | `G` |
 
-at positions `origin + (i − G − 1/2)·h` (cell) or `origin + (i − G − 1)·h`
-(vertex). Three ranges have names: the **owned** range `G+1 … G+N` (what
+at positions `lo + (k + ½)·h` (cell) or `lo + k·h` (vertex), `k = B + i −
+G − 1` the point's integer coordinate (*Positions* below). Three ranges have names: the **owned** range `G+1 … G+N` (what
 `interiorview` returns, unchanged); the **closed** range `G+1 … G+N+c_d`,
 the block's `N+1` faces or vertices including both boundary planes
 (`closedview`, and `map_blocks!(…; closed = true)`); and the **exchange**
@@ -295,6 +295,79 @@ centering; `fill_by_coordinates!` and
 points — face centers for a face field.
 
 The alternatives rejected here — closed ownership, and one shape for every centering — are recorded with their reasons in [HISTORY.md](HISTORY.md#centerings).
+
+**Positions.** Every position is formed from integers, so that every
+copy of a point — on a shared plane, in a ghost, a coarse point under a
+fine one, an element's two face nodes — is at one position bit for bit.
+Along each dimension a point has an integer coordinate `k`, counted from
+its patch's low face `lo` in units of its level's spacing `h`: `k = B +
+I − 1` for owned index `I` (stored index minus `G`) of a block whose
+integer corner is `B = g·N`, `g = (rootpos << level) + coords` the
+block's integer coordinate at its level within its patch. The position is
+
+    lo + k·h              (vertex-like)
+    lo + (k + ½)·h        (cell-like)
+    lo + ((B + q(P+1)) + oᵢ)·h    (node i of element q)
+
+a conversion, a multiplication and then an addition, never `muladd`.
+`nodeposition(lo, h, B, I, c, nodes)` is the one function that forms
+them, and it is `public`.
+
+- *Why the copies agree.* Every block that holds a point at one level
+  has the same `k`, `lo` and `h`; a level up `k` halves and `h` doubles,
+  both exactly, so `T(2k)·(h/2)` is `T(k)·h` bit for bit. That holds
+  where `T(k)` is not exact as well — a `Float32` rounds `k` beyond
+  `2²⁴`, about level 16 at eight roots of `N = 32` — since every copy
+  rounds the same integer, and rounding commutes with a factor of two.
+  An element's last node, offset exactly `P + 1`, is formed as the next
+  element's first, `lo + (B + (q+1)(P+1))·h`: formed as `B + q(P+1)`
+  plus the offset `P + 1`, its integer part would differ from the next
+  element's by `P + 1` and round differently where `T` cannot hold it.
+  `test/position_tests.jl` checks every stored point of every centering
+  in `D = 1, 2, 3`, `Float64` and `Float32`, on a refined mesh with
+  non-dyadic extents and on a 1D mesh refined to level 21.
+- *Which `lo`, which `h`.* `h` is `spacing(T, forest, level)`, one
+  number for every dimension and every patch, `root_spacing / 2ˡ` from
+  patch 1's first dimension; `h_fine = h_coarse/2` exactly. `lo` is the
+  low corner of the block's patch along the dimension, `B` an `Int` on
+  the host and on a device (`MAX_LEVEL = 32` levels below a few roots
+  overflow 32 bits). A block's corner is `lo + B·h` by the same rule, so
+  `block_origin` is a vertex's position and `block_extent`s tile the
+  domain bit for bit. The domain's high face is at `lo + K·h`, `K` the
+  spacings across it, the same bits at every level; it differs from the
+  extent the forest was given by rounding, where the extents are
+  bitwise isotropic, and by up to the isotropy tolerance `check_brick`
+  allows (`4096 eps`) where they are not — in practice a few ulps. The
+  point interpolator locates points in each patch's **location box**,
+  `(lo, max(hi, lo + K·h))` per dimension (`location_box`): the box the
+  forest was given, widened where a node lies past it, so that every
+  position `coordinates` returns is located and every point of the given
+  box still is.
+- *What a kernel sees.* `block_lows` (the patch's low corner, an
+  `NTuple{D,T}`) and `block_bases` (`B`, an `NTuple{D,Int}`) beside
+  `block_spacings`, indexed by local block, built on the host and
+  uploaded per call by the setup-frequency launches and kept by the
+  `BoundaryPlan` for the hooks, as the origins were. A position costs an
+  integer addition more than `origin + (I − 1)·h` did. `block_origins`
+  stays, now formed by the same rule, for what is not a node's position:
+  `element_lattice`'s sub-cell centres. The point interpolator inverts a
+  position relative to the block's corner, `t = (x − (lo + B·h))/h`, as
+  before; the positions an `exclude` region is tested at
+  (`stencil_position`) are `nodeposition`'s, and M11's six-argument
+  `stencil_hits(region, lo, h, base, off, Val(n))` keeps its shape, its
+  arguments now `nodeposition`'s pieces (`base` the integer coordinate
+  of the first stencil point, `off` zero or a half).
+- *On a device.* A backend that fused the multiplication and the
+  addition would still give every copy the same bits, since scaling by
+  two is exact inside the fused product as well; what it would break is
+  equality with the host. On Metal it does not fuse: device and host
+  positions are `===` at every owned point and every hook-written ghost
+  of the refined meshes above, in `Float32`, through `P = 3`. On CUDA
+  this is **(open)**: not measured.
+- *What it does not give.* A position and its mirror image are exact
+  negatives only about a plane at `lo = 0`, and positions moved in their
+  last bits when this rule replaced `origin + (I − 1)·h` (M22 step 1 in
+  [HISTORY.md](HISTORY.md#m22--closed-blocks)).
 
 **Invariant.** The exchange region on a block's high side spans positions
 `N … N+G_d+c_d−1` and must lie within one ring of neighbors, including
@@ -481,22 +554,21 @@ its operators move whole elements between levels.
   `regrid_stage`, `transfer_groups`), with no default where a forgotten
   `P` would build cell-centre stencils for Gauss–Lobatto nodes without a
   word.
-- *Every position goes through `nodeposition(origin, h, I, c, nodes)`.*
-  `coordinates`, both `fill_by_coordinates!` kernels, the four
-  boundary-hook kernels, the flagging sweep of `firing_boxes` and the
-  fold kernel all call it, and no other function forms a position from
-  an index, so that a site which misses the element case fails rather
-  than computing cell centres. With `nodes === nothing` it is the
-  equally spaced expression, `origin + (I − ½)h` or `origin + (I − 1)h`,
-  `I` the owned index, bit for bit what these positions always were. For
-  an element set owned point `I` is node `i = (I − 1) mod (P+1)` of
-  element `q = (I − 1) ÷ (P+1)`, at `origin + h(q(P+1) + oᵢ)` with the
-  offset `oᵢ = (P+1)(1 + ξᵢ)/2`, which is how TreeWaveOLDG forms it. The
-  face offsets are `0` and `P + 1` exactly, so the two face nodes at one
-  position get the same bits, within a block and across blocks. A ghost
-  sits **at the face**, on the other side of it: `origin` below,
-  `origin + Nh` above. The offsets are a small array on the backend,
-  uploaded per call beside the origins and spacings and kept by the
+- *Every position goes through `nodeposition(lo, h, B, I, c, nodes)`*
+  (*Positions* above). `coordinates`, the four `fill_by_coordinates!`
+  kernels, the six boundary-hook kernels, the glue's ghost positions and
+  appendix kernel, the flagging sweep of `firing_boxes` and the fold
+  kernel all call it, and no other function forms a position from an
+  index, so that a site which misses the element case fails rather than
+  computing cell centres. For an element set owned point `I` is node `i =
+  (I − 1) mod (P+1)` of element `q = (I − 1) ÷ (P+1)`, at `lo + ((B +
+  q(P+1)) + oᵢ)·h` with the offset `oᵢ = (P+1)(1 + ξᵢ)/2`, the last node,
+  `oₚ = P + 1` exactly, as the next element's first, so the two face
+  nodes at one position get the same bits, within a block and across
+  blocks. A ghost sits **at the face**, on the other side of it: `lo +
+  B·h` below, `lo + (B + N)·h` above. The offsets are a small array on
+  the backend, uploaded per call beside the corners and spacings and
+  kept by the
   `BoundaryPlan` for the hooks: `P` is a run-time value, and a tuple of
   run-time length would be neither inferable nor kept in registers on a
   device.
@@ -542,7 +614,8 @@ multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 **(proposed)** *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the
 decisions are recorded under M22 in
 [HISTORY.md](HISTORY.md#m22--closed-blocks). Nothing of this section is
-implemented. It replaces "Shared points and half-open ownership" under
+implemented but its positions from integer coordinates (step 1), which
+are current text under [Centerings](#centerings). It replaces "Shared points and half-open ownership" under
 [Centerings](#centerings), and everything this document derives from
 it, when it lands.)*
 
@@ -681,46 +754,12 @@ field set's working array it is `unify!(fs, schedule)`, stages A, P and
 **One position per point.** The copies of a point must be at one
 position, bit for bit, or a right-hand side that reads it — a source
 term, a `1/r`, a gauge condition — gives them values that differ by
-rounding. Today a block forms a position from its own corner, `origin +
-(I − 1)h`, and `origin_A + N h` on one side of a face is not always the
-bits of `origin_B` on the other. Positions are formed from integers
-instead. Along each dimension a point has a coordinate `k`, counted
-from its patch's low face in units of its level's spacing: `k = b + I −
-1` for own index `I` of a block whose low corner is at `b = g N`, `g`
-the block's integer coordinate at its level. Its position is
-
-    lo + k·h              (vertex-like)
-    lo + (k + ½)·h        (cell-like)
-    lo + (b + q(P+1) + oᵢ)·h    (node i of element q)
-
-a multiplication and then an addition, never a fused one, which a
-device and a host would round differently. Every block holding a point
-at one level has the same `k`, `lo` and `h`; a level up `k` halves and
-`h` doubles, both exactly, so the product has the same bits; and an
-element's two face nodes at one position have the same integer part and
-the offsets `0` and `P + 1`. So every copy of a point is at one
-position, across blocks and levels, in every centering.
-
-`nodeposition` stays the only function that forms a position, and takes
-`lo`, `h` and `b` where it took `origin` and `h`. A block's corner is
-`lo + b·h` by the same rule, so `block_origin` is a node's position,
-`block_extent`s tile the domain bit for bit, and a domain's high face
-is at `lo + K·h` at every level, which may differ from the extent the
-forest was given in the last bit. What a kernel sees of the geometry
-gains two arrays indexed by block beside `block_spacings`, the patch's
-low corner and the block's integer corner (**(proposed)**
-`block_lows`, `block_bases`), and `nodeposition` becomes `public`:
-downstream kernels form positions from `block_origins` today, and get
-one position per point only through it. `block_origins` stays for what
-is not a node's position. The cost is an integer addition per position.
-
-With it a deterministic right-hand side gives the copies at a
-same-level face inside a patch the same `du` bit for bit, so on a
-uniform brick the state stays unified without `unify!`. It does not
-make a position and its mirror image exact negatives of each other,
-except about a plane at `lo = 0`. It changes the last bit of positions
-throughout, so numbers recorded in this document may move in their last
-digits.
+rounding. That is implemented already, on half-open blocks: positions
+are formed from integer coordinates (*Positions* under
+[Centerings](#centerings)). With it a deterministic right-hand side
+gives the copies at a same-level face inside a patch the same `du` bit
+for bit, so on a uniform brick the state stays unified without
+`unify!`.
 
 **The fill.** In order, each stage reading only what earlier ones wrote:
 
@@ -3787,8 +3826,9 @@ multi_indices(Val(D), maxorder)
   tested at come from the basis too, `stencil_place`, whose default is
   the equally spaced `UniformStencil` and which an element basis
   overrides (`ElementStencil`). An equally spaced stencil is tested by
-  M11's six-argument `stencil_hits(region, origin, h, base, off,
-  Val(n))`, unchanged, because that is the method a `Region` overrides —
+  M11's six-argument `stencil_hits(region, lo, h, base, off,
+  Val(n))`, its shape unchanged (its arguments are `nodeposition`'s
+  pieces since M22 step 1), because that is the method a `Region` overrides —
   TreeGeneralizedHarmonic's horizon guard does — and an element stencil
   by `stencil_hits(region, place, Val(n))`, the `Ellipsoid`'s separable
   test included, which reads the nodes through `stencil_position(place,
@@ -6425,7 +6465,7 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 | residency | `device.jl` | `todevice` (host-built metadata uploaded once, where it is already being rebuilt) and `check_floattype` |
 | communicator | `communicator.jl`; `ext/TreeAMRMPIExt.jl` | M7: abstract `Communicator`, `SerialCommunicator` (rank 0 of 1), `communicator`, and the verbs (`commrank`, `commsize`, `allgather`, `allgatherv` public; `alltoallv`, `bcast`, `commnodes`, `isend`/`irecv`/`waitall`, `hoststaging`), each with a serial method; the MPI extension (weak dependency MPI.jl) adds `MPICommunicator` — a cached `MPI_Comm_dup` with its rank, size and `deviceaware` setting — and one MPI.jl call per verb |
 | tree | `morton.jl`, `forest.jl` | `MortonKey{D}` (root, level, coords; curve order computed on the fly), `Forest{D}` = sorted leaf vector + `generation` counter + connectivity (one brick, or patches and their glue table, M17); neighbor finding (oriented across a rotating seam or a glued face), `refine!`/`coarsen!`, `balance!` (conformity at a seam and a glued face) |
-| geometry | `geometry.jl` | key + stored cell index → physical coordinates (logical, patch by patch, on a forest of patches); `block_origins`, `block_spacings` and `block_patches` |
+| geometry | `geometry.jl` | key + stored cell index → physical coordinates (logical, patch by patch, on a forest of patches); `block_origins`, `block_lows`, `block_bases`, `block_spacings` and `block_patches`; `nodeposition`, which forms every position, is in `storage.jl` |
 | storage | `storage.jl` | `FieldSet`: one `(N+2G₁+c₁, …, N+2G_D+c_D, nvars, nblocks)` array over all leaves, ghosts included; the per-dimension `G` and the centering live here, not on the forest, and so do `parity`, `rotation` and their tables; `RotationPair` |
 | operators | `operators.jl` | `Operators` (family + orders), `check_operators`, Lagrange weights |
 | exchange | `schedule.jl`, `ghosts.jl` | `GhostSchedule` (built when the tree changes) and `fill_ghosts!` (replays it) |
@@ -6874,8 +6914,8 @@ which companion releases go with it.
 
 `test/runtests.jl` runs the test files, which are, in its order,
 `tree_tests.jl` (M1), `ghost_tests.jl`, `centering_tests.jl`,
-`element_tests.jl` (M16), `reflect_tests.jl` (M10), `outflow_tests.jl`,
-`rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
+`element_tests.jl` (M16), `position_tests.jl` (M22 step 1),
+`reflect_tests.jl` (M10), `outflow_tests.jl`, `rotate_tests.jl` (M12), `halfturn_tests.jl` (M14), `patch_tests.jl` (M17),
 `interpolate_tests.jl` (M11), `element_interpolate_tests.jl` and
 `atlas_tests.jl` (M19), `glue_tests.jl`, `glue_ball_tests.jl` and
 `glue_exchange_tests.jl` (M20),
@@ -6954,12 +6994,24 @@ limiter's injection) and that OrdinaryDiffEq's Shu–Osher SSPRK33 is
 different there. Its names clash with OrdinaryDiffEq's (`RK4`,
 `SSPRK33`), so it uses `import IMEXRungeKutta as IRK`.
 
+`position_tests.jl` holds the positions from integer coordinates (M22
+step 1, *Positions* under [Centerings](#centerings)): every stored point
+of every centering grouped by its exact place, each group at one
+position bit for bit, on a refined mesh of non-dyadic extents in `D = 1,
+2, 3`, `Float64` and `Float32`, and on a 1D mesh refined to level 21
+where `Float32` cannot hold the integer coordinate; the kernels, the
+folds, the flagging sweep and the hooks against `coordinates`; the
+ghosts of a uniform brick after a fill of the positions; the extents
+tiling bit for bit, on a forest of patches too; and every own point
+located where `coordinates` puts it, the high outer face included.
+
 `element_tests.jl` holds the element centering's own tests (M16): the
 tables against closed forms for `P ≤ 4`, each table's exactness and
 `M_c R = Iᵀ M_f` in `BigFloat` and after rounding; the centering, its
 refusals and the element family's; a schedule whose type is the same
 for every layout, under `@inferred`; every position at its node bit for
-bit, and every equally spaced position as before; the GLL norm and
+bit, and every equally spaced position from its integer coordinate;
+the GLL norm and
 mass; and the fill against an oracle of its own (`element_oracle`),
 which finds the blocks across each face by `neighbor_keys` and
 evaluates the Lagrange polynomials and the GLL quadrature at the

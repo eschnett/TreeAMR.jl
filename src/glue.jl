@@ -373,8 +373,8 @@ function ghost_position(::Type{R}, forest::Forest{D}, key::MortonKey{D},
                         idx::NTuple{D,<:Integer}, G::NTuple{D,Int},
                         c::NTuple{D,Int}) where {R,D}
     h = spacing(R, forest, level(key))
-    origin = block_origin(R, forest, key)
-    return ntuple(d -> nodeposition(origin[d], h, Int(idx[d]) - G[d], c[d], nothing), D)
+    lo, B = block_low(R, forest, key), block_base(forest, key)
+    return ntuple(d -> nodeposition(lo[d], h, B[d], Int(idx[d]) - G[d], c[d], nothing), D)
 end
 
 # Every interpolated ghost of `regions`, located: the atlas names the
@@ -1024,15 +1024,16 @@ AppendixCallback(f, ::Val{NV}, all::Bool, patch::Bool) where {NV} =
 # `coordinates_kernel!` uses, from the owned index `N + 1` on its plane, so
 # that a point the patches share is filled from the same arithmetic.
 @kernel function appendix_coordinates_kernel!(work, g, @Const(points), @Const(block),
-                                              @Const(origins), @Const(spacings),
-                                              @Const(patches), nodes, ::Val{D}, ::Val{G},
-                                              ::Val{C}, ::Val{NV}) where {D,G,C,NV}
+                                              @Const(lows), @Const(bases),
+                                              @Const(spacings), @Const(patches), nodes,
+                                              ::Val{D}, ::Val{G}, ::Val{C},
+                                              ::Val{NV}) where {D,G,C,NV}
     j = @index(Global, Linear)
     @inbounds begin
         b = Int(block[j])
         I = points[j]
-        origin, h, p = origins[b], spacings[b], Int(patches[b])
-        x = ntuple(d -> nodeposition(origin[d], h, Int(I[d]), C[d], nodes), Val(D))
+        lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+        x = ntuple(d -> nodeposition(lo[d], h, B[d], Int(I[d]), C[d], nodes), Val(D))
         vals = g(x, p)
         idx = ntuple(d -> Int(I[d]) + G[d], Val(D))
         ntuple(Val(NV)) do v
@@ -1047,11 +1048,12 @@ function fill_appendix_coordinates!(g::AppendixCallback, fs::FieldSet{T,D}) wher
     isempty(L.host.points) && return nothing
     forest = fs.forest
     backend = get_backend(fs.work)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     patches = todevice(backend, block_patches(forest))
     with_nodes(backend, T, fs.P) do nodes
-        appendix_coordinates_kernel!(backend)(fs.work, g, L.points, L.block, origins,
+        appendix_coordinates_kernel!(backend)(fs.work, g, L.points, L.block, lows, bases,
                                               spacings, patches, nodes, Val(D), Val(fs.G),
                                               Val(staggers(fs)), Val(fs.nvars);
                                               ndrange=length(L.host.points))

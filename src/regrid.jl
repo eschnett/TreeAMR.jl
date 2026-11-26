@@ -89,12 +89,13 @@ end
     ntuple(d -> max(hi[d], Int32(i[d])), Val(D))
 
 @kernel function firing_lanes_kernel!(counts, los, his, @Const(work), fires,
-                                      @Const(origins), @Const(spacings), nodes,
-                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
+                                      @Const(lows), @Const(bases), @Const(spacings),
+                                      nodes, ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
                                       ::Val{W}) where {D,G,C,N,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
-    origin, h = origins[b], spacings[b]
+    # `x0`, not `lo`: `lo` is the firing box below.
+    x0, B, h = lows[b], bases[b], spacings[b]
     cells = CartesianIndices(ntuple(_ -> N, Val(D)))
 
     n = 0
@@ -105,7 +106,7 @@ end
         i = ntuple(d -> c[d], Val(D))                  # owned index, 1:N
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
         # The same expression `coordinates` forms, per centering.
-        x = ntuple(d -> nodeposition(origin[d], h, i[d], C[d], nodes), Val(D))
+        x = ntuple(d -> nodeposition(x0[d], h, B[d], i[d], C[d], nodes), Val(D))
         if fires(work, idx, b, x)
             n += 1
             lo = widen_lo(lo, i)
@@ -190,10 +191,11 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     counts = allocate(backend, Int32, (n,))
     los = allocate(backend, NTuple{D,Int32}, (n,))
     his = allocate(backend, NTuple{D,Int32}, (n,))
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     with_nodes(backend, T, fs.P) do nodes
-        firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
+        firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, lows, bases,
                                       spacings, nodes, Val(D), Val(fs.G),
                                       Val(staggers(fs)), Val(forest.N), Val(W);
                                       ndrange=W * n)

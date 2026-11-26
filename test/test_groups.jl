@@ -23,7 +23,7 @@ const TEST_HELPERS = ["oracles.jl", "ghost_oracles.jl", "wave.jl", "burgers.jl",
 # are as heavy, the two heaviest entries, so that they start in different
 # groups (`pack_groups` checks it).
 const TEST_FILES = ["tree_tests" => 14, "ghost_tests" => 56, "centering_tests" => 32,
-                    "element_tests" => 57, "reflect_tests" => 30,
+                    "element_tests" => 57, "position_tests" => 20, "reflect_tests" => 30,
                     "outflow_tests" => 11, "rotate_tests" => 50,
                     "halfturn_tests" => 35, "patch_tests" => 40,
                     "interpolate_tests" => 22, "element_interpolate_tests" => 20,

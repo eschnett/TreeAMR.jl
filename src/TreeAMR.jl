@@ -21,6 +21,10 @@ export Forest, nleaves, maxlevel, root_position, root_index, alldirections, floa
 export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
 export root_spacing, spacing, minimum_spacing, block_origin, block_extent,
        block_spacings, block_origins
+# Positions from integer coordinates (M22 step 1): `nodeposition` is
+# public, not exported, since its name is generic.
+export block_lows, block_bases
+public nodeposition
 
 # Multi-patch forests (M17)
 export patch, block_patches

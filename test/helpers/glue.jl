@@ -62,15 +62,13 @@ function glue_ghosts(fs)
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         p = patch(forest, k)
-        h = spacing(forest, k)
-        o = block_origin(forest, k)
         for I in CartesianIndices(size(fs.work)[1:D])
             idx = Tuple(I)
             δ = ntuple(d -> idx[d] <= G[d] ? -1 :
                             idx[d] > G[d] + fs.forest.N + dims[b][d] ? 1 : 0, D)
             all(iszero, δ) && continue
             TreeAMR.interpolated_region(conn, k, δ) || continue
-            ξ = ntuple(d -> o[d] + (idx[d] - G[d] - 1 + (1 - c[d]) / 2) * h, D)
+            ξ = coordinates(floattype(forest), fs, b, idx)
             push!(out, (b, idx, ξ, p))
         end
     end
@@ -89,9 +87,9 @@ function fill_from_owned!(fs, sched, f; boundary=nothing)
     fs.work .= NaN
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
-        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
+        p = patch(forest, k)
         for I in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + dims[b][d]), D))
-            ξ = ntuple(d -> o[d] + (I[d] - G[d] - 1 + (1 - c[d]) / 2) * h, D)
+            ξ = coordinates(floattype(forest), fs, b, Tuple(I))
             for v in 1:fs.nvars
                 fs.work[I, v, b] = v * f(ξ, p)
             end
