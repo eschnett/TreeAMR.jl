@@ -222,7 +222,13 @@ function wave_errors(::Val{D}; N, G=1, ops=Operators(prolongation=2, restriction
     uexact = statevector(final)
     gather!(uexact, final)
 
-    err = sol.u[end] .- uexact
+    # A secondary's state entry is integrated along and never read (M22,
+    # "Closed blocks" in CODE.md): its value is its primary's after a fill,
+    # and `unify!` gives the state that value, as an application's output
+    # would.
+    u = copy(sol.u[end])
+    unify!(u, fs, problem.schedule)
+    err = u .- uexact
     return (l2=volume_weighted_norm(fs, err),
             linf=volume_weighted_norm(fs, err; p=Inf),
             h=h, nsteps=nsteps, nblocks=nleaves(forest))

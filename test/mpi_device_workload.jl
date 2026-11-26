@@ -558,7 +558,9 @@ pending_case(tag, step) = emit("# pending until M22 step $step:", tag)
 
 function main()
     emit("# ranks", NRANKS, "backend", BNAME, "T", T, "deviceaware", DEVICEAWARE)
-    pending_case("W2v", 3)
+    wave_case("W2v", forest_of((4, 4), 8; centre=(1.6, 2.3)); G=1,
+              centering=vertexcentered(2), ops=Operators(prolongation=4, restriction=4),
+              steps=4)
     parity = [(OddParity, EvenParity), (EvenParity, EvenParity)]
     wave_case("R2c", forest_of((3, 3), 8; reflecting=((true, false), (true, false)),
                                centre=(0.4, 0.5)); G=2, centering=cellcentered(2),

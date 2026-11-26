@@ -97,7 +97,7 @@ end
     # What the serial reference prints while M22 is built: the cases
     # pending until a later step print one comment line each instead
     # (`pending_case`), and the regrids left are those of M32x2-.
-    NPENDING, NREGRIDS, NUNCHANGED = 22, 8, 1
+    NPENDING, NREGRIDS, NUNCHANGED = 21, 8, 1
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -120,7 +120,7 @@ end
     @test count(startswith("packages "), lines) == 1
     @test !occursin(r" (Test|OrdinaryDiffEq\w*|IMEXRungeKutta)( |$)",
                     only(filter(startswith("# packages "), lines)))
-    @test count(l -> occursin(" state ", l), lines) >= 5   # 7 with W2v, B2 (M22)
+    @test count(l -> occursin(" state ", l), lines) >= 6   # 7 with B2 (M22)
     @test count(l -> occursin(" filled ", l), lines) >= 13
     # Burgers' fixup (B2), the regrid cycles (TP, BR, A2, M) and the ranks
     # without blocks (E2) are pending until M22 steps 3 and 6, and so is
@@ -206,7 +206,7 @@ end
                   ("PR2 cell", "PR2 element", "PS3 element"))
         # The negative control: one received ghost rewritten from a
         # corrupted message buffer changes the gathered digest.
-        @test "# W1o perturbed-ghost-changes-digest true" in hashes
+        @test "# W2v perturbed-ghost-changes-digest true" in hashes
         # A forest mutated on one rank only, a layout that differs on one
         # rank, and an argument one rank alone refuses: refused on every
         # rank, saying why.

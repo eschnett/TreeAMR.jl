@@ -157,7 +157,7 @@ end
     @test worst < gputol(T)
 end
 
-@pending 3 "$bname: a staggered exchange runs on the device: T=$T, D=$D" for
+@testset "$bname: a staggered exchange runs on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The same claim for a vertex-like layout (M8). Two things here are
     # device-specific rather than merely centering-specific: the transfer
@@ -264,7 +264,6 @@ end
     # does its arithmetic in that type: Metal has no `Float64`.
     f = x -> oftype(x[1], 0.3) + sum(d -> oftype(x[1], 2 + d) / 10 * x[d], 1:D)
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(3, "$bname: relative hook, $C, T=$T, D=$D"); continue)
         fs = FieldSet{T}(forest, 1; G=ghosts_for(C, 4), centering=C, backend=backend)
         fill!(fs.work, T(NaN))
         fill_by_coordinates!((x, v) -> f(x), fs)
@@ -1088,7 +1087,7 @@ end
     @test convergence_rate(Float64.(hs), Float64.(l2)) ≈ 2.0 atol = 0.15
 end
 
-@pending 3 "$bname: vertex convergence reproduced: T=$T, D=$D" for
+@testset "$bname: vertex convergence reproduced: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # M8a's acceptance criterion on a device: the same 2nd-order result
     # on a *staggered* layout, at G = 1. Three things here are

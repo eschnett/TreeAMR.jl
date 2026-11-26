@@ -1527,12 +1527,12 @@ function main()
     # then three levels against outer faces, which brings in the hook.
     wave_case("W1p", forest_of((2,), 8; periodic=(true,)); G=2,
               centering=cellcentered(1), ops=OPS4, steps=8)
-    # The negative control is here while W2v is pending (M22 step 3).
     wave_case("W1o", forest_of((4,), 8; centre=(1.3,)); G=2, centering=cellcentered(1),
-              ops=OPS4, steps=8, control=true)
+              ops=OPS4, steps=8)
     # D = 2, vertex-centered, outer faces, three levels; with the
     # negative control.
-    pending_case("W2v", 3)
+    wave_case("W2v", forest_of((4, 4), 8; centre=(1.6, 2.3)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6, control=true)
     # D = 3, cell-centered, periodic, three levels.
     wave_case("W3c", forest_of((2, 2, 2), 4; periodic=(true, true, true),
                                centre=(0.7, 0.8, 1.2)); G=1,

@@ -305,8 +305,10 @@ end
 @testset "The ranks hold the serial mask and stage 0 and fill alike: D=$D" for D in (1, 2, 3)
     # Guards a primary chosen by a rank-local index: every rank must
     # decide each piece as the serial forest does, and a fill over
-    # simulated ranks must give the serial ghosts bit for bit.
-    for (name, serial) in closed_forests(D; N=8), C in closed_centerings(D)
+    # simulated ranks must give the serial ghosts bit for bit, on meshes of
+    # several levels too, where stage 0 restricts.
+    for (name, serial) in vcat(closed_forests(D; N=8), refined_forests(D; N=8)),
+        C in closed_centerings(D)
         n = nleaves(serial)
         c = staggers(C)
         sbits = [primary_bits(serial, j, c) for j in 1:n]
@@ -333,13 +335,15 @@ end
 end
 
 @testset "Stage 0 and phase 1 fill alike flat and shaped: D=$D" for D in (1, 2, 3)
-    # Guards the flat launch a device takes over the new pieces.
-    for (name, forest) in closed_forests(D), C in closed_centerings(D)
+    # Guards the flat launch a device takes over the new pieces, stage 0's
+    # restrictions and the halved ranges of phases 1 and 2 included.
+    for (name, forest) in vcat(closed_forests(D), refined_forests(D)),
+        C in closed_centerings(D)
         fs = FieldSet(forest, 2; G=1, centering=C)
         sched = GhostSchedule(fs, closed_ops(1))
         @test !isempty(sched.unify)
         data = randn(Xoshiro(7), size(fs.work))
-        for g in vcat(sched.unify, sched.phase1)
+        for g in vcat(sched.unify, sched.phase1, sched.phase2...)
             fills = map((false, true)) do flat
                 work = copy(data)
                 run_group!(work, work, g, fs.nvars, TreeAMR.CPU(); flat=flat)
@@ -347,6 +351,163 @@ end
             end
             @test fills[1] == fills[2]
         end
+    end
+end
+
+# The values the own copies of a point hold after a fill, by position: a
+# copy of a point the primary holds too is its value bit for bit; along a
+# cell-like dimension beside a finer block a coarse face value has no
+# coincident point, and is the mean of the fine values at the cell
+# centres about it (the order-2 restriction of `closed_ops`), to rounding.
+# Ghosts are not compared: across a coarse-fine face a ghost at a point
+# some block owns is the coarse source's interpolant there, and equals
+# the owner's value only to the scheme's order. `average = false` skips
+# the means, for a restriction of higher order. Returns the count of
+# points checked each way and whether all held.
+function refined_copies_ok(fs::FieldSet{T,D}, groups; average::Bool=true) where {T,D}
+    c = staggers(fs)
+    exact, averaged, ok = 0, 0, true
+    for (p, copies) in groups
+        any(x -> x[3], copies) || continue
+        primary = refined_primary(fs, p, copies)
+        if primary !== nothing
+            pb, pidx = primary
+            for (b, idx, own) in copies, v in 1:fs.nvars
+                own || continue
+                bits(fs.work[idx..., v, b]) == bits(fs.work[pidx..., v, pb]) || (ok = false)
+            end
+            exact += 1
+            continue
+        end
+        average || continue
+        # The fine level's cell centres about `p` along every cell-like
+        # dimension, a quarter of the coarse spacing either side.
+        b0, idx0, _ = first(x for x in copies if x[3])
+        hf = 1 // (fs.forest.N * 2^(level(blockkey(fs, b0)) + 1))
+        offsets = Iterators.product(ntuple(d -> c[d] == 1 ? (0 // 1,) :
+                                                (-hf // 2, hf // 2), D)...)
+        fine = [get(groups, ntuple(d -> p[d] + o[d], D), nothing) for o in offsets]
+        any(isnothing, fine) && (ok = false; continue)
+        for v in 1:fs.nvars
+            want = sum(fine) do cs
+                b, idx, _ = first(x for x in cs if x[3])
+                fs.work[idx..., v, b]
+            end / length(fine)
+            for (b, idx, own) in copies
+                own || continue
+                isapprox(fs.work[idx..., v, b], want; rtol=8eps(T), atol=8eps(T)) ||
+                    (ok = false)
+            end
+        end
+        averaged += 1
+    end
+    return exact, averaged, ok
+end
+
+@testset "Every copy is its primary's after a fill on a refined mesh: D=$D" for
+        D in (1, 2, 3)
+    # Guards stage 0's restrictions: a coarse copy of a point on a
+    # coarse-fine face must take the finest copy's value — injected, bit
+    # for bit, where the point is the fine block's too, and the mean of the
+    # fine values about it along a cell-like dimension — and a mid-plane
+    # or a hanging node its fine primary's; and every own point of every
+    # block is written only by its primary.
+    hook = boundary_by_coordinates((x, v) -> sum(x) + v)
+    for (name, forest) in refined_forests(D; N=4), C in closed_centerings(D), G in (1, 2)
+        fs = FieldSet(forest, 2; G=G, centering=C)
+        fs.work .= randn(Xoshiro(2300 + D), size(fs.work))
+        fill_ghosts!(fs, GhostSchedule(fs, closed_ops(G)); boundary=hook)
+        exact, averaged, ok = refined_copies_ok(fs, closed_point_groups(fs))
+        @test ok
+        @test exact > 0
+        # Not vacuous where a coarse-fine face lies across a cell-like
+        # dimension of the set (the diagonal mesh has none normal to z).
+        @test averaged > 0 || all(==(1), staggers(C)) || D == 1 ||
+              (name == "diagonal" && staggers(C)[3] == 1)
+    end
+end
+
+@testset "N = 2G fills a refined mesh, and its copies agree: D=$D" for D in (1, 2, 3)
+    # Guards the bound itself (M22 step 3): at `N = 2G` a coarse ghost
+    # `G` planes past a coarse-fine face is injected from the fine block's
+    # far plane, its last own point, and a finer neighbour spans exactly
+    # the ghost region. Nothing ran there before the bound was relaxed.
+    hook = boundary_by_coordinates((x, v) -> sum(x) + v)
+    for (G, N, ops) in ((1, 2, Operators(prolongation=2, restriction=2)),
+                        (2, 4, Operators(prolongation=4, restriction=2)))
+        for (name, forest) in refined_forests(D; N=N), C in closed_centerings(D)
+            any(forest.periodic) && continue        # the data is linear, not periodic
+            fs = FieldSet(forest, 1; G=G, centering=C)
+            data = (x, v) -> 1.0 + sum(d -> d * x[d], 1:D)
+            fill_by_coordinates!(data, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(data))
+            _, _, ok = refined_copies_ok(fs, closed_point_groups(fs))
+            @test ok
+            # Linear data, which both orders reproduce, in every ghost.
+            worst = 0.0
+            for b in 1:nblocks(fs), I in CartesianIndices(size(fs.work)[1:D])
+                x = coordinates(fs, b, Tuple(I))
+                worst = max(worst, abs(fs.work[I, 1, b] - data(x, 1)))
+            end
+            @test worst < 1e-12
+        end
+    end
+end
+
+@testset "An edge-centered set's copies around an edge beside a diagonal finer block are one number" begin
+    # Guards rule 1 at an edge only a diagonal finer block touches, which
+    # the interface restriction left out: every coarse copy of a point on
+    # the edge takes the fine primary's value, so the four blocks around
+    # the edge hold one electromotive force there.
+    forest = Forest((2, 2, 1); N=8)
+    refine!(forest, filter(k -> block_extent(forest, k)[1][1] ==
+                                block_extent(forest, k)[2][1], forest.leaves))
+    balance!(forest)
+    fs = FieldSet(forest, 1; G=0, centering=edgecentered(3, 3))
+    fs.work .= randn(Xoshiro(23), size(fs.work))
+    unify!(fs, GhostSchedule(fs, closed_ops(0)))
+    groups = closed_point_groups(fs)
+    _, averaged, ok = refined_copies_ok(fs, groups)
+    @test ok
+    @test averaged > 0
+    # The central edge, x = y = 1: its coarse copies are one number.
+    central = [copies for (p, copies) in groups if p[1] == 1 && p[2] == 1 &&
+               count(x -> x[3] && level(blockkey(fs, x[1])) == 0, copies) >= 2]
+    @test !isempty(central)
+    @test all(central) do copies
+        vals = [fs.work[idx..., 1, b] for (b, idx, own) in copies
+                if own && level(blockkey(fs, b)) == 0]
+        all(v -> bits(v) == bits(first(vals)), vals)
+    end
+end
+
+@testset "A refined box fills mirror-symmetrically to rounding: D=$D" for D in (1, 2, 3)
+    # Guards the fine block's authority on all its faces alike (M22 rule
+    # 1), the done-when of step 3: half-open ownership made a refined box
+    # asymmetric at 4.7e-5. Point-symmetric data on a box refined at two
+    # opposite corners, outer faces with the data as hook, order-4
+    # operators: every value must equal its mirror image's to rounding.
+    # The two sides sum a prolongation's window in mirrored order and form
+    # their positions as `lo + k h` from opposite ends, so the bound is a
+    # few roundings of the data's scale, `64 eps · max |f|` (an order-4
+    # window's weights sum in absolute value to 1.25 a dimension, 2 in 3D);
+    # what is exact is asserted separately: every copy is its primary's,
+    # bit for bit.
+    L = D == 1 ? 3 : 2
+    f = point_symmetric(D, L)
+    ops = Operators(prolongation=4, restriction=4)
+    for C in closed_centerings(D)
+        forest = faces_forest(ntuple(_ -> :outer, D); N=8)
+        fs = FieldSet(forest, 1; G=ghosts_for(C, 4), centering=C)
+        fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops);
+                     boundary=boundary_by_coordinates(f))
+        err, n = point_mirror_error(fs, L)
+        scale = maximum(abs, fs.work)
+        @test n > 0
+        @test err <= 64 * eps() * scale
+        showerrors() && @info "mirror" D C err scale
+        exact, _, ok = refined_copies_ok(fs, closed_point_groups(fs); average=false)
+        @test ok && exact > 0
     end
 end
 
@@ -603,8 +764,6 @@ end
     ops = Operators(prolongation=2, restriction=2)
     two = Forest((2, 2); N=8)
     refine!(two, two.leaves[1])
-    @test_throws "M22 step 3" GhostSchedule(FieldSet(two, 1; G=1,
-                                                     centering=vertexcentered(2)), ops)
     @test_throws "M22 step 3" InterfaceSchedule(FieldSet(two, 1; G=0,
                                                          centering=facecentered(2, 1)))
     walled = Forest((2, 2); N=8, reflecting=((true, false), (false, false)))

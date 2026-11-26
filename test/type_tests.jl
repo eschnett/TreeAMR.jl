@@ -192,7 +192,7 @@ end
           100 * exchange_error(forest, ops, makepoly(D, 1))
 end
 
-@pending 3 "A staggered layout is type generic too: T=$T, D=$D, C=$C" for
+@testset "A staggered layout is type generic too: T=$T, D=$D, C=$C" for
         T in FLOATTYPES, D in (1, 2), C in (facecentered(D, 1), vertexcentered(D))
     # The centering changes the position arithmetic — a vertex-like
     # dimension subtracts a whole cell where a cell-centered one

@@ -25,8 +25,10 @@ all_variables(::Val{NV}) where {NV} =
 # Every layout here also satisfies `check_operators` at order 2, since
 # the boundary testset below exchanges ghosts over it: a ghost width of
 # zero is legal along a stagger and nowhere else.
+# (A vertex-like dimension without ghosts has no hook region on closed
+# blocks, M22: its wall is its own; so the 1D vertex case takes one ghost.)
 allvariables_cases(D) =
-    D == 1 ? ((cellcentered(1), (1,)), (vertexcentered(1), (0,))) :
+    D == 1 ? ((cellcentered(1), (1,)), (vertexcentered(1), (1,))) :
     D == 2 ? ((cellcentered(2), (1, 1)), (facecentered(2, 1), (0, 1)),
               (vertexcentered(2), (1, 0))) :
              ((cellcentered(3), (1, 1, 1)), (facecentered(3, 2), (1, 0, 1)),
@@ -68,7 +70,6 @@ end
     nv = 2
 
     for (C, G) in allvariables_cases(D)
-        vertexlike(C) && (pending(3, "all-variables hook, $C, D=$D"); continue)
         per = FieldSet(forest, nv; G=G, centering=C)
         whole = FieldSet(forest, nv; G=G, centering=C)
         schedule = GhostSchedule(per, OPS2A)

@@ -30,7 +30,7 @@ A candidate for TreeAMR's own API (the open question of the same name in
 both packages' `CODE.md`), kept here until it is named.
 """
 function state_partition(fs::FieldSet{T,D}) where {T,D}
-    L = fs.forest.N^D * fs.nvars
+    L = statelength(fs) ÷ nblocks(fs)             # one block's entries, every copy
     parts = UnitRange{Int}[(first(r) - 1) * L + 1:last(r) * L
                            for r in threadchunks(nblocks(fs))]
     while length(parts) < Threads.nthreads()
@@ -63,6 +63,8 @@ function imex_wave_errors(::Val{D}; N, ops, G=1, L=1.0, m=1, cfl=0.25,
     final = FieldSet(forest, 2; G=G, centering=vertexcentered(D))
     fill_by_coordinates!(wave_exact(D, L, m, t_end), final)
     uexact = statevector(final); gather!(uexact, final)
+    # The secondaries take their primaries' values first, as in `wave_errors`.
+    unify!(u, fs, problem.schedule)
     return (l2=volume_weighted_norm(fs, u .- uexact), h=h)
 end
 
@@ -75,7 +77,7 @@ state_mass(fs::FieldSet{T,D}, u) where {T,D} =
     tid[I[end]] = Threads.threadid()
 end
 
-@pending 3 "The partition gives each state entry to the thread that runs its block" begin
+@testset "The partition gives each state entry to the thread that runs its block" begin
     # The failure mode is a partition that covers the state exactly — so
     # IMEXRungeKutta accepts it and every result is still right — but
     # hands a block's entries to another thread than the one
@@ -89,7 +91,7 @@ end
     tid = zeros(Int, nblocks(fs))
     map_blocks!(owner_thread_kernel!, fs, tid)
     offset = Threads.threadpoolsize(:interactive)
-    L = fs.forest.N^2 * fs.nvars
+    L = statelength(fs) ÷ nblocks(fs)
     for (c, r) in enumerate(part), b in unique(cld.(r, L))
         # IMEXRungeKutta places range `c` on default-pool thread `c`, as
         # TreeAMR's `threaded_chunks` does; one thread runs everything
@@ -98,7 +100,7 @@ end
     end
 end
 
-@pending 3 "RK4 by owner is bitwise the broadcast, and OrdinaryDiffEq's RK4 to roundoff: D=$D" for
+@testset "RK4 by owner is bitwise the broadcast, and OrdinaryDiffEq's RK4 to roundoff: D=$D" for
         D in (1, 2, 3)
     # Guards a stage arithmetic that differs by path (a partition that
     # drops, doubles or reorders an entry, or a fold that reassociates),
@@ -126,7 +128,7 @@ end
     @test err ≤ 1e-11
 end
 
-@pending 3 "The wave equation converges at second order through IMEXRungeKutta's RK4: D=$D" for
+@testset "The wave equation converges at second order through IMEXRungeKutta's RK4: D=$D" for
         D in (1, 2)
     # The M8a rate (1.99 at order-4 operators, G = 1) must not depend on
     # which package forms the stages. A mistimed stage or a wrong weight

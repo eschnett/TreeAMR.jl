@@ -385,7 +385,6 @@ end
     forest = nested_forest(Val(D); N=8)
     f = monotone_cubic(D)
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(3, "bounded monotone cubic, $C, D=$D"); continue)
         G = ghosts_for(C, 4)
         works = map((PLAIN_PV, BOUNDED_PV)) do ops
             fs = FieldSet(forest, 2; G=G, centering=C)

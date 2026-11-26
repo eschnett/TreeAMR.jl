@@ -62,20 +62,19 @@ end
     @test_throws ArgumentError FieldSet(forest, 1; G=1, centering=:vertex)
 end
 
-@testset "N >= 2G + 2c: the exchange region fits one ring of neighbours" begin
-    # A vertex-like dimension needs one coarse cell more than a
-    # cell-centered one, because its shared boundary plane makes the high
-    # exchange region one plane longer, and a finer neighbour spans only
-    # N/2 of this block's cells.
+@testset "N >= 2G: the exchange region fits one ring of neighbours" begin
+    # Every centering takes the same bound (M22 step 3): a block owns its
+    # closed range, so its high exchange region is `G` points, as the low
+    # one is, and a finer neighbour spans N/2 of this block's cells or
+    # points beyond the face.
     set(N, G, C) = FieldSet(Forest((2, 2); N=N), 1; G=G, centering=C)
     @test set(8, 4, cellcentered(2)) isa FieldSet
-    @test_throws ArgumentError set(8, 4, vertexcentered(2))
-    @test set(8, 3, vertexcentered(2)) isa FieldSet
-    @test_throws "N must be >= 2G + 2c" set(8, 4, vertexcentered(2))
-    # Per dimension: wide in a cell-centered x, at the limit in a
-    # vertex-like y.
-    @test set(8, (4, 3), (:cell, :vertex)) isa FieldSet
-    @test_throws ArgumentError set(8, (4, 4), (:cell, :vertex))
+    @test set(8, 4, vertexcentered(2)) isa FieldSet
+    @test_throws "N must be >= 2G" set(8, 5, vertexcentered(2))
+    @test_throws "N must be >= 2G" set(8, 5, cellcentered(2))
+    # Per dimension.
+    @test set(8, (4, 4), (:cell, :vertex)) isa FieldSet
+    @test_throws ArgumentError set(8, (4, 5), (:cell, :vertex))
     # G = 0 along a stagger is legal and is the point of the whole move:
     # a face field still has its shared plane, and nothing else.
     @test size(set(8, (0, 1), (:vertex, :cell)).work) == (9, 10, 1, 4)
@@ -239,7 +238,6 @@ end
     @test length(unique(level.(forest.leaves))) >= 3
 
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(3, "exchange exact to degree p-1, $C, D=$D"); continue)
         for (p, G) in ((2, 1), (4, 2))
             ops = Operators(prolongation=p, restriction=p)
             # All three transfer kinds really occur, so exactness is not
@@ -265,12 +263,11 @@ end
     forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> isodd(D), D))
     N = forest.N
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(3, "exchange partitions stored points, $C, D=$D"); continue)
         c = staggers(C)
         for G in (ntuple(_ -> 1, D), ntuple(d -> c[d] == 1 ? 0 : 1, D))
             fs = FieldSet(forest, 1; G=G, centering=C)
             counts = write_counts(GhostSchedule(fs, OPS2C))
-            owned = ntuple(d -> (G[d] + 1):(G[d] + N), D)
+            owned = ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D)
             ok = true
             for b in 1:nleaves(forest)
                 slab = view(counts, ntuple(_ -> Colon(), D)..., b)
@@ -281,7 +278,7 @@ end
             end
             @test ok
             stored = prod(ntuple(d -> N + 2G[d] + c[d], D))
-            @test sum(counts) == nleaves(forest) * (stored - N^D)
+            @test sum(counts) == nleaves(forest) * (stored - prod(d -> N + c[d], 1:D))
         end
     end
 end
@@ -298,8 +295,13 @@ end
     forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
     @test length(unique(level.(forest.leaves))) >= 3
 
-    # Coarse-fine faces of a vertex-centered set come back in M22 step 3.
-    pending(3, "vertex restriction is injection, D=$D")
+    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
+    fill_arbitrary!(fs)
+    fill_ghosts!(fs, GhostSchedule(fs, OPS2C))
+    nfiner, nsame, bad = injection_report(fs)
+    @test nfiner > 0                       # restriction from finer blocks happens
+    @test nsame > 0                        # so do same-level copies
+    @test bad == 0                         # and both reproduce the owner exactly
 
     # A cell-centered set has no coincident points across levels at all:
     # a coarse cell center falls on the interface between two fine cells,
@@ -344,9 +346,12 @@ end
     @test_throws "needs G >= 1" GhostSchedule(FieldSet(Forest((2,); N=8), 1; G=0), OPS2C)
     @test GhostSchedule(vset(0), OPS2C) isa GhostSchedule
 
-    # One less than the bound fails; one more passes the exactness test, on
-    # a refined mesh (M22 step 3).
-    pending(3, "G = p/2 - 1 is exact along a stagger")
+    # One less than the bound fails; one more passes the exactness test.
+    forest = nested_forest(Val(1); N=8)
+    @test exchange_error(forest, ops(4), makepoly(1, 3); G=1,
+                         centering=vertexcentered(1)) < 1e-10
+    @test exchange_error(forest, ops(4), makepoly(1, 4); G=1,
+                         centering=vertexcentered(1)) > 1e-8
 end
 
 @testset "A ghost-free cell-centered dimension is legal at conservative order 1" begin

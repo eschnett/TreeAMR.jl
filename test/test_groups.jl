@@ -23,7 +23,7 @@ const TEST_HELPERS = ["oracles.jl", "ghost_oracles.jl", "wave.jl", "burgers.jl",
 # are as heavy, the two heaviest entries, so that they start in different
 # groups (`pack_groups` checks it).
 const TEST_FILES = ["tree_tests" => 14, "ghost_tests" => 56, "centering_tests" => 32,
-                    "element_tests" => 57, "position_tests" => 20, "closed_tests" => 30,
+                    "element_tests" => 57, "position_tests" => 20, "closed_tests" => 100,
                     "reflect_tests" => 30,
                     "outflow_tests" => 11, "rotate_tests" => 50,
                     "halfturn_tests" => 35, "patch_tests" => 40,
@@ -35,8 +35,8 @@ const TEST_FILES = ["tree_tests" => 14, "ghost_tests" => 56, "centering_tests" =
                     "interpolate_exchange_tests" => 17, "allvariables_tests" => 6,
                     "state_tests" => 10, "fold_tests" => 8, "regrid_tests" => 14,
                     "bounded_tests" => 36, "staggered_conservative_tests" => 8,
-                    "walls_tests" => 10, "relative_tests" => 6, "wave_tests" => 3,
-                    "wave_cell_tests" => 2, "burgers_tests" => 15, "imex_tests" => 5,
+                    "walls_tests" => 10, "relative_tests" => 6, "wave_tests" => 25,
+                    "wave_cell_tests" => 2, "burgers_tests" => 15, "imex_tests" => 15,
                     "type_tests" => 15, "thread_tests" => 67, "mpi_tests" => 70,
                     "gpu_tests" => 47]
 

@@ -875,10 +875,11 @@ function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
     return RotationPair{typeof(a),typeof(b),typeof(af),typeof(av)}(a, b, af, bf, av, bv)
 end
 
-# The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d] +
-# 2c[d]` is what makes a block's high exchange region reachable from one
-# ring of neighbors even when those neighbors are finer and each spans
-# only `N/2` coarse cells (see "Blocks" in CODE.md).
+# The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d]` is
+# what makes a block's high exchange region, `G` points beyond its closed
+# range as the low one is (M22), reachable from one ring of neighbors even
+# when those neighbors are finer and each spans only `N/2` of this block's
+# cells or points (see "Blocks" in CODE.md).
 ghostwidths(G::Integer, ::Val{D}) where {D} = ghostwidths(ntuple(_ -> G, D), Val(D))
 function ghostwidths(G::Tuple{Vararg{Integer}}, ::Val{D}) where {D}
     length(G) == D || throw(ArgumentError(
@@ -889,12 +890,11 @@ function ghostwidths(G::Tuple{Vararg{Integer}}, ::Val{D}) where {D}
 end
 
 function storedsize(N::Int, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
-    all(d -> N >= 2 * G[d] + 2 * c[d], 1:D) || throw(ArgumentError(
-        "N must be >= 2G + 2c in every dimension, got N=$N, G=$G, c=$c. A block's " *
-        "high exchange region must be reachable from one ring of neighbors, and a " *
-        "finer neighbor spans only N/2 of this block's cells; a vertex-like " *
-        "dimension (c=1) needs one more, because its shared boundary plane makes " *
-        "that region one plane longer."))
+    all(d -> N >= 2 * G[d], 1:D) || throw(ArgumentError(
+        "N must be >= 2G in every dimension, got N=$N, G=$G. A block's exchange " *
+        "regions, G cells or points beyond its own range on either side, must be " *
+        "reachable from one ring of neighbors, and a finer neighbor spans only N/2 " *
+        "of this block's cells or points."))
     return ntuple(d -> N + 2 * G[d] + c[d], D)
 end
 

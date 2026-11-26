@@ -852,19 +852,18 @@ end
 # the high ghosts `G+N+c+1 … N+2G+c`. Along a cell-like dimension that is
 # the partition it always was.
 #
-# A halved own range, the half of it that one of two finer sources
-# restricts into, exists along a cell-like dimension only until M22 step
-# 3, which decides which finer source writes the mid-plane of a
-# vertex-like one; a set with a vertex-like dimension is refused on a mesh
-# with two levels until then, so asking for one is a bug.
+# A halved own range is the half of it that one of two finer sources
+# restricts into, `od` the source's child offset. Along a vertex-like
+# dimension the two halves share the mid-plane, which the lower child
+# writes, as it is the mid-plane's primary in stage 0 (M22 step 3): `G+1 …
+# G+1+N/2` and `G+2+N/2 … G+N+1`.
 function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool)
     δd == 1 && return (G + N + c + 1):(N + 2G + c)
     δd == -1 && return 1:G
     if halved
-        c == 0 || error("a halved own range of a vertex-like dimension asked for; " *
-                        "coarse-fine faces of such a set come back in M22 step 3, and " *
-                        "GhostSchedule refuses them until then, so this is a bug")
-        return (G + 1 + od * (N ÷ 2)):(G + (od + 1) * (N ÷ 2))
+        h = N ÷ 2
+        c == 1 && return od == 0 ? ((G + 1):(G + 1 + h)) : ((G + 2 + h):(G + N + 1))
+        return (G + 1 + od * h):(G + (od + 1) * h)
     end
     return (G + 1):(G + N + c)
 end
@@ -896,6 +895,22 @@ function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int;
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
 
+# One dimension of a transfer of stage 0 (M22): a copy over the target's
+# span from the same span of a block of its level (`copy_stencil`), or a
+# restriction over it from a finer block, by the set's restriction of
+# order `p` along a cell-like dimension (injection along a vertex-like
+# one), with the multilinear weights stacked below where the group is
+# bounded, as phase 1's restrictions are.
+function unify_stencil(::Type{T}, N::Int, G::Int, c::Int, key, d::Int, p::Int,
+                       mode::Int8) where {T}
+    δd, code = key.direction[d], key.span[d]
+    key.kind === :copy && return copy_stencil(T, N, G, c, δd; span=code)
+    rng = piece_range(N, G, c, code)
+    s = restrict_stencil_over(T, rng, N, G, c, δd, key.offset[d], p)
+    mode == BOUNDED_POINTVALUE || return s
+    return stack_linear(s, restrict_stencil_over(T, rng, N, G, c, δd, key.offset[d], 2))
+end
+
 # Restriction, fine -> coarse. `od` is the source's child offset within
 # the (refined) node adjacent to the target, so it selects which half of
 # the target's extent this source covers.
@@ -905,7 +920,9 @@ end
 # width one with weight one. It is exact for any data, carries no order,
 # and never has to shift — the circularity that forces the cell-centered
 # window inward cannot arise, because the coincident fine point is always
-# owned by the fine block (that is the `N ≥ 2G + 2` invariant).
+# an own point of the fine block: a coarse ghost `g ≤ G` planes past the
+# face is fine point `2g ≤ N` past it (the `N ≥ 2G` invariant), and a coarse
+# point of the closed range the fine point there.
 restrict_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int, p::Int) where {T} =
     restrict_stencil_over(T, target_range(N, G, c, δd, od, true), N, G, c, δd, od, p)
 
@@ -1539,52 +1556,83 @@ function primary_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}) where {D}
 end
 
 # Stage 0's transfers into global leaf `b`: every sub-piece of its closed
-# box whose copy is a secondary, copied from the primary's sub-piece, the
-# sub-pieces with one source block and direction merged where
-# `merged_spans` says, keyed by the direction to the primary's block and
-# the spans.
+# box whose copy is a secondary, from its primary's — a copy from a block
+# of its own level, keyed by the direction to it, or a restriction from a
+# finer one, keyed by the direction to the finer block's parent node and
+# the finer block's child offset in it — merged as `merged_transfers`
+# says, and keyed by the spans each writes.
 function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
                         b::Int) where {D}
-    bysource = Dict{Tuple{Int,NTuple{D,Int}},Vector{NTuple{D,Int}}}()
+    entries = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int}}[]
     lvl = level(forest.leaves[b])
-    allowed = closed_subpieces(c, forest.N).iterators
     for sub in closed_subpieces(c, forest.N)
         all(==(1), piece_of(sub)) && continue       # the open interior: no copies
-        slvl, s, scls, δ, _ = piece_primary(piece_copies(forest, b, sub, c))
+        slvl, s, scls, δ, o = piece_primary(piece_copies(forest, b, sub, c))
         s == b && scls == piece_of(sub) && continue
-        slvl == lvl || error(
-            "a primary on a finer level asked for; stage 0's restrictions come with the " *
-            "rest of M22 step 3, and GhostSchedule refuses two levels until then, so " *
-            "this is a bug")
-        push!(get!(bysource, (s, δ), NTuple{D,Int}[]), sub)
+        push!(entries, (sub, slvl == lvl ? :copy : :restrict, s, δ, o))
     end
-    # Sorted, so that the transfers do not follow `Dict` order.
-    for (s, δ) in sort!(collect(keys(bysource)))
-        for spans in merged_spans(bysource[(s, δ)], allowed)
-            key = GroupKey{D}(:copy, δ, ntuple(_ -> 0, D), 0, ntuple(_ -> Int8(0), D),
-                              Int8(0), Int8(0), spans)
-            push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
-        end
+    for (kind, s, δ, o, spans) in merged_transfers(entries,
+                                                   closed_subpieces(c, forest.N).iterators)
+        key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(0), Int8(0), spans)
+        push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
     end
     return nothing
 end
 
-# Stage 0's merging policy, the one place it is decided: the span codes of
-# the transfers that write the sub-pieces `subs` of one target from one
-# source in one direction, `allowed` the sub-classes each dimension has
-# (`closed_subpieces`). One transfer over their bounding box where they
-# fill it — every allowed sub-class between the least and the greatest,
-# along every dimension, in every combination — which on one level they
-# always do (the direction to the primary is decided per dimension, so the
-# sub-pieces are a product of a span per dimension), and otherwise one per
-# sub-piece, rather than a guess at a cover.
-function merged_spans(subs::Vector{NTuple{D,Int}}, allowed) where {D}
-    subs = unique(subs)
+# Stage 0's merging policy, the one place it is decided: the transfers,
+# as `(kind, source, direction, offset, spans)`, that write one target's
+# secondary sub-pieces, `entries` as `(sub-piece, kind, source, direction,
+# offset)`, with `allowed` the sub-classes each dimension has
+# (`closed_subpieces`). Sub-pieces with one source, direction and offset
+# merge into one transfer over their bounding box where they fill it:
+# every allowed sub-class between the least and the greatest, along every
+# dimension, in every combination. Copies try the whole set first, which
+# on one level always fills its box, since the direction to a primary is
+# decided per dimension; where it does not — the copies of a coarse block
+# whose other pieces face finer blocks — each piece's sub-pieces merge,
+# which always fill their box, the primary of a piece being one block.
+# Restrictions merge within one piece of the target only, so that a coarse
+# piece facing finer blocks takes one transfer a child, with spans that do
+# not depend on what lies around it. Sorted, so that the transfers follow
+# no `Dict` order.
+function merged_transfers(entries::Vector{Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},
+                                                NTuple{D,Int}}}, allowed) where {D}
+    bysource = Dict{Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int}},Vector{NTuple{D,Int}}}()
+    for (sub, kind, s, δ, o) in entries
+        push!(get!(bysource, (kindrank(kind), s, δ, o), NTuple{D,Int}[]), sub)
+    end
+    out = Tuple{Symbol,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int8}}[]
+    for g in sort!(collect(keys(bysource)))
+        rank, s, δ, o = g
+        kind = rank == kindrank(:copy) ? :copy : :restrict
+        subs = unique(bysource[g])
+        spans = kind === :copy ? box_spans(subs, allowed) : nothing
+        if spans === nothing
+            for piece in sort!(unique(map(piece_of, subs)))
+                part = filter(p -> piece_of(p) == piece, subs)
+                spans = box_spans(part, allowed)
+                if spans === nothing
+                    for p in part
+                        push!(out, (kind, s, δ, o, map(x -> span_code(x, x), p)))
+                    end
+                else
+                    push!(out, (kind, s, δ, o, spans))
+                end
+            end
+        else
+            push!(out, (kind, s, δ, o, spans))
+        end
+    end
+    return out
+end
+
+# The span codes of the bounding box of the distinct sub-pieces `subs`
+# where they fill it, or `nothing`.
+function box_spans(subs::Vector{NTuple{D,Int}}, allowed) where {D}
     lo = ntuple(d -> minimum(p -> p[d], subs), D)
     hi = ntuple(d -> maximum(p -> p[d], subs), D)
     box = prod(ntuple(d -> count(x -> lo[d] <= x <= hi[d], allowed[d]), D))
-    box == length(subs) && return [ntuple(d -> span_code(lo[d], hi[d]), D)]
-    return [map(x -> span_code(x, x), p) for p in subs]
+    return box == length(subs) ? ntuple(d -> span_code(lo[d], hi[d]), D) : nothing
 end
 
 # The regions of stage W (M22) on global leaf `j`, local block `b`: every
@@ -2348,7 +2396,7 @@ end
 # `collective_checks`. Cell-centered and element sets have no shared
 # points and are not affected. `what` names the caller.
 function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Symbol,
-                             what::AbstractString; levels::Bool=true) where {D}
+                             what::AbstractString) where {D}
     any(==(:vertex), cs) || return nothing
     why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
           "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
@@ -2358,10 +2406,6 @@ function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Sym
         "symmetric: an outer wall plane is the block's own on both sides, evolved by " *
         "default; a wall the boundary hook prescribes is `CellBoundary(…; wall = " *
         ":prescribed)`. The `walls` keyword goes in M22 step 4."))
-    lvl = level(first(forest.leaves))
-    levels && any(k -> level(k) != lvl, forest.leaves) && throw(ArgumentError(
-        "$what: the forest has leaves at more than one level, which is refused for " *
-        "$why: coarse-fine faces come back in M22 step 3."))
     any(f -> f[1] != OuterFace || f[2] != OuterFace, getfield(forest, :faces)) &&
         throw(ArgumentError(
             "$what: the forest has a reflecting or an outflow face, which is refused " *
@@ -2397,7 +2441,7 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         gs = ghostwidths(G, Val(D))
         cs = centerings(centering, Val(D))
         ss = staggers(cs)
-        storedsize(N, gs, ss)                    # the N >= 2G[d] + 2c[d] invariant
+        storedsize(N, gs, ss)                    # the N >= 2G[d] invariant
         # `0` is the forest form's "no elements", as `FieldSet` stores it.
         order = element_order(P == 0 ? nothing : P, cs, N, gs, forest)
         check_operators(N, gs, cs, order, operators)
@@ -2502,10 +2546,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # nearest owned row at an outflow face), or the derived wall row.
     boundedof(key) = boundedmode(operators, key.kind, key.mirror, stags)
     function build1(key, d)
-        # A piece of stage 0 (M22): a copy into the target's closed box.
-        isunify(key) &&
-            return copy_stencil(T, N, ghosts[d], stags[d], key.direction[d];
-                                span=key.span[d])
+        # A span of stage 0 (M22): a copy or a restriction into the
+        # target's closed box.
+        isunify(key) && return unify_stencil(T, N, ghosts[d], stags[d], key, d,
+                                             operators.restriction, boundedof(key))
         δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
         mode = boundedof(key)
         if state == 2
