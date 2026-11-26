@@ -402,7 +402,7 @@ the one that says why.
   plane is projected onto each variable's parity by stage P, after stage
   W and before stage 0. `N ≥ 2G` in every dimension. A sum or a count
   over such a set takes `primaries = true`. What later steps rebuild
-  (`regrid!`, seams, glues) is refused with the step's
+  (seams, glues) is refused with the step's
   name, and its old code errors if reached: do not route around a
   refusal ("Closed blocks", and the pending tests in
   `test/helpers/pending.jl`). Read the seam through `seam_plane`,

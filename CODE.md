@@ -17,7 +17,8 @@ layout, stage 0 and the primary mask on uniform meshes with periodic and
 outer faces — is implemented there, and so are step 3, coarse-fine faces
 on meshes refined once and left alone, with the interface restriction
 as `unify!` on a flux set, and step 4, reflecting and outflow faces with
-a symmetric wall and no `walls` keyword; what later steps rebuild is refused for a set
+a symmetric wall and no `walls` keyword, and step 6, regridding; step
+5, the first measurement, waits for its cluster runs; what later steps rebuild is refused for a set
 with a vertex-like dimension until then (the list is under
 [Closed blocks](#closed-blocks)). Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
@@ -602,7 +603,7 @@ multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 
 *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the decisions are
 recorded under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
-**On the `m22` branch, steps 1 to 4 are implemented**: positions
+**On the `m22` branch, steps 1 to 4 and 6 are implemented**: positions
 from integer coordinates (*Positions* under [Centerings](#centerings));
 the closed layout, stage 0, the primary mask, `unify!`, the trapezoid's
 weights and the hook at an outer face, evolved or prescribed, on
@@ -612,17 +613,18 @@ below; "Shared points and closed ownership" under
 and left alone, with the interface restriction as `unify!` on a flux set
 (*What step 3 implements* below); and reflecting and outflow faces, the
 mirror and the clamp about the wall plane and stage P (*Walls* and *Stage
-P* below). The rest of this section is **(proposed)**,
+P* below); and regridding, flagging over the closed box and the kept
+blocks' copies over the created ones (*Regridding* below). The rest of
+this section is **(proposed)**,
 and until its step lands a set with a vertex-like dimension is refused,
 with an `ArgumentError` naming the step:
 
 - by `GhostSchedule`, `UnifySchedule` and `primary_mask`, inside their
   collective checks (`check_closed_blocks`): a rotating seam or half
   turn, and so a `RotationPair` (step 7), and a forest of patches with a
-  glued face (step 8);
-- by `regrid!`, with the set's schedule, and so by
-  `adapt_to_initial_data!`, and by `firing_boxes` (step 6). `fs =>
-  nothing`, which only resizes a set, is accepted.
+  glued face (step 8), and so by `regrid!` with the set's schedule,
+  `adapt_to_initial_data!` and `firing_boxes`, which ask the same
+  question. `fs => nothing`, which only resizes a set, is accepted.
 
 The code of the half-open treatment that those steps replace — a copy
 across a seam or a glue in `piece_copies` — stays behind the refusals
@@ -1037,17 +1039,49 @@ the planes it owned there are every block's own. `AppendixArray`,
 go. "No refinement boundary at a glue" stays as it is, and so does the
 refusal of a patch corner's ghosts for a set that copies.
 
-**Regridding.** A transfer's target is the new block's closed box. A
-created fine block takes its face planes from its parent alone, whose
-closed box contains them; two created blocks agree on a common plane,
-since each parent's plane holds the same numbers. A created fine block
-beside a *kept* fine one does not: at the hanging nodes of their common
-plane the kept block holds evolved fine values and the created one
-interpolated ones. So `regrid!` ends its transfers with a pass in which
-a kept block's copy of a shared point replaces a created block's, and
-only then fills. (Today the plane goes to whichever block is the upper
-one.) Flagging sweeps the closed box, so a point on a face flags every
-block holding it, and a refinement criterion has no half-open bias.
+**Regridding.** A transfer's target is the new block's closed box: a
+created fine block's `G+1 … G+N+1` prolongated from its parent, a
+coarsened block's closed halves restricted from its children, the
+mid-plane from the lower child as in the fill (`target_range`), by
+injection from the children's own even points along a vertex-like
+dimension. A restriction reads a child's own points only, so it never
+mirrors, and `mirror_restriction`'s closed-half rule does not arise. A
+created block takes its face planes from its parent or children, whose
+copies of them the fill before the transfer unified, so two created
+blocks agree on a common plane bit for bit, bounded or not, from
+different parents too; a created fine block beside a kept coarser one is
+the finer, so the primary; a created coarse block beside a kept finer
+one has the secondary. A created fine block beside a *kept* fine one
+does not agree: at the hanging nodes of their common plane the kept
+block holds evolved values and the created one interpolated ones, and
+where the created block is the lower its copy is the primary, which
+stage 0 would carry over the evolved one. So `regrid!` runs a second
+stage after the transfer (`REGRID_KEPT_TAG`, `regrid_kept_pairs`): wherever
+a kept block holds a point at the finest level holding it, every created
+copy there takes the kept block's value, a same-level copy over stage
+0's spans, read from the old storage as the transfer reads it. Its
+targets are disjoint sub-pieces, each from one source, and its pairs are
+classified over every created block on every rank, the decision being
+replicated, so sender and receiver find the same transfers. Its
+precondition, an old storage in which every copy at a level is equal
+and a coarse copy is its fine primary's restriction, is `regrid!`'s own:
+it fills every set it moves before the transfer, and the fill's stage 0
+makes it so; a set whose copies drifted is unified then, never moved as
+it is. `regrid!` runs neither stage P nor stage 0 after the transfer,
+which would build a second stage 0 per regrid beside the schedule the
+caller rebuilds anyway: the first `fill_ghosts!` or `unify!`
+with the rebuilt schedule does, so the order is regrid, rebuild the
+schedule, fill or `unify!`, then `gather!`. A `gather!` before that
+takes the copies as the transfer left them: equal on one level, a
+coarse copy its fine primary's restriction only to the operators' order
+along a cell-like dimension (exactly along a vertex-like one), and an
+odd variable on a reflecting wall zero, of either sign. Flagging sweeps
+the closed box, so a point on a face fires in every block holding it,
+and along a vertex-like dimension `firing_boxes` reports the cells
+touching the firing nodes, `max(1, lo − 1) … min(N, hi)`: flag boxes
+stay in cell indices `1:N`, the buffer's reach test is unchanged, and
+the image of a firing pattern under a mirror gives the image of its box,
+which a clamp of node `N + 1` to cell `N` would not.
 
 **Norms and reductions.** A volume-weighted reduction over a
 vertex-like dimension takes the trapezoid's weights within each block:
@@ -3397,8 +3431,7 @@ below is `eps(T)` of the answer itself.
 
 The static rows are `unify!`'s on closed blocks, the same numbers to the
 last digit as the interface restriction's; the rows through regrids are
-the interface restriction's, and come back with regridding on closed
-blocks (M22 step 6).
+the same on closed blocks, bit for bit.
 
 Three things in that table are worth saying out loud. The drift is one or
 two ulp of the total mass and does **not** grow with the step count, so
@@ -3487,10 +3520,14 @@ the strongest available statement that nothing in it is fp64-dependent.
    boundary data. Whether a set has its own hook is part of what the
    ranks agree on. `fs => (nothing, hook)` is refused, since a set only
    resized is never filled.
-   For a staggered field the target of every transfer is the *owned*
-   range: the shared plane and the ghosts of a fresh block are left to
-   the next `fill_ghosts!`, as ghosts are today. Coarsening a vertex-like
-   dimension is injection from the children's even points, all owned.
+   For a staggered field the target of every transfer is the own range,
+   closed along a vertex-like dimension, and a second stage gives a
+   created block's copies of a point a kept block holds at the finest
+   level the kept block's value ("Regridding" under
+   [Closed blocks](#closed-blocks)); the ghosts of a fresh block are left
+   to the next `fill_ghosts!`, as ghosts are today, and so are stages P
+   and 0. Coarsening a vertex-like dimension is injection from the
+   children's even points, all own.
 
 A single regrid moves a block by **at most one level**: marks move a
 block by one, and balance completion against an already-balanced tree

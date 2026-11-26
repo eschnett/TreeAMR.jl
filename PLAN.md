@@ -682,12 +682,12 @@ Steps:
    stage of its own or merges into phase 1, and whether `map_blocks!`
    skips the secondaries by itself; if either changes, when steps 2–4
    pass again in the new form.
-6. **Regridding.** Transfers over closed boxes, a kept block's copy
-   over a created one's, flagging over the closed box. *Done when* a
-   regrid of mirror-symmetric data on a mirror-symmetric mesh stays
-   symmetric to rounding, through refinement and coarsening, serially
-   and over ranks; the regridding wave and Burgers runs keep their
-   recorded numbers or have them re-measured and recorded.
+6. **Regridding** — done on `m22`, ahead of step 5's cluster numbers
+   (the review's decision): transfers over closed boxes, the kept
+   blocks' copies over the created ones, flagging over the closed box
+   ("Regridding" under [Closed blocks](CODE.md#closed-blocks)); the
+   record is M22 step 6 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
 7. **Seams.** Quarter and half turns on the ordinary partition, the
    seam's copies under rule 2 and the axis under rule 3; `seam_shift`
    deleted. *Done when* the half plane's two seam halves agree to

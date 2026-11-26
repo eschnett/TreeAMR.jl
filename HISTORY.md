@@ -5843,6 +5843,79 @@ M12 was decided with Erik, after M7 and before M9b.
   doctests pass. The pending tests by step, as call sites: step 6, 12
   testsets, 10 loops and 12 workload cases; step 7, 22, 18 and 11; step
   8, 26, 8 and 4; steps 3 and 4, none.
+- *Step 6, regridding (2026-11-26).* Implemented on `m22` in four
+  commits after a written plan reviewed as the earlier steps' were, by
+  Claude and not by Erik: flagging over the closed box; the transfer with
+  the kept blocks' copies over the created ones; the applications and
+  workloads; the documents. *Built before step 5's cluster numbers*, an
+  ordering departure from PLAN.md that is the review's decision: the
+  plan showed nothing in step 6 depends on step 5's outcome (stage 0 its
+  own stage or merged into phase 1, `map_blocks!` skipping secondaries).
+  The review's decisions on the plan:
+  - *`regrid!` runs neither stage P nor stage 0*; the first fill or
+    `unify!` with the rebuilt schedule does, and the documents give the
+    order and what a `gather!` before it holds.
+  - *The kept-over-created pass is a second stage*, after the transfer
+    and reading the same old storage, rather than a substitution of
+    sources in `classify_regrid!`.
+  - *A vertex-like flag box is the cells touching the firing nodes*,
+    `max(1, lo − 1) … min(N, hi)`. Claude's plan had proposed clamping
+    node `N + 1` to cell `N`; the review rejected it as the half-open
+    bias again (with `buffer = 1` a firing node at `I = N` recruits the
+    high neighbour and its mirror image at `I = 2` not the low one), and
+    rejected changing `markbox` to accept `1:N+1` as well.
+  - *The precondition of the pass* — an old storage unified — is to be
+    stated and guaranteed: `regrid!` fills every set it moves before the
+    transfer, so a set whose copies drifted is unified, never moved as
+    it is.
+  - *Test the pass's claim directly*, and that two created blocks of
+    different parents agree on their plane without one; the mirror
+    testset at `N = 2G` and through refine-then-coarsen.
+  What the code showed against the plan:
+  - *The transfer's targets were already the closed ranges*: step 3's
+    `target_range` gives `regrid_stage`'s δ = 0 stencils the closed
+    range, and its halved restriction the closed halves. What changed is
+    the second stage, the refusal (now `check_closed_blocks`'), the
+    flagging sweep and the comments. A regrid's restriction reads a
+    child's own points only, so it never mirrors at a wall.
+  - *Created beside created agree bit for bit*, bounded or not, periodic
+    and at reflecting walls, D = 1–3, every vertex-like centering: no
+    bracket and no summation order differed.
+  - *Three pending testsets predate closed blocks*: the staggered
+    conservative regrid took its old values from unfilled data, whose
+    coarse copies on a coarse-fine face are not yet their fine primaries'
+    restriction (it unifies first now); the several-set initial-data
+    criterion took a maximum without `primaries` (it takes every copy
+    now); and the staging testset's second fill differs from its first in
+    the sign of zeros, which stage P writes as an odd value times 0 (step
+    4's accepted `±0`), so it compares bit for bit but for that.
+  - *The thread workload built its flag box by hand* from the own points,
+    and reported node `N + 1`, which `markbox` refuses; it reports the
+    touching cells now. An application that builds boxes by hand from
+    `interiorview` must do the same; `touching_cells` is internal.
+  - *Re-measured*, against the half-open baseline 02bf9d1: Burgers'
+    regrid runs (cell-centered) are unchanged bit for bit, drift / scale
+    3.33 × 10⁻¹⁶ and 5.55 × 10⁻¹⁶, the controls 3.83 × 10⁻⁵ and 5.13 ×
+    10⁻⁵. The wave's tracked pulse (vertex-centered, 1D, 22 blocks,
+    tracking 1.0) moved by more than rounding, as the closed flagging and
+    fill change which nodes fire and what the coarse-fine faces hold: the
+    adaptive run's worst error 0.023955 → 0.023510 against the uniformly
+    fine 0.023268 (M8a's record had 0.0240 against 0.0233), with a buffer
+    of 4 cells 0.024413 → 0.024518, unbuffered 0.025999 → 0.024649.
+    Every assertion holds with its tolerance unchanged. The MPI
+    workload's regrid count is 20 of the 24 before M22: the rotating
+    cases' (Q2, QE2, H2) wait for step 7.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  after the transfer commit, 189,166 tests and 319 pending at eight
+  threads, and after the last, 189,218 and 314 in 7m08 at eight threads
+  and 189,166 and 314 in 6m21 at one, both MPI jobs included with TP,
+  BR, A2, M and E2 at two and three ranks. `gpu_tests.jl` with
+  `closed_tests.jl` on Metal (Float32) passes, 26,223 tests and 18
+  pending in 7m01, and so does `mpi_device_tests.jl` on Metal at two and
+  three ranks, 53 tests, with TP and M back and the stages with messages
+  five. The docs build and their doctests pass. The pending tests by
+  step, as call sites: step 6, none; step 7, 22 testsets, 18
+  loops and 11 workload cases; step 8, 26, 8 and 4.
 
 ## Downstream checks
 

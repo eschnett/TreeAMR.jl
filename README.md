@@ -35,7 +35,8 @@ acceptance; M20's ghosts interpolated across a glue, for finite
 differences on a cubed sphere, are implemented, pending TreeWave's
 use; M22's closed blocks are being built on the branch `m22`, whose
 steps 2 to 4 (the closed layout on uniform meshes, coarse-fine faces,
-and reflecting and outflow faces) are implemented there. M7 is measured on a
+and reflecting and outflow faces) and 6 (regridding) are implemented
+there. M7 is measured on a
 cluster: weak scaling to four nodes, the distributed run on CUDA GPUs
 with and without a CUDA-aware MPI, and checkpoints. A first checkpoint,
 one shared file written through MPI-IO, lost data between nodes on the
