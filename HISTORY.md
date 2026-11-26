@@ -5879,8 +5879,10 @@ M12 was decided with Erik, after M7 and before M9b.
     flagging sweep and the comments. A regrid's restriction reads a
     child's own points only, so it never mirrors at a wall.
   - *Created beside created agree bit for bit*, bounded or not, periodic
-    and at reflecting walls, D = 1–3, every vertex-like centering: no
-    bracket and no summation order differed.
+    and at reflecting walls, D = 1–3, every vertex-like centering, on
+    uniform forests. The review then found it false in general (see the
+    follow-up below): at a concave corner the two parents read different
+    ghosts along the plane, until the ghost stages were amended.
   - *Three pending testsets predate closed blocks*: the staggered
     conservative regrid took its old values from unfilled data, whose
     coarse copies on a coarse-fine face are not yet their fine primaries'
@@ -5916,6 +5918,90 @@ M12 was decided with Erik, after M7 and before M9b.
   five. The docs build and their doctests pass. The pending tests by
   step, as call sites: step 6, none; step 7, 22 testsets, 18
   loops and 11 workload cases; step 8, 26, 8 and 4.
+- *Step 6's review: a ghost on the extension of a face plane, and
+  fix-ups (2026-11-26).* The review's finding, by Claude and not by Erik,
+  with probes: step 3's ghost stages gave a direction's whole target,
+  closed along the tangential vertex-like dimensions, to the neighbour
+  across it, so where that neighbour is coarser and a block of the
+  target's own level holds the rows on the extension of a face plane —
+  at a concave edge or corner of a refined region — those rows held the
+  coarse interpolant. Two blocks of one level stored two values for one
+  point (8 points, 4e-5 to 2e-4, in a 2D probe); a stencil pass and
+  `unify!` broke mirror symmetry by 1.6 × 10⁻⁴, the class rule picking
+  the interpolated copy at one corner and the copied one at its image;
+  and two created blocks of different parents disagreed on their plane
+  before any fill (1 of 113 shared points in 2D vertex, 3 of 64
+  face-centered; 17 of 3912 and 48 of 1280 in 3D), so step 6's claim
+  held on uniform forests only. Implemented in three commits after a
+  plan the review approved:
+  - *The review's decision, amending the ghost stages* (Erik has not
+    confirmed it, and its commit can be reverted alone): every stored
+    copy of a point takes the value of the finest level holding it. A
+    prolongated ghost's tangential face-plane pieces whose holder on the
+    target's level is not the coarse neighbour become phase-1 copies
+    from that holder; the prolongation keeps the rest as spans
+    (`ghost_plane_parts`, `prolong_stencil_over`). Nothing splits where
+    the block sits inside the coarse neighbour, and a finer holder is
+    refused as a bug (2:1 balance forbids it). The plan had proposed a
+    stage-0 marker field in `GroupKey`; `isunify` became "a span along
+    every dimension" instead, which tells the keys apart without a new
+    field, since a ghost key keeps `-1` along the dimensions its
+    direction leaves by.
+  - *Counts*, against a651a2c: the schedules of every test forest
+    without a concave corner are the same byte for byte (the closed,
+    refined, nested, reflecting and outer forests of the dump, D = 1–3,
+    1–3 ranks), and on `bench/nested.jl`'s mesh and the step-4 boxes the
+    group counts do not move (nested: stage 0 80/1599, P 7/187, phase 1
+    124/4678, phase 2 381/1191; reflecting box uniform 19/279, 4/25,
+    63/1267; with a corner refined 80/352, 4/30, 100/1376, 91/91; outer
+    box 19/279, 26/936 and 80/352, 45/997, 61/61), so step 5's recorded
+    counts stand. The "two corners" and "diagonal" forests gain phase-1
+    groups, 18 → 22 serially in 2D vertex. The build: 28.1 → 29.8 ms on
+    the nested mesh, 7.4 → 8.1 on the refined reflecting box (laptop).
+  - *Probes*, old → new: same-level copies differing, 8 → 0; mirror
+    error after a stencil pass and `unify!`, 1.6 × 10⁻⁴ → 1.8 × 10⁻¹⁵
+    (after the fill alone 9.4 × 10⁻¹⁶ both); created blocks disagreeing
+    at the concave corner, 1/113 → 0 and 3/64 → 0.
+  - *The factor path writes `+0`* (the review's decision): `scaled` adds
+    `+0` after the factor, so a fill is bitwise idempotent; the staging
+    testset compares its second fill bit for bit again, and
+    exchange_tests' packing testset, which asserted that a mirrored zero
+    left a `−0`, asserts there is none. Step 7 inherits expectations
+    that move: the rotating and half-turn exchange testsets
+    (`nnegzero > 0`) and the MPI workload's Q2 and H2 `negzeros` count
+    turned ghosts holding `−0`, which become `+0`. This commit came
+    first, since the amendment's bitwise invariant at reflecting walls
+    needs it.
+  - *The kept-over-created pass made local*: it skips a created block
+    without a kept neighbour on its level, and each rank classifies only
+    its candidates (`kept_candidates`). Laptop, 3D vertex, `N = 16`, one
+    thread, `kept_pairs` per regrid: before, 23 / 27 ms at 512 → 960
+    leaves (a slab refined / moved) and 194 / 227 ms at 4096 → 7680;
+    after the skip, 3.3 / 4.6 and 30 / 39 ms; the slowest rank's share
+    with the candidates, 1.0 / 1.1 and 6.8 / 7.6 ms over 8 ranks, 0.2 and
+    1.4 / 1.5 over 64. `regrid_sources` takes 0.1–1.5 ms on the same
+    regrids. The serial and simulated-rank results are unchanged bit for
+    bit; the lockstep helper checks that each rank's candidates keep
+    what the whole classification keeps.
+  - *Fix-ups*: the created-beside-created claim corrected in the code,
+    the docstring, CODE.md and above; `firing_boxes`' broken paragraph
+    joined; and the flag boxes documented as cell indices `1:N`, a box
+    built by hand from a vertex-like dimension's nodes being the cells
+    touching them.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite at
+  eight threads after the amendment's commit, 189,711 tests and 314
+  pending, and after the last, 189,711 and 314 in 7m02 at eight threads
+  and 189,659 and 314 in 6m57 at one; `gpu_tests.jl` with
+  `closed_tests.jl` on Metal, 26,714 and 18 pending in 7m30; the docs
+  build and their doctests. `--trace-compile-timing` of the serial
+  `test/mpi_workload.jl`, one run each against a651a2c: 90.0 → 84.3 s in
+  all, TreeAMR's 32.1 → 36.6 s over 843 → 861 methods, the new ones the
+  schedule build's (`ghost_plane_parts`, the span stencils), none on a
+  launch path; its output differs only where a reflecting fill held a
+  `−0` (R2v, F2, F3, BP, CS, N3, M2, E2, A2's second digest) and in TP's
+  third cycle, whose regrids leave concave corners (its `l2` sum
+  0.300772035 → 0.300772032). The fill on `bench/nested.jl`'s mesh,
+  serially, 357 → 322 ms (laptop noise; no slower).
 
 ## Downstream checks
 

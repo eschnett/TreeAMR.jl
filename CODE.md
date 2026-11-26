@@ -739,6 +739,26 @@ code (the record is step 2 under M22 in
   earlier stage wrote, which `stage_groups` sees from the stencils as
   before. Prolongation writes ghosts only. `N ≥ 2G` replaces `N ≥ 2G +
   2` (*Invariant* under [Centerings](#centerings)).
+- *Every stored copy of a point takes the value of the finest level
+  holding it*, ghosts included. Along a tangential vertex-like dimension
+  a ghost region spans the block's closed range, so its face-plane rows
+  lie on the extension of the block's face planes, where a block across
+  `δ ± e_d` (in 3D also `δ ± e_d ± e_d′`) may hold them as own points.
+  Where the neighbour across `δ` is coarser and such a block is on the
+  target's level — at a concave edge or corner of a refined region —
+  those rows are a phase-1 copy from it, direction `δ` plus the step and
+  span the piece, and the prolongation keeps the rest, as spans
+  (`ghost_plane_parts`, `prolong_stencil_over`); otherwise a prolongated
+  row would hold the coarse interpolant where the level's own value
+  exists, two blocks of one level would store two values for one point,
+  and a stencil pass and `unify!` would break mirror symmetry. Where the
+  block sits inside the coarse neighbour along `d` the block across is
+  the coarse block itself and nothing splits; none is finer than the
+  target, which would face the coarse neighbour across two levels, and
+  the build refuses that as a bug. Mirrored ghosts split the same way
+  through `δ′`. A ghost key keeps `-1` along the dimensions its direction
+  leaves by, so a key with a span along every dimension is stage 0's (or
+  stage P's), `isunify`.
 - *The interface restriction is `unify!`.* `UnifySchedule(fs)` holds
   stage 0 alone, takes no `Operators` and restricts by the exact
   two-cell average; `InterfaceSchedule` and `restrict_interfaces!` are
@@ -1006,7 +1026,8 @@ of them, the value itself otherwise, a product since the mirrors commute
 holds as that projection. Its transfers copy a block's own points onto
 themselves: local, no message, disjoint targets, each reading only
 itself; an even variable is multiplied by one, which keeps its bits, and
-an odd one becomes `±0`, which compares equal to zero. A piece whose
+an odd one becomes `+0` (*The factor path writes `+0`* under
+[Distributed meshes](#distributed-meshes)). A piece whose
 variables are all even there gets no transfer, so a set of even variables
 has no stage P (the schedule takes the set's parities and refuses a set
 with others). A wall point is no copy of anything — no block lies across
@@ -1046,10 +1067,12 @@ mid-plane from the lower child as in the fill (`target_range`), by
 injection from the children's own even points along a vertex-like
 dimension. A restriction reads a child's own points only, so it never
 mirrors, and `mirror_restriction`'s closed-half rule does not arise. A
-created block takes its face planes from its parent or children, whose
-copies of them the fill before the transfer unified, so two created
-blocks agree on a common plane bit for bit, bounded or not, from
-different parents too; a created fine block beside a kept coarser one is
+created block takes its face planes from its parent or children, and two
+created blocks agree on a common plane bit for bit, bounded or not, from
+different parents too, because the fill before the transfer gives every
+stored copy of a point the value of the finest level holding it, own or
+ghost, so both parents read the same values on the plane and along it
+through the same weights; a created fine block beside a kept coarser one is
 the finer, so the primary; a created coarse block beside a kept finer
 one has the secondary. A created fine block beside a *kept* fine one
 does not agree: at the hanging nodes of their common plane the kept
@@ -1060,9 +1083,17 @@ stage after the transfer (`REGRID_KEPT_TAG`, `regrid_kept_pairs`): wherever
 a kept block holds a point at the finest level holding it, every created
 copy there takes the kept block's value, a same-level copy over stage
 0's spans, read from the old storage as the transfer reads it. Its
-targets are disjoint sub-pieces, each from one source, and its pairs are
-classified over every created block on every rank, the decision being
-replicated, so sender and receiver find the same transfers. Its
+targets are disjoint sub-pieces, each from one source. A created
+block's pairs depend on it and the tree alone, so each rank classifies
+only its candidates (`kept_candidates`): the new blocks it stores, and
+the new blocks sharing a point with a kept block it stored, whose pairs
+it may send; sender and receiver find the same transfers. A created
+block without a kept neighbour on its level is skipped before its
+sub-pieces. Measured on the laptop (3D vertex, `N = 16`, a slab of an
+eighth of the blocks refined, or moved by one root), the slowest rank's
+classification takes 1.0–1.1 ms at 512 → 960 leaves and 6.8–7.6 ms at
+4096 → 7680 over 8 ranks, 0.2 and 1.4–1.5 ms over 64, against 3–5 ms
+and 30–39 ms for one rank classifying every created block. Its
 precondition, an old storage in which every copy at a level is equal
 and a coarse copy is its fine primary's restriction, is `regrid!`'s own:
 it fills every set it moves before the transfer, and the fill's stage 0
@@ -1075,7 +1106,7 @@ schedule, fill or `unify!`, then `gather!`. A `gather!` before that
 takes the copies as the transfer left them: equal on one level, a
 coarse copy its fine primary's restriction only to the operators' order
 along a cell-like dimension (exactly along a vertex-like one), and an
-odd variable on a reflecting wall zero, of either sign. Flagging sweeps
+odd variable on a reflecting wall zero. Flagging sweeps
 the closed box, so a point on a face fires in every block holding it,
 and along a vertex-like dimension `firing_boxes` reports the cells
 touching the firing nodes, `max(1, lo − 1) … min(N, hi)`: flag boxes
@@ -2097,8 +2128,8 @@ through an accessor, as it reaches M7's packed buffers, and an ordinary
 group launches it unchanged. Under MPI the pack applies the axis map
 and the permutation and computes the unscaled sum, and the unpack
 applies the sign through the factor column, as it applies the parity,
-so the serial fill's `−0` is kept bit for bit (see "The parity factor
-is applied when unpacking" under
+so the unpacked value is the serial kernel's bit for bit (see "The parity
+factor is applied when unpacking" under
 [Distributed meshes](#distributed-meshes)).
 
 *Conformity*. Leaves across a seam face
@@ -6065,29 +6096,26 @@ which keeps "one kernel for every transfer" true.
   target, as every group does today. On the CPU, `run_phase!`'s
   bisection is then over whichever block list says who owns the
   transfer.
+- **The factor path writes `+0`.** A transfer with a factor (a parity
+  sign, a turn's sign, stage P's projection) writes `acc · f + 0`
+  (`scaled`): a factor of `−1` or `0` applied to `+0`, or to a value of
+  the other sign, would give `−0`, whose sign depends on the data's
+  history, and a second fill would differ from the first in the sign of
+  zeros. `x + 0` is `+0` for `x = ±0` and `x` otherwise, NaN included,
+  and IEEE forbids folding it away, so it costs one add on that path
+  only, and no fill writes `−0` through a factor.
 - **The parity factor is applied when unpacking**. An unpack goes
-  through the kernel's sum, `0 + 1·x`. That is the identity on every
-  value a stencil sum produces, because the sum starts at `+0` and so
-  never yields `−0`. It is not the identity on `−0` itself, which it
-  turns into `+0`. A mirrored transfer is the one transfer that can
-  produce `−0`: an odd variable that is zero at the wall, such as the
-  normal momentum of a fluid at rest, gives `+0 · (−1)`. A pack that
-  applied the factor would therefore deliver `+0` where the serial
-  fill writes `−0`, and the byte-for-byte digests would see it. So a
-  pack computes the unscaled sum, and the unpack group carries the
-  mirrored group's `factorcol`. The value written is then
-  `scaled(0 + 1·acc) == scaled(acc)`, bit for bit what the serial
-  kernel writes. The round trip test checks this bitwise, `Float32x2`
-  included, for which it also needs `0 + 1·x` to be the identity on
-  normalized limbs. (Measured: with the factor moved to the
-  pack, the `Float64` round trip fails in every 2D case tried, as
-  argued. `Float32x2` cannot tell the two apart: MultiFloats' product
-  returns `+0` for `0 · (−1)`, so its serial fill has no `−0` to lose.
-  Nor is `0 + 1·x` the identity on every limb pair — it maps `(−0, −0)`
-  to `(+0, +0)` — but it held on every value a pack produced in the
+  through the kernel's sum, `0 + 1·x`, the identity on every value a
+  stencil sum produces, since the sum starts at `+0`. A pack computes
+  the unscaled sum, and the unpack group carries the mirrored group's
+  `factorcol`, so the value written is `scaled(0 + 1·acc) ==
+  scaled(acc)`, bit for bit what the serial kernel writes. The round
+  trip test checks this bitwise, `Float32x2` included, for which it also
+  needs `0 + 1·x` to be the identity on normalized limbs: it maps `(−0,
+  −0)` to `(+0, +0)`, but it held on every value a pack produced in the
   round trip, which is a check over the tested cases and not a proof.
-  In 1D every mirrored transfer is the block's own reflection,
-  so the remote `−0` case exists from 2D on.)
+  (Before the factor path wrote `+0`, this placement was also what kept
+  a mirrored zero's `−0`; HISTORY.md, M22 step 6, has why that went.)
 - **Why the ghosts are bit-identical.** Every ghost is written once, by
   the same kernel, from the same source values and the same stencil,
   summed in the same order as in the serial fill — a pack keeps the
@@ -6785,8 +6813,8 @@ The ideas that span several files and are easy to violate:
   filled as a `RotationPair`, whose odd turns read the partner's array
   (`altsrc`) and whose two schedules' stages run merged
   (`exchange_pair!`); a plain fill refuses it. Under MPI the pack
-  permutes and the unpack, a plain width-1 copy, applies the sign, which
-  keeps the serial `−0`. `interpolate` folds a point beyond the seam
+  permutes and the unpack, a plain width-1 copy, applies the sign, as the
+  serial kernel does. `interpolate` folds a point beyond the seam
   back and turns its value and gradient. A vertex-like set
   owns both seam planes (the same points under the turn) and evolves
   them at one level.
@@ -6941,8 +6969,7 @@ The ideas that span several files and are easy to violate:
   `NamedTuple` `(buf, offsets, dims)` that `transfer_kernel!` reaches
   through three accessor methods), sent, and unpacked on the target's
   rank by a width-1, weight-1 transfer that carries the mirrored
-  group's **parity factor**: applied when packing, the factor would
-  turn the serial fill's `−0` into `+0`. Every ordering point of the
+  group's **parity factor**. Every ordering point of the
   serial fill is a stage with its own tag — phase 1 (1), each phase-2
   target level (`2 + ℓ`), each interface dimension (`40 + d`), the
   regrid (50) — run by `run_stages!` in five steps (post receives, pack
@@ -7137,7 +7164,7 @@ and the digest gather by replication) for the partition and each rank's
 local schedule; `exchange_tests.jl`'s lockstep, which builds every
 simulated rank's stages and wires their buffers directly, for the
 classification, the layouts, write-once and the bitwise pack/unpack
-round trip (the `−0` parity case included), and its
+round trip (the parity factor included), and its
 `MailboxCommunicator`, one task per rank with a channel per message,
 for the staged driver itself; `regrid_exchange_tests.jl`'s
 `GatherCommunicator` (collectives as rendezvous between the tasks, the
