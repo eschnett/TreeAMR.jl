@@ -1162,6 +1162,14 @@ join a low face to a low face.
   patch across the corner one glue at a time does not reach
   (`check_patch_corners`). A kinked glue reaches them by position, and a
   set that needs patch corners is interpolated across its glues.
+  Against half-open ownership (02bf9d1) this refuses, at a corner of
+  two low faces, a set vertex-like along both dimensions with `G = 0`
+  along either, `G = (0, 0)`, `(0, 1)` or `(1, 0)`, which filled; and it
+  fills, at a corner of two high faces, a set vertex-like along one
+  dimension with no ghosts along it, `(:vertex, :cell)` with `G = (0,
+  1)` or `(:cell, :vertex)` with `G = (1, 0)`, which was refused. No
+  test, TreeMultiPatch or downstream builds a schedule for any of them
+  (HISTORY.md, M22 step 8's review).
 
 **Regridding.** A transfer's target is the new block's closed box: a
 created fine block's `G+1 … G+N+1` prolongated from its parent, a

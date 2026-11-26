@@ -6231,8 +6231,10 @@ M12 was decided with Erik, after M7 and before M9b.
     torus's interpolated ghosts: 1.0e-2, 1.26e-4, 2.16e-6, rates 6.31,
     5.87, unchanged;
   - the seven-patch ball's symmetry error 7.55e-15 → 8.88e-15 and its
-    interpolation error 5.54e-4 → 6.92e-4, the copies now averaged; and
-    every copy of each of its 17,217 points one number after a fill;
+    interpolation error 5.54e-4 → 6.92e-4, and every copy of each of its
+    17,217 points one number after a fill. (The cause of the error's
+    rise given here first, "the copies now averaged", was wrong; the
+    review's correction is below.)
   - schedules (groups / transfers; stage 0 new): the 3D brick cut and
     refined beside the glue, phase 1 82/294 → 54/294, phase 2 104/140 →
     86/140, stage 0 108/198, build 6.7 → 6.8 ms; the annulus refined,
@@ -6260,6 +6262,42 @@ M12 was decided with Erik, after M7 and before M9b.
   dissipation, is TreeWave's: its ball right-hand side used
   `map_blocks!(…; appendix = true)` and `isowned`, and is measured when
   the downstream is ported to closed blocks.
+- *Step 8's review (2026-11-26).* The review, by Claude and not by Erik,
+  asked for the cause of the balls' larger interpolation error, since a
+  smooth function's copies at one point are equal and averaging them
+  changes nothing, and for the layouts the wider patch-corner refusal
+  changes. Measured against 02bf9d1 with the symmetry test's function,
+  ghost by ghost:
+  - every ghost of the old fill has the same error in the new one, bit
+    for bit; the maximum rises only over the ghosts that are new, the
+    face-plane rows at stored index `G + N + 1` that every glue ghost
+    region's tangential range now includes (the closed range), 1,944 on
+    the coarsest balls, the worst on a patch's edge with a lop-sided
+    window:
+
+    | ball | ghosts, old → new | max, common | max, new only |
+    |---|---|---|---|
+    | seven (2, 1) | 44,928 → 46,872 | 5.54e-4 | 6.92e-4 |
+    | seven (4, 2) | 217,728 → 221,832 | 9.58e-6 | 8.79e-6 |
+    | seven (8, 4) | 952,128 → 960,552 | 1.24e-7 | 1.13e-7 |
+    | thirteen (2, 1, 1) | 94,824 → 96,768 | 9.01e-3 | 1.20e-2 |
+    | thirteen (4, 2, 2) | 445,824 → 449,928 | 1.36e-4 | 1.57e-4 |
+
+    The overall maximum converges at the same order: rates 5.85, 6.27 →
+    6.17, 6.27 on the seven-patch ball, 6.05 → 6.26 on the
+    thirteen-patch ball. The symmetry under the cube's symmetries at the
+    coarsest size, over every ghost: seven 7.55e-15 → 8.88e-15,
+    thirteen 1.28e-13 → 1.42e-13 (aligned atlas 7.11e-14 → 1.14e-13),
+    rounding both;
+  - the wider refusal, over two L-shaped forests of three patches and
+    every 2D centering and ghost width: newly refused at a corner of two
+    low faces, a set vertex-like along both with `G = (0, 0)`, `(0, 1)`
+    or `(1, 0)`; newly filling at a corner of two high faces,
+    `(:vertex, :cell)` with `G = (0, 1)` and `(:cell, :vertex)` with
+    `G = (1, 0)`. No TreeAMR test, TreeMultiPatch or downstream builds a
+    schedule for any of them: TreeMultiPatch's vertex sets interpolate
+    across their glues, TreeWave's copying ball set builds none, and
+    TreeWaveOLDG's are element sets.
 
 ## Downstream checks
 
