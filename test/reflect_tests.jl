@@ -264,7 +264,6 @@ end
     N = D == 3 ? 4 : 8
     kinds = ntuple(d -> isodd(d) ? :reflect_lo : :reflect_hi, D)
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(6, "regrid at a reflecting face, $C, D=$D"); continue)
         forest = faces_forest(kinds; N=N)
         f, parity = parity_data(Float64, kinds, 2)
         hook = boundary_by_coordinates(f)            # for the outer faces

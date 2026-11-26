@@ -139,7 +139,7 @@ end
     end
 end
 
-@pending 6 "A regrid with the relative hook transfers what a complete fill gives: D=$D" for
+@testset "A regrid with the relative hook transfers what a complete fill gives: D=$D" for
         D in (2, 3)
     # `regrid!` fills before its transfer. With the hook that fill must be
     # complete: the same regrid after a complete fill, with no hook, which

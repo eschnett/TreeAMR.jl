@@ -528,26 +528,43 @@ mirror_parity(kinds) = [ntuple(_ -> EvenParity, length(kinds)),
     end
 end
 
-@pending 6 "A closed box stays mirror-symmetric through a regrid that refines every block: D=$D" for
+@testset "A closed box stays mirror-symmetric through refining and coarsening regrids: D=$D" for
         D in (1, 2, 3)
     # Guards a regrid transfer with a direction-dependent rule (walls_tests'
     # claim, on closed blocks): a regrid that refines every block keeps the
     # box uniform, and the fill after it symmetric to rounding, a
-    # prolongation summing its window in mirrored order on the two sides.
+    # prolongation summing its window in mirrored order on the two sides;
+    # then a regrid that coarsens every block again, and from the box
+    # refined at two opposite corners one that coarsens the corners and
+    # refines the rest, at once, each followed by a fill. At `N = 8` and at
+    # `N = 2G`, where a coarsened block's two halves meet at its mid-plane
+    # and the mirrored fill's restriction takes the closed half. The
+    # regrid's own restriction reads a child's own points only, so it
+    # never mirrors.
     L = D == 1 ? 3 : 2
     f = point_symmetric(D, L)
     ops = Operators(prolongation=4, restriction=4)
-    for kinds in mirror_boxes(D), C in closed_centerings(D)
-        forest = faces_forest(kinds; N=8, refined=false)
-        fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C,
+    for kinds in mirror_boxes(D), C in closed_centerings(D), small in (false, true),
+        refined in (false, true)
+        G = ghosts_for(C, 4)
+        # `N = 2G` for the vertex set alone: a cell-like dimension's
+        # restriction of order 4 needs more than `2G` fine cells.
+        small && C != vertexcentered(D) && continue
+        N = small ? 2 * maximum(G) : 8
+        forest = faces_forest(kinds; N=N, refined=refined)
+        fs = FieldSet(forest, 2; G=G, centering=C,
                       parity=any(==(:reflect_both), kinds) ? mirror_parity(kinds) : nothing)
         hook = boundary_by_coordinates(f)
         fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops); boundary=hook)
-        regrid!(forest, fs => GhostSchedule(fs, ops); flags=fill(Refine, nleaves(forest)),
-                boundary=hook)
-        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=hook)
-        err, n = point_mirror_error(fs, L)
-        @test n > 0 && err <= 64 * eps() * maximum(abs, fs.work)
+        rounds = refined ? (k -> level(k) == 0 ? Refine : Coarsen,) :
+                 (k -> Refine, k -> Coarsen)
+        for flag in rounds
+            @test regrid!(forest, fs => GhostSchedule(fs, ops); flags=map(flag, forest.leaves),
+                          boundary=hook)
+            fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=hook)
+            err, n = point_mirror_error(fs, L)
+            @test n > 0 && err <= 64 * eps() * maximum(abs, fs.work)
+        end
     end
 end
 
@@ -1009,8 +1026,8 @@ end
     walled = Forest((2, 2); N=8, reflecting=((true, false), (false, false)))
     uniform = Forest((2, 2); N=8)
     vs = FieldSet(uniform, 1; G=1, centering=vertexcentered(2))
-    @test_throws "M22 step 6" regrid!(uniform, vs => GhostSchedule(vs, ops);
-                                      flags=fill(Keep, 4))
+    # A regrid of a vertex-like set is back (M22 step 6): a mesh kept as it is.
+    @test !regrid!(uniform, vs => GhostSchedule(vs, ops); flags=fill(Keep, 4))
     quad = Forest((2, 2); N=8, rotating=(1, 2))
     @test_throws "M22 step 7" firing_boxes((w, i, b, x) -> true,
                                            FieldSet(quad, 1; G=1,
@@ -1073,5 +1090,145 @@ end
             @test shape(forest)
         end
         @test maxlevel(forest) == 2
+    end
+end
+
+# The kept-over-created pass of `regrid!` (M22 step 6): a forest refined
+# over the high half along dimension 1, periodic, whose low half the
+# regrid refines, so that every created fine block meets kept fine blocks
+# at x₁ = 1, where the created block's high plane is the primary by the
+# class rule, and at x₁ = 0, where the kept block's is.
+function half_refined(D; comm=nothing)
+    forest = Forest(ntuple(_ -> 2, D); N=8, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, 2.0), D), comm=comm)
+    refine!(forest, filter(k -> block_extent(forest, k)[1][1] >= 1, forest.leaves))
+    balance!(forest)
+    return forest
+end
+
+# Per point of `groups` (`closed_point_groups` of the set after a regrid),
+# the own copies at the finest level holding it, split into those of kept
+# blocks — with their old block index — and of created ones.
+function kept_created(fs, groups, oldleaves)
+    out = []
+    for (p, copies) in groups
+        own = [(b, idx) for (b, idx, o) in copies if o]
+        finest = maximum(x -> level(blockkey(fs, x[1])), own)
+        atf = filter(x -> level(blockkey(fs, x[1])) == finest, own)
+        kept = [(b, idx, findfirst(==(blockkey(fs, b)), oldleaves)) for (b, idx) in atf
+                if blockkey(fs, b) in oldleaves]
+        created = [(b, idx) for (b, idx) in atf if !(blockkey(fs, b) in oldleaves)]
+        isempty(kept) || isempty(created) || push!(out, (kept, created))
+    end
+    return out
+end
+
+@testset "A regrid gives a created copy the kept block's value, before any fill: D=$D" for
+        D in (1, 2, 3)
+    # Guards the pass that keeps evolved values: without it a created fine
+    # block's prolongated copy of a plane it shares with a kept fine block
+    # would be the primary at x₁ = 1, and the next fill's stage 0 would
+    # carry the interpolated value over the evolved one. After `regrid!`
+    # and before any fill, every created copy of a point a kept block
+    # holds at the finest level is the kept block's old value bit for bit;
+    # after the first fill the kept blocks' values there are unchanged;
+    # and over 2 and 3 simulated ranks, with kept and created blocks on
+    # different ranks, the regrid is the serial one bit for bit.
+    ncross = 0
+    for C in closed_centerings(D), bounded in (false, true)
+        ops = Operators(prolongation=4, restriction=4, bounded=bounded)
+        G = ghosts_for(C, 4)
+        forest = half_refined(D)
+        fs = FieldSet(forest, 2; G=G, centering=C)
+        data = randn(Xoshiro(60 + D), size(fs.work))
+        fs.work .= data
+        oldleaves = copy(forest.leaves)
+        flags = [level(k) == 0 ? Refine : Keep for k in forest.leaves]
+        @test regrid!(forest, fs => GhostSchedule(fs, ops); flags=flags)
+        # The old storage as the regrid moved it: filled, so unified.
+        ref = FieldSet(half_refined(D), 2; G=G, centering=C)
+        ref.work .= data
+        fill_ghosts!(ref, GhostSchedule(ref, ops))
+        old = ref.work
+        moved = copy(fs.work)
+        pairs = kept_created(fs, closed_point_groups(fs), oldleaves)
+        mask = primary_mask(fs)
+        nprimary = 0
+        same = all(pairs) do (kept, created)
+            b0, i0, o0 = first(kept)
+            all(v -> all(((b, idx, o),) -> bits(old[idx..., v, o]) == bits(old[i0..., v, o0]),
+                         kept) &&
+                     all(((b, idx),) -> bits(moved[idx..., v, b]) == bits(old[i0..., v, o0]),
+                         created), 1:2)
+        end
+        nprimary = count(pairs) do (kept, created)
+            any(((b, idx),) -> isprimary(mask, (idx .- G)..., b), created)
+        end
+        # Only a set vertex-like along dimension 1 shares the planes x₁ = 0
+        # and 1 between kept and created blocks of one level.
+        if staggers(C)[1] == 1
+            @test !isempty(pairs) && same
+            @test nprimary > 0
+        else
+            @test isempty(pairs)
+        end
+        fill_ghosts!(fs, GhostSchedule(fs, ops))
+        @test all(pairs) do (kept, created)
+            all(((b, idx, o),) -> all(v -> bits(fs.work[idx..., v, b]) ==
+                                           bits(old[idx..., v, o]), 1:2), kept)
+        end
+        # The same regrid over simulated ranks, before any fill.
+        for P in (2, 3)
+            n = nleaves(forest)
+            kp = TreeAMR.regrid_kept_pairs(TreeAMR.leaves_view(forest, forest.leaves),
+                                           oldleaves, forest.leaves, staggers(fs))
+            ncross += count(((t, s),) -> equalsplit_part(length(oldleaves), P, Int(s)) !=
+                                         equalsplit_part(n, P, Int(t)),
+                            [(t, s) for (ts, ss) in values(kp) for (t, s) in zip(ts, ss)])
+            comms = gather_ranks(P)
+            results = on_ranks(P) do r
+                rf = half_refined(D; comm=comms[r])
+                owned = blockrange(rf)
+                rfs = FieldSet(rf, 2; G=G, centering=C)
+                rfs.work .= data[ntuple(_ -> :, D + 1)..., owned]
+                regrid!(rf, rfs => GhostSchedule(rfs, ops); flags=flags[owned])
+                (blockrange(rf), copy(rfs.work))
+            end
+            @test all(((range, work),) -> bitwise_equal(work,
+                                                        moved[ntuple(_ -> :, D + 1)...,
+                                                              range]), results)
+        end
+    end
+    @test ncross > 0
+end
+
+@testset "Two created blocks of different parents agree on their common plane: D=$D" for
+        D in (1, 2, 3)
+    # Guards the claim the kept-over-created pass leaves out: two blocks
+    # created by refinement from different parents take a common plane
+    # from each parent's copy of it, which the fill before the regrid
+    # unified, through the same weights in the same order, so they agree
+    # bit for bit before any fill — bounded or not, periodic and at
+    # reflecting walls.
+    for C in closed_centerings(D), bounded in (false, true),
+        kinds in (ntuple(_ -> :periodic, D), ntuple(_ -> :reflect_both, D))
+        ops = Operators(prolongation=4, restriction=4, bounded=bounded)
+        forest = faces_forest(kinds; N=8, refined=false)
+        fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C,
+                      parity=kinds[1] === :reflect_both ? mirror_parity(kinds) : nothing)
+        fs.work .= randn(Xoshiro(70 + D), size(fs.work))
+        oldleaves = copy(forest.leaves)
+        regrid!(forest, fs => GhostSchedule(fs, ops); flags=fill(Refine, nleaves(forest)))
+        nshared = 0
+        agree = all(closed_point_groups(fs)) do (p, copies)
+            own = [(b, idx) for (b, idx, o) in copies if o]
+            isempty(own) && return true                 # ghosts beyond a wall
+            parents = unique(parentkey(blockkey(fs, b)) for (b, _) in own)
+            length(parents) >= 2 && (nshared += 1)
+            b0, i0 = first(own)
+            all(((b, idx),) -> all(v -> bits(fs.work[idx..., v, b]) ==
+                                        bits(fs.work[i0..., v, b0]), 1:2), own)
+        end
+        @test agree && nshared > 0
     end
 end

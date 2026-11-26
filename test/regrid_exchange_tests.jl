@@ -46,7 +46,6 @@ using TreeAMR: regrid_sources, regrid_stage, split_regrid, equalsplit, MAX_LEVEL
         counts = D == 1 ? (1, 2, 3, 5, max(length(old), length(new)) + 1) :
                  D == 2 ? (2, 3, 5) : (2, 3, 7)
         for C in allcenterings(Val(D)), P in counts
-            vertexlike(C) && (pending(6, "regrid stage, $C, $kinds, P = $P"); continue)
             same, transfers, bad, nc, ns, empty = lockstep_regrid(serial, P, C,
                                                                   PointValue, Float64)
             @test same
@@ -198,7 +197,7 @@ end
     @test nrecruits > 0
 end
 
-@pending 6 "regrid! over a distributed forest is the serial regrid, block for block: D=$D" for
+@testset "regrid! over a distributed forest is the serial regrid, block for block: D=$D" for
         D in (2, 3)
     # The whole driver: the agreed checks, the gather of each rank's own
     # flags (bare flags and (flag, box) pairs mixed, with a buffer), the
@@ -360,7 +359,7 @@ end
 # handed out of, so the test can tell that the path it means to test is
 # the one that ran.
 
-@pending 6 "Staging the messages through host mirrors delivers the same bits" begin
+@testset "Staging the messages through host mirrors delivers the same bits" begin
     # A staged message that lost its download, its upload, or a segment
     # boundary would deliver stale or shifted ghosts. So the ghost fill
     # with the hook, the interface restriction and `regrid!` itself run
@@ -411,9 +410,12 @@ end
         buffers = [x for st in sched.stages if st.remote !== nothing
                    for x in st.remote.buffers[nvars]]
         ghosts_handed = copy(comm.handed)
-        # The same fill again, now that the mirrors exist.
+        # The same fill again, now that the mirrors exist. Bit for bit but
+        # for the sign of a zero: stage P writes an odd variable on a wall
+        # as its value times 0 (M22 step 4), whose sign is the value's.
         fill_ghosts!(fs, sched; boundary=hook)
-        again = bitwise_equal(fs.work, work) &&
+        again = size(fs.work) == size(work) &&
+                all(map((x, y) -> x === y || (iszero(x) && iszero(y)), fs.work, work)) &&
                 all(splat(===), zip(mirrors, [m for st in sched.stages
                                               if st.remote !== nothing
                                               for m in st.remote.mirrors[nvars]]))
@@ -547,7 +549,7 @@ end
     end
 end
 
-@pending 6 "adapt_to_initial_data! over a distributed forest starts from ranks without blocks" begin
+@testset "adapt_to_initial_data! over a distributed forest starts from ranks without blocks" begin
     # From a single leaf, every rank but one starts empty, and each pass
     # gathers flags from ranks with and without blocks. Both criterion
     # forms — the host callback and a flag vector from `firing_boxes` —

@@ -2,7 +2,8 @@
 # on its own: every test process includes all of `helpers/` ("Parallel
 # groups" in CODE.md).
 
-using TreeAMR: regrid_sources, regrid_stage, split_regrid, equalsplit, MAX_LEVEL
+using TreeAMR: regrid_sources, regrid_stage, split_regrid, equalsplit, MAX_LEVEL,
+               regrid_kept_pairs, regrid_kept_stage, leaves_view
 
 # Refine the coarsest leaves and coarsen the finest, so that a regrid
 # has copies, prolongations and restrictions at once.
@@ -74,51 +75,70 @@ function lockstep_regrid(serial::Forest{D}, P, C, family, ::Type{T};
               for r in 1:P]
     olds = [old[colons..., oldranges[r]] for r in 1:P]
     fresh = [zeros(T, size(old)[1:(D + 1)]..., length(newranges[r])) for r in 1:P]
-    bufs(r) = stagebuffers(stages[r].remote, nvars, CPU())
-
-    for r in 1:P
-        stages[r].remote === nothing && continue
-        pack_stage!(olds[r], stages[r].remote, bufs(r), nvars, CPU())
-    end
-    for r in 1:P
-        remote = stages[r].remote
-        remote === nothing && continue
-        for (peer, range) in zip(remote.sendpeers, segment_ranges(remote.sendcounts, nvars))
-            other = stages[peer + 1].remote
-            i = findfirst(==(r - 1), other.recvpeers)
-            into = segment_ranges(other.recvcounts, nvars)[i]
-            bad += length(into) != length(range)
-            copyto!(view(bufs(peer + 1)[2], into), view(bufs(r)[1], range))
-            # Both ends' entries for this segment, offsets taken from the
-            # segment's start: the same transfers, in the same order.
-            mine = filter(e -> e.peer == peer, remote.sendlayout)
-            theirs = filter(e -> e.peer == r - 1, other.recvlayout)
-            rel(es) = [(e.key, e.target, e.source, e.offset - first(es).offset, e.npoints)
-                       for e in es]
-            bad += rel(mine) != rel(theirs)
-        end
-    end
     transfers = Tuple{Symbol,Int,Int}[]
     ncrossing = 0
-    for r in 1:P
-        st = stages[r]
-        run_phase!(fresh[r], olds[r], st.locals, nvars, CPU())
-        toff, soff = first(newranges[r]) - 1, first(oldranges[r]) - 1
-        for g in st.locals, t in 1:ntransfers(g)
-            push!(transfers, (g.kind, Int(g.targetblocks[t]) + toff,
-                              Int(g.sourceblocks[t]) + soff))
+    # One stage over every rank in lockstep; the transfers of the first,
+    # the regrid's own, are collected.
+    function lockstep!(stages, collect::Bool)
+        bufs(r) = stagebuffers(stages[r].remote, nvars, CPU())
+        for r in 1:P
+            stages[r].remote === nothing && continue
+            pack_stage!(olds[r], stages[r].remote, bufs(r), nvars, CPU())
         end
-        st.remote === nothing && continue
-        unpack_stage!(fresh[r], st.remote, bufs(r), nvars, nothing, CPU())
-        for e in st.remote.recvlayout
-            push!(transfers, (e.key.kind, e.target, e.source))
-            bad += e.peer != equalsplit_part(nold, P, e.source) - 1
-            bad += !(e.target in newranges[r])
+        for r in 1:P
+            remote = stages[r].remote
+            remote === nothing && continue
+            for (peer, range) in zip(remote.sendpeers,
+                                     segment_ranges(remote.sendcounts, nvars))
+                other = stages[peer + 1].remote
+                i = findfirst(==(r - 1), other.recvpeers)
+                into = segment_ranges(other.recvcounts, nvars)[i]
+                bad += length(into) != length(range)
+                copyto!(view(bufs(peer + 1)[2], into), view(bufs(r)[1], range))
+                # Both ends' entries for this segment, offsets taken from the
+                # segment's start: the same transfers, in the same order.
+                mine = filter(e -> e.peer == peer, remote.sendlayout)
+                theirs = filter(e -> e.peer == r - 1, other.recvlayout)
+                rel(es) = [(e.key, e.target, e.source, e.offset - first(es).offset,
+                            e.npoints) for e in es]
+                bad += rel(mine) != rel(theirs)
+            end
         end
-        bad += any(e -> !(e.source in oldranges[r]) ||
-                        e.peer != equalsplit_part(nnew, P, e.target) - 1,
-                   st.remote.sendlayout)
-        ncrossing += length(st.remote.recvlayout)
+        for r in 1:P
+            st = stages[r]
+            run_phase!(fresh[r], olds[r], st.locals, nvars, CPU())
+            toff, soff = first(newranges[r]) - 1, first(oldranges[r]) - 1
+            collect && for g in st.locals, t in 1:ntransfers(g)
+                push!(transfers, (g.kind, Int(g.targetblocks[t]) + toff,
+                                  Int(g.sourceblocks[t]) + soff))
+            end
+            st.remote === nothing && continue
+            unpack_stage!(fresh[r], st.remote, bufs(r), nvars, nothing, CPU())
+            for e in st.remote.recvlayout
+                collect && push!(transfers, (e.key.kind, e.target, e.source))
+                bad += e.peer != equalsplit_part(nold, P, e.source) - 1
+                bad += !(e.target in newranges[r])
+            end
+            bad += any(e -> !(e.source in oldranges[r]) ||
+                            e.peer != equalsplit_part(nnew, P, e.target) - 1,
+                       st.remote.sendlayout)
+            collect && (ncrossing += length(st.remote.recvlayout))
+        end
+        return nothing
+    end
+    lockstep!(stages, true)
+    # A set with a vertex-like dimension (M22): the kept-over-created pass,
+    # its pairs classified once and split per rank.
+    if any(==(1), staggers(fs))
+        kpairs = regrid_kept_pairs(leaves_view(forest, newleaves), oldleaves, newleaves,
+                                   staggers(fs))
+        kstages = [regrid_kept_stage(T, serial.N, fs.G, staggers(fs), CPU(), kpairs;
+                                     oldrange=oldranges[r], newrange=newranges[r],
+                                     nold=nold, nnew=nnew,
+                                     oldowner=i -> equalsplit_part(nold, P, i) - 1,
+                                     newowner=j -> equalsplit_part(nnew, P, j) - 1)
+                   for r in 1:P]
+        lockstep!(kstages, false)
     end
     same = all(r -> bitwise_equal(fresh[r], reference[colons..., newranges[r]]), 1:P)
     return same, transfers, bad, ncrossing, straddling(oldleaves, newleaves, P),

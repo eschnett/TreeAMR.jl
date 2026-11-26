@@ -319,7 +319,6 @@ monotone_cubic(D) = (x, v) -> v + sum(d -> 0.4d * x[d] + 0.05 * x[d]^3, 1:D)
     plain = Operators(prolongation=2, restriction=2)
     ops = Operators(prolongation=2, restriction=2, bounded=true)
     for C in (cellcentered(D), vertexcentered(D))
-        vertexlike(C) && (pending(6, "bounded width 2, $C, D=$D"); continue)
         results = map((plain, ops)) do o
             forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
             fs = FieldSet(forest, 1; G=1, centering=C)
@@ -341,39 +340,35 @@ end
 
 @testset "A refined point is the bounded interpolant of the coarse grid: D=$D, $cen" for
         D in (1, 2, 3), cen in (:cell, :vertex)
-    if cen === :vertex
-        pending(6, "refined point is the bounded interpolant, D=$D, $cen")
-    else
-        # The definition. A periodic brick refined everywhere at once: every
-        # new point is the oracle's clamped interpolant of the coarse grid,
-        # whatever the data, so a wrong bracket, a missing clamp or a clamp
-        # into the wrong window shows. Random data clamp often.
-        N = 8
-        forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D),
-                        extents=ntuple(_ -> (0.0, 2.0), D))
-        n = 2N
-        h = 2 / n
-        U = rand(MersenneTwister(80 + D), n * ones(Int, D)...)
-        C = ntuple(_ -> cen, D)
-        fs = FieldSet(forest, 1; G=2, centering=C)
-        at(x) = CartesianIndex(ntuple(d -> mod1(round(Int, x[d] / h + (cen === :cell ? 0.5 : 1)),
-                                                n), D))
-        fill_by_coordinates!((x, v) -> U[at(x)], fs)
-        @test regrid!(forest, fs => GhostSchedule(fs, BOUNDED_PV);
-                      flags=fill(Refine, nleaves(forest)))
-        worst, nclamped = 0.0, 0
-        for b in 1:nblocks(fs)
-            blk = blockview(fs, b, 1)
-            for idx in CartesianIndices(ntuple(_ -> 3:(N + 2), D))
-                x = coordinates(fs, b, Tuple(idx))
-                want = bounded_point(U, x, h, cen, 4)
-                worst = max(worst, abs(blk[idx] - want))
-                want == bounded_point(U, x, h, cen, 4; raw=true) || (nclamped += 1)
-            end
+    # The definition. A periodic brick refined everywhere at once: every
+    # new point is the oracle's clamped interpolant of the coarse grid,
+    # whatever the data, so a wrong bracket, a missing clamp or a clamp
+    # into the wrong window shows. Random data clamp often.
+    N = 8
+    forest = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D),
+                    extents=ntuple(_ -> (0.0, 2.0), D))
+    n = 2N
+    h = 2 / n
+    U = rand(MersenneTwister(80 + D), n * ones(Int, D)...)
+    C = ntuple(_ -> cen, D)
+    fs = FieldSet(forest, 1; G=2, centering=C)
+    at(x) = CartesianIndex(ntuple(d -> mod1(round(Int, x[d] / h + (cen === :cell ? 0.5 : 1)),
+                                            n), D))
+    fill_by_coordinates!((x, v) -> U[at(x)], fs)
+    @test regrid!(forest, fs => GhostSchedule(fs, BOUNDED_PV);
+                  flags=fill(Refine, nleaves(forest)))
+    worst, nclamped = 0.0, 0
+    for b in 1:nblocks(fs)
+        blk = blockview(fs, b, 1)
+        for idx in CartesianIndices(ntuple(_ -> 3:(N + 2), D))
+            x = coordinates(fs, b, Tuple(idx))
+            want = bounded_point(U, x, h, cen, 4)
+            worst = max(worst, abs(blk[idx] - want))
+            want == bounded_point(U, x, h, cen, 4; raw=true) || (nclamped += 1)
         end
-        @test worst < 1e-14
-        @test nclamped > 0
     end
+    @test worst < 1e-14
+    @test nclamped > 0
 end
 
 @testset "Bounded point values reproduce a monotone cubic bit for bit: D=$D" for
@@ -399,44 +394,40 @@ end
 
 @testset "Bounded point values create no new extrema: D=$D, $cen" for
         D in (1, 2, 3), cen in (:cell, :vertex)
-    if cen === :vertex
-        pending(6, "bounded point values create no new extrema, D=$D, $cen")
-    else
-        # The point of the bound: through the ghost fill — prolongations,
-        # interpolating restrictions — and random regrids, data stay within
-        # their initial range, and a surface dropping over thirteen orders of
-        # magnitude stays positive. The unbounded control overshoots.
-        initial = Dict(:random => (x, rng) -> rand(rng),
-                       :step => (x, rng) -> x[1] < 1.3 ? 0.0 : 1.0,
-                       :surface => (x, rng) -> x[1] < 1.3 ? 1.0 : 1.0e-13)
-        C = ntuple(_ -> cen, D)
-        G = ghosts_for(C, 4)
-        for data in (:random, :step, :surface)
-            forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
-            fs = FieldSet(forest, 1; G=G, centering=C)
-            rng = MersenneTwister(90 + D)
-            fill_by_coordinates!((x, v) -> initial[data](x, rng), fs)
-            fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
-            lower = data === :surface ? 1.0e-13 : 0.0
-            lo, hi = extrema(fs.work)
-            @test lower <= lo && hi <= 1
-            for pass in 1:3
-                flags = flag_blocks(forest) do b, k
-                    r = rand(rng)
-                    r < 0.4 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
-                end
-                regrid!(forest, fs => GhostSchedule(fs, BOUNDED_PV); flags=flags)
-                fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
-                lo, hi = extrema(fs.work)
-                @test lower <= lo && hi <= 1
-            end
-        end
+    # The point of the bound: through the ghost fill — prolongations,
+    # interpolating restrictions — and random regrids, data stay within
+    # their initial range, and a surface dropping over thirteen orders of
+    # magnitude stays positive. The unbounded control overshoots.
+    initial = Dict(:random => (x, rng) -> rand(rng),
+                   :step => (x, rng) -> x[1] < 1.3 ? 0.0 : 1.0,
+                   :surface => (x, rng) -> x[1] < 1.3 ? 1.0 : 1.0e-13)
+    C = ntuple(_ -> cen, D)
+    G = ghosts_for(C, 4)
+    for data in (:random, :step, :surface)
         forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
         fs = FieldSet(forest, 1; G=G, centering=C)
-        fill_by_coordinates!((x, v) -> x[1] < 1.3 ? 1.0 : 1.0e-13, fs)
-        regrid!(forest, fs => GhostSchedule(fs, PLAIN_PV); flags=fill(Refine, nleaves(forest)))
-        @test minimum(fs.work) < 0
+        rng = MersenneTwister(90 + D)
+        fill_by_coordinates!((x, v) -> initial[data](x, rng), fs)
+        fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
+        lower = data === :surface ? 1.0e-13 : 0.0
+        lo, hi = extrema(fs.work)
+        @test lower <= lo && hi <= 1
+        for pass in 1:3
+            flags = flag_blocks(forest) do b, k
+                r = rand(rng)
+                r < 0.4 && level(k) < 3 ? Refine : r < 0.7 ? Coarsen : Keep
+            end
+            regrid!(forest, fs => GhostSchedule(fs, BOUNDED_PV); flags=flags)
+            fill_ghosts!(fs, GhostSchedule(fs, BOUNDED_PV))
+            lo, hi = extrema(fs.work)
+            @test lower <= lo && hi <= 1
+        end
     end
+    forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
+    fs = FieldSet(forest, 1; G=G, centering=C)
+    fill_by_coordinates!((x, v) -> x[1] < 1.3 ? 1.0 : 1.0e-13, fs)
+    regrid!(forest, fs => GhostSchedule(fs, PLAIN_PV); flags=fill(Refine, nleaves(forest)))
+    @test minimum(fs.work) < 0
 end
 
 @testset "Bounded point values are mirrored, turned and clamped as the data are: D=$D" for

@@ -500,7 +500,6 @@ end
     f = makepoly(D, 1)
     hook = boundary_by_coordinates(f)
     for C in allcenterings(Val(D))
-        vertexlike(C) && (pending(6, "regrid transfer exact, $C, D=$D"); continue)
         forest = Forest(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (0.0, 1.0), D))
         refine!(forest, forest.leaves[1])
         balance!(forest)

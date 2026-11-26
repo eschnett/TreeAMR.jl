@@ -731,11 +731,17 @@ end
 # every leaf, nothing is split, and the stage is the serial groups with
 # no messages.
 #
-# Every target here is the new block's *owned* range — the δ = 0 case of
-# the ghost builders. A fresh block's shared plane and ghosts are left
-# to the next `fill_ghosts!`, as ghosts always are; in a vertex-like
-# dimension that makes coarsening halved injection from the children's
-# even points, all of which they own.
+# Every target here is the new block's own range — the δ = 0 case of
+# the ghost builders, closed along a vertex-like dimension (M22): a
+# prolongation writes the created fine block's `G+1 … G+N+1` from its
+# parent, and a restriction the coarse block's closed halves, the
+# mid-plane from the lower child (`target_range`), by injection from the
+# children's even points, all of them own points. A restriction reads a
+# child's own points only, so none mirrors at a wall: the closed-half
+# rule of `mirror_restriction` never arises here. The ghosts are left to
+# the next `fill_ghosts!`, as ghosts always are, and the kept blocks'
+# copies of a shared point over the created blocks' to the second stage
+# (`regrid_kept_pairs`).
 #
 # `P` is the layout's element order, `0` for none, and is required, as
 # for `kind_stencil`. An element set (M16) refines by `I` and coarsens by
@@ -773,6 +779,111 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
                           targetowner=newowner, sourceowner=oldowner,
                           targetrange=newrange, sourcerange=oldrange, bounded=bounded)
     return ST(REGRID_TAG, locals, remote)
+end
+
+# The kept-over-created pass (M22, "Closed blocks" in CODE.md): the
+# regrid transfer's second stage, which gives every created copy of a
+# shared point the value a kept block holds there, wherever a kept block
+# holds the point at the finest level holding it. A created fine block's
+# face planes are prolongated from its parent, so at the hanging nodes
+# of a plane it shares with a kept fine block it holds interpolated
+# values where the kept block holds evolved ones, and stage 0 of the
+# next fill would carry whichever copy the class rule makes the primary
+# to the others: the interpolated one, where the created block is the
+# lower. Every other pair already agrees: created beside created, each
+# from its own parent's copy of the plane, which the old fill unified;
+# a created fine block beside a kept coarser one, which is the finer and
+# so the primary; a created coarse block beside a kept finer one, whose
+# copy is the primary. The pass reads the old storage, as the first
+# stage does, so it runs after it, into the same fresh array; its
+# targets are disjoint sub-pieces, each from one source, so its groups
+# never write the same point.
+#
+# The kept block's value is the evolved one only if the old storage is
+# unified — every copy of a point at its level equal, a coarse copy its
+# fine primary's restriction — which `regrid!` makes so itself: it fills
+# every set it moves before the transfer, and the fill's stage 0 does
+# exactly that.
+#
+# `view` is a serial forest holding the new leaves, for the neighbour
+# lookups; the pairs are classified over every created block on every
+# rank, the decision being replicated, and `split_regrid` keeps this
+# rank's ends, so the sender and the receiver find the same transfers.
+# Its sources are old leaf indices, its keys same-level copies over the
+# spans `merged_transfers` gives.
+function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
+                           newleaves::AbstractVector{MortonKey{D}},
+                           c::NTuple{D,Int}) where {D}
+    pairs = TransferPairs{D}()
+    any(==(1), c) || return pairs
+    oldindex(k) = (i = searchsortedfirst(oldleaves, k);
+                   i <= length(oldleaves) && oldleaves[i] == k ? i : 0)
+    kept = [oldindex(k) for k in newleaves]
+    created = findall(iszero, kept)
+    allowed = closed_subpieces(c, view.N).iterators
+    perblock = [Pair{GroupKey{D},Int32}[] for _ in created]
+    threaded_chunks(length(created)) do _, chunk
+        for i in chunk
+            j = created[i]
+            t = NeighbourTable(view, j)
+            entries = Tuple{NTuple{D,Int},Symbol,Int,NTuple{D,Int},NTuple{D,Int}}[]
+            for sub in closed_subpieces(c, view.N)
+                all(==(1), piece_of(sub)) && continue      # the open interior
+                copies = piece_copies(t, sub, c)
+                finest = maximum(x -> x[1], copies)
+                t.level == finest || continue
+                holders = filter(x -> x[1] == finest && kept[x[2]] != 0, copies)
+                isempty(holders) && continue
+                _, s, _, δ, o = argmax(x -> x[3], holders)
+                push!(entries, (sub, :copy, s, δ, o))
+            end
+            for (kind, s, δ, o, spans) in merged_transfers(entries, allowed)
+                key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(0),
+                                  Int8(0), spans)
+                push!(perblock[i], key => Int32(kept[s]))
+            end
+        end
+    end
+    for (i, j) in enumerate(created), (key, s) in perblock[i]
+        push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(j), s))
+    end
+    return pairs
+end
+
+# The leaves `leaves` over `forest`'s geometry, as one serial forest: what
+# the neighbour lookups of the kept-over-created pass ask, before the
+# forest itself holds them.
+leaves_view(forest::Forest{D,T}, leaves::Vector{MortonKey{D}}) where {D,T} =
+    Forest{D,T}(forest.roots, forest.periodic, forest.faces, forest.rotating,
+                forest.extents, forest.N, leaves, ForestState(), SerialCommunicator(),
+                forest.conn)
+
+# The kept-over-created pass as a stage (tag `REGRID_KEPT_TAG`), from its
+# pairs, built as `regrid_stage` builds the first: same-level copies over
+# stage 0's spans, with no factor, mirror or bound.
+function regrid_kept_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
+                           backend::Backend, pairs::TransferPairs{D};
+                           oldrange::UnitRange{Int}, newrange::UnitRange{Int},
+                           nold::Int, nnew::Int, oldowner, newowner) where {T,D}
+    built = Dict{GroupKey{D},Any}()
+    stencils(key) = get!(() -> ntuple(d -> copy_stencil(T, N, G[d], c[d], key.direction[d];
+                                                        span=key.span[d]), D),
+                         built, key)
+    serial = oldrange == 1:nold && newrange == 1:nnew
+    local_, sent, received = serial ? (pairs, nothing, nothing) :
+                             split_regrid(pairs, oldrange, newrange)
+    GRP = grouptype(backend, T, Val(D))
+    locals = GRP[todevice(backend, TransferGroup{T,D}(:copy, stencils(key), targets,
+                                                      sources, 0, 0, identity_axes(Val(D)),
+                                                      UNBOUNDED))
+                 for (key, (targets, sources)) in local_]
+    ST = stagetype(backend, T, Val(D))
+    remote = serial ? nothing :
+             remote_stage(remotetype(ST), T, backend, sent, received, stencils, key -> 0;
+                          targetowner=newowner, sourceowner=oldowner,
+                          targetrange=newrange, sourcerange=oldrange,
+                          bounded=key -> UNBOUNDED)
+    return ST(REGRID_KEPT_TAG, locals, remote)
 end
 
 # The serial regrid transfer's groups, from the old and the new leaf
@@ -988,15 +1099,9 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
     ops = sched.operators
     push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded,
                    ops.vertex_prolongation, ops.glue))
-    # A set with a vertex-like dimension owns its closed range (M22), and
-    # its regrid transfer is rebuilt on it in step 6; until then it can only
-    # be resized, `fs => nothing`.
-    any(==(:vertex), fs.centering) && throw(ArgumentError(
-        "regrid!, and so adapt_to_initial_data!, does not yet take a set with a " *
-        "vertex-like dimension with its schedule (centering " *
-        "$(fs.centering)): such a set owns its closed range, both boundary planes, and " *
-        "the regrid transfer is rebuilt on that layout in M22 step 6 (\"Closed blocks\" " *
-        "in CODE.md). Until then pass it as `fs => nothing`, which only resizes it."))
+    # A set with a vertex-like dimension owns its closed range (M22); its
+    # transfer across a seam or a glue comes back in steps 7 and 8.
+    check_closed_blocks(forest, fs.centering, "regrid!")
     return nothing
 end
 
@@ -1040,11 +1145,22 @@ seam, and a pair stays valid, since its sets' storage is replaced in
 place. The regridded mesh is conforming at the seam, as
 [`balance!`](@ref) leaves it.
 
-The target of every transfer is the new block's **owned** range, whatever
-the centering: a fresh block's shared boundary plane and its ghosts are
-left to the next [`fill_ghosts!`](@ref), as ghosts always are. A test
-that inspects a staggered field set after a regrid has to fill ghosts
-first.
+The target of every transfer is the new block's **own** range, whatever
+the centering: along a vertex-like dimension its closed range, both face
+planes (M22, "Closed blocks" in `CODE.md`); its ghosts are left to the
+next [`fill_ghosts!`](@ref), as ghosts always are. A created block takes
+its face planes from its parent, or its children, whose copies of them
+the fill before the transfer unified; where a *kept* block holds the
+same point at the finest level holding it, a second pass gives the
+created copy the kept block's value, which is evolved where the created
+one is interpolated. Stages P and 0 are not run: the first
+[`fill_ghosts!`](@ref) or [`unify!`](@ref) with the rebuilt schedule
+runs them, so the order is regrid, rebuild the schedule, fill or
+`unify!`, then [`gather!`](@ref). A `gather!` before that takes every
+copy as the transfer left it: the copies of a point on one level equal,
+a coarse copy its fine primary's restriction only to the operators'
+order along a cell-like dimension (exactly along a vertex-like one), and
+an odd variable on a reflecting wall zero, of either sign.
 
 An element-centered set (M16, [`ElementLocal`](@ref) operators) is
 refined by its elements' polynomials evaluated at the fine nodes and
@@ -1069,6 +1185,7 @@ rebuild both:
 ```julia
 if regrid!(forest, fs => schedule; flags = flags)
     schedule = GhostSchedule(fs, operators)
+    unify!(fs, schedule)                     # one value per point (M22)
     u = statevector(fs); gather!(u, fs)      # then reinit! the integrator
 end
 ```
@@ -1145,6 +1262,8 @@ function regrid!(forest::Forest{D}, pairs;
     oldowner(i) = equalsplit_part(nold, P, Int(i)) - 1
     newowner(j) = equalsplit_part(nnew, P, Int(j)) - 1
     sources = nothing                            # classified once, on first use
+    # The kept-over-created pairs, per set of staggers, on first use.
+    kept = Dict{NTuple{D,Int},TransferPairs{D}}()
 
     for (fs, sched, fill, hook) in regrid_steps(sets)
         # Per field set, not once from the first one: nothing says two
@@ -1192,6 +1311,24 @@ function regrid!(forest::Forest{D}, pairs;
             # forest's pool now that nothing is in flight, for the next
             # field set's stage or the next regrid to take.
             stage.remote === nothing || release_stage!(forest, stage.remote)
+            # A set with a vertex-like dimension (M22): the kept blocks'
+            # copies of a shared point over the created blocks' at the
+            # finest level holding it (`regrid_kept_pairs`), after the
+            # first stage, which wrote those points too.
+            c = staggers(fs)
+            if any(==(1), c)
+                pairs = get!(() -> regrid_kept_pairs(leaves_view(forest, newleaves),
+                                                     oldleaves, newleaves, c), kept, c)
+                second = regrid_kept_stage(eltype(fs.work), forest.N, fs.G, c, backend,
+                                           pairs; oldrange=oldrange, newrange=newrange,
+                                           nold=nold, nnew=nnew, oldowner=oldowner,
+                                           newowner=newowner)
+                sends = run_stages!(fresh, fs.work, fs.nvars, nothing, [second], 1:1,
+                                    second.locals, forest, backend, nothing, fs.work,
+                                    nothing)
+                sends === nothing || waitall(comm, sends)
+                second.remote === nothing || release_stage!(forest, second.remote)
+            end
         end
         fs.work = fresh
     end

@@ -710,7 +710,7 @@ end
     end
 end
 
-@pending 6 "Each field set may bring its own boundary hook to regrid!: D=$D" for D in (1, 2)
+@testset "Each field set may bring its own boundary hook to regrid!: D=$D" for D in (1, 2)
     # An all-variables hook is checked against its set's `nvars`, so one
     # shared hook cannot fill sets with different `nvars`; and sets of
     # different physics have different boundary data. Regridding them in
@@ -771,7 +771,7 @@ end
     @test_throws "fs => schedule" regrid!(forest, fs => 3; flags=flags)
 end
 
-@pending 6 "Several field sets adapt to their initial data together: D=$D" for D in (1, 2)
+@testset "Several field sets adapt to their initial data together: D=$D" for D in (1, 2)
     # Sets with different `nvars` and centerings, each re-evaluated on the
     # final mesh — the adapted set alone would leave the others to be
     # filled afterwards, and a criterion reading the second set would
@@ -830,7 +830,7 @@ end
     seen = Ref{Any}(nothing)
     byg = function (sets)
         seen[] = map(fs -> fs.nvars, sets)
-        hi = block_mapreduce(identity, max, -Inf, sets[2])
+        hi = block_mapreduce(identity, max, -Inf, sets[2]; primaries=false)
         return [level(blockkey(sets[2], b)) < 1 && hi[b] > 1.5 ? Refine : Keep
                 for b in 1:nblocks(sets[2])]
     end

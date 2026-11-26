@@ -589,6 +589,7 @@ const UNIFY_TAG = 0                                       # stage 0 (M22)
 const PHASE1_TAG = 1
 prolongation_tag(level::Integer) = 2 + Int(level)       # 2 … 2 + MAX_LEVEL
 const REGRID_TAG = 50                                     # the regrid transfer
+const REGRID_KEPT_TAG = 51                                # its kept-over-created pass
 
 # The stage a ghost transfer of group key `key` runs in, for a layout of
 # element order `P` (`0` for none): the prolongations onto level ℓ in
