@@ -65,9 +65,23 @@ to make, in one place.
   of a face value its primary's (the fine faces' area-weighted sum at a
   coarse-fine face). It takes no `Operators`.
 - `unify!(v, fs, schedule)` applies the same to a state vector; it is
-  optional (the fill unifies the working array on every call) but keeps
-  a state's secondaries equal to their primaries, and is required after
-  a right-hand side that skips secondaries.
+  optional inside a run (the fill unifies the working array on every
+  call, so no right-hand side reads a stale copy) but keeps a state's
+  secondaries equal to their primaries, and is required after a
+  right-hand side that skips secondaries.
+- **Unify a state before measuring it.** The state vector an integrator
+  returns holds each secondary as integrated, with its own right-hand
+  side, and only the next fill overwrites it. An error norm, an output,
+  a symmetry check or a comparison of two runs taken straight from
+  `sol.u[end]` reads those stale copies: at a coarse-fine face of a
+  vertex set the coarse copy's error is the coarse stencil's, and
+  TreeWave's sine wave measured an L∞ error of `O(1)` there until its
+  drivers unified first, `unify!(copy(u), fs, schedule)`. Across a glue
+  the set is interpolated at, the same call makes each glued point's
+  copies their mean (stage A).
+- A hand-written loop over `interiorview` that counts or sums visits
+  every copy; skip the secondaries with `isprimary(primary_mask(fs), i…,
+  b)`, as `primaries = true` does.
 - After `regrid!`: rebuild the schedule, then fill or `unify!`, then
   `gather!`. `regrid!` leaves the unification to the next fill.
 
@@ -116,5 +130,9 @@ to make, in one place.
 - A cell-centered set's numbers are unchanged; a vertex-like set's
   change where half-open ownership made a mesh asymmetric (refined
   regions, walls, seams), by the scheme's error there.
-- Checkpoints: TreeIOHDF5 stores the closed state under a new format
-  feature and says what a file of half-open blocks becomes.
+- Checkpoints: TreeIOHDF5 stores a vertex-like set's closed blocks under
+  the format feature `closed_blocks`, and refuses, saying why, a file
+  written before 0.3 that holds such a set (M20's appendix and AMR-8's
+  symmetric walls included); its cell-like sets still load through
+  `load_checkpoint(…; fieldsets)`. Cell and element files load as
+  before. Whether a half-open file can be converted is open.
