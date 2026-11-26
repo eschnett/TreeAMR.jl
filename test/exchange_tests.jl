@@ -16,7 +16,7 @@
 
 using TreeAMR: PHASE1_TAG, UNIFY_TAG, prolongation_tag, ntransfers, boxsize,
                stagebuffers, segment_ranges, pack_stage!, unpack_stage!, run_phase!,
-               apply_boundary!, exchange_ghosts!, exchange_interfaces!, leafowner,
+               apply_boundary!, exchange_ghosts!, leafowner,
                remote_neighbors, equalsplit_part, ntarget
 using KernelAbstractions: CPU, synchronize
 using MultiFloats: Float32x2

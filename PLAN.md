@@ -655,7 +655,12 @@ Steps:
    re-measured and recorded; the interface tests pass on `unify!` with
    their conservation numbers, exact at same-level faces; and an
    edge-centered set's copies around an edge beside a diagonal finer
-   block are one number.
+   block are one number. *Implemented on `m22`*, every done-when item
+   passing but one: the vertex convergence table is re-measured (0.97 /
+   1.92 in `D = 1`, 1.04 / 1.95 in `D = 2`, against 0.99 / 1.99 and 1.01 /
+   1.99) and awaits Erik's review before [CODE.md](CODE.md#operators)
+   records it; the step is done then. The record is step 3 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
 4. **Reflecting and outflow faces.** The mirror about the wall plane,
    stage P, the clamp to the wall row; `walls`, `wall_stencil` and
    mirror state 2 deleted. *Done when* a closed box, uniform and

@@ -393,12 +393,15 @@ the one that says why.
 - **Closed blocks (M22, on this branch).** A vertex-like dimension owns
   its closed range, `G+1 … G+N+1`; the state holds every copy of a
   shared point, `∏(N + c_d)` per block. Stage 0 of the fill gives every
-  secondary its primary's value (the copy with the greatest class tuple,
-  on the block lowest along the shared dimensions: a local rule, no
-  index), one group per direction, keyed by `GroupKey.span`; the ghost stages use the
-  symmetric partition. A sum or a count over such a set takes
-  `primaries = true`. What later steps rebuild (two levels, reflecting
-  and outflow faces, `regrid!`, seams, glues) is refused with the step's
+  secondary its primary's value (the copy on the finest level, there the
+  one with the greatest class tuple: a local rule, no index) by a copy or
+  the set's restriction, keyed by `GroupKey.span`, merged only in
+  `merged_transfers`; the ghost stages use the symmetric partition, the
+  mid-plane of a halved range the lower child's. The interface
+  restriction is `unify!` with a `UnifySchedule`. `N ≥ 2G` in every
+  dimension. A sum or a count over such a set takes `primaries = true`.
+  What later steps rebuild (reflecting and outflow faces, `regrid!`,
+  seams, glues) is refused with the step's
   name, and its old code errors if reached: do not route around a
   refusal ("Closed blocks", and the pending tests in
   `test/helpers/pending.jl`). Read the seam through `seam_plane`,

@@ -806,17 +806,15 @@ isstale(s::GhostSchedule) = generation(s.forest) != s.generation
 # Index conventions, all in *stored* indices, per dimension `d` against
 # that dimension's ghost width `G = G[d]` and stagger `c = c[d]` (`1` in
 # a vertex-like dimension, `0` in a cell-centered one). The stored extent
-# is 1:N+2G+c and the owned range is G+1:G+N whatever the centering:
+# is 1:N+2G+c and the own range G+1:G+N+c, both face planes of a
+# vertex-like dimension (M22, `target_range`):
 #
-#   δ_d = +1  target is the high exchange region  G+N+1 : N+2G+c
-#   δ_d = -1  target is the low  ghost slab           1 : G
-#   δ_d =  0  target spans the block's own owned extent
+#   δ_d = +1  target is the high ghost slab   G+N+c+1 : N+2G+c
+#   δ_d = -1  target is the low  ghost slab         1 : G
+#   δ_d =  0  target spans the block's own range, or the half of it one of
+#             two finer sources restricts into
 #
-# The high region is one plane longer in a vertex-like dimension: that is
-# the boundary plane the block *shares* with its high-side neighbor,
-# which the neighbor owns and the exchange therefore fills, exactly as it
-# fills a ghost. Everything above the owned range is exchange-filled, so
-# the asymmetry is bookkeeping in the target ranges and nothing more.
+# Stage 0 (M22) writes own points instead, the spans of `piece_range`.
 #
 # For restriction the tangential extent is halved, since each of the
 # 2^(tangential) fine neighbors supplies one half. That split is of the

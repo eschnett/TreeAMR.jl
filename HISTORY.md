@@ -5632,6 +5632,77 @@ M12 was decided with Erik, after M7 and before M9b.
     | face, D = 3 | 2 → 1 / 26 | 2 → 1 / 26 | 1 → 1 / 26 | 1 → 1 / 26 |
     | edge, D = 3 | 16 → 3 / 26 | 16 → 3 / 26 | 5 → 3 / 26 | 7 → 5 / 26 |
 
+- *Step 3, coarse-fine faces (2026-11-26).* Implemented on `m22` in four
+  commits after a written plan Erik reviewed: the primary across levels,
+  by sub-piece, with the mask; stage 0's restrictions and the ghost
+  stages on refined meshes, with `N ≥ 2G`; `UnifySchedule` and `unify!`
+  in place of `InterfaceSchedule` and `restrict_interfaces!`; the
+  workloads and documents. Erik's decisions on the plan: five sub-classes
+  a vertex-like dimension, the primary rule unchanged and the mask one
+  `UInt32` a block; the mid-plane to the lower fine block, in stage 0
+  and in phase 1's halved ranges alike; restrictions merged only within
+  one piece of the target, for now, with the whole policy in one
+  function so that step 5's measurement can change it; `N ≥ 2G` in place
+  of `N ≥ 2G + 2` along a stagger, tested at the bound; a removed name
+  failing as a missing name. What the code showed against the design:
+  - *A coarse face value along a cell-like dimension has no coincident
+    fine point.* It is secondary all the same, the restriction of the
+    fine cells about it; the mask's oracle and the count of distinct
+    points take "a finer block's closed box contains the point", not "a
+    finer copy coincides".
+  - *A coarse block's copies need not fill a box.* Where some of its
+    pieces face finer blocks, the rest, copied from a block of its own
+    level, do not form one, and merging them into singletons gave 73
+    copy groups on a periodic `4³` brick with one root refined; merging
+    piece by piece where the whole set is not a box gave 37.
+  - *A secondary's state entry drifts at a coarse-fine face.* The coarse
+    copy's `du`, from the coarse stencil over unified values, differs
+    from its fine primary's by the Laplacian's `O(1)` defect next to a
+    prolongated ghost, and the wave study, which measured the state raw,
+    saw it as a rate of 0.54 at order 2 and no convergence in `L∞`.
+    Never read, as the design says; the study now unifies the final
+    state before measuring it, as an application's output would.
+  - *The vertex rates moved* (`L2`, `N = 8 … 32`, the half-open checkout
+    7d99187 run the same day beside): `D = 1`, order 2: 0.99 → 0.97;
+    order 4: 1.99 → 1.92; `D = 2`, order 2: 1.01 → 1.04; order 4: 1.99 →
+    1.95. Both faces of the refined region now carry the fine face's
+    defect, where one did; the local rates at order 4 in `D = 1` are
+    1.90, then 1.94. Recorded in CODE.md as **(open)** until Erik has
+    reviewed them. The Burgers interface-order table and its static
+    drift rows came out the same to the last digit.
+  - *A ghost-free vertex-like dimension has no hook region*, so the 1D
+    vertex case of the all-variables hook test takes one ghost; tests
+    gated in step 2 that sized a state as `N^D` a block (the IMEX
+    partition, the wave's state length) and the exchange's partition
+    test, which counted `N^D` own points, now count the own range.
+  - *A flux set at a reflecting face is a closed set there*, refused
+    until step 4: partition_tests builds its unify schedule over outer
+    faces.
+  - *Measured* (laptop M3 Pro, Julia 1.13.4, smoke): in 3D, `N = 16`,
+    `G = 2`, order 4, stage 0 copies + restrictions / phase 1 / phase 2:
+    a periodic `4³` brick with one root refined, cell 0 / 82 / 152,
+    vertex 37 + 152 / 82 / 152, face 1 + 8, edge 7 + 40; the nested mesh
+    of `bench/nested.jl` with outer faces, cell 0 / 63 / 273, vertex 19 +
+    61 / 63 / 273. Schedule build, best of three: a uniform periodic
+    `8³` vertex set 0.046 s at the step-2 head against 0.14 s now (the
+    sub-piece search, `5^v` sub-pieces a block); on the nested mesh a
+    vertex set 0.082 s against a cell set's 0.008 s, which is unchanged.
+    The refined box's fill is mirror-symmetric to 6.7 × 10⁻¹⁶ in 2D and
+    2.4 × 10⁻¹⁵ in 3D at a data scale of 2, against 4.7 × 10⁻⁵ under
+    half-open ownership.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  at eight threads, 176,329 tests and 728 pending (Broken) in 5m20, and
+  at one, 176,277 and 728 in 5m17, both MPI jobs included, W2v and B2
+  among their cases again; `closed_tests.jl` checks every done-when item
+  on the CPU, flat against shaped and over simulated ranks, and the MPI
+  workload's W2v and B2 cases at two and three ranks against the serial
+  run. `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32) passes,
+  20,275 tests and 39 pending in 5m43. The docs build and their doctests
+  pass. The pending tests by step, as call sites (whole testsets, loops'
+  vertex-like iterations, workload cases): step 4, 13, 20 and 8; step 6,
+  12, 10 and 12; step 7, 22, 18 and 11; step 8, 26, 8 and 4; step 3,
+  none.
+
 ## Downstream checks
 
 **TreeWave.** The `[sources]` pins to `main` went when 0.1.1 was
