@@ -519,3 +519,43 @@ end
     @test size(interpolate(fs, NTuple{2,Float64}[], Lagrange(4)).values) == (2, 1, 0)
     @test sprint(show, Lagrange(4)) == "Lagrange(4)"
 end
+
+@testset "Interpolation mirrors with the data, near a high face as near a low one: D=$D" for
+        D in (1, 2, 3)
+    # Guards the windows on closed blocks (M22): a vertex-like block's
+    # stored array, `G | N + 1 | G`, is symmetric under reversal, so a
+    # centered window near a block's high face is the mirror image of one
+    # near a low face, and data symmetric under `x₁ → 4 − x₁` must
+    # interpolate to the same value at a point and its mirror image, to
+    # rounding (the weights sum in the other order), for an even number
+    # of points, whose window is centered; an odd number's sits half a
+    # node low by design. The mesh is refined symmetrically about the
+    # mirror plane, so the points' blocks are each other's images, but for
+    # a point on a coarse-fine face, `x₁ = 1` or `3`: the location is
+    # half-open (`locate_point`), so such a point is read from the fine
+    # block on one side and from the coarse one at its image, and the two
+    # differ by the interpolation error; those points are left out.
+    forest = Forest(ntuple(d -> d == 1 ? 4 : 2, D); N=8,
+                    extents=ntuple(d -> (0.0, d == 1 ? 4.0 : 2.0), D))
+    refine!(forest, filter(k -> block_extent(forest, k)[1][1] in (1.0, 2.0), forest.leaves))
+    balance!(forest)
+    g(x, v) = exp(-(x[1] - 2)^2) * prod(ntuple(d -> d == 1 ? 1.0 : cos(x[d]), D)) + v
+    for C in (vertexcentered(D), facecentered(D, 1))
+        fs = FieldSet(forest, 2; G=3, centering=C)
+        fill_by_coordinates!(g, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=6, restriction=6));
+                     boundary=boundary_by_coordinates(g))
+        # Points on a grid of 1/256, so that the mirror image is exact,
+        # near every block face along dimension 1 and between them.
+        rng = Xoshiro(30 + D)
+        xs = [ntuple(d -> d == 1 ? rand(rng, setdiff(1:1023, (256, 768))) / 256 :
+                          rand(rng, 1:511) / 256, D) for _ in 1:200]
+        mirrored = [Base.setindex(x, 4 - x[1], 1) for x in xs]
+        for n in (2, 4, 6)
+            a = interpolate(fs, xs, Lagrange(n)).values
+            b = interpolate(fs, mirrored, Lagrange(n)).values
+            scale = maximum(abs, a)
+            @test maximum(abs, a .- b) <= 16 * eps() * scale
+        end
+    end
+end
