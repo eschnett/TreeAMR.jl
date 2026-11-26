@@ -17,11 +17,10 @@ layout, stage 0 and the primary mask on uniform meshes with periodic and
 outer faces — is implemented there, and so are step 3, coarse-fine faces
 on meshes refined once and left alone, with the interface restriction
 as `unify!` on a flux set, and step 4, reflecting and outflow faces with
-a symmetric wall and no `walls` keyword, step 6, regridding, and step
-7, rotating seams; step 5, the first measurement, waits for its cluster
-runs; what step 8 rebuilds (glues) is refused for a set
-with a vertex-like dimension until then (the list is under
-[Closed blocks](#closed-blocks)). Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
+a symmetric wall and no `walls` keyword, step 6, regridding, step 7,
+rotating seams, and step 8, glues; step 5, the first measurement, waits
+for its cluster runs ([Closed blocks](#closed-blocks)). Next is
+visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
 — is in [HISTORY.md](HISTORY.md); a step number such as "M7 step 6b" or
@@ -217,13 +216,11 @@ root), is the **primary**, and the fill gives every other copy, a
   outer faces is mirror-symmetric under every vertex-like centering.
 - What the half-open partition needed work-arounds for — symmetric walls,
   the half turn's shifted seam slab, the appendix of a set interpolated
-  across a glue — is gone, and what later steps rebuild on the closed
-  layout is refused for a set with a vertex-like dimension until then
-  (the list is under [Closed blocks](#closed-blocks)). The sections on
+  across a glue — is gone, and seams and glues are rebuilt on the
+  closed layout ([Closed blocks](#closed-blocks)). The sections on
   reflecting and outflow faces, seams, glues and coarse-fine faces below
-  describe those features for cell-centered and element sets, and the
-  half-open treatment of a vertex-like dimension that the later steps
-  replace.
+  describe those features for cell-centered and element sets, and say
+  where a vertex-like dimension differs.
 
 **Stored layout.** Per dimension `d`, with `c_d = 1` for `:vertex` and
 `0` for `:cell`, a field set with ghost width `G_d` stores `N + 2G_d +
@@ -545,8 +542,8 @@ its operators move whole elements between levels.
   word.
 - *Every position goes through `nodeposition(lo, h, B, I, c, nodes)`*
   (*Positions* above). `coordinates`, the four `fill_by_coordinates!`
-  kernels, the six boundary-hook kernels, the glue's ghost positions and
-  appendix kernel, the flagging sweep of `firing_boxes`, the fold
+  kernels, the six boundary-hook kernels, the glue's ghost positions,
+  the flagging sweep of `firing_boxes`, the fold
   kernel and the `exclude` test's stencils (`stencil_position` for an
   equally spaced stencil and for an `ElementStencil`) all call it, and
   no other function forms a position from an
@@ -604,7 +601,7 @@ multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 
 *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the decisions are
 recorded under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
-**On the `m22` branch, steps 1 to 4, 6 and 7 are implemented**: positions
+**On the `m22` branch, steps 1 to 4 and 6 to 8 are implemented**: positions
 from integer coordinates (*Positions* under [Centerings](#centerings));
 the closed layout, stage 0, the primary mask, `unify!`, the trapezoid's
 weights and the hook at an outer face, evolved or prescribed, on
@@ -617,20 +614,12 @@ mirror and the clamp about the wall plane and stage P (*Walls* and *Stage
 P* below); and regridding, flagging over the closed box and the kept
 blocks' copies over the created ones (*Regridding* below); and rotating
 seams, the copies of a seam point one number through the turn and the
-axis projected (*Seams* below). The rest of this section is
-**(proposed)**,
-and until its step lands a set with a vertex-like dimension is refused,
-with an `ArgumentError` naming the step:
-
-- by `GhostSchedule`, `UnifySchedule` and `primary_mask`, inside their
-  collective checks (`check_closed_blocks`): a forest of patches with a
-  glued face (step 8), and so by `regrid!` with the set's schedule,
-  `adapt_to_initial_data!` and `firing_boxes`, which ask the same
-  question. `fs => nothing`, which only resizes a set, is accepted.
-
-The code of the half-open treatment that those steps replace — a copy
-across a seam or a glue in `piece_copies` — stays behind the refusals
-and throws an internal error if reached.
+axis projected (*Seams* below); and glues, a copying glue's copies one
+number by the lowest patch's and a kinked glue's their mean, stage A
+(*Glues* below). Nothing is refused for a set with a vertex-like
+dimension any more that is not refused for its own reason. What is left
+of M22 in TreeAMR — `interpolate!`'s windows, and what is marked
+**(proposed)** below — is step 9.
 
 **What step 2 implements**, and how the design came out against the
 code (the record is step 2 under M22 in
@@ -669,8 +658,8 @@ code (the record is step 2 under M22 in
   rank decides alike by construction (`closed_tests.jl` checks it over
   simulated ranks), and a block's secondaries have at most `2^v − 1`
   directions, `v` the number of vertex-like dimensions. Step 3 added
-  copies on a finer level (below), and step 8 adds copies across a glue
-  (`glue_copies`), with the patch an entry of its own in the key.
+  copies on a finer level (below), and step 8 copies across a glue, the
+  lowest patch first (*Glues* below).
 - *The mask* is `PrimaryMask` (`pieces`, one `UInt32` per local block,
   `N`, the staggers), built by `primary_mask(fs)` once per forest
   generation and kept in the field set on its backend; `isprimary(mask,
@@ -830,7 +819,7 @@ fluxes are computed over today (`closed = true`).
 
 The price is `(1 + 1/N)` per vertex-like dimension in the state and in
 the right-hand side's work, 9.7 % at `N = 32` in 3D, which is what
-`map_blocks!(…; appendix = true)` costs today. The alternatives — every
+`map_blocks!(…; appendix = true)` cost under M20's appendix. The alternatives — every
 point once in a state of non-uniform blocks, and a mask that lets the
 right-hand side skip the copies — are in HISTORY.md with the reasons
 they were set aside.
@@ -853,8 +842,10 @@ given by a rule that does not mention the orientation of an axis, and
    map — are the same number for a covariant right-hand side. One of
    them, the **primary**, is evolved in earnest, and the others, the
    **secondaries**, are copied from it through the map. The primary is
-   the copy on the finest level, then (from step 8) on the first patch,
-   then the one whose class tuple is greatest: the copy on the block
+   the copy on the finest level, then on the lowest-numbered patch, then
+   the one at the greatest position in that patch (which decides a seam's
+   orbit and a patch glued to itself), then the one whose class tuple is
+   greatest: the copy on the block
    lying lowest along the dimensions the point is shared in. The choice
    is bookkeeping, as far as the values go: it decides which of several
    equal numbers is kept. It is local, so that every rank decides alike
@@ -871,8 +862,9 @@ given by a rule that does not mention the orientation of an axis, and
 4. *Copies across a kinked glue are averaged.* Under `glue =
    :interpolate` the patches holding a point evolve it by different
    stencils, and their copies differ by the scheme's error. Each patch's
-   primary takes the mean over the patches holding the point, summed in
-   patch order. This is the prototype's "averaged right-hand sides"
+   **within-patch primary** takes the mean over the patches holding the
+   point, summed in patch order (stage A); the **primary**, which the
+   mask marks and `primaries = true` counts, is the lowest patch's. This is the prototype's "averaged right-hand sides"
    coupling (M20 in HISTORY.md: stable at the dissipation the corners
    need, mirror asymmetry 1 × 10⁻⁷), since the dynamics of a state whose
    copies are averaged before every evaluation are those of the
@@ -1091,15 +1083,17 @@ through the turn (rule 2):
   idempotent bit for bit. A scalar is untouched, a turned vector's
   in-plane components vanish, and a tensor's are averaged. It runs in
   stage P after the mirror's projection, which it commutes with, on the
-  axis points the schedule records (`AxisPoints`: the primaries of the
-  axis pieces of a set vertex-like in both plane dimensions), reading the
-  set's map at fill time, so a schedule is tied to no map; it is not
-  launched for a set whose map turns nothing. It is the one kernel of
-  the fill that is not `transfer_kernel!` ("One kernel for every
-  transfer" under [Code structure](#code-structure)): a variable there
-  is written from several, which an in-place transfer would race on, so
-  it gathers into a buffer and writes back, behind a barrier, so that a
-  forest without an axis compiles none of it.
+  axis points the schedule records (`axis_points`: the primaries of the
+  axis pieces of a set vertex-like in both plane dimensions, each with
+  its orbit as members of a `MeanPoints`), reading the set's map at fill
+  time, so a schedule is tied to no map; it is not launched for a set
+  whose map turns nothing. Its kernel, shared with stage A (*Glues*
+  below), is the one of the fill that is not `transfer_kernel!` ("One
+  kernel for every transfer" under [Code structure](#code-structure)): a
+  variable there is written from several, which an in-place transfer
+  would race on, so it gathers into a buffer, `nvars × n` made per call,
+  and writes back, behind a barrier, so that a forest without an axis
+  compiles none of it. Sharing it changed no bit of step 7's axis.
 - *Counting*. With the trapezoid's weights a seam point is half on each
   of its faces, and its orbit's halves make one point, so
   `volume_weighted_norm` and `total_mass` need no seam mask: a
@@ -1127,13 +1121,47 @@ through the turn (rule 2):
 
 **Glues.** A glue that copies carries a closed range onto a closed
 range whatever it reverses and whichever faces it joins, so the two
-refusals of `check_glue_layout` go, and a turn need not join a low face
-to a low face. A set interpolated across a kinked glue has no appendix:
-the planes it owned there are every block's own. `AppendixArray`,
-`isowned`, `hasappendix`, `corelength`, `appendix_entries`, the
-`appendix` keywords of `statearray` and `map_blocks!`, and `FoldMask`
-go. "No refinement boundary at a glue" stays as it is, and so does the
-refusal of a patch corner's ghosts for a set that copies.
+ownership refusals of `check_glue_layout` are gone, and a turn need not
+join a low face to a low face.
+
+- *Copies across a glue that copies.* `piece_copies` finds a point's
+  copies across a glued face as across a seam, in the asking block's
+  virtual frame, and takes each one's class and position into the patch
+  across by the glue's map (`real_classes`, `real_position` with the
+  crossing). Among the finest copies the lowest patch's wins (rule 2):
+  positions of two patches do not compare, and the lowest patch is what
+  M20's fold counted. A copy or a restriction across a glue is keyed as
+  a seam's is, its direction and child offset in the virtual frame.
+- *The key carries the map, not the glue.* `GroupKey.axes` is the
+  glue's axis map, a signed permutation coded by `axes_code` (its rank
+  among the `D!` permutations times `2^D`, plus the flips; the identity
+  0, at most 47 in 3D), where it held the slot of the glue's table
+  entry. A copy or a restriction needs nothing else of the glue, so
+  transfers across every glue with one map share a group and a launch,
+  and the key does not grow with the number of patches: the seven-patch
+  ball's table has 36 entries (18 glues, each in both directions) and
+  the thirteen-patch ball's 72, with 13 distinct maps on each, and a
+  multi-block forest of M21 has hundreds of entries, where a slot would
+  overflow an `Int8` and a code cannot.
+  The neighbor search's `Crossing` keeps the slot, as an `Int32`, which
+  is what finds the leaf across and its map. A kinked glue's
+  interpolation is per glue entry, and is kept in its `GluePlan`.
+- *A kinked glue* is "Closed blocks across a kinked glue" under
+  [Finite differences across a glue](#finite-differences-across-a-glue):
+  stage A, the means of the within-patch primaries, in the kernel the
+  seam's axis runs in. The appendix of M20 is gone: `AppendixArray`,
+  `isowned`, `hasappendix`, `corelength`, `appendix_entries`, the
+  `appendix` keywords of `statearray` and `map_blocks!` (refused, saying
+  why) and `FoldMask`.
+- *Limitations*, both kept from M17 and M20 and both for M21 to lift on
+  its multi-block forests: **no refinement boundary at a kinked glue**,
+  since the interpolation and stage A's members would then span two
+  levels; and **no patch corner for a set that copies**, a region beyond
+  two glued faces at once, and, for a set vertex-like along both
+  dimensions there, the points of the corner line, whose copies on the
+  patch across the corner one glue at a time does not reach
+  (`check_patch_corners`). A kinked glue reaches them by position, and a
+  set that needs patch corners is interpolated across its glues.
 
 **Regridding.** A transfer's target is the new block's closed box: a
 created fine block's `G+1 … G+N+1` prolongated from its parent, a
@@ -1221,7 +1249,7 @@ lowest patch. It has two uses, and they are the same query:
   vertex-like dimension and has no default, since a sum that silently
   counts a plane twice is the mistake to prevent.
 - *A right-hand side that skips the secondaries.* A kernel asks
-  `isprimary(mask, I…, b)`, as it asks `isowned` of an appendix today,
+  `isprimary(mask, I…, b)`, as it asked `isowned` of M20's appendix,
   and returns early; the application passes the mask as it passes any
   argument. The entries of `du` it leaves are then not defined, so
   `unify!(du, …)` must follow, which gives every secondary its
@@ -1260,11 +1288,10 @@ still reads `p/2 − 1` planes past the face, `G ≥ p/2 − 1`.
   `N`, forms its kernels' positions through `nodeposition`, and
   TreeGRRMHD's `walls_to_state!` and zeroed wall `du` go.
 - Symmetries on patches (M21) lose the shifted slab at a glued axis,
-  the turn's low-to-low rule and the appendix's part in both.
-
-**Open.**
-
-- Stage A's round for interpolated sets, beside stage 0's.
+  the turn's low-to-low rule and the appendix's part in both. A turn
+  written as a glue entry needs a variable map on the entry, which the
+  copy and stage A's kernel would read as a seam's `rotvars`; the
+  primary's rule already decides a patch glued to itself by position.
 
 ### Tree structure
 
@@ -2418,12 +2445,15 @@ path, where the pack applies the axis map on the sender and the unpack
 is the plain copy it always is. What is new:
 
 - *The axis map comes from the table, and travels by value.* `GroupKey`
-  carries `glue`, an `Int8`: the slot in the forest's glue table of the
-  face the source lies across, 0 otherwise, ordered after `orientation`
-  in `keyorder`, so both ends of a message derive one layout. The slot
-  is canonical by construction — the table is dense and covered by the
-  digest — so nothing is deduplicated during the schedule build, which
-  would have obliged every rank to do it in the same order.
+  carries `axes`, an `Int8`: the code of the glue's axis map
+  (`axes_code`), 0 for the identity and off a glue, ordered after
+  `orientation` in `keyorder`, so both ends of a message derive one
+  layout. The code is a function of the map alone, so nothing is
+  deduplicated during the schedule build, which would have obliged every
+  rank to do it in the same order. Until M22 it was the slot of the
+  glue's table entry; the map serves a copy or a restriction as well,
+  merges the groups of glues with one map, and does not grow with the
+  number of patches (*Glues* under [Closed blocks](#closed-blocks)).
   `TransferGroup` carries the axis map itself, `perm::NTuple{D,Int8}`,
   `flip::NTuple{D,Bool}` and `turned::Bool`, computed on the host when
   the group is built (`group_axes`): `axismap` of the orientation across
@@ -2457,11 +2487,13 @@ is the plain copy it always is. What is new:
   it is filled on faces only, and the faces-only filter removes every
   edge and corner direction before the search. So on a cubed sphere an
   element set fills and a cell- or vertex-centered set is refused,
-  except one whose ghost widths leave the corner region empty — a cell
-  set with `G = 0` along one of the two dimensions. A vertex-like
-  dimension with `G = 0` still has its shared high plane beyond a high
-  face, and is refused there. Patch corners for cell and vertex sets
-  are not in the design.
+  except one whose ghost widths leave the corner region empty — a set
+  with `G = 0` along one of the two dimensions — and that is not
+  vertex-like along both: such a set holds points on the corner line
+  itself (M22), shared by three or more patches, whose copies one glue
+  at a time does not reach, and is refused whatever its ghost widths.
+  Patch corners for cell and vertex sets that copy are not in the
+  design; a set interpolated across its glues fills them.
 - *The layout must survive the map* (`check_glue_layout`, also among
   the collective checks). A turned source is read with the target's own
   stored size and offsets through the axis map, so along axis `a` of the
@@ -2469,10 +2501,9 @@ is the plain copy it always is. What is new:
   the same ghost width and the same centering, as `symmetric_layout`
   asks of a set that turns into itself across a seam. Unlike a seam's,
   a glue has no partner set for a layout that does not; it is refused,
-  saying why. And a reversed vertex-like axis is refused except as the
-  normal of a low face glued to a low face, because half-open ownership
-  does not survive the reversal (see "Across a glued face" under
-  [Centerings](#centerings)).
+  saying why. A reversed vertex-like axis, refused under half-open
+  ownership, carries a closed range onto a closed range (M22) and fills
+  as any other.
 - *Phase 1 stays race free*, by the seam's argument: a copy or a
   restriction across a glue reads the real source's owned points nearest
   the face, and the layout refusals above are what keep that true along
@@ -4178,12 +4209,9 @@ differently in every process, and needs a `Base.hash` method over its
 values (TreeMultiPatch's layouts are `isbits`).
 
 *Implemented* (M20 step 4): the keywords, the refusals at schedule build,
-the location with `chart_aligned`, the stage, closed ownership with its
-appendix — `statelength`, `scatter!`, `gather!`, `statearray(u, fs;
-appendix = true)` (an `AppendixArray`), `map_blocks!`'s keyword and the
-closed ranges of the fill — the folds and norms counting each point
-once, and `regrid!`'s guard with the appendix carried by a kept
-block's copy, serially and over a distributed forest, on the CPU and
+the location with `chart_aligned`, the stage, the folds and norms
+counting each point once, and `regrid!`'s guard, serially and over a
+distributed forest, on the CPU and
 on a device: `src/glue.jl`, tested in `test/glue_tests.jl`, on the
 seven- and thirteen-patch balls in `test/glue_ball_tests.jl`, over
 simulated ranks in `test/glue_exchange_tests.jl`, through MPI in
@@ -4215,12 +4243,11 @@ one root per cube side is too coarse (`3.03 Lc`) and two suffice
 
 The value is a tensor product of one-dimensional Lagrange stencils of
 `k` points at `ξ′`, centered where they fit and clamped, per dimension
-of `q`, into `q`'s closed box at that level: its points `0 … n`, the
-glued high face plane included (it is owned, below) and an outer high
-face plane too, which the hook has filled by then. So near `q`'s faces
-the stencil is lop-sided, which cost no measurable accuracy in the
-prototype. It reads `s`'s stored array: its owned points, its appendix
-or the hook's outer high plane, and its ghosts inside `q` — never a
+of `q`, into `q`'s closed box at that level: its points `0 … n`, both
+face planes included, every block's own (M22). So near `q`'s faces the
+stencil is lop-sided, which cost no measurable accuracy in the
+prototype. It reads `s`'s stored array: its own points, final after
+stage 0, and its ghosts inside `q` — never a
 ghost of `s` across a glue, which is interpolated from `p` in turn. Two
 conditions keep that true, both checked at schedule build: `k ≤ 2(G_d
 + c_d)` along every dimension, so that a centered stencil about a point
@@ -4257,88 +4284,57 @@ Rounding to a nearby node without the declaration would not guarantee
 this: it would depend on how well the atlas inverts its map, and would
 also round ghosts that are near a node by coincidence.
 
-**Closed ownership and the appendix.** Under half-open ownership a
-patch owns its low face planes only. On the seven-patch ball that leaves
-two of the eight corner lines, where three shells meet, to no shell
-whatever the orientation, and the prototype found no stable way to
-extrapolate them. So an interpolated set owns every glued face point on
-each patch holding it: a block whose high face, along a vertex-like
-dimension, lies on a glued face of its patch also owns that face plane,
-the closed range `G+1 … G+N+1` along that dimension. The copies of a
-point on two patches are evolved apart, each by its own patch's
-stencil, and differ by the scheme's error, as on overlapping grids; the
-prototype measured them stable at the dissipation the corners need
-anyway. (Closed ownership stays rejected inside a patch, for the reason
-under [Centerings](#centerings): copies at a coarse-fine face would see
-different ghosts, and nothing keeps one there.)
+**Closed blocks across a kinked glue** (M22; the record of the appendix
+it replaced is under M20 in
+[HISTORY.md](HISTORY.md#m20--treemultipatch-and-finite-differences-on-patches)).
+Every patch holding a point of a glued face holds a copy of it, on each
+of its blocks holding it, as every block holds its closed box
+([Closed blocks](#closed-blocks)). Inside a patch the copies are one
+number by stage 0, from the **within-patch primary**, the copy rule 2
+picks among that patch's blocks; across the glue they are not copies,
+since the patches evolve the point by different stencils, and **stage
+A** makes them their mean (rule 4) before stages W, P and 0, which carry
+it to the other copies inside each patch. On the seven-patch ball that
+covers the corner lines where three shells meet, which half-open
+ownership left to no shell. The state is the closed boxes, as on a
+brick; `scatter!`, `gather!`, `statearray`, `map_blocks!` and the folds
+need no keyword, and `appendix` is refused, saying why.
 
-The core stays: `N^D` per block per variable, in block order, as every
-function of [Data layout](#data-layout) has it. The planes closed
-ownership adds follow all the cores as the **appendix**: per block with
-any, per variable, the points of its high glued face planes, each point
-once — a point on two such planes, at an edge or a corner, in the plane
-of the lowest dimension — every plane in the order of its stored
-indices. `statelength` counts both; `scatter!` and `gather!` move both;
-`statearray(u, fs)` stays the cores' array, so code written for bricks
-reads the cores as before; and **`statearray(u, fs; appendix = true)`**
-is the whole state as an `(i1, …, iD, var, b)` array whose `i_d` runs to
-`N + 1` where the block owns the plane, reading and writing the core or
-the appendix as the index says, and discarding a write to a point the
-block does not own. On a set with no appendix it is the plain
-`statearray`. (`stateview` is taken: it is one set's segment of a state
-vector of several sets.) A block's
-appendix offset is a host table built with the schedule's layout, and
-the planes are already stored: a vertex-like set stores its high plane
-at `G+N+1` today, as a ghost.
-
-`map_blocks!` on a set with an appendix requires **`appendix = true`
-or `false`**, with no default, because a right-hand side that forgets
-the appendix leaves its planes unevolved without a word. With `true` it
-launches over the closed range, as `closed = true` does, and the kernel
-writes through `statearray(du, fs; appendix = true)`, which discards the
-planes a block does not own. That costs a plane per dimension on every block, about `D/N` of the
-work, 9 % at `N = 32` in 3D, which a kernel skips by asking
-`isowned(A, i…, v, b)` of the `AppendixArray` it writes through (it works
-on a device); a launch over the appendix alone is the optimization if
-even that shows.
-
-The fill skips the appendix: along a glued dimension a block's own
-range is its closed range, and every region that reaches into the
-other dimensions follows it, so that a same-level copy within the
-patch carries the neighbor's appendix plane into the target's ghost,
-where an interpolation stencil may read it. This is the shape of
-symmetric walls' trim, with the opposite sign, and goes the same way:
-a per-dimension flag in `GroupKey`, part of its order, so that both
-ends of a message agree: the search for the transfers a rank sends for
-another rank's block runs in the interpolated mode too, or it would key
-them without the flag and the two ends would lay the message out
-differently.
-
-A fold or a norm counts every point once: a point on a glued face at
-the copy of the lowest-numbered patch holding it, which the fold reads
-from the core or the appendix. Under a low face glued to a low face
-both cores hold the point; under a high face glued to a high face
-neither does, and both appendices do. The copies of a point are found
-by following the glues of every glued face it lies on, in each patch's
-integer coordinates, so exactly, and an image that lands where the
-other patch's centering has no point (a glue turning a vertex-like
-dimension onto a cell-like one) is no copy; among copies on one patch, a patch
-glued to itself, the lower position counts, so a wrap counts its low
-plane. A block's owned points fall into at most `3^D` pieces — along
-each dimension its glued low face plane, its appendix plane, or
-neither — whose points all lie on the same glued faces, and a glue
-joins a whole face to a whole face, so the decision is one bit per
-piece: a `FoldMask` per block, built on the host for each reduction,
-which the fold kernel tests at each point of the closed range. Where
-two copies lie on the lowest patch the pieces are checked point by
-point, and a self-glue that splits a piece is refused; over a distributed
-forest with a patch glued to itself every rank checks every leaf, so
-that all refuse alike. A set without an
-appendix passes `NoMasks()` and compiles none of it. `block_mapreduce`
-and `mesh_mapreduce` over a set with an appendix run as this fold,
-behind `Base.inferencebarrier`, every selected variable at a point in
-turn; and a norm's volume counts the points the fold does, so that a
-constant is its own norm.
+- *The members* of a point are the within-patch primaries of every
+  patch holding it, one a patch, or two where a patch is glued to
+  itself: found by following the glues of every glued face the point
+  lies on (`glue_copies`), in each patch's integer coordinates, so
+  exactly, and ordered by patch and then by position (`glue_members`).
+  The torus has 2 members a point and 4 at its corners (two patches,
+  each glued to itself), the seven-patch ball 2, 3 along the corner
+  lines and 4 at the cube's corners, the brick cut into four patches 2
+  and 4.
+- *The mean* is `x₁ + Σ_{m≥2} (x_m − x₁) / M` in member order, the same
+  on every rank, which is `x₁` exactly when the members are equal,
+  whatever `M`, so that a second fill changes no bit; `(x₁ + x₂ + x₃)/3`
+  is not, three equal values summing with rounding. It runs in the
+  kernel the rotating seam's axis runs in (`mean_gather_kernel!`, the
+  axis's paired rule selected by a flag), gathering every target's mean
+  into a buffer and writing it back, behind a barrier: a forest without
+  a kinked glue compiles none of it.
+- *Between ranks* the members another rank holds come in one round
+  under `GLUE_MEAN_TAG`, before stage W: each rank packs its members'
+  values unchanged, a point's variables together, in the order both ends
+  derive from the tree — per peer, by the receiving member's global leaf
+  and stored index, then the sending member's — and forms the means
+  itself once its receives are in, so that no second round carries a
+  mean back. The buffers (the means, `nvars × n`, and what is sent and
+  received) are made on the first fill, kept with the plan
+  (`GlueMeans`), remade when the variable count changes and freed with
+  the schedule, as the glue plan's are.
+- *Counting.* The mask marks the lowest patch's within-patch primary,
+  then the greatest position within it (`glue_lowest_bits`), so that
+  `primaries = true` takes each point once; on the seven-patch ball that
+  is its number of distinct nodes. The norms take each patch's
+  trapezoid weights, a face point half on each patch's side, so a
+  constant is its own norm, with no mask.
+- *`unify!`* runs stage A too, on a working array and on a state, with
+  a `GhostSchedule` or a `UnifySchedule`.
 
 **Stages.** An interpolated transfer reads what phase 1 and the
 boundary hook write — the hook's outer high face plane where a stencil
@@ -4400,25 +4396,13 @@ launch paths keep their types (compare `--trace-compile-timing` of
 `test/mpi_workload.jl` against `main`).
 
 **What a set without a glue compiles of it.** Everything only an
-interpolated set or a set with an appendix runs is reached through
-`Base.inferencebarrier`, as element-only code is, because the switch is
-a run-time field of the set, not its type: the glue plan's build, its
-checks and its fill (the fill not even entered for an empty plan); the
-appendix's `scatter!`, `gather!`, length and layout; the fold masks and
-the norm's counts; `regrid!`'s guard and its re-keyed transfers; and the
-`AppendixArray`, which `statearray(u, fs; appendix = true)` returns
-uninferred. `statearray(u, fs)` keeps one return type for every set —
-the cores as the array `reshape(u, …)` gives, over `u`'s own memory on
-the host (`Base.wrap`) — so that a kernel taking it compiles once, and
-`statearray` is constant-propagated so that the default keyword selects
-it. The neighbor search takes the interpolated mode as a `Bool` and an
-always-present region list, one specialization rather than two. What
-remains on every set's path is the `top` flag of `GroupKey` and its
-keyword through `kind_stencil` and `target_range`. Measured on an Apple
-M3 Pro, `main`'s `test/mpi_workload.jl` compiles in 65–68 s against this
-package and in 62–65 s against `main`, three alternating rounds each,
-about 5 % more; before the barriers above it was 69–72 s, and the
-union of `statearray`'s return types was most of the difference.
+interpolated set runs is reached through `Base.inferencebarrier`, as
+element-only code is, because the switch is a run-time field of the set,
+not its type: the glue plan's build, its checks and its fill (the fill
+not even entered for an empty plan), stage A's build and run, the mask's
+lowest-patch bits, and `regrid!`'s guard. The neighbor search takes the
+interpolated mode as a `Bool` and an always-present region list, one
+specialization rather than two.
 
 **No refinement boundary at a glue.** A coarse-fine face, edge or
 corner touching a glued face is refused by `GhostSchedule` for an
@@ -4428,39 +4412,23 @@ balance would carry into one of them is refused, saying which block and
 why. So are the blocks the schedule's glue stencils read: their sources
 and the neighbors whose copies or restrictions fill the ghosts they
 read (`GluePlan.reads`, gathered over the ranks), so that whatever
-`regrid!` accepts, the schedule builds again. So every block within reach of a glue, on either side, is at one
-level, the interpolated ghosts never interpolate across levels, and
-the appendix is never prolongated or restricted: when `regrid!`
-compacts and repartitions, a block's appendix moves with it, its copy
-keyed with the same `top` flag as the fill's. The guard is on whenever
+`regrid!` accepts, the schedule builds again. So every block within
+reach of a glue, on either side, is at one level, the interpolated
+ghosts never interpolate across levels, and stage A's members are on
+one level. The guard is on whenever
 a set `regrid!` moves is interpolated across a glue; it drops the marks
 after the buffer has recruited, so a buffer reaching a glued face is
 dropped there too. Lifting
 this — interpolating from a leaf at another level, which a located
-point finds anyway, and the appendix in the regrid transfers — comes
-after M20.
+point finds anyway, and a mean over copies of two levels — is not in
+M22; it is a limitation M21's multi-block forests inherit.
 
-**What else learns of the appendix.** The appendix's layout — per block
-its dimensions, offset and size, and every point — is built once per
-change of the forest and kept in the field set (`fs.appendix`, untyped,
-so that a set's type does not say whether it has one), with its tables
-on the set's backend: `scatter!`, `gather!` and `statearray` run every
-evaluation, and their kernels read the tables where they run. An
-`AppendixArray` goes into a device kernel through `Adapt`, which is why
-`Adapt`, already loaded by KernelAbstractions, is a direct dependency:
-a right-hand side launched with `map_blocks!(…; appendix = true)` and a
-fold over the state vector take it as an argument. Its reads check the
-index on the host only (`@boundscheck`), so that a kernel under
-`@inbounds` compiles no throw; its accessors are inlined, without which
-every access allocated its index tuples on the CPU (70 ns and 148 B an
-entry through a fold, 9 ns and nothing now). `fill_by_coordinates!` fills
-the appendix after the cores, every form of its callback through one
-kernel over the appendix's points, and `adapt_to_initial_data!` takes the
-`atlas` its schedules need. TreeIOHDF5 saves it as a dataset of its own
-beside the cores, under the format feature `interpolated_glue`, through
-the companion interface's `hasappendix`, `corelength` and
-`appendix_entries` ([Companion interface](#companion-interface)); its
-`CODE.md` has the format.
+`fill_by_coordinates!` fills every own point, the face planes
+included, and `adapt_to_initial_data!` takes the `atlas` its schedules
+need. TreeIOHDF5 saved the appendix as a dataset of its own, under the
+format feature `interpolated_glue`; on closed blocks the state is the
+closed boxes, and what a file of the old layout becomes is TreeIOHDF5's
+to decide ([Companion interface](#companion-interface)).
 
 ### Folds over points
 
@@ -4543,14 +4511,13 @@ reduction does.
 - `op(init, init) == init`;
 - `rf(a, p) == op(a, rf(init, p))`.
 
-**Which points.** Exactly the owned points `map_blocks!` visits, so a
-vertex-like block's shared upper plane is not counted, and every
-physical point is counted once. On a set with an appendix that is the
-appendix too, each glued face point at one of its copies ("Closed
-ownership and the appendix" under
-[Finite differences across a glue](#finite-differences-across-a-glue)),
-and `p.I` reaches `N + 1` there. `vars` selects what `p.u` holds, not
-which points are visited.
+**Which points.** Exactly the own points `map_blocks!` visits, the
+closed range of a vertex-like dimension, every copy of a shared point;
+with `primaries = true` its primary only, so that every physical point is
+counted once, a glued face's at the lowest patch's copy ("Closed blocks
+across a kinked glue" under
+[Finite differences across a glue](#finite-differences-across-a-glue)).
+`vars` selects what `p.u` holds, not which points are visited.
 
 **A weight is per point.** `rf` multiplies by `p.h^D` itself. The same
 norm through `mesh_mapreduce`, whose weight scales a block's value after
@@ -6750,10 +6717,13 @@ The ideas that span several files and are easy to violate:
   ("Element-only code goes behind a barrier"). Compare
   `--trace-compile-timing` of `test/mpi_workload.jl` against `main` for
   any change to a launch path. The one kernel of a fill that is not
-  `transfer_kernel!` is the axis projection of a rotating seam (M22,
-  *Seams* under [Closed blocks](#closed-blocks)): it writes a variable
-  from several of one point, which an in-place transfer would race on,
-  so it gathers into a buffer and writes back, behind a barrier.
+  `transfer_kernel!` is the mean over a point's members
+  (`mean_gather_kernel!` and its write-back), which a rotating seam's
+  axis (stage P) and a kinked glue's copies (stage A) share, a flag
+  selecting the axis's paired sum or stage A's (M22, *Seams* and
+  *Glues* under [Closed blocks](#closed-blocks)): it writes a variable
+  from several values, which an in-place transfer would race on, so it
+  gathers into a buffer and writes back, behind a barrier.
 - **The copy kernels launch flat on a device, shaped on the CPU**
   (see "The copy kernels on a device"). `transfer_kernel!`,
   `scatter_kernel!` and `gather_kernel!` take a `shape` first and read
@@ -7322,17 +7292,17 @@ forests: the kinked torus of `bench/coupling/torus.jl`
 (`helpers/glue.jl`), whose ghosts reproduce a patch's polynomial of
 degree `glue - 1` to rounding and converge at the glue order; the
 annulus, declared aligned, bit for bit the copy; two patches glued low
-to low and high to high; the refusals at schedule build; the appendix
-through `statelength`, `scatter!`, `gather!`, `statearray` and
-`map_blocks!`; the folds and norms counting each point once; and
-`regrid!`'s guard. `glue_ball_tests.jl` holds the same on the seven- and
+to low and high to high; the refusals at schedule build; the closed
+state and its round trip; the folds over the primaries and the norms
+counting each point once; and `regrid!`'s guard. `glue_ball_tests.jl` holds the same on the seven- and
 thirteen-patch balls of TreeMultiPatch, written out again in
 `helpers/ball.jl`, since the test environment cannot depend on a
 package that depends on TreeAMR: a patch's polynomial at every ghost,
 faces, cube edges and patch corners included, with the outer sphere's
-plane from the hook; the state's length, its round trip, and a fold
-counting the ball's distinct nodes, each once (`(M + 1)³ + (mN - 1)(6M²
-+ 2)`, `M = nN`); the fill of data with the cube's symmetries keeping
+plane from the hook; the state's length, its round trip, every copy of
+a point one number after a fill, and a fold over the primaries counting
+the ball's distinct nodes, each once (`(M + 1)³ + mN (6M² + 2)`, `M =
+nN`, the outer sphere included); the fill of data with the cube's symmetries keeping
 them to `1.6e-14` against an interpolation error of `5.5e-4` at two
 roots per side, which an off-center window breaks and a polynomial does
 not see; `chart_aligned`'s widths on the thirteen-patch ball, one along
@@ -7342,9 +7312,10 @@ coarse for its corner ghosts. `glue_exchange_tests.jl` holds them over
 simulated ranks, as tasks over `helpers/regrid_exchange.jl`'s rendezvous
 communicator: the kinked torus and the seven-patch ball, two variables,
 over 2, 3 and 5 ranks, bit for bit the serial fill, with no collective
-call in the fill and every ghost sent received; a fold counting each
-point once; a refusal of the glue plan raised on every rank; and a
-regrid whose kept blocks carry their appendix between ranks.
+call in the fill, every ghost sent received and stage A's means the
+serial ones; a fold over the primaries counting each point once; a
+refusal of the glue plan raised on every rank; and a regrid whose kept
+blocks move between ranks as the serial regrid moves them.
 `mpi_workload.jl`'s `G2` is the kinked torus through MPI: a fill, the
 reductions, a regrid and the fill again, with a `#` line counting the
 ghosts received; `mpi_device_workload.jl`'s `G2` the same on a device,
@@ -7965,8 +7936,8 @@ Remaining, none blocking before their milestone:
   atlases move from TreeWaveOLDG to a package of their own,
   TreeMultiPatch ([PLAN.md](PLAN.md#m20--treemultipatch-and-finite-differences-on-patches));
   and a finite-difference set is filled across a glue by
-  interpolation, owns every glued face point on each patch holding it,
-  and carries the planes that adds as an appendix to its state
+  interpolation, and holds every glued face point on each patch holding
+  it, the copies averaged by stage A
   ([Finite differences across a glue](#finite-differences-across-a-glue)).
   An interpolated set needs neither the patch corners nor the reversed
   vertex-like axis above.

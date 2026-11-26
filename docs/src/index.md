@@ -107,8 +107,8 @@ interpolation through the atlas, for the kinked maps of a cubed sphere
 being built on the branch `m22`, which this documentation describes:
 step 2, the closed layout on uniform meshes with periodic and outer
 faces, step 3, coarse-fine faces on meshes refined once, step 4,
-reflecting and outflow faces, step 6, regridding, and step 7, rotating
-seams, are implemented there. Next is visualization export (M9b).
+reflecting and outflow faces, step 6, regridding, step 7, rotating
+seams, and step 8, glues, are implemented there. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -209,8 +209,10 @@ symmetric. At a reflecting face the ghosts are the mirror image about the
 wall plane and an odd variable is zero on it; at an outflow face they
 repeat the wall. Across a rotating seam a seam point's copies are one
 number through the turn, and a point on the axis is projected onto the
-turn's invariant part. Until M22's step 8 a set with a vertex-like
-dimension is refused across a glue. After a regrid,
+turn's invariant part. Across a glue that copies, the copy on the
+lowest-numbered patch is the primary; across a glue the set is
+interpolated at (`glue = :interpolate`), every patch evolves its own
+copy, and the fill makes them their mean. After a regrid,
 rebuild the schedule and fill or [`unify!`](@ref) before
 [`gather!`](@ref): `regrid!` leaves stages P and 0 to the next fill, and a
 kept block's evolved value on a plane it shares with a created block is

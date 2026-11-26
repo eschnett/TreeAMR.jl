@@ -403,12 +403,13 @@ the one that says why.
   restriction is `unify!` with a `UnifySchedule`. A reflecting wall
   plane is projected onto each variable's parity by stage P, after stage
   W and before stage 0. `N ≥ 2G` in every dimension. A sum or a count
-  over such a set takes `primaries = true`. What later steps rebuild
-  (glues) is refused with the step's
-  name, and its old code errors if reached: do not route around a
-  refusal ("Closed blocks", and the pending tests in
-  `test/helpers/pending.jl`). Read the seam through `seam_plane`,
-  `ishalfturn` and `seam_keywords`, never `forest.rotating` raw.
+  over such a set takes `primaries = true`. Across a copying glue the
+  lowest patch's copy is the primary; across a kinked glue stage A
+  averages the patches' within-patch primaries, in the one kernel the
+  seam's axis shares (`mean_gather_kernel!`). A group key carries a
+  glue's axis map (`axes_code`), never its table slot. Read the seam
+  through `seam_plane`, `ishalfturn` and `seam_keywords`, never
+  `forest.rotating` raw.
 - **Reflecting and outflow faces are transfers, not hooks**, and
   **rotating seams are oriented transfers**; the boundary hook sees only
   outer faces ("Domain and boundaries", "Ghost filling"). The face kinds

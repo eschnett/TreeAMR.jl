@@ -6152,6 +6152,114 @@ M12 was decided with Erik, after M7 and before M9b.
   disagreeing with `unify!`. CODE.md now states the order, and the
   rounding-only seam copies of a set cell-like in the plane as a
   limitation.
+- *Step 8, glues (2026-11-26).* Implemented on `m22`'s step-8 branch in
+  four commits after a written plan the review approved, by Claude and
+  not by Erik: copying glues; stage A; the tests; the documents. The
+  review's decisions on the plan:
+  - *The primary across a copying glue* is the finest level's copy, then
+    the lowest patch's, then step 7's rule within that patch. Named
+    apart in the code and CODE.md: the **within-patch primary**, which
+    stage A writes on a kinked glue, and the **primary** the mask marks,
+    the lowest patch's.
+  - *Group keys carry the glue's axis map, not its table slot*: the
+    plan had proposed composed glue maps as extra table entries under
+    the `Int8` slot; the review asked for the numbers and for the map
+    alone where a copy or a restriction needs nothing else. Counted: the
+    seven-patch ball's table has 36 entries and the thirteen-patch
+    ball's 72, with 13 distinct maps each, and a signed permutation has
+    at most 47 codes in 3D (`axes_code`); the neighbor search's
+    `Crossing` keeps the slot, widened to `Int32`, with a pointed error
+    for a code that would not fit (`D ≥ 4`). No composed map was needed:
+    a copying set vertex-like along both dimensions of a patch corner is
+    refused (below).
+  - *Stage A in the axis's kernel, generalised* (`mean_gather_kernel!`),
+    with two requirements: bitwise idempotence for every member count
+    that occurs, met by `x₁ + Σ (x_m − x₁)/M`, and the axis keeping its
+    bits, met by its paired sum selected by a flag, checked against
+    fb54af7's fills and state `unify!` (2D and 3D, quarter and half
+    turns) and asserted in `seam_tests.jl` against the paired sum formed
+    in the test.
+  - *Stage A's messages*: every holder receives the other members and
+    sums them itself, one round; buffers kept with the plan, remade on a
+    change of the variable count, freed with the schedule. The axis
+    still makes its `nvars × n` buffer per call.
+  - *Both refusals kept* (no refinement boundary at a kinked glue; patch
+    corners for copying sets), as documented limitations for M21.
+  - *The baseline for M20's numbers is 02bf9d1.*
+  What the code showed against the plan:
+  - *A patch corner refuses more than before*: a copying set
+    vertex-like along both dimensions there holds points on the corner
+    line, whose copy on the patch across the corner one glue at a time
+    does not reach, so `check_patch_corners` refuses it whatever its
+    ghost widths. M17 had refused it for its ghosts already; a set
+    vertex-like along one of the two, with no ghosts along it, fills.
+  - *Conformity rules out a concave corner on a glued plane in 2D*: a
+    coarse-fine face may not cross a glue, so the refined region meets
+    the glue alike on both sides. The tests use a strip across the glue
+    in 2D, and in 3D an L whose concave edge crosses the glued plane,
+    where `ghost_plane_parts` copies 4 face-plane rows across the glue.
+  - *The phase-1 groups merge*: keying by the map put transfers across
+    every glue with one map, and identity glues with the brick's own,
+    into one group (counts below). The MPI workload therefore counts
+    its glued messages by the patches of their ends, the annulus' glue
+    being the identity.
+  - *The overhang rule* treats a block's closed range as its own, so a
+    glue stencil ending on its source block's high plane, refused under
+    the appendix at `a = 0.22` in the test, is accepted; `a = 0.2` reads
+    past it and is refused.
+  - *`check_closed_blocks` went entirely*: nothing was left in it once
+    kinked glues filled.
+  Assertions that changed: the exactness tests' polynomials (torus,
+  every centering and order, both balls) now agree on the glued faces,
+  their patch-dependent terms vanishing there, since stage A averages
+  copies that differ; the appendix testsets (layout, round trip,
+  `map_blocks!(…; appendix = true)`, allocation-free reads, `isowned`)
+  are replaced by the closed state's round trip and the refusal of
+  `appendix`; the folds count with `primaries = true`, the folded
+  pairs' totals `2(nN + 1)² − (nN + 1)` for both pairings where the
+  appendix gave `2(nN)² ∓ nN`; the seven-patch ball's distinct nodes
+  include the outer sphere, own to the outermost blocks, 15,679 →
+  17,217; the vertex-like reversal and high-to-high refusals in
+  `patch_tests.jl` became fills; the interface testset that expected a
+  coarse-fine glue reported as a bug became "unify! across a glue is the
+  brick's"; the exchange cases' data differ by patch, so that stage A's
+  mean is exercised across ranks; `mpi_tests` counts no pending case.
+  *Measured*, against 02bf9d1 (half-open, with the appendix):
+  - derivatives across the kink (the kinked pair, `n = 2, 4, 8`): first
+    9.64e-3, 6.26e-4, 3.98e-5, rates 3.94, 3.97; second 2.43e-2,
+    1.53e-3, 9.68e-5, rates 3.99, 3.98; unchanged to three digits. The
+    torus's interpolated ghosts: 1.0e-2, 1.26e-4, 2.16e-6, rates 6.31,
+    5.87, unchanged;
+  - the seven-patch ball's symmetry error 7.55e-15 → 8.88e-15 and its
+    interpolation error 5.54e-4 → 6.92e-4, the copies now averaged; and
+    every copy of each of its 17,217 points one number after a fill;
+  - schedules (groups / transfers; stage 0 new): the 3D brick cut and
+    refined beside the glue, phase 1 82/294 → 54/294, phase 2 104/140 →
+    86/140, stage 0 108/198, build 6.7 → 6.8 ms; the annulus refined,
+    phase 1 32/160 → 8/160, stage 0 9/64, 0.9 → 1.5 ms; the 3D layout
+    cycled with two axes reversed, refused → stage 0 33/81, phase 1
+    44/256, 4.4 ms; the kinked torus (`n = 4`), phase 1 12/168 → 8/168,
+    glue 1368 both, stage A 256 targets, 15.8 → 4.8 ms; the seven-patch
+    ball, phase 1 56/128 → 26/128, glue 44,928 → 46,872 ghosts, stage A
+    6,344 targets, 542 → 208 ms
+    (laptop; one build each of five, the minimum);
+  - `--trace-compile-timing` of the serial `test/mpi_workload.jl`
+    against fb54af7, one run each: 88.8 → 96.1 s, TreeAMR's 34.2 → 37.9 s
+    over 926 → 1010 methods, with G2 back; `transfer_kernel!`'s
+    specializations unchanged at 59, the mean kernel compiled twice (the
+    axis and stage A), behind its barriers.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite at eight
+  threads after the first commit, 198,716 tests and 37 pending, and
+  after the third, 198,981 and none pending at eight threads and
+  198,929 at one, both MPI jobs included with G2 back; `gpu_tests.jl`
+  with `closed_tests.jl` on Metal (Float32), 26,851 tests, stage A on
+  the device included; `mpi_device_tests.jl` on Metal at two and three
+  ranks, 65 tests, with G2's interpolated ghosts crossing ranks; the
+  docs build and their doctests.
+  The last done-when item, the wave on the balls bounded at M20's
+  dissipation, is TreeWave's: its ball right-hand side used
+  `map_blocks!(…; appendix = true)` and `isowned`, and is measured when
+  the downstream is ported to closed blocks.
 
 ## Downstream checks
 

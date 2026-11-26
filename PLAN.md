@@ -693,15 +693,14 @@ Steps:
    (`seam_shift` had already gone in step 2). The design text is
    *Seams* under [Closed blocks](CODE.md#closed-blocks), the record M22
    step 7 in [HISTORY.md](HISTORY.md#m22--closed-blocks).
-8. **Glues.** A glue that copies, in any pairing and with reversed
-   axes, the refusals lifted; a kinked glue without the appendix, with
-   stage A; the appendix's code and names deleted. The plan settles:
-   the mask across a glue, with the count's lowest patch; stage A's
-   buffer and its message layout. *Done when* the patch tests fill
-   every pairing bit for bit against a brick laid out as patches, the
-   kinked torus and both balls keep M20's convergence and symmetry
-   numbers with every copy of a glued point equal after a fill, and the
-   wave on the balls stays bounded at M20's dissipation.
+8. **Glues** — done on `m22`, but for its last done-when item: a glue
+   that copies in any pairing and with reversed axes, the lowest patch's
+   copy the primary; a kinked glue's copies averaged by stage A; group
+   keys carrying the glue's axis map. The wave on the balls at M20's
+   dissipation is TreeWave's, whose ball code used the appendix, and is
+   checked when the downstream is ported. The design text is *Glues*
+   under [Closed blocks](CODE.md#closed-blocks), the record M22 step 8
+   in [HISTORY.md](HISTORY.md#m22--closed-blocks).
 9. **What is left in TreeAMR**: `interpolate!`'s windows;
    `bench/mpi.jl` and the device suite on CUDA and Metal against
    `main`, with step 5's measurements repeated on the finished branch;
