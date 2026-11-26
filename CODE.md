@@ -254,27 +254,52 @@ I − 1` for owned index `I` (stored index minus `G`) of a block whose
 integer corner is `B = g·N`, `g = (rootpos << level) + coords` the
 block's integer coordinate at its level within its patch. The position is
 
-    lo + k·h              (vertex-like)
-    lo + (k + ½)·h        (cell-like)
-    lo + ((B + q(P+1)) + oᵢ)·h    (node i of element q)
+    fma(T(k), h, lo)                  lo + k·h             (vertex-like)
+    fma(T(2k + 1), h/2, lo)           lo + (k + ½)·h       (cell-like)
+    fma(T(B + q(P+1)) + oᵢ, h, lo)    node i of element q
 
-a conversion, a multiplication and then an addition, never `muladd`.
-`nodeposition(lo, h, B, I, c, nodes)` is the one function that forms
-them, and it is `public`.
+one conversion and one explicit `fma`, so that the position is `lo +
+k·h` rounded once, wherever `T(k)` is exact. The cell-like form counts
+half spacings, `2k + 1` of `h/2`, both exact, where `T(k) + ½` would
+drop the half one bit earlier. An element's interior node rounds the sum
+of its integer part and its offset `oᵢ`, which is not an integer, before
+the `fma`; halving buys it nothing. `nodeposition(lo, h, B, I, c,
+nodes)` is the one function that forms them, and it is `public`; the
+`exclude` test's stencils call it too.
 
+- *Why `fma`.* The rule must be one every backend keeps, and a
+  multiplication then an addition is not: CUDA contracts the two into
+  an `fma` of its own accord and the host does not, so the device's
+  positions differed from the host's at 30–57 % of points, by up to
+  13 ulps where `lo + k·h` is near zero (*On a device* below). With the
+  `fma` written out, host and device round once alike, and the position
+  is the correctly rounded one besides. A CPU without hardware FMA gets
+  the same bits from Julia's software `fma`, correctly and slowly. On
+  the H200 the explicit `fma` costs a fill of the positions nothing in
+  `Float64` and in vertex-like `Float32`, and 10 % in cell-like
+  `Float32` (193 µs against 175 µs over 64 blocks of `32³`, job
+  612473, best of 20 in one process each). A
+  type without an IEEE `fma` — `MultiFloats`' `Float32x2` and
+  `Float64x2`, for which `Base.fma` is undefined — takes the product and
+  then the sum (`position_fma`, a function of the package rather than a
+  method of `Base.fma`); its copies of a point still agree by the
+  argument below, and no device test uses one.
 - *Why the copies agree.* Every block that holds a point at one level
   has the same `k`, `lo` and `h`; a level up `k` halves and `h` doubles,
-  both exactly, so `T(2k)·(h/2)` is `T(k)·h` bit for bit. That holds
+  both exactly, so `T(2k)·(h/2)` is `T(k)·h` exactly before the `fma`'s
+  one rounding, and the two round alike. That holds
   where `T(k)` is not exact as well — a `Float32` rounds `k` beyond
   `2²⁴`, about level 16 at eight roots of `N = 32` — since every copy
   rounds the same integer, and rounding commutes with a factor of two.
   An element's last node, offset exactly `P + 1`, is formed as the next
-  element's first, `lo + (B + (q+1)(P+1))·h`: formed as `B + q(P+1)`
+  element's first, from the integer `B + (q+1)(P+1)`: formed as `B + q(P+1)`
   plus the offset `P + 1`, its integer part would differ from the next
   element's by `P + 1` and round differently where `T` cannot hold it.
   `test/position_tests.jl` checks every stored point of every centering
   in `D = 1, 2, 3`, `Float64` and `Float32`, on a refined mesh with
-  non-dyadic extents and on a 1D mesh refined to level 21.
+  non-dyadic extents and on a 1D mesh refined to level 21, and that
+  every one is the exact `lo + k·h` — `lo` and `h` the floating-point
+  numbers they are, `k` as `T` holds it — rounded once.
 - *Which `lo`, which `h`.* `h` is `spacing(T, forest, level)`, one
   number for every dimension and every patch, `root_spacing / 2ˡ` from
   patch 1's first dimension; `h_fine = h_coarse/2` exactly. `lo` is the
@@ -306,16 +331,18 @@ them, and it is `public`.
   `stencil_hits(region, lo, h, base, off, Val(n))` keeps its shape, its
   arguments now `nodeposition`'s pieces (`base` the integer coordinate
   of the first stencil point, `off` zero or a half).
-- *On a device.* A backend that fused the multiplication and the
-  addition would still give every copy the same bits, since scaling by
-  two is exact inside the fused product as well; what it would break is
-  equality with the host. On Metal it does not fuse: device and host
-  positions are `===` at every owned point and every hook-written ghost
-  of the refined meshes above, in `Float32`, through `P = 3`. On CUDA
-  this is **(open)**: not measured.
+- *On a device.* Device and host positions are `===` at every owned
+  point and every hook-written ghost of the refined meshes above, for
+  cell, vertex and element sets through `P = 3`: on Metal in `Float32`,
+  and on CUDA (an H200, Symmetry jobs 612445 and 612473) in `Float64` and
+  `Float32`. Formed as a multiplication and then an addition, they were
+  `===` on Metal, which does not fuse, and differed on CUDA, which does:
+  every differing device value was exactly the host's `fma` (jobs
+  612315 and 612335, [HISTORY.md](HISTORY.md#m22--closed-blocks)).
 - *What it does not give.* A position and its mirror image are exact
   negatives only about a plane at `lo = 0`, and positions moved in their
-  last bits when this rule replaced `origin + (I − 1)·h` (M22 step 1 in
+  last bits when this rule replaced `origin + (I − 1)·h`, and again when
+  the `fma` replaced the separate product and sum (M22 step 1 in
   [HISTORY.md](HISTORY.md#m22--closed-blocks)).
 
 **Invariant.** **`N ≥ 2G_d + 2c_d`** is checked when the field set is
@@ -508,8 +535,10 @@ its operators move whole elements between levels.
 - *Every position goes through `nodeposition(lo, h, B, I, c, nodes)`*
   (*Positions* above). `coordinates`, the four `fill_by_coordinates!`
   kernels, the six boundary-hook kernels, the glue's ghost positions and
-  appendix kernel, the flagging sweep of `firing_boxes` and the fold
-  kernel all call it, and no other function forms a position from an
+  appendix kernel, the flagging sweep of `firing_boxes`, the fold
+  kernel and the `exclude` test's stencils (`stencil_position` for an
+  equally spaced stencil and for an `ElementStencil`) all call it, and
+  no other function forms a position from an
   index, so that a site which misses the element case fails rather than
   computing cell centres. For an element set owned point `I` is node `i =
   (I − 1) mod (P+1)` of element `q = (I − 1) ÷ (P+1)`, at `lo + ((B +
@@ -3861,7 +3890,7 @@ multi_indices(Val(D), maxorder)
   2.92, 3.90 and 5.02 for `P = 1…4`; `∂ₓ` at 0.94, 1.98, 3.00 and 4.13;
   `∂ₓ²` at 1.05, 2.08 and 2.94 for `P = 2…4`; `∂ₓ∂ᵧ` at 0.89, 2.17,
   2.86 and 4.07. The `exclude` test reads the nodes' positions through
-  `ElementStencil`, `nodeposition`'s expression.
+  `ElementStencil`, formed by `nodeposition`.
 - **It reads no ghosts,** so it needs no `fill_ghosts!`, reads a state
   vector as well as the working array, and picks up none of the
   exchange's error at a coarse-fine face. The state-vector form,

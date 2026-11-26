@@ -109,6 +109,60 @@ position_cases(D) = vcat([(cellcentered(D), 0), (vertexcentered(D), 0)],
     end
 end
 
+# The exact place of stored index `idx` of block `b` along each dimension,
+# as a `BigFloat` wide enough to hold it: the patch's low corner `lo` plus
+# the point's offset times the spacing `h`, with `lo` and `h` the
+# floating-point numbers they are. The offset is the integer `k` or `k +
+# ½` — as `T` holds it, which past `2²⁴` in `Float32` it does not
+# exactly, and no single rounding can then give the exact place — or for
+# an element's interior node `T(B + q(P+1)) + oᵢ`, the sum `nodeposition`
+# rounds before its `fma` (an offset that is not an integer cannot be
+# added without a rounding of its own).
+function exact_position(fs::FieldSet{T}, b, idx) where {T}
+    forest = fs.forest
+    k = blockkey(fs, b)
+    B, lo = TreeAMR.block_base(forest, k), TreeAMR.block_low(T, forest, k)
+    h = BigFloat(spacing(T, forest, k))
+    c = staggers(fs)
+    P1 = fs.P + 1
+    nodes = fs.P == 0 ? nothing : TreeAMR.element_offsets(T, fs.P)
+    return ntuple(length(idx)) do d
+        I = idx[d] - fs.G[d]
+        if fs.P == 0
+            return BigFloat(lo[d]) + BigFloat(T(2 * (B[d] + I - 1) + 1 - c[d])) * (h / 2)
+        end
+        I <= 0 && return BigFloat(lo[d]) + BigFloat(T(B[d])) * h
+        q, i = divrem(I - 1, P1)
+        i == P1 - 1 && return BigFloat(lo[d]) + BigFloat(T(B[d] + (q + 1) * P1)) * h
+        return BigFloat(lo[d]) + BigFloat(T(B[d] + q * P1) + nodes[i + 1]) * h
+    end
+end
+
+@testset "Positions are correctly rounded: D=$D, $T" for D in (1, 2, 3),
+                                                         T in (Float64, Float32)
+    # Guards a position rounded twice, as `lo + k·h` formed by a
+    # multiplication and then an addition is, or fused on one backend and
+    # not on another: every stored position must be the exact `lo + k·h`
+    # (`lo + (k + ½)·h` cell-like) rounded once to `T`, which is what an
+    # explicit `fma` gives on the host and on every device alike. Near
+    # `lo + k·h = 0` the twice-rounded form was off by up to 13 ulps on
+    # CUDA, which fuses.
+    forests = Any[position_forest(T, D)]
+    D == 1 && push!(forests, deep_forest(T, 21))
+    D == 2 && push!(forests, patch_position_forest(T))
+    setprecision(BigFloat, 512) do
+        for forest in forests, (C, P) in position_cases(D)
+            fs = position_set(forest, 1, C, P; G=P == 0 ? 2 : 1)
+            bad = 0
+            for b in 1:nblocks(fs), I in CartesianIndices(size(fs.work)[1:D])
+                x = coordinates(fs, b, Tuple(I))
+                bad += x === map(T, exact_position(fs, b, Tuple(I))) ? 0 : 1
+            end
+            @test bad == 0
+        end
+    end
+end
+
 @testset "Copies agree where the integer coordinate is not exact in the type: $T" for
     T in (Float32, Float64, Float32x2)
     # Guards the argument that the copies need no exact `T(k)`: past
@@ -201,8 +255,8 @@ end
                 p = patch(forest, k)
                 lo = T(TreeAMR.patch_extents(forest, p)[d][1])
                 K = TreeAMR.patch_roots(forest, p)[d] * forest.N << level(k)
-                @test ext[d][2] === lo + T(K) * spacing(T, forest, k)
-                @test ext[d][2] === lo + T(K >> level(k)) * spacing(T, forest, 0)
+                @test ext[d][2] === fma(T(K), spacing(T, forest, k), lo)
+                @test ext[d][2] === fma(T(K >> level(k)), spacing(T, forest, 0), lo)
             end
         end
     end

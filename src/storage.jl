@@ -991,20 +991,29 @@ entry of [`block_lows`](@ref)), its level's spacing `h` (of
 [`block_spacings`](@ref)) and its integer corner `B` (of
 [`block_bases`](@ref)). `c` is the set's stagger along the dimension, 1
 vertex-like and 0 cell-like, and `nodes` is `nothing` for an equally
-spaced set.
+spaced set, else the element's node offsets (a vector, or a tuple in a
+stencil).
 
 The point's integer coordinate `k = B + I − 1` counts spacings of its
 level from the patch's low face, and the position is
 
-    lo + k·h              (vertex-like)
-    lo + (k + ½)·h        (cell-like)
+    fma(T(k), h, lo)            lo + k·h        (vertex-like)
+    fma(T(2k + 1), h/2, lo)     lo + (k + ½)·h  (cell-like)
 
-a conversion, a multiplication and then an addition. Every block that
-holds a point at one level has the same `k`, `lo` and `h`, and a level up
-`k` halves and `h` doubles, both exactly, so every copy of a point — on
-a shared plane, in a ghost, a coarse point under a fine one — is at one
-position bit for bit, even where `k` is too large for the type to hold
-exactly. This is the only function that forms a position from an index:
+each correctly rounded: the product is exact inside the `fma` and the sum
+is rounded once, wherever `T(k)` (or `T(2k + 1)`) is exact — `k < 2⁵³` in
+`Float64`, `2²⁴` in `Float32`. The cell-like form takes the odd integer
+`2k + 1` and the half spacing, which is exact, rather than `T(k) + ½`,
+which loses the half one bit earlier. An explicit `fma`, not a multiply
+and an add, because a device may fuse the two of its own accord (CUDA
+does) and the host does not: with the `fma` written out, every backend
+rounds once and forms the same bits. Every block that holds a point at
+one level has the same `k`, `lo` and `h`, and a level up `k` halves and
+`h` doubles, both exactly, so every copy of a point — on a shared plane,
+in a ghost, a coarse point under a fine one — is at one position bit for
+bit, even where `k` is too large for the type to hold exactly. A type
+without an IEEE `fma` takes the product and then the sum (`position_fma`).
+This is the only function that forms a position from an index:
 [`coordinates`](@ref), [`fill_by_coordinates!`](@ref), the boundary
 hooks, [`firing_boxes`](@ref) and the folds all call it, and a kernel
 that forms a position of its own should too. See "Positions" under
@@ -1012,29 +1021,50 @@ that forms a position of its own should too. See "Positions" under
 
 For an element set (M16) `nodes` are the node offsets in spacings from
 an element's low face, and owned point `I` is node `i = (I-1) mod (P+1)`
-of element `q = (I-1) ÷ (P+1)`, at `lo + ((B + q(P+1)) + oᵢ)·h`. The last
+of element `q = (I-1) ÷ (P+1)`, at `fma(T(B + q(P+1)) + oᵢ, h, lo)`: the
+offset is not an integer, so its sum with the integer part rounds once
+before the `fma` does, and the halving of the cell-like form would gain
+nothing. The first node (`o₀ = 0`) is the integer form exactly. The last
 node, whose offset is exactly `P + 1`, is formed as the next element's
-first, at `lo + (B + (q+1)(P+1))·h`, so that the two face nodes at one
-position have the same integer and get the same bits. A ghost of an
+first, at `fma(T(B + (q+1)(P+1)), h, lo)`, so that the two face nodes at
+one position have the same integer and get the same bits. A ghost of an
 element set sits at the face: `lo + B·h` below and `lo + (B + N)·h`
-above.
+above, by the same integer form.
 """
 @inline function nodeposition(lo, h, B::Integer, I::Integer, c::Integer, ::Nothing)
-    # Not `uniform_shift` subtracted from `I`: the shift goes into the
-    # integer for a vertex, so that `k` is the same integer on every
-    # level that holds the point, and the half of a cell-like dimension
-    # is added after the conversion, exactly.
-    k = oftype(h, B + I - 1)
-    return lo + (c == 1 ? k : k + one(h) / 2) * h
+    # Not `uniform_shift` added to `k`: the shift goes into the integer,
+    # `2k + 1` half spacings for a cell-like dimension, so that the one
+    # rounding is the `fma`'s. One conversion, of whichever integer the
+    # stagger picks: converting in each branch made a `Float32` fill of
+    # the positions on an H200 take 214 µs against 174 (HISTORY.md, M22
+    # step 1).
+    k = B + I - 1
+    m, s = c == 1 ? (k, h) : (2 * k + 1, h / 2)
+    return position_fma(oftype(h, m), s, lo)
 end
 @inline function nodeposition(lo, h, B::Integer, I::Integer, c::Integer,
-                              nodes::AbstractVector)
-    I <= 0 && return lo + oftype(h, B) * h
+                              nodes::Union{AbstractVector,Tuple})
+    I <= 0 && return position_fma(oftype(h, B), h, lo)
     P1 = length(nodes)
     q, i = divrem(I - 1, P1)
-    i == P1 - 1 && return lo + oftype(h, B + (q + 1) * P1) * h
-    return lo + (oftype(h, B + q * P1) + @inbounds(nodes[i + 1])) * h
+    i == P1 - 1 && return position_fma(oftype(h, B + (q + 1) * P1), h, lo)
+    return position_fma(oftype(h, B + q * P1) + @inbounds(nodes[i + 1]), h, lo)
 end
+
+# The one rounding of a position, `x·y + z` (CODE.md, "Positions" under
+# "Centerings"). An IEEE type takes `fma`, which rounds once on the host
+# and on every device alike; a CPU without hardware FMA computes the same
+# bits in software, slowly. Any other type — `MultiFloats`' `Float32x2`
+# and `Float64x2`, whose `fma` is `Base`'s "not defined" error — takes the
+# product and then the sum. Its copies of a point still agree: they all
+# evaluate the same expression on the same `k`, `lo` and `h`, and the
+# coarse copy's `T(k)·2h` is the fine one's `T(2k)·h` because the
+# product scales by two exactly. Such a type is a host type here; no
+# device test uses one. A local function rather than a method of
+# `Base.fma` for a type that is not ours.
+@inline position_fma(x::Base.IEEEFloat, y::Base.IEEEFloat, z::Base.IEEEFloat) =
+    fma(x, y, z)
+@inline position_fma(x, y, z) = x * y + z
 
 # The node offsets the position kernels of a set of order `P` read, in
 # `T`, or `nothing` for a set without elements (`P = 0`), on the host.
