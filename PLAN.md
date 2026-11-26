@@ -688,12 +688,11 @@ Steps:
    ("Regridding" under [Closed blocks](CODE.md#closed-blocks)); the
    record is M22 step 6 in
    [HISTORY.md](HISTORY.md#m22--closed-blocks).
-7. **Seams.** Quarter and half turns on the ordinary partition, the
-   seam's copies under rule 2 and the axis under rule 3; `seam_shift`
-   deleted. *Done when* the half plane's two seam halves agree to
-   rounding on the refined mesh (9 × 10⁻⁶ today), the full plane is an
-   oracle to rounding there for a vertex-like `d2`, and a quarter
-   domain's norm is a quarter of the full one's.
+7. **Seams** — done on `m22`: quarter and half turns on the ordinary
+   partition, the seam's copies under rule 2 and the axis under rule 3
+   (`seam_shift` had already gone in step 2). The design text is
+   *Seams* under [Closed blocks](CODE.md#closed-blocks), the record M22
+   step 7 in [HISTORY.md](HISTORY.md#m22--closed-blocks).
 8. **Glues.** A glue that copies, in any pairing and with reversed
    axes, the refusals lifted; a kinked glue without the appendix, with
    stage A; the appendix's code and names deleted. The plan settles:

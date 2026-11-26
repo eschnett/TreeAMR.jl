@@ -374,7 +374,9 @@ the one that says why.
   schedule's type must not depend on `P`, so that cell and vertex sets
   compile none of it. Compare `--trace-compile-timing` of
   `test/mpi_workload.jl` against `main` for any change to a launch path
-  ("The copy kernels on a device").
+  ("The copy kernels on a device"). A rotating seam's axis projection
+  (M22) is the one fill kernel that is not `transfer_kernel!`, behind a
+  barrier ("Seams" under "Closed blocks").
 - **The copy kernels launch flat on a device, shaped on the CPU**; a new
   copy-like kernel goes the same way. KA's CPU emitter only rewrites
   `@index` at statement level, so assign it before passing it to a
@@ -402,7 +404,7 @@ the one that says why.
   plane is projected onto each variable's parity by stage P, after stage
   W and before stage 0. `N ≥ 2G` in every dimension. A sum or a count
   over such a set takes `primaries = true`. What later steps rebuild
-  (seams, glues) is refused with the step's
+  (glues) is refused with the step's
   name, and its old code errors if reached: do not route around a
   refusal ("Closed blocks", and the pending tests in
   `test/helpers/pending.jl`). Read the seam through `seam_plane`,

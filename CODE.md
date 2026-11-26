@@ -17,8 +17,9 @@ layout, stage 0 and the primary mask on uniform meshes with periodic and
 outer faces — is implemented there, and so are step 3, coarse-fine faces
 on meshes refined once and left alone, with the interface restriction
 as `unify!` on a flux set, and step 4, reflecting and outflow faces with
-a symmetric wall and no `walls` keyword, and step 6, regridding; step
-5, the first measurement, waits for its cluster runs; what later steps rebuild is refused for a set
+a symmetric wall and no `walls` keyword, step 6, regridding, and step
+7, rotating seams; step 5, the first measurement, waits for its cluster
+runs; what step 8 rebuilds (glues) is refused for a set
 with a vertex-like dimension until then (the list is under
 [Closed blocks](#closed-blocks)). Next is visualization export (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
@@ -603,7 +604,7 @@ multi-patch forest" under [Domain and boundaries](#domain-and-boundaries)).
 
 *(M22 in [PLAN.md](PLAN.md#m22--closed-blocks); the decisions are
 recorded under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
-**On the `m22` branch, steps 1 to 4 and 6 are implemented**: positions
+**On the `m22` branch, steps 1 to 4, 6 and 7 are implemented**: positions
 from integer coordinates (*Positions* under [Centerings](#centerings));
 the closed layout, stage 0, the primary mask, `unify!`, the trapezoid's
 weights and the hook at an outer face, evolved or prescribed, on
@@ -614,14 +615,15 @@ and left alone, with the interface restriction as `unify!` on a flux set
 (*What step 3 implements* below); and reflecting and outflow faces, the
 mirror and the clamp about the wall plane and stage P (*Walls* and *Stage
 P* below); and regridding, flagging over the closed box and the kept
-blocks' copies over the created ones (*Regridding* below). The rest of
-this section is **(proposed)**,
+blocks' copies over the created ones (*Regridding* below); and rotating
+seams, the copies of a seam point one number through the turn and the
+axis projected (*Seams* below). The rest of this section is
+**(proposed)**,
 and until its step lands a set with a vertex-like dimension is refused,
 with an `ArgumentError` naming the step:
 
 - by `GhostSchedule`, `UnifySchedule` and `primary_mask`, inside their
-  collective checks (`check_closed_blocks`): a rotating seam or half
-  turn, and so a `RotationPair` (step 7), and a forest of patches with a
+  collective checks (`check_closed_blocks`): a forest of patches with a
   glued face (step 8), and so by `regrid!` with the set's schedule,
   `adapt_to_initial_data!` and `firing_boxes`, which ask the same
   question. `fs => nothing`, which only resizes a set, is accepted.
@@ -1044,11 +1046,67 @@ for a vector (one variable odd a dimension); stage 0 as the outer box's,
 7.2 ms against 5.3 and 6.9 ms (laptop).
 
 **Seams.** The axis map reverses a stored index as `len + 1 − k`, which
-now carries an own range onto an own range, so a half turn's slab has
-the ordinary partition and `seam_shift` goes, in all its states. A
-seam's two planes are exact copies under the turn (rule 2), the axis is
-its own image (rule 3), and a norm counts the seam with half weight
-(below), so a quarter domain's norm is a quarter of the full one's.
+carries an own range onto an own range, so every seam region, a half
+turn's slab included, has the ordinary partition, and `N ≥ 2G` is the
+invariant there as elsewhere. A seam point's copies are an **orbit** —
+on a quarter turn's two faces `(0, y)` and `(y, 0)`, on a half turn's
+one face `(0, y)` and `(0, lo + hi − y)` — and they are one number
+through the turn (rule 2):
+
+- *The primary* is decided by `piece_primary` from the copies
+  `piece_copies` lists across the seam, each with its orientation, its
+  class taken back into its own block's frame (`real_classes`), and the
+  real position of the point there (`real_position`): the finest level
+  holding any member first, then the member at the lexicographically
+  greatest real position, `d1` first, then the class rule in the real
+  frame. Off the seam every copy is at one position, so the second step
+  decides nothing; on it, it picks the `d2` face of a quarter turn and
+  the upper half of a half turn's. The rule asks for no index and no
+  frame, so every block holding a point, and every rank, decides alike.
+  It only moves rounding: the two members are computed from stencils
+  that are each other's images, so a covariant right-hand side evolves
+  them alike to rounding, and the choice says which of the two is kept.
+  Stage 0's transfers across the seam carry the orientation, so the
+  kernel reads them through the axis map, `rotvars` and the sign column,
+  as every turned transfer does, and `ghost_plane_parts` copies a
+  turned diagonal the same way.
+- *The axis* is its own image (rule 3): each variable there becomes the
+  mean of its images under the orbit's powers of the set's map, `¼ Σ_r
+  Qʳ u` for a quarter turn, `½ (u + Q u)` for a half turn, summed in
+  pairs a half turn apart, `(t₀ + t₂) + (t₁ + t₃)`, so that a component
+  the half turn negates cancels exactly and the projection is
+  idempotent bit for bit. A scalar is untouched, a turned vector's
+  in-plane components vanish, and a tensor's are averaged. It runs in
+  stage P after the mirror's projection, which it commutes with, on the
+  axis points the schedule records (`AxisPoints`: the primaries of the
+  axis pieces of a set vertex-like in both plane dimensions), reading the
+  set's map at fill time, so a schedule is tied to no map; it is not
+  launched for a set whose map turns nothing. It is the one kernel of
+  the fill that is not `transfer_kernel!` ("One kernel for every
+  transfer" under [Code structure](#code-structure)): a variable there
+  is written from several, which an in-place transfer would race on, so
+  it gathers into a buffer and writes back, behind a barrier, so that a
+  forest without an axis compiles none of it.
+- *Counting*. With the trapezoid's weights a seam point is half on each
+  of its faces, and its orbit's halves make one point, so
+  `volume_weighted_norm` and `total_mass` need no seam mask: a
+  quadrant's `total_mass` is a quarter of the full plane's, a half
+  plane's a half, and the normalized norm is the full plane's, as the
+  bitant's was under a mirror. A sum or a count with `primaries = true`
+  takes each orbit once, the independent values: a quadrant of a `(2n +
+  1)²` grid of nodes holds `n² + n + 1` orbits, the `(n + 1)²` nodes less
+  the `n` of one face, the axis counted once.
+- *Pairs*. A set whose layout is not symmetric in the plane and is
+  vertex-like along `d1` or `d2` has its seam plane's copies in its
+  partner, `F_{d1}(0, y) = −F_{d2}(y, 0)`, and the orbit rule may make
+  the partner's copy the primary. So such a set is filled, unified and
+  regridded only as a `RotationPair` (`seam_partnered`), its stage 0 of
+  odd orientation reading the partner through the pair's tables; a flux
+  with `G = 0` included, which before closed blocks needed no partner.
+  A member's mask marks its own primaries, so a sum over one member
+  alone with `primaries = true` leaves out its seam plane where the
+  partner holds the primary, and the two members' sums together count
+  each orbit once.
 
 **Glues.** A glue that copies carries a closed range onto a closed
 range whatever it reverses and whichever faces it joins, so the two
@@ -2183,27 +2241,13 @@ high ghosts facing the target are the real low ghosts beyond the seam —
 and these are filled in phase 1 or in an earlier step of the sweep, as
 for any prolongation.
 
-*Two owned seam planes*. In a vertex-like set the low plane
-of `d1` and the low plane of `d2` are both owned, as every low boundary
-plane is under M8's half-open ownership, and both are evolved, although
-they are the same points under `R`. The alternative, deriving one from
-the other as M10 derives the upper wall point, would have the blocks on
-one seam face own `N − 1` points across it, and the uniform state
-layout would be gone; that is the reason M8 gave for accepting
-asymmetric walls. Under conformity the two copies see same-level
-ghosts that are each other's images, so a covariant right-hand side
-evolves them identically: to roundoff in general, and bit for bit when
-its arithmetic is itself invariant under the rotation. IEEE addition
-commutes, so `a + b` against `b + a` is exact, but a longer sum taken
-in another order is not. The wave test asserts what it measures. The
-axis, a point in 2D and a line along the third dimension in 3D, is
-its own image and is owned once, by the blocks along it. A sum
-over owned points, such as `volume_weighted_norm`, holds the seam's
-points once per face, so it is not exactly a quarter of the full
-domain's. A vertex-like set carries no conserved total (the
-conservative family takes point values along a stagger), so this is
-recorded rather than corrected. The choice is about ownership only and assumes
-nothing about aligned axes.
+*The seam planes on closed blocks*. In a vertex-like set the low plane
+of `d1` and the low plane of `d2` are both own planes, every face plane
+being a block's own, and they are the same points under `R`: copies,
+one number through the turn after every fill, as *Seams* under
+[Closed blocks](#closed-blocks) says, the axis projected onto the turn's
+invariant part. The wave test measures the two planes 0 apart, and a
+quadrant's norm a quarter of the full plane's.
 
 *Asymmetric layouts, and pairs*. The virtual frame needs the rotated source to have the target's
 layout. A set whose layout is symmetric under exchanging `d1` and `d2`
@@ -2313,39 +2357,16 @@ covers:
   dimensions normal to the seam, which is why a rotated copy reads only
   the real source's points nearest the seam (*Phase 1 stays race free*
   above). A half turn also flips `d2`, which is tangential to the seam.
-  A cell-like `d2` is unaffected: the flip maps the owned range onto
-  itself. In a vertex-like `d2` half-open ownership does not survive
-  the flip. A real block owns `[gN, (g+1)N)` along `d2`, and its image
-  owns the high-closed `((n₂−1−g)N, (n₂−g)N]`. So with the ordinary
-  target ranges a seam copy would read the real source's shared plane
-  `G+N+1`: that is a ghost written in the same phase, or, at the high
-  face of `d2`, the hook's.
+  The flip `k ↦ n + 1 − k` maps a block's own range onto itself, the
+  closed range along a vertex-like `d2` (M22) as the cell range along a
+  cell-like one, so the seam slab takes the ordinary partition: a copy
+  reads the real source's own points, final after stage 0, and a
+  restriction, injection along a vertex-like `d2`, its children's, both
+  inside the own range by `N ≥ 2G`. A prolongation runs in phase 2 and
+  reads filled ghosts anyway. (Under half-open ownership the flip did
+  not carry owned points onto owned points, and the slab was shifted one
+  plane, `seam_shift`; closed blocks removed it, HISTORY.md, M22 step 2.)
 
-  So in the seam slab (`δ_{d1} = −1`), along a vertex-like `d2`, the
-  target's partition is the image of the real blocks', with every
-  boundary one plane up:
-  - `δ_{d2} = −1` covers `1 : G+1`;
-  - `δ_{d2} = 0` covers `G+2 : G+N+1`, its halves meeting between
-    `G+1+N/2` and `G+2+N/2`;
-  - `δ_{d2} = +1` covers `G+N+2 : N+2G+1`.
-
-  Each region is then the image of owned points of one real block. A
-  copy reads `G+1 … G+N`, `N+1 … N+G` or `G+1 … 2G+1` of its source,
-  and a restriction, which is injection there, reads `G+1 … G+N−1`,
-  `N+1 … N+G−1` or `G+1 … 3G+1`. All of these are owned by
-  `N ≥ 2G + 2`. A prolongation runs in phase 2 and reads filled ghosts
-  anyway. The shift changes target ranges, so it is part of the
-  `GroupKey` (`shift`), and with it of the message layout. The hook's
-  regions in the slab take the same partition: the corner beyond the
-  low face of `d2` then holds the plane `G+1` at negative `a`, the image
-  of the high face's hook-filled plane.
-
-  Under symmetric walls (AMR-8) the image of plane `G+N+1` of a block on
-  the high face of `d2`, in the slab, is the bottom block's low wall,
-  which the fill writes from the hook. So on that block the upper
-  boundary stays where it was: `δ_{d2} = 0` covers `G+2 : G+N`, and the
-  hook's `δ_{d2} = +1` region covers `G+N+1 : N+2G+1`. The lower
-  boundary moves all the same (`shift` state 2, against 1).
 - *Hook regions.* A region whose image leaves the domain leaves through
   a face of `d2` (the low or the high one, since `P` exchanges them) or
   through the high face of `d1`, and all three are outer. So the hook
@@ -2353,32 +2374,15 @@ covers:
   outside the half plane, and a hook covariant under the half turn,
   such as `boundary_by_coordinates` of covariant data, gives there what
   the image would get, as for a quarter turn.
-- *Two owned seam half-planes.* In a vertex-like `d1` the seam plane
-  `a = 0` is owned and evolved by the blocks on it, and its points at
-  `x_{d2}` and `lo_{d2} + hi_{d2} − x_{d2}` are each other's images.
-  The axis line, `a = 0` on the centre plane of `d2`, is its own image,
-  and is owned once, by the block above it. Unlike a quarter turn's two
-  seam planes, the two halves do not stay each other's image in general,
-  when `d2` is vertex-like too. The turn reverses `d2` along the seam,
-  and half-open ownership is not symmetric under that reversal in two
-  places:
-  - an outer face of `d2` under half-open walls, where the low wall is
-    evolved and the high one is the hook's;
-  - a coarse-fine face along the seam, whose shared point belongs to its
-    upper block, which the turn makes the lower one.
-
-  On a uniform half plane with symmetric walls they evolve identically,
-  bit for bit; elsewhere they drift apart by the scheme's error. The
-  wave test measures 9 × 10⁻⁶ after 143 steps on the refined half plane,
-  against a covariance defect of 1 × 10⁻³ in the full plane's own
-  solution. This is the **(open)** asymmetry of vertex-like sets at
-  coarse-fine faces under [Centerings](#centerings), which the flip of
-  `d2` brings onto the seam. For the same reason a vertex-like `d2`
-  makes the full plane a test oracle only to interpolation accuracy
-  where levels meet along `d2` in the seam slab. There a point the full
-  plane interpolates is one the half plane owns, and the other way
-  round at its image. A cell-like `d2` agrees with the full plane to
-  roundoff.
+- *The seam half-planes on closed blocks.* In a vertex-like `d1` the
+  seam plane `a = 0` is own to the blocks on it, and its points at
+  `x_{d2}` and `lo_{d2} + hi_{d2} − x_{d2}` are an orbit: copies, one
+  number through the half turn, the upper one the primary; the axis
+  line, `a = 0` on the centre plane of `d2`, is its own image and is
+  projected (*Seams* under [Closed blocks](#closed-blocks)). The wave
+  test measures the two halves 0 apart on the refined half plane (9 ×
+  10⁻⁶ under half-open ownership), and the full plane is an oracle to
+  rounding for a vertex-like `d2` as for a cell-like one.
 
 A periodic `d2` would be consistent with the flip, which is a symmetry
 of the torus, and reflecting or outflow faces of `d2` or the high face
@@ -6728,7 +6732,11 @@ The ideas that span several files and are easy to violate:
   and for the same reason a schedule's type must not depend on `P`
   ("Element-only code goes behind a barrier"). Compare
   `--trace-compile-timing` of `test/mpi_workload.jl` against `main` for
-  any change to a launch path.
+  any change to a launch path. The one kernel of a fill that is not
+  `transfer_kernel!` is the axis projection of a rotating seam (M22,
+  *Seams* under [Closed blocks](#closed-blocks)): it writes a variable
+  from several of one point, which an in-place transfer would race on,
+  so it gathers into a buffer and writes back, behind a barrier.
 - **The copy kernels launch flat on a device, shaped on the CPU**
   (see "The copy kernels on a device"). `transfer_kernel!`,
   `scatter_kernel!` and `gather_kernel!` take a `shape` first and read

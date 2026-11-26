@@ -107,8 +107,8 @@ interpolation through the atlas, for the kinked maps of a cubed sphere
 being built on the branch `m22`, which this documentation describes:
 step 2, the closed layout on uniform meshes with periodic and outer
 faces, step 3, coarse-fine faces on meshes refined once, step 4,
-reflecting and outflow faces, and step 6, regridding, are implemented
-there. Next is visualization export (M9b).
+reflecting and outflow faces, step 6, regridding, and step 7, rotating
+seams, are implemented there. Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -207,8 +207,10 @@ primary, and a coarser copy takes its value by the set's restriction, so
 a fine block evolves its whole closed box and a refined region is
 symmetric. At a reflecting face the ghosts are the mirror image about the
 wall plane and an odd variable is zero on it; at an outflow face they
-repeat the wall. Until later steps of M22 a set with a vertex-like
-dimension is refused across a rotating seam or a glue. After a regrid,
+repeat the wall. Across a rotating seam a seam point's copies are one
+number through the turn, and a point on the axis is projected onto the
+turn's invariant part. Until M22's step 8 a set with a vertex-like
+dimension is refused across a glue. After a regrid,
 rebuild the schedule and fill or [`unify!`](@ref) before
 [`gather!`](@ref): `regrid!` leaves stages P and 0 to the next fill, and a
 kept block's evolved value on a plane it shares with a created block is
@@ -433,8 +435,9 @@ A set whose layout is not symmetric under exchanging `d1` and `d2` — a
 face-centered `B_x` beside `B_y`, as in constrained transport — turns
 into its partner, so the two are filled together as a
 [`RotationPair`](@ref), each `rotation` naming the partner's variables.
-(On the `m22` branch a set with a vertex-like dimension is refused over a
-rotating seam until M22's step 7, so this example does not run there.)
+On closed blocks (M22) `B_x`'s copies of the seam plane are `B_y`'s
+turned, so the pair is unified ([`unify!`](@ref)) and regridded together
+too, a flux with no ghosts included.
 
 ```julia
 a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),

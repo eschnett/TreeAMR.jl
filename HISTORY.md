@@ -6002,6 +6002,136 @@ M12 was decided with Erik, after M7 and before M9b.
   third cycle, whose regrids leave concave corners (its `l2` sum
   0.300772035 → 0.300772032). The fill on `bench/nested.jl`'s mesh,
   serially, 357 → 322 ms (laptop noise; no slower).
+- *Step 7, rotating seams (2026-11-26).* Implemented on `m22`'s step-7
+  branch in four commits after a written plan reviewed as the earlier
+  steps' were, by Claude and not by Erik: the fill, `unify!` and the
+  regrid across a seam; the step-7 testsets and workload cases back; the
+  seam's own tests (`test/seam_tests.jl`); the documents. Glues (step 8)
+  were not waited for: the review's decision. The review's decisions on
+  the plan:
+  - *The orbit's primary* is the copy at the lexicographically greatest
+    real integer position at the finest level, then the class rule in the
+    real frame (`piece_primary`). Any fixed choice would do: the members
+    are computed from stencils that are each other's images, so the
+    choice only moves rounding, which CODE.md says.
+  - *The axis is projected by a dedicated kernel* in stage P, gathering
+    into a buffer and writing back, since a variable there is written
+    from several and an in-place transfer would race: behind a barrier,
+    not launched for a set whose map turns nothing, writing primaries
+    only, stage 0 carrying the result to the secondaries; CODE.md states
+    it as the one exception to "one kernel for every transfer".
+  - *No schedule is tied to the set's map*: the projection reads it at
+    fill time, in all three forms of `unify!` as in the fill.
+  - *Counting*: `primaries = true` counts each orbit once, and the norms
+    and `total_mass` take the trapezoid's weights with no seam mask;
+    CODE.md says both, with "a quarter of a `(2n+1)²` grid holds `n² + n
+    + 1` orbits", and what a `RotationPair` member's mask and sum mean
+    alone.
+  What the code showed against the plan:
+  - *`seam_shift` had already gone in step 2* (7136c4a, "Delete
+    half-open ownership's work-arounds"), with `shifted_range` and
+    `GroupKey.shift`; the step-2 record above did not say so, and
+    PLAN.md's step 7 still listed the deletion. Step 7 only corrected the
+    stale text about it in CODE.md (the half-turn slab's partition, "Two
+    owned seam planes", "Two owned seam half-planes").
+  - *The UnifySchedule's sign column ignored the orientation*: a turned
+    stage-0 transfer of a flux pair took the plain column, and the rigid
+    rotation's mass drifted by 2.6 until `factorcol` took the turn's
+    column as the GhostSchedule's does.
+  - *Summing the orbit in order left `−1.4 × 10⁻¹⁷`* of a negated
+    component on the axis, and a second fill moved it; summed in pairs a
+    half turn apart, `(t₀ + t₂) + (t₁ + t₃)`, the projection is exact and
+    idempotent bit for bit.
+  - *An asymmetric set over a quarter turn needs its partner wherever its
+    seam plane is its own*: a flux normal to `d1`, even with `G = 0`, has
+    its seam copies' primary possibly in the partner. So the fill,
+    `unify!` and `regrid!` refuse such a set alone (`seam_partnered`,
+    "Unify it as a `RotationPair`"), where before closed blocks a lone
+    flux was unified without one; the advection helpers unify their plane
+    fluxes as a pair.
+  - *The kept-over-created pass reads the new arrays*, after every set
+    has moved: across the seam a created copy's kept source may be the
+    partner's, which moves in the same regrid, so the pass runs once all
+    sets have their new storage, and `kept_candidates` takes the new
+    range. The lockstep helper's count of passes crossing ranks takes a
+    source's new owner accordingly.
+  - *A 3D face set normal to `z`* has its seam copies equal to rounding,
+    not bit for bit (≤ 16 ulp of the data): it is cell-like in the
+    plane, and a turned restriction averages its window in the reversed
+    order. A set vertex-like in the plane agrees bit for bit.
+  - *`ghost_plane_parts`' holder may lie across the seam*: it carries the
+    crossing, and the turned diagonal is copied through it; it refuses
+    only a glue (step 8).
+  - *Periodic positions are not wrapped* in `real_position`: a copy's own
+    position and its neighbours' were compared in different periods and
+    the closed periodic tests failed; without the wrap each copy's
+    position is its own block's, so every block holding the point lists
+    the same positions and decides alike, across a periodic face too.
+  Assertions that changed, none on a cell or element set's values: a
+  turned zero is `+0` (step 6's factor path), so the rotating and
+  half-turn exchange testsets and `mpi_tests`' Q2 and H2 counts assert no
+  `−0`; the seam partition counts the closed own range; a rotated level's
+  stage groups have stage 0 in front; the interface-schedule testsets,
+  which claimed nothing crosses the seam, become "a flux pair's `unify!`
+  makes the seam's copies one number through the turn" and its half-turn
+  counterpart, bit for bit, and their non-conforming-seam refusal goes,
+  since stage 0 takes the finest copy through the turn; the seam waves
+  measure their error after `unify!` of the state, as `wave.jl`'s does;
+  the zero-weight testset asserts a vertex prolongation's coincident
+  column only with a tangential dimension or a second ghost row (closed
+  blocks, step 3); the device MPI test counts one pending case (G2) and
+  seven stages with messages.
+  *Measured*, the done-when items against the half-open baseline 02bf9d1
+  (K = 1 / K = 2, 143 steps):
+  - the half plane's seam halves 8.9 × 10⁻⁶ / 4.7 × 10⁻⁵ apart → 0 over
+    79 pairs; the quadrant's seam planes 0 apart, as before;
+  - every stored point of the vertex half plane against the full plane,
+    7.8 × 10⁻⁵ / 2.1 × 10⁻⁴ → 7.6 × 10⁻¹⁴ / 3.1 × 10⁻¹³, the full
+    plane's covariance 1.0 × 10⁻³ / 3.5 × 10⁻³ → 1.1 × 10⁻¹³ / 3.2 ×
+    10⁻¹³; the vertex quadrant 1.9 × 10⁻⁴ / 3.2 × 10⁻⁴ → 1.6 × 10⁻¹³ /
+    4.3 × 10⁻¹³, its covariance 2.0 × 10⁻³ / 3.7 × 10⁻³ → 2.6 × 10⁻¹³ /
+    5.0 × 10⁻¹³; the cell sets unchanged (≤ 5.7 × 10⁻¹³);
+  - a uniform quadrant's `total_mass` against the full plane's,
+    0.29438 → 0.25000000000000006, and the normalized norm the full
+    one's to 64 ulp.
+  The wave's rates, `l2` / `linf`: the vertex quadrant 2.043 / 2.002 →
+  2.104 / 2.022 (K = 1) and 2.018 / 1.996 → 2.100 / 1.986 (K = 2); the
+  vertex half plane 2.011 / 1.923 → 2.095 / 2.022 and 2.020 / 1.981 →
+  2.024 / 1.974; the cell rates and the rigid rotations' drifts (6.1 ×
+  10⁻¹⁵ quarter, 8.1 × 10⁻¹⁵ half) unchanged. Schedules, vertex-centered,
+  `N = 16`, `G = 1`, the seam tests' forests (groups / transfers, 02bf9d1
+  → step 7): the 2D quadrant, 22 leaves, stage 0 none → 15 / 64, phase 1
+  22 / 135 and phase 2 22 / 22 unchanged, turned groups 13 → 16; the 2D
+  half plane, 44 leaves, stage 0 → 24 / 129, turned 9 → 13; the 3D
+  quadrant, 123 leaves, stage 0 → 184 / 999, phase 1 125 / 2010 → 180 /
+  2100, phase 2 268 / 706 → 303 / 713, turned 95 → 144; the 3D half
+  plane, 246 leaves, stage 0 → 225 / 1971, phase 1 103 / 4020 → 183 /
+  4200, phase 2 280 / 1412 → 372 / 1426, turned 53 → 109. The build,
+  0.3 / 0.4 / 5.5 / 7.8 ms → 0.7 / 1.1 / 19.8 / 37.9 ms; the same leaves
+  without a seam build in 0.6 / 1.1 / 19.1 / 36.9 ms, so the threefold
+  rise is closed blocks' stage 0 and `ghost_plane_parts` (steps 2–6), the
+  seam adding about 1 ms. `--trace-compile-timing` of the serial
+  `test/mpi_workload.jl` against aa30c96: 75.2 → 80.9 s in all,
+  TreeAMR's 29.4 → 31.5 s over 861 → 926 methods, with seven cases back
+  (Q2v, Q2, QE2, H2v, H2 and the two refusals); the axis kernels compile
+  once each, for the cases with an axis, `axis_project!` behind its
+  barrier (70 ms), and `transfer_kernel!`'s specializations go 55 → 59,
+  the cases' new set types.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite at eight
+  threads after the first commit, 189,715 tests and 314 pending, and
+  after the last, 198,351 and 98 pending in 16m10 at eight threads (the
+  machine shared) and 198,299 and 98 in 11m19 at one, both MPI jobs
+  included; `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32),
+  26,812 tests and 6 pending in 8m14; `mpi_device_tests.jl` on Metal at
+  two and three ranks, 61 tests, with Q2v and QP2 back and the stages
+  with messages seven; the docs build and their doctests.
+  What step 8 inherits: the glue refusal in `check_closed_blocks` and
+  `ghost_plane_parts`; its pending tests, 26 testsets, 8 loops and 4
+  workload cases (PR2v, PR2 vertex and G2 twice), step 7 having none
+  left; the orbit rule, which a glue's copies are to
+  take too, "the count's lowest patch" deciding where positions do not;
+  `seam_partnered`'s pairs, which a turn written as a glue entry (M21
+  step 3) must keep; and step 5's cluster numbers, still to be taken.
 
 ## Downstream checks
 
