@@ -58,6 +58,8 @@ struct UnifySchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},ST<:ExchangeStage
     unify::Vector{GRP}                           # stage 0's local groups
     stages::Vector{ST}                           # stage 0, one stage
     stateunify::Vector{ST}                       # stage 0 on a state, for `unify!`
+    selfimage::Vector{GRP}                       # stage P (M22), local
+    stateselfimage::Vector{GRP}                  # stage P on a state
 end
 
 isstale(s::UnifySchedule) = generation(s.forest) != s.generation
@@ -119,7 +121,9 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
     # dimension, the exact two-cell average, order 2, along a cell-like one.
     build(key) = ntuple(d -> unify_stencil(T, N, ghosts[d], stags[d], key, d, 2, UNBOUNDED),
                         D)
-    factorcol(key) = 0
+    # Stage P's groups take the parity projection's column; every other is
+    # a plain copy or restriction.
+    factorcol(key) = any(==(Int8(2)), key.mirror) ? mirrorcolumn(key.mirror) : 0
     axesof(key) = group_axes(forest, key)
     bounded(key) = UNBOUNDED
     stageof(key) = UNIFY_TAG
@@ -132,9 +136,19 @@ function UnifySchedule(fs::FieldSet{T,D}) where {T,D}
                           required=[UNIFY_TAG], axesof=axesof, bounded=bounded)
     stateunify = state_unify_stages(ST, GRP, T, backend, forest, owned, ghosts, pairs, sent,
                                     received, build, factorcol, axesof, bounded, stageof)
+    # Stage P (M22): a reflecting wall plane projected onto each variable's
+    # parity, at the primaries, before stage 0; a flux normal to the wall
+    # is odd there, and becomes zero.
+    ppairs = TransferPairs{D}()
+    for b in 1:nb
+        selfimage_sources!(ppairs, forest, stags, offset + b, b, fs.parity)
+    end
+    selfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol, axesof)
+    stateselfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol,
+                                      axesof; ghosts=ghosts)
     return UnifySchedule{T,D,floattype(forest),typeof(backend),GRP,ST}(
         forest, generation(forest), ghosts, fs.centering, backend, unify, stages,
-        stateunify)
+        stateunify, selfimage, stateselfimage)
 end
 
 function Base.show(io::IO, s::UnifySchedule{T,D}) where {T,D}

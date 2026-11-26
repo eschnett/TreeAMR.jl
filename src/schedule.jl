@@ -773,20 +773,25 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     phase1group::Int                             # the run that holds phase 1
     stateunify::Vector{ST}                       # stage 0 on a state, for `unify!`
     glueplan::GluePlan{T,D}                      # the ghosts interpolated across a glue
+    selfimage::Vector{GRP}                       # stage P (M22): wall-plane projection
+    stateselfimage::Vector{GRP}                  # stage P on a state, for `unify!`
+    parities::Any                                # the parities stage P was built for
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
         forest, generation, G, centering, P, walls, glue, operators, backend, unify,
         phase1, phase2, levels, boundaries, boundaryplan, stages, stagegroups,
-        stateunify, glueplan) where {T,D,R,BK,GRP,BP,ST}
+        stateunify, glueplan, selfimage, stateselfimage,
+        parities) where {T,D,R,BK,GRP,BP,ST}
         p1 = findfirst(r -> any(i -> stages[i].tag == PHASE1_TAG, r), stagegroups)::Int
         return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls, glue,
                                        operators,
                                        backend, unify, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
                                        group_locals(stages, stagegroups), p1,
-                                       stateunify, glueplan)
+                                       stateunify, glueplan, selfimage, stateselfimage,
+                                       parities)
     end
 end
 
@@ -2106,6 +2111,89 @@ function state_unify_stages(::Type{ST}, ::Type{GRP}, ::Type{T}, backend, forest:
     return ST[ST(UNIFY_TAG, ulocal, uremote)]
 end
 
+# --- Stage P: the self-image projection (M22) -----------------------------
+#
+# A point on a reflecting wall plane of a vertex-like dimension is its own
+# mirror image, and rule 3 of "One value per point" (CODE.md, "Closed
+# blocks") unifies it with that image: the mean of `u` and `S u`, which is
+# `(1 + σ)/2` times `u` for a variable of parity `σ` across the wall, and
+# the product of those over every reflecting wall a point lies on (the
+# mirrors commute). An even variable keeps its value; an odd one becomes
+# zero. Stage P writes it at the primaries only, after stage W and before
+# stage 0, which carries it to every other copy: a hook's prescribed
+# value on the mirror plane is projected too. Its transfers are copies of
+# a block's own wall pieces onto themselves through the factor column of
+# mirror state 2, which is that projection along each dimension marked 2
+# (`parityfactors`); they read only their own targets, write disjoint
+# ones, and need no message.
+#
+# The P transfers of global leaf `j`, local block `b`: every primary piece
+# of its closed box that lies on a reflecting wall plane, keyed by the
+# reflecting dimensions it lies on (`mirror` 2 there) and its span; the
+# pieces of one key merge into one box where they fill one. A piece whose
+# factor is 1 for every variable is left out when the variables' parities
+# are known (`parities`; `nothing` or empty when they are not), so a set of
+# even variables has no stage P.
+function selfimage_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
+                            j::Int, b::Int, parities) where {D}
+    any(==(1), c) || return nothing
+    k = forest.leaves[j]
+    face(d, s) = wall_direction(forest, k, ntuple(e -> e == d ? s : 0, D))[2][d]
+    refl = ntuple(d -> c[d] == 1 ? (face(d, -1) == ReflectingFace,
+                                     face(d, 1) == ReflectingFace) : (false, false), D)
+    any(r -> r[1] || r[2], refl) || return nothing
+    bits = primary_bits(forest, j, c)
+    bystate = Dict{NTuple{D,Int8},Vector{NTuple{D,Int}}}()
+    for cls in closed_pieces(c)
+        (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+        state = ntuple(d -> (cls[d] == 0 && refl[d][1]) || (cls[d] == 2 && refl[d][2]) ?
+                            Int8(2) : Int8(0), D)
+        any(!iszero, state) || continue
+        (parities === nothing || isempty(parities)) ||
+            any(p -> any(d -> state[d] == 2 && p[d] === OddParity, 1:D), parities) ||
+            continue
+        push!(get!(bystate, state, NTuple{D,Int}[]), cls)
+    end
+    zero = ntuple(_ -> 0, D)
+    for state in sort!(collect(keys(bystate)))
+        for spans in piece_box_spans(bystate[state], c)
+            key = GroupKey{D}(:copy, zero, zero, 0, state, Int8(0), Int8(0), spans)
+            push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(b)))
+        end
+    end
+    return nothing
+end
+
+# The span codes of pieces `pieces` (classes 0, 1, 2 per dimension): one
+# box where they fill their bounding box, and otherwise one a piece.
+function piece_box_spans(pieces::Vector{NTuple{D,Int}}, c::NTuple{D,Int}) where {D}
+    first_sub(x) = x == 0 ? 0 : x == 1 ? 1 : 4
+    last_sub(x) = x == 0 ? 0 : x == 1 ? 3 : 4
+    lo = ntuple(d -> minimum(p -> p[d], pieces), D)
+    hi = ntuple(d -> maximum(p -> p[d], pieces), D)
+    prod(ntuple(d -> hi[d] - lo[d] + 1, D)) == length(unique(pieces)) &&
+        return [ntuple(d -> span_code(first_sub(lo[d]), last_sub(hi[d])), D)]
+    return [ntuple(d -> span_code(first_sub(p[d]), last_sub(p[d])), D) for p in unique(pieces)]
+end
+
+# Stage P's groups, from its transfers in local block indices, through the
+# schedule's `build`, `factorcol` and `axesof`; with `ghosts` given, every
+# stencil moved down by it, for a state-shaped array.
+function selfimage_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend,
+                          pairs::TransferPairs{D}, build, factorcol, axesof;
+                          ghosts=nothing) where {GRP,T,D}
+    shifted(key) = ntuple(D) do d
+        st = build(key)[d]::Stencil1D{T,Vector{Int32},Matrix{T}}
+        ghosts === nothing && return st
+        Stencil1D{T}(st.targetfirst - ghosts[d], st.srcstart .- Int32(ghosts[d]),
+                     st.weights, st.unit, st.single)
+    end
+    return GRP[todevice(backend, TransferGroup{T,D}(key.kind, shifted(key), targets,
+                                                    sources, factorcol(key), Int8(0),
+                                                    axesof(key), UNBOUNDED))
+               for (key, (targets, sources)) in sort!(collect(pairs); by=first)]
+end
+
 # --- Stage groups ----------------------------------------------------------
 #
 # Which phase-2 stages run together on this rank (`GhostSchedule`'s
@@ -2483,13 +2571,14 @@ has_glue(conn::Patches) = any(e -> e.patch != 0, conn.glue)
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
                   walls=fs.walls, glue=fs.glue, atlas=atlas, T=T,
-                  backend=get_backend(fs.work))
+                  backend=get_backend(fs.work),
+                  parity=something(fs.parity, NTuple{D,Parity}[]))
 
 function GhostSchedule(forest::Forest{D,R}, operators::Operators;
                        G::Union{Integer,Tuple{Vararg{Integer}}},
                        centering=cellcentered(D), P::Integer=0,
                        walls::Symbol=:half_open, glue::Symbol=:copy, atlas=nothing,
-                       T::Type=R, backend::Backend=CPU()) where {D,R}
+                       T::Type=R, backend::Backend=CPU(), parity=nothing) where {D,R}
     N = forest.N
     # The build is collective over a distributed forest (M7): the ranks
     # agree that their forests and layouts are the same, and a refusal
@@ -2633,9 +2722,9 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # orientation and takes no sign, however its axes turn: a glued
     # transfer keeps 0 unless it is also mirrored.
     function factorcol(key)
-        parity = map(m -> m == 3 ? Int8(0) : m, key.mirror)
-        return any(!iszero, parity) || key.orientation != 0 ?
-               mirrorcolumn(parity) + 3^D * Int(key.orientation) : 0
+        signs = map(m -> m == 3 ? Int8(0) : m, key.mirror)
+        return any(!iszero, signs) || key.orientation != 0 ?
+               mirrorcolumn(signs) + 3^D * Int(key.orientation) : 0
     end
     axesof(key) = group_axes(forest, key)
 
@@ -2676,10 +2765,20 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # Which of them may run together here, from the host stencils.
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)
+    # Stage P (M22): the wall-plane projection, local to each block.
+    ppairs = TransferPairs{D}()
+    if closed
+        for b in 1:nb
+            selfimage_sources!(ppairs, forest, stags, offset + b, b, parity)
+        end
+    end
+    selfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol, axesof)
+    stateselfimage = selfimage_groups(GRP, T, Val(D), backend, ppairs, build, factorcol,
+                                      axesof; ghosts=ghosts)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, order, walls, glue, operators,
         backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups,
-        stateunify, glueplan)
+        stateunify, glueplan, selfimage, stateselfimage, parity)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}

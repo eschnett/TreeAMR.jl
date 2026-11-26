@@ -929,6 +929,10 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     # Stage W (M22): a hook that prescribes the wall writes the wall's
     # primaries first, so that stage 0 carries them to every other copy.
     boundary === nothing || wall_boundary!(fs, boundary, schedule, backend)
+    # Stage P (M22): a point on a reflecting wall plane, its own mirror
+    # image, projected onto its parity, at the primaries, after stage W so
+    # that a prescribed value there is projected too.
+    isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
     # Stage 0 (M22): every secondary copy of a shared point from its
     # primary, which no transfer of the stage writes; before anything
     # reads a copy.
@@ -1658,6 +1662,7 @@ fill is.
 """
 function unify!(fs::FieldSet, schedule::GhostSchedule)
     backend = check_fill(fs, schedule)
+    isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
     p1 = schedule.phase1group
     forest = schedule.forest
     sends = nothing
@@ -1671,6 +1676,7 @@ end
 
 function unify!(fs::FieldSet, schedule::UnifySchedule)
     backend = check_unify(fs, schedule)
+    isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
     forest = schedule.forest
     sends = run_stages!(fs, schedule.stages, 1:1, schedule.unify, forest, backend, nothing)
     sends === nothing || waitall(forest.comm, sends)
@@ -1685,6 +1691,9 @@ function unify!(v::AbstractVector, fs::FieldSet,
     isempty(stages) && return v
     A = statearray(v, fs)
     forest = schedule.forest
+    isempty(schedule.stateselfimage) ||
+        run_phase!(A, A, schedule.stateselfimage, fs.nvars, backend; factors=fs.factors,
+                   rotvars=fs.rotvars)
     sends = run_stages!(A, A, fs.nvars, fs.factors, stages, 1:1, stages[1].locals, forest,
                         backend, nothing, A, fs.rotvars)
     sends === nothing || waitall(forest.comm, sends)
@@ -1786,6 +1795,12 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "the field set has walls = :$(fs.walls) but this schedule was built for " *
         ":$(schedule.walls); the target ranges at a low domain face differ between " *
         "the two. Build one with `GhostSchedule(fs, operators)`."))
+    schedule.parities === nothing || isempty(schedule.parities) ||
+        schedule.parities == fs.parity ||
+        throw(ArgumentError(
+            "the field set's variables have the parities $(fs.parity) but this " *
+            "schedule was built for $(schedule.parities); its stage P projects the wall " *
+            "planes by them. Build one with `GhostSchedule(fs, operators)`."))
     fs.glue === schedule.glue || throw(ArgumentError(
         "the field set has glue = :$(fs.glue) but this schedule was built for " *
         ":$(schedule.glue); the ghosts across a glued face are copied under one and " *

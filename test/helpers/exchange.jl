@@ -209,6 +209,12 @@ exchange_hook() = CellBoundary((x, v, δ) -> v == 3 ? zero(x[1]) :
 # ends disagreed in length.
 function lockstep!(sets, scheds, backend; between=nothing)
     P = length(sets)
+    # Stage P (M22), local to each rank and before every stage, as the
+    # fill and `unify!` run it.
+    for r in 1:P
+        hasproperty(scheds[r], :selfimage) && !isempty(scheds[r].selfimage) &&
+            run_phase!(sets[r], scheds[r].selfimage, backend)
+    end
     tags = sort!(unique!([st.tag for sched in scheds for st in sched.stages]))
     stageat(r, tag) = (i = findfirst(st -> st.tag == tag, scheds[r].stages);
                        i === nothing ? nothing : scheds[r].stages[i])

@@ -241,15 +241,37 @@ end
     end
 end
 
-@pending 4 "$bname: symmetric walls are written on the device: T=$T, D=$D" for
+@testset "$bname: stage P projects the mirror planes on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
-    # The owned low wall planes, set to NaN, are written by the device's
-    # fill — mirrored, clamped or by the cell hook — before anything reads
-    # them, at every face kind.
-    for kinds in Iterators.product(ntuple(_ -> (:outer, :reflect_lo, :outflow_lo), D)...)
-        nnan, worst, _ = undefined_walls(kinds, vertexcentered(D); T=T, backend=backend)
-        @test nnan == 0
-        @test worst < 16 * gputol(T)
+    # The wall plane of a vertex-like dimension is the block's own on both
+    # sides (M22) and its own mirror image: the device's fill leaves an
+    # even variable there as the host's does, bit for bit, and projects an
+    # odd one onto zero, at every face kind and on a refined box.
+    for kinds in Iterators.product(ntuple(_ -> (:outer, :reflect_both, :outflow_both),
+                                          D)...)
+        forest = faces_forest(kinds; T=T, N=8)
+        parity = [ntuple(_ -> EvenParity, D),
+                  ntuple(d -> kinds[d] === :reflect_both ? OddParity : EvenParity, D)]
+        f = (x, v) -> oftype(x[1], v) + sum(d -> x[d] * x[d] / 8, 1:D)
+        works = map((CPU(), backend)) do be
+            fs = FieldSet{T}(forest, 2; G=1, centering=vertexcentered(D), parity=parity,
+                             backend=be)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                         boundary=boundary_by_coordinates(f))
+            Array(fs.work)
+        end
+        @test count(isnan, works[2]) == 0
+        @test maximum(abs.(works[1] .- works[2])) < 16 * gputol(T)
+        # The odd variable on every low reflecting wall plane, own points.
+        zeros_ok = true
+        for d in 1:D, b in 1:nleaves(forest)
+            kinds[d] === :reflect_both || continue
+            block_extent(forest, forest.leaves[b])[d][1] == forest.extents[d][1] || continue
+            own = ntuple(e -> e == d ? (2:2) : (2:(size(works[2], e) - 1)), D)
+            zeros_ok &= all(iszero, view(works[2], own..., 2, b))
+        end
+        @test zeros_ok
     end
 end
 

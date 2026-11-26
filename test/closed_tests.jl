@@ -6,6 +6,7 @@
 # the point is shared in.
 
 using TreeAMR: UNIFY_TAG, PHASE1_TAG, primary_bits, piece_copies, piece_primary,
+               facekind, ReflectingFace, ntransfers,
                closed_pieces, run_group!
 
 # The vertex-like centerings, and a cell-centered control.
@@ -481,33 +482,223 @@ end
     end
 end
 
-@testset "A refined box fills mirror-symmetrically to rounding: D=$D" for D in (1, 2, 3)
-    # Guards the fine block's authority on all its faces alike (M22 rule
-    # 1), the done-when of step 3: half-open ownership made a refined box
-    # asymmetric at 4.7e-5. Point-symmetric data on a box refined at two
-    # opposite corners, outer faces with the data as hook, order-4
-    # operators: every value must equal its mirror image's to rounding.
-    # The two sides sum a prolongation's window in mirrored order and form
-    # their positions as `lo + k h` from opposite ends, so the bound is a
-    # few roundings of the data's scale, `64 eps · max |f|` (an order-4
-    # window's weights sum in absolute value to 1.25 a dimension, 2 in 3D);
-    # what is exact is asserted separately: every copy is its primary's,
-    # bit for bit.
+# The face kinds of a box symmetric under its point reflection: every one
+# alike, and in 2D and 3D a mix of the three.
+mirror_boxes(D) = vcat([ntuple(_ -> k, D) for k in (:outer, :reflect_both, :outflow_both)],
+                       D >= 2 ? [ntuple(d -> (:reflect_both, :outflow_both, :outer)[d], D)] :
+                       [])
+
+# One variable even across every reflecting face and one odd there.
+mirror_parity(kinds) = [ntuple(_ -> EvenParity, length(kinds)),
+                        ntuple(d -> kinds[d] === :reflect_both ? OddParity : EvenParity,
+                               length(kinds))]
+
+@testset "A closed box fills mirror-symmetrically under every face kind: D=$D" for
+        D in (1, 2, 3)
+    # Guards a rule that depends on which way an axis runs (M22): under
+    # half-open ownership a refined box was asymmetric at 4.7e-5, and a
+    # reflecting or outflow box needed `walls = :symmetric`. Point-symmetric
+    # data on a box, uniform and refined at two opposite corners, outer,
+    # reflecting, outflow and mixed faces, the data as hook, order-4
+    # operators, bounded and not: every value must equal its mirror
+    # image's to rounding, with no keyword. The two sides sum a window in
+    # mirrored order and form their positions as `lo + k h` from opposite
+    # ends, so the bound is a few roundings of the data's scale, `64 eps ·
+    # max |f|` (an order-4 window's weights sum in absolute value to 1.25
+    # a dimension, 2 in 3D); what is exact is asserted separately: every
+    # copy is its primary's, bit for bit, and an odd variable is zero on
+    # its mirror plane.
     L = D == 1 ? 3 : 2
     f = point_symmetric(D, L)
-    ops = Operators(prolongation=4, restriction=4)
-    for C in closed_centerings(D)
-        forest = faces_forest(ntuple(_ -> :outer, D); N=8)
-        fs = FieldSet(forest, 1; G=ghosts_for(C, 4), centering=C)
+    for kinds in mirror_boxes(D), refined in (false, true), bounded in (false, true),
+        C in closed_centerings(D)
+        ops = Operators(prolongation=4, restriction=4, bounded=bounded)
+        forest = faces_forest(kinds; N=8, refined=refined)
+        fs = FieldSet(forest, 2; G=ghosts_for(C, 4), centering=C,
+                      parity=any(==(:reflect_both), kinds) ? mirror_parity(kinds) : nothing)
         fill_ghosts!(fill_by_coordinates!(f, fs), GhostSchedule(fs, ops);
                      boundary=boundary_by_coordinates(f))
         err, n = point_mirror_error(fs, L)
         scale = maximum(abs, fs.work)
         @test n > 0
         @test err <= 64 * eps() * scale
-        showerrors() && @info "mirror" D C err scale
+        showerrors() && @info "mirror" D kinds refined bounded C err scale
         exact, _, ok = refined_copies_ok(fs, closed_point_groups(fs); average=false)
         @test ok && exact > 0
+    end
+end
+
+# Every own point of `fs` on a reflecting wall plane of a vertex-like
+# dimension, as `(block, stored index)`.
+function mirror_plane_points(fs::FieldSet{T,D}) where {T,D}
+    forest = fs.forest
+    c = staggers(fs)
+    out = Tuple{Int,NTuple{D,Int}}[]
+    for b in 1:nblocks(fs), I in CartesianIndices(ntuple(d -> forest.N + c[d], D))
+        idx = ntuple(d -> I[d] + fs.G[d], D)
+        k = blockkey(fs, b)
+        onwall = any(1:D) do d
+            c[d] == 1 || return false
+            ext = block_extent(forest, k)[d]
+            (I[d] == 1 && ext[1] == forest.extents[d][1] && facekind(forest, d, 1) ==
+                                                            ReflectingFace) ||
+                (I[d] == forest.N + 1 && ext[2] == forest.extents[d][2] &&
+                 facekind(forest, d, 2) == ReflectingFace)
+        end
+        onwall && push!(out, (b, idx))
+    end
+    return out
+end
+
+@testset "An odd variable is zero on its mirror plane at every copy: D=$D" for D in (1, 2, 3)
+    # Guards stage P (M22 rule 3): a point on a reflecting wall plane is
+    # its own image, and an odd variable must vanish there at every copy,
+    # after a fill and after `unify!` on a state, at a coarse-fine line on
+    # the wall and where two reflecting walls meet; an even one is not
+    # written by it, and keeps the bits its primary holds.
+    kinds = ntuple(d -> d == 2 ? :outer : :reflect_both, D)
+    for refined in (false, true), C in closed_centerings(D)
+        forest = faces_forest(kinds; N=8, refined=refined)
+        fs = FieldSet(forest, 2; G=1, centering=C, parity=mirror_parity(kinds))
+        data = randn(Xoshiro(41 + D), size(fs.work))
+        fs.work .= data
+        sched = GhostSchedule(fs, closed_ops(1))
+        fill_ghosts!(fs, sched; boundary=boundary_by_coordinates((x, v) -> 0.0))
+        walls = mirror_plane_points(fs)
+        @test !isempty(walls) || all(d -> staggers(C)[d] == 0 || kinds[d] === :outer, 1:D)
+        @test all(((b, idx),) -> fs.work[idx..., 2, b] == 0, walls)
+        mask = primary_mask(fs)
+        @test all(walls) do (b, idx)
+            I = ntuple(d -> idx[d] - fs.G[d], D)
+            !isprimary(mask, I..., b) || bits(fs.work[idx..., 1, b]) == bits(data[idx..., 1, b])
+        end
+        u = statevector(fs)
+        u .= randn(Xoshiro(43 + D), length(u))
+        unify!(u, fs, sched)
+        A = statearray(u, fs)
+        @test all(((b, idx),) -> A[ntuple(d -> idx[d] - fs.G[d], D)..., 2, b] == 0, walls)
+    end
+end
+
+@testset "Stage P writes primaries only, and nothing for even variables: D=$D" for
+        D in (1, 2, 3)
+    # Guards stage P's targets: a projection written at a secondary would
+    # be overwritten by stage 0, and one at a point whose variables are
+    # all even would cost a launch for nothing. Its groups copy a block's
+    # own points onto themselves.
+    kinds = ntuple(_ -> :reflect_both, D)
+    forest = faces_forest(kinds; N=8)
+    for C in closed_centerings(D)
+        even = FieldSet(forest, 2; G=1, centering=C,
+                        parity=[ntuple(_ -> EvenParity, D), ntuple(_ -> EvenParity, D)])
+        @test isempty(GhostSchedule(even, closed_ops(1)).selfimage)
+        fs = FieldSet(forest, 2; G=1, centering=C, parity=mirror_parity(kinds))
+        sched = GhostSchedule(fs, closed_ops(1))
+        @test !isempty(sched.selfimage)
+        @test length(UnifySchedule(fs).selfimage) == length(sched.selfimage)
+        mask = primary_mask(fs)
+        @test all(sched.selfimage) do g
+            g.targetblocks == g.sourceblocks || return false
+            first = ntuple(d -> g.stencils[d].targetfirst, D)
+            all(1:ntransfers(g)) do t
+                b = g.targetblocks[t]
+                all(CartesianIndices(TreeAMR.boxsize(g))) do off
+                    I = ntuple(d -> first[d] + off[d] - 1 - fs.G[d], D)
+                    isprimary(mask, I..., b)
+                end
+            end
+        end
+    end
+end
+
+@testset "A bitant's mass is half the full domain's, and its norm the same: D=$D" for
+        D in (1, 2, 3)
+    # Guards the trapezoid's weights at a mirror plane: half weight on the
+    # wall plane, which the full domain counts once between two blocks.
+    # Exact on data whose values and partial sums are dyadic; to a few ulp
+    # on any other, since the two halves of the full domain sum their
+    # points in mirrored order.
+    N = 8
+    half = Forest(ntuple(d -> d == 1 ? 2 : 2, D); N=N,
+                  extents=ntuple(d -> d == 1 ? (0.0, 2.0) : (0.0, 2.0), D),
+                  reflecting=ntuple(d -> d == 1 ? (true, false) : (false, false), D))
+    full = Forest(ntuple(d -> d == 1 ? 4 : 2, D); N=N,
+                  extents=ntuple(d -> d == 1 ? (-2.0, 2.0) : (0.0, 2.0), D))
+    for (g, exact) in (((x, v) -> 1 + x[1]^2 / 4 + sum(x) / 8 - x[1] / 8, true),
+                       ((x, v) -> cos(x[1]) * (1 + sin(sum(x) - x[1])), false))
+        for C in closed_centerings(D)
+            a = FieldSet(half, 1; G=1, centering=C, parity=[ntuple(_ -> EvenParity, D)])
+            b = FieldSet(full, 1; G=1, centering=C)
+            fill_by_coordinates!(g, a)
+            fill_by_coordinates!(g, b)
+            ua, ub = statevector(a), statevector(b)
+            gather!(ua, a)
+            gather!(ub, b)
+            if exact
+                @test 2 * total_mass(a, 1) == total_mass(b, 1)
+                @test volume_weighted_norm(a, ua) == volume_weighted_norm(b, ub)
+            else
+                @test 2 * total_mass(a, 1) ≈ total_mass(b, 1) rtol = 8eps()
+                @test volume_weighted_norm(a, ua) ≈ volume_weighted_norm(b, ub) rtol = 8eps()
+            end
+        end
+    end
+end
+
+@testset "A flux normal to a mirror plane is zero there after unify!: D=$D" for D in (1, 2, 3)
+    # Guards stage P in a `UnifySchedule`: every field set over a forest
+    # with reflecting faces declares its parities, so a mass flux normal to
+    # the wall, odd across it, is projected to zero there, and an even one
+    # keeps its bits.
+    kinds = ntuple(_ -> :reflect_both, D)
+    forest = faces_forest(kinds; N=8)
+    fs = FieldSet(forest, 2; G=0, centering=facecentered(D, 1),
+                  parity=[ntuple(d -> d == 1 ? OddParity : EvenParity, D),
+                          ntuple(_ -> EvenParity, D)])
+    data = randn(Xoshiro(7 + D), size(fs.work))
+    fs.work .= data
+    unify!(fs, UnifySchedule(fs))
+    walls = mirror_plane_points(fs)
+    @test !isempty(walls)
+    @test all(((b, idx),) -> fs.work[idx..., 1, b] == 0, walls)
+    mask = primary_mask(fs)
+    @test all(walls) do (b, idx)
+        I = ntuple(d -> idx[d] - fs.G[d], D)
+        !isprimary(mask, I..., b) || bits(fs.work[idx..., 2, b]) == bits(data[idx..., 2, b])
+    end
+end
+
+@testset "N = 2G mirrors a ghost onto the mid-plane of a finer source: D=$D" for D in (2, 3)
+    # Guards the mirrored restriction at the bound: beyond a high
+    # reflecting wall the outermost ghost of a coarse block mirrors onto
+    # the mid-plane of the finer blocks across its tangential face, which
+    # the upper child holds at its low plane. Data even across the wall
+    # and quadratic, so the mirror, the injection and an order-4
+    # prolongation reproduce it: every stored value must be the data at
+    # its own position, against the position oracle.
+    for (G, N) in ((1, 2), (2, 4))
+        forest = Forest(ntuple(d -> d <= 2 ? 2 : 1, D); N=N,
+                        reflecting=ntuple(d -> d == 1 ? (false, true) : (false, false), D))
+        refine!(forest, filter(k -> all(d -> block_extent(forest, k)[d][1] >= (d <= 2 ? 1 : 0),
+                                        1:D), forest.leaves))
+        balance!(forest)
+        g = (x, v) -> 1 + (x[1] - 2)^2 + x[2] / 3 + (D == 3 ? x[3] / 5 : 0.0)
+        # The mirror dimension vertex-like, where the mid-plane is; order 4
+        # along a cell-like dimension needs two ghosts, and the order-2
+        # restriction there is exact for the linear data only.
+        for C in (G == 1 ? [vertexcentered(D)] :
+                  filter(C -> C[1] === :vertex, closed_centerings(D)))
+            fs = FieldSet(forest, 1; G=G, centering=C, parity=[ntuple(_ -> EvenParity, D)])
+            fill!(fs.work, NaN)
+            fill_by_coordinates!(g, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=2));
+                         boundary=boundary_by_coordinates(g))
+            worst = 0.0
+            for b in 1:nblocks(fs), I in CartesianIndices(size(fs.work)[1:D])
+                worst = max(worst, abs(fs.work[I, 1, b] - g(coordinates(fs, b, Tuple(I)), 1)))
+            end
+            @test worst < 1e-12
+        end
     end
 end
 
