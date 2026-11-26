@@ -2149,13 +2149,15 @@ function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
                        acrossglue::Bool=true, bits=nothing) where {D}
     k = forest.leaves[j]
     N = forest.N
-    outer = ntuple(D) do d
-        lo = c[d] == 1 && isempty(oriented_neighbors(forest, k,
-                                                     ntuple(e -> e == d ? -1 : 0, D))[2])
-        hi = c[d] == 1 && isempty(oriented_neighbors(forest, k,
-                                                     ntuple(e -> e == d ? 1 : 0, D))[2])
-        (lo, hi)
+    # An outer face, where the hook writes: no block across, and not a
+    # reflecting or outflow face, whose wall plane is the set's own (stage
+    # P projects a reflecting one), as `boundary_region` decides.
+    function isouter(d, s)
+        step = ntuple(e -> e == d ? s : 0, D)
+        _, faces = wall_direction(forest, k, step)
+        return faces[d] == OuterFace && isempty(oriented_neighbors(forest, k, step)[2])
     end
+    outer = ntuple(d -> c[d] == 1 ? (isouter(d, -1), isouter(d, 1)) : (false, false), D)
     any(o -> o[1] || o[2], outer) || return walls
     bits = bits === nothing ? primary_bits(forest, j, c; acrossglue=acrossglue) : bits
     for cls in closed_pieces(c)

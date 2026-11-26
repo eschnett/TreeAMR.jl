@@ -957,6 +957,43 @@ end
     end
 end
 
+@testset "A prescribed wall is written on outer faces only, not on reflecting or outflow ones: D=$D" for
+        D in (1, 2, 3)
+    # Guards stage W's choice of faces: a wall plane on a reflecting or
+    # outflow face is the set's own, reached by no hook, and a hook that
+    # prescribes the wall must leave it alone (found by TreeBSSN's and
+    # TreeWaveGR's ports, whose reflecting octants took the Dirichlet data
+    # on their mirror planes). Each kind of face in turn at the low end of
+    # dimension `D`, the high end outer.
+    for kind in (:reflect, :outflow), C in closed_centerings(D)
+        c = staggers(C)
+        c[D] == 1 || continue
+        faces = ntuple(d -> d == D ? (true, false) : (false, false), D)
+        forest = kind === :reflect ?
+                 Forest(ntuple(_ -> 2, D); N=4, reflecting=faces) :
+                 Forest(ntuple(_ -> 2, D); N=4, outflow=faces)
+        parity = kind === :reflect ? [ntuple(_ -> EvenParity, D)] : nothing
+        fs = FieldSet(forest, 1; G=1, centering=C, parity=parity)
+        fill_by_coordinates!((x, v) -> 1.0, fs)
+        sched = GhostSchedule(fs, closed_ops(1))
+        fill_ghosts!(fs, sched;
+                     boundary=boundary_by_coordinates((x, v) -> 7.0; wall=:prescribed))
+        onlow, written, ok = 0, 0, true
+        for b in 1:nblocks(fs), I in CartesianIndices(TreeAMR.interiorranges(fs))
+            x = coordinates(fs, b, Tuple(I))
+            outer = any(d -> c[d] == 1 && (x[d] == forest.roots[d] ||
+                                           (d != D && x[d] == 0.0)), 1:D)
+            outer && (written += fs.work[I, 1, b] == 7.0)
+            x[D] == 0.0 && !outer || continue
+            onlow += 1
+            fs.work[I, 1, b] == 1.0 || (ok = false)
+        end
+        @test ok
+        @test onlow > 0
+        @test written > 0
+    end
+end
+
 @testset "Skipping the secondaries with unify! is the full run at the primaries: D=$D" for
         D in (1, 2)
     # Guards `unify!` on a state vector: a right-hand side that computes
