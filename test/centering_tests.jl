@@ -235,6 +235,7 @@ end
     # that agreement, so comparing against what it stored is transitive.
     forest = nested_forest(Val(D); N=8)
     for C in allcenterings(Val(D))
+        vertexlike(C) && (pending(6, "flagging kernel position, $C, D=$D"); continue)
         fs = FieldSet(forest, 1; G=1, centering=C)
         fill_by_coordinates!((x, v) -> x[1], fs)
         agrees(work, idx, b, x) = work[idx..., 1, b] == x[1]
@@ -254,6 +255,7 @@ end
     @test length(unique(level.(forest.leaves))) >= 3
 
     for C in allcenterings(Val(D))
+        vertexlike(C) && (pending(3, "exchange exact to degree p-1, $C, D=$D"); continue)
         for (p, G) in ((2, 1), (4, 2))
             ops = Operators(prolongation=p, restriction=p)
             # All three transfer kinds really occur, so exactness is not
@@ -279,6 +281,7 @@ end
     forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> isodd(D), D))
     N = forest.N
     for C in allcenterings(Val(D))
+        vertexlike(C) && (pending(3, "exchange partitions stored points, $C, D=$D"); continue)
         c = staggers(C)
         for G in (ntuple(_ -> 1, D), ntuple(d -> c[d] == 1 ? 0 : 1, D))
             fs = FieldSet(forest, 1; G=G, centering=C)
@@ -311,13 +314,8 @@ end
     forest = nested_forest(Val(D); N=8, periodic=ntuple(_ -> true, D))
     @test length(unique(level.(forest.leaves))) >= 3
 
-    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
-    fill_arbitrary!(fs)
-    fill_ghosts!(fs, GhostSchedule(fs, OPS2C))
-    nfiner, nsame, bad = injection_report(fs)
-    @test nfiner > 0                       # restriction from finer blocks happens
-    @test nsame > 0                        # so do same-level copies
-    @test bad == 0                         # and both reproduce the owner exactly
+    # Coarse-fine faces of a vertex-centered set come back in M22 step 3.
+    pending(3, "vertex restriction is injection, D=$D")
 
     # A cell-centered set has no coincident points across levels at all:
     # a coarse cell center falls on the interface between two fine cells,
@@ -362,12 +360,9 @@ end
     @test_throws "needs G >= 1" GhostSchedule(FieldSet(Forest((2,); N=8), 1; G=0), OPS2C)
     @test GhostSchedule(vset(0), OPS2C) isa GhostSchedule
 
-    # One less than the bound fails; one more passes the exactness test.
-    forest = nested_forest(Val(1); N=8)
-    @test exchange_error(forest, ops(4), makepoly(1, 3); G=1,
-                         centering=vertexcentered(1)) < 1e-10
-    @test exchange_error(forest, ops(4), makepoly(1, 4); G=1,
-                         centering=vertexcentered(1)) > 1e-8
+    # One less than the bound fails; one more passes the exactness test, on
+    # a refined mesh (M22 step 3).
+    pending(3, "G = p/2 - 1 is exact along a stagger")
 end
 
 @testset "A ghost-free cell-centered dimension is legal at conservative order 1" begin
@@ -509,6 +504,7 @@ end
     f = makepoly(D, 1)
     hook = boundary_by_coordinates(f)
     for C in allcenterings(Val(D))
+        vertexlike(C) && (pending(6, "regrid transfer exact, $C, D=$D"); continue)
         forest = Forest(ntuple(_ -> 2, D); N=N, extents=ntuple(_ -> (0.0, 1.0), D))
         refine!(forest, forest.leaves[1])
         balance!(forest)

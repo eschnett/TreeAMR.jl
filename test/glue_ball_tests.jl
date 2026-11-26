@@ -22,7 +22,7 @@ function ball_ghost_error(fs, atlas, f)
     end
 end
 
-@testset "On the balls every interpolated ghost of a patch's polynomial is exact" begin
+@pending 8 "On the balls every interpolated ghost of a patch's polynomial is exact" begin
     # Guards the location and the stencil where a cubed sphere is hardest:
     # across the cube's edges three shells meet, at its corners four
     # patches, the shells are glued by quarter turns, the cube to the
@@ -62,7 +62,7 @@ ball_distinct(b::TestBall, N) =
 # are closer than 10⁻⁹, and rounding moves a node far less.
 ball_key(x) = round.(Int, x .* 1e9)
 
-@testset "The seven-patch ball's state holds each glued face point once per patch" begin
+@pending 8 "The seven-patch ball's state holds each glued face point once per patch" begin
     # Guards closed ownership on a cubed sphere: the cube owns all six of
     # its faces, a shell its inner face and both pairs of side faces, and
     # none the outer sphere; the state round-trips through scatter! and
@@ -112,7 +112,7 @@ end
 const BALL_SYMMETRIES = (x -> .-x, x -> (-x[1], x[2], x[3]), x -> (x[2], x[1], x[3]),
                          x -> (x[3], x[1], x[2]))
 
-@testset "The fill of data with the seven-patch ball's symmetries has them to rounding" begin
+@pending 8 "The fill of data with the seven-patch ball's symmetries has them to rounding" begin
     # Guards the orientation of every glue and stencil: a quarter turn or a
     # reversal applied the wrong way, or a window chosen differently on
     # the two sides of a symmetry, breaks the symmetry of the ghosts of
@@ -147,7 +147,7 @@ const BALL_SYMMETRIES = (x -> .-x, x -> (-x[1], x[2], x[3]), x -> (x[2], x[1], x
     @test ball_ghost_error(fs, ball, fp) > 1e-6
 end
 
-@testset "On the thirteen-patch ball the shared coordinates take no stencil" begin
+@pending 8 "On the thirteen-patch ball the shared coordinates take no stencil" begin
     # Guards `chart_aligned` on the layout it was made for: between two
     # outer shells a ghost has the radius of a node of the shell across,
     # so its stencil has width one along the radius; between an inner and

@@ -157,7 +157,7 @@ end
     @test worst < gputol(T)
 end
 
-@testset "$bname: a staggered exchange runs on the device: T=$T, D=$D" for
+@pending 3 "$bname: a staggered exchange runs on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The same claim for a vertex-like layout (M8). Two things here are
     # device-specific rather than merely centering-specific: the transfer
@@ -202,7 +202,7 @@ end
     end
 end
 
-@testset "$bname: reflecting faces are filled on the device: T=$T, D=$D" for
+@pending 4 "$bname: reflecting faces are filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # Mirrored transfers are ordinary groups with a parity factor, so on
     # a device they run in the same kernel as every other transfer, with
@@ -218,7 +218,7 @@ end
     end
 end
 
-@testset "$bname: bounded point values are clamped on the device: T=$T, D=$D" for
+@pending 4 "$bname: bounded point values are clamped on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The clamp is a branch of the one transfer kernel, its bracket read
     # off stencil rows uploaded with the rest. On a device it must leave
@@ -241,7 +241,7 @@ end
     end
 end
 
-@testset "$bname: symmetric walls are written on the device: T=$T, D=$D" for
+@pending 4 "$bname: symmetric walls are written on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # The owned low wall planes, set to NaN, are written by the device's
     # fill — mirrored, clamped or by the cell hook — before anything reads
@@ -264,6 +264,7 @@ end
     # does its arithmetic in that type: Metal has no `Float64`.
     f = x -> oftype(x[1], 0.3) + sum(d -> oftype(x[1], 2 + d) / 10 * x[d], 1:D)
     for C in allcenterings(Val(D))
+        vertexlike(C) && (pending(3, "$bname: relative hook, $C, T=$T, D=$D"); continue)
         fs = FieldSet{T}(forest, 1; G=ghosts_for(C, 4), centering=C, backend=backend)
         fill!(fs.work, T(NaN))
         fill_by_coordinates!((x, v) -> f(x), fs)
@@ -278,7 +279,7 @@ end
     end
 end
 
-@testset "$bname: a rotating seam is filled on the device: T=$T, D=$D" for
+@pending 7 "$bname: a rotating seam is filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
     # M12. Turned transfers are ordinary groups too, read through the
     # axis map and the variable table, both of which travel to the
@@ -324,7 +325,7 @@ end
     end
 end
 
-@testset "$bname: a half-turn seam is filled on the device: T=$T, D=$D" for
+@pending 7 "$bname: a half-turn seam is filled on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
     # M14. Orientation 2 about the centre line, with the vertex-centered
     # seam slab partitioned one plane up: nothing unwritten or read before
@@ -408,7 +409,7 @@ end
     @test results[1][2] == results[2][2]
 end
 
-@testset "$bname: the interface fixup runs on the device: T=$T, D=$D" for
+@pending 3 "$bname: the interface fixup runs on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2, 3)
     # M8b. The fixup adds no kernel of its own — it is the transfer
     # kernel over one-plane target ranges — so what has to hold on a
@@ -451,7 +452,7 @@ end
     @test Array(fs.work) == hostfs.work
 end
 
-@testset "$bname: packing and unpacking on the device reproduce the serial fill: T=$T" for
+@pending 4 "$bname: packing and unpacking on the device reproduce the serial fill: T=$T" for
         (bname, backend, types) in BACKENDS, T in types
     # M7's exchange on a device. A pack's destination and an unpack's
     # source are a message buffer, which reaches the transfer kernel as a
@@ -476,7 +477,7 @@ end
     @test same && bad == 0 && nremote > 0
 end
 
-@testset "$bname: the conservative cycle conserves on the device: T=$T, D=$D" for
+@pending 3 "$bname: the conservative cycle conserves on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # M8b's acceptance claim, on whatever backend: the three-step
     # right-hand side of `burgers.jl` over the M3 two-level mesh keeps the
@@ -1087,7 +1088,7 @@ end
     @test convergence_rate(Float64.(hs), Float64.(l2)) ≈ 2.0 atol = 0.15
 end
 
-@testset "$bname: vertex convergence reproduced: T=$T, D=$D" for
+@pending 3 "$bname: vertex convergence reproduced: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
     # M8a's acceptance criterion on a device: the same 2nd-order result
     # on a *staggered* layout, at G = 1. Three things here are
@@ -1133,7 +1134,7 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
     (u = ξ ./ 2; one(u[1]) / 2 + p * u[1]^5 + 2u[1]^3 * u[2]^4 * u[3]^2 -
                  (p + 1) * u[3]^5 + u[1] * u[2] * u[3] + u[2]^5 / 3)
 
-@testset "$bname: ghosts across a glue and the appendix run on the device: T=$T, D=$D" for
+@pending 8 "$bname: ghosts across a glue and the appendix run on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
     # M20. The glue plan's tables travel to the device at the build and
     # its kernels run there; the appendix's tables are cached per set on

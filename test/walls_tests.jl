@@ -10,7 +10,7 @@
 #
 # This file's definitions are in `helpers/walls.jl`.
 
-@testset "A closed box fills mirror-symmetrically with symmetric walls: D=$D" for
+@pending 6 "A closed box fills mirror-symmetrically with symmetric walls: D=$D" for
         D in (1, 2, 3)
     # The claim of AMR-8: symmetric data fill symmetrically, both walls
     # included, at every face kind. On a uniform box every value is a
@@ -63,7 +63,7 @@
     end
 end
 
-@testset "The fill writes the owned low wall, and reads it only after: D=$D" for
+@pending 4 "The fill writes the owned low wall, and reads it only after: D=$D" for
         D in (1, 2, 3)
     # The owned low wall planes are set to NaN before the fill. With
     # symmetric walls the fill must write every one of them, by the hook,
@@ -89,7 +89,7 @@ end
     @test nnan == 0
 end
 
-@testset "Symmetric walls partition the ghosts and the owned low walls: D=$D" for
+@pending 4 "Symmetric walls partition the ghosts and the owned low walls: D=$D" for
         D in (1, 2, 3)
     # Every ghost written exactly once, every owned low wall plane at a
     # domain face exactly once, and no other owned point at all — so no
@@ -115,7 +115,7 @@ end
     end
 end
 
-@testset "Half-open walls are the default and change nothing" begin
+@pending 4 "Half-open walls are the default and change nothing" begin
     # The default must be today's layout: no group key marks a trimmed
     # range, and a schedule built for the default fills a set that says
     # so explicitly, bit for bit.
@@ -134,7 +134,7 @@ end
     @test fs.work == explicit.work
 end
 
-@testset "A schedule belongs to its walls" begin
+@pending 4 "A schedule belongs to its walls" begin
     # The target ranges at a low domain face differ between the two, so a
     # schedule built for one is refused for the other, in the fill and in
     # the regrid, and an unknown kind of wall is refused with the two

@@ -94,6 +94,10 @@ function workload_mismatches(ref, out; rtol=1e-12)
 end
 
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
+    # What the serial reference prints while M22 is built: the cases
+    # pending until a later step print one comment line each instead
+    # (`pending_case`), and the regrids left are those of M32x2-.
+    NPENDING, NREGRIDS, NUNCHANGED = 22, 8, 1
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -116,15 +120,13 @@ end
     @test count(startswith("packages "), lines) == 1
     @test !occursin(r" (Test|OrdinaryDiffEq\w*|IMEXRungeKutta)( |$)",
                     only(filter(startswith("# packages "), lines)))
-    @test count(l -> occursin(" state ", l), lines) >= 7
+    @test count(l -> occursin(" state ", l), lines) >= 5   # 7 with W2v, B2 (M22)
     @test count(l -> occursin(" filled ", l), lines) >= 13
-    @test any(l -> startswith(l, "B2 conserved true"), lines)
-    # The regrid cycles (step 4) changed the mesh every time, Burgers'
-    # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 24
-    @test "BR conserved true" in lines
-    @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
-    @test count(l -> occursin(" unchanged false", l), lines) == 3
+    # Burgers' fixup (B2), the regrid cycles (TP, BR, A2, M) and the ranks
+    # without blocks (E2) are pending until M22 steps 3 and 6, and so is
+    # what they assert: B2 and BR conserved, the regrid count, A2 converged.
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == NREGRIDS
+    @test count(l -> occursin(" unchanged false", l), lines) == NUNCHANGED
     # Point interpolation (step 5): every point answered, some flagged.
     @test count(startswith("I2"), lines) == 5
     @test all(l -> split(l)[3] == "301", filter(l -> occursin(" values ", l) &&
@@ -146,22 +148,10 @@ end
     @test 0 < parse(Int, words("L2 inside")[3]) < 211
     @test 0 < parse(Int, words("L2 excluded")[3])
     @test words("L2 lattice")[3] == "256"
-    @test words("N3 leaves")[3:4] == ["232", "3"]
-    @test "# N3 largest groups 3 with messages 0" in lines
-    # The ranks without blocks (E2): everything ran, and both initial-data
-    # cycles refined and converged.
-    @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
-              filter(startswith("E2 adapted "), lines))
-    # The rotating quadrant (M12): the turned ghosts hold `−0` in all
-    # three sets, and three quarters of the points were turned back
-    # across the seam.
-    @test all(w -> parse(Int, w) > 0, words("Q2 negzero")[3:5])
-    @test words("Q2 interpolated")[3:4] == ["257", "193"]
-    # The half plane (M14): the turned ghosts hold `−0` in both sets, and
-    # about half of the points were turned back across the seam.
-    @test all(w -> parse(Int, w) > 0, words("H2 negzero")[3:4])
-    @test all(l -> split(l)[4:5] == ["257", "128"],
-              filter(startswith("H2 interpolated "), lines))
+    # The nested octant (N3, M22 step 4), the ranks without blocks (E2,
+    # step 6), the rotating quadrant (Q2) and the half plane (H2, step 7)
+    # are pending.
+    @test count(startswith("# pending until M22 step "), lines) == NPENDING
     # Element sets (M16): one stage, and the GLL mass conserved through
     # both regrids.
     @test all(t -> words("$t transfers")[end] == "1" && "$t conserved true" in lines,
@@ -171,8 +161,7 @@ end
     @test words("PR2 leaves")[3:4] == ["16", "0"]
     @test words("PS3 leaves")[3:4] == ["24", "0"]
     @test all(t -> length(filter(startswith(t), lines)) == 1,
-              ("PR2 cell filled", "PR2 vertex filled", "PR2 element filled",
-               "PS3 element filled"))
+              ("PR2 cell filled", "PR2 element filled", "PS3 element filled"))
     # The public collectives (AMR-13) hold their contract on the serial
     # reference too, so that the ranks' agreeing with it means something.
     @test "V public true 1" in lines
@@ -204,17 +193,6 @@ end
         @test isempty(bad)
         hashes = filter(startswith("#"), workload_lines(out))
         refused(what) = only(filter(startswith("# $what refused on"), hashes))
-        # E2's two leaves leave one of three ranks without a block, before
-        # its regrids and after them.
-        @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
-        @test "# E2 empty ranks after the regrids $(n == 3 ? 1 : 0)" in hashes
-        # The rotating quadrant (M12): seam transfers crossed ranks, and the
-        # single leaf left all ranks but one empty before its regrids and
-        # after them, and none in between.
-        @test parse(Int, split(only(filter(startswith("# Q2 rotated received"),
-                                           hashes)))[end]) > 0
-        @test parse(Int, split(only(filter(startswith("# H2 rotated received"),
-                                           hashes)))[end]) > 0
         # An element set's prolongations crossed ranks, in its one stage.
         @test all(t -> parse(Int, split(only(filter(startswith("# $t prolongations"),
                                                     hashes)))[end]) > 0,
@@ -223,22 +201,10 @@ end
         # on either side of a glue had different owners.
         @test all(t -> parse(Int, split(only(filter(startswith("# $t glued received"),
                                                     hashes)))[end]) > 0,
-                  ("PR2 cell", "PR2 vertex", "PR2 element", "PS3 element"))
-        # Ghosts interpolated across a glue (M20) were evaluated by the rank
-        # owning their sources and sent to the target's.
-        @test parse(Int, split(only(filter(startswith("# G2 glue received"),
-                                           hashes)))[end]) > 0
-        @test "# QE2 empty ranks $(n - 1)" in hashes
-        @test "# QE2 empty ranks after refining 0" in hashes
-        @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
-        # The nested octant (N3): some rank ran a group of levels with
-        # messages, one of them at two ranks and more at three.
-        nmessages = parse.(Int, split(only(filter(startswith("# N3 largest groups"),
-                                                  hashes)))[(n + 7):end])
-        @test length(nmessages) == n && maximum(nmessages) >= n - 1
+                  ("PR2 cell", "PR2 element", "PS3 element"))
         # The negative control: one received ghost rewritten from a
         # corrupted message buffer changes the gathered digest.
-        @test "# W2v perturbed-ghost-changes-digest true" in hashes
+        @test "# W1o perturbed-ghost-changes-digest true" in hashes
         # A forest mutated on one rank only, a layout that differs on one
         # rank, and an argument one rank alone refuses: refused on every
         # rank, saying why.
@@ -289,27 +255,13 @@ end
                          "rank(s) 1 of $n passed a point outside the domain")
         @test occursin("On rank 1, point 2, (0.5, 9.0), is outside the domain",
                        refused("interpolate outside"))
-        # M12: a point beyond the seam of a set that turns into its
-        # partner, on rank 1 only, and such a set regridded alone on rank 1
-        # where the others regrid the pair; refused on every rank.
-        @test startswith(refused("rotating interpolate"),
-                         "# rotating interpolate refused on $n of $n ranks: interpolate " *
-                         "is refused on every rank, this one (rank 0) included, since " *
-                         "rank(s) 1 of $n passed a point")
-        @test occursin("On rank 1, point 2, (-0.5, 0.7), lies 1 quarter turn(s) away " *
-                       "across the rotating seam", refused("rotating interpolate"))
-        @test startswith(refused("rotating regrid"),
-                         "# rotating regrid refused on $n of $n ranks: regrid! was " *
-                         "refused on rank(s) 1 of $n")
         # What the regrid acceptance asks for actually happened at this
         # rank count: blocks moved up the ranks when the first ones were
         # refined and down again when they were coarsened, and a coarsened
         # block's children had more than one owner, in every element type.
         migrated(what) = parse.(Int, split(only(filter(startswith("# $what migrated"),
                                                      hashes)))[[4, 6, 8]])
-        @test migrated("M4.refine")[1] > 0
-        @test migrated("M4.coarsen")[2] > 0
-        @test all(t -> migrated("$t.coarsen")[3] > 0, ("M2", "M32x2-2"))
+        @test migrated("M32x2-2.coarsen")[3] > 0     # M: M22 step 6
     end
 end
 

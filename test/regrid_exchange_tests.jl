@@ -46,6 +46,7 @@ using TreeAMR: regrid_sources, regrid_stage, split_regrid, equalsplit, MAX_LEVEL
         counts = D == 1 ? (1, 2, 3, 5, max(length(old), length(new)) + 1) :
                  D == 2 ? (2, 3, 5) : (2, 3, 7)
         for C in allcenterings(Val(D)), P in counts
+            vertexlike(C) && (pending(6, "regrid stage, $C, $kinds, P = $P"); continue)
             same, transfers, bad, nc, ns, empty = lockstep_regrid(serial, P, C,
                                                                   PointValue, Float64)
             @test same
@@ -197,7 +198,7 @@ end
     @test nrecruits > 0
 end
 
-@testset "regrid! over a distributed forest is the serial regrid, block for block: D=$D" for
+@pending 6 "regrid! over a distributed forest is the serial regrid, block for block: D=$D" for
         D in (2, 3)
     # The whole driver: the agreed checks, the gather of each rank's own
     # flags (bare flags and (flag, box) pairs mixed, with a buffer), the
@@ -359,7 +360,7 @@ end
 # handed out of, so the test can tell that the path it means to test is
 # the one that ran.
 
-@testset "Staging the messages through host mirrors delivers the same bits" begin
+@pending 6 "Staging the messages through host mirrors delivers the same bits" begin
     # A staged message that lost its download, its upload, or a segment
     # boundary would deliver stale or shifted ghosts. So the ghost fill
     # with the hook, the interface restriction and `regrid!` itself run
@@ -546,7 +547,7 @@ end
     end
 end
 
-@testset "adapt_to_initial_data! over a distributed forest starts from ranks without blocks" begin
+@pending 6 "adapt_to_initial_data! over a distributed forest starts from ranks without blocks" begin
     # From a single leaf, every rank but one starts empty, and each pass
     # gathers flags from ranks with and without blocks. Both criterion
     # forms — the host callback and a flag vector from `firing_boxes` —
@@ -637,7 +638,7 @@ end
 
 # --- Rotating seams (M12) ---------------------------------------------------
 
-@testset "regrid! over a distributed rotating quadrant is the serial regrid: D=$D" for
+@pending 7 "regrid! over a distributed rotating quadrant is the serial regrid: D=$D" for
         D in (2, 3)
     # A pair is filled as a pair before its transfers, each member's
     # ghosts across the seam being the other's data, and the conforming
@@ -707,7 +708,7 @@ end
     end
 end
 
-@testset "adapt_to_initial_data! over a distributed rotating quadrant, alone or as a pair" begin
+@pending 7 "adapt_to_initial_data! over a distributed rotating quadrant, alone or as a pair" begin
     # From a single leaf at the axis, every rank but one starts empty and
     # the leaf is its own neighbor across the seam three times over. The
     # cycle — a fill, the flags, the regrid, the data re-evaluated — must
@@ -764,7 +765,7 @@ end
     end
 end
 
-@testset "regrid! over a distributed half plane is the serial regrid: D=$D" for D in (2, 3)
+@pending 7 "regrid! over a distributed half plane is the serial regrid: D=$D" for D in (2, 3)
     # The seam is kept conforming by the replicated completion, and a
     # prolongation reads its parent's ghosts across the seam. Over 3 and
     # 5 ranks, a cell- and a vertex-centered set regridded together —

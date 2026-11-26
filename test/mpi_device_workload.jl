@@ -551,11 +551,13 @@ function glue_case(tag)
     return nothing
 end
 
+# A case that needs what a later step of M22 ("Closed blocks") rebuilds:
+# one comment line in place of its output, which the comparison skips.
+pending_case(tag, step) = emit("# pending until M22 step $step:", tag)
+
 function main()
     emit("# ranks", NRANKS, "backend", BNAME, "T", T, "deviceaware", DEVICEAWARE)
-    wave_case("W2v", forest_of((4, 4), 8; centre=(1.6, 2.3)); G=1,
-              centering=vertexcentered(2), ops=Operators(prolongation=4, restriction=4),
-              steps=4)
+    pending_case("W2v", 3)
     parity = [(OddParity, EvenParity), (EvenParity, EvenParity)]
     wave_case("R2c", forest_of((3, 3), 8; reflecting=((true, false), (true, false)),
                                centre=(0.4, 0.5)); G=2, centering=cellcentered(2),
@@ -563,19 +565,15 @@ function main()
     # A rotating quadrant (M12): the turned transfers on the device and
     # across ranks, a scalar and a face-centered pair.
     rotating = forest_of((3, 3), 8; rotating=(1, 2), centre=(0.3, 0.4))
-    wave_case("Q2v", rotating; G=1, centering=vertexcentered(2),
-              ops=Operators(prolongation=4, restriction=4), steps=4, rotation=(1, 2))
-    rotating_pair_case("QP2", rotating; ops=Operators(prolongation=4, restriction=4))
+    pending_case("Q2v", 7)
+    pending_case("QP2", 7)
     wave_case("W3c", forest_of((2, 2, 2), 4; periodic=(true, true, true),
                                centre=(0.7, 0.8, 1.2)); G=1, centering=cellcentered(3),
               ops=Operators(prolongation=2, restriction=2), steps=3)
-    burgers_case("B2", forest_of((4, 4), 8; periodic=(true, true), centre=(1.6, 2.3));
-                 G=2, ops=Operators(family=Conservative, prolongation=3, restriction=2),
-                 steps=4)
-    tracked_pulse_case("TP"; cycles=2, steps=3)
-    moving_blocks_case("M")
-    # Ghosts interpolated across a glue (M20).
-    glue_case("G2")
+    pending_case("B2", 3)
+    pending_case("TP", 6)
+    pending_case("M", 6)
+    pending_case("G2", 8)
     return nothing
 end
 

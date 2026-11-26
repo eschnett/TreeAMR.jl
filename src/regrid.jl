@@ -181,6 +181,13 @@ tree rather than the data.
 """
 function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
+    # A set with a vertex-like dimension owns its closed range (M22), and
+    # the flagging sweep covers it in step 6, with the regrid transfer.
+    any(==(:vertex), fs.centering) && throw(ArgumentError(
+        "firing_boxes does not yet sweep a set with a vertex-like dimension " *
+        "(centering $(fs.centering)): such a set owns its closed range, both boundary " *
+        "planes (\"Closed blocks\" in CODE.md), and flagging over the closed box " *
+        "comes with regridding in M22 step 6"))
     backend = get_backend(fs.work)
     n = nblocks(fs)
     n == 0 && return Tuple{Int,NTuple{D,UnitRange{Int}}}[]   # a rank without blocks
@@ -987,6 +994,15 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
     ops = sched.operators
     push!(layout, (Int(ops.family), ops.prolongation, ops.restriction, ops.bounded,
                    ops.vertex_prolongation, ops.glue))
+    # A set with a vertex-like dimension owns its closed range (M22), and
+    # its regrid transfer is rebuilt on it in step 6; until then it can only
+    # be resized, `fs => nothing`.
+    any(==(:vertex), fs.centering) && throw(ArgumentError(
+        "regrid!, and so adapt_to_initial_data!, does not yet take a set with a " *
+        "vertex-like dimension with its schedule (centering " *
+        "$(fs.centering)): such a set owns its closed range, both boundary planes, and " *
+        "the regrid transfer is rebuilt on that layout in M22 step 6 (\"Closed blocks\" " *
+        "in CODE.md). Until then pass it as `fs => nothing`, which only resizes it."))
     return nothing
 end
 

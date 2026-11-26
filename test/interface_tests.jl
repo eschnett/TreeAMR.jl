@@ -15,7 +15,7 @@ interface_cases(::Val{1}) = [facecentered(1, 1)]
 interface_cases(::Val{2}) = [facecentered(2, 1), facecentered(2, 2), vertexcentered(2)]
 interface_cases(::Val{3}) = [facecentered(3, 1), facecentered(3, 3), edgecentered(3, 1)]
 
-@testset "Interface restriction is the average of the finer side: D=$D" for
+@pending 3 "Interface restriction is the average of the finer side: D=$D" for
         D in (1, 2, 3)
     # The claim, against an oracle that knows only positions: every point
     # on a coarse block's coarse-fine boundary face comes back as the
@@ -65,7 +65,7 @@ interface_cases(::Val{3}) = [facecentered(3, 1), facecentered(3, 3), edgecentere
     end
 end
 
-@testset "Every interface target is written exactly once per phase: D=$D" for
+@pending 3 "Every interface target is written exactly once per phase: D=$D" for
         D in (2, 3)
     # There is one phase per face dimension. Within a phase a double
     # write would make the result depend on which fine source landed
@@ -109,7 +109,7 @@ end
     @test_throws "facecentered(2, d)" InterfaceSchedule(FieldSet(forest, 1; G=2))
 end
 
-@testset "An interface schedule refuses a mesh or a layout it was not built for" begin
+@pending 3 "An interface schedule refuses a mesh or a layout it was not built for" begin
     # Every target plane in a schedule is an index into one layout over
     # one leaf array. A stale or mismatched one would write the wrong
     # cells of the wrong blocks rather than fail.
@@ -136,7 +136,7 @@ end
     @test occursin("InterfaceSchedule{Float64,2}", sprint(show, isched))
 end
 
-@testset "The interface schedule is a function of the tree alone: D=$D" for D in (2, 3)
+@pending 3 "The interface schedule is a function of the tree alone: D=$D" for D in (2, 3)
     # The neighbour walk is threaded and its per-task lists are
     # concatenated in chunk order, which is block order. That is what
     # makes the schedule — and therefore every number the fixup produces
@@ -156,7 +156,7 @@ end
     @test restrict_interfaces!(fs, isched).work == once
 end
 
-@testset "No plane the fixup writes is one it reads: D=$D" for D in (1, 2, 3)
+@pending 3 "No plane the fixup writes is one it reads: D=$D" for D in (1, 2, 3)
     # The phases would otherwise not commute: a field set with more than
     # one vertex-like dimension runs several of them, and a fine block
     # that is itself the coarse side of a deeper interface could hand a

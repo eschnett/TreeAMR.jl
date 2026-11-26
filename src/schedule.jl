@@ -2155,6 +2155,41 @@ function check_glue_layout(conn::Patches{D}, G::NTuple{D,Int}, centering::NTuple
     return nothing
 end
 
+# What a set with a vertex-like dimension cannot be filled over yet (M22,
+# "Closed blocks"). Such a set owns its closed range, and the fill is
+# rebuilt on it step by step; what a later step rebuilds is refused until
+# then, with the step that brings it, rather than left half-working. Every
+# condition is a property of the forest and the layout, the same on every
+# rank, and the refusal is raised inside `GhostSchedule`'s
+# `collective_checks`. Cell-centered and element sets have no shared
+# points and are not affected. `what` names the caller.
+function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Symbol,
+                             what::AbstractString) where {D}
+    any(==(:vertex), cs) || return nothing
+    why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
+          "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
+          "(\"Closed blocks\" in CODE.md)"
+    lvl = level(first(forest.leaves))
+    any(k -> level(k) != lvl, forest.leaves) && throw(ArgumentError(
+        "$what: the forest has leaves at more than one level, which is refused for " *
+        "$why: coarse-fine faces come back in M22 step 3."))
+    any(f -> f[1] != OuterFace || f[2] != OuterFace, getfield(forest, :faces)) &&
+        throw(ArgumentError(
+            "$what: the forest has a reflecting or an outflow face, which is refused " *
+            "for $why: the mirror and the clamp about the wall plane come back in M22 " *
+            "step 4."))
+    (hasrotating(forest) || ishalfturn(forest)) && throw(ArgumentError(
+        "$what: the forest has a rotating seam, which is refused for $why: quarter " *
+        "and half turns, and so a RotationPair, come back in M22 step 7."))
+    ispatched(forest) && has_glue(forest.conn) && throw(ArgumentError(
+        "$what: the forest is a forest of patches with a glued face, which is " *
+        "refused for $why: glues come back in M22 step 8."))
+    return nothing
+end
+
+# Whether a forest of patches glues any face.
+has_glue(conn::Patches) = any(e -> e.patch != 0, conn.glue)
+
 GhostSchedule(fs::FieldSet{T,D}, operators::Operators; atlas=nothing) where {T,D} =
     GhostSchedule(fs.forest, operators; G=fs.G, centering=fs.centering, P=fs.P,
                   walls=fs.walls, glue=fs.glue, atlas=atlas, T=T,
@@ -2196,6 +2231,8 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
         end
         check_floattype(T, backend)
         check_walls(walls)
+        # After the refusals above, which keep their own reasons (M22).
+        check_closed_blocks(forest, cs, walls, "GhostSchedule")
         layout = layouthash(gs, cs, order, walls, Int(operators.family),
                             operators.prolongation,
                             operators.restriction, operators.bounded,

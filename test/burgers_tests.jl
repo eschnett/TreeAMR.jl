@@ -46,7 +46,7 @@
     end
 end
 
-@testset "The fixup is what conserves at a coarse-fine face: D=$D" for D in (1, 2, 3)
+@pending 3 "The fixup is what conserves at a coarse-fine face: D=$D" for D in (1, 2, 3)
     # The claim in its cheapest, most direct form, and the only one that
     # runs in 3D: the M3 static two-level mesh, a smooth solution short
     # of the breaking time, no regridding and no limiter — so the fixup
@@ -71,7 +71,7 @@ end
     @test control.drift > 1e-5 * control.scale
 end
 
-@testset "Total mass is conserved to roundoff across coarse-fine faces: D=$D" for
+@pending 6 "Total mass is conserved to roundoff across coarse-fine faces: D=$D" for
         D in (1, 2)
     # The M8b acceptance test. A sine steepens into a shock, the refined
     # region follows it, the mesh is rebuilt between chunks, and the
@@ -112,7 +112,7 @@ end
     @test control.drift > 1e-5 * control.scale
 end
 
-@testset "Conservation survives Float32" begin
+@pending 6 "Conservation survives Float32" begin
     # The bound is relative to the precision, not an absolute constant:
     # the fixup adds no arithmetic, only target ranges, so the drift is
     # still an ulp of the total mass. The control's drift, by contrast,
@@ -130,7 +130,7 @@ end
     end
 end
 
-@testset "The interface-order rule for the conservative family: D=$D" for D in (1, 2)
+@pending 3 "The interface-order rule for the conservative family: D=$D" for D in (1, 2)
     # CODE.md's prediction, measured. A flux divergence divides an
     # `O(hᵖ)` ghost error by `h` once, so the interface caps the global
     # rate at `p - 1 + 1 = p`; against a second-order scheme that is 1 at
@@ -204,7 +204,7 @@ end
     @test leaky.linf ≈ 1.0 atol = 0.25
 end
 
-@testset "A tracked shock matches the uniformly fine reference" begin
+@pending 6 "A tracked shock matches the uniformly fine reference" begin
     # M4's claim on a conservative scheme: "tracks the shock without
     # artifacts" means the adaptive run agrees with the *uniformly finest*
     # mesh — the one at its own finest level — at fewer cells, while the
@@ -241,7 +241,7 @@ end
           l1_difference(unbuffered.reduced, fine.reduced)
 end
 
-@testset "The conservative RHS is a pure function of the state" begin
+@pending 3 "The conservative RHS is a pure function of the state" begin
     # The integrator's `u` is authoritative; the working arrays — the
     # state's and all `D` flux sets' — are scratch. A right-hand side
     # that wrote back into `u`, or that carried state between calls,

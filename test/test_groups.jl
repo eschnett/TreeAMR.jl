@@ -12,7 +12,7 @@ const TEST_HELPERS = ["oracles.jl", "ghost_oracles.jl", "wave.jl", "burgers.jl",
                       "helpers/partition.jl", "helpers/exchange.jl",
                       "helpers/regrid_exchange.jl", "helpers/state.jl",
                       "helpers/walls.jl", "helpers/patch.jl", "helpers/glue.jl",
-                      "helpers/ball.jl"]
+                      "helpers/ball.jl", "helpers/pending.jl"]
 
 # Every test file in the order the serial suite runs them, with its
 # seconds in that suite at one thread (an M3 Pro, 2026-11-05). The weights

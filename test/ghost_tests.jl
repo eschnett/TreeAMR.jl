@@ -313,6 +313,8 @@ end
     ops = Operators(prolongation=6, restriction=6)
     parity = [ntuple(_ -> EvenParity, D)]
     for C in (vertexcentered(D), cellcentered(D))
+        # The octant reflects, and is refined.
+        vertexlike(C) && (pending(4, "independent levels, $C, D=$D"); continue)
         s = GhostSchedule(FieldSet(octant, 1; G=3, centering=C, parity=parity), ops)
         @test s.levels == [1, 2, 3]
         @test s.stagegroups == [1:1, 2:4]
@@ -320,13 +322,7 @@ end
     end
     # A level with rotated prolongations runs alone, and so does every
     # level of a schedule printed as before.
-    quad = rotating_forest(Val(D); rotating=(1, 2))
-    s = GhostSchedule(FieldSet(quad, 1; G=2, centering=vertexcentered(D), rotation=[1]),
-                      Operators(prolongation=4, restriction=4))
-    @test length(s.levels) == 2
-    @test all(gs -> any(g -> g.orientation != 0, gs), s.phase2)
-    @test s.stagegroups == [1:1, 2:2, 3:3]
-    @test !occursin("run together", sprint(show, s))
+    pending(7, "a rotated level runs alone, vertex-centered, D=$D")
 end
 
 @testset "A level that reads what the level below writes runs after it" begin
@@ -391,7 +387,7 @@ end
                   levels=(1, 3)) == apart
 end
 
-@testset "A grouped fill is the same in any order within the group: D=$D" for D in (2, 3)
+@pending 7 "A grouped fill is the same in any order within the group: D=$D" for D in (2, 3)
     # The oracle for the dependency check. Run in reverse, a level that
     # read a ghost the level below writes would read it before it was
     # written — NaN here, from the prefill — and a level that read a
@@ -523,12 +519,9 @@ end
     two = Forest(ntuple(_ -> 2, D); N=N, periodic=ntuple(_ -> true, D))
     refine!(two, two.leaves[1]); balance!(two)
     push!(setups, FieldSet(two, 3; G=2))
-    push!(setups, FieldSet(two, 3; G=2, centering=vertexcentered(D)))
-    kinds = ntuple(d -> d == 1 ? :reflect_hi : :periodic, D)
-    walls = faces_forest(kinds; N=N)
-    push!(setups, FieldSet(walls, 2; G=2, centering=vertexcentered(D),
-                           parity=[ntuple(d -> d == 1 ? OddParity : NoParity, D),
-                                   ntuple(d -> d == 1 ? EvenParity : NoParity, D)]))
+    # A vertex-centered set on the refined mesh (M22 step 3) and at a
+    # reflecting face (step 4), whose high wall plane is derived.
+    pending(4, "flat launch and copy path, vertex-centered, D=$D")
     if D >= 2
         quad = rotating_forest(Val(D); rotating=(1, 2), N=N)
         push!(setups, FieldSet(quad, D + 1; G=2, centering=cellcentered(D),
@@ -552,11 +545,6 @@ end
         end
     end
     @test nunit > 0                                # the copy path was taken
-    # A copy at a vertex-like high wall derives the wall plane it does not
-    # own by interpolation, so a `:copy` group is not unit by its kind.
-    wallsched = GhostSchedule(setups[3], ops)
-    @test any(g -> g.kind === :copy && !all(s -> s.unit, g.stencils),
-              wallsched.phase1)
 end
 
 @testset "Skipping zero-weight taps fills bit for bit: D=$D" for D in (1, 2, 3)
@@ -589,6 +577,8 @@ end
                               vertex_prolongation=4), 4))
     nsingle = 0
     for (C, ops, p) in configs
+        # At reflecting and outflow faces (M22 step 4), and across a seam (7).
+        vertexlike(C) && (pending(7, "zero-weight taps, $C, p = $p, D=$D"); continue)
         G = ghosts_for(C, p)
         _, parity = parity_data(Float64, kinds, p)
         setups = Any[FieldSet(faces_forest(kinds; N=N), 2; G=G, centering=C,

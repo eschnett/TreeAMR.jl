@@ -42,7 +42,7 @@
     @test convergence_rate(hs, l2) ≈ 2.0 atol = 0.15
 end
 
-@testset "Vertex-centered wave equation on a two-level mesh: D=$D" for D in (1, 2)
+@pending 3 "Vertex-centered wave equation on a two-level mesh: D=$D" for D in (1, 2)
     # The M3 claim on a staggered layout, at the ghost width the vertex
     # row of the operator table allows: order-4 prolongation reaches one
     # plane past the source's shared plane, and the Laplacian reaches one
@@ -64,7 +64,7 @@ end
     @test convergence_rate(hs, linf) ≈ 2.0 atol = 0.2
 end
 
-@testset "Only prolongation limits the vertex rate: D=$D" for D in (1,)
+@pending 3 "Only prolongation limits the vertex rate: D=$D" for D in (1,)
     # The cell-centered study needs *both* orders raised, because each
     # side of the interface gets its ghosts from a different operator.
     # Along a stagger the restriction side is injection — a coincident
@@ -87,7 +87,7 @@ end
     @test rate(Operators(prolongation=4, restriction=4), 1) ≈ 2.0 atol = 0.15
 end
 
-@testset "The restriction order is inert along a stagger: D=$D" for D in (1, 2)
+@pending 3 "The restriction order is inert along a stagger: D=$D" for D in (1, 2)
     # Stronger than the rates above, and the reason they come in pairs:
     # the restriction stencil in a vertex-like dimension is width 1 with
     # weight 1 *regardless of the order asked for*, so the two runs are
@@ -102,7 +102,7 @@ end
     end
 end
 
-@testset "G = 1 is the whole requirement at order 4: D=$D" for D in (1, 2)
+@pending 3 "G = 1 is the whole requirement at order 4: D=$D" for D in (1, 2)
     # The vertex row of the operator table says G >= p/2 - 1, so a
     # second ghost plane buys nothing at order 4 — not "almost nothing",
     # nothing: the same stencils read the same points. Cell centering
@@ -118,7 +118,7 @@ end
                                       centering=cellcentered(D))
 end
 
-@testset "Vertex-centered wave equation in 3D" begin
+@pending 3 "Vertex-centered wave equation in 3D" begin
     # Smoke test only: 3D convergence runs are expensive, so this checks
     # that the same code path works and that the solution stays sane.
     r = wave_errors(Val(3); N=8, G=1, ops=Operators(prolongation=4, restriction=4))
@@ -128,7 +128,7 @@ end
     @test r.linf < 0.2
 end
 
-@testset "A moving refined region tracks a propagating pulse" begin
+@pending 6 "A moving refined region tracks a propagating pulse" begin
     # M4's claim, on the staggered layout: "without artifacts" means the
     # adaptive run matches the *uniformly finest* mesh, so a moving
     # coarse-fine interface that reflected or smeared the pulse would
@@ -169,7 +169,7 @@ end
     @test amr.nblocks * 8 < fine.cells
 end
 
-@testset "RHS does not mutate the state vector" begin
+@pending 3 "RHS does not mutate the state vector" begin
     # The integrator's `u` is authoritative; the working array is
     # scratch. A RHS that wrote back into `u` would corrupt multi-stage
     # methods like RK4. Asserted on the staggered layout because the
@@ -206,7 +206,7 @@ end
     @test du2 == du
 end
 
-@testset "Energy stays bounded" begin
+@pending 3 "Energy stays bounded" begin
     # A standing mode neither grows nor decays; a wrong interface
     # treatment usually shows up as slow drift long before it shows up
     # as an outright instability.

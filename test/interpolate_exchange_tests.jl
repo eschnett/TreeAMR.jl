@@ -49,60 +49,64 @@ end
          (2, (:outer, :outer), cellcentered(2), Float64, (5,)),
          (2, (:reflect_hi, :outer), facecentered(2, 1), Float32, (3,)),
          (3, (:reflect_lo, :outer, :periodic), cellcentered(3), Float64, (4,)))
-    # A point routed to the wrong rank, evaluated on the wrong local block,
-    # or put back in the wrong slot gives a wrong value; one evaluated from
-    # other inputs than the serial kernel's gives one that differs in the
-    # last bit. Random data over every stored point, ghosts included, so
-    # no smooth field hides either.
-    serial = faces_forest(kinds; N=D == 3 ? 6 : 8)
-    walls = any(d -> any(TreeAMR.reflecting_faces(serial)[d]), 1:D)
-    parity = walls ? EXCHANGE_PARITY : nothing
-    G = ghosts_for(C, 4)
-    sfs = FieldSet{T}(serial, 3; G=G, centering=C, parity=parity)
-    data = T.(rand(MersenneTwister(D), size(sfs.work)...) .- 0.5)
-    copyto!(sfs.work, data)
-    xs = routing_points(Xoshiro(30 + D), serial)
-    mid = ntuple(d -> (serial.extents[d][1] + serial.extents[d][2]) / 2, D)
-    ball = Ellipsoid(mid, ntuple(d -> 0.3, D))
-    basis = Lagrange(4)
-    derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
-    full = interpolate(sfs, xs, basis; derivs=derivs, vars=[3, 1], exclude=ball)
-    plain = interpolate(sfs, xs, basis)
-    @test 0 < count(full.excluded) < length(xs)
-    for P in Ps
-        P = P === :empty ? nleaves(serial) + 2 : P      # ranks without blocks
-        parts = uneven_parts(length(xs), P)
-        comms = gather_ranks(P)
-        results = on_ranks(P) do r
-            forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
-                            reflecting=TreeAMR.reflecting_faces(serial),
-                            outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
-                            TreeAMR.seam_keywords(serial)...,
-                            leaves=serial.leaves, comm=comms[r])
-            fs = FieldSet{T}(forest, 3; G=G, centering=C, parity=parity)
-            copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
-            mine = xs[parts[r]]
-            a = interpolate(fs, mine, basis; derivs=derivs, vars=[3, 1], exclude=ball)
-            b = interpolate(fs, mine, basis)
-            # Into caller-supplied outputs, over the points as SVector-like
-            # vectors rather than tuples.
-            vals = fill(T(NaN), 3, length(derivs), length(mine))
-            exc = fill(true, length(mine))
-            interpolate!(vals, exc, fs, [collect(x) for x in mine], basis; derivs=derivs,
-                         vars=1:3)
-            (a, b, vals, exc, nblocks(fs))
-        end
-        P > nleaves(serial) && @test any(res -> res[5] == 0, results)
-        @test isempty(parts[2]) && size(results[2][1].values) == (2, length(derivs), 0)
-        for (r, (a, b, vals, exc, _)) in enumerate(results)
-            js = parts[r]
-            @test bitwise_equal(a.values, full.values[:, :, js])
-            @test a.excluded == full.excluded[js]
-            @test bitwise_equal(b.values, plain.values[:, :, js])
-            @test !any(b.excluded)
-            ref = interpolate(sfs, xs[js], basis; derivs=derivs)
-            @test bitwise_equal(vals, ref.values)
-            @test !any(exc)
+    if vertexlike(C)
+        pending(4, "distributed interpolate, D=$D, $kinds, $C")
+    else
+        # A point routed to the wrong rank, evaluated on the wrong local block,
+        # or put back in the wrong slot gives a wrong value; one evaluated from
+        # other inputs than the serial kernel's gives one that differs in the
+        # last bit. Random data over every stored point, ghosts included, so
+        # no smooth field hides either.
+        serial = faces_forest(kinds; N=D == 3 ? 6 : 8)
+        walls = any(d -> any(TreeAMR.reflecting_faces(serial)[d]), 1:D)
+        parity = walls ? EXCHANGE_PARITY : nothing
+        G = ghosts_for(C, 4)
+        sfs = FieldSet{T}(serial, 3; G=G, centering=C, parity=parity)
+        data = T.(rand(MersenneTwister(D), size(sfs.work)...) .- 0.5)
+        copyto!(sfs.work, data)
+        xs = routing_points(Xoshiro(30 + D), serial)
+        mid = ntuple(d -> (serial.extents[d][1] + serial.extents[d][2]) / 2, D)
+        ball = Ellipsoid(mid, ntuple(d -> 0.3, D))
+        basis = Lagrange(4)
+        derivs = (gradient_derivs(D)..., hessian_derivs(D)...)
+        full = interpolate(sfs, xs, basis; derivs=derivs, vars=[3, 1], exclude=ball)
+        plain = interpolate(sfs, xs, basis)
+        @test 0 < count(full.excluded) < length(xs)
+        for P in Ps
+            P = P === :empty ? nleaves(serial) + 2 : P      # ranks without blocks
+            parts = uneven_parts(length(xs), P)
+            comms = gather_ranks(P)
+            results = on_ranks(P) do r
+                forest = Forest(serial.roots; N=serial.N, periodic=serial.periodic,
+                                reflecting=TreeAMR.reflecting_faces(serial),
+                                outflow=TreeAMR.outflow_faces(serial), extents=serial.extents,
+                                TreeAMR.seam_keywords(serial)...,
+                                leaves=serial.leaves, comm=comms[r])
+                fs = FieldSet{T}(forest, 3; G=G, centering=C, parity=parity)
+                copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
+                mine = xs[parts[r]]
+                a = interpolate(fs, mine, basis; derivs=derivs, vars=[3, 1], exclude=ball)
+                b = interpolate(fs, mine, basis)
+                # Into caller-supplied outputs, over the points as SVector-like
+                # vectors rather than tuples.
+                vals = fill(T(NaN), 3, length(derivs), length(mine))
+                exc = fill(true, length(mine))
+                interpolate!(vals, exc, fs, [collect(x) for x in mine], basis; derivs=derivs,
+                             vars=1:3)
+                (a, b, vals, exc, nblocks(fs))
+            end
+            P > nleaves(serial) && @test any(res -> res[5] == 0, results)
+            @test isempty(parts[2]) && size(results[2][1].values) == (2, length(derivs), 0)
+            for (r, (a, b, vals, exc, _)) in enumerate(results)
+                js = parts[r]
+                @test bitwise_equal(a.values, full.values[:, :, js])
+                @test a.excluded == full.excluded[js]
+                @test bitwise_equal(b.values, plain.values[:, :, js])
+                @test !any(b.excluded)
+                ref = interpolate(sfs, xs[js], basis; derivs=derivs)
+                @test bitwise_equal(vals, ref.values)
+                @test !any(exc)
+            end
         end
     end
 end
@@ -194,7 +198,7 @@ function seam_points(rng, forest::Forest{D}; nrandom=160) where {D}
     return xs
 end
 
-@testset "A distributed interpolate through a rotating seam is the serial one: D=$D" for
+@pending 7 "A distributed interpolate through a rotating seam is the serial one: D=$D" for
         D in (2, 3)
     # Routing turns a point beyond the seam back into the quadrant on the
     # host, to find its owner, and the owner's kernel turns it again to
@@ -237,7 +241,7 @@ end
     end
 end
 
-@testset "A point beyond the seam of a set that turns into its partner is refused on every rank" begin
+@pending 7 "A point beyond the seam of a set that turns into its partner is refused on every rank" begin
     # The value there is the partner's, which `interpolate` does not read.
     # The host marks such a point when it locates it, before anything is
     # routed, so a point on one rank only must be refused on every rank
@@ -270,7 +274,7 @@ end
     end
 end
 
-@testset "A distributed interpolate through a half-turn seam is the serial one: D=$D" for
+@pending 7 "A distributed interpolate through a half-turn seam is the serial one: D=$D" for
         D in (2, 3)
     # Routing turns a point beyond the seam back about the centre line on
     # the host, to find its owner, and the owner's kernel turns it again;

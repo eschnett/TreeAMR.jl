@@ -30,7 +30,7 @@ using MultiFloats: Float32x2
     end
 end
 
-@testset "The candidate remote targets are every remote leaf touching this rank: D=$D" for
+@pending 4 "The candidate remote targets are every remote leaf touching this rank: D=$D" for
         D in (1, 2, 3)
     # A missing candidate is a remote target whose ghosts this rank never
     # packs, and its owner then waits for a message that is never sent.
@@ -69,6 +69,8 @@ end
     nonempty = 0
     for kinds in EXCHANGE_KINDS[D], C in allcenterings(Val(D)),
         family in (all(==(:cell), C) ? (PointValue, Conservative) : (PointValue,))
+        # Refined, and reflecting but in D = 1 (M22 steps 3 and 4).
+        vertexlike(C) && (pending(4, "rank transfers, $C, $kinds"); continue)
         serial = faces_forest(kinds; N=8)
         n = nleaves(serial)
         ops = exchange_operators(C, family)
@@ -101,6 +103,7 @@ end
     # for element — the same transfers in the same order at the same
     # offsets — or every ghost after the first disagreement is another's.
     for kinds in EXCHANGE_KINDS[D], C in (cellcentered(D), vertexcentered(D))
+        vertexlike(C) && (pending(4, "message layouts, $C, $kinds"); continue)
         serial = faces_forest(kinds; N=8)
         G = exchange_ghosts(C, PointValue)
         for P in 2:5
@@ -123,6 +126,7 @@ end
     # that stage, at most one per point — which the serial write counts
     # (exactly one per ghost, `ghost_tests.jl`) then make exactly one.
     for kinds in EXCHANGE_KINDS[D], C in allcenterings(Val(D))
+        vertexlike(C) && (pending(4, "every ghost written once, $C, $kinds"); continue)
         serial = faces_forest(kinds; N=8)
         G = exchange_ghosts(C, PointValue)
         stored = ntuple(d -> serial.N + 2G[d] + (C[d] === :vertex), D)
@@ -140,7 +144,7 @@ end
     end
 end
 
-@testset "The interface stages hold the serial restrictions, split by rank: D=$D" for
+@pending 4 "The interface stages hold the serial restrictions, split by rank: D=$D" for
         D in (1, 2, 3)
     # The interface restriction is the other exchange that crosses
     # ranks: a coarse-fine face whose fine side is another rank's. The
@@ -197,6 +201,7 @@ end
     # `Float32x2`, whose limbs must survive it. A rank with no blocks
     # takes part too.
     nnegzero = nmirror = 0
+    ran = false
     for kinds in EXCHANGE_KINDS[D]
         serial = faces_forest(kinds; T=T, N=8)
         centers = T === Float64 ? allcenterings(Val(D)) :
@@ -204,6 +209,8 @@ end
         counts = T === Float64 ? (D == 1 ? (1, 2, 3, 5, nleaves(serial) + 1) : (2, 3, 5)) :
                  (3,)
         for C in centers, P in counts
+            vertexlike(C) && (pending(4, "lockstep fill, $C, $kinds, P = $P, $T"); continue)
+            ran = true
             same, nz, nm, bad = lockstep_ghost_fill(serial, P, C, PointValue, T)
             @test same
             @test bad == 0
@@ -222,6 +229,7 @@ end
             # off the multilinear rows the pack keeps; vertex-centered, so
             # that the derived wall row is bounded too.
             for C in (cellcentered(D), vertexcentered(D))
+                vertexlike(C) && (pending(4, "bounded lockstep fill, $C, $kinds"); continue)
                 same, _, _, bad = lockstep_ghost_fill(serial, 3, C, PointValue, T;
                                                       bounded=true)
                 @test same && bad == 0
@@ -231,14 +239,16 @@ end
     # MultiFloats' product returns `+0` for `0 · (−1)`, so the serial fill
     # has no `−0` to preserve in `Float32x2`; what that type checks is
     # that `0 + 1·x` returns the limbs of every value a pack produces.
-    T === Float32x2 || @test nnegzero > 0
+    # (Vacuous where every centering run here is pending, as in Float32
+    # in 3D, which runs the vertex-centered set alone: M22 step 4.)
+    T === Float32x2 || !ran || @test nnegzero > 0
     # In 1D every mirrored region is the block's own reflection, which is
     # always local; from 2D on an edge region's mirror image lies in a
     # tangential neighbor, which may be another rank's.
-    D == 1 || @test nmirror > 0
+    D == 1 || !ran || @test nmirror > 0
 end
 
-@testset "The staged interface restriction reproduces the serial one bitwise: D=$D, T=$T" for
+@pending 4 "The staged interface restriction reproduces the serial one bitwise: D=$D, T=$T" for
         D in (1, 2, 3), T in (Float64, Float32x2)
     # The interface restriction overwrites a coarse block's own face
     # values with the fine side's, so a fine side on another rank is a
@@ -282,6 +292,7 @@ end
     serial = faces_forest(kinds; N=8)
     nvars = length(EXCHANGE_PARITY)
     for C in (cellcentered(D), vertexcentered(D)), P in (3, 5)
+        vertexlike(C) && (pending(4, "staged driver, $C, P = $P, D=$D"); continue)
         G = exchange_ghosts(C, PointValue)
         sfs = FieldSet(serial, nvars; G=G, centering=C, parity=EXCHANGE_PARITY)
         data = exchange_data(MersenneTwister(7), Float64, size(sfs.work))
@@ -352,6 +363,7 @@ end
     f = (x, v) -> sin(sum(x)) + x[1]^2
     for (C, hook) in ((vertexcentered(D), CellBoundary(Relative(x -> cos(sum(x))))),
                       (cellcentered(D), boundary_by_coordinates(f))), P in (2, 3)
+        vertexlike(C) && (pending(4, "grouped stages, $C, P = $P, D=$D"); continue)
         sfs = FieldSet(serial, 1; G=3, centering=C, parity=parity)
         data = rand(MersenneTwister(11), size(sfs.work)...) .- 0.5
         copyto!(sfs.work, data)
@@ -543,7 +555,7 @@ end
 # values bit for bit — for a set that turns into itself and for a
 # `RotationPair`, whose stages are merged by (stage, member).
 
-@testset "Across a rotating seam the ranks hold the serial transfers, laid out alike and written once: D=$D" for
+@pending 7 "Across a rotating seam the ranks hold the serial transfers, laid out alike and written once: D=$D" for
         D in (2, 3)
     # A rotated transfer lost between ranks leaves a ghost unwritten; one
     # whose orientation a rank derives differently from its peer reads
@@ -584,7 +596,7 @@ end
     @test nrotated > 0
 end
 
-@testset "Packing and unpacking across a rotating seam reproduces the serial fill bitwise: D=$D" for
+@pending 7 "Packing and unpacking across a rotating seam reproduces the serial fill bitwise: D=$D" for
         D in (2, 3)
     # The values. A pack that applied the turn's sign would turn the
     # serial fill's `−0` — a component that is zero, negated by the turn
@@ -664,7 +676,7 @@ end
     @test nrot > 0
 end
 
-@testset "The staged driver over a communicator fills across a rotating seam: D=$D" for
+@pending 7 "The staged driver over a communicator fills across a rotating seam: D=$D" for
         D in (2, 3)
     # The composition through the communicator verbs, every rank its own
     # task: the single fill of a set that turns into itself, and the
@@ -743,7 +755,7 @@ end
 # one write per point, and the values bit for bit, with `−0` from the
 # negated component.
 
-@testset "Across a half-turn seam the ranks hold the serial transfers and its values bitwise: D=$D" for
+@pending 7 "Across a half-turn seam the ranks hold the serial transfers and its values bitwise: D=$D" for
         D in (2, 3)
     # A shifted slab whose range one end derives differently from the other
     # misplaces a whole message; a pack that applied the sign turns the

@@ -416,6 +416,8 @@ end
     for (rot, other) in cases, p in (2, 4),
         C in (rot == cases[1][1] ? symmetric_centerings(D, rot) :
               [cellcentered(D), vertexcentered(D)])
+        vertexlike(C) && (pending(7, "rotated ghosts defined, $C, $rot, p = $p, D=$D");
+                          continue)
         nnan, worst, schedule = undefined_rotated_ghosts(Val(D); rotating=rot,
                                                          other=other, C=C, p=p)
         (nnan == 0 && worst < 1e-10) || push!(bad, (rot, other, C, p, nnan, worst))
@@ -444,6 +446,7 @@ end
             [((1, 2), :periodic), ((2, 1), :reflect_lo), ((3, 1), :outer)]
     worst = 0.0
     for (rot, other) in cases, C in (cellcentered(D), vertexcentered(D))
+        vertexlike(C) && (pending(7, "rotating quadrant, $C, $rot, D=$D"); continue)
         result = rotating_vs_quadrupled(Val(D); rotating=rot, centering=C, other=other)
         @test result !== nothing
         result === nothing && continue
@@ -469,6 +472,7 @@ end
     for (rot, other) in cases
         for (Ca, Ga, p) in ((facecentered(D, rot[1]), nothing, 4),
                             (cellcentered(D), ntuple(d -> d == rot[1] ? 2 : 1, D), 2))
+            vertexlike(Ca) && (pending(7, "RotationPair, $Ca, $rot, D=$D"); continue)
             G = Ga === nothing ? ghosts_for(Ca, p) : Ga
             result = rotating_pair_vs_quadrupled(Val(D); rotating=rot, other=other, p=p,
                                                  Ca=Ca, Ga=G)
@@ -504,6 +508,7 @@ end
         Cf = facecentered(D, d1)
         push!(layouts, (Cf, ghosts_for(Cf, 4)), (swap(Cf), swap(ghosts_for(Cf, 4))))
         for (C, G) in layouts
+            vertexlike(C) && (pending(7, "partition across the seam, $C, $rot"); continue)
             fs = FieldSet(forest, D + 1; G=G, centering=C,
                           rotation=vector_rotation(D, rot),
                           parity=vector_parity(D, rot, other))
@@ -521,7 +526,7 @@ end
     end
 end
 
-@testset "An asymmetric set is refused alone where its ghosts are its partner's" begin
+@pending 7 "An asymmetric set is refused alone where its ghosts are its partner's" begin
     # Filled alone, a set whose layout is not symmetric in the plane would
     # read its own data where its partner's belongs, the wrong component
     # in the wrong layout; the plain fill refuses it and says what to do.
@@ -580,6 +585,8 @@ end
         for (label, kw) in (("cell", (; C=cellcentered(D))),
                             ("vertex", (; C=vertexcentered(D))),
                             ("pair", (; pair=true)))
+            label == "cell" ||
+                (pending(7, "regrid across the seam, $label, $rot, D=$D"); continue)
             results = rotating_regrid_vs_quadrupled(Val(D); rotating=rot, other=other,
                                                     passes=passes, kw...)
             counts = [r.nleaves for r in results]
@@ -600,7 +607,7 @@ end
     end
 end
 
-@testset "regrid! refuses an asymmetric set alone and takes a pair with its schedules" begin
+@pending 7 "regrid! refuses an asymmetric set alone and takes a pair with its schedules" begin
     # Moved alone, a set whose ghosts across the seam are its partner's
     # would be filled from its own data before the transfer; the regrid
     # must refuse it with the hint, as the fill does, and agree on it on
@@ -635,7 +642,7 @@ end
                        boundary=CellBoundary((x, v, δ) -> zero(eltype(x)))) === pair
 end
 
-@testset "The initial-data cycle adapts a rotating quadrant, alone or as a pair" begin
+@pending 7 "The initial-data cycle adapts a rotating quadrant, alone or as a pair" begin
     # The cycle fills ghosts before it flags, and a pair's ghosts across
     # the seam are each other's; it must converge to a conforming mesh
     # and leave data that a fill reproduces exactly.
@@ -692,7 +699,7 @@ end
     @test worst < 1e-10
 end
 
-@testset "The interface schedule records nothing across the conforming seam: D=$D" for
+@pending 7 "The interface schedule records nothing across the conforming seam: D=$D" for
         D in (2, 3)
     # A coarse-fine face across the seam would need a turned restriction,
     # which the interface schedule does not build; conformity rules it
@@ -732,7 +739,7 @@ end
     @test_throws "this is a bug" InterfaceSchedule(fx)
 end
 
-@testset "Rigid rotation conserves mass through the seam and coarse-fine faces" begin
+@pending 7 "Rigid rotation conserves mass through the seam and coarse-fine faces" begin
     # The seam's two faces must exchange exactly the flux one loses and
     # the other gains, and the coarse-fine faces inside the quadrant need
     # the fixup, as anywhere: a leak at the seam or at an interface shows
@@ -780,6 +787,8 @@ end
     worst_poly, worst_full = 0.0, 0.0
     worst_direct = Dict(:cell => 0.0, :vertex => 0.0)
     for (rot, other) in cases, C in (cellcentered(D), vertexcentered(D))
+        vertexlike(C) && (pending(7, "interpolation beyond the seam, $C, $rot, D=$D");
+                          continue)
         d1, d2 = rot
         z = outofplane(D, rot)
         mirrors = other === :reflect_lo
@@ -904,7 +913,7 @@ end
     println("Float32 beyond the seam: within $(maximum(abs.(res[2] .- res[1]))) of Float64")
 end
 
-@testset "A turned point reads variables it was not asked for" begin
+@pending 7 "A turned point reads variables it was not asked for" begin
     # The failure mode: the turn takes a requested component to one that is
     # not in `vars` — the metric's g_xz to g_yz — and an implementation that
     # only loaded the requested variables would read the wrong one. The
@@ -933,7 +942,7 @@ end
     @test a == [-b[1], b[3], -b[2], -b[4], -b[7], b[6], -b[5]]
 end
 
-@testset "A set that turns into its partner refuses points beyond the seam" begin
+@pending 7 "A set that turns into its partner refuses points beyond the seam" begin
     # A face-centered set's value beyond the seam is its partner's, turned;
     # read from itself it would be the wrong component in the wrong
     # layout, so the point is refused with the reason, after the launch,
@@ -1002,6 +1011,7 @@ end
     # same points, and must keep them equal.
     rotation = rotwave_rotation(K, (1, 2))
     for C in (cellcentered(2), vertexcentered(2))
+        vertexlike(C) && (pending(7, "wave on a quadrant, $C, K=$K"); continue)
         full = rotating_wave(; N=16, C=C, K=K, full=true)
         quad = rotating_wave(; N=16, C=C, K=K, full=false)
         @test quad.nsteps == full.nsteps
@@ -1036,6 +1046,7 @@ end
     # half-turned edge) shows as a rate below 2 long before a single fill
     # looks wrong.
     for C in (cellcentered(2), vertexcentered(2)), K in (1, 2)
+        vertexlike(C) && (pending(7, "quadrant wave converges, $C, K=$K"); continue)
         hs, l2, linf = Float64[], Float64[], Float64[]
         for N in (8, 16, 32)
             r = rotating_wave(; N=N, C=C, K=K, full=false)

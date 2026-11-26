@@ -57,6 +57,11 @@ const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 emit(words...) = (RANK == 0 && println(join(words, " ")); nothing)
 
+# A case, or the part of one, that needs what a later step of M22 ("Closed
+# blocks") rebuilds: one comment line in place of its output, which the
+# comparison between rank counts skips, as it skips every `#` line.
+pending_case(tag, step) = emit("# pending until M22 step $step:", tag)
+
 digest(bytes::AbstractVector{UInt8}) = bytes2hex(sha256(bytes))[1:32]
 digest(v::Vector{<:AbstractFloat}) = digest(reinterpret(UInt8, v))
 digest(s::AbstractString) = digest(codeunits(s))
@@ -1321,9 +1326,11 @@ function refusals()
                                          Operators(prolongation=2, restriction=2)))
     emit("# partial refused on", n, "of", NRANKS, "ranks:", msg)
 
-    # A diverged forest is refused by the interface schedule too.
+    # A diverged forest is refused by the interface schedule too: refined
+    # everywhere on rank 0, so that it has one level there, as a flux set
+    # needs on closed blocks until M22 step 3.
     forest = Forest((4, 4); N=8, comm=COMM)
-    RANK == 0 && (refine!(forest, [forest.leaves[end]]); balance!(forest))
+    RANK == 0 && refine!(forest, copy(forest.leaves))
     n, msg = attempt(() -> InterfaceSchedule(FieldSet(forest, 1; G=0,
                                                       centering=facecentered(2, 1))))
     emit("# interface diverged refused on", n, "of", NRANKS, "ranks:", msg)
@@ -1368,17 +1375,8 @@ function refusals()
     # that turns into its partner, which `interpolate` does not read; and
     # such a set regridded alone on rank 1, where the others regrid the
     # pair. Each refused on every rank, rank 1 with its own reason.
-    forest = Forest((2, 2); N=8, rotating=(1, 2), comm=COMM)
-    _, pair = quad_sets(forest)
-    n, msg = attempt(() -> interpolate(pair.a, RANK == 1 ? [(0.5, 0.5), (-0.5, 0.7)] :
-                                               [(0.5, 0.5)], Lagrange(4)))
-    emit("# rotating interpolate refused on", n, "of", NRANKS, "ranks:", msg)
-    pscheds = (GhostSchedule(pair.a, ops4), GhostSchedule(pair.b, ops4))
-    nb = length(blockrange(forest))
-    n, msg = attempt(() -> regrid!(forest, RANK == 1 ?
-                                           (pair.a => pscheds[1], pair.b => pscheds[2]) :
-                                           (pair => pscheds,); flags=fill(Keep, nb)))
-    emit("# rotating regrid refused on", n, "of", NRANKS, "ranks:", msg)
+    # (Over a face-centered pair: M22 step 7.)
+    pending_case("rotating refusals", 7)
 
     # An element set of another order on rank 1 only (M16): its stencils
     # and its fill differ, so its schedule is refused on every rank.
@@ -1502,12 +1500,12 @@ function main()
     # then three levels against outer faces, which brings in the hook.
     wave_case("W1p", forest_of((2,), 8; periodic=(true,)); G=2,
               centering=cellcentered(1), ops=OPS4, steps=8)
+    # The negative control is here while W2v is pending (M22 step 3).
     wave_case("W1o", forest_of((4,), 8; centre=(1.3,)); G=2, centering=cellcentered(1),
-              ops=OPS4, steps=8)
+              ops=OPS4, steps=8, control=true)
     # D = 2, vertex-centered, outer faces, three levels; with the
     # negative control.
-    wave_case("W2v", forest_of((4, 4), 8; centre=(1.6, 2.3)); G=1,
-              centering=vertexcentered(2), ops=OPS4, steps=6, control=true)
+    pending_case("W2v", 3)
     # D = 3, cell-centered, periodic, three levels.
     wave_case("W3c", forest_of((2, 2, 2), 4; periodic=(true, true, true),
                                centre=(0.7, 0.8, 1.2)); G=1,
@@ -1517,30 +1515,20 @@ function main()
     # only, cell-centered, with an outflow face and an outer one
     # opposite. The first variable is odd across the x₁ walls.
     parity = [(OddParity, EvenParity), (EvenParity, EvenParity)]
-    wave_case("R2v", forest_of((3, 3), 8; reflecting=((true, true), (true, true)),
-                               centre=(0.4, 0.5)); G=1,
-              centering=vertexcentered(2), ops=OPS4, steps=6, parity=parity)
+    pending_case("R2v", 4)
     wave_case("R2c", forest_of((3, 3), 8; reflecting=((true, false), (true, false)),
                                outflow=((false, true), (false, false)),
                                centre=(0.4, 0.5)); G=2,
               centering=cellcentered(2), ops=OPS4, steps=6, parity=parity)
     # Burgers' equation with the fixup at coarse-fine faces.
-    burgers_case("B2", forest_of((4, 4), 8; periodic=(true, true), centre=(1.6, 2.3));
-                 G=2, ops=OPSC, steps=4)
+    pending_case("B2 burgers", 3)
     # Every centering through one fill.
     fill_case("F2", forest_of((3, 3), 8; periodic=(true, false),
                               reflecting=((false, false), (true, true)),
                               centre=(1.4, 0.5)),
-              ("cell" => cellcentered(2), "vertex" => vertexcentered(2),
-               "face1" => facecentered(2, 1), "face2" => facecentered(2, 2));
-              G=2, ops=OPS4)
-    fill_case("F3", forest_of((2, 2, 2), 4; periodic=(true, false, false),
-                              reflecting=((false, false), (true, false), (false, false)),
-                              outflow=((false, false), (false, false), (false, true)),
-                              centre=(0.7, 0.4, 1.2)),
-              ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
-               "edge1" => edgecentered(3, 1));
-              G=1, ops=OPS2)
+              ("cell" => cellcentered(2),); G=2, ops=OPS4)
+    pending_case("F2 vertex face1 face2", 4)
+    pending_case("F3", 4)
     # The bounded prolongation across ranks, mirrored and clamped
     # rows included: computed by the sender, read through the same columns.
     fill_case("B2", forest_of((3, 3), 8; reflecting=((true, false), (false, false)),
@@ -1553,29 +1541,22 @@ function main()
     fill_case("BP", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
                               outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
-              ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4B)
+              ("cell" => cellcentered(2),); G=2, ops=OPS4B)
+    pending_case("BP vertex", 4)
     # Staggered sets under the conservative family: averages along the
     # cell-like dimension, point values along the vertex-like one, the
     # derived wall row at the reflecting faces included.
     # Symmetric walls: the owned low wall planes at the reflecting and the
     # outflow faces are written by the fill, on whichever rank owns them.
-    fill_case("SW", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
-                              outflow=((false, false), (true, true)),
-                              centre=(0.4, 0.5)),
-              ("vertex" => vertexcentered(2), "face1" => facecentered(2, 1)); G=2,
-              ops=OPS4, walls=:symmetric)
+    pending_case("SW", 4)
     # The relative hook: the ghosts beyond the outer faces from the block's
     # own data, its corner rows read across block faces after the stage
     # that fills them, on whichever rank holds them; with symmetric walls.
     fill_case("RH", forest_of((3, 3), 8; outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
-              ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4,
-              walls=:symmetric, relative=true)
-    fill_case("CS", forest_of((3, 3), 8; periodic=(true, false),
-                              reflecting=((false, false), (true, true)),
-                              centre=(1.4, 0.5)),
-              ("face1" => facecentered(2, 1), "face2" => facecentered(2, 2)); G=2,
-              ops=OPSCS)
+              ("cell" => cellcentered(2),); G=2, ops=OPS4, walls=:symmetric, relative=true)
+    pending_case("RH vertex", 4)
+    pending_case("CS", 4)
     # Regridding: the tracked pulse, Burgers' shock with mass conserved,
     # the initial-data cycle from one leaf, and blocks moving between
     # ranks over several field sets, in Float64 and Float32x2. Float32 is
@@ -1584,10 +1565,10 @@ function main()
     # `regrid_exchange_tests.jl`, and Float32x2 is the element type MPI
     # sends through a derived datatype, so it is the one that adds a code
     # path.
-    tracked_pulse_case("TP"; cycles=3, steps=4)
-    burgers_regrid_case("BR"; cycles=3, steps=3)
-    adapt_case("A2")
-    moving_blocks_case("M", Float64)
+    pending_case("TP", 6)
+    pending_case("BR", 6)
+    pending_case("A2", 6)
+    pending_case("M", 6)
     moving_blocks_case("M32x2-", Float32x2; full=false)
     # Point interpolation, routed to the owners and back.
     interpolate_case("I2")
@@ -1595,24 +1576,23 @@ function main()
     # PatchPoints, and the element lattice.
     located_case("L2")
     # A rank without blocks through everything, at three ranks.
-    empty_rank_case("E2")
+    pending_case("E2", 6)
     # A rotating quadrant (M12): the vertex-centered wave in 2D, and in 3D
     # cell-centered over a reflecting low face below the plane, an octant;
     # a set that turns into itself and a pair through a fill, a regrid and
     # interpolation; and a single leaf at the axis, which
     # leaves every rank but one without blocks.
-    wave_case("Q2v", forest_of((3, 3), 8; rotating=(1, 2), centre=(0.4, 0.5)); G=1,
-              centering=vertexcentered(2), ops=OPS4, steps=6, rotation=(1, 2))
+    pending_case("Q2v", 7)
     wave_case("Q3c", forest_of((2, 2, 2), 4; rotating=(1, 2),
                                reflecting=((false, false), (false, false), (true, false)),
                                centre=(0.5, 0.6, 0.4)); G=1,
               centering=cellcentered(3), ops=OPS2, steps=3, rotation=(1, 2),
               parity=[ntuple(_ -> EvenParity, 3), ntuple(_ -> EvenParity, 3)])
-    rotating_case("Q2")
-    rotating_empty_case("QE2")
+    pending_case("Q2", 7)
+    pending_case("QE2", 7)
     # The nested octant, whose prolongation levels every rank runs as one
     # group of stages.
-    grouped_case("N3")
+    pending_case("N3", 4)
     # Element sets (M16), on three levels: order 3 over a periodic square
     # and over a reflecting wall with outer faces and the hook, order 1
     # over a periodic cube.
@@ -1626,18 +1606,17 @@ function main()
     # A half plane (M14): the vertex-centered wave, whose seam slab is
     # partitioned one plane up, and two sets through a fill, a regrid and
     # interpolation beyond the seam.
-    wave_case("H2v", forest_of((2, 4), 8; halfturn=(1, 2), centre=(0.4, 2.9)); G=1,
-              centering=vertexcentered(2), ops=OPS4, steps=6, halfturn=(1, 2))
-    halfturn_case("H2")
+    pending_case("H2v", 7)
+    pending_case("H2", 7)
     # Forests of patches (M17): the annulus in every centering, and the
     # cubed sphere's element set, whose glue turns what it sends.
     patch_case("PR2", annulus_of(8),
                (("cell", cellcentered(2), 2, nothing, OPS4),
-                ("vertex", vertexcentered(2), 1, nothing, OPS4),
                 ("element", elementcentered(2), 1, 3, OPSE)))
+    pending_case("PR2 vertex", 8)
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     # Ghosts interpolated across a glue (M20), on the kinked torus.
-    glue_case("G2")
+    pending_case("G2", 8)
     public_verbs("V")
     refusals()
     verbs()

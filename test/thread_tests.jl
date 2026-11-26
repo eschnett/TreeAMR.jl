@@ -137,10 +137,8 @@ end
     @test length(ghostgroups) > 1
     @test all(g -> issorted(g.targetblocks), ghostgroups)
 
-    isched = InterfaceSchedule(FieldSet(forest, 1; G=0, centering=facecentered(D, 1)))
-    facegroups = vcat(isched.phases...)
-    @test sum(ntransfers, facegroups; init=0) > 0
-    @test all(g -> issorted(g.targetblocks), facegroups)
+    # The interface fixup's at coarse-fine faces comes back with M22 step 3.
+    pending(3, "interface groups in block order, D=$D")
 
     finest = maxlevel(forest)
     flags = [level(k) == finest ? Coarsen : level(k) == 0 ? Refine : Keep
@@ -248,7 +246,7 @@ end
     lines = split(serial, '\n')
     turned(tag) = parse.(Int, split(only(filter(startswith("$tag schedule "),
                                                 lines)))[(end - 1):end])
-    @test all(t -> turned(t) == [0, 0], ("PR2c", "PR2v", "PR2e"))
+    @test all(t -> turned(t) == [0, 0], ("PR2c", "PR2e"))   # PR2v: M22 step 8
     @test all(>(0), turned("PL2c"))
     @test turned("PS3e")[1] > 0
 

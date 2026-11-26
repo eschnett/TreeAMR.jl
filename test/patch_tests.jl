@@ -309,6 +309,8 @@ end
     f = makepoly(D, 2)
     for refined in (false, true), C in patch_centerings(Val(D))
         refined && first(C) === :element && continue
+        vertexlike(C) && (pending(8, "brick cut into patches, $C, refined = $refined, " *
+                                     "D=$D"); continue)
         patched, place = brick_cut(roots, ((2,),))
         refined && patch_refine_one!(patched, place)
         brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
@@ -391,6 +393,7 @@ end
             @test_throws "vertex-like" GhostSchedule(fsp, patch_ops(fsp))
             continue
         end
+        vertexlike(C) && (pending(8, "swapped and reversed axes, $C, $name"); continue)
         brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
         fsb = patch_fieldset(brick, C)
         nnan, schedule = undefined_patch_ghosts(fsp, patch_ops(fsp), place)
@@ -418,16 +421,20 @@ end
     # every ghost inside a patch what its neighbor owns, and no `NaN` may
     # reach a ghost the fill writes. The glue is the identity, so its
     # transfers are ordinary copies, turned by nothing.
-    forest = patch_ring(4, (2, 1))
-    patch_refine_all!(forest)
-    fs = patch_fieldset(forest, C)
-    nnan, schedule = undefined_patch_ghosts(fs, patch_ops(fs), (p, x) -> (p, x))
-    @test nnan == 0
-    mismatches, seen = patch_ghost_mismatches(fs, patch_ring_across)
-    @test mismatches == 0
-    @test seen[:glued] > 0 && seen[:inside] > 0
-    @test !occursin("turned", sprint(show, schedule))
-    @test fs.rotvars == reshape(Int32[1, 2], :, 1)
+    if vertexlike(C)
+        pending(8, "annulus fills across its glue, $C")
+    else
+        forest = patch_ring(4, (2, 1))
+        patch_refine_all!(forest)
+        fs = patch_fieldset(forest, C)
+        nnan, schedule = undefined_patch_ghosts(fs, patch_ops(fs), (p, x) -> (p, x))
+        @test nnan == 0
+        mismatches, seen = patch_ghost_mismatches(fs, patch_ring_across)
+        @test mismatches == 0
+        @test seen[:glued] > 0 && seen[:inside] > 0
+        @test !occursin("turned", sprint(show, schedule))
+        @test fs.rotvars == reshape(Int32[1, 2], :, 1)
+    end
 end
 
 @testset "A cubed sphere refuses its patch corners and fills an element set exactly" begin
@@ -486,14 +493,10 @@ end
     @test_throws "a high face to a high face" GhostSchedule(
         patch_fieldset(highhigh, (:vertex, :cell)), PATCH_OPS)
     # What is not refused: the same with the reversed dimension cell-like,
-    # and a low face glued to a low face, vertex-like along its normal.
-    @test GhostSchedule(patch_fieldset(tangent, (:vertex, :cell)), PATCH_OPS) isa
-          GhostSchedule
-    @test GhostSchedule(patch_fieldset(highhigh, (:cell, :vertex)), PATCH_OPS) isa
-          GhostSchedule
-    lowlow, _ = laid_out((4, 3), ((-1, 2), (1, 2)))
-    @test GhostSchedule(patch_fieldset(lowlow, vertexcentered(2)), PATCH_OPS) isa
-          GhostSchedule
+    # and a low face glued to a low face, vertex-like along its normal —
+    # sets with a vertex-like dimension on a glued forest, which come back
+    # with M22 step 8.
+    pending(8, "a glue accepts the layouts its axis map carries")
 end
 
 @testset "Groups across different glued faces are told apart, in one order" begin
@@ -582,7 +585,7 @@ end
     end
 end
 
-@testset "The interface schedule reports a coarse-fine face across a glue as a bug" begin
+@pending 8 "The interface schedule reports a coarse-fine face across a glue as a bug" begin
     # A finer neighbor across a glued face can only mean a forest that is not
     # conforming, which no checked path produces: the interface schedule
     # says so, rather than skip the restriction, or restrict untransformed.
@@ -615,6 +618,8 @@ end
     all2(x, p) = ntuple(v -> fp(x, p, v), 2)
     for refined in (false, true), C in patch_centerings(Val(D))
         refined && first(C) === :element && continue
+        vertexlike(C) && (pending(8, "identical extents, $C, refined = $refined, D=$D");
+                          continue)
         patched, place = same_box(Val(D))
         @test patched.extents == ntuple(_ -> (0.0, 2.0), D)
         refined && patch_refine_one!(patched, place)
@@ -664,6 +669,8 @@ end
     code(x, p, v, δ) = 1000 * p + 100 * v + 10 * δ[2] + δ[1] + x[1] / 4 + x[2] / 64
     ps = block_patches(ring)
     for C in patch_centerings(Val(2))
+        vertexlike(C) && (pending(8, "WithPatch hands outer ghosts their patch, $C");
+                          continue)
         fs = patch_fieldset(ring, C)
         sched = GhostSchedule(fs, patch_ops(fs))
         hooks = (CellBoundary(WithPatch((x, p, v, δ) -> oftype(x[1], code(x, p, v, δ)))),

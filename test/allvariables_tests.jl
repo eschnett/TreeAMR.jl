@@ -68,6 +68,7 @@ end
     nv = 2
 
     for (C, G) in allvariables_cases(D)
+        vertexlike(C) && (pending(3, "all-variables hook, $C, D=$D"); continue)
         per = FieldSet(forest, nv; G=G, centering=C)
         whole = FieldSet(forest, nv; G=G, centering=C)
         schedule = GhostSchedule(per, OPS2A)

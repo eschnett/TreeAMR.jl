@@ -134,6 +134,9 @@ end
     # `coordinates` does not.
     forest = position_forest(T, D)
     for (C, P) in position_cases(D)
+        # The flagging sweep (M22 step 6) on a refined mesh (step 3).
+        vertexlike(C) && (pending(6, "kernels form coordinates' positions, $C, D=$D, $T");
+                          continue)
         fs = position_set(forest, D, C, P; G=1)
         fill_by_coordinates!((x, v) -> x[v], fs)
         N = forest.N
@@ -218,6 +221,7 @@ end
         # On a forest of patches a stencil reads no ghost, which only an
         # element set's does not.
         TreeAMR.ispatched(forest) && P == 0 && continue
+        vertexlike(C) && (pending(3, "own points located, $C, D=$D, $T"); continue)
         fs = position_set(forest, 1, C, P; G=P == 0 ? 2 : 1)
         fill_by_coordinates!((x, v) -> 1 + sum(x), fs)
         fill_ghosts!(fs, GhostSchedule(fs, P == 0 ?

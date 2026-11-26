@@ -27,7 +27,7 @@ const GLUE_EXCHANGE_CASES = [
      (ξ, p) -> sin(sum(TreeAMR.chart_map(seven_ball(2, 1), ξ, p))),
      ball_hook((ξ, p) -> sin(sum(TreeAMR.chart_map(seven_ball(2, 1), ξ, p)))))]
 
-@testset "Over simulated ranks the interpolated ghosts are the serial ones bit for bit" begin
+@pending 8 "Over simulated ranks the interpolated ghosts are the serial ones bit for bit" begin
     # Guards the sender's evaluation: a ghost located on one rank and
     # evaluated on another, through a stencil the owner rebuilds from the
     # location, must come out as the serial fill's, in the slot the
@@ -75,7 +75,7 @@ TreeAMR.chart_locate(::MisalignedTorus, x) = TreeAMR.chart_locate(KINKED, x)
 TreeAMR.chart_map(::MisalignedTorus, ξ, p) = TreeAMR.chart_map(KINKED, ξ, p)
 TreeAMR.chart_aligned(::MisalignedTorus, p, q) = (true, true)
 
-@testset "Over simulated ranks a refusal of the glue plan is raised on every rank" begin
+@pending 8 "Over simulated ranks a refusal of the glue plan is raised on every rank" begin
     # Guards the collective agreement: a wrong alignment is found on the
     # ranks whose blocks have the ghost, and every rank must refuse rather
     # than wait in the build's alltoallv.
@@ -96,7 +96,7 @@ TreeAMR.chart_aligned(::MisalignedTorus, p, q) = (true, true)
               results)
 end
 
-@testset "Over simulated ranks regrid! moves the appendix with its block" begin
+@pending 8 "Over simulated ranks regrid! moves the appendix with its block" begin
     # Guards the regrid of a set with an appendix between ranks: a kept
     # block whose owner changes is a copy between ranks, which must carry
     # its owned high face planes under the same key on both ends.

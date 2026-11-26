@@ -710,7 +710,7 @@ end
     end
 end
 
-@testset "Each field set may bring its own boundary hook to regrid!: D=$D" for D in (1, 2)
+@pending 6 "Each field set may bring its own boundary hook to regrid!: D=$D" for D in (1, 2)
     # An all-variables hook is checked against its set's `nvars`, so one
     # shared hook cannot fill sets with different `nvars`; and sets of
     # different physics have different boundary data. Regridding them in
@@ -771,7 +771,7 @@ end
     @test_throws "fs => schedule" regrid!(forest, fs => 3; flags=flags)
 end
 
-@testset "Several field sets adapt to their initial data together: D=$D" for D in (1, 2)
+@pending 6 "Several field sets adapt to their initial data together: D=$D" for D in (1, 2)
     # Sets with different `nvars` and centerings, each re-evaluated on the
     # final mesh — the adapted set alone would leave the others to be
     # filled afterwards, and a criterion reading the second set would

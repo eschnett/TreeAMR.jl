@@ -140,12 +140,14 @@ end
                                 4)
         Cs = D == 3 ? [centerings[mod1(i, length(centerings))]] : centerings
         for C in Cs
+            vertexlike(C) && continue               # M22 step 4, below
             nnan, worst = outflow_deviation(forest, C, f, parity)
             (nnan == 0 && worst < 1e-12) || push!(bad, (kinds, C, nnan, worst))
         end
     end
     @test isempty(bad)
     isempty(bad) || foreach(println, bad)
+    pending(4, "outflow ghost repeats nearest owned point, vertex-like centerings, D=$D")
 end
 
 @testset "Every ghost is defined and none is read undefined at outflow faces: D=$D" for
@@ -166,12 +168,14 @@ end
     for (i, kinds) in enumerate(cases)
         Cs = D == 3 ? [centerings[mod1(i, length(centerings))]] : centerings
         for C in Cs
+            vertexlike(C) && continue               # M22 step 4, below
             nnan, worst = undefined_ghosts(kinds, C)
             (nnan == 0 && worst < 1e-10) || push!(bad, (kinds, C, nnan, worst))
         end
     end
     @test isempty(bad)
     isempty(bad) || foreach(println, bad)
+    pending(4, "every ghost defined at outflow faces, vertex-like centerings, D=$D")
 end
 
 @testset "Outflow and periodic faces need no boundary hook: D=$D" for D in (1, 2, 3)
@@ -180,6 +184,7 @@ end
     kinds = ntuple(d -> d == 1 ? :outflow_both : :periodic, D)
     forest = faces_forest(kinds)
     for C in (cellcentered(D), vertexcentered(D))
+        vertexlike(C) && (pending(4, "outflow needs no hook, $C, D=$D"); continue)
         fs = FieldSet(forest, 1; G=ghosts_for(C, 4), centering=C)
         schedule = GhostSchedule(fs, OPS4)
         @test isempty(schedule.boundaries)
@@ -197,6 +202,7 @@ end
     N = D == 3 ? 4 : 8
     kinds = ntuple(d -> isodd(d) ? :outflow_lo : :reflect_hi, D)
     for C in allcenterings(Val(D))
+        vertexlike(C) && (pending(6, "regrid at an outflow face, $C, D=$D"); continue)
         forest = faces_forest(kinds; N=N)
         f, parity = parity_data(Float64, kinds, 2)
         hook = boundary_by_coordinates(f)            # for the outer faces

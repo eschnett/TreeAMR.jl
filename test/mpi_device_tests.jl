@@ -84,9 +84,10 @@ numbers(lines, words...) =
     backend, T, deviceaware = header[5], header[7], header[9] == "true"
     rtol = T == "Float32" ? 1e-5 : 1e-12
     @info "reference" backend T deviceaware lines = length(serial)
-    @test count(l -> occursin(" state ", l), serial) >= 6
-    @test "B2 conserved true" in serial
-    @test "M conserved true" in serial
+    # W2v, Q2v, QP2 and B2 (M22 steps 3 and 7), TP and M (step 6) and G2
+    # (step 8) are pending, each a `#` line.
+    @test count(l -> occursin(" state ", l), serial) >= 2
+    @test count(startswith("# pending until M22 step "), serial) == 7
     for n in RANKCOUNTS
         out = workload(n)
         @test split(first(out))[1:3] == ["#", "ranks", string(n)]
@@ -97,33 +98,14 @@ numbers(lines, words...) =
         # Every stage with messages went through host mirrors on a device
         # that is not handed to MPI directly, and none did otherwise.
         stages = [l for l in out if occursin(" stages messages ", l)]
-        @test length(stages) == 7
+        @test length(stages) == 2                    # R2c and W3c
         for l in stages
             w = split(l)
             messages, staged = parse(Int, w[end - 2]), parse(Int, w[end])
             @test messages > 0
             @test staged == (backend != "cpu" && !deviceaware ? messages : 0)
         end
-        # Ghosts interpolated across a glue (M20) crossed ranks, through host
-        # mirrors exactly where the stages' messages went through them.
-        received, sending, staged = only(numbers(filter(startswith("# G2"), out), "G2",
-                                                 "glue"))
-        @test received > 0 && sending > 0
-        @test staged == (backend != "cpu" && !deviceaware ? sending : 0)
-        moved(name) = only(numbers(filter(startswith("# M"), out), name, "migrated"))
-        @test moved("M4.refine")[1] > 0              # blocks moved up the ranks
-        @test moved("M4.coarsen")[2] > 0             # and back down
-        @test moved("M2.coarsen")[3] > 0             # siblings with different owners
-
-        # The second regrid cycle took every buffer and mirror from the
-        # pool, which kept the first cycle's; mirrors exactly where staged.
-        for name in ("M4", "M2")
-            pool = numbers(filter(startswith("# $name pool"), out), name, "pool")
-            @test length(pool) == 2
-            (r1, a1, m1), (r2, a2, m2) = pool
-            @test (r1, r2) == (1, 2)
-            @test a1 > 0 && a2 == a1 && m2 == m1
-            @test (m1 > 0) == (backend != "cpu" && !deviceaware)
-        end
+        # The glue's messages (G2) and the regrids' moves and pool (M) come
+        # back with M22 steps 8 and 6.
     end
 end

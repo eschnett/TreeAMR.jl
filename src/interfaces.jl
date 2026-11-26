@@ -177,6 +177,16 @@ function InterfaceSchedule(fs::FieldSet{T,D}) where {T,D}
             "face. Build it over the field set that holds the face quantity, whose " *
             "centering is vertex-like in the face dimension (`facecentered($D, d)`), " *
             "not over the cell-centered state."))
+        # On closed blocks (M22) the interface restriction becomes `unify!`
+        # on a flux set, at coarse-fine faces, in step 3; until then a mesh
+        # with such faces is refused, and on one level the schedule is empty.
+        lvl = level(first(forest.leaves))
+        any(k -> level(k) != lvl, forest.leaves) && throw(ArgumentError(
+            "InterfaceSchedule: the forest has leaves at more than one level, which " *
+            "is refused for a set with a vertex-like dimension (centering " *
+            "$(fs.centering)): such a set owns its closed range, both boundary planes " *
+            "(\"Closed blocks\" in CODE.md), and the interface restriction is rebuilt " *
+            "on that layout as `unify!` on the flux set in M22 step 3."))
         return fd, layouthash(ghosts, fs.centering, T, nameof(typeof(backend)))
     end
     # This rank's blocks, in global leaf indices, as in `GhostSchedule`.

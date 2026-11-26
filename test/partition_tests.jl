@@ -97,12 +97,12 @@ end
             # The per-block reductions are per local block.
             @test block_mapreduce(abs, max, 0.0, fs) ==
                   block_mapreduce(abs, max, 0.0, sfs)[range]
-            fires(work, idx, b, x) = x[1] < 0.6 * sum(serial.extents[1])
-            @test firing_boxes(fires, fs) == firing_boxes(fires, sfs)[range]
         end
         @test reduce(vcat, collect.(ranges); init=Int[]) == collect(1:n)
         P > n && @test count(isempty, ranges) == P - n
     end
+    # The flagging sweep of a vertex-like set comes back in M22 step 6.
+    pending(6, "firing_boxes per local block, $C, D=$D")
 end
 
 @testset "A rank's schedules hold exactly the serial transfers local to it: D=$D" for
@@ -121,6 +121,8 @@ end
     ops = Operators(prolongation=4, restriction=4)
     parity = [EvenParity, OddParity]
     for C in (cellcentered(D), vertexcentered(D))
+        vertexlike(C) && (pending(4, "rank schedules at reflecting faces, $C, D=$D");
+                          continue)
         sched = GhostSchedule(FieldSet(serial, 2; G=2, centering=C, parity=parity), ops)
         stransfers = transfer_set(schedule_groups(sched), 0)
         sbounds = Set((Int(r.block), r.direction, r.region) for r in sched.boundaries)
@@ -143,19 +145,7 @@ end
         end
         @test crossing > 0            # so the filter had something to drop
     end
-    # The interface schedule the same way, over a face-centered flux.
-    flux(forest) = FieldSet(forest, 1; G=0, centering=facecentered(D, 1),
-                            parity=[EvenParity])
-    sisched = InterfaceSchedule(flux(serial))
-    sinterfaces = transfer_set(schedule_groups(sisched), 0)
-    @test !isempty(sinterfaces)
-    for P in (2, 3), r in 0:(P - 1)
-        forest = rank_forest(serial, r, P)
-        range = blockrange(forest)
-        isched = InterfaceSchedule(flux(forest))
-        @test transfer_set(schedule_groups(isched), first(range) - 1) ==
-              Set(t for t in sinterfaces if t[4] in range && t[5] in range)
-    end
+    pending(3, "rank interface schedules, D=$D")
 end
 
 @testset "What needs a message refuses a distributed forest, and says why" begin

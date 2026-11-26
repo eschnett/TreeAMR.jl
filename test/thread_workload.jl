@@ -201,7 +201,8 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
                     exclude=Ellipsoid(ntuple(_ -> 0.5, D), ntuple(_ -> 0.2, D)))
     println(tag, " interp-split ", digest(vec(s.values)), " ", count(s.excluded),
             " ", isequal(s.values, r.values))
-    rotating === nothing || rotating_pair(forest, tag, rotating, ops)
+    # The face-centered pair across the seam: M22 step 7.
+    rotating === nothing || pending_case("$tag pair", 7)
     return nothing
 end
 
@@ -237,6 +238,11 @@ end
 const OPS4 = Operators(prolongation=4, restriction=4)
 const OPS2 = Operators(prolongation=2, restriction=2)
 
+# A case that needs what a later step of M22 ("Closed blocks") rebuilds
+# is pending, and says so in one comment line, the same at every thread
+# count, in place of its output.
+pending_case(tag, step) = println("# pending until M22 step $step: $tag")
+
 workload(Val(1); roots=8, N=8, G=2, ops=OPS4, periodic=true, σ=0.04, steps=24, buffer=3)
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=true, σ=0.05, steps=20, buffer=3)
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=20, buffer=3)
@@ -248,10 +254,8 @@ workload(Val(3); roots=4, N=4, G=1, ops=OPS2, periodic=true, σ=0.03, steps=6, b
 # injection, and narrows the prolongation window, so the parallel loops
 # `run_phase!` deals out are differently shaped ones. `G = 1` is what
 # order 4 needs along a stagger, which also keeps these cheap.
-workload(Val(1); roots=8, N=8, G=1, ops=OPS4, periodic=true, σ=0.04, steps=24, buffer=3,
-         centering=vertexcentered(1))
-workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
-         centering=vertexcentered(2))
+pending_case("D1pv", 6)                    # it regrids
+pending_case("D2ov", 6)
 
 # Reflecting faces (M10): the mirrored transfers are ordinary groups in
 # the same phases, so a slice dealt out of order would show here as it
@@ -261,8 +265,7 @@ workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12,
 # dimension, which brings in the derived upper wall row.
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          reflecting=((true, false), (true, false)), x0=0.12)
-workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
-         centering=vertexcentered(2), reflecting=((true, true), (true, true)), x0=0.12)
+pending_case("D2ovr", 6)
 
 # A rotating seam (M12): the turned transfers are ordinary groups in the
 # same phases too, but read through the axis map and the variable map,
@@ -271,13 +274,11 @@ workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12,
 # interpolation points spread over the whole plane.
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          rotating=(1, 2), x0=0.3)
-workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
-         centering=vertexcentered(2), rotating=(1, 2), x0=0.3)
+pending_case("D2ovq", 7)
 
 # A half-turn seam (M14): orientation 2 about the middle of the low x₁
 # face, with the vertex-centered seam slab partitioned one plane up.
-workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
-         centering=vertexcentered(2), halfturn=(1, 2), x0=0.3)
+pending_case("D2ovh", 7)
 
 # --- element sets (M16) ----------------------------------------------------
 #
@@ -485,7 +486,7 @@ end
 let ring = annulus()
     refine!(ring, copy(ring.leaves))
     patch_workload("PR2c", ring, cellcentered(2); G=2, ops=OPS4, layout=1, steps=8)
-    patch_workload("PR2v", ring, vertexcentered(2); G=1, ops=OPS4, layout=1, steps=8)
+    pending_case("PR2v", 8)
     patch_workload("PR2e", ring, elementcentered(2); G=1, P=3, ops=OPSE, layout=1, steps=0)
 end
 patch_workload("PL2c", laid_out(), cellcentered(2); G=2, ops=OPS4, layout=2, steps=8)
@@ -651,7 +652,6 @@ end
 
 const OPSC = Operators(family=Conservative, prolongation=3, restriction=2)
 
-burgers_workload(Val(1); roots=8, N=8, G=2, ops=OPSC, steps=40, buffer=4,
-                 threshold=0.15, width=0.2)
-burgers_workload(Val(2); roots=4, N=8, G=2, ops=OPSC, steps=24, buffer=1,
-                 threshold=0.6, width=0.08)
+# Its face-centered fluxes on a refined mesh, regridded: M22 steps 3 and 6.
+pending_case("B1", 6)
+pending_case("B2", 6)
