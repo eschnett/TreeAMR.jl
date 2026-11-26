@@ -925,9 +925,18 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     stages = schedule.stages
     groups = schedule.stagegroups
     locals = schedule.grouplocals
-    # Phase 1: same-level copies and restrictions. Both read interiors
-    # only, so they cannot race with each other.
-    sends = run_stages!(fs, stages, groups[1], locals[1], forest, backend, nothing)
+    p1 = schedule.phase1group
+    # Stage 0 (M22): every secondary copy of a shared point from its
+    # primary, which no transfer of the stage writes; before anything
+    # reads a copy.
+    sends = nothing
+    for k in 1:(p1 - 1)
+        sends = run_stages!(fs, stages, groups[k], locals[k], forest, backend, sends)
+    end
+    # Phase 1: same-level copies and restrictions. Both read own points
+    # only, which stage 0 has made final, so they cannot race with each
+    # other.
+    sends = run_stages!(fs, stages, groups[p1], locals[p1], forest, backend, sends)
 
     # Physical boundaries, before prolongation rather than after
     # everything: a block against the domain edge has prolongation
@@ -950,7 +959,7 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     # one group of stages (`stagegroups`). The relative hook's regions
     # that read prolongated ghosts run after the group whose stage fills
     # them (`boundary_after_stage!`), in level order.
-    for k in 2:length(groups)
+    for k in (p1 + 1):length(groups)
         sends = run_stages!(fs, stages, groups[k], locals[k], forest, backend, sends)
         boundary === nothing && continue
         for i in groups[k]
@@ -1491,13 +1500,14 @@ reaches an outer face of the patch across, so a fill without the hook
 leaves the ghosts across the glue near that face reading whatever the
 plane held; fill such a set with its hook.
 
-In a vertex-like dimension the outward region on the domain's **high**
-side starts at the shared boundary plane `G+N+1`, one plane further in
-than a ghost slab: those points belong to nobody, since ownership is
-half-open, so the hook fills them and the application never evolves them.
-The low boundary points are owned and evolved as usual. This asymmetry is
-the price of a uniform `N^D` state layout for every centering; see
-"Centerings" in `CODE.md`.
+A set with a vertex-like dimension owns its closed range (M22, "Closed
+blocks" in `CODE.md`): a point on a block face is held by every block
+whose closed box contains it, and the fill first gives every copy its
+primary's value, the copy on the block first in the leaf order (stage
+0), before anything reads one. At an outer face the wall plane is the
+block's own on both sides, evolved, and the hook fills the `G` ghosts
+beyond it, so a set without ghosts along a vertex-like dimension (a
+flux, `G = 0`) has no hook region there at all: its wall is its own.
 
 !!! note "Where the boundary hook runs"
     The hook runs after the copies and restrictions but **before** the
@@ -1645,6 +1655,12 @@ function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule
                         backend)
     a, b = pair.a, pair.b
     forest = sa.forest
+    # A pair's sets are refused with a vertex-like dimension until M22
+    # step 7, so neither has a stage 0, and phase 1 is each one's first.
+    sa.phase1group == sb.phase1group == 1 || error(
+        "a RotationPair with a stage 0 asked for; rotating seams of a set with a " *
+        "vertex-like dimension come back in M22 step 7, and GhostSchedule refuses them " *
+        "until then, so this is a bug")
     runa(i, sends) = run_stages!(a.work, a.work, a.nvars, pair.afactors, sa.stages, i:i,
                                  sa.stages[i].locals, forest, backend, sends, b.work,
                                  pair.arotvars)

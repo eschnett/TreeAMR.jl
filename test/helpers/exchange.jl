@@ -204,8 +204,8 @@ exchange_hook() = CellBoundary((x, v, δ) -> v == 3 ? zero(x[1]) :
 # Run every simulated rank's stages in lockstep, tag by tag, as a real run
 # interleaves them: pack on every rank, deliver each send segment into the
 # peer's receive segment, then run the local groups and unpack on every
-# rank. After the first stage, `between(r)` runs on every rank — the
-# boundary hook of a ghost fill. Returns the number of segments whose two
+# rank. After phase 1, `between(r)` runs on every rank — the boundary hook
+# of a ghost fill, which stage 0 (M22) precedes. Returns the number of segments whose two
 # ends disagreed in length.
 function lockstep!(sets, scheds, backend; between=nothing)
     P = length(sets)
@@ -244,7 +244,7 @@ function lockstep!(sets, scheds, backend; between=nothing)
                               stagebuffers(st.remote, sets[r].nvars, backend), backend)
             synchronize(backend)
         end
-        if k == 1 && between !== nothing
+        if tag == PHASE1_TAG && between !== nothing
             foreach(between, 1:P)
         end
     end

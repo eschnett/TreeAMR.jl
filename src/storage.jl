@@ -219,21 +219,19 @@ for one width per dimension; it is stored as an `NTuple{D,Int}`.
 [`edgecentered`](@ref), or, for elements of Gauss–Lobatto nodes, with
 [`elementcentered`](@ref) and the order `P` below; an element dimension
 stores and owns as a cell-centered one does. A vertex-like dimension
-stores one plane more —
-the boundary plane the block **shares** with its high-side neighbor,
-which that neighbor owns and the exchange fills exactly as it fills a
-ghost. Three ranges per dimension have names, with `c_d = 1` in a
+stores one plane more, and its own range is its closed range, both
+boundary planes (M22, "Closed blocks" in `CODE.md`): a point on a block
+face is held by every block whose closed box contains it, and the fill
+gives every copy its primary's value. Per dimension, with `c_d = 1` in a
 vertex-like dimension and `0` otherwise:
 
 | stored index | role | view |
 |---|---|---|
 | `1 … G` | low ghosts | |
-| `G+1 … G+N` | **owned** — what the state vector holds | [`interiorview`](@ref) |
-| `G+1 … G+N+c` | **closed** — both boundary planes included | [`closedview`](@ref) |
-| `G+N+1 … N+2G+c` | high exchange region | |
+| `G+1 … G+N+c` | **own** — what the state vector holds | [`interiorview`](@ref) |
+| `G+N+c+1 … N+2G+c` | high ghosts | |
 
-Everything outside the owned range is exchange-filled, so the asymmetry
-is bookkeeping in the target ranges and nothing more. The invariant
+The invariant
 `N ≥ 2G[d] + 2c[d]` is checked here, per dimension: a block's high
 exchange region must be reachable from one ring of neighbors, and a
 finer neighbor spans only `N/2` of this block's cells.
@@ -947,53 +945,26 @@ blockview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
     interiorview(fs::FieldSet, b::Integer)
     interiorview(fs::FieldSet, b::Integer, v::Integer)
 
-A view of block `b`'s **owned** points — shape `(N, ..., N, nvars)`, or
-`(N, ..., N)` for a single variable `v`. This is the part that tiles the
-domain and that the ODE state vector holds, for every centering: in a
-vertex-like dimension a block owns its points `0 … N-1` and the boundary
-point `N` belongs to the neighbor on that side (see
-[`closedview`](@ref)).
+A view of block `b`'s **own** points — shape `(N+c[1], ..., N+c[D],
+nvars)`, or without the trailing `nvars` for a single variable `v`: what
+the ODE state vector holds. In a vertex-like dimension that is the
+block's closed range, both of its face planes, `N + 1` points, each face
+point shared with the blocks across (M22, "Closed blocks" in `CODE.md`).
 """
 interiorview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
     view(fs.work, interiorranges(fs)..., :, b)
 interiorview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
     view(fs.work, interiorranges(fs)..., v, b)
 
-# The owned range per dimension, `G[d]+1 … G[d]+N`.
-interiorranges(fs::FieldSet{T,D}) where {T,D} =
-    ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D)
-
-"""
-    closedview(fs::FieldSet, b::Integer)
-    closedview(fs::FieldSet, b::Integer, v::Integer)
-
-A view of block `b`'s **closed** range — shape `(N+c[1], ..., N+c[D],
-nvars)`, or without the trailing `nvars` for a single variable `v`: the
-owned points plus the shared boundary plane at the high end of every
-vertex-like dimension.
-
-This is what a quantity defined on a block's faces or edges is computed
-over — a flux `F_d` has `N+1` faces in `d`, not `N` — and it is what
-[`map_blocks!`](@ref)`(...; closed = true)` launches over. In a
-cell-centered field set it is exactly [`interiorview`](@ref).
-
-The extra plane is not owned: it belongs to the high-side neighbor, and
-the exchange fills it. A kernel launched over the closed range
-nevertheless *writes* it, because a flux is needed on both of a block's
-faces; making the two sides of a coarse-fine face agree afterwards is
-the interface restriction's job (see `CODE.md`, "Conservation at
-coarse-fine faces").
-"""
-closedview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
-    view(fs.work, closedranges(fs)..., :, b)
-closedview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
-    view(fs.work, closedranges(fs)..., v, b)
-
-# The closed range per dimension, `G[d]+1 … G[d]+N+c[d]`.
-function closedranges(fs::FieldSet{T,D}) where {T,D}
+# The own range per dimension, `G[d]+1 … G[d]+N+c[d]`.
+function interiorranges(fs::FieldSet{T,D}) where {T,D}
     c = staggers(fs)
     return ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D)
 end
+
+# The points of a block's own range per dimension, `N + c[d]`.
+ownextents(fs::FieldSet{T,D}) where {T,D} =
+    ntuple(d -> fs.forest.N + staggers(fs)[d], D)
 
 # The offset from an owned index to a position along a dimension of an
 # equally spaced set: half a cell in a cell-centered dimension (the value
@@ -1339,13 +1310,15 @@ end
     fill_by_coordinates!(WithPatch(f), fs::FieldSet)
     fill_by_coordinates!(WithPatch(AllVariables(f)), fs::FieldSet)
 
-Set every **owned** point of every block from the callback
+Set every **own** point of every block from the callback
 `f(x, v) -> value`, where `x` is that point's position — a cell center,
 a face center, a vertex, an element's Gauss–Lobatto node, whatever this
 field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
-`v` the variable index. The ghosts and the shared boundary plane are
-left untouched: they are filled by the ghost exchange (M2).
+`v` the variable index — both face planes of a vertex-like dimension
+included, every copy of a shared point at one position bit for bit, so
+that every copy gets the same value. The ghosts are left untouched: they
+are filled by the ghost exchange (M2).
 
 `f` is called once per point from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
@@ -1391,7 +1364,7 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(coordinates_kernel!, backend, fs.work, f, lows, bases,
                          spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs));
-                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+                         ndrange=(ownextents(fs)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
     return fs
@@ -1410,7 +1383,7 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, lows, bases,
                          spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
-                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+                         Val(fs.nvars); ndrange=(ownextents(fs)..., nblocks(fs)))
     end
     synchronize(backend)
     return fs
@@ -1426,7 +1399,7 @@ function fill_by_coordinates!(w::WithPatch, fs::FieldSet{T,D}) where {T,D}
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(coordinates_patch_kernel!, backend, fs.work, w.f, lows, bases,
                          spacings, patches, nodes, Val(D), Val(fs.G), Val(staggers(fs));
-                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+                         ndrange=(ownextents(fs)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
     return fs
@@ -1446,7 +1419,7 @@ function fill_by_coordinates!(w::WithPatch{<:AllVariables}, fs::FieldSet{T,D}) w
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(coordinates_patch_all_kernel!, backend, fs.work, f, lows, bases,
                          spacings, patches, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
-                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+                         Val(fs.nvars); ndrange=(ownextents(fs)..., nblocks(fs)))
     end
     synchronize(backend)
     return fs

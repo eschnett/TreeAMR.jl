@@ -103,7 +103,7 @@ function advect_rhs!(du, u, p)
     fill_ghosts!(p.state, p.schedule; boundary=p.hook)
     ntuple(Val(D)) do d
         map_blocks!(advect_flux_kernel!, p.fluxes[d], p.fluxes[d].work, p.state.work,
-                    p.vel[d].work, Val(D), Val(p.state.G), Val(d); closed=true)
+                    p.vel[d].work, Val(D), Val(p.state.G), Val(d))
         p.fixup && restrict_interfaces!(p.fluxes[d], p.ischeds[d])
         nothing
     end

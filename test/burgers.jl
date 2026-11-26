@@ -12,7 +12,7 @@
 # sketches them --
 #
 #     scatter! -> fill_ghosts!                     # (0) the state's ghosts
-#     map_blocks!(flux_kernel!, F_d; closed=true)  # (i) fluxes, N+1 per dim
+#     map_blocks!(flux_kernel!, F_d)               # (i) fluxes, N+1 per dim
 #     restrict_interfaces!(F_d, isched[d])         # (ii) the fixup
 #     map_blocks!(divergence_kernel!, state, du)   # (iii) the divergence
 #
@@ -91,7 +91,7 @@ arithmetic" rule exists to stop.
 end
 
 # The fluxes normal to dimension `d`, one per face of the closed range.
-# Launched over the *flux* set with `closed = true`, so `I[d]` runs over
+# Launched over the *flux* set, whose own range is closed, so `I[d]` runs over
 # `1 … N+1` and the other indices over `1 … N`: a block computes the flux
 # on both of its own faces, and making the two sides of a coarse-fine face
 # agree afterwards is `restrict_interfaces!`'s job.
@@ -213,8 +213,7 @@ function burgers_rhs!(du, u, p::BurgersProblem{T,D}, t) where {T,D}
     fill_ghosts!(p.state, p.schedule)
     ntuple(Val(D)) do d
         map_blocks!(burgers_flux_kernel!, p.fluxes[d], p.fluxes[d].work,
-                    p.state.work, p.valD, p.valGU, p.valGF, Val(d), p.limiter;
-                    closed=true)
+                    p.state.work, p.valD, p.valGU, p.valGF, Val(d), p.limiter)
         p.fixup && restrict_interfaces!(p.fluxes[d], p.ischeds[d])
         nothing
     end

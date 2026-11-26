@@ -40,19 +40,14 @@ end
         fs = FieldSet(forest, 2; G=1, centering=C)
         @test fs.centering == C
         @test size(fs.work) == (ntuple(d -> 8 + 2 + c[d], D)..., 2, 2^D)
-        # The owned range is `N` wide whatever the centering — that is
-        # what keeps the state layout uniform — and the closed range adds
-        # the shared boundary plane.
-        @test size(interiorview(fs, 1, 1)) == ntuple(_ -> 8, D)
-        @test size(closedview(fs, 1, 1)) == ntuple(d -> 8 + c[d], D)
-        @test size(closedview(fs, 1)) == (ntuple(d -> 8 + c[d], D)..., 2)
-        @test statelength(fs) == 8^D * 2 * 2^D
+        # The own range is the closed range (M22): `N + 1` along a
+        # vertex-like dimension, both face planes, and the state holds it,
+        # every copy of a shared point.
+        @test size(interiorview(fs, 1, 1)) == ntuple(d -> 8 + c[d], D)
+        @test size(interiorview(fs, 1)) == (ntuple(d -> 8 + c[d], D)..., 2)
+        @test statelength(fs) == prod(d -> 8 + c[d], 1:D) * 2 * 2^D
+        @test size(statearray(statevector(fs), fs)) == (ntuple(d -> 8 + c[d], D)..., 2, 2^D)
     end
-    # In a cell-centered set the two views are the same range.
-    cells = FieldSet(forest, 1; G=2)
-    fill!(interiorview(cells, 1, 1), 5.0)
-    @test all(==(5.0), closedview(cells, 1, 1))
-    @test size(closedview(cells, 1, 1)) == size(interiorview(cells, 1, 1))
 
     # The default is cell-centered, as every field set was through M6.
     @test FieldSet(forest, 1; G=1).centering == cellcentered(D)
@@ -131,39 +126,35 @@ end
     for C in allcenterings(Val(D)), G in (1, 2)
         fs = FieldSet(forest, 2; G=G, centering=C)
         fill_by_coordinates!(f, fs)
-        owned = CartesianIndices(ntuple(_ -> (G + 1):(G + forest.N), D))
+        c = staggers(C)
+        owned = CartesianIndices(ntuple(d -> (G + 1):(G + forest.N + c[d]), D))
         identical = all(1:nblocks(fs)) do b
             all(v -> all(idx -> blockview(fs, b, v)[idx] ===
                                 f(coordinates(fs, b, Tuple(idx)), v), owned),
                 1:fs.nvars)
         end
         @test identical
-        # The shared plane is *not* owned, so it is left to the exchange
-        # exactly as a ghost is.
-        c = staggers(C)
-        if any(==(1), c)
-            plane = ntuple(d -> c[d] == 1 ? (G + forest.N + 1) : (G + 1), D)
-            @test iszero(fs.work[plane..., 1, 1])
-        end
+        # Both face planes are own points (M22), filled; the ghosts beyond
+        # are left to the exchange.
+        ghost = ntuple(d -> G + forest.N + c[d] + 1, D)
+        @test iszero(fs.work[ghost..., 1, 1])
     end
 end
 
-@testset "map_blocks! over the closed range covers the shared plane: D=$D" for
+@testset "map_blocks! covers the own range, both face planes: D=$D" for
         D in (1, 2, 3)
-    # A flux has N+1 faces per dimension, not N: the extra one is the
-    # block's own high face, which lives on the shared plane.
+    # A flux has N+1 faces per dimension, not N, and a vertex-like block
+    # owns both of its face planes (M22): the launch covers them, and the
+    # `closed` keyword it replaced says what replaced it.
     forest = Forest(ntuple(_ -> 2, D); N=4, periodic=ntuple(_ -> true, D))
     for C in allcenterings(Val(D))
         c = staggers(C)
         fs = FieldSet(forest, 1; G=1, centering=C)
-        map_blocks!(mark_kernel!, fs, fs.work, Val(D), Val(fs.G); closed=true)
-        @test count(==(1.0), fs.work) == nblocks(fs) * prod(ntuple(d -> 4 + c[d], D))
-        @test all(==(1.0), closedview(fs, 1, 1))
-
-        fill!(fs.work, 0.0)
         map_blocks!(mark_kernel!, fs, fs.work, Val(D), Val(fs.G))
-        @test count(==(1.0), fs.work) == nblocks(fs) * 4^D
+        @test count(==(1.0), fs.work) == nblocks(fs) * prod(ntuple(d -> 4 + c[d], D))
         @test all(==(1.0), interiorview(fs, 1, 1))
+        @test_throws "no longer takes `closed`" map_blocks!(mark_kernel!, fs, fs.work,
+                                                             Val(D), Val(fs.G); closed=true)
     end
 end
 
@@ -209,21 +200,14 @@ end
         # this kernel writes variable 1 only.
         @test all(iszero, view(fs.work, ntuple(_ -> Colon(), D)..., 2, :))
 
-        # The owned form covers strictly fewer points wherever there is
-        # anything outside the owned range to cover.
+        # The own form covers strictly fewer points wherever there is
+        # anything outside the own range to cover.
         fill!(fs.work, 0.0)
         map_blocks!(mark_kernel!, fs, fs.work, Val(D), Val(fs.G))
-        @test count(!iszero, fs.work) == nblocks(fs) * N^D
-        @test prod(stored) > N^D               # so the claim is not vacuous
+        own = prod(d -> N + c[d], 1:D)
+        @test count(!iszero, fs.work) == nblocks(fs) * own
+        @test prod(stored) > own || all(iszero, G)
     end
-
-    # The closed range is a sub-range of the stored one, so asking for
-    # both names two different loops rather than an intersection.
-    fs = FieldSet(forest, 1; G=1)
-    @test_throws ArgumentError map_blocks!(mark_kernel!, fs, fs.work, Val(D),
-                                           Val(fs.G); closed=true, stored=true)
-    @test_throws "not both" map_blocks!(mark_kernel!, fs, fs.work, Val(D),
-                                        Val(fs.G); closed=true, stored=true)
 end
 
 @testset "The flagging kernel forms the same position: D=$D" for D in (1, 2, 3)
@@ -457,39 +441,45 @@ end
         forest, verts => csched; flags=fill(Keep, nleaves(forest)))
 end
 
-@testset "The domain's upper boundary plane belongs to the hook: D=$D" for D in (1, 2)
-    # Ownership is half-open, so at a non-periodic boundary the domain's
-    # *upper* boundary points belong to nobody: they are the first plane
-    # of an outward-facing region, and the hook fills them. The lower
-    # ones are owned and evolved. A vertex-centered application with
-    # physical boundaries sees this asymmetry; a periodic domain has none.
+@testset "Both wall planes are own points, and the hook fills the ghosts beyond: D=$D" for
+        D in (1, 2)
+    # Under half-open ownership the domain's upper boundary plane belonged
+    # to nobody and the hook filled it, while the lower one was evolved.
+    # On closed blocks (M22) both walls are the block's own, alike: every
+    # hook region is the `G` ghosts beyond, on the low side and the high,
+    # and a fill leaves both walls as the data put them.
     forest = Forest(ntuple(_ -> 2, D); N=8)
     G = 1
     fs = FieldSet(forest, 1; G=G, centering=vertexcentered(D))
     schedule = GhostSchedule(fs, OPS2C)
-
-    # The high-side outward regions start at the shared plane, one plane
-    # further in than a ghost slab; the low-side ones are plain ghosts.
     highs = filter(r -> r.direction == ntuple(d -> d == 1 ? 1 : 0, D),
                    schedule.boundaries)
     lows = filter(r -> r.direction == ntuple(d -> d == 1 ? -1 : 0, D),
                   schedule.boundaries)
     @test !isempty(highs) && !isempty(lows)
-    @test all(r -> first(r.region.indices[1]) == G + forest.N + 1, highs)
-    @test all(r -> length(r.region.indices[1]) == G + 1, highs)
+    @test all(r -> r.region.indices[1] == (G + forest.N + 2):(2G + forest.N + 1), highs)
     @test all(r -> r.region.indices[1] == 1:G, lows)
+    # The relative hook's nearest evolved point is the wall, on both sides.
+    @test all(r -> r.clamps[1] == G + forest.N + 1, highs)
+    @test all(r -> r.clamps[1] == G + 1, lows)
 
-    # And the hook really does write that plane: with it, the linear
-    # field is exact everywhere; without it, the upper plane is left at
-    # its initial zero.
+    # With the hook, the linear field is exact everywhere; the walls are
+    # the data's, which the hook does not touch.
     f = makepoly(D, 1)
     @test exchange_error(forest, OPS2C, f; nvars=1, G=G,
                          centering=vertexcentered(D)) < 1e-12
     fill_by_coordinates!(f, fs)
-    fill_ghosts!(fs, schedule)
+    hook = boundary_by_coordinates((x, v) -> 1000.0)
+    fill_ghosts!(fs, schedule; boundary=hook)
     topblock = findfirst(k -> block_extent(forest, k)[1][2] == 2.0, forest.leaves)
-    @test iszero(fs.work[ntuple(d -> d == 1 ? G + forest.N + 1 : G + 1, D)..., 1,
-                         topblock])
+    wall = ntuple(d -> d == 1 ? G + forest.N + 1 : G + 1, D)
+    @test fs.work[wall..., 1, topblock] == f(coordinates(fs, topblock, wall), 1)
+    @test fs.work[ntuple(d -> d == 1 ? G + forest.N + 2 : G + 1, D)..., 1,
+                  topblock] == 1000.0
+    # A set without ghosts along the stagger has no hook region there: its
+    # walls are its own.
+    flux = GhostSchedule(FieldSet(forest, 1; G=0, centering=vertexcentered(D)), OPS2C)
+    @test isempty(flux.boundaries)
 end
 
 @testset "The regrid transfer is exact for every centering: D=$D" for D in (1, 2, 3)

@@ -356,11 +356,10 @@ end
     for C in allcenterings(Val(D))
         @test_throws "a patch corner" GhostSchedule(patch_fieldset(patched, C), PATCH_OPS)
     end
-    # The low side of a vertex-like dimension with no ghosts has no region,
-    # but its high side has the shared plane.
-    vertex = ntuple(d -> d == 1 ? :vertex : :cell, D)
-    @test_throws "a patch corner" GhostSchedule(
-        patch_fieldset(patched, vertex; G=ntuple(d -> Int(d != 1), D)), PATCH_OPS)
+    # A vertex-like dimension with no ghosts has no region beyond either
+    # face on closed blocks (M22), and so no patch corner along it: what a
+    # glued forest makes of it comes back with M22 step 8.
+    pending(8, "a ghost-free vertex-like dimension at a patch corner, D=$D")
 end
 
 @testset "Patches with swapped and reversed axes fill as the brick: $name" for (name, roots,

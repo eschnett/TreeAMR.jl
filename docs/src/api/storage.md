@@ -16,7 +16,6 @@ nblocks
 blockkey
 blockview
 interiorview
-closedview
 fill_by_coordinates!
 AllVariables
 WithPatch

@@ -28,7 +28,7 @@ public nodeposition
 
 # Multi-patch forests (M17)
 export patch, block_patches
-export FieldSet, nblocks, blockkey, blockview, interiorview, closedview,
+export FieldSet, nblocks, blockkey, blockview, interiorview,
        coordinates, fill_by_coordinates!
 export cellcentered, vertexcentered, facecentered, edgecentered, staggers
 

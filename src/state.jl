@@ -15,10 +15,14 @@
 """
     statelength(fs::FieldSet)
 
-Number of entries in this field set's state vector: `N^D · nvars ·
-nblocks`, counting interior cells only.
+Number of entries in this field set's state vector: `∏(N + c_d) · nvars ·
+nblocks`, every own point of every block, with `c_d` the stagger of
+dimension `d` ([`staggers`](@ref)): `N^D` per block and variable for a
+cell-centered or element set, and one plane more along each vertex-like
+dimension, every copy of a shared point (M22, "Closed blocks" in
+`CODE.md`).
 """
-statelength(fs::FieldSet{T,D}) where {T,D} = fs.forest.N^D * fs.nvars * nblocks(fs)
+statelength(fs::FieldSet{T,D}) where {T,D} = prod(ownextents(fs)) * fs.nvars * nblocks(fs)
 
 """
     statevector(fs::FieldSet)
@@ -41,14 +45,15 @@ end
 """
     statearray(u, fs::FieldSet)
 
-View a flat state vector as an `(N, ..., N, nvars, nblocks)` array,
-sharing memory. This is the layout application kernels write `du` in;
-the index order matches the working array, minus the ghosts.
+View a flat state vector as an `(N+c[1], ..., N+c[D], nvars, nblocks)`
+array, sharing memory, `c` the set's [`staggers`](@ref): a plain reshape.
+This is the layout application kernels write `du` in; the index order
+matches the working array, minus the ghosts.
 """
 function statearray(u::AbstractVector, fs::FieldSet{T,D}; kwargs...) where {T,D}
     check_removed_appendix(kwargs, "statearray")
     check_statelength(u, fs)
-    shape = (ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs))
+    shape = (ownextents(fs)..., fs.nvars, nblocks(fs))
     return state_array(u, shape)
 end
 
@@ -59,16 +64,21 @@ end
 state_array(u::AbstractVector, shape) = reshape(u, shape)
 state_array(u::Vector, shape) = Base.wrap(Array, u.ref, shape)
 
-# The `appendix` keyword of a set interpolated across a glue (M20) is
-# gone with closed blocks (M22), which make a block's glued high face
-# planes part of every block's own range: say so, rather than a
-# `MethodError` about a keyword.
+# The keywords closed blocks (M22) replace: `appendix`, a set
+# interpolated across a glue's owned glued high face planes (M20), and
+# `closed`, the launch over the closed range, which is now every block's
+# own range. Say so, rather than a `MethodError` about a keyword.
 function check_removed_appendix(kwargs, what)
     isempty(kwargs) && return nothing
     haskey(kwargs, :appendix) && throw(ArgumentError(
         "$what no longer takes `appendix`: closed blocks (M22, \"Closed blocks\" in " *
         "CODE.md) make the planes the appendix held part of every block's own range, " *
         "which the state and the launch cover without a keyword"))
+    haskey(kwargs, :closed) && throw(ArgumentError(
+        "$what no longer takes `closed`: closed blocks (M22, \"Closed blocks\" in " *
+        "CODE.md) make the closed range, both face planes of a vertex-like dimension, " *
+        "every block's own range, which the launch covers without a keyword; " *
+        "`stored = true` still covers every stored point"))
     throw(ArgumentError("$what got an unsupported keyword: $(join(keys(kwargs), ", "))"))
 end
 
@@ -111,7 +121,7 @@ function run_over_interiors!(kernel, fs::FieldSet{T,D}, a, b;
                              flat::Bool=flatlaunch(get_backend(fs.work))) where {T,D}
     backend = get_backend(fs.work)
     launch_positional!(kernel, backend, a, b, Val(D), Val(fs.G); flat=flat,
-                       extents=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
+                       extents=(ownextents(fs)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
     return nothing
 end
@@ -307,36 +317,31 @@ function check_statelength(u::AbstractVector, sets::Tuple{Vararg{FieldSet}})
 end
 
 """
-    map_blocks!(kernel!, fs::FieldSet, args...; closed=false, stored=false,
-                workgroupsize=nothing)
+    map_blocks!(kernel!, fs::FieldSet, args...; stored=false, workgroupsize=nothing)
 
-Launch a KernelAbstractions kernel over every **owned** point of every
-block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
-is therefore `(i1, ..., iD, b)` with each `i` running over `1:N`; add
-`G[d]` to reach the working array's stored indices.
-
-With `closed = true` the loop runs over the **closed** range instead —
-`N + c[d]` per dimension, so a vertex-like dimension also covers the
-shared boundary plane (see [`closedview`](@ref)). That is what a
-quantity defined on a block's faces wants: a flux has `N+1` faces per
-dimension, not `N`, and the extra one is the block's own high face. In a
-cell-centered field set the two are the same loop.
+Launch a KernelAbstractions kernel over every **own** point of every
+block, with `ndrange = (N+c[1], ..., N+c[D], nblocks)`, `c` the set's
+[`staggers`](@ref): `N` points along a cell-like dimension, and `N + 1`
+along a vertex-like one, both face planes, which the block owns (M22,
+"Closed blocks" in `CODE.md`); a flux has `N+1` faces per dimension. The
+kernel's global index is therefore `(i1, ..., iD, b)`, each `i` an index
+into the own range, and it adds `G[d]` to reach the working array's
+stored indices; it is also the index of [`statearray`](@ref).
 
 With `stored = true` the loop runs over every **stored** point of every
 block, ghosts included — `ndrange = (size(fs.work)[1:D]..., nblocks(fs))`,
 that is `N + 2G[d] + c[d]` per dimension.
 
-!!! warning "The three forms index differently"
+!!! warning "The two forms index differently"
     Under `stored = true` the kernel's global index **is** the stored
-    index: there is nothing to add. Under the default and under
-    `closed = true` it is an offset into the owned range and the kernel
-    adds `G[d]`. A kernel written for one form is wrong under the other
-    — silently so, since both are in bounds — so a kernel meant for the
-    stored form should not add `G` anywhere.
+    index: there is nothing to add. Under the default it is an offset
+    into the own range and the kernel adds `G[d]`. A kernel written for
+    one form is wrong under the other — silently so, since both are in
+    bounds — so a kernel meant for the stored form should not add `G`
+    anywhere.
 
-`stored = true` together with `closed = true` is an error: the closed
-range is a sub-range of the stored one, so asking for both is a
-contradiction.
+The `closed` keyword of half-open blocks is gone with them: its range is
+the default's.
 
 The stored form exists because a pointwise pass sometimes has to cover
 the ghosts too. The case that asked for it is a hydrodynamics code
@@ -386,19 +391,10 @@ end
 ```
 """
 function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
-                     closed::Bool=false, stored::Bool=false,
-                     workgroupsize=nothing, kwargs...) where {T,D}
+                     stored::Bool=false, workgroupsize=nothing, kwargs...) where {T,D}
     check_removed_appendix(kwargs, "map_blocks!")
-    stored && closed && throw(ArgumentError(
-        "map_blocks! takes `closed = true` or `stored = true`, not both: the " *
-        "closed range G+1 … G+N+c is a sub-range of the stored one 1 … N+2G+c, " *
-        "so asking for both names two different loops. Pass `stored = true` for " *
-        "every stored point, ghosts included, and `closed = true` for the owned " *
-        "points plus the shared boundary plane."))
     backend = get_backend(fs.work)
-    c = staggers(fs)
-    extent = stored ? ntuple(d -> size(fs.work, d), D) :
-             ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
+    extent = stored ? ntuple(d -> size(fs.work, d), D) : ownextents(fs)
     launch_by_owner!(kernel!, backend, args...; ndrange=(extent..., nblocks(fs)),
                      workgroupsize=workgroupsize)
     synchronize(backend)
@@ -469,11 +465,11 @@ const REDUCE_LANES = 256
 # `init`, into its own slot.
 @kernel function block_partials_kernel!(partials, @Const(array), f, op, init,
                                         firstvar::Int, lastvar::Int,
-                                        ::Val{D}, ::Val{G}, ::Val{N},
-                                        ::Val{W}) where {D,G,N,W}
+                                        ::Val{D}, ::Val{G}, ::Val{E},
+                                        ::Val{W}) where {D,G,E,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
-    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    cells = CartesianIndices(E)
     ncells = length(cells)
     acc = init
     for j in l:W:(ncells * (lastvar - firstvar + 1))
@@ -506,7 +502,7 @@ function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
     values = allocate(backend, R, (n,))
     block_partials_kernel!(backend)(partials, array, f, op, init,
                                     first(vars), last(vars),
-                                    Val(D), Val(g), Val(fs.forest.N), Val(W);
+                                    Val(D), Val(g), Val(ownextents(fs)), Val(W);
                                     ndrange=W * n)
     fold_lanes_kernel!(backend)(values, partials, op, Val(W); ndrange=n)
     synchronize(backend)
@@ -520,8 +516,8 @@ end
 function _block_mapreduce_host(f, op, init::R, array, fs::FieldSet{T,D},
                                g::NTuple{D,Int},
                                vars::UnitRange{Int}) where {R,T,D}
-    N = fs.forest.N
-    inner = ntuple(d -> (g[d] + 1):(g[d] + N), D)
+    E = ownextents(fs)
+    inner = ntuple(d -> (g[d] + 1):(g[d] + E[d]), D)
     values = Vector{R}(undef, nblocks(fs))
     threaded_foreach(nblocks(fs)) do b
         values[b] = mapreduce(f, op, view(array, inner..., vars, b); init=init)
@@ -827,8 +823,9 @@ What a fold's `rf` is handed for each owned point (see
 - `p.h`: the block's spacing, so `p.h^D` is the point's volume weight;
 - `p.level`: the block's refinement level;
 - `p.tag`: the block's value of the fold's `tag` function, or `nothing`;
-- `p.I`: the owned index, each entry in `1:N` (add `G[d]` for the
-  stored index, as in [`map_blocks!`](@ref));
+- `p.I`: the own index, each entry in `1:N`, or `1:N+1` along a
+  vertex-like dimension (add `G[d]` for the stored index, as in
+  [`map_blocks!`](@ref));
 - `p.b`: the local block index.
 """
 struct FoldPoint{D,NV,T,TG}
@@ -872,13 +869,13 @@ end
                                      @Const(lows), @Const(bases), @Const(spacings), nodes,
                                      @Const(levels),
                                      tags, firstvar::Int,
-                                     ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}, ::Val{NV},
-                                     ::Val{W}) where {D,G,C,N,NV,W}
+                                     ::Val{D}, ::Val{G}, ::Val{C}, ::Val{E}, ::Val{NV},
+                                     ::Val{W}) where {D,G,C,E,NV,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
     lo, B, h = lows[b], bases[b], spacings[b]
     lev, tag = levels[b], tags[b]
-    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    cells = CartesianIndices(E)
     acc = init
     for j in l:W:length(cells)
         I = Tuple(cells[j])
@@ -960,7 +957,7 @@ function launch_fold!(backend, partials, array, rf, init, lows, bases, spacings,
     with_nodes(backend, T, fs.P) do nodes
         launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, lows,
                          bases, spacings, nodes, levels, tags, firstvar, Val(D),
-                         Val(g), Val(staggers(fs)), Val(fs.forest.N), nv, w;
+                         Val(g), Val(staggers(fs)), Val(ownextents(fs)), nv, w;
                          ndrange=(W * nblocks(fs),))
     end
     return nothing

@@ -181,7 +181,7 @@ end
         @test fs.P == 3
         @test fs.centering == elementcentered(D)
         @test size(fs.work) == size(FieldSet(forest, 2; G=G).work)
-        @test TreeAMR.closedranges(fs) == TreeAMR.interiorranges(fs)
+        @test TreeAMR.interiorranges(fs) == TreeAMR.interiorranges(FieldSet(forest, 2; G=G))
     end
     @test FieldSet(forest, 1; G=1, centering=elementcentered(D), P=1).P == 1
     @test FieldSet(forest, 1; G=1).P == 0

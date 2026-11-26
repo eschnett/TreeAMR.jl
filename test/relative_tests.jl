@@ -14,14 +14,11 @@
 function oracle_relative_point(fs::FieldSet{T,D}, b, δ, idx) where {T,D}
     forest = fs.forest
     box = block_extent(forest, blockkey(fs, b))
-    G, N = fs.G, forest.N
+    G, N, c = fs.G, forest.N, staggers(fs)
     return ntuple(D) do d
         forest.periodic[d] && return idx[d]
-        δ[d] > 0 && box[d][2] == forest.extents[d][2] && return G[d] + N
-        if δ[d] < 0 && box[d][1] == forest.extents[d][1]
-            symmetric = fs.walls === :symmetric && fs.centering[d] === :vertex
-            return G[d] + 1 + symmetric
-        end
+        δ[d] > 0 && box[d][2] == forest.extents[d][2] && return G[d] + N + c[d]
+        δ[d] < 0 && box[d][1] == forest.extents[d][1] && return G[d] + 1
         return idx[d]
     end
 end
@@ -82,7 +79,10 @@ end
             region_hook = function (fs, b, key, δ, region)
                 for idx in region
                     i = Tuple(idx)
-                    r = ntuple(d -> δ[d] > 0 ? G[d] + N : δ[d] < 0 ? G[d] + 1 : i[d], D)
+                    # The wall itself, the block's own on both sides (M22).
+                    c = staggers(fs)
+                    r = ntuple(d -> δ[d] > 0 ? G[d] + N + c[d] : δ[d] < 0 ? G[d] + 1 : i[d],
+                               D)
                     fs.work[i..., 1, b] = f(coordinates(fs, b, i)) +
                                           (fs.work[r..., 1, b] - f(coordinates(fs, b, r)))
                 end
@@ -167,14 +167,15 @@ end
     @test works[1] == works[2]
 end
 
-@pending 2 "A closed box with relative walls is mirror-symmetric" begin
-    # TreeGRRMHD's case: the potentials' Dirichlet data in the field, with
-    # symmetric walls, on a uniform box. Point-symmetric data and case fill
-    # point-symmetrically, bit for bit.
+@testset "A closed box with relative walls is mirror-symmetric" begin
+    # TreeGRRMHD's case: the potentials' Dirichlet data in the field, on a
+    # uniform box, whose walls closed blocks (M22) make symmetric without
+    # a keyword. Point-symmetric data and case fill point-symmetrically,
+    # bit for bit.
     D, L = 2, 2
     f = x -> cos(1.7 * (x[1] - L / 2)) * cos(1.1 * (x[2] - L / 2))
     forest = faces_forest((:outer, :outer); N=8, refined=false)
-    fs = FieldSet(forest, 1; G=1, centering=vertexcentered(2), walls=:symmetric)
+    fs = FieldSet(forest, 1; G=1, centering=vertexcentered(2))
     fill_by_coordinates!((x, v) -> f(x) + 0.2 * (x[1] - 1)^2 * (x[2] - 1)^2, fs)
     fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
                  boundary=CellBoundary(Relative(f)))

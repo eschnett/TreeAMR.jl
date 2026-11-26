@@ -151,13 +151,13 @@ arbitrary_value(::Type{T}, p, v::Integer) where {T} =
     T(2 * (hash((p, v)) / typemax(UInt64)) - 1)
 
 """
-Fill every owned point of every block from [`arbitrary_value`](@ref), or
-every *closed*-range point with `closed = true` — which is what a block
-computes for itself when it holds a flux or an EMF, the shared plane
-included, and so what the interface restriction finds in place.
+Fill every own point of every block from [`arbitrary_value`](@ref): the
+closed range along a vertex-like dimension, both face planes (M22). The
+keyword `closed` asked for that range under half-open ownership, and is
+the default's now.
 """
-function fill_arbitrary!(fs::FieldSet{T,D}; closed::Bool=false) where {T,D}
-    c = closed ? staggers(fs) : ntuple(_ -> 0, D)
+function fill_arbitrary!(fs::FieldSet{T,D}; closed::Bool=true) where {T,D}
+    c = staggers(fs)
     owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D))
     for b in 1:nblocks(fs), v in 1:fs.nvars, idx in owned
         fs.work[Tuple(idx)..., v, b] =

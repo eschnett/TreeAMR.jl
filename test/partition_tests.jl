@@ -72,7 +72,7 @@ end
             m = length(range)
             @test nblocks(fs) == m
             @test size(fs.work) == (size(sfs.work)[1:(D + 1)]..., m)
-            @test statelength(fs) == forest.N^D * 2 * m
+            @test statelength(fs) == prod(d -> forest.N + staggers(C)[d], 1:D) * 2 * m
             @test [blockkey(fs, b) for b in 1:m] == serial.leaves[range]
             @test_throws BoundsError blockkey(fs, m + 1)
             @test block_origins(forest) == sorigins[range]

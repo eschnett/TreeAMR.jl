@@ -1389,7 +1389,7 @@ end
 stencil_source(fs::FieldSet{T,D}, ::Nothing) where {T,D} =
     fs.work, fs.G, size(fs.work)[1:D]
 stencil_source(fs::FieldSet{T,D}, u) where {T,D} =
-    statearray(u, fs), ntuple(_ -> 0, D), ntuple(_ -> fs.forest.N, D)
+    statearray(u, fs), ntuple(_ -> 0, D), ownextents(fs)
 
 # The variable table the kernel turns a point beyond a rotating seam with
 # (M12): the set's own, or `nothing` where no point is turned — over a

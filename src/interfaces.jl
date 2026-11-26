@@ -24,11 +24,15 @@
 # high side. Both are the first point of a range `target_range` already
 # names — the block's own range and its high exchange region — so the
 # single source of truth stays single.
-function interface_plane(N::Int, G::Int, c::Int, δd::Int)
-    f = δd == 1 ? first(target_range(N, G, c, 1, 0, false)) :
-        first(target_range(N, G, c, 0, 0, false))
-    return f:f
-end
+#
+# Its ranges are half-open ownership's, and a coarse-fine face, the only
+# place the schedule has a transfer, is refused until M22 step 3 makes the
+# restriction `unify!` on a flux set; reaching here is a bug.
+interface_plane(N::Int, G::Int, c::Int, δd::Int) = error(interface_bug())
+
+interface_bug() = "an interface restriction asked for; coarse-fine faces of a set with a " *
+                  "vertex-like dimension come back in M22 step 3 as `unify!`, and " *
+                  "InterfaceSchedule refuses them until then, so this is a bug"
 
 # One dimension of an interface transfer. In the face dimension it is the
 # single plane above; tangentially it is the owned range (cell-like) or
@@ -43,9 +47,7 @@ end
 # `D - 1` tangential dimensions is the `1/2^(D-1)` of a face average when
 # every tangential dimension is cell-like, as a flux's are.
 interface_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int, od::Int) where {T} =
-    restrict_stencil_over(T, δd == 0 ? target_range(N, G, c, 0, od, true, true) :
-                             interface_plane(N, G, c, δd),
-                          N, G, c, δd, od, 2)
+    error(interface_bug())
 
 """
     InterfaceSchedule{T,D,R}

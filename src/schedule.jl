@@ -376,6 +376,17 @@ end
 # the index is the same on every rank by construction, and `keyorder`
 # stays a function of the keys alone.
 #
+#
+# `piece` marks a transfer of stage 0 (M22, "Closed blocks" in CODE.md),
+# which writes a secondary copy of a point from its primary: per
+# dimension the class of the piece of the target's closed box it writes —
+# 0 the low face plane, 1 the open interior (always, along a cell-like
+# dimension), 2 the high face plane — and `-1` everywhere for any other
+# transfer, which writes the region beyond the box that `direction`
+# names. The direction alone does not fix the piece: along a dimension
+# with `δ_d = 0` the target may be any of the three, as a block's high
+# face plane is when its primary is the block beside it along another
+# dimension. It changes the target range, so it is part of the key.
 struct GroupKey{D}
     kind::Symbol
     direction::NTuple{D,Int}
@@ -384,7 +395,15 @@ struct GroupKey{D}
     mirror::NTuple{D,Int8}
     orientation::Int8
     glue::Int8
+    piece::NTuple{D,Int8}
 end
+GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level::Int,
+            mirror::NTuple{D,Int8}, orientation::Int8, glue::Int8) where {D} =
+    GroupKey{D}(kind, direction, offset, level, mirror, orientation, glue, nopiece(Val(D)))
+
+# The `piece` of a key that is not stage 0's, and the test for one that is.
+nopiece(::Val{D}) where {D} = ntuple(_ -> Int8(-1), Val(D))
+isunify(key::GroupKey) = key.piece[1] >= 0
 
 GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int},
             level::Int) where {D} =
@@ -407,7 +426,8 @@ kindrank(kind::Symbol) =
     kind === :copy ? 1 : kind === :restrict ? 2 : kind === :prolong ? 3 :
     throw(ArgumentError("no transfer kind $kind"))
 keyorder(k::GroupKey) =
-    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue)
+    (kindrank(k.kind), k.direction, k.offset, k.level, k.mirror, k.orientation, k.glue,
+     k.piece)
 Base.isless(a::GroupKey{D}, b::GroupKey{D}) where {D} = isless(keyorder(a), keyorder(b))
 
 # --- Distributed stages (M7) ----------------------------------------------
@@ -542,6 +562,7 @@ end
 # match the same stage on the peer (CODE.md, "Deadlock freedom and
 # message matching"). Ascending in the order the stages run, which the
 # in-process tests rely on to run every rank's stages in lockstep.
+const UNIFY_TAG = 0                                       # stage 0 (M22)
 const PHASE1_TAG = 1
 prolongation_tag(level::Integer) = 2 + Int(level)       # 2 … 2 + MAX_LEVEL
 interface_tag(d::Integer) = 40 + Int(d)                  # one per face dimension
@@ -553,9 +574,12 @@ const REGRID_TAG = 50                                     # the regrid transfer
 # source that a coarser level's prolongation wrote, and everything else
 # in phase 1. An element set's prolongations read owned points only and
 # write only ghosts, which is phase 1's invariant, so they run there,
-# and an element fill is one stage (M16). The one place this is decided:
-# the local groups, the messages and the stage groups all ask it.
+# and an element fill is one stage (M16). A transfer that writes a
+# secondary copy from its primary is stage 0's, which runs before phase 1
+# (M22). The one place this is decided: the local groups, the messages
+# and the stage groups all ask it.
 transfer_stage(key, P::Int) =
+    isunify(key) ? UNIFY_TAG :
     key.kind === :prolong && P == 0 ? prolongation_tag(key.level) : PHASE1_TAG
 
 """
@@ -707,6 +731,7 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     glue::Symbol                                 # glue mode it was built for (M20)
     operators::Operators
     backend::BK
+    unify::Vector{GRP}                           # stage 0 (M22): secondaries
     phase1::Vector{GRP}
     phase2::Vector{Vector{GRP}}                  # by target level, coarsest first
     levels::Vector{Int}                          # target level of each phase2 entry
@@ -715,19 +740,21 @@ struct GhostSchedule{T,D,R,BK<:Backend,GRP<:TransferGroup{T,D},BP<:BoundaryPlan{
     stages::Vector{ST}                           # phase 1, then phase 2 by level
     stagegroups::Vector{UnitRange{Int}}          # runs of `stages` that run together
     grouplocals::Vector{Vector{GRP}}             # each run's local groups, in stage order
+    phase1group::Int                             # the run that holds phase 1
     glueplan::GluePlan{T,D}                      # the ghosts interpolated across a glue
 
     # The constructor the build calls, which derives `grouplocals`: inside
     # it every type is static, which the build's own body is not.
     function GhostSchedule{T,D,R,BK,GRP,BP,ST}(
-        forest, generation, G, centering, P, walls, glue, operators, backend, phase1,
-        phase2, levels, boundaries, boundaryplan, stages, stagegroups,
+        forest, generation, G, centering, P, walls, glue, operators, backend, unify,
+        phase1, phase2, levels, boundaries, boundaryplan, stages, stagegroups,
         glueplan) where {T,D,R,BK,GRP,BP,ST}
+        p1 = findfirst(r -> any(i -> stages[i].tag == PHASE1_TAG, r), stagegroups)::Int
         return new{T,D,R,BK,GRP,BP,ST}(forest, generation, G, centering, P, walls, glue,
                                        operators,
-                                       backend, phase1, phase2, levels, boundaries,
+                                       backend, unify, phase1, phase2, levels, boundaries,
                                        boundaryplan, stages, stagegroups,
-                                       group_locals(stages, stagegroups), glueplan)
+                                       group_locals(stages, stagegroups), p1, glueplan)
     end
 end
 
@@ -784,33 +811,48 @@ function interpolation_weights(lo::Int, p::Int, x::Rational, what::AbstractStrin
     return unit_lagrange_weights(p, x - lo)
 end
 
-# Target range of a transfer in dimension d.
+# Target range of a transfer in dimension d: one symmetric partition of
+# the stored range for every block (M22, "Closed blocks" in CODE.md), the
+# low ghosts `1 … G`, the block's own range `G+1 … G+N+c` (its closed
+# range: both face planes of a vertex-like dimension are its own), and
+# the high ghosts `G+N+c+1 … N+2G+c`. Along a cell-like dimension that is
+# the partition it always was.
 #
-# `closed` extends the block's *own* range (δd = 0) by the shared plane,
-# turning the owned range into the closed one and giving the top half of
-# a halved range the extra point. The ghost exchange never wants it — a
-# block's shared plane is the target of its δ_d = +1 region, not of a
-# tangential one — but the interface restriction does: it overwrites the
-# block's own closed-range values, and in a vertex-like dimension the
-# boundary line of a coarse-fine face is part of what must agree. Keeping
-# it here, rather than in a range the interface schedule derives for
-# itself, is what keeps this function the single source of truth.
-function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool,
-                      closed::Bool=false)
-    δd == 1 && return (G + N + 1):(N + 2G + c)
+# A halved own range, the half of it that one of two finer sources
+# restricts into, exists along a cell-like dimension only until M22 step
+# 3, which decides which finer source writes the mid-plane of a
+# vertex-like one; a set with a vertex-like dimension is refused on a mesh
+# with two levels until then, so asking for one is a bug.
+function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool)
+    δd == 1 && return (G + N + c + 1):(N + 2G + c)
     δd == -1 && return 1:G
-    top = closed ? c : 0                            # the shared plane, to the top half
-    halved && return (G + 1 + od * (N ÷ 2)):(G + od * (N ÷ 2) + N ÷ 2 + od * top)
-    return (G + 1):(G + N + top)
+    if halved
+        c == 0 || error("a halved own range of a vertex-like dimension asked for; " *
+                        "coarse-fine faces of such a set come back in M22 step 3, and " *
+                        "GhostSchedule refuses them until then, so this is a bug")
+        return (G + 1 + od * (N ÷ 2)):(G + (od + 1) * (N ÷ 2))
+    end
+    return (G + 1):(G + N + c)
+end
+
+# The stored range of a piece of a block's closed box along a dimension
+# (M22): class 0 the low face plane, 1 the open interior, 2 the high face
+# plane; along a cell-like dimension only class 1, the own range.
+function piece_range(N::Int, G::Int, c::Int, cls::Integer)
+    c == 0 && return (G + 1):(G + N)
+    cls == 0 && return (G + 1):(G + 1)
+    cls == 2 && return (G + N + 1):(G + N + 1)
+    return (G + 2):(G + N)
 end
 
 # Same-level copy: a pure shift of N cells against the direction, for
-# every centering. In a vertex-like dimension the high target is one
-# plane longer and its first entry, the shared plane G+N+1, reads the
-# neighbor's first *owned* point G+1 — which is the same point. So a copy
-# still reads interiors only, which is what makes phase 1 race free.
-function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
-    rng = target_range(N, G, c, δd, 0, false)
+# every centering. A ghost reads the neighbor's own points only, which
+# stage 0 has made equal to their primaries; a piece of stage 0 (`piece`
+# its class, M22) reads the same points of its primary's block, a face
+# plane the block across's opposite one, which is the same point.
+function copy_stencil(::Type{T}, N::Int, G::Int, c::Int, δd::Int;
+                      piece::Integer=-1) where {T}
+    rng = piece >= 0 ? piece_range(N, G, c, piece) : target_range(N, G, c, δd, 0, false)
     srcstart = Int32[j - N * δd for j in rng]
     return Stencil1D{T}(first(rng), srcstart, ones(T, 1, length(rng)))
 end
@@ -1157,6 +1199,7 @@ clamp_range(N::Int, G::Int, c::Int, δd::Int) =
     δd < 0 ? (1:G) : ((G + N + 1):(N + 2G + c))
 
 function clamp_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    c == 0 || error(step4_bug("clamped rows"))
     rng = clamp_range(N, G, c, δd)
     row = (δd < 0 ? G + 1 : G + N) - s.targetfirst + 1
     # The nearest owned row is on the wall side of the owned range, so
@@ -1179,6 +1222,7 @@ mirror_index(N::Int, G::Int, c::Int, δd::Int, j::Int) =
     δd < 0 ? 2G + 1 + c - j : 2(G + N) + 1 + c - j
 
 function mirror_rows(s::Stencil1D{T}, N::Int, G::Int, c::Int, δd::Int) where {T}
+    c == 0 || error(step4_bug("mirrored rows"))
     rng = mirror_range(N, G, c, δd)
     rows = Int[mirror_index(N, G, c, δd, j) - s.targetfirst + 1 for j in rng]
     # Every mirror point lies inside the owned range, within the half on
@@ -1200,6 +1244,7 @@ end
 # is why the row is the same whatever kind the transfer is. See "Ghost
 # filling" in CODE.md.
 function wall_stencil(::Type{T}, N::Int, G::Int, p::Int) where {T}
+    error(step4_bug("a derived wall row"))
     h = p ÷ 2
     nodes = [Rational{Int}(i) for i in vcat(-h:-1, 1:h)]
     w = lagrange_weights(nodes, 0//1)
@@ -1210,6 +1255,14 @@ function wall_stencil(::Type{T}, N::Int, G::Int, p::Int) where {T}
     wall = G + N + 1
     return Stencil1D{T}(wall, Int32[wall - h], weights)
 end
+
+# The mirror and the clamp above, and the derived wall row, are those of
+# half-open ownership along a vertex-like dimension; M22 step 4 rebuilds
+# them about the wall plane, and a set with a vertex-like dimension is
+# refused over reflecting and outflow faces until then.
+step4_bug(what) = "$what along a vertex-like dimension asked for; reflecting and " *
+                  "outflow faces of such a set come back in M22 step 4, and " *
+                  "GhostSchedule refuses them until then, so this is a bug"
 
 # --- Schedule construction -----------------------------------------------
 
@@ -1273,7 +1326,7 @@ function block_sources!(pairs::TransferPairs{D},
         end
         crossing, nbrs = oriented_neighbors(forest, k, δ)
         if isempty(nbrs)
-            push!(boundaries, boundary_region(forest, k, b, δ, region, G))
+            push!(boundaries, boundary_region(forest, k, b, δ, region, G, c))
             continue
         end
         nblevel = level(first(nbrs))
@@ -1295,6 +1348,93 @@ function block_sources!(pairs::TransferPairs{D},
             end
         end
     end
+    # The secondaries of the block's closed box, from their primaries (M22).
+    any(==(1), c) && unify_sources!(pairs, forest, c, b)
+    return nothing
+end
+
+# --- The primary of a shared point (M22) ---------------------------------
+#
+# A point on a block face of a vertex-like dimension is held by every block
+# whose closed box contains it. One copy is the primary, the copy on the
+# block first in the forest's leaf order, and the others take its value in
+# stage 0. A block's closed box falls into at most `3^D` pieces, by the
+# class of each dimension (0 low face plane, 1 open interior, 2 high face
+# plane; always 1 along a cell-like dimension), and every point of a piece
+# lies on the same faces of the block, so the same blocks hold it, each
+# at one piece of its own: whether a copy is the primary is decided per
+# piece, one bit.
+#
+# The order is by global leaf position, the index into the replicated
+# `forest.leaves`, never a rank-local block index, so that every rank —
+# both ends of a message, and every rank's mask — decides alike. A point
+# a block shares with itself, across a periodic dimension of one root,
+# has two copies on that block; the lower class, the low face plane, is
+# the primary. Step 3 adds copies on other levels, the finer winning
+# (hence the level first in the key, negated); step 8 those across a glue.
+
+# The index of a piece among a block's `3^D`, `Σ cls_d 3^(d-1)`.
+piece_index(cls::NTuple{D,Int}) where {D} = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
+
+# The pieces of a block's closed box, by class per dimension.
+closed_pieces(c::NTuple{D,Int}) where {D} =
+    Iterators.product(ntuple(d -> c[d] == 1 ? (0:2) : (1:1), D)...)
+
+# Every copy of the piece `cls` of global leaf `j`, as `(level, leaf,
+# class, direction)`: the leaf holding it, at which piece of its own, and
+# the direction from `j` to it; `j`'s own copy first. On one level the
+# copies are the neighbours across the faces the piece lies on, the piece
+# taken to its opposite class along each step.
+function piece_copies(forest::Forest{D}, j::Int, cls::NTuple{D,Int}) where {D}
+    k = forest.leaves[j]
+    copies = Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int}}[(level(k), j, cls,
+                                                        ntuple(_ -> 0, D))]
+    steps = ntuple(d -> cls[d] == 1 ? (0,) : (0, cls[d] == 0 ? -1 : 1), D)
+    for δ in Iterators.product(steps...)
+        all(iszero, δ) && continue
+        crossing, nbrs = oriented_neighbors(forest, k, δ)
+        isempty(nbrs) && continue                   # an outer face
+        crossing.turns == 0 && crossing.glue == 0 || error(
+            "a copy of a point across a rotating seam or a glue asked for; those come " *
+            "back in M22 steps 7 and 8, and GhostSchedule refuses them until then, so " *
+            "this is a bug")
+        length(nbrs) == 1 && level(only(nbrs)) == level(k) || error(
+            "a copy of a point on another level asked for; coarse-fine faces come back " *
+            "in M22 step 3, and GhostSchedule refuses them until then, so this is a bug")
+        push!(copies, (level(k), find_leaf(forest, only(nbrs)),
+                       ntuple(d -> δ[d] == 0 ? cls[d] : 2 - cls[d], D), δ))
+    end
+    return copies
+end
+
+# The primary among `piece_copies`: the finest level, then the lowest
+# global leaf, then the lowest class.
+piece_primary(copies) = argmin(x -> (-x[1], x[2], x[3]), copies)
+
+# One bit per piece of global leaf `j`'s closed box, set where its copy is
+# the primary, for a set of staggers `c`.
+function primary_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}) where {D}
+    bits = UInt32(0)
+    for cls in closed_pieces(c)
+        _, s, scls, _ = piece_primary(piece_copies(forest, j, cls))
+        s == j && scls == cls && (bits |= UInt32(1) << piece_index(cls))
+    end
+    return bits
+end
+
+# Stage 0's transfers into global leaf `b`: every piece of its closed box
+# whose copy is a secondary, copied from the primary's piece, keyed by the
+# direction to the primary's block and the piece's classes.
+function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
+                        b::Int) where {D}
+    for cls in closed_pieces(c)
+        all(==(1), cls) && continue                 # the open interior: no copies
+        _, s, scls, δ = piece_primary(piece_copies(forest, b, cls))
+        s == b && scls == cls && continue
+        key = GroupKey{D}(:copy, δ, ntuple(_ -> 0, D), 0, ntuple(_ -> Int8(0), D), Int8(0),
+                          Int8(0), map(Int8, cls))
+        push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
+    end
     return nothing
 end
 
@@ -1311,7 +1451,7 @@ end
 # point is clamped along every component instead, so that the hook
 # never reads another hook region.
 function boundary_region(forest::Forest{D}, k::MortonKey{D}, b::Int, δ::NTuple{D,Int},
-                         region, G::NTuple{D,Int}) where {D}
+                         region, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
     N = forest.N
     exits = ntuple(D) do d
         δ[d] == 0 && return false
@@ -1332,10 +1472,11 @@ function boundary_region(forest::Forest{D}, k::MortonKey{D}, b::Int, δ::NTuple{
             end
         end
     end
-    # The nearest evolved point.
+    # The nearest evolved point: the wall itself along a vertex-like
+    # dimension, on both sides, which is the block's own (M22).
     clamps = ntuple(D) do d
         exits[d] || return Int32(0)
-        return Int32(δ[d] > 0 ? G[d] + N : G[d] + 1)
+        return Int32(δ[d] > 0 ? G[d] + N + c[d] : G[d] + 1)
     end
     return BoundaryRegion{D}(Int32(b), δ, region, clamps, slot)
 end
@@ -1396,7 +1537,7 @@ function mirror_sources!(pairs::TransferPairs{D},
     # and then mirrored.
     crossing, nbrs = oriented_neighbors(forest, k, δ′)
     if isempty(nbrs)
-        push!(boundaries, boundary_region(forest, k, b, δ, region, G))
+        push!(boundaries, boundary_region(forest, k, b, δ, region, G, c))
         return nothing
     end
     nblevel = level(first(nbrs))
@@ -1813,7 +1954,9 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
                       boundaries::Vector{BoundaryRegion{D}}, @nospecialize(build),
                       @nospecialize(boundedof), @nospecialize(stageof),
                       offset::Int) where {D}
-    length(tags) <= 2 && return [i:i for i in eachindex(tags)]
+    # Stage 0 (M22), where there is one, and phase 1 run alone, in front.
+    p1 = something(findfirst(==(PHASE1_TAG), tags), 1)
+    length(tags) <= p1 + 1 && return [i:i for i in eachindex(tags)]
     index = Dict{Int,Int}()
     access = Vector{StageAccess{D}}(undef, length(tags))
     for (i, tag) in enumerate(tags)
@@ -1826,7 +1969,7 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
             # Phase 1 runs alone, whatever it holds: an element set's
             # prolongations are there (`transfer_stage`).
             i = get(index, stageof(key)::Int, 0)
-            i <= 1 && continue
+            i <= p1 && continue
             boxes = stage_boxes(build(key), boundedof(key)::Int8)::Union{Nothing,
                                                                          NTuple{2,Box{D}}}
             boxes === nothing && continue
@@ -1838,16 +1981,16 @@ function stage_groups(tags::Vector{Int}, pairs::TransferPairs{D},
     end
     for r in boundaries
         i = get(index, r.slot, 0)
-        i <= 1 && continue
+        i <= p1 && continue
         push!(access[i].writes, (r.block, r.region.indices))
         push!(access[i].reads, (r.block, hook_read_box(r)))
     end
 
-    groups = [1:1]
+    groups = [i:i for i in 1:p1]
     written, read = BlockBoxes{D}(), BlockBoxes{D}()   # by the stages of the open group
-    for i in 2:length(tags)
+    for i in (p1 + 1):length(tags)
         a = access[i]
-        joins = i > 2 && tags[i] == tags[i - 1] + 1 && !a.rotated[] &&
+        joins = i > p1 + 1 && tags[i] == tags[i - 1] + 1 && !a.rotated[] &&
                 !meets(written, a.reads) && !meets(written, a.writes) &&
                 !meets(read, a.writes)
         if joins
@@ -1902,7 +2045,7 @@ end
 # bound, `boundedmode`, and `stageof(key)` its stage, `transfer_stage`.
 function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::TransferPairs{D},
                       build, factorcol, axesof, bounded, stageof) where {GRP,T,D}
-    phase1 = GRP[]
+    unify, phase1 = GRP[], GRP[]
     bylevel = Dict{Int,Vector{GRP}}()
     for (key, (targets, sources)) in pairs
         # The stencils come out of a `Dict{…,Any}`.
@@ -1910,13 +2053,16 @@ function local_groups(::Type{GRP}, ::Type{T}, ::Val{D}, backend, pairs::Transfer
         group = todevice(backend, TransferGroup{T,D}(key.kind, stencils, targets, sources,
                                                      factorcol(key), key.orientation,
                                                      axesof(key), bounded(key)::Int8))
-        if stageof(key) == PHASE1_TAG
+        stage = stageof(key)
+        if stage == UNIFY_TAG
+            push!(unify, group)
+        elseif stage == PHASE1_TAG
             push!(phase1, group)
         else
             push!(get!(bylevel, key.level, GRP[]), group)
         end
     end
-    return phase1, bylevel
+    return unify, phase1, bylevel
 end
 
 # A ghost region that crosses two glued faces at once lies beyond a patch
@@ -2168,6 +2314,10 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # nearest owned row at an outflow face), or the derived wall row.
     boundedof(key) = boundedmode(operators, key.kind, key.mirror, stags)
     function build1(key, d)
+        # A piece of stage 0 (M22): a copy into the target's closed box.
+        isunify(key) &&
+            return copy_stencil(T, N, ghosts[d], stags[d], key.direction[d];
+                                piece=key.piece[d])
         δd, od, state = key.direction[d], key.offset[d], key.mirror[d]
         mode = boundedof(key)
         if state == 2
@@ -2207,28 +2357,31 @@ function GhostSchedule(forest::Forest{D,R}, operators::Operators;
     # local groups, the messages and the stage groups alike.
     stageof(key) = transfer_stage(key, order)
     GRP = grouptype(backend, T, Val(D))
-    phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol, axesof,
-                                   boundedof, stageof)
+    unify, phase1, bylevel = local_groups(GRP, T, Val(D), backend, pairs, build, factorcol,
+                                          axesof, boundedof, stageof)
 
     levels = sort!(collect(keys(bylevel)))          # coarsest targets first
     phase2 = [bylevel[l] for l in levels]
     bplan = BoundaryPlan(backend, T, forest, boundaries, order)
 
-    # Phase 1 is one stage and phase 2 one per target level. Serially
-    # each stage is one of the phases above and sends nothing.
+    # Stage 0 (M22) for a layout with a vertex-like dimension, phase 1,
+    # and one stage per phase-2 target level. Serially each stage is one
+    # of the phases above and sends nothing.
     leveltags = prolongation_tag.(levels)
-    localsof(tag) = tag == PHASE1_TAG ? phase1 :
+    closed = any(==(1), stags)
+    localsof(tag) = tag == UNIFY_TAG ? unify : tag == PHASE1_TAG ? phase1 :
                     (i = findfirst(==(tag), leveltags); i === nothing ? GRP[] : phase2[i])
     ST = stagetype(backend, T, Val(D))
     stages = build_stages(ST, T, backend, leveltags, localsof, bystage(stageof, sent),
                           bystage(stageof, received), build, factorcol, forest;
-                          required=[PHASE1_TAG], axesof=axesof, bounded=boundedof)
+                          required=closed ? [UNIFY_TAG, PHASE1_TAG] : [PHASE1_TAG],
+                          axesof=axesof, bounded=boundedof)
     # Which of them may run together here, from the host stencils.
     groups = stage_groups([st.tag for st in stages], pairs, sent, received, boundaries,
                           build, boundedof, stageof, offset)
     return GhostSchedule{T,D,R,typeof(backend),GRP,typeof(bplan),ST}(
         forest, generation(forest), ghosts, centers, order, walls, glue, operators,
-        backend, phase1, phase2, levels, boundaries, bplan, stages, groups, glueplan)
+        backend, unify, phase1, phase2, levels, boundaries, bplan, stages, groups, glueplan)
 end
 
 function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
@@ -2244,7 +2397,10 @@ function Base.show(io::IO, s::GhostSchedule{T,D}) where {T,D}
     nrot = sum(g -> g.orientation == 0 ? 0 : ntransfers(g), groups; init=0)
     # The ones turned across a glued face (M17) likewise.
     nturn = sum(g -> g.turned && g.orientation == 0 ? ntransfers(g) : 0, groups; init=0)
-    print(io, "GhostSchedule{", T, ",", D, "}(", ncopy, " copies, ", nrest,
+    # The copies of stage 0 (M22), said only where there are any.
+    nunify = sum(ntransfers, s.unify; init=0)
+    print(io, "GhostSchedule{", T, ",", D, "}(", nunify == 0 ? "" : "$nunify unifying, ",
+          ncopy, " copies, ", nrest,
           " restrictions, ", nprol, " prolongations over ", length(s.phase2),
           " level(s), ", nmirror == 0 ? "" : "$nmirror mirrored transfers, ",
           nrot == 0 ? "" : "$nrot rotated transfers, ",
