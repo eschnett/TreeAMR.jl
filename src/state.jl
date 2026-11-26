@@ -412,9 +412,10 @@ dimension, the one on the block lying lowest along the dimensions the
 point is shared in, for which it lies on high face planes (M22, "Closed
 blocks" in `CODE.md`). One bit per piece of a block's closed box —
 along each vertex-like dimension its low face plane, its open interior or
-its high face plane, `3^D` pieces — since every point of a piece lies on
-the same block faces, and so has its copies on the same blocks. Every
-point of a cell-centered or element set is a primary.
+its high face plane, `3^D` pieces — since whether a block's copy is the
+primary is the same at every point of a piece, on a mesh of several levels
+too: a piece facing a finer block is secondary everywhere, the finer copy
+winning. Every point of a cell-centered or element set is a primary.
 
 Built by [`primary_mask`](@ref) and asked by [`isprimary`](@ref); it is
 `isbits` once on its backend, so a kernel takes it as an argument.
@@ -468,7 +469,7 @@ function primary_mask(fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     # The primaries across levels, mirrors, seams and glues come with the
     # steps that rebuild those (M22); refused until then, as the fill is.
-    check_closed_blocks(forest, fs.centering, :half_open, "primary_mask")
+    check_closed_blocks(forest, fs.centering, :half_open, "primary_mask"; levels=false)
     c = staggers(fs)
     range = blockrange(forest)
     pieces = Vector{UInt32}(undef, length(range))

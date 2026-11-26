@@ -412,19 +412,20 @@ GroupKey{D}(kind::Symbol, direction::NTuple{D,Int}, offset::NTuple{D,Int}, level
 nospan(::Val{D}) where {D} = ntuple(_ -> Int8(-1), Val(D))
 isunify(key::GroupKey) = key.span[1] >= 0
 
-# A span of piece classes along one dimension, `lo:hi`, as one code,
-# `8lo + hi`. The classes are 0 the low face plane, 1 the open interior
-# (the only one along a cell-like dimension) and 2 the high face plane.
-# On one level a merged transfer of stage 0 writes `0:0` (the low plane,
-# from the block below), `1:2` (the open interior and the high plane, the
-# block below holding the primary of the low plane) or `0:2` (the whole
-# own range, where no block lies below) along a vertex-like dimension, and
-# `1:1` along a cell-like one; a single piece, `0:0`, `1:1` or `2:2`, is
-# written where pieces do not merge into a box (`merged_spans`). A
-# span rather than a list of shapes, so that M22 step 3, which divides a
-# vertex-like range at its mid-plane, can number finer classes — low
-# plane, lower half, mid-plane, upper half, high plane — and keep the
-# spans as they are; three bits a class leave it room.
+# A span of sub-classes along one dimension, `lo:hi`, as one code, `8lo +
+# hi` (three bits a class). The sub-classes divide a block's closed range
+# where finer sources divide it (`closed_subpieces`): along a vertex-like
+# dimension 0 the low face plane, 1 the lower open half, 2 the mid-plane,
+# 3 the upper open half and 4 the high face plane; along a cell-like one 1
+# the lower half and 3 the upper. A copy on one level writes `0:0` (the
+# low plane, from the block below), `1:4` (the open interior and the high
+# plane) or `0:4` (the whole own range, where no block lies below) along a
+# vertex-like dimension, and `1:3` along a cell-like one; a restriction
+# from a finer block writes its half of one piece, `1:2` or `3:3` across
+# an open interior (the mid-plane is the lower child's), `0:0` or `4:4`
+# along the dimensions it steps in, and `1:1` or `3:3` along a cell-like
+# one; where sub-pieces do not form a box, each is written alone
+# (`merged_spans`).
 span_code(lo::Integer, hi::Integer) = Int8(8lo + hi)
 span_classes(code::Integer) = (Int(code) >> 3, Int(code) & 7)
 
@@ -868,16 +869,20 @@ function target_range(N::Int, G::Int, c::Int, δd::Int, od::Int, halved::Bool)
     return (G + 1):(G + N + c)
 end
 
-# The stored range of a span of pieces of a block's closed box along a
-# dimension (M22, `span_code`): class 0 the low face plane, 1 the open
-# interior, 2 the high face plane; along a cell-like dimension only class
-# 1, the own range.
+# The stored range of a span of sub-pieces of a block's closed box along a
+# dimension (M22, `span_code`).
 function piece_range(N::Int, G::Int, c::Int, code::Integer)
-    c == 0 && return (G + 1):(G + N)
     lo, hi = span_classes(code)
-    return (lo == 0 ? G + 1 : lo == 1 ? G + 2 : G + N + 1):(hi == 0 ? G + 1 :
-                                                             hi == 1 ? G + N : G + N + 1)
+    h = N ÷ 2
+    c == 0 && return (lo == 1 ? G + 1 : G + h + 1):(hi == 1 ? G + h : G + N)
+    first = (G + 1, G + 2, G + h + 1, G + h + 2, G + N + 1)[lo + 1]
+    last = (G + 1, G + h, G + h + 1, G + N, G + N + 1)[hi + 1]
+    return first:last
 end
+
+# The span of a whole piece, by its class.
+piece_span(cls::Integer) =
+    cls == 0 ? span_code(0, 0) : cls == 2 ? span_code(4, 4) : span_code(1, 3)
 
 # Same-level copy: a pure shift of N cells against the direction, for
 # every centering. A ghost reads the neighbor's own points only, which
@@ -1394,30 +1399,54 @@ end
 # take its value in stage 0. A block's closed box falls into at most `3^D`
 # pieces, by the class of each dimension (0 low face plane, 1 open
 # interior, 2 high face plane; always 1 along a cell-like dimension), and
-# every point of a piece lies on the same faces of the block, so the same
-# blocks hold it, each at one piece of its own: whether a copy is the
-# primary is decided per piece, one bit.
+# whether the block's copy of a point is the primary is the same at every
+# point of a piece: whether a copy is the primary is decided per piece,
+# one bit (`primary_bits`).
 #
-# The primary is the copy whose class tuple is greatest, dimension 1
-# first: the copy on the block lying lowest along the dimensions the point
-# is shared in, for which the point is on high face planes. On one level
-# the copies of a piece are its own and one across each nonempty subset of
-# the faces it lies on that have a block across (a brick of roots, so a
-# block across each of two faces has one across their edge), the class
-# flipped, 0 to 2, along each step; distinct copies have distinct class
-# tuples, so the greatest is one copy, the one high along every shared
-# dimension. The direction from a secondary to its primary is then `-1`
-# exactly where its class is the low plane and a block lies below, and
-# never `+1`, across a periodic wrap too. A block that is its own
-# neighbour, across a periodic dimension of one root, holds two copies;
-# its high plane is the primary.
+# The primary is the copy on the finest level holding the point (M22 rule
+# 1: a coarser copy takes the fine value by the set's restriction), and
+# among the copies there the one whose class tuple is greatest, dimension
+# 1 first: the copy on the block lying lowest along the dimensions the
+# point is shared in, for which the point is on high face planes. On one
+# level the copies of a piece are its own and one across each nonempty
+# subset of the faces it lies on that have a block across (a brick of
+# roots, so a block across each of two faces has one across their edge),
+# the class flipped, 0 to 2, along each step; distinct copies have
+# distinct class tuples, so the greatest is one copy, the one high along
+# every shared dimension. The direction from a secondary to its primary on
+# its own level is then `-1` exactly where its class is the low plane and
+# a block lies below, and never `+1`, across a periodic wrap too. A block
+# that is its own neighbour, across a periodic dimension of one root,
+# holds two copies; its high plane is the primary.
+#
+# Across levels (step 3) the blocks holding the points of one piece are
+# not the same everywhere: a coarse piece facing finer blocks is covered
+# by several of them, which share its mid-plane, and a hanging node of a
+# fine face has no coarse copy. What is uniform along a piece is whether
+# the block's copy is the primary. Under 2:1 balance, counting edges and
+# corners, the blocks across a face, edge or corner of a block are one
+# block of the same level or coarser, or finer blocks that tile the
+# whole of what they share with it; so either every point of a piece has
+# a finer copy, and the piece is secondary, or none has, and its copies
+# on the block's own level, one block across each step and covering the
+# piece, decide it as on one level. Coarser copies never win.
+#
+# Stage 0's transfers are found per **sub-piece**, which divides a piece
+# where finer sources divide it: along a vertex-like dimension 0 the low
+# plane, 1 the lower open half, 2 the mid-plane, 3 the upper open half, 4
+# the high plane; along a cell-like one 1 the lower half and 3 the upper.
+# Every point of a sub-piece has its copies on the same blocks, at the
+# same classes, so its primary is one copy. The mid-plane is held by both
+# finer children across a face, the lower one at its high plane, so the
+# lower one is its primary, and phase 1's halved ghost ranges give it the
+# mid-plane too (`target_range`).
 #
 # The rule is local: it asks for no index, so every rank — both ends of a
 # message, and every rank's mask — decides alike by construction, and the
 # secondaries of a block share their few directions, which is what lets
-# stage 0 take one transfer group per direction (`merged_spans`). Step 3
-# adds copies on other levels, the finer winning (hence the level first
-# in the key, negated); step 8 those across a glue, by a patch entry.
+# stage 0 take one transfer group per direction on one level
+# (`merged_spans`). Step 8 adds copies across a glue, by a patch entry of
+# the key after the level.
 
 # The index of a piece among a block's `3^D`, `Σ cls_d 3^(d-1)`.
 piece_index(cls::NTuple{D,Int}) where {D} = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
@@ -1426,16 +1455,37 @@ piece_index(cls::NTuple{D,Int}) where {D} = sum(ntuple(d -> cls[d] * 3^(d - 1), 
 closed_pieces(c::NTuple{D,Int}) where {D} =
     Iterators.product(ntuple(d -> c[d] == 1 ? (0:2) : (1:1), D)...)
 
-# Every copy of the piece `cls` of global leaf `j`, as `(level, leaf,
-# class, direction)`: the leaf holding it, at which piece of its own, and
-# the direction from `j` to it; `j`'s own copy first. On one level the
-# copies are the neighbours across the faces the piece lies on, the piece
-# taken to its opposite class along each step.
-function piece_copies(forest::Forest{D}, j::Int, cls::NTuple{D,Int}) where {D}
+# The sub-pieces of a block's closed box, by sub-class per dimension, and
+# the piece a sub-piece lies in. Along a vertex-like dimension of `N = 2`
+# the open halves are empty, and left out.
+closed_subpieces(c::NTuple{D,Int}, N::Int) where {D} =
+    Iterators.product(ntuple(d -> c[d] == 0 ? (1, 3) : N == 2 ? (0, 2, 4) : (0:4), D)...)
+piece_class(sub::Integer) = sub == 0 ? 0 : sub == 4 ? 2 : 1
+piece_of(sub::NTuple{D,Int}) where {D} = map(piece_class, sub)
+
+# A sub-piece of a piece, at which the piece's primary is decided: any
+# would do; the mid-plane is never empty.
+piece_representative(cls::NTuple{D,Int}, c::NTuple{D,Int}) where {D} =
+    ntuple(d -> c[d] == 0 ? 1 : 2 * cls[d], D)
+
+# Every copy of the sub-piece `sub` of global leaf `j` (staggers `c`) on
+# `j`'s level or a finer one, as `(level, leaf, class, direction, offset)`:
+# the leaf holding it, at which piece of its own, the direction from `j`
+# to it, and, for a finer leaf, its child offset in its parent (what a
+# restriction from it is keyed by); `j`'s own copy first. On `j`'s level
+# the copies are the neighbours across the faces the sub-piece lies on,
+# the class flipped along each step; on the finer level the children
+# across, chosen along each dimension the step leaves alone by which half
+# the sub-piece lies in, both at the mid-plane. A coarser neighbour's copy
+# never wins, and is left out.
+function piece_copies(forest::Forest{D}, j::Int, sub::NTuple{D,Int},
+                      c::NTuple{D,Int}) where {D}
     k = forest.leaves[j]
-    copies = Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int}}[(level(k), j, cls,
-                                                        ntuple(_ -> 0, D))]
-    steps = ntuple(d -> cls[d] == 1 ? (0,) : (0, cls[d] == 0 ? -1 : 1), D)
+    zero = ntuple(_ -> 0, D)
+    cls = piece_of(sub)
+    copies = Tuple{Int,Int,NTuple{D,Int},NTuple{D,Int},NTuple{D,Int}}[
+        (level(k), j, cls, zero, zero)]
+    steps = ntuple(d -> c[d] == 1 && cls[d] != 1 ? (0, cls[d] == 0 ? -1 : 1) : (0,), D)
     for δ in Iterators.product(steps...)
         all(iszero, δ) && continue
         crossing, nbrs = oriented_neighbors(forest, k, δ)
@@ -1444,11 +1494,29 @@ function piece_copies(forest::Forest{D}, j::Int, cls::NTuple{D,Int}) where {D}
             "a copy of a point across a rotating seam or a glue asked for; those come " *
             "back in M22 steps 7 and 8, and GhostSchedule refuses them until then, so " *
             "this is a bug")
-        length(nbrs) == 1 && level(only(nbrs)) == level(k) || error(
-            "a copy of a point on another level asked for; coarse-fine faces come back " *
-            "in M22 step 3, and GhostSchedule refuses them until then, so this is a bug")
-        push!(copies, (level(k), find_leaf(forest, only(nbrs)),
-                       ntuple(d -> δ[d] == 0 ? cls[d] : 2 - cls[d], D), δ))
+        across = ntuple(d -> δ[d] == 0 ? cls[d] : 2 - cls[d], D)
+        lvl = level(first(nbrs))
+        lvl < level(k) && continue                  # coarser: never the primary
+        if lvl == level(k)
+            push!(copies, (lvl, find_leaf(forest, only(nbrs)), across, δ, zero))
+            continue
+        end
+        for nbr in nbrs
+            o = childoffset(nbr)
+            # Along a dimension the step leaves alone the child holds the
+            # sub-piece when it lies in the child's half, the mid-plane in
+            # both; its class there is the sub-class seen from that half.
+            holds = all(d -> δ[d] != 0 || (c[d] == 0 ? o[d] == (sub[d] == 3) :
+                                           sub[d] == 2 || o[d] == (sub[d] >= 3)), 1:D)
+            holds || continue
+            fcls = ntuple(D) do d
+                δ[d] != 0 && return across[d]
+                c[d] == 0 && return 1
+                sub[d] == 2 && return o[d] == 0 ? 2 : 0
+                return sub[d] == 0 || sub[d] == 4 ? cls[d] : 1
+            end
+            push!(copies, (lvl, find_leaf(forest, nbr), fcls, δ, o))
+        end
     end
     return copies
 end
@@ -1458,33 +1526,41 @@ end
 piece_primary(copies) = argmin(x -> (-x[1], map(-, x[3])), copies)
 
 # One bit per piece of global leaf `j`'s closed box, set where its copy is
-# the primary, for a set of staggers `c`.
+# the primary, for a set of staggers `c`: decided at one sub-piece of each
+# piece, since the answer is the same along a piece.
 function primary_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}) where {D}
     bits = UInt32(0)
     for cls in closed_pieces(c)
-        _, s, scls, _ = piece_primary(piece_copies(forest, j, cls))
+        _, s, scls, _, _ = piece_primary(piece_copies(forest, j,
+                                                      piece_representative(cls, c), c))
         s == j && scls == cls && (bits |= UInt32(1) << piece_index(cls))
     end
     return bits
 end
 
-# Stage 0's transfers into global leaf `b`: every piece of its closed box
-# whose copy is a secondary, copied from the primary's piece, the pieces
-# with one source block and direction merged into one transfer where they
-# form a box (`merged_spans`), keyed by the direction to the primary's
-# block and the spans.
+# Stage 0's transfers into global leaf `b`: every sub-piece of its closed
+# box whose copy is a secondary, copied from the primary's sub-piece, the
+# sub-pieces with one source block and direction merged where
+# `merged_spans` says, keyed by the direction to the primary's block and
+# the spans.
 function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,Int},
                         b::Int) where {D}
     bysource = Dict{Tuple{Int,NTuple{D,Int}},Vector{NTuple{D,Int}}}()
-    for cls in closed_pieces(c)
-        all(==(1), cls) && continue                 # the open interior: no copies
-        _, s, scls, δ = piece_primary(piece_copies(forest, b, cls))
-        s == b && scls == cls && continue
-        push!(get!(bysource, (s, δ), NTuple{D,Int}[]), cls)
+    lvl = level(forest.leaves[b])
+    allowed = closed_subpieces(c, forest.N).iterators
+    for sub in closed_subpieces(c, forest.N)
+        all(==(1), piece_of(sub)) && continue       # the open interior: no copies
+        slvl, s, scls, δ, _ = piece_primary(piece_copies(forest, b, sub, c))
+        s == b && scls == piece_of(sub) && continue
+        slvl == lvl || error(
+            "a primary on a finer level asked for; stage 0's restrictions come with the " *
+            "rest of M22 step 3, and GhostSchedule refuses two levels until then, so " *
+            "this is a bug")
+        push!(get!(bysource, (s, δ), NTuple{D,Int}[]), sub)
     end
     # Sorted, so that the transfers do not follow `Dict` order.
     for (s, δ) in sort!(collect(keys(bysource)))
-        for spans in merged_spans(bysource[(s, δ)])
+        for spans in merged_spans(bysource[(s, δ)], allowed)
             key = GroupKey{D}(:copy, δ, ntuple(_ -> 0, D), 0, ntuple(_ -> Int8(0), D),
                               Int8(0), Int8(0), spans)
             push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(b), Int32(s)))
@@ -1493,18 +1569,22 @@ function unify_sources!(pairs::TransferPairs{D}, forest::Forest{D}, c::NTuple{D,
     return nothing
 end
 
-# The span codes of the transfers that write the pieces `pieces` of one
-# target from one source in one direction: one transfer over their
-# bounding box where they fill it, which on one level they always do (the
-# direction to the primary is decided per dimension, so the pieces are a
-# product of a span per dimension), and otherwise one per piece, rather
-# than a guess at a cover.
-function merged_spans(pieces::Vector{NTuple{D,Int}}) where {D}
-    lo = ntuple(d -> minimum(p -> p[d], pieces), D)
-    hi = ntuple(d -> maximum(p -> p[d], pieces), D)
-    prod(ntuple(d -> hi[d] - lo[d] + 1, D)) == length(unique(pieces)) &&
-        return [ntuple(d -> span_code(lo[d], hi[d]), D)]
-    return [map(x -> span_code(x, x), p) for p in unique(pieces)]
+# Stage 0's merging policy, the one place it is decided: the span codes of
+# the transfers that write the sub-pieces `subs` of one target from one
+# source in one direction, `allowed` the sub-classes each dimension has
+# (`closed_subpieces`). One transfer over their bounding box where they
+# fill it — every allowed sub-class between the least and the greatest,
+# along every dimension, in every combination — which on one level they
+# always do (the direction to the primary is decided per dimension, so the
+# sub-pieces are a product of a span per dimension), and otherwise one per
+# sub-piece, rather than a guess at a cover.
+function merged_spans(subs::Vector{NTuple{D,Int}}, allowed) where {D}
+    subs = unique(subs)
+    lo = ntuple(d -> minimum(p -> p[d], subs), D)
+    hi = ntuple(d -> maximum(p -> p[d], subs), D)
+    box = prod(ntuple(d -> count(x -> lo[d] <= x <= hi[d], allowed[d]), D))
+    box == length(subs) && return [ntuple(d -> span_code(lo[d], hi[d]), D)]
+    return [map(x -> span_code(x, x), p) for p in subs]
 end
 
 # The regions of stage W (M22) on global leaf `j`, local block `b`: every
@@ -1538,8 +1618,8 @@ function wall_regions!(walls::Vector{BoundaryRegion{D}}, forest::Forest{D},
                    D)
         all(iszero, δ) && continue
         (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
-        region = CartesianIndices(ntuple(d -> piece_range(N, G[d], c[d],
-                                                          span_code(cls[d], cls[d])), D))
+        region = CartesianIndices(ntuple(d -> piece_range(N, G[d], c[d], piece_span(cls[d])),
+                                         D))
         clamps = ntuple(d -> Int32(δ[d] < 0 ? G[d] + 2 : δ[d] > 0 ? G[d] + N : 0), D)
         push!(walls, BoundaryRegion{D}(Int32(b), δ, region, clamps, UNIFY_TAG))
     end
@@ -2268,7 +2348,7 @@ end
 # `collective_checks`. Cell-centered and element sets have no shared
 # points and are not affected. `what` names the caller.
 function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Symbol,
-                             what::AbstractString) where {D}
+                             what::AbstractString; levels::Bool=true) where {D}
     any(==(:vertex), cs) || return nothing
     why = "a set with a vertex-like dimension (centering $cs) owns its closed range, " *
           "both boundary planes, and its fill is being rebuilt on that layout in M22 " *
@@ -2279,7 +2359,7 @@ function check_closed_blocks(forest::Forest{D}, cs::NTuple{D,Symbol}, walls::Sym
         "default; a wall the boundary hook prescribes is `CellBoundary(…; wall = " *
         ":prescribed)`. The `walls` keyword goes in M22 step 4."))
     lvl = level(first(forest.leaves))
-    any(k -> level(k) != lvl, forest.leaves) && throw(ArgumentError(
+    levels && any(k -> level(k) != lvl, forest.leaves) && throw(ArgumentError(
         "$what: the forest has leaves at more than one level, which is refused for " *
         "$why: coarse-fine faces come back in M22 step 3."))
     any(f -> f[1] != OuterFace || f[2] != OuterFace, getfield(forest, :faces)) &&

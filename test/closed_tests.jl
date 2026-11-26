@@ -118,7 +118,8 @@ end
         for cls in Iterators.product(ntuple(d -> c[d] == 1 ? (0:2) : (1:1), D)...)
             piece = sum(cls[d] * 3^(d - 1) for d in 1:D)
             @test ((b >> piece) & 1 == 1) == !any(==(0), cls)
-            @test length(piece_copies(forest, 1, cls)) == 2^count(!=(1), cls)
+            sub = TreeAMR.piece_representative(cls, c)
+            @test length(piece_copies(forest, 1, sub, c)) == 2^count(!=(1), cls)
         end
     end
 end
@@ -136,7 +137,8 @@ end
                 δ = ntuple(e -> e == d ? -1 : 0, D)
                 !isempty(TreeAMR.oriented_neighbors(forest, k, δ)[2])
             end
-            _, _, _, δ = piece_primary(piece_copies(forest, j, cls))
+            sub = TreeAMR.piece_representative(cls, c)
+            _, _, _, δ, _ = piece_primary(piece_copies(forest, j, sub, c))
             @test δ == ntuple(d -> cls[d] == 0 && below[d] ? -1 : 0, D)
         end
     end
@@ -177,6 +179,111 @@ end
     # A cell-centered set has no shared point, and needs no keyword.
     cells = FieldSet(Forest(ntuple(_ -> 2, D); N=4), 1; G=1)
     @test mesh_mapreduce(x -> 1, +, 0, cells) == 2^D * 4^D
+end
+
+# Meshes of two and three levels (M22 step 3), each balanced: the
+# nested mesh with outer faces and periodic, two refined corners of a
+# box, two fine blocks diagonal to each other with coarse blocks in the
+# other quadrants, and in 3D one refined corner, whose fine blocks touch
+# the coarse block across from it at a corner only.
+function refined_forests(D; N=4)
+    forests = Any[("nested", nested_forest(Val(D); N=N)),
+                  ("nested periodic", nested_forest(Val(D); N=N,
+                                                    periodic=ntuple(_ -> true, D))),
+                  ("two corners", faces_forest(ntuple(_ -> :outer, D); N=N))]
+    if D >= 2
+        f = Forest(ntuple(d -> d <= 2 ? 2 : 1, D); N=N)
+        refine!(f, filter(k -> block_extent(f, k)[1][1] == block_extent(f, k)[2][1],
+                          f.leaves))
+        balance!(f)
+        push!(forests, ("diagonal", f))
+    end
+    if D == 3
+        f = Forest((2, 2, 2); N=N)
+        refine!(f, [f.leaves[1]])
+        balance!(f)
+        push!(forests, ("one corner", f))
+    end
+    return forests
+end
+
+# The primary of the point at exact position `p` among its own copies on
+# a mesh of several levels, or `nothing` where it has none: the finest
+# level whose closed boxes contain the point — a coarse copy along a
+# cell-like dimension has no coincident fine point, and takes the
+# restriction of the fine cells about it — then the greatest own index,
+# which on that level is the greatest class tuple.
+function refined_primary(fs, p, copies)
+    forest = fs.forest
+    inside(k) = all(1:length(p)) do d
+        lo, hi = leafbox(forest, k)
+        any(x -> lo[d] <= x <= hi[d],
+            forest.periodic[d] ? (p[d], p[d] + forest.roots[d]) : (p[d],))
+    end
+    finest = maximum(level(k) for k in forest.leaves if inside(k))
+    own = [(idx, b) for (b, idx, o) in copies if o && level(blockkey(fs, b)) == finest]
+    isempty(own) && return nothing
+    idx, b = maximum(own)
+    return (b, idx)
+end
+
+@testset "Whether a copy is the primary is one bit a piece across levels: D=$D" for
+        D in (1, 2, 3)
+    # Guards the mask's claim that the answer is the same along a piece
+    # when finer blocks cover part of what a block shares: every own point
+    # of every block is marked primary exactly when it is its point's
+    # finest copy, high along every dimension the point is shared in on
+    # that level — at a hanging node, a mid-plane, a coincident point, and
+    # beside a diagonal or corner-only finer block.
+    for (name, forest) in refined_forests(D), C in closed_centerings(D)
+        fs = FieldSet(forest, 1; G=1, centering=C)
+        mask = primary_mask(fs)
+        ok, shared = true, 0
+        for (p, copies) in closed_point_groups(fs)
+            any(x -> x[3], copies) || continue
+            count(x -> x[3], copies) > 1 && (shared += 1)
+            primary = refined_primary(fs, p, copies)
+            for (b, idx, own) in copies
+                own || continue
+                I = ntuple(d -> idx[d] - fs.G[d], D)
+                isprimary(mask, I..., b) == ((b, idx) == primary) || (ok = false)
+            end
+        end
+        @test ok
+        @test shared > 0
+    end
+end
+
+@testset "A count over a refined set is its number of distinct points: D=$D" for
+        D in (1, 2, 3)
+    # Guards a count with `primaries = true` that takes a coincident point
+    # at its coarse copy as well as its fine one, or misses a hanging node.
+    # Along a cell-like dimension a coarse face value beside finer blocks
+    # is no point of its own: it is the restriction of the fine ones.
+    for (name, forest) in refined_forests(D), C in closed_centerings(D)
+        fs = FieldSet(forest, 1; G=1, centering=C)
+        distinct = count(pairs(closed_point_groups(fs))) do (p, copies)
+            any(x -> x[3], copies) && refined_primary(fs, p, copies) !== nothing
+        end
+        @test mesh_mapreduce(x -> 1, +, 0, fs; vars=1, primaries=true) == distinct
+        @test mesh_fold((acc, p) -> acc + 1, +, 0, fs; vars=1, primaries=true) == distinct
+    end
+end
+
+@testset "A constant is its own norm on a refined mesh, a unit its volume: D=$D" for
+        D in (1, 2, 3)
+    # Guards the trapezoid's weights across levels: each leaf integrates
+    # its own closed box, so the sum over the leaves is the domain's
+    # composite rule with no mask.
+    for (name, forest) in refined_forests(D), C in closed_centerings(D)
+        fs = FieldSet(forest, 1; G=1, centering=C)
+        u = statevector(fs)
+        fill!(u, 3.0)
+        @test volume_weighted_norm(fs, u) ≈ 3.0 rtol = 4eps()
+        @test volume_weighted_norm(fs, u; p=1) ≈ 3.0 rtol = 4eps()
+        fs.work .= 1.0
+        @test total_mass(fs, 1) ≈ prod(forest.roots) rtol = 4eps()
+    end
 end
 
 @testset "A constant is its own norm, and a unit its domain's volume: D=$D" for

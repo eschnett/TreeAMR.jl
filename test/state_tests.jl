@@ -351,10 +351,11 @@ end
     for (i, fs) in enumerate(sets)
         own = gather!(statevector(fs), fs)
         seg = stateview(u, sets, i)
-        # (`primaries`, which a vertex-like set requires, M22.)
+        # (`primaries`, which a vertex-like set requires, M22: each point
+        # once, on this refined mesh too.)
         if vertexlike(fs)
-            # Each point once, on this refined mesh: M22 step 3.
-            pending(3, "a sum over a segment of a vertex-like set, $(fs.centering)")
+            @test block_mapreduce(abs2, +, 0.0, fs, seg; primaries=true) ==
+                  block_mapreduce(abs2, +, 0.0, fs, own; primaries=true)
         else
             @test block_mapreduce(abs2, +, 0.0, fs, seg) ==
                   block_mapreduce(abs2, +, 0.0, fs, own)
