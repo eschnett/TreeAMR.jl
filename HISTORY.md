@@ -5633,6 +5633,9 @@ M12 was decided with Erik, after M7 and before M9b.
     | face, D = 3 | 2 → 1 / 26 | 2 → 1 / 26 | 1 → 1 / 26 | 1 → 1 / 26 |
     | edge, D = 3 | 16 → 3 / 26 | 16 → 3 / 26 | 5 → 3 / 26 | 7 → 5 / 26 |
 
+  - *Confirmed by Erik (2026-11-27)*, of the decisions above, the removed
+    keywords (`closed`, `appendix`) throwing with what replaced them: on
+    "Throughout", "all good". The rest stay the review's.
 - *Step 3, coarse-fine faces (2026-11-26).* Implemented on `m22` in four
   commits after a written plan reviewed as step 2's was, by Claude and
   not by Erik: the primary across levels,
@@ -5743,6 +5746,10 @@ M12 was decided with Erik, after M7 and before M9b.
   vertex-like iterations, workload cases): step 4, 13, 20 and 8; step 6,
   12, 10 and 12; step 7, 22, 18 and 11; step 8, 26, 8 and 4; step 3,
   none.
+  - *Confirmed by Erik (2026-11-27)*, of the decisions above, a removed name
+    failing as a missing name: on "Throughout", "all good". The rest
+    (five sub-classes, the mid-plane to the lower fine block, merging
+    within one piece, `N ≥ 2G`) stay the review's.
 - *Step 4, reflecting and outflow faces (2026-11-26).* Implemented on
   `m22` in four commits after a written plan reviewed as step 2's was,
   by Claude and not by Erik: the mirror
@@ -5843,6 +5850,10 @@ M12 was decided with Erik, after M7 and before M9b.
   doctests pass. The pending tests by step, as call sites: step 6, 12
   testsets, 10 loops and 12 workload cases; step 7, 22, 18 and 11; step
   8, 26, 8 and 4; steps 3 and 4, none.
+  - *Confirmed by Erik (2026-11-27)*: the stage order A → W → P → 0,
+    amending the design. On "I swapped them": "agreed". That a schedule
+    is tied to its set's parities on a forest with reflecting faces stays
+    the review's: Erik answered the stage order in that group, not it.
 - *Step 5, the first measurement (2026-11-26).* Measured on clusters,
   each study a snapshot of the step-5 branch at 96c24f6 — closed blocks
   through step 4, with the merging prototype of 60421d6 — against the
@@ -6032,6 +6043,8 @@ M12 was decided with Erik, after M7 and before M9b.
   five. The docs build and their doctests pass. The pending tests by
   step, as call sites: step 6, none; step 7, 22 testsets, 18
   loops and 11 workload cases; step 8, 26, 8 and 4.
+  - *Confirmed by Erik (2026-11-27)*: the decisions above. On "Step 6,
+    regridding": "all good".
 - *Step 6's review: a ghost on the extension of a face plane, and
   fix-ups (2026-11-26).* The review's finding, by Claude and not by Erik,
   with probes: step 3's ghost stages gave a direction's whole target,
@@ -6116,6 +6129,9 @@ M12 was decided with Erik, after M7 and before M9b.
   third cycle, whose regrids leave concave corners (its `l2` sum
   0.300772035 → 0.300772032). The fill on `bench/nested.jl`'s mesh,
   serially, 357 → 322 ms (laptop noise; no slower).
+  - *Confirmed by Erik (2026-11-27)*: the ghosts on a face plane's
+    extension taking the finest level's value, and a zero through a
+    factor written `+0`. On "Step 6, regridding": "all good".
 - *Step 7, rotating seams (2026-11-26).* Implemented on `m22`'s step-7
   branch in four commits after a written plan reviewed as the earlier
   steps' were, by Claude and not by Erik: the fill, `unify!` and the
@@ -6246,6 +6262,10 @@ M12 was decided with Erik, after M7 and before M9b.
   take too, "the count's lowest patch" deciding where positions do not;
   `seam_partnered`'s pairs, which a turn written as a glue entry (M21
   step 3) must keep; and step 5's cluster numbers, still to be taken.
+  - *Confirmed by Erik (2026-11-27)*: the orbit's primary at the greatest
+    position, the axis projected by its own kernel, and `RotationPair`
+    required for a set asymmetric in the seam's plane and vertex-like
+    along it. On "Step 7, seams": "all agreed".
 - *Step 7's review: a pair's stage order in `unify!` (2026-11-26).* The
   review, by Claude and not by Erik, verified step 7 by its own probe (a
   fourfold-symmetric scalar on four quadrant forests, concave corners on
@@ -6376,6 +6396,10 @@ M12 was decided with Erik, after M7 and before M9b.
   dissipation, is TreeWave's: its ball right-hand side used
   `map_blocks!(…; appendix = true)` and `isowned`, and is measured when
   the downstream is ported to closed blocks.
+  - *Confirmed by Erik (2026-11-27)*: the primary across a copying glue
+    (finest level, then lowest patch), keys carrying the axis map, and
+    both refusals kept with the patch-corner one widened. On "Step 8,
+    glues": "agreed".
 - *Step 8's review (2026-11-26).* The review, by Claude and not by Erik,
   asked for the cause of the balls' larger interpolation error, since a
   smooth function's copies at one point are equal and averaging them
@@ -6529,6 +6553,10 @@ M12 was decided with Erik, after M7 and before M9b.
     mean of stage A and the wider patch-corner refusal, step 8; the
     memo, step 9); the vertex convergence table of step 3; and
     PrecompileTools as a hard dependency.
+  - *Confirmed by Erik (2026-11-27)*: of the amendments listed as still
+    the review's, those of steps 4 (the stage order), 6, 7 and 8, each
+    with his words in its own record. The vertex convergence table of
+    step 3 and step 9's own plan decisions stay the review's.
 - *Step 9's repeat of step 5's measurements (2026-11-26).* Snapshots of
   88c9425 against the half-open baseline 02bf9d1, submitted by the
   review under Erik's standing permission; `CODE.md` takes its current
@@ -6623,6 +6651,8 @@ M12 was decided with Erik, after M7 and before M9b.
   `interpolate!`; both suites pass against the step unchanged, 6349 and
   10410 (1 broken, as before), and GH's printed numbers differ from
   step 10b's in timings only.
+  - *Confirmed by Erik (2026-11-27)*: a point on a coarse-fine face read
+    from the finest leaf. On "Step 10c": "yes".
 - *Step 10b, positions anchored at zero (2026-11-26).* TreeGeneralized-
   Harmonic's quadrant against its box drifted to `1e−8` at `h = 5/48`,
   the quadrant's corner (0) not the box's (−5/2) putting the same point
@@ -6693,6 +6723,13 @@ M12 was decided with Erik, after M7 and before M9b.
     smaller errors. TreeWaveGR too: its holes at `v = 0.6` converge at
     2.54 evolved and 2.44 prescribed against an asserted 2.5 (2.66 on
     0.2.12).
+  - *Erik's decision on the stale copies (2026-11-27).* On "Callers
+    unifying before they read is the most efficient": "make it so".
+    TreeAMR never unifies a state by itself: a reader that reads a raw
+    state unifies it first, and neither `unify!(du)` in every right-hand
+    side nor a per-step callback is added. The three options' costs
+    above are the reason; the migration note's "Settle a state before
+    reading it" is the rule.
 
 ## Downstream checks
 

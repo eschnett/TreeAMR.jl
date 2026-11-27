@@ -730,8 +730,9 @@ Steps:
       better) and every port's suite passes against it. Numbered 10b so
       that the steps keep their numbers and the releases stay last.
     - 10c. **A point on a coarse-fine face read from the finest leaf**
-      (the review's request): `locate_point` gives a point on a face,
-      edge or corner that leaves of two levels share to the finest leaf
+      (the review's request; Erik's "yes", 2026-11-27): `locate_point`
+      gives a point on a face, edge or corner that leaves of two levels
+      share to the finest leaf
       holding it in its closed box, rule 1 of "One value per point";
       among leaves of one level the half-open rule stays. And an
       editing pass over [Closed blocks](CODE.md#closed-blocks). *Done

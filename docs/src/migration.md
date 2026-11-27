@@ -84,7 +84,10 @@ to make, in one place.
   the copies their mean); where the hook prescribes a wall, `unify!`
   cannot write it, so `scatter!`, `fill_ghosts!` with the hook and
   `gather!` instead. An adaptive integrator's error estimate is not
-  affected (measured: the same steps raw or unified).
+  affected (measured: the same steps raw or unified). TreeAMR does not
+  unify a state for you, at a step's end or in a right-hand side: that
+  would cost every step of every run, and one `unify!` per read is the
+  cheapest (Erik's decision, 2026-11-27).
 - **Decide what a Dirichlet hook does with the wall.** Under half-open
   ownership the low outer plane was evolved and the high one was a ghost
   the hook wrote; now both are own points, evolved unless the hook says

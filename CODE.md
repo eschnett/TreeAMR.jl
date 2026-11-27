@@ -906,12 +906,15 @@ values do not depend on the state's copies at all.
   derivative). On a field set's working array it is `unify!(fs,
   schedule)`, stages A, P and 0 alone, which is what a flux set needs
   (*Across levels* below).
-- **(open)** Whether the state should never part — `unify!(du)` at the
-  end of every right-hand side, about `+11 %` to `+24 %` of a right-hand
-  side's cost, or a callback unifying `u` once a step, `+3 %` to `+6 %`
-  (and an extra evaluation of a first-same-as-last method, `+32 %` with
-  BS3) — is Erik's decision ([HISTORY.md](HISTORY.md#m22--closed-blocks)
-  has the measurement).
+- *TreeAMR never unifies a state by itself*: a reader unifies first
+  (Erik's decision, 2026-11-27: "make it so"). Keeping the state from
+  parting would cost `unify!(du)` at the end of every right-hand side,
+  about `+11 %` to `+24 %` of a right-hand side's cost, or a callback
+  unifying `u` once a step, `+3 %` to `+6 %` (and an extra evaluation of
+  a first-same-as-last method, `+32 %` with BS3), every step of every
+  run; a reader that unifies pays one `unify!` per read, which is the
+  cheapest of the three ([HISTORY.md](HISTORY.md#m22--closed-blocks) has
+  the measurement).
 
 **Walls.** A reflecting face mirrors the ghosts about the wall plane,
 `j* = 2(G+1) − j` below and `2(G+N+1) − j` above, and the wall is the
