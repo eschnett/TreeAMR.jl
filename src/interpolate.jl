@@ -486,11 +486,18 @@ end
 # can take: the domain in the field set's type, the brick, the face
 # kinds, the rotating seam's pair of dimensions (M12; `(0, 0)` for none),
 # the finest level present (an `O(nleaves)` scan, done once per batch on
-# the host), and the flat index of the brick's first root less one. On a
-# forest of patches (M17) it is one patch's: its box, its roots and its
+# the host), and the flat index of the brick's first root less one; and
+# the forward map's anchor (`patch_anchor`), its integer coordinate `m`,
+# the level-0 spacing and `N`, from which `locate_leaf` forms the faces of
+# the block it finds exactly as positions are formed. On a forest of
+# patches (M17) it is one patch's: its box, its roots, its anchor and its
 # first root, which `patch_geometry` builds in the kernel per point.
 struct PointGeometry{D,T}
     extents::NTuple{D,Tuple{T,T}}
+    anchor::NTuple{D,T}
+    m::NTuple{D,Int}
+    h0::T
+    N::Int
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
     reflecting::NTuple{D,Tuple{Bool,Bool}}
@@ -506,8 +513,9 @@ end
 # what everything but the location of a `PatchPoint` reads (the seam,
 # which a forest of patches does not have).
 function PointGeometry(::Type{T}, forest::Forest{D}) where {T,D}
-    return PointGeometry{D,T}(location_box(T, forest, 1),
-                              forest.roots, forest.periodic, reflecting_faces(forest),
+    a, m = patch_anchor(T, forest, 1)
+    return PointGeometry{D,T}(location_box(T, forest, 1), a, m, spacing(T, forest, 0),
+                              forest.N, forest.roots, forest.periodic, reflecting_faces(forest),
                               hasrotating(forest) ? seam_plane(forest) : (0, 0),
                               ishalfturn(forest), maxlevel(forest), 0)
 end
@@ -558,8 +566,8 @@ pointdims(x::PatchPoint) = length(x.ξ)
 # one isbits entry per patch for a kernel; `nothing` on a brick.
 function patch_table(::Type{T}, forest::Forest{D}) where {T,D}
     ispatched(forest) || return nothing
-    return [(location_box(T, forest, p), patch_roots(forest, p), patch_firstroot(forest, p))
-            for p in 1:npatches(forest)]
+    return [(location_box(T, forest, p), patch_anchor(T, forest, p)..., patch_roots(forest, p),
+             patch_firstroot(forest, p)) for p in 1:npatches(forest)]
 end
 
 # The geometry a point is located with, its position in `T`, its patch,
@@ -576,9 +584,9 @@ end
     ξ = ntuple(d -> T(x.ξ[d]), Val(D))
     p = x.p
     1 <= p <= length(table) || return g, ξ, p, false
-    @inbounds ext, roots, fr = table[p]
-    return PointGeometry{D,T}(ext, roots, ntuple(_ -> false, Val(D)), g.reflecting, (0, 0),
-                              false, g.L, fr), ξ, p, true
+    @inbounds ext, a, m, roots, fr = table[p]
+    return PointGeometry{D,T}(ext, a, m, g.h0, g.N, roots, ntuple(_ -> false, Val(D)),
+                              g.reflecting, (0, 0), false, g.L, fr), ξ, p, true
 end
 
 # One coordinate brought into the domain: wrapped along a periodic
@@ -661,28 +669,27 @@ end
 
 # The block index of the leaf containing the in-domain point `x`.
 #
-# The level-`L` node containing `x`: the root brick position, then the
-# node's coordinates bit by bit from the fraction within the root —
-# doubling is exact, so this needs no integer conversion of `2^L`, which
-# `T` could not hold exactly at deep levels. A point on the upper face of
-# the domain lands in the last node (the fraction reaches one and every
-# bit is set). Then the last leaf not after that node in curve order,
-# which is the covering leaf: the leaves tile the domain, and an
-# ancestor sorts immediately before its descendants, which are contiguous.
+# The level-`L` node containing `x`, as the forward map places it (M22
+# step 10b): its index along each dimension from the anchor, `s = (x −
+# a)/h_L + m·2^L` spacings over `N`, and then corrected by one either way
+# against the node's faces formed exactly as `nodeposition` forms them,
+# `position_fma(k, h_L, a)`, so that a point on a face — a node's own position
+# included — lands in the upper node, whatever the division rounded to; a
+# point on the upper face of the domain lands in the last node. `h_L` is
+# the level-0 spacing halved `L` times, exact, and `k` an integer `T`
+# holds exactly wherever positions are exact (`nodeposition`). Then the
+# last leaf not after that node in curve order, which is the covering
+# leaf: the leaves tile the domain, and an ancestor sorts immediately
+# before its descendants, which are contiguous.
 @inline function locate_leaf(leaves, g::PointGeometry{D,T}, x) where {D,T}
+    hL = g.h0 / (1 << g.L)
     cell = ntuple(Val(D)) do d
-        xlo, xhi = g.extents[d]
-        t = (x[d] - xlo) / (xhi - xlo) * T(g.roots[d])
-        rp = clamp(floorindex(t), 0, g.roots[d] - 1)
-        r = t - T(rp)
-        c = 0
-        for _ in 1:(g.L)
-            r += r
-            bit = r >= one(T)
-            bit && (r -= one(T))
-            c = 2c + bit
-        end
-        (rp, c)
+        a, mL, N = g.anchor[d], g.m[d] << g.L, g.N
+        last = (g.roots[d] << g.L) - 1
+        b = clamp(floorindex(((x[d] - a) / hL + T(mL)) / T(N)), 0, last)
+        b > 0 && x[d] < position_fma(T(b * N - mL), hL, a) && (b -= 1)
+        b < last && x[d] >= position_fma(T((b + 1) * N - mL), hL, a) && (b += 1)
+        (b >> g.L, b & ((1 << g.L) - 1))
     end
     root = g.firstroot + root_index(g.roots, ntuple(d -> cell[d][1], Val(D)))
     pc = ntuple(d -> UInt64(cell[d][2]) << (MAX_LEVEL - g.L), Val(D))

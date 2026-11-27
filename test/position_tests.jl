@@ -405,6 +405,40 @@ end
     end
 end
 
+@testset "Every node, block face and domain edge is located as the forward map places it: D=$D, $T" for
+    D in (1, 2, 3), T in (Float64, Float32)
+    # Guards an inverse map that rounds differently from the forward one: a
+    # point on a face must land in the block above it, a node at the
+    # domain's high edge in the last block, whichever way the division in
+    # `locate_leaf` rounds.
+    for forest in (centred_forest(T, D; N=D == 3 ? 6 : 12), position_forest(T, D; N=6))
+        n = 0
+        for k in forest.leaves
+            ext = block_extent(forest, k)
+            h = spacing(T, forest, k)
+            B = TreeAMR.block_base(forest, k)
+            a = TreeAMR.block_low(T, forest, k)
+            for I in CartesianIndices(ntuple(_ -> 1:(forest.N + 1), D))
+                x = ntuple(d -> TreeAMR.nodeposition(a[d], h, B[d], I[d], 1, nothing), D)
+                j = locate_point(forest, x)
+                j === nothing && (n += 1; continue)
+                e = block_extent(forest, forest.leaves[j])
+                top = ntuple(d -> TreeAMR.location_box(T, forest, 1)[d][2], D)
+                ok = all(d -> e[d][1] <= x[d] &&
+                              (x[d] < e[d][2] || e[d][2] >= top[d]), 1:D)
+                ok || (n += 1)
+            end
+        end
+        @test n == 0
+        # Both edges of the domain, as given and as formed, are located.
+        box = TreeAMR.location_box(T, forest, 1)
+        for x in (ntuple(d -> T(forest.extents[d][1]), D), ntuple(d -> T(forest.extents[d][2]), D),
+                  ntuple(d -> box[d][1], D), ntuple(d -> box[d][2], D))
+            @test locate_point(forest, x) isa Int
+        end
+    end
+end
+
 @testset "A centred box's edges are each other's negation: D=1, $T" for T in (Float64, Float32)
     # Guards the edges of a zero anchor, `∓(n/2)·h`, which are `∓L` only
     # where the product rounds there: they must at least mirror each
@@ -433,4 +467,26 @@ end
         xs = own_positions(fs)
         @test all(x -> all(d -> Base.setindex(x, -x[d] + zero(T), d) in xs, 1:D), xs)
     end
+end
+
+@testset "A centred box takes its own edges and refuses the next float out: D=$D, $T" for
+    D in (1, 2), T in (Float64, Float32)
+    # Guards what depends on an edge: anchored at zero the edges are
+    # `∓(n/2)·h`, an ulp off `∓L` where the product rounds away, and a
+    # point at the extent given, at the edge formed, or at a node a hook
+    # writes must still be inside; a point past both is outside.
+    L = T(7 // 10)
+    f = Forest{T}(ntuple(_ -> 2, D); N=12, extents=ntuple(_ -> (-L, L), D))
+    fs = FieldSet{T}(f, 1; G=2, centering=vertexcentered(D))
+    fill_by_coordinates!((x, v) -> 1 + sum(x), fs)
+    fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=2, restriction=2));
+                 boundary=CellBoundary((x, v, δ) -> 1 + sum(x)))
+    box = TreeAMR.location_box(T, f, 1)
+    edges = [ntuple(_ -> -L, D), ntuple(_ -> L, D), ntuple(d -> box[d][1], D),
+             ntuple(d -> box[d][2], D)]
+    r = interpolate(fs, edges, Lagrange(2))
+    @test all(r.inside)
+    @test vec(r.values) ≈ [1 + sum(x) for x in edges]
+    out = [ntuple(d -> prevfloat(min(-L, box[d][1])), D), ntuple(d -> nextfloat(max(L, box[d][2])), D)]
+    @test_throws "outside the domain" interpolate(fs, out, Lagrange(2))
 end
