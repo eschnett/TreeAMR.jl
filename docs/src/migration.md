@@ -104,7 +104,12 @@ to make, in one place.
   or unify after.
 - **Positions are `nodeposition`'s, in tests too.** A test comparing
   positions bit for bit with `block_origins + (I − 1) h` fails against
-  the kernels' `nodeposition`.
+  the kernels' `nodeposition`. Every position is now formed from the
+  patch's low corner and the block's integer corner, so two forests
+  whose patches start at different corners place the same physical point
+  alike only to rounding (TreeWaveOLDG's nested boxes against a uniform
+  box over the finest cube, element nodes off the integers: 3e-15 of the
+  field).
 - A hand-written loop over `interiorview` that counts or sums visits
   every copy; skip the secondaries with `isprimary(primary_mask(fs), i…,
   b)`, as `primaries = true` does.
