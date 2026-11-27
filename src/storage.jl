@@ -959,8 +959,8 @@ ownextents(fs::FieldSet{T,D}) where {T,D} =
 The position along one dimension of owned index `I` of a block — the
 stored index minus the ghost width, so `1 … N` (`N + 1` on a vertex-like
 dimension's shared plane) for its own points and `≤ 0` or beyond for its
-ghosts — given its patch's low corner `lo` along that dimension (an
-entry of [`block_lows`](@ref)), its level's spacing `h` (of
+ghosts — given its patch's anchor `lo` along that dimension (an
+entry of [`block_lows`](@ref): zero, a symmetry face or the centre), its level's spacing `h` (of
 [`block_spacings`](@ref)) and its integer corner `B` (of
 [`block_bases`](@ref)). `c` is the set's stagger along the dimension, 1
 vertex-like and 0 cell-like, and `nodes` is `nothing` for an equally
@@ -1095,8 +1095,8 @@ outside the block's boundary.
 The position depends on the field set's ghost width *and* on its
 centering — `lo + (k + 1/2)·h` in a cell-centered dimension and `lo +
 k·h` in a vertex-like one, with `k = B + i − G[d] − 1` the point's
-integer coordinate in its level's spacings from its patch's low corner
-`lo`, and for an element set (M16; [`elementcentered`](@ref)) the
+integer coordinate in its level's spacings from its patch's anchor
+`lo` ([`block_lows`](@ref)), and for an element set (M16; [`elementcentered`](@ref)) the
 Gauss–Lobatto node the index holds, with a ghost at the block's face;
 see [`nodeposition`](@ref TreeAMR.nodeposition), which forms every one
 of them, so that the copies of a point held by several blocks are at one

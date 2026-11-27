@@ -407,7 +407,7 @@ end
     # Guards a position formed from a block's own floating-point corner,
     # or with the shift subtracted in floating point: every position must
     # be `lo + k·h` or `lo + (k + ½)·h` for the point's integer coordinate
-    # `k`, rounded once by an explicit `fma` (the half as `2k + 1` half
+    # `k` from the patch's anchor `lo`, rounded once by an explicit `fma` (the half as `2k + 1` half
     # spacings), the expression that puts every copy of a point at one
     # position (CODE.md, "Positions" under "Centerings").
     for T in (Float64, Float32), C in (cellcentered(D), vertexcentered(D),
@@ -418,13 +418,13 @@ end
         c = staggers(fs)
         for b in (1, nblocks(fs)), I in stored_indices(fs)
             k = blockkey(fs, b)
-            lo = forest.extents
+            lo = TreeAMR.block_low(T, forest, k)       # the anchor: here the centre
             B = TreeAMR.block_base(forest, k)
             h = spacing(T, forest, k)
             kk = ntuple(d -> B[d] + I[d] - G - 1, D)
             @test coordinates(fs, b, Tuple(I)) ===
-                  ntuple(d -> c[d] == 1 ? fma(T(kk[d]), h, T(lo[d][1])) :
-                                          fma(T(2 * kk[d] + 1), h / 2, T(lo[d][1])), D)
+                  ntuple(d -> c[d] == 1 ? fma(T(kk[d]), h, lo[d]) :
+                                          fma(T(2 * kk[d] + 1), h / 2, lo[d]), D)
         end
     end
 end

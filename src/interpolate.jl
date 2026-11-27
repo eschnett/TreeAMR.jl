@@ -53,7 +53,7 @@ and `TreeAMR.check_derivative(basis, m)` if it cannot produce every
 derivative order below `n`, and `TreeAMR.stencil_place(basis, lo, h, B,
 first, Val(G), Val(C))` if its stencil points are not the stored points
 of an equally spaced set — the positions an `exclude` region is tested
-at, formed from the patch's low corner `lo`, the spacing `h` and the
+at, formed from the patch's anchor `lo` ([`block_lows`](@ref)), the spacing `h` and the
 block's integer corner `B` as
 [`nodeposition`](@ref TreeAMR.nodeposition) forms them. The
 position, rather than a stored index, is what the kernel hands a basis
