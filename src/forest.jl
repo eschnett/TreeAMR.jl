@@ -3,11 +3,16 @@
 # builds new stages, and they take their buffers, and host mirrors, from
 # it instead of allocating them again (`BufferPool`). It is made on first
 # use, so a serial forest, whose stages have no messages, never has one.
+# `anchors` holds where positions are anchored, patch by patch
+# (`position_anchors`), computed on first use: it depends on the extents,
+# the roots and `N` only, which a forest never changes, so it is the same
+# on every rank and for every generation.
 mutable struct ForestState
     generation::Int
     pool::Union{Nothing,BufferPool}
+    anchors::Any
 end
-ForestState() = ForestState(0, nothing)
+ForestState() = ForestState(0, nothing, nothing)
 
 function bufferpool(forest)
     state = forest.state

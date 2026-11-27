@@ -296,3 +296,141 @@ end
         @test vec(r.values) ≈ [1 + sum(x isa PatchPoint ? x.ξ : x) for x in xs]
     end
 end
+
+# --- M22 step 10b: positions anchored at zero ---------------------------------
+#
+# Where zero is a level-0 node of a patch along a dimension, positions are
+# formed from zero, `0 + k·h`, rather than from the low corner (CODE.md,
+# "Positions" under "Centerings"). The spacing `5/48`, which a double
+# cannot hold, is the case the anchor exists for.
+
+# A box `[−L, L]^D` of `2^D` roots, refined about the low corner twice, so
+# that it has every kind of coarse-fine face on both sides of zero.
+function centred_forest(::Type{T}, D; N=12, L=T(5 // 2), half=ntuple(_ -> false, D)) where {T}
+    forest = Forest{T}(ntuple(d -> half[d] ? 1 : 2, D); N=N,
+                       extents=ntuple(d -> (half[d] ? zero(T) : -L, L), D))
+    for _ in 1:2
+        refine!(forest, [first(forest.leaves)])
+        balance!(forest)
+    end
+    return forest
+end
+
+# Every own point's position over a set, as a `Set` of tuples.
+function own_positions(fs)
+    c = staggers(fs)
+    D = length(c)
+    out = Set{NTuple{D,eltype(fs.work)}}()
+    for b in 1:nblocks(fs), I in CartesianIndices(ntuple(d -> 1:(fs.forest.N + c[d]), D))
+        push!(out, Tuple(coordinates(fs, b, Tuple(I) .+ fs.G)))
+    end
+    return out
+end
+
+@testset "Zero on a patch's grid is found exactly, and only there" begin
+    # Guards the integer test: an anchor where zero misses the grid by a
+    # representation error would move every position by it.
+    anchor(ext, roots; N=8) = TreeAMR.position_anchors(
+        Forest((roots,); N=N, extents=(ext,)))[1][1]
+    @test anchor((-1.0, 1.0), 2) == 8
+    @test anchor((-2.5, 2.5), 4; N=12) == 24
+    @test anchor((0.0, 1.0), 2) == 0                 # the low corner is zero
+    @test anchor((-1.0, 0.0), 2) == 16               # the high corner is
+    @test anchor((-0.25, 0.75), 1) == 2              # a dyadic third of the way
+    @test anchor((0.3, 1.3), 2) == 0                 # zero outside
+    @test anchor((-0.3, 0.7), 1; N=10) == 0          # −0.3 is not −3/10 in a double
+    @test anchor((-0.125, 0.875), 1; N=4) == 0       # zero a cell centre only
+    f32 = Forest{Float32}((1,); N=8, extents=((-0.25f0, 0.75f0),))
+    @test TreeAMR.position_anchors(f32)[1] == (2,)
+end
+
+@testset "A box centred on zero is antisymmetric bit for bit: D=$D, $T" for
+    D in (1, 2, 3), T in (Float64, Float32)
+    # Guards a position formed from the low corner, whose rounding differs
+    # on the two sides of zero: `x(n − j) == −x(j)` along every dimension,
+    # at every level and centering, at a spacing a double cannot hold.
+    forest = centred_forest(T, D; N=D == 3 ? 6 : 12)
+    for C in unique([vertexcentered(D), cellcentered(D), facecentered(D, 1)])
+        fs = FieldSet{T}(forest, 1; G=1, centering=C)
+        xs = own_positions(fs)
+        # Every position is an exact multiple of its level's spacing,
+        # formed from zero; on the uniform box every position's negation
+        # along each dimension is a position too (`+ zero(T)` makes `−0`
+        # the `0` it is).
+        h0 = spacing(T, forest, 0)
+        multiple(v) = any(L -> (h = h0 / (1 << L); k = round(v / h * 2) / 2;
+                                v == (isinteger(k) ? fma(T(k), h, zero(T)) :
+                                      fma(T(2k), h / 2, zero(T)))), 0:2)
+        @test all(x -> all(d -> multiple(x[d]), 1:D), xs)
+        coarse = FieldSet{T}(Forest{T}(ntuple(_ -> 2, D); N=forest.N,
+                                       extents=forest.extents), 1; G=1, centering=C)
+        cx = own_positions(coarse)
+        @test all(x -> all(d -> Base.setindex(x, -x[d] + zero(T), d) in cx, 1:D), cx)
+    end
+end
+
+@testset "A quadrant's, bitant's and half-turn domain's positions are the box's: D=$D" for
+    D in (2, 3)
+    # Guards the agreement of a symmetric domain with its full box at a
+    # spacing a double cannot hold, which a position formed from each
+    # domain's own low corner breaks by an ulp (TreeGeneralizedHarmonic's
+    # quadrant against its box drifted to 1e−8 from it).
+    for T in (Float64, Float32), C in (vertexcentered(D), cellcentered(D))
+        L = T(5 // 2)
+        box = FieldSet{T}(Forest{T}(ntuple(_ -> 4, D); N=12,
+                                    extents=ntuple(_ -> (-L, L), D)), 1; G=1, centering=C)
+        bx = own_positions(box)
+        halves = [ntuple(d -> d >= 2, D), ntuple(d -> d == D, D)]
+        for half in halves
+            f = Forest{T}(ntuple(d -> half[d] ? 2 : 4, D); N=12,
+                          extents=ntuple(d -> (half[d] ? zero(T) : -L, L), D))
+            hx = own_positions(FieldSet{T}(f, 1; G=1, centering=C))
+            @test issubset(hx, bx)
+        end
+    end
+end
+
+@testset "A domain without zero on its grid keeps its positions: D=$D" for D in (1, 2)
+    # Guards the fallback: every position is `lo + k·h` from the low corner,
+    # as before the anchor, so a domain off zero keeps its bits and digests.
+    T = Float64
+    forest = Forest{T}(ntuple(_ -> 3, D); N=8, extents=ntuple(_ -> (0.3, 1.3), D))
+    @test TreeAMR.position_anchors(forest)[1] == ntuple(_ -> 0, D)
+    fs = FieldSet{T}(forest, 1; G=1, centering=vertexcentered(D))
+    h = spacing(T, forest, 0)
+    for b in 1:nblocks(fs)
+        o = block_origin(forest, blockkey(fs, b))
+        B = TreeAMR.block_base(forest, blockkey(fs, b))
+        @test o == ntuple(d -> fma(T(B[d]), h, T(0.3)), D)
+    end
+end
+
+@testset "A centred box's edges are each other's negation: D=1, $T" for T in (Float64, Float32)
+    # Guards the edges of a zero anchor, `∓(n/2)·h`, which are `∓L` only
+    # where the product rounds there: they must at least mirror each
+    # other, so that the domain is symmetric.
+    for L in (T(5 // 2), T(1), T(1 // 3), T(7 // 10)), roots in (2, 4)
+        f = Forest{T}((roots,); N=12, extents=((-L, L),))
+        lo = block_extent(f, first(f.leaves))[1][1]
+        hi = block_extent(f, last(f.leaves))[1][2]
+        @test lo === -hi
+    end
+end
+
+@testset "Element nodes mirror, and so does an element set in a centred box: $T" for
+    T in (Float64, Float32)
+    # Guards the conditional claim for element sets: their nodes are
+    # antisymmetric about a zero anchor only if the tabulated offsets
+    # mirror exactly, `oᵢ + o_{P−i} == P + 1`, which they do for every
+    # order tested (checked here), and then so are the positions.
+    for P in 1:8
+        o = TreeAMR.element_offsets(T, P)
+        @test all(i -> o[i + 1] + o[P - i + 1] == T(P + 1), 0:P)
+    end
+    for D in (1, 2), P in (1, 2)
+        f = Forest{T}(ntuple(_ -> 2, D); N=12, extents=ntuple(_ -> (-T(5 // 2), T(5 // 2)), D))
+        fs = FieldSet{T}(f, 1; G=1, centering=elementcentered(D), P=P)
+        xs = own_positions(fs)
+        @test all(x -> all(d -> Base.setindex(x, -x[d] + zero(T), d) in xs, 1:D), xs)
+    end
+end
