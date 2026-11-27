@@ -1113,6 +1113,25 @@ through the turn (rule 2):
   kernel reads them through the axis map, `rotvars` and the sign column,
   as every turned transfer does, and `ghost_plane_parts` copies a
   turned diagonal the same way.
+- *What a reduced domain promises against its full one.* A quadrant,
+  bitant, half-turn domain or octant and the full box it stands for have
+  the same positions bit for bit wherever zero is on both grids
+  (*Positions* under [Centerings](#centerings)), and the same values to
+  rounding only: the reduced domain makes its seam's (or wall's) copies
+  of a point one number, through the turn or the mirror exactly, where
+  the full box holds independent values at `p` and its image, which a
+  data or a right-hand side that is symmetric only to rounding leaves
+  apart. The reduced domain is the symmetric one of the two. Measured on
+  TreeGeneralizedHarmonic's spinning hole on the rotating quadrant
+  against its box (M22 step 10b): the first difference appears at the
+  first fill, on the seam planes only, 136–610 ulps — the analytic
+  background's own quarter-turn asymmetry, which half-open ownership
+  kept because it evolved both seam planes side by side — and a moving
+  layer's centred time difference amplifies it to `4.65e−9` after
+  sixteen steps (`1.3e−10` on 0.2.12), at rest `8.1e−13` (`4.3e−14`);
+  the axis and the points off the seam agree as well as or better than
+  on 0.2.12, and the mirrored quadrant and bitant, whose walls were
+  already owned planes, agree to `5e−14`.
 - *A limitation: copies equal to rounding where the plane is
   cell-like.* A set cell-like in both plane dimensions but vertex-like
   across them — in 3D the face set normal to the axis, `(:cell, :cell,

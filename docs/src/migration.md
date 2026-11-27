@@ -135,6 +135,14 @@ to make, in one place.
 - A seam point's copies are one number through the turn, and a point on
   the axis is projected onto the turn's invariant part (a turned
   vector's in-plane components are zero there).
+- A reduced domain (quadrant, bitant, half turn) and its full box have
+  the same positions bit for bit where zero is on both grids, and the
+  same values to rounding: the reduced domain makes its seam's copies
+  one number, where the box keeps the two values its data or right-hand
+  side give at `p` and at its image. A test comparing the two compares
+  to a bound that names that source; TreeGeneralizedHarmonic's spinning
+  hole on the rotating quadrant measured 136–610 ulps on the seam planes
+  after the first fill, amplified to `4.65e−9` by a moving layer.
 - Across a glue that copies, the lowest-numbered patch's copy is the
   primary; a glue may now reverse a vertex-like axis and join a high
   face to a high face. A set vertex-like along both dimensions of a
