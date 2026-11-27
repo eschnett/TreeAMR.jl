@@ -338,9 +338,9 @@ end
     @test anchor((0.0, 1.0), 2) == 0                 # the low corner is zero
     @test anchor((-1.0, 0.0), 2) == 16               # the high corner is
     @test anchor((-0.25, 0.75), 1) == 2              # a dyadic third of the way
-    @test anchor((0.3, 1.3), 2) == 8                 # zero outside: the centre
-    @test anchor((-0.3, 0.7), 1; N=10) == 5          # −0.3 is not −3/10 in a double
-    @test anchor((-0.125, 0.875), 1; N=4) == 2       # zero a cell centre only
+    @test anchor((0.3, 1.3), 2) == 0                 # zero outside: the low corner
+    @test anchor((-0.3, 0.7), 1; N=10) == 0          # −0.3 is not −3/10 in a double
+    @test anchor((-0.125, 0.875), 1; N=4) == 0       # zero a cell centre only
     f32 = Forest{Float32}((1,); N=8, extents=((-0.25f0, 0.75f0),))
     @test TreeAMR.position_anchors(f32)[1] == (2,)
 end
@@ -399,80 +399,86 @@ function level0_nodes(::Type{T}, forest) where {T}
             for K in 1:(forest.roots[1] * forest.N + 1)]
 end
 
-@testset "Off zero, a dimension is anchored at its symmetry face, else at its centre" begin
-    # Guards the fallback's order (M22 step 10d): zero first, then a
-    # reflecting face or a face of the seam, the lower of two, and the
-    # centre otherwise; an outer or outflow face is no symmetry face. And
-    # the anchor's value: the face's extent itself, or `(T(lo) + T(hi))/2`.
-    kinds(f) = map(last, TreeAMR.anchor_table(f)[1])
+@testset "Off zero, positions are counted from the low corner, whatever the faces" begin
+    # Guards the anchor's independence of the face kinds (M22 step 10f,
+    # step 10d's fallback taken out): off zero every position is `lo + k·h`
+    # from the patch's low corner, for outer, reflecting and outflow faces
+    # and a seam alike, so two forests with the same extents and other
+    # faces place every point at one position.
     ext = ((0.3, 1.3), (0.3, 1.3))
-    @test kinds(Forest((2, 2); N=8, extents=ext)) == (TreeAMR.ANCHOR_CENTRE, TreeAMR.ANCHOR_CENTRE)
-    f = Forest((2, 2); N=8, extents=ext, reflecting=((false, true), (true, true)))
-    @test kinds(f) == (TreeAMR.ANCHOR_HIGH, TreeAMR.ANCHOR_LOW)
-    @test TreeAMR.position_anchors(f)[1] == (16, 0)
-    @test TreeAMR.patch_anchor(Float64, f, 1)[1] == (1.3, 0.3)
-    f = Forest((2, 2); N=8, extents=ext, outflow=((true, true), (false, false)))
-    @test kinds(f) == (TreeAMR.ANCHOR_CENTRE, TreeAMR.ANCHOR_CENTRE)
-    @test TreeAMR.patch_anchor(Float64, f, 1)[1] == ntuple(_ -> (0.3 + 1.3) / 2, 2)
-    @test kinds(Forest((2, 2); N=8, extents=ext, rotating=(1, 2))) ==
-          (TreeAMR.ANCHOR_LOW, TreeAMR.ANCHOR_LOW)
-    @test kinds(Forest((2, 2); N=8, extents=ext, halfturn=(1, 2))) ==
-          (TreeAMR.ANCHOR_LOW, TreeAMR.ANCHOR_CENTRE)
-    # Zero on the grid wins over a symmetry face.
-    @test kinds(Forest((2,); N=8, extents=((-1.0, 1.0),), reflecting=((false, true),))) ==
-          (TreeAMR.ANCHOR_ZERO,)
-    # A Float32 forest takes the centre in Float32.
-    f32 = Forest{Float32}((2,); N=8, extents=((0.3f0, 1.3f0),))
-    @test TreeAMR.patch_anchor(Float32, f32, 1)[1] == ((0.3f0 + 1.3f0) / 2,)
-    # Every block's origin is formed from that anchor.
-    for f in (Forest((3, 3); N=8, extents=ext .|> e -> (0.3, 1.3)),
-              Forest((3, 3); N=8, extents=ext, reflecting=((false, true), (false, false))))
-        a, _ = TreeAMR.patch_anchor(Float64, f, 1)
+    kws = ((;), (; reflecting=((false, true), (true, true))),
+           (; outflow=((true, true), (false, false))), (; rotating=(1, 2)), (; halfturn=(1, 2)))
+    origins = map(kws) do kw
+        f = Forest((4, 4); N=8, extents=ext, kw...)
+        refine!(f, [first(f.leaves)])
+        balance!(f)
+        @test TreeAMR.position_anchors(f)[1] == (0, 0)
+        @test TreeAMR.patch_anchor(Float64, f, 1)[1] == (0.3, 0.3)
         h = spacing(Float64, f, 0)
         for k in f.leaves
-            B = TreeAMR.block_base(f, k)
-            @test block_origin(f, k) == ntuple(d -> fma(Float64(B[d]), h, a[d]), 2)
+            B, hk = TreeAMR.block_base(f, k), spacing(Float64, f, k)
+            @test block_origin(f, k) == ntuple(d -> fma(Float64(B[d]), hk, 0.3), 2)
         end
+        Dict(k => block_origin(f, k) for k in f.leaves)
     end
+    # A seam's conformity refines more leaves; compare those all have.
+    common = intersect(map(keys, origins)...)
+    @test length(common) > 10
+    @test all(o -> all(k -> o[k] === origins[1][k], common), origins)
 end
 
-@testset "A half domain is its full one's upper half: bit for bit where its face is the full one's centre, else to ulps: $T" for
+# The edges of a box as positions form them, `lo + 0·h` and `lo + n·h` from
+# its anchor, in `T`: what `block_extent` gives the first and last leaf.
+function formed_edges(::Type{T}, lo, hi; roots=4, N=12) where {T}
+    f = Forest{T}((roots,); N=N, extents=((T(lo), T(hi)),))
+    return block_extent(f, first(f.leaves))[1][1], block_extent(f, last(f.leaves))[1][2]
+end
+
+@testset "The edges are the extents but for rounding, as measured: $T" for T in (Float64, Float32)
+    # Guards the limits CODE.md states for the edges (M22 step 10f): a box
+    # centred on zero has edges `∓(n/2)·h`, exact negatives of each other
+    # and within an ulp of `∓L`, off in about 6 % of boxes; off zero the low
+    # edge is the extent and the high edge `lo + n·h` is within two ulps.
+    # Over the sweep CODE.md quotes (368 widths, the tests' roots and `N`).
+    Ls = vcat([T(p // 7) for p in 1:300], [T(p) / T(16) for p in 1:60],
+              T[0.1, 0.3, 0.7, 1.1, 2.5, 3.14159, 5.0, 7.3])
+    total, off, worst = 0, 0, 0
+    lows, highs = 0, 0
+    for L in Ls, roots in (1, 2, 3, 4, 8), N in (4, 6, 8, 12, 16, 32)
+        isodd(roots * N) && continue
+        lo, hi = formed_edges(T, -L, L; roots=roots, N=N)
+        total += 1
+        lo === -hi || (worst = typemax(Int))
+        if hi != L
+            off += 1
+            worst = max(worst, round(Int, abs(Float64(big(hi) - big(L))) / Float64(eps(L))))
+        end
+        c = T(0.3)
+        olo, ohi = formed_edges(T, c, c + 2L; roots=roots, N=N)
+        lows += olo != c
+        highs = max(highs, round(Int, abs(Float64(big(ohi) - big(c + 2L))) / Float64(eps(c + 2L))))
+    end
+    @test total == 11040
+    @test worst <= 1                                   # negatives, an ulp at most
+    @test 0.04 < off / total < 0.09                    # 6.6 % and 6.0 % measured
+    @test lows == 0                                    # the low corner is exact
+    @test highs <= 2                                   # the high edge within two ulps
+end
+
+@testset "A box far from zero keeps its points accurate at their own magnitude: $T" for
     T in (Float64, Float32)
-    # Guards what the centre anchor promises off zero: the half (c, c + L),
-    # reflecting at c, is anchored at `T(c)`, and the full (c − L, c + L)
-    # at its computed centre; where the two are one number and the
-    # spacings agree the positions are the same bits, and otherwise they
-    # differ by a few ulps (measured at most 6 in M22 step 10d).
-    L = T(5 // 2)
-    function halves(c)
-        full = Forest{T}((6,); N=8, extents=((T(c) - L, T(c) + L),))
-        half = Forest{T}((3,); N=8, extents=((T(c), T(c) + L),),
-                         reflecting=((true, false),))
-        hx = level0_nodes(T, half)
-        return full, hx, level0_nodes(T, full)[(end - length(hx) + 1):end]
+    # Guards the low corner against the error step 10d's centre anchor had:
+    # an ulp of the anchor, not of the point ([1e-6, 100]'s low edge came out
+    # a relative 6e-9 off). Here every node is within two ulps of itself of
+    # the exact `lo + k·(hi − lo)/n`, and the low edge is `lo` exactly.
+    for (lo, hi) in ((T(1e-6), T(100)), (T(0.1), T(5.1)), (T(1e-3), T(1)))
+        f = Forest{T}((4,); N=12, extents=((lo, hi),))
+        xs = level0_nodes(T, f)
+        n = length(xs) - 1
+        @test xs[1] === lo
+        @test all(k -> abs(big(xs[k + 1]) - (big(lo) + k * (big(hi) - big(lo)) / n)) <=
+                       2 * eps(xs[k + 1]), 0:n)
     end
-    full, hx, fx = halves(0.75)
-    @test TreeAMR.patch_anchor(T, full, 1)[1] == (T(0.75),)
-    @test hx == fx
-    full, hx, fx = halves(0.3)
-    @test TreeAMR.patch_anchor(T, full, 1)[1] != (T(0.3),)
-    @test hx != fx
-    @test maximum(abs.(hx .- fx) ./ eps.(fx)) <= 8
-end
-
-@testset "Positions off zero depend on the face kinds" begin
-    # Guards the claim CODE.md makes: two forests with the same extents and
-    # other face kinds are anchored apart, so off zero their positions can
-    # differ in the last bits, and on zero they do not.
-    pos(f) = level0_nodes(Float64, f)
-    ext = ((0.3, 1.3),)
-    a, b = pos(Forest((6,); N=8, extents=ext)), pos(Forest((6,); N=8, extents=ext,
-                                                       reflecting=((false, true),)))
-    @test a != b
-    @test maximum(map((x, y) -> abs(x - y) / eps(x), a, b)) <= 8
-    z = ((-1.0, 1.0),)
-    @test pos(Forest((6,); N=8, extents=z)) ==
-          pos(Forest((6,); N=8, extents=z, reflecting=((true, true),)))
 end
 
 @testset "Every node, block face and domain edge is located as the forward map places it: D=$D, $T" for

@@ -60,79 +60,43 @@ block_spacings(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
 # The leaves whose blocks this rank stores, in local block order.
 localleaves(forest::Forest) = view(forest.leaves, blockrange(forest))
 
-# Where positions are anchored, patch by patch and dimension by
-# dimension, as `(m, kind)`: `m` the number of level-0 spacings from the
-# patch's low face to the anchor, and `kind` which anchor it is. The rule,
-# in order (M22 steps 10b and 10d; CODE.md, "Positions" under
-# "Centerings"):
-#
-# 1. `ANCHOR_ZERO`: coordinate zero, where zero is one of the patch's
-#    level-0 nodes along `d`, `lo + K·(hi − lo)/n` for an integer `K` in
-#    `0…n`, `n` the roots times `N`; then `m = K`.
-# 2. `ANCHOR_LOW` or `ANCHOR_HIGH`: a symmetry face of `d`, a reflecting
-#    face or a face of the rotating seam (a quarter turn's low faces of
-#    `d1` and `d2`, a half turn's low face of `d1`); `m = 0` or `n`. Both
-#    faces symmetric: the low one. An outer or outflow face is none.
-# 3. `ANCHOR_CENTRE`: the centre, `m = n/2`; `n` is even, since `N` is.
-#
-# The test for zero is exact, in `Rational{BigInt}` of the extents in the
-# forest's own type. It is made once per forest, on the host, and kept in
-# its `ForestState`: it depends on the extents, the roots, `N`, the face
-# kinds and the seam, which a forest never changes, the same on every
-# rank. A zero that is a cell centre and not a node does not anchor.
-const ANCHOR_ZERO, ANCHOR_LOW, ANCHOR_HIGH, ANCHOR_CENTRE = Int8(0), Int8(1), Int8(2), Int8(3)
-
-# Whether face `side` (1 low, 2 high) of dimension `d` is a symmetry face:
-# reflecting, or a face of the rotating seam.
-function symmetry_face(forest::Forest, d::Integer, side::Integer)
-    facekind(forest, d, side) == ReflectingFace && return true
-    hasrotating(forest) && side == 1 || return false
-    d1, d2 = seam_plane(forest)
-    return d == d1 || (!ishalfturn(forest) && d == d2)
-end
-
-function anchor_table(forest::Forest{D}) where {D}
+# Where positions are anchored (M22 step 10b), patch by patch and
+# dimension by dimension: `m`, the number of level-0 spacings from the
+# patch's low face to coordinate zero, when zero is one of the patch's
+# level-0 nodes along that dimension, `lo + K·(hi − lo)/n` for an integer
+# `K` in `0…n`, `n` the roots times `N`; and `0` otherwise. With `m > 0`
+# a position is formed from zero, `0 + k·h`, which makes it an exact
+# multiple of the spacing and a box centred on zero exactly antisymmetric;
+# with `m = 0` from the low corner, as before (CODE.md, "Positions" under
+# "Centerings"). The test is exact, in `Rational{BigInt}` of the extents
+# in the forest's own type, and is made once per forest, on the host, and
+# kept in its `ForestState`: it depends on the extents, the roots and `N`
+# only, the same on every rank. A zero that is a cell centre and not a
+# node does not anchor.
+function position_anchors(forest::Forest{D}) where {D}
     cached = forest.state.anchors
-    cached === nothing || return cached::Vector{NTuple{D,Tuple{Int,Int8}}}
+    cached === nothing || return cached::Vector{NTuple{D,Int}}
     anchors = map(1:npatches(forest)) do p
         extents, roots = patch_extents(forest, p), patch_roots(forest, p)
         return ntuple(D) do d
             lo = Rational{BigInt}(extents[d][1])
             hi = Rational{BigInt}(extents[d][2])
             n = roots[d] * forest.N
-            K = -lo * n / (hi - lo)
-            denominator(K) == 1 && 0 <= K <= n && return (Int(K), ANCHOR_ZERO)
-            symmetry_face(forest, d, 1) && return (0, ANCHOR_LOW)
-            symmetry_face(forest, d, 2) && return (n, ANCHOR_HIGH)
-            @assert iseven(n)
-            return (n ÷ 2, ANCHOR_CENTRE)
+            m = -lo * n / (hi - lo)
+            return denominator(m) == 1 && 0 <= m <= n ? Int(m) : 0
         end
     end
     forest.state.anchors = anchors
     return anchors
 end
 
-# The anchors' integer coordinates `m`, patch by patch.
-position_anchors(forest::Forest{D}) where {D} =
-    [map(first, a) for a in anchor_table(forest)]
-
 # The anchor of patch `p` along each dimension, in `T`, and its integer
-# coordinate `m` in level-0 spacings. Its value: zero; the face's extent
-# itself, `T(lo)` or `T(hi)`; or the centre, `(T(lo) + T(hi)) / 2`, the
-# extents converted, summed with one rounding and halved exactly, which
-# is zero for extents `(−L, L)` (CODE.md, "Positions" under "Centerings").
+# coordinate in level-0 spacings: zero at `m` where zero is on the grid,
+# else the low corner at `0`.
 function patch_anchor(::Type{T}, forest::Forest{D}, p::Integer) where {T,D}
-    table = anchor_table(forest)[p]
+    m = position_anchors(forest)[p]
     extents = patch_extents(forest, p)
-    a = ntuple(D) do d
-        lo, hi = T(extents[d][1]), T(extents[d][2])
-        kind = table[d][2]
-        kind == ANCHOR_ZERO && return zero(T)
-        kind == ANCHOR_LOW && return lo
-        kind == ANCHOR_HIGH && return hi
-        return (lo + hi) / 2
-    end
-    return a, map(first, table)
+    return ntuple(d -> m[d] > 0 ? zero(T) : T(extents[d][1]), D), m
 end
 
 # The integer corner of block `k` along each dimension: the number of
@@ -151,7 +115,8 @@ function block_base(forest::Forest{D}, k::MortonKey{D}) where {D}
 end
 
 # The anchor of block `k`'s patch, in `T` (`patch_anchor`): zero where
-# zero is on the patch's grid, else its symmetry face, else its centre.
+# zero is on the patch's grid, else its low corner — on a forest of one
+# brick, the forest's own extents'.
 block_low(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D} =
     patch_anchor(T, forest, patch(forest, k))[1]
 
@@ -185,10 +150,10 @@ outer corner of its first interior cell, not that cell's center). On a
 forest of patches (M17) it is in the logical coordinates of `k`'s patch.
 
 It is a node's position, formed by [`nodeposition`](@ref
-TreeAMR.nodeposition) as `a + B·h` from the patch's anchor `a` (zero
-where zero is on the patch's grid, else a symmetry face, else the
-centre; [`block_lows`](@ref)), the block's integer corner `B` counted
-from it and its level's spacing `h`, so that it
+TreeAMR.nodeposition) as `lo + B·h` from the patch's anchor `lo` (zero
+where zero is a node of the patch's level-0 grid, else its low corner;
+[`block_lows`](@ref)), the block's integer corner `B` counted from it
+and its level's spacing `h`, so that it
 is bit for bit the corner the blocks around it see and the first vertex
 `coordinates` gives.
 """
@@ -221,12 +186,11 @@ block_origins(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
 
 The anchor of the patch (M17) of every block this rank stores, as an
 `NTuple{D,T}` indexed by local block, dimension by dimension: zero where
-zero is a node of the patch's level-0 grid; else the extent of a
-symmetry face (a reflecting face or a face of the rotating seam, the
-lower of two); else the centre, `(T(lo) + T(hi)) / 2`. The name stays
-from when it was the low corner. With [`block_bases`](@ref) and
+zero is a node of the patch's level-0 grid, else the patch's low corner
+(the forest's own on a forest of one brick). The name is from when it
+was always the low corner. With [`block_bases`](@ref) and
 [`block_spacings`](@ref) it is what [`nodeposition`](@ref
-TreeAMR.nodeposition) forms a point's position from, `a + k·h` with `k`
+TreeAMR.nodeposition) forms a point's position from, `lo + k·h` with `k`
 an integer counted from the anchor, and why every block holding a point puts it at the same
 position bit for bit. A number per block rather than per patch, so that
 a kernel reads it as it reads the spacing.
@@ -268,9 +232,9 @@ The `(lo, hi)` physical extent of block `k`'s interior, per dimension.
 Both ends are node positions ([`nodeposition`](@ref
 TreeAMR.nodeposition)), so the leaves' extents tile the domain bit for
 bit: a block's `hi` is its neighbour's `lo`, at one level or across two.
-The domain's high face is then at `lo + K·h` for `K` the number of
-spacings across it, which is the extent the forest was given up to
-rounding (CODE.md, "Positions" under "Centerings").
+The domain's faces are then at `lo + K·h` from the anchor, `K` an
+integer, which are the extents the forest was given up to rounding
+(CODE.md, "Positions" under "Centerings").
 """
 function block_extent(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D}
     lo, B, h = block_low(T, forest, k), block_base(forest, k), spacing(T, forest, k)
