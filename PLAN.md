@@ -746,7 +746,21 @@ Steps:
       centre (*Positions* under [Centerings](CODE.md#centerings)).
       *Done when* the rule is tested under each branch, the forward and
       inverse maps agree there, a reloaded checkpoint keeps its anchor,
-      and every port's suite passes against it.
+      and every port's suite passes against it. Done, and taken out
+      again by 10f.
+    - 10e. **Positions in twice precision** (Erik, 2026-11-27, on
+      `range`: "if so, use it"): tried and parked unmerged on
+      `eschnett-claude/m22-step-10e-range`; an open question in
+      [CODE.md](CODE.md#open-questions).
+    - 10f. **Back to the low corner** (Erik's question, "this is getting
+      complicated. should we just get back to your original
+      recommendation?", and his decision, 2026-11-27: "make it so"):
+      positions from zero where zero is a level-0 node, else from the
+      low corner, one `fma`, whatever the faces (*Positions* under
+      [Centerings](CODE.md#centerings)). *Done when* the tests state
+      what holds (edges, antisymmetry on zero, accuracy off it, no
+      dependence on the faces), GH's quadrant and bitant agree with the
+      box at about `5e−14` again, and every port's suite passes.
 11. **The releases**: `m22` merged, TreeAMR 0.3.0 first, and M21
     resumed on it.
 

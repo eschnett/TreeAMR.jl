@@ -6594,13 +6594,26 @@ M12 was decided with Erik, after M7 and before M9b.
     glue and stage A run on the device", Float32, twice — the assertion
     that fails on `main` too (`gpu_tests.jl:1197` there). Not new;
     unexplained.
-  - **(open)** *`mpi_device_tests` on Fir*: Float64 at four ranks
+  - *`mpi_device_tests` on Fir*: Float64 at four ranks
     segfaulted once (job 6389475, node fc10207, staged in rank 0 and
     direct in rank 1; Float32 and two and three ranks pass). The
     half-open baseline passes on Fir, the same test and three
     harness-style launches pass on fc10209 and fc10508, and the CPU
     backend at four ranks under `--check-bounds=yes` is clean; both
     codes are queued pinned to fc10207 to tell the node from the code.
+    *Closed (2026-11-27): the node, not the code.* Both jobs pinned to
+    fc10207 ran, each `mpi_device_tests` in Float64, staged: the
+    finished branch (study m22-step9-mpi-gpu, 88c9425; job 6421789) and
+    the half-open baseline 02bf9d1 (study m22-step9-mpi-gpu-base; job
+    6421807) alike segfaulted in the harness at ranks "2 3 4", at -n 3
+    in rank 2 (signal 11); "4" alone passed (35 and 34 tests) and the
+    workload by hand at four ranks completed (111 lines) for both. The
+    baseline, which passes on every other node, fails on fc10207 as the
+    new code does, and the failing rank count moves from run to run, so
+    it is a fault of that node, a GPU or its memory. Float64
+    `mpi_device_tests` at 2, 3 and 4 ranks on four H100s stands as
+    passing on the finished branch (fc10508, job 6416795: 95 tests).
+    Whether to report the node to the Alliance is Erik's.
 - *The device regrid's bitwise claim (2026-11-26).* "Ghosts across a
   glue and stage A run on the device" asserted `rd == rh`, the 2D
   regrid on the device bit for bit the host's; on CUDA it failed for
@@ -6614,6 +6627,66 @@ M12 was decided with Erik, after M7 and before M9b.
   the CPU does not. The assertion asked for more than the code
   promises, and now compares within `gputol(T)` of the maximum, as the
   same testset compares the fill.
+- *Steps 10e and 10f, the fallback taken out again (2026-11-27).* The
+  review's probe found what step 10d's table hid: with the centre as
+  anchor a position is `centre + k·h` in one rounding, so its error is an
+  ulp of the centre, not of the point. `[0.1, 5.1]`'s low edge came out
+  0.09999999999999953, 34 ulps of 0.1; `[1e-6, 100]`'s 9.99999993922529e-7,
+  a relative 6e-9. 10d's own table was mixed besides: the half against
+  the full box was worse than the low corner's for `c = 0.3` (11 of 25
+  nodes apart against none). Erik, on the review's report: "julia has a
+  function `range` (or `LinRange`?) which hits both interval boundaries
+  exactly. i think the idea is to use essentially linear interpolation
+  between two values (the boundary coordinates), with weights that are
+  guaranteed to vanish and the respective boundary. can we use this?
+  would this remain efficient? if so, use it. if not, let's go back to
+  the low corner as you recommend." Measured by the review (`scratchpad/
+  dd_positions.jl`, `lerp2.jl`; 3,000 random boxes per type, Float64 and
+  Float32):
+  - *`LinRange`'s lerp*, `(1 − j/n)·lo + (j/n)·hi`: both edges exact, but
+    not antisymmetric on a centred box (2,935 of 3,000), a half unequal to
+    its box (2,978), 35 % of off-zero points not the correctly rounded
+    value (422,183 of 1,210,166 in Float64), a division a coordinate.
+  - *Erik's symmetric weighted forms* (his proposal of 2026-11-27),
+    `((n − j)/n)·lo + (j/n)·hi` and `(jmax − j)/n·lo + (j − jmin)/n·hi`,
+    the same arithmetic: antisymmetric on a centred box and exact at
+    both edges, as he said; but a half differs from its box in 2,956 of
+    3,000 boxes (62 % of the half's points), 60 % of points are not the
+    correctly rounded value, two divisions a coordinate, and contracted
+    to an `fma` by a back end it loses antisymmetry in 2,973 of 3,000.
+  - *The twice-precision step*, as `range` forms its elements: the
+    spacing a pair `(h, δ)`, the reference at zero (10b's test) or the low
+    corner, a TwoSum at the end. Both edges exact in every box,
+    antisymmetric in every centred box, a half's step equal to its box's
+    in every box, correctly rounded but for one point in 5 (Float64) and
+    3 (Float32) centred boxes and 25 and 16 off-zero ones; about four
+    operations a coordinate on zero and a dozen off it, no division.
+    Step 10e began it on `eschnett-claude/m22-step-10e-range`: an
+    `isbits` `PositionReference` in `block_lows`, so that no call to
+    `nodeposition` changes (the review's choice among three options, the
+    other two a seventh argument in every port or the low corner); it
+    needed a change in TreeGRRMHD's typed `point_x` and a formula proof
+    against `fma` contraction on a device (CUDA contracts). Parked there,
+    unfinished and unmerged.
+  Erik, on the weighted forms and the twice-precision design: "this is
+  getting complicated. should we just get back to your original
+  recommendation?"; the review's recommendation was yes, and on its
+  summary of what that means — positions from zero where zero is on the
+  grid, else from the low corner; step 10d's fallback removed; the
+  twice-precision work parked unmerged; this record; CODE.md with twice
+  precision under open questions and the centred box's edge limit stated
+  — he answered "make it so". Step 10f does that: 10b's two cases, one
+  `fma`, `block_lows` plain numbers, no port change. Its tests state
+  what holds: on zero exact multiples of `h`, antisymmetry and the
+  reduced domains equal to the box bit for bit; a centred box's edges
+  exact negatives within an ulp of the extents (6.6 % and 6.0 % off, over
+  10b's sweep); off zero the low edge exact, the high within two ulps,
+  every node of `[1e-6, 100]` within two ulps of itself; no dependence on
+  the face kinds, which TreeIOHDF5's reload test now states (1165
+  tests). GH's acceptance is back: the quadrant against the box after
+  16 steps at `h = 5/48`, `4.97e−14`, the bitant `4.62e−14`. Every port's
+  suite passes with its 10b counts. The suite: 201,327 tests at eight
+  threads and 201,275 at one; Metal `gpu_tests` 2718.
 - *Step 10d, the anchor's fallback (2026-11-27).* Step 10b had left
   open where positions are anchored when zero is not on a patch's grid,
   the low corner as before, with Erik's own suggestion beside it. Erik

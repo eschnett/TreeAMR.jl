@@ -252,57 +252,44 @@ its patch's **anchor** `lo` in units of its level's spacing `h`: `k = B +
 I − 1` for owned index `I` (stored index minus `G`) of a block whose
 integer corner is `B = g·N − m·2^level`, `g = (rootpos << level) +
 coords` the block's integer coordinate at its level within its patch.
-The anchor, at `m` level-0 spacings from the patch's low face, is
-chosen per patch and dimension in this order (M22 steps 10b and 10d,
-Erik's request and his choice of the fallback, 2026-11-27;
-`anchor_table`, `patch_anchor`, `block_low` and `block_base` are the
-only places it enters):
+The anchor is zero, at `m` level-0 spacings from the patch's low face,
+where zero is one of the patch's level-0 nodes along that dimension,
+`lo_p + m·(hi_p − lo_p)/n` exactly for an integer `m` in `0…n` (`n` the
+roots times `N`; tested in `Rational{BigInt}` of the extents in the
+forest's own type, once per forest, kept in its `ForestState`); else the
+patch's low corner, `m = 0` (M22 steps 10b and 10f, Erik's request and
+his decision, 2026-11-27: "make it so"; `position_anchors`,
+`patch_anchor`, `block_low` and `block_base` are the only places it
+enters). It depends on the extents, the roots and `N` only, not on the
+face kinds or a seam (tested; TreeIOHDF5's reload test checks the same).
 
-1. **zero**, where zero is one of the patch's level-0 nodes along the
-   dimension, `lo_p + m·(hi_p − lo_p)/n` exactly for an integer `m` in
-   `0…n` (`n` the roots times `N`; tested in `Rational{BigInt}` of the
-   extents in the forest's own type);
-2. else a **symmetry face**: a reflecting face, or a face of the
-   rotating seam (a quarter turn's low faces of `d1` and `d2`, a half
-   turn's low face of `d1`), the lower if both faces are; its value is
-   the face's extent itself, `T(lo_p)` or `T(hi_p)`, and `m = 0` or `n`.
-   An outer or outflow face is none;
-3. else the **centre**, `m = n/2` (`n` is even, since `N` is), whose
-   value is `(T(lo_p) + T(hi_p)) / 2`: the extents converted, summed with
-   one rounding and halved exactly. It is zero for extents `(−L, L)` and
-   negates with them; `T(lo) + (T(hi) − T(lo))/2` recovers a centre
-   written as a decimal more often (58 % of random cases against 48 %),
-   but is not symmetric in the two extents.
+What holds, and its limits:
 
-The choice is made once per forest, on the host, and kept in its
-`ForestState`; it depends on the extents, the roots, `N`, the face kinds
-and the seam, so **two forests with the same extents and other face
-kinds can place a point off zero apart in the last bits** (tested):
-a test comparing a run with outer faces against one with a reflecting
-face compares positions an ulp apart, and a checkpoint is reloaded into
-the faces it was saved with — TreeIOHDF5 stores the extents, the faces
-and the seam, and a reload derives the same anchor (tested there).
-Anchored at zero a position is an exact multiple of `h` rounded once, so
-a box centred on zero is antisymmetric bit for bit at any spacing, every
-centering and level, element nodes too (their offsets mirror exactly,
-`oᵢ + o_{P−i} = P + 1`, for every `P` up to 8, tested), and a quadrant,
-bitant or half-turn domain has its full box's positions. Off zero
-nothing is bit-exact under reflection, since rounding is symmetric
-under negation only: about the centre of `[c − 1, c + 1]` (48 cells) 9
-to 15 of 24 mirror pairs differ, by at most an ulp, where the low corner
-left 22 to 24 apart. A half domain, reflecting at its face `c`, agrees
-with its full domain bit for bit when its face is the same number as
-the full domain's computed centre and its spacing the full one's
-(`c = 0.75`, `L = 5/2`, tested), and otherwise to a few ulps (for
-`L = 1`, 9 to 14 of 25 nodes apart for `c = 0.3, 1/3, 0.1`, at most 2
-ulps; for `L = 5/2` up to 6; tested to 8). The
-edges of an anchor in the middle are `a ∓ (n/2)·h`, the extents only
-where that rounds to them: of 55,200 boxes `[c − L, c + L]` (`L` over
-368 values, five `c`, `n` over the roots and `N` the tests use) 15.1 %
-in `Float64` and 16.8 % in `Float32` have an edge one ulp off its
-extent, never more, where the low corner, whose low edge is exact, has
-its high edge `lo + n·h` off in 24.5 % and 25.8 %, by up to two ulps.
-A face anchor's own edge is exact. `location_box` spans
+- *On zero* a position is an exact multiple of `h` rounded once, so a
+  box centred on zero is antisymmetric bit for bit at any spacing, every
+  centering and level, element nodes too (their offsets mirror exactly,
+  `oᵢ + o_{P−i} = P + 1`, for every `P` up to 8, tested), and a
+  quadrant, bitant or half-turn domain has its full box's positions.
+  The two edges of a centred box are `∓(n/2)·h`, exact negatives of
+  each other, and the extents `∓L` only where that rounds to them: in a
+  sweep of 11,040 centred boxes (`L` over 368 values, dyadic and not,
+  `n` over the roots and `N` the tests use) 6.6 % in `Float64` and
+  6.0 % in `Float32` have an edge one ulp off its extent, never more
+  (tested over the same sweep).
+- *Off zero* the low edge is the extent exactly and every position is
+  `lo + k·h` rounded once, so a point is accurate at its own magnitude:
+  its error is `k` times the spacing's rounding plus an ulp of itself,
+  within two ulps of itself of the exact `lo + k·(hi − lo)/n` (tested on
+  `[1e-6, 100]`, `[0.1, 5.1]` and `[1e-3, 1]`). The high edge `lo + n·h`
+  is within two ulps of the extent. Nothing is bit-exact under
+  reflection off zero, since rounding is symmetric under negation only,
+  and a half domain off zero agrees with its full box only to rounding.
+
+Step 10d had anchored a patch without zero at a symmetry face, else at
+its centre; an anchor in the middle puts an ulp *of the anchor* on every
+point, `[0.1, 5.1]`'s low edge 34 ulps of 0.1 off, so it was taken out
+again ([HISTORY.md](HISTORY.md#m22--closed-blocks), steps 10d–10f, has
+it and the alternatives measured). `location_box` spans
 the extents and the formed edges, so a point at either is inside, and
 `locate_leaf` finds a point's node from the anchor and corrects it
 against the node's faces formed as positions are, so the inverse agrees
@@ -781,8 +768,8 @@ position, bit for bit, or a right-hand side that reads it — a source
 term, a `1/r`, a gauge condition — gives them values that differ by
 rounding. Positions are formed from integer coordinates counted from a
 patch's anchor: from zero along a dimension where zero is a node of the
-patch's level-0 grid, else from a symmetry face, else from the centre
-(*Positions* under [Centerings](#centerings)). Every copy of a point is formed from
+patch's level-0 grid, else from the patch's low corner (*Positions*
+under [Centerings](#centerings)). Every copy of a point is formed from
 the same integers, so the copies are at one position, and a reduced
 domain's positions are its full box's wherever zero is on both grids
 (*Seams* below). With it a deterministic right-hand side gives the
@@ -7837,6 +7824,19 @@ collective `interpolate`, only redundant.
 
 All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
+
+- **(open)** *Positions in twice precision* (a possible refinement,
+  M22 step 10e, parked unmerged on `eschnett-claude/m22-step-10e-range`).
+  Forming a position as Julia's `range` does — the spacing held as a
+  pair `(h, δ)` in twice the precision, the reference at zero or the low
+  corner, a TwoSum at the end — would make every edge its extent and
+  every position the correctly rounded value but for rare ulps
+  (measured in HISTORY.md). It would take an opaque `isbits` entry in
+  `block_lows` in place of a plain number, a change in TreeGRRMHD's
+  typed `point_x`, about four operations a coordinate on zero and a
+  dozen off it, and a formula written so that no product feeds an
+  addition, since a back end that contracts into `fma` (CUDA's does)
+  would otherwise move the bits; tested on each device.
 
 - Wiring `volume_weighted_norm` (of one set, or of the state vector of
   several) into adaptive

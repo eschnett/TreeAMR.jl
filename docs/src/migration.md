@@ -118,17 +118,12 @@ to make, in one place.
   point alike bit for bit at any spacing, and a box centred on zero is
   exactly antisymmetric. Its edges are then `∓(n/2)·h`, one ulp off the
   extents in about 6 % of boxes, always each other's negation. Off
-  zero (step 10d, Erik's choice) a patch is anchored at a symmetry face
-  along a dimension that has one — a reflecting face or a face of the
-  rotating seam, the lower of two — and at its centre, `(lo + hi)/2` in
-  the forest's type, otherwise. Every off-zero position moves from the
-  low corner's by an ulp or so, and so does any digest of one; off zero
-  a half domain agrees with its full one bit for bit only where its face
-  is the same number as the full one's computed centre, and positions
-  depend on the face kinds: the same extents with a reflecting face and
-  with an outer one place a point apart in the last bits. A checkpoint
-  reloads into the faces it was saved with, so its positions are the
-  saved ones.
+  zero positions are counted from the patch's low corner, whose edge is
+  the extent exactly, and the high edge `lo + n·h` is within two ulps of
+  its extent; the face kinds play no part, so the same extents under
+  other faces place every point alike. (An anchor at a symmetry face or
+  the centre was tried and taken out again before 0.3.0: it put an ulp
+  of the anchor on every point.)
 - A hand-written loop over `interiorview` that counts or sums visits
   every copy; skip the secondaries with `isprimary(primary_mask(fs), i…,
   b)`, as `primaries = true` does.
