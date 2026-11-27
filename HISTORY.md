@@ -6586,6 +6586,25 @@ M12 was decided with Erik, after M7 and before M9b.
   the CPU does not. The assertion asked for more than the code
   promises, and now compares within `gputol(T)` of the maximum, as the
   same testset compares the fill.
+- *Step 10b, positions anchored at zero (2026-11-26).* TreeGeneralized-
+  Harmonic's quadrant against its box drifted to `1e−8` at `h = 5/48`,
+  the quadrant's corner (0) not the box's (−5/2) putting the same point
+  an ulp apart. Erik asked whether the patch's centre, or a symmetry
+  face, could be the anchor; the review answered that exactness exists
+  only for an anchor at zero and proposed anchoring at zero where zero
+  is on the patch's grid, else at the low corner; Erik: "yes, design and
+  add this." The review's decisions on the plan, unconfirmed by Erik:
+  the low corner as the fallback (his centre fallback is an open
+  question in `CODE.md`, with its table), no anchor at a zero that is a
+  cell centre only, `locate_leaf` following the anchor, and element
+  nodes' antisymmetry a conditional claim, which holds (their offsets
+  mirror exactly for `P = 1…8` in `Float64` and `Float32`). The edges
+  of a zero anchor were swept: 724 of 11,040 `Float64` boxes and 666 in
+  `Float32` have an edge one ulp off its extent, none more, all
+  antisymmetric. No base is assumed non-negative anywhere: every use of
+  `block_base(s)` and of the kernels' `bases` adds it to an index before
+  `nodeposition`, and the one `÷` near it (the element stencil's
+  `(first − G − 1) ÷ n`) does not involve the base.
 - *PrecompileTools (2026-11-26).* Asked about "PrecompileTools as a
   dependency", Erik answered "yes, fine": step 9's last commit, the
   precompile workload, came onto the step-10 branch as it was, and

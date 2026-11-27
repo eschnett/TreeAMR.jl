@@ -721,6 +721,14 @@ Steps:
     stays bounded at M20's dissipation, once its right-hand side no
     longer uses the appendix. *Done when* each suite passes against the
     branch from a scratch copy.
+    - 10b. **Positions anchored at zero** (Erik's request, 2026-11-26):
+      where zero is on a patch's grid, positions are formed from zero,
+      so that a symmetric domain and its full box agree bit for bit at
+      any spacing and a centred box is antisymmetric; elsewhere the low
+      corner. *Done when* TreeGeneralizedHarmonic's quadrant and bitant
+      against the box agree at `h = 5/48` at `main`'s level (4.0e−11 or
+      better) and every port's suite passes against it. Numbered 10b so
+      that the steps keep their numbers and the releases stay last.
 11. **The releases**: `m22` merged, TreeAMR 0.3.0 first, and M21
     resumed on it.
 

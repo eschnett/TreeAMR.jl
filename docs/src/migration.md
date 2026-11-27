@@ -109,12 +109,14 @@ to make, in one place.
   whose patches start at different corners place the same physical point
   alike only to rounding (TreeWaveOLDG's nested boxes against a uniform
   box over the finest cube, element nodes off the integers: 3e-15 of the
-  field). At a spacing a double cannot hold the same holds for vertex
-  points: TreeGeneralizedHarmonic's quadrant (corner 0) against its box
-  (corner −5/2) at `h = 5/48` put 85 % of the points an ulp apart, and a
-  scheme that amplifies roundoff carried that to `1e−8`; at `h = 1/16`
-  the two agree as before. A test comparing two domains bit for bit
-  wants a dyadic spacing.
+  field). Where zero is on a patch's grid, positions are anchored at
+  zero instead (step 10b): two domains that both have zero on their grid
+  — a quadrant, bitant or half-turn domain and its full box — place a
+  point alike bit for bit at any spacing, and a box centred on zero is
+  exactly antisymmetric. Its edges are then `∓(n/2)·h`, one ulp off the
+  extents in about 6 % of boxes, always each other's negation. Domains
+  without zero on their grid keep the low corner, and compare to
+  rounding.
 - A hand-written loop over `interiorview` that counts or sums visits
   every copy; skip the secondaries with `isprimary(primary_mask(fs), i…,
   b)`, as `primaries = true` does.

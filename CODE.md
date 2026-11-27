@@ -248,10 +248,33 @@ under M22 there.
 copy of a point — on a shared plane, in a ghost, a coarse point under a
 fine one, an element's two face nodes — is at one position bit for bit.
 Along each dimension a point has an integer coordinate `k`, counted from
-its patch's low face `lo` in units of its level's spacing `h`: `k = B +
+its patch's **anchor** `lo` in units of its level's spacing `h`: `k = B +
 I − 1` for owned index `I` (stored index minus `G`) of a block whose
-integer corner is `B = g·N`, `g = (rootpos << level) + coords` the
-block's integer coordinate at its level within its patch. The position is
+integer corner is `B = g·N − m·2^level`, `g = (rootpos << level) +
+coords` the block's integer coordinate at its level within its patch.
+The anchor is zero, at `m` level-0 spacings from the patch's low face,
+where zero is one of the patch's level-0 nodes along that dimension,
+`lo_p + m·(hi_p − lo_p)/n` exactly for an integer `m` in `0…n` (`n` the
+roots times `N`; tested in `Rational{BigInt}` of the extents in the
+forest's own type, once per forest, kept in its `ForestState`); else the
+low face, `m = 0` (M22 step 10b, Erik's request; `position_anchors`,
+`block_low` and `block_base` are the only places it enters). Anchored at
+zero a position is an exact multiple of `h` rounded once, so a box
+centred on zero is antisymmetric bit for bit at any spacing, every
+centering and level, element nodes too (their offsets mirror exactly,
+`oᵢ + o_{P−i} = P + 1`, for every `P` up to 8, tested), and a quadrant,
+bitant or half-turn domain has its full box's positions; a domain
+without zero on its grid keeps the low corner's bits. The edges of a
+zero anchor are `∓(n/2)·h`, the extents only where that rounds to them:
+in a sweep of 11,040 centred boxes (`L` over 368 values, dyadic and
+not, `n` over the roots and `N` the tests use) 6.6 % in `Float64` and
+6.0 % in `Float32` have an edge one ulp off its extent, never more, and
+the two edges are always each other's negation. `location_box` spans
+the extents and the formed edges, so a point at either is inside, and
+`locate_leaf` finds a point's node from the anchor and corrects it
+against the node's faces formed as positions are, so the inverse agrees
+with the forward map at every node, face and edge (tested). The
+position is
 
     fma(T(k), h, lo)                  lo + k·h             (vertex-like)
     fma(T(2k + 1), h/2, lo)           lo + (k + ½)·h       (cell-like)
@@ -7745,6 +7768,24 @@ collective `interpolate`, only redundant.
 
 All design questions through M3 are resolved in the sections above.
 Remaining, none blocking before their milestone:
+
+- **(open)** *The anchor's fallback* (M22 step 10b). Where zero is not
+  on a patch's grid, positions are anchored at the low corner, as
+  before. Erik's own suggestion, the centre or, with a symmetry, the
+  symmetry face, would also make a half domain agree with its full
+  domain off zero, at the price of an edge an ulp off its extent and of
+  moved digests off zero. For a box `[c − 1, c + 1]` of 48 cells and its
+  half `[c, c + 1]` (anchored at its face `c`):
+
+  | `c` | anchor | asymmetry about `c` | edges off their extents | half agrees with the box |
+  |---|---|---|---|---|
+  | 0.3 | low corner | 2.2e-16 | 0, 2.2e-16 | 25/25 |
+  | 0.3 | centre | 2.2e-16 | 0, 2.2e-16 | 25/25 |
+  | 1/3 | low corner | 2.8e-16 | 0, 2.2e-16 | 5/25 |
+  | 1/3 | centre | 2.2e-16 | 1.1e-16, 0 | 25/25 |
+
+  Off zero no anchor is exactly symmetric (rounding is symmetric under
+  negation only). Switching is one function, `position_anchors`.
 
 - Wiring `volume_weighted_norm` (of one set, or of the state vector of
   several) into adaptive
