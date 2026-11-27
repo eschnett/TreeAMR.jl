@@ -6529,6 +6529,10 @@ M12 was decided with Erik, after M7 and before M9b.
     mean of stage A and the wider patch-corner refusal, step 8; the
     memo, step 9); the vertex convergence table of step 3; and
     PrecompileTools as a hard dependency.
+- *PrecompileTools (2026-11-26).* Asked about "PrecompileTools as a
+  dependency", Erik answered "yes, fine": step 9's last commit, the
+  precompile workload, came onto the step-10 branch as it was, and
+  PrecompileTools is a hard dependency.
 - *Step 10, the downstreams (2026-11-26).* Every downstream ported on a
   branch of a scratch clone against this checkout (version 0.3.0, so
   that `[compat] "0.3"` resolves), each suite against its base commit on

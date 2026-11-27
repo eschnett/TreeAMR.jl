@@ -152,6 +152,11 @@ to make, in one place.
 
 ## Smaller changes
 
+- TreeAMR precompiles a fill (PrecompileTools, a new hard dependency):
+  the package's own precompilation takes longer (2.3 → 16–21 s on a
+  laptop, once per environment), and the first fill in a fresh process
+  comes sooner (9.3 → 2.5 s after the start).
+
 - The fill runs its stages as A (kinked glues), W (prescribed walls),
   P (wall planes and a seam's axis), 0 (secondaries), 1, the hook, the
   interpolated glue ghosts, then 2; the boundary hook sees outer faces

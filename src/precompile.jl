@@ -3,8 +3,8 @@
 # the CPU, about 20 s before anything ran. PrecompileTools runs this when
 # the package is precompiled, so that what it compiles is cached in the
 # package image: a cell and a vertex set in 2D and 3D, a schedule, a fill,
-# `unify!`, a gather and a norm. A separable choice: Erik's to take or
-# drop (HISTORY.md, M22 step 9).
+# `unify!`, a gather and a norm. PrecompileTools is a hard dependency,
+# which Erik accepted (HISTORY.md, M22 step 10).
 @setup_workload begin
     @compile_workload begin
         for D in (2, 3), centering in (cellcentered(D), vertexcentered(D))

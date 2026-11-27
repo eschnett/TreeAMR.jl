@@ -6714,6 +6714,7 @@ two package extensions in `ext/`; each layer uses only the ones before it:
 | ODE | `state.jl` | flat interior-only state vector, `scatter!`/`gather!`, `map_blocks!`, the reductions `block_mapreduce` (per block) and `mesh_mapreduce` (one number; its cross-rank step is the rank-order fold of gathered partials in `combine_blocks`), `volume_weighted_norm`; the folds over points `block_fold` and `mesh_fold` with `FoldPoint`, `Sum`/`Max`/`Min`, `combine` and `addto` |
 | regrid | `regrid.jl` | flags → `buffered_flags` → `complete_marks` → rebuild → transfer; `adapt_to_initial_data!` |
 | interpolation | `interpolate.jl` | `locate_point` (one binary search) and `interpolate`: a batch of arbitrary points, tensor-product `Lagrange(n)` over one block's stored array, first and second derivatives, periodic wrap and reflecting fold, `exclude` region flags |
+| precompilation | `precompile.jl` | a PrecompileTools workload, included last: a cell and a vertex set in 2D and 3D, a schedule, a fill, `unify!`, a gather and a norm, compiled into the package image. On the laptop the first fill of a fresh process comes 9.3 → 2.5 s after the start (`bench/firstcall.jl`), and precompiling the package takes 2.3 → 16–21 s, once per environment; every downstream precompiles it once. PrecompileTools is a hard dependency (Erik's decision, [HISTORY.md](HISTORY.md#m22--closed-blocks)) |
 
 ### Rules that span several files
 
