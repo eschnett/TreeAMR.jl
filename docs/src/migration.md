@@ -69,16 +69,42 @@ to make, in one place.
   call, so no right-hand side reads a stale copy) but keeps a state's
   secondaries equal to their primaries, and is required after a
   right-hand side that skips secondaries.
-- **Unify a state before measuring it.** The state vector an integrator
-  returns holds each secondary as integrated, with its own right-hand
-  side, and only the next fill overwrites it. An error norm, an output,
-  a symmetry check or a comparison of two runs taken straight from
-  `sol.u[end]` reads those stale copies: at a coarse-fine face of a
-  vertex set the coarse copy's error is the coarse stencil's, and
-  TreeWave's sine wave measured an L∞ error of `O(1)` there until its
-  drivers unified first, `unify!(copy(u), fs, schedule)`. Across a glue
-  the set is interpolated at, the same call makes each glued point's
-  copies their mean (stage A).
+- **Settle a state before reading it.** The state vector an integrator
+  returns holds each secondary as integrated, with its own block's
+  stencil; only the next fill overwrites it. At a coarse-fine face the
+  fine primary's stencil reads a prolongated ghost and the coarse
+  secondary's does not, so their `du` differ by `O(h^min(q, p−2))`
+  (scheme order `q`, prolongation order `p`), which the secondary
+  integrates with no feedback: on TreeWave's sine wave after a quarter
+  period, π/2 at every `N` at `p = 2`, `O(h²)` at `p = 4` and 6. An
+  error norm, `volume_weighted_norm` or `total_mass` of a state, an
+  output, a checkpoint, a symmetry check or a `scatter!` into `regrid!`
+  without a fill reads those stale copies. Unify first,
+  `unify!(copy(u), fs, schedule)` (across an interpolated glue it makes
+  the copies their mean); where the hook prescribes a wall, `unify!`
+  cannot write it, so `scatter!`, `fill_ghosts!` with the hook and
+  `gather!` instead. An adaptive integrator's error estimate is not
+  affected (measured: the same steps raw or unified).
+- **Decide what a Dirichlet hook does with the wall.** Under half-open
+  ownership the low outer plane was evolved and the high one was a ghost
+  the hook wrote; now both are own points, evolved unless the hook says
+  `wall = :prescribed`. A port that keeps its hook unchanged evolves
+  both. Where the data are the boundary condition itself, prescribe:
+  TreeWave's closed ball, whose energy rose once by 7 % with an evolved
+  sphere, follows its M20 history prescribed. Where the hook only
+  supplies exact data around a scheme that converges anyway, evolving
+  may keep more order: TreeBSSN's Kerr–Schild box and TreeWaveGR's holes
+  converge faster evolved than prescribed, with somewhat larger errors.
+  Say which, and why.
+- **Write a state over the closed box.** A helper that writes only the
+  old owned range `1:N` leaves the high-face copies as they were, and
+  where those are the primaries the fill spreads the old values
+  (TreeGRRMHD's gauge offset). Random data drawn per entry gives the
+  copies of a point different values; draw from the point's position,
+  or unify after.
+- **Positions are `nodeposition`'s, in tests too.** A test comparing
+  positions bit for bit with `block_origins + (I − 1) h` fails against
+  the kernels' `nodeposition`.
 - A hand-written loop over `interiorview` that counts or sums visits
   every copy; skip the secondaries with `isprimary(primary_mask(fs), i…,
   b)`, as `primaries = true` does.

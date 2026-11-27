@@ -6529,6 +6529,53 @@ M12 was decided with Erik, after M7 and before M9b.
     mean of stage A and the wider patch-corner refusal, step 8; the
     memo, step 9); the vertex convergence table of step 3; and
     PrecompileTools as a hard dependency.
+- *Step 10, the downstreams (2026-11-26).* Every downstream ported on a
+  branch of a scratch clone against this checkout (version 0.3.0, so
+  that `[compat] "0.3"` resolves), each suite against its base commit on
+  registered 0.2.12; the per-repository record is in each one's history
+  and commit messages. What it found here:
+  - *The stale secondaries.* TreeWave's sine wave, measured from the
+    state RK4 returned, lost its order at `p = 2` (L2 rate 0.54, L∞ 1.57
+    at every `N`). The review's probe located it: only the coarse
+    secondary of a coarse-fine face point drifts, by π/2 in 1D and 2.7
+    in 2D after a quarter period, independent of `N`, and at `t = 0` it
+    is the fine primary's `du` that is off (−59.08 against −39.48
+    exact, a second difference of `1.5 φ″` across a linear ghost). The
+    drift is the difference of the two stencils at one point, integrated
+    without feedback. Drift orders over `N = 8, 16, 32`, 1D/2D: 0.0/0.0
+    at `p = 2` (1.568, 1.571, 1.571 in 1D), 2.0/2.0 at `p = 4`
+    (0.0257, 0.00648, 0.00162), 2.0/2.0 at `p = 6` (0.0130, 0.00323,
+    0.000808); the unified state's L2 rates 0.97, 1.92, 1.98 in 1D.
+    Raw against unified on one adaptive case (the 2D sine wave, BS3,
+    tolerances `1e-4` and `1e-6`, `dtmax = h/2`): 46 and 61 steps
+    accepted, none rejected, raw or unified or kept unified. The price
+    of never letting the copies part, one `unify!` against one
+    right-hand side on the laptop (the sine wave's 28 blocks, `N = 16`,
+    2D; a nested 3D mesh of 498 blocks, `N = 8`): 0.24 and 0.12 of a
+    right-hand side at one thread, 0.18 and 0.11 at eight, so
+    `unify!(du)` in every evaluation of RK4 costs 11–24 % and a
+    per-step callback 3–6 % (with BS3 the callback also costs an
+    evaluation a step, 246 against 186 in all); both keep the state
+    unified to rounding at every step end (2.4e-16, and 0). The
+    migration note and "A state's secondaries" in `CODE.md` say what
+    reads a raw state; which way to go is open, for Erik.
+  - *Stage W wrote reflecting faces.* `CellBoundary(g; wall =
+    :prescribed)` wrote the wall plane of a reflecting or outflow face
+    as well as the outer ones (found by the TreeBSSN and TreeWaveGR
+    ports, whose octants took the Dirichlet data on their mirror
+    planes): `wall_regions!` asked only whether a block had a neighbour
+    across. It now asks the face kind too, as `boundary_region` does.
+  - *Dirichlet hooks.* A downstream hook that was Dirichlet must now say
+    `wall = :prescribed`, or its wall plane is evolved: TreeWave's
+    closed ball lost its condition on the sphere in the first port, and
+    its energy rose once by 7 % between `t = 130` and 140; prescribed,
+    its history to `t = 640` follows M20's (the same three rises of at
+    most 0.1 %, at `t = 470`, 500, 530, from the same physical data).
+    TreeBSSN keeps its walls evolved: prescribed, its Kerr–Schild rate
+    fell from 3.70 to 3.52 against an asserted 3.7 (3.75 on 0.2.12), at
+    smaller errors. TreeWaveGR too: its holes at `v = 0.6` converge at
+    2.54 evolved and 2.44 prescribed against an asserted 2.5 (2.66 on
+    0.2.12).
 
 ## Downstream checks
 

@@ -745,13 +745,35 @@ point are at one position bit for bit.
   wall, so the same finer and same-level blocks hold it: it is a primary
   of the same block whenever the wall point is, even where a coarse copy
   drops out at a hanging node.
-- *A state's secondaries.* On a refined mesh a coarse copy's entry of
-  `du`, computed by the coarse stencil from unified values, differs from
-  its primary's by the scheme's error at the face, `O(1)` in a
-  second-derivative stencil next to a prolongated ghost; integrated
-  along, it is never read, as *Why copies cannot drift* says, but a
-  state measured raw shows it. Output and error norms take the state
-  after `unify!` (the wave study does).
+- *A state's secondaries.* At a coarse-fine face each copy's `du` is
+  its own block's stencil applied to unified values: the fine primary's
+  reads a prolongated ghost, an error `O(h^p)` that a second difference
+  divides by `h²`, and the coarse secondary's is the consistent stencil
+  at the coarse spacing, an error `O(h^q)` for a scheme of order `q`.
+  The two differ by `O(h^min(q, p−2))` (prolongation order `p`); the
+  fill discards the secondary at every evaluation, so the difference is
+  integrated with no feedback and the raw secondary drifts linearly in
+  time from its primary. Measured on the vertex sine wave (TreeWave's,
+  a quarter period, `N = 8, 16, 32`, 1D and 2D): orders 0.0, 2.0 and
+  2.0 at `p = 2, 4, 6` (`q = 2`), the drift π/2 in 1D and 2.7 in 2D at
+  `p = 2`, where the fine primary's second difference is `1.5 φ″`; same-
+  level copies, whose stencils agree, stay equal to rounding. The raw
+  state's L2 error carries it (rate 0.54 against 0.97 unified at `p =
+  2` in 1D). Whatever reads a state rather than the working array reads
+  the drift: an error norm, `volume_weighted_norm` or `total_mass` of a
+  state, output, a checkpoint, a `scatter!` into a `regrid!` without a
+  fill between. Such a reader takes the state after `unify!`, or after
+  `scatter!`, `fill_ghosts!` and `gather!` where a prescribed wall is
+  involved, since `unify!` has no hook. An adaptive integrator's error
+  estimate does not see it: on the 2D sine wave BS3 took the same
+  steps, 46 and 61 accepted and none rejected at tolerances `1e-4` and
+  `1e-6`, raw or unified. **(open)** Whether the state should never
+  part — `unify!(du)` at the end of every right-hand side, about
+  `+11 %` to `+24 %` of a right-hand side's cost, or a callback
+  unifying `u` once a step, `+3 %` to `+6 %` (and an extra evaluation
+  of a first-same-as-last method, `+32 %` with BS3) — is Erik's
+  decision ([HISTORY.md](HISTORY.md#m22--closed-blocks) has
+  the measurement).
 
 **Why.** Half-open ownership is invisible at a same-level face inside a
 patch, where the right-hand side at a shared point is the same whoever
@@ -872,8 +894,9 @@ combinations a Runge–Kutta method forms, `d(U u)/dt = U k(U u)`, a
 closed equation for the unified state. Whatever the state holds in the
 kernel of `U` — a secondary's deviation from its primary — is
 integrated along and never read. It grows at most linearly, by the
-scheme's error (the difference of two stencils' right-hand sides at one
-point), and it feeds nothing. That is what was missing in the closed
+difference of two stencils' right-hand sides at one point, `O(h^min(q,
+p−2))` at a coarse-fine face (*A state's secondaries* above), and it
+feeds nothing. That is what was missing in the closed
 ownership M8 rejected, where each copy was read by its own block and
 the copies drifted with feedback. The dynamics are those of the
 primaries, and they do not depend on what an application does with a
