@@ -50,11 +50,12 @@ end
     # BigFloat, so a query at a node's coordinates evaluates the element's
     # polynomial where it interpolates that node; anything above a few
     # roundings means the stencil and the stored positions disagree. A
-    # node on a block's upper face is left out: that point belongs to the
-    # block above, as every face point does, whose element interpolates
-    # it only to its own accuracy where the levels differ. A node on an
-    # element face inside a block is in, and is read from the upper
-    # element, which holds the same value.
+    # node on a block's upper face is left out, and so is one on a lower
+    # face below which a finer block lies: such a point is read from
+    # another block, the one above it or the finest holding it (M22 step
+    # 10c), whose element interpolates it only to its own accuracy where
+    # the levels differ. A node on an element face inside a block is in,
+    # and is read from the upper element, which holds the same value.
     g(x, v) = prod(sin(2x[d] + v + d) for d in 1:D)
     fs = element_interp_set(D, P, g)
     worst = 0.0
@@ -62,6 +63,7 @@ end
     for b in 1:nblocks(fs), I in CartesianIndices(ntuple(_ -> N - 1, D))
         idx = Tuple(I) .+ fs.G
         x = coordinates(fs, b, idx)
+        locate_point(fs.forest, x) == b || continue     # serial: block = leaf
         r = interpolate(fs, [x], ElementPolynomial(); vars=[2]).values[1]
         worst = max(worst, abs(r - fs.work[idx..., 2, b]))
     end
