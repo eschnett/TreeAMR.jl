@@ -241,15 +241,37 @@ end
     end
 end
 
-@testset "$bname: symmetric walls are written on the device: T=$T, D=$D" for
+@testset "$bname: stage P projects the mirror planes on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (1, 2)
-    # The owned low wall planes, set to NaN, are written by the device's
-    # fill — mirrored, clamped or by the cell hook — before anything reads
-    # them, at every face kind.
-    for kinds in Iterators.product(ntuple(_ -> (:outer, :reflect_lo, :outflow_lo), D)...)
-        nnan, worst, _ = undefined_walls(kinds, vertexcentered(D); T=T, backend=backend)
-        @test nnan == 0
-        @test worst < 16 * gputol(T)
+    # The wall plane of a vertex-like dimension is the block's own on both
+    # sides (M22) and its own mirror image: the device's fill leaves an
+    # even variable there as the host's does, bit for bit, and projects an
+    # odd one onto zero, at every face kind and on a refined box.
+    for kinds in Iterators.product(ntuple(_ -> (:outer, :reflect_both, :outflow_both),
+                                          D)...)
+        forest = faces_forest(kinds; T=T, N=8)
+        parity = [ntuple(_ -> EvenParity, D),
+                  ntuple(d -> kinds[d] === :reflect_both ? OddParity : EvenParity, D)]
+        f = (x, v) -> oftype(x[1], v) + sum(d -> x[d] * x[d] / 8, 1:D)
+        works = map((CPU(), backend)) do be
+            fs = FieldSet{T}(forest, 2; G=1, centering=vertexcentered(D), parity=parity,
+                             backend=be)
+            fill_by_coordinates!(f, fs)
+            fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=4, restriction=4));
+                         boundary=boundary_by_coordinates(f))
+            Array(fs.work)
+        end
+        @test count(isnan, works[2]) == 0
+        @test maximum(abs.(works[1] .- works[2])) < 16 * gputol(T)
+        # The odd variable on every low reflecting wall plane, own points.
+        zeros_ok = true
+        for d in 1:D, b in 1:nleaves(forest)
+            kinds[d] === :reflect_both || continue
+            block_extent(forest, forest.leaves[b])[d][1] == forest.extents[d][1] || continue
+            own = ntuple(e -> e == d ? (2:2) : (2:(size(works[2], e) - 1)), D)
+            zeros_ok &= all(iszero, view(works[2], own..., 2, b))
+        end
+        @test zeros_ok
     end
 end
 
@@ -435,7 +457,7 @@ end
         hostfs.work[Tuple(idx)..., v, b] = sum(x) + T(v)
     end
     linear = copy(hostfs.work)
-    restrict_interfaces!(hostfs, InterfaceSchedule(hostfs))
+    unify!(hostfs, UnifySchedule(hostfs))
     @test maximum(abs, hostfs.work .- linear) < gputol(T)
 
     # The same schedule over structureless data, on both backends. What
@@ -443,11 +465,11 @@ end
     # does, so the assertion does not depend on the RNG stream.
     noise = T.(rand(MersenneTwister(42), size(linear)...))
     copyto!(hostfs.work, noise)
-    restrict_interfaces!(hostfs, InterfaceSchedule(hostfs))
+    unify!(hostfs, UnifySchedule(hostfs))
 
     fs = FieldSet{T}(forest, 2; G=0, centering=C, backend=backend)
     copyto!(fs.work, noise)
-    restrict_interfaces!(fs, InterfaceSchedule(fs))
+    unify!(fs, UnifySchedule(fs))
     @test Array(fs.work) == hostfs.work
 end
 
@@ -1112,15 +1134,14 @@ end
     @test convergence_rate(Float64.(hs), Float64.(l2)) ≈ 2.0 atol = 0.15
 end
 
-# A right-hand side through the whole state (M20), written through
-# `statearray(…; appendix = true)` at every point of the closed range, the
-# planes a block does not own discarded.
+# A right-hand side through the whole state, written at every own point,
+# the closed range (M22).
 @kernel function glue_index!(du, ::Val{D}, ::Val{NV}) where {D,NV}
     I = @index(Global, NTuple)
     J = ntuple(d -> I[d], Val(D))
     b = I[D + 1]
     @inbounds for v in 1:NV
-        isowned(du, J..., v, b) && (du[J..., v, b] = v * sum(J) + 100b)
+        du[J..., v, b] = v * sum(J) + 100b
     end
 end
 
@@ -1133,16 +1154,16 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
     (u = ξ ./ 2; one(u[1]) / 2 + p * u[1]^5 + 2u[1]^3 * u[2]^4 * u[3]^2 -
                  (p + 1) * u[3]^5 + u[1] * u[2] * u[3] + u[2]^5 / 3)
 
-@testset "$bname: ghosts across a glue and the appendix run on the device: T=$T, D=$D" for
+@testset "$bname: ghosts across a glue and stage A run on the device: T=$T, D=$D" for
         (bname, backend, types) in BACKENDS, T in types, D in (2, 3)
-    # M20. The glue plan's tables travel to the device at the build and
-    # its kernels run there; the appendix's tables are cached per set on
-    # its backend; an `AppendixArray` goes into a kernel. So the state
+    # M20 and M22. The glue plan's tables and stage A's travel to the
+    # device at the build and their kernels run there. So the state
     # round-trips through `scatter!` and `gather!` bit for bit, the fill
-    # leaves nothing unwritten and lands on the CPU's numbers, a fold over
-    # the state vector or the working array counts each glued face point
-    # once, a right-hand side written through the whole state reaches the
-    # appendix, and in 2D a regrid carries the appendix, all as on the CPU.
+    # leaves nothing unwritten and lands on the CPU's numbers, stage A's
+    # means included, a fold over the primaries of the state vector or the
+    # working array counts each glued face point once, a right-hand side
+    # reaches every own point, and in 2D a regrid moves the closed blocks,
+    # all as on the CPU.
     make() = D == 2 ? kinked_forest(2) : ball_forest(seven_ball(2, 1))
     atlas = D == 2 ? KINKED : seven_ball(2, 1)
     ops = D == 2 ? KINKED_OPS : BALL_OPS
@@ -1165,12 +1186,12 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
         sched = GhostSchedule(fs, ops; atlas=atlas)
         fill_ghosts!(fs, sched; boundary=hook)
         count1(acc, p) = acc + 1
-        folds = (mesh_fold(count1, +, 0, fs), mesh_fold(count1, +, 0, fs, u),
-                 mesh_mapreduce(x -> 1, +, 0, fs, u))
+        folds = (mesh_fold(count1, +, 0, fs; primaries=true),
+                 mesh_fold(count1, +, 0, fs, u; primaries=true),
+                 mesh_mapreduce(x -> 1, +, 0, fs, u; primaries=true))
         du = statevector(fs)
         fill!(du, T(NaN))
-        map_blocks!(glue_index!, fs, statearray(du, fs; appendix=true), Val(D), Val(2);
-                    appendix=true)
+        map_blocks!(glue_index!, fs, statearray(du, fs), Val(D), Val(2))
         regridded = nothing
         if D == 2
             rs = FieldSet{T}(kinked_forest(4), 2; G=3, centering=vertexcentered(D),
@@ -1194,5 +1215,13 @@ gpu_glue_poly(ξ::NTuple{3}, p) =
     @test fd == fh
     @test fh[1] == fh[2] && fh[3] == 2 * fh[1]
     @test !any(isnan, duh) && dud == duh
-    D == 2 && @test rd == rh
+    # The regrid to rounding, not bit for bit: its prolongation is sums of
+    # products, which CUDA contracts into fused multiply-adds and the CPU
+    # does not. Measured on an H200 (M22 step 10, Float32): 951 of 9,072
+    # entries differ, by at most 2 ulps, and the device and the host are
+    # each within 2.6 ulps of the same regrid in Float64.
+    if D == 2
+        @test size(rd) == size(rh)
+        @test maximum(abs, rd - rh) < gputol(T) * maximum(abs, rh)
+    end
 end

@@ -14,8 +14,9 @@ const OUTFLOW_KINDS = (:outflow_lo, :outflow_hi, :outflow_both)
 
 """
 The stored index whose value the ghost `idx` of block `b` holds: `idx`
-itself clamped into the owned range along every dimension in which it
-lies beyond an outflow face of the domain — or `nothing` when it lies
+itself clamped into the own range along every dimension in which it
+lies beyond an outflow face of the domain — onto the wall plane along a
+vertex-like dimension, the block's own on both sides (M22) — or `nothing` when it lies
 beyond an outer face, which makes it the boundary hook's, holding the
 data at its own position. Beyond a periodic or a reflecting face the
 data themselves are periodic or of definite parity, so the index stays.
@@ -25,14 +26,15 @@ function outflow_source(fs::FieldSet{T,D}, b, idx::NTuple{D,Int}) where {T,D}
     N = forest.N
     ext = block_extent(forest, blockkey(fs, b))
     hook = false
+    c = staggers(fs)
     j = ntuple(D) do d
         G = fs.G[d]
         lo = idx[d] <= G && ext[d][1] == forest.extents[d][1]
-        hi = idx[d] >= G + N + 1 && ext[d][2] == forest.extents[d][2]
+        hi = idx[d] >= G + N + c[d] + 1 && ext[d][2] == forest.extents[d][2]
         (lo || hi) && !forest.periodic[d] || return idx[d]
         kind = facekind(forest, d, lo ? 1 : 2)
         kind == OuterFace && (hook = true)
-        return kind == OutflowFace ? (lo ? G + 1 : G + N) : idx[d]
+        return kind == OutflowFace ? (lo ? G + 1 : G + N + c[d]) : idx[d]
     end
     return hook ? nothing : j
 end

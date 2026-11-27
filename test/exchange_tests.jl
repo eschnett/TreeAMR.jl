@@ -14,9 +14,9 @@
 #
 # This file's definitions are in `helpers/exchange.jl`.
 
-using TreeAMR: PHASE1_TAG, prolongation_tag, interface_tag, ntransfers, boxsize,
+using TreeAMR: PHASE1_TAG, UNIFY_TAG, prolongation_tag, ntransfers, boxsize,
                stagebuffers, segment_ranges, pack_stage!, unpack_stage!, run_phase!,
-               apply_boundary!, exchange_ghosts!, exchange_interfaces!, leafowner,
+               apply_boundary!, exchange_ghosts!, leafowner,
                remote_neighbors, equalsplit_part, ntarget
 using KernelAbstractions: CPU, synchronize
 using MultiFloats: Float32x2
@@ -69,6 +69,7 @@ end
     nonempty = 0
     for kinds in EXCHANGE_KINDS[D], C in allcenterings(Val(D)),
         family in (all(==(:cell), C) ? (PointValue, Conservative) : (PointValue,))
+        # Refined, and reflecting but in D = 1 (M22 steps 3 and 4).
         serial = faces_forest(kinds; N=8)
         n = nleaves(serial)
         ops = exchange_operators(C, family)
@@ -87,9 +88,12 @@ end
             @test Set(locals) ∪ Set(remote) == stransfers
             P == 1 ? (@test nsent == 0) : (nonempty += nsent > 0)
             # A stage's local groups run in the order the serial phases
-            # did: the tags ascend, and phase 1 is there on every rank.
+            # did: the tags ascend, and stage 0 (M22, for a set with a
+            # vertex-like dimension) and phase 1 are there on every rank.
+            first_tag = any(==(:vertex), C) ? UNIFY_TAG : PHASE1_TAG
             @test all(s -> issorted([st.tag for st in s.stages]) &&
-                           first(s.stages).tag == PHASE1_TAG, scheds)
+                           first(s.stages).tag == first_tag &&
+                           any(st -> st.tag == PHASE1_TAG, s.stages), scheds)
         end
     end
     @test nonempty > 0
@@ -153,13 +157,13 @@ end
         serial = faces_forest(kinds; N=8)
         G = ntuple(d -> C[d] === :vertex ? 0 : 1, D)
         flux(forest) = FieldSet(forest, 1; G=G, centering=C, parity=[OddParity])
-        isched = InterfaceSchedule(flux(serial))
-        @test [st.tag for st in isched.stages] == interface_tag.(isched.dimensions)
+        isched = UnifySchedule(flux(serial))
+        @test [st.tag for st in isched.stages] == [UNIFY_TAG]
         stransfers = serial_transfers(isched)
         stored = ntuple(d -> serial.N + 2G[d] + (C[d] === :vertex), D)
         scounts = stage_write_counts([isched], stored, nleaves(serial))
         for P in 1:5
-            scheds = [InterfaceSchedule(flux(rank_forest(serial, r, P))) for r in 0:(P - 1)]
+            scheds = [UnifySchedule(flux(rank_forest(serial, r, P))) for r in 0:(P - 1)]
             locals, remote, unmatched, bad, nsent = distributed_transfers(scheds)
             @test bad == 0
             @test unmatched == 0
@@ -189,14 +193,16 @@ end
     # an identity, so every rank's working array, ghosts included, must
     # equal the serial fill on its blocks bit for bit, the boundary hook
     # between the stages included. Two things could break that silently:
-    # a pack that applied the parity factor would turn the serial fill's
-    # `−0` from a mirrored zero into `+0` (so the data has an odd
-    # variable that is zero, and the test asserts that `−0` occurs and
-    # that mirrored transfers do cross ranks), and an unpack `0 + 1·x`
-    # that is not the identity on an element type — the reason for
-    # `Float32x2`, whose limbs must survive it. A rank with no blocks
-    # takes part too.
+    # a pack that applied the parity factor twice, which the mirrored
+    # transfers that cross ranks show on every nonzero value, and an
+    # unpack `0 + 1·x` that is not the identity on an element type — the
+    # reason for `Float32x2`, whose limbs must survive it. A mirrored zero
+    # is `+0` (the factor path adds `+0` after the factor, so that a fill
+    # is bitwise idempotent: the review's decision in M22 step 6), and the
+    # serial fill holds no `−0` at all, which is asserted. A rank with no
+    # blocks takes part too.
     nnegzero = nmirror = 0
+    ran = false
     for kinds in EXCHANGE_KINDS[D]
         serial = faces_forest(kinds; T=T, N=8)
         centers = T === Float64 ? allcenterings(Val(D)) :
@@ -204,6 +210,7 @@ end
         counts = T === Float64 ? (D == 1 ? (1, 2, 3, 5, nleaves(serial) + 1) : (2, 3, 5)) :
                  (3,)
         for C in centers, P in counts
+            ran = true
             same, nz, nm, bad = lockstep_ghost_fill(serial, P, C, PointValue, T)
             @test same
             @test bad == 0
@@ -228,14 +235,13 @@ end
             end
         end
     end
-    # MultiFloats' product returns `+0` for `0 · (−1)`, so the serial fill
-    # has no `−0` to preserve in `Float32x2`; what that type checks is
-    # that `0 + 1·x` returns the limbs of every value a pack produces.
-    T === Float32x2 || @test nnegzero > 0
+    # What `Float32x2` checks is that `0 + 1·x` returns the limbs of every
+    # value a pack produces.
+    @test nnegzero == 0
     # In 1D every mirrored region is the block's own reflection, which is
     # always local; from 2D on an edge region's mirror image lies in a
     # tangential neighbor, which may be another rank's.
-    D == 1 || @test nmirror > 0
+    D == 1 || !ran || @test nmirror > 0
 end
 
 @testset "The staged interface restriction reproduces the serial one bitwise: D=$D, T=$T" for
@@ -317,16 +323,16 @@ end
         sflux = FieldSet(serial, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
         fdata = exchange_data(MersenneTwister(8), Float64, size(sflux.work))
         copyto!(sflux.work, fdata)
-        restrict_interfaces!(sflux, InterfaceSchedule(sflux))
+        unify!(sflux, UnifySchedule(sflux))
         fluxes = map(forests) do forest
             fs = FieldSet(forest, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
             copyto!(fs.work, fdata[ntuple(_ -> :, D + 1)..., blockrange(forest)])
             fs
         end
-        ischeds = [InterfaceSchedule(fs) for fs in fluxes]
+        ischeds = [UnifySchedule(fs) for fs in fluxes]
         before = box.nmessages
         @sync for r in 1:P
-            @async restrict_interfaces!(fluxes[r], ischeds[r])
+            @async unify!(fluxes[r], ischeds[r])
         end
         @test box.nmessages > before
         @test all(r -> bitwise_equal(fluxes[r].work,
@@ -586,15 +592,14 @@ end
 
 @testset "Packing and unpacking across a rotating seam reproduces the serial fill bitwise: D=$D" for
         D in (2, 3)
-    # The values. A pack that applied the turn's sign would turn the
-    # serial fill's `−0` — a component that is zero, negated by the turn
-    # — into `+0`; one that read the wrong member of a pair, or turned
-    # the wrong way, a whole region. So every rank's working array,
-    # ghosts included, must equal the serial fill on its blocks bit for
-    # bit, the hook between the stages included, for a set that turns into
-    # itself (its `v_{d2}` zero) and for a pair (the second variable of
-    # each member zero), with `−0` present and rotated transfers received
-    # across rank boundaries.
+    # The values. A pack that applied the turn's sign twice, read the wrong
+    # member of a pair, or turned the wrong way, shows on a whole region.
+    # So every rank's working array, ghosts included, must equal the serial
+    # fill on its blocks bit for bit, the hook between the stages included,
+    # for a set that turns into itself (its `v_{d2}` zero) and for a pair
+    # (the second variable of each member zero), with rotated transfers
+    # received across rank boundaries. A turned zero is `+0` (the factor
+    # path adds `+0`, M22 step 6), so the serial fill holds no `−0`.
     N = D == 3 ? 4 : 8
     p = D == 3 ? 2 : 4
     ops = Operators(prolongation=p, restriction=p)
@@ -659,8 +664,7 @@ end
             nrot += nrotated_remote(schedsa) + nrotated_remote(schedsb)
         end
     end
-    @test nnegzero > 0
-    @test npairzero > 0
+    @test nnegzero == 0 && npairzero == 0
     @test nrot > 0
 end
 
@@ -736,12 +740,13 @@ end
 # --- Half-turn seams (M14) --------------------------------------------------
 #
 # A half turn's transfers are orientation 2, packed and unpacked as a
-# quarter turn's are; what is new is the shifted seam slab of a
-# vertex-like `d2`, whose ranges both ends of a message must derive alike.
+# quarter turn's are; what is new is the reversed tangent `d2`, which on
+# closed blocks (M22) carries the own range onto itself, so both ends of a
+# message derive the ordinary ranges alike.
 # The half plane of `halfturn_forest` (`ghost_oracles.jl`), refined at the
 # axis and off it, split over 2, 3 and 5 ranks: the transfers, the layouts,
-# one write per point, and the values bit for bit, with `−0` from the
-# negated component.
+# one write per point, and the values bit for bit; the negated component's
+# zeros are `+0` (M22 step 6).
 
 @testset "Across a half-turn seam the ranks hold the serial transfers and its values bitwise: D=$D" for
         D in (2, 3)
@@ -799,7 +804,7 @@ end
         end
     end
     @test nrotated > 0
-    @test nnegzero > 0
+    @test nnegzero == 0
     @test nrot > 0
 end
 

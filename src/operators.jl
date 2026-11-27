@@ -427,9 +427,7 @@ const BOUNDED_POINTVALUE = Int8(2)
 # point-value stencil of width 2 is linear interpolation, a convex
 # combination of its bracket, so both are bounded already and take the
 # plain kernel; so does injection, a vertex-like restriction. A point-value
-# restriction interpolates along every cell-like dimension, and the
-# derived wall row of a reflecting vertex-like dimension (mirror state 2)
-# interpolates at the prolongation order whatever the group's kind.
+# restriction interpolates along every cell-like dimension.
 function boundedmode(ops::Operators, kind::Symbol, mirror::NTuple{D,Int8},
                      c::NTuple{D,Int}) where {D}
     ops.bounded || return UNBOUNDED
@@ -440,7 +438,6 @@ function boundedmode(ops::Operators, kind::Symbol, mirror::NTuple{D,Int8},
     kind === :prolong && ops.prolongation > 2 && return BOUNDED_POINTVALUE
     kind === :restrict && ops.restriction > 2 && any(iszero, c) &&
         return BOUNDED_POINTVALUE
-    any(==(Int8(2)), mirror) && ops.prolongation > 2 && return BOUNDED_POINTVALUE
     return UNBOUNDED
 end
 

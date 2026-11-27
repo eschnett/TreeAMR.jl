@@ -50,11 +50,14 @@ internal functions, which are everything the kernel asks of it:
   `n`-tuples;
 
 and `TreeAMR.check_derivative(basis, m)` if it cannot produce every
-derivative order below `n`, and `TreeAMR.stencil_place(basis, origin, h,
+derivative order below `n`, and `TreeAMR.stencil_place(basis, lo, h, B,
 first, Val(G), Val(C))` if its stencil points are not the stored points
 of an equally spaced set — the positions an `exclude` region is tested
-at. The position, rather than a stored index, is what the kernel hands
-a basis because an element set's stored index is not linear in it.
+at, formed from the patch's anchor `lo` ([`block_lows`](@ref)), the
+spacing `h` and the block's integer corner `B` as
+[`nodeposition`](@ref TreeAMR.nodeposition) forms them. The
+position, rather than a stored index, is what the kernel hands a basis
+because an element set's stored index is not linear in it.
 """
 abstract type InterpolationBasis end
 
@@ -272,24 +275,27 @@ end
 @inline element_derivatives(c::NTuple{L,T}, λ::T) where {L,T} =
     ntuple(m -> T(factorial(m - 1)) * c[m] * λ, Val(L))
 
-# The positions of an element stencil's nodes: node `k` (from 0) of
-# element `q` along `d` at `origin + h·(q·n + o_k)`, `nodeposition`'s
-# expression, so that an `exclude` region flags a node exactly when its
+# The positions of an element stencil's nodes: node `k` (from 0) of the
+# element whose first node has the integer coordinate `base` along `d`,
+# at `lo + (base + o_k)·h` and the last node at `lo + (base + n)·h`,
+# formed by `nodeposition` as owned index `k + 1` of a block whose corner
+# is `base`, so that an `exclude` region flags a node exactly when its
 # `coordinates` are inside.
 struct ElementStencil{D,T,n}
-    origin::NTuple{D,T}
+    lo::NTuple{D,T}
     h::T
-    q::NTuple{D,Int}
+    base::NTuple{D,Int}
     offsets::NTuple{n,T}
 end
 
-@inline stencil_position(s::ElementStencil{D,T,n}, d, k) where {D,T,n} =
-    s.origin[d] + s.h * (s.q[d] * n + s.offsets[k + 1])
+@inline function stencil_position(s::ElementStencil{D,T,n}, d, k) where {D,T,n}
+    return nodeposition(s.lo[d], s.h, s.base[d], k + 1, 0, s.offsets)
+end
 
-@inline function stencil_place(b::ElementBasis{n}, origin::NTuple{D,T}, h, first,
+@inline function stencil_place(b::ElementBasis{n}, lo::NTuple{D,T}, h, B, first,
                                ::Val{G}, ::Val{C}) where {n,D,T,G,C}
-    return ElementStencil{D,T,n}(origin, h, ntuple(d -> (first[d] - G[d] - 1) ÷ n, Val(D)),
-                                 b.offsets)
+    base = ntuple(d -> B[d] + ((first[d] - G[d] - 1) ÷ n) * n, Val(D))
+    return ElementStencil{D,T,n}(lo, h, base, b.offsets)
 end
 
 # `floor(s)` as an `Int`, for the bounded arguments this file gives it (a
@@ -319,12 +325,15 @@ point inside it. [`Ellipsoid`](@ref) is the one implemented.
 A new region is an `isbits` subtype implementing `TreeAMR.inside(region,
 x)` for a point `x::NTuple{D,T}`, and `TreeAMR.convertregion(T, region)`
 if its parameters must be brought to the field set's type. It may also
-override `TreeAMR.stencil_hits(region, origin, h, base, off, Val(n))`
-with something cheaper than the default, which tests all `n^D` stencil
-points of an equally spaced set, point `k` (from 0) along dimension `d`
-at `TreeAMR.stencil_position(origin, h, base, off, d, k)`. An element
-set's stencil (M19), whose nodes are not equally spaced, is tested by
-`TreeAMR.stencil_hits(region, place, Val(n))` at
+override `TreeAMR.stencil_hits(region, lo, h, base, off, Val(n))` with
+something cheaper than the default, which tests all `n^D` stencil points
+of an equally spaced set, point `k` (from 0) along dimension `d` at
+`TreeAMR.stencil_position(lo, h, base, off, d, k)`. The arguments are
+what [`nodeposition`](@ref TreeAMR.nodeposition) forms the points'
+positions from, and an override should pass them on rather than read
+them: `stencil_position` reproduces [`coordinates`](@ref) bit for bit.
+An element set's stencil (M19), whose nodes are not equally spaced, is
+tested by `TreeAMR.stencil_hits(region, place, Val(n))` at
 `TreeAMR.stencil_position(place, d, k)`, whose default tests every
 point.
 """
@@ -378,25 +387,27 @@ end
 
 # The positions of a stencil's points, which an `exclude` region is
 # tested at: for an equally spaced set, stencil point `k` (from 0) along
-# `d` sits at `origin + ((base + k) − off)·h`, with `base = first − G` —
-# the expression `coordinates` evaluates, in the same order, so a stencil
-# point is flagged exactly when its `coordinates` are inside.
+# `d` sits at `lo + ((base + k) + off)·h`, with `base = B + first − G −
+# 1` the integer coordinate of the first point and `off` 0 along a
+# vertex-like dimension and ½ along a cell-like one — the expression
+# `nodeposition` evaluates, in the same order, so a stencil point is
+# flagged exactly when its `coordinates` are inside.
 struct UniformStencil{D,T}
-    origin::NTuple{D,T}
+    lo::NTuple{D,T}
     h::T
     base::NTuple{D,Int}
     off::NTuple{D,T}
 end
 
 @inline stencil_position(s::UniformStencil, d, k) =
-    stencil_position(s.origin, s.h, s.base, s.off, d, k)
+    stencil_position(s.lo, s.h, s.base, s.off, d, k)
 
 # The places of a basis's stencil; equally spaced unless the basis says
 # otherwise.
-@inline function stencil_place(basis, origin::NTuple{D,T}, h, first, ::Val{G},
+@inline function stencil_place(basis, lo::NTuple{D,T}, h, B, first, ::Val{G},
                                ::Val{C}) where {D,T,G,C}
-    return UniformStencil{D,T}(origin, h, ntuple(d -> first[d] - G[d], Val(D)),
-                               ntuple(d -> uniform_shift(h, C[d]), Val(D)))
+    return UniformStencil{D,T}(lo, h, ntuple(d -> B[d] + first[d] - G[d] - 1, Val(D)),
+                               ntuple(d -> C[d] == 1 ? zero(h) : one(h) / 2, Val(D)))
 end
 
 # Whether any point of the stencil at `place` lies in the region. An
@@ -406,14 +417,16 @@ end
 # a region seen through an atlas take the place itself.
 @inline stencil_hits(::Nothing, place, ::Val{n}) where {n} = false
 @inline stencil_hits(region::Region, s::UniformStencil, v::Val) =
-    stencil_hits(region, s.origin, s.h, s.base, s.off, v)
+    stencil_hits(region, s.lo, s.h, s.base, s.off, v)
 
-# M11's forms: stencil point `k` (from 0) along `d` at `origin + ((base +
-# k) − off)·h`, with `base = first − G`.
-@inline stencil_hits(::Nothing, origin, h, base, off, ::Val{n}) where {n} = false
+# M11's forms: stencil point `k` (from 0) along `d` at `lo + ((base + k) +
+# off)·h`, `UniformStencil`'s. `off` is zero or a half, a vertex-like or a
+# cell-like dimension, and the position is `nodeposition`'s for that
+# stagger, bit for bit.
+@inline stencil_hits(::Nothing, lo, h, base, off, ::Val{n}) where {n} = false
 
-@inline stencil_position(origin, h, base, off, d, k) =
-    origin[d] + ((base[d] + k) - off[d]) * h
+@inline stencil_position(lo, h, base, off, d, k) =
+    nodeposition(lo[d], h, base[d] + k, 1, iszero(off[d]) ? 1 : 0, nothing)
 
 @inline function stencil_hits(region::Region, origin::NTuple{D}, h, base, off,
                               ::Val{n}) where {D,n}
@@ -445,7 +458,7 @@ end
 # The same two tests over a stencil whose points are not equally spaced,
 # read through `stencil_position(place, d, k)`.
 @inline function stencil_hits(region::Region, place, ::Val{n}) where {n}
-    D = length(place.origin)
+    D = length(place.lo)
     for J in CartesianIndices(ntuple(_ -> n, Val(D)))
         x = ntuple(d -> stencil_position(place, d, J[d] - 1), Val(D))
         inside(region, x) && return true
@@ -473,11 +486,18 @@ end
 # can take: the domain in the field set's type, the brick, the face
 # kinds, the rotating seam's pair of dimensions (M12; `(0, 0)` for none),
 # the finest level present (an `O(nleaves)` scan, done once per batch on
-# the host), and the flat index of the brick's first root less one. On a
-# forest of patches (M17) it is one patch's: its box, its roots and its
+# the host), and the flat index of the brick's first root less one; and
+# the forward map's anchor (`patch_anchor`), its integer coordinate `m`,
+# the level-0 spacing and `N`, from which `locate_leaf` forms the faces of
+# the block it finds exactly as positions are formed. On a forest of
+# patches (M17) it is one patch's: its box, its roots, its anchor and its
 # first root, which `patch_geometry` builds in the kernel per point.
 struct PointGeometry{D,T}
     extents::NTuple{D,Tuple{T,T}}
+    anchor::NTuple{D,T}
+    m::NTuple{D,Int}
+    h0::T
+    N::Int
     roots::NTuple{D,Int}
     periodic::NTuple{D,Bool}
     reflecting::NTuple{D,Tuple{Bool,Bool}}
@@ -493,9 +513,9 @@ end
 # what everything but the location of a `PatchPoint` reads (the seam,
 # which a forest of patches does not have).
 function PointGeometry(::Type{T}, forest::Forest{D}) where {T,D}
-    return PointGeometry{D,T}(ntuple(d -> (T(forest.extents[d][1]),
-                                           T(forest.extents[d][2])), D),
-                              forest.roots, forest.periodic, reflecting_faces(forest),
+    a, m = patch_anchor(T, forest, 1)
+    return PointGeometry{D,T}(location_box(T, forest, 1), a, m, spacing(T, forest, 0),
+                              forest.N, forest.roots, forest.periodic, reflecting_faces(forest),
                               hasrotating(forest) ? seam_plane(forest) : (0, 0),
                               ishalfturn(forest), maxlevel(forest), 0)
 end
@@ -542,14 +562,12 @@ end
 pointdims(x) = length(x)
 pointdims(x::PatchPoint) = length(x.ξ)
 
-# Each patch's box, roots and first root less one, as one isbits entry
-# per patch for a kernel; `nothing` on a brick.
+# Each patch's box (`location_box`), roots and first root less one, as
+# one isbits entry per patch for a kernel; `nothing` on a brick.
 function patch_table(::Type{T}, forest::Forest{D}) where {T,D}
     ispatched(forest) || return nothing
-    return [(ntuple(d -> (T(patch_extents(forest, p)[d][1]),
-                          T(patch_extents(forest, p)[d][2])), D),
-             patch_roots(forest, p), patch_firstroot(forest, p))
-            for p in 1:npatches(forest)]
+    return [(location_box(T, forest, p), patch_anchor(T, forest, p)..., patch_roots(forest, p),
+             patch_firstroot(forest, p)) for p in 1:npatches(forest)]
 end
 
 # The geometry a point is located with, its position in `T`, its patch,
@@ -566,9 +584,9 @@ end
     ξ = ntuple(d -> T(x.ξ[d]), Val(D))
     p = x.p
     1 <= p <= length(table) || return g, ξ, p, false
-    @inbounds ext, roots, fr = table[p]
-    return PointGeometry{D,T}(ext, roots, ntuple(_ -> false, Val(D)), g.reflecting, (0, 0),
-                              false, g.L, fr), ξ, p, true
+    @inbounds ext, a, m, roots, fr = table[p]
+    return PointGeometry{D,T}(ext, a, m, g.h0, g.N, roots, ntuple(_ -> false, Val(D)),
+                              g.reflecting, (0, 0), false, g.L, fr), ξ, p, true
 end
 
 # One coordinate brought into the domain: wrapped along a periodic
@@ -651,31 +669,42 @@ end
 
 # The block index of the leaf containing the in-domain point `x`.
 #
-# The level-`L` node containing `x`: the root brick position, then the
-# node's coordinates bit by bit from the fraction within the root —
-# doubling is exact, so this needs no integer conversion of `2^L`, which
-# `T` could not hold exactly at deep levels. A point on the upper face of
-# the domain lands in the last node (the fraction reaches one and every
-# bit is set). Then the last leaf not after that node in curve order,
-# which is the covering leaf: the leaves tile the domain, and an
-# ancestor sorts immediately before its descendants, which are contiguous.
-@inline function locate_leaf(leaves, g::PointGeometry{D,T}, x) where {D,T}
-    cell = ntuple(Val(D)) do d
-        xlo, xhi = g.extents[d]
-        t = (x[d] - xlo) / (xhi - xlo) * T(g.roots[d])
-        rp = clamp(floorindex(t), 0, g.roots[d] - 1)
-        r = t - T(rp)
-        c = 0
-        for _ in 1:(g.L)
-            r += r
-            bit = r >= one(T)
-            bit && (r -= one(T))
-            c = 2c + bit
-        end
-        (rp, c)
+# The level-`L` node containing `x`, as the forward map places it (M22
+# step 10b): its index along each dimension from the anchor, `s = (x −
+# a)/h_L + m·2^L` spacings over `N`, and then corrected by one either way
+# against the node's faces formed exactly as `nodeposition` forms them,
+# `position_fma(k, h_L, a)`, so that a point on a face — a node's own position
+# included — lands in the upper node, whatever the division rounded to; a
+# point on the upper face of the domain lands in the last node. `h_L` is
+# the level-0 spacing halved `L` times, exact, and `k` an integer `T`
+# holds exactly wherever positions are exact (`nodeposition`). Returns the
+# node and, as bits, the dimensions along which `x` lies exactly on the
+# node's low face with a node below it (across a periodic wrap too).
+@inline function locate_node(g::PointGeometry{D,T}, x) where {D,T}
+    hL = g.h0 / (1 << g.L)
+    found = ntuple(Val(D)) do d
+        a, mL, N = g.anchor[d], g.m[d] << g.L, g.N
+        last = (g.roots[d] << g.L) - 1
+        b = clamp(floorindex(((x[d] - a) / hL + T(mL)) / T(N)), 0, last)
+        b > 0 && x[d] < position_fma(T(b * N - mL), hL, a) && (b -= 1)
+        b < last && x[d] >= position_fma(T((b + 1) * N - mL), hL, a) && (b += 1)
+        onface = (b > 0 || g.periodic[d]) && x[d] == position_fma(T(b * N - mL), hL, a)
+        (b, onface)
     end
-    root = g.firstroot + root_index(g.roots, ntuple(d -> cell[d][1], Val(D)))
-    pc = ntuple(d -> UInt64(cell[d][2]) << (MAX_LEVEL - g.L), Val(D))
+    node = ntuple(d -> found[d][1], Val(D))
+    face = 0
+    for d in 1:D
+        found[d][2] && (face |= 1 << (d - 1))
+    end
+    return node, face
+end
+
+# The leaf covering the level-`L` node `node`: the last leaf not after it
+# in curve order — the leaves tile the domain, and an ancestor sorts
+# immediately before its descendants, which are contiguous.
+@inline function covering_leaf(leaves, g::PointGeometry{D,T}, node) where {D,T}
+    root = g.firstroot + root_index(g.roots, ntuple(d -> node[d] >> g.L, Val(D)))
+    pc = ntuple(d -> UInt64(node[d] & ((1 << g.L) - 1)) << (MAX_LEVEL - g.L), Val(D))
     # Largest `i` with `leaves[i] ≤ query`; `lo` and `hi` bracket it.
     # (Named apart from the extents above: a closure that assigned to a
     # captured `lo` would box it, and the search would infer as `Any`.)
@@ -693,6 +722,35 @@ end
     return lo
 end
 
+# The block index of the leaf a point is read from (M22 step 10c): the
+# leaf covering its level-`L` node (`locate_node`), unless the point lies
+# exactly on a face, edge or corner that a finer leaf holds too — then the
+# finest leaf holding it in its closed box, as rule 1 makes the finest
+# level's copy of a point its primary, so that a point on a coarse-fine
+# face is read from the fine side whichever side the coarse block is on,
+# and its mirror image alike. Among leaves of one level the half-open rule
+# stays (the upper one): their data agree after a fill. A property of the
+# tree, the same on every rank. Through a rotating seam or a glue nothing
+# is looked for: a point is read on its own side of those.
+@inline function locate_leaf(leaves, g::PointGeometry{D,T}, x) where {D,T}
+    node, face = locate_node(g, x)
+    best = covering_leaf(leaves, g, node)
+    face == 0 && return best
+    level_ = Int(leaves[best].level)
+    for mask in 1:((1 << D) - 1)
+        mask & ~face == 0 || continue
+        below = ntuple(Val(D)) do d
+            (mask >> (d - 1)) & 1 == 0 && return node[d]
+            node[d] > 0 && return node[d] - 1
+            return (g.roots[d] << g.L) - 1                      # across the wrap
+        end
+        j = covering_leaf(leaves, g, below)
+        l = Int(leaves[j].level)
+        l > level_ && (best = j; level_ = l)
+    end
+    return best
+end
+
 """
     locate_point(forest, x) -> Union{Int,Nothing}
 
@@ -702,9 +760,12 @@ every tree query's is: serially it is also the block index of every
 [`FieldSet`](@ref) over `forest`, and over a distributed forest the
 block is stored by the rank whose [`blockrange`](@ref) contains it.
 
-Leaves own half-open boxes, so a point on a face shared by two leaves
-belongs to the upper one; a point on the domain's upper face belongs to
-the last leaf there. Along a periodic dimension `x` is wrapped into the
+A point on a face, edge or corner shared by leaves of two levels belongs
+to the finest leaf holding it in its closed box, as the finest level's
+copy of a point is its primary (M22, "Closed blocks" in `CODE.md`); among
+leaves of one level, whose data agree after a fill, to the upper one, as
+if leaves owned half-open boxes; a point on the domain's upper face
+belongs to the last leaf there. Along a periodic dimension `x` is wrapped into the
 domain first, beyond a reflecting face it is mirrored once, and beyond a
 rotating seam (M12) it is turned back into the quadrant by as many
 quarter turns as it lay away — which is where [`interpolate`](@ref)
@@ -744,23 +805,33 @@ unknown_patch(forest::Forest, x, j) = ArgumentError(
 
 # The stencil of an in-domain query in block `b`: its first stored index
 # per dimension, the query's offset `ξ` from it in spacings, and the
-# places of its points. The position in spacings from the block's origin
-# is what the basis is handed (`stencilstart`), since an element set's
-# stored index is not linear in it.
-@inline function query_stencil(basis, x::NTuple{D,T}, origin, h, ::Val{G}, ::Val{C},
+# places of its points. The position in spacings from the block's corner
+# — `lo + B·h`, `block_origin`'s — is what the basis is handed
+# (`stencilstart`), since an element set's stored index is not linear in
+# it; the places are formed from `lo` and `B` as `nodeposition` forms
+# them.
+@inline function query_stencil(basis, x::NTuple{D,T}, lo, h, B, ::Val{G}, ::Val{C},
                                ::Val{S}) where {D,T,G,C,S}
+    origin = ntuple(d -> nodeposition(lo[d], h, B[d], 1, 1, nothing), Val(D))
     t = ntuple(d -> (x[d] - origin[d]) / h, Val(D))
     fξ = ntuple(d -> stencilstart(basis, t[d], G[d], C[d], S[d]), Val(D))
     first = ntuple(d -> fξ[d][1], Val(D))
     ξ = ntuple(d -> fξ[d][2], Val(D))
-    return first, ξ, stencil_place(basis, origin, h, first, Val(G), Val(C))
+    return first, ξ, stencil_place(basis, lo, h, B, first, Val(G), Val(C))
 end
+# The form with the block's corner alone, which TreeWaveOLDG's extraction
+# calls for the stencil and its weights: the same `first` and `ξ`, since
+# `lo + 0·h` is `origin` bit for bit, but places relative to the corner,
+# which are not `coordinates`' bits.
+@inline query_stencil(basis, x::NTuple{D,T}, origin, h, ::Val{G}, ::Val{C},
+                      ::Val{S}) where {D,T,G,C,S} =
+    query_stencil(basis, x, origin, h, ntuple(_ -> 0, Val(D)), Val(G), Val(C), Val(S))
 
 # The whole of one query, written into slot `j` of the outputs.
 #
 # `leaves` is the whole leaf array, replicated on every rank, so the
 # search answers in global leaf indices, which is what `blocks[j]`
-# records. `origins`, `spacings` and `work` are per local block, and
+# records. `lows`, `bases`, `spacings` and `work` are per local block, and
 # `boffset` is the global index of the leaf before this rank's first
 # block: zero serially, where the two coincide, and under M7 the shift a
 # point routed to the owner of its block takes to reach it ("Point
@@ -779,7 +850,7 @@ end
 # forest without a seam, where `r` is always 0, and for a set whose
 # layout is not symmetric in the plane, whose value beyond the seam is
 # its partner's: such a point is recorded as `-1` and refused by the host.
-@inline function interpolate_point!(values, excluded, blocks, xs, leaves, origins,
+@inline function interpolate_point!(values, excluded, blocks, xs, leaves, lows, bases,
                                     spacings, work, factors, rotvars, vars, region, basis,
                                     g::PointGeometry{D,T}, derivs::NTuple{K}, swapped,
                                     ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
@@ -795,7 +866,7 @@ end
     end
     b = locate_leaf(leaves, g, x)
     blocks[j] = b
-    evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
+    evaluate_point!(values, excluded, lows, bases, spacings, work, factors, rotvars, vars,
                     region, basis, g, derivs, swapped, Val(M), Val(G), Val(C), Val(S),
                     b - boffset, x, fold, r, j)
     return nothing
@@ -806,14 +877,13 @@ end
 # and turned by `r` quarter turns, contracted with the basis's weights.
 # Both the fused path above and the split one (`evaluate_kernel!`, which
 # reads what `locate` stored) call this, so the two agree bit for bit.
-@inline function evaluate_point!(values, excluded, origins, spacings, work, factors,
+@inline function evaluate_point!(values, excluded, lows, bases, spacings, work, factors,
                                  rotvars, vars, region, basis, g::PointGeometry{D,T},
                                  derivs::NTuple{K}, swapped, ::Val{M}, ::Val{G}, ::Val{C},
                                  ::Val{S}, b, x, fold, r, j) where {D,T,K,M,G,C,S}
-    origin = origins[b]
-    h = spacings[b]
+    lo, B, h = lows[b], bases[b], spacings[b]
     n = stencilwidth(basis)
-    first, ξ, place = query_stencil(basis, x, origin, h, Val(G), Val(C), Val(S))
+    first, ξ, place = query_stencil(basis, x, lo, h, B, Val(G), Val(C), Val(S))
     excluded[j] = stencil_hits(region, place, Val(n))
     W = ntuple(d -> basisweights(basis, ξ[d], Val(M)), Val(D))
 
@@ -952,12 +1022,13 @@ end
 @inline paritysign(factors, v, col, ::Type{T}) where {T} = factors[v, col]
 
 @kernel function interpolate_kernel!(values, excluded, blocks, @Const(xs),
-                                     @Const(leaves), @Const(origins), @Const(spacings),
-                                     @Const(work), factors, rotvars, @Const(vars), region,
-                                     basis, g, ::Val{DV}, ::Val{DS}, ::Val{M}, ::Val{G},
-                                     ::Val{C}, ::Val{S}, boffset) where {DV,DS,M,G,C,S}
+                                     @Const(leaves), @Const(lows), @Const(bases),
+                                     @Const(spacings), @Const(work), factors, rotvars,
+                                     @Const(vars), region, basis, g, ::Val{DV}, ::Val{DS},
+                                     ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
+                                     boffset) where {DV,DS,M,G,C,S}
     j = @index(Global, Linear)
-    interpolate_point!(values, excluded, blocks, xs, leaves, origins, spacings, work,
+    interpolate_point!(values, excluded, blocks, xs, leaves, lows, bases, spacings, work,
                        factors, rotvars, vars, region, basis, g, DV, DS, Val(M), Val(G),
                        Val(C), Val(S), boffset, j)
 end
@@ -1333,7 +1404,8 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, u, xs, g, ba
     # Uploaded per call: this is an analysis-cadence operation, and on the
     # CPU the leaves are not copied at all.
     leaves = todevice(backend, forest.leaves)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     vs = todevice(backend, Int32[v for v in vars])
     blocks = allocate(backend, Int32, npts)
@@ -1353,7 +1425,7 @@ function launch_interpolation!(values, excluded, fs::FieldSet{T,D}, u, xs, g, ba
               interpolate_kernel!(backend)
     rotvars = seam_rotvars(fs)
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
-    kernel!(values, excluded, blocks, xs, leaves, origins, spacings, src,
+    kernel!(values, excluded, blocks, xs, leaves, lows, bases, spacings, src,
             fs.factors, rotvars, vs, region, basis, g, Val(ms), Val(swapped), Val(M),
             Val(G), Val(staggers(fs)), Val(S), boffset; ndrange=npts)
     synchronize(backend)
@@ -1368,7 +1440,7 @@ end
 stencil_source(fs::FieldSet{T,D}, ::Nothing) where {T,D} =
     fs.work, fs.G, size(fs.work)[1:D]
 stencil_source(fs::FieldSet{T,D}, u) where {T,D} =
-    statearray(u, fs), ntuple(_ -> 0, D), ntuple(_ -> fs.forest.N, D)
+    statearray(u, fs), ntuple(_ -> 0, D), ownextents(fs)
 
 # The variable table the kernel turns a point beyond a rotating seam with
 # (M12): the set's own, or `nothing` where no point is turned — over a
@@ -1783,7 +1855,7 @@ end
 # `status[j]` is 1 for a point beyond a rotating seam that `rotvars` cannot
 # turn, 0 otherwise.
 @inline function evaluate_located!(values, excluded, status, leaf, ys, codes, inside,
-                                   patches, atlas, origins, spacings, work, factors,
+                                   patches, atlas, lows, bases, spacings, work, factors,
                                    rotvars, vars, region, basis, g::PointGeometry{D,T},
                                    derivs, swapped, ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
                                    boffset, fillvalue, j) where {D,T,M,G,C,S}
@@ -1800,7 +1872,7 @@ end
         status[j] = Int8(1)
         return nothing
     end
-    evaluate_point!(values, excluded, origins, spacings, work, factors, rotvars, vars,
+    evaluate_point!(values, excluded, lows, bases, spacings, work, factors, rotvars, vars,
                     mapped_region(region, atlas, patches[j]), basis, g, derivs, swapped,
                     Val(M), Val(G), Val(C), Val(S), Int(leaf[j]) - boffset, ys[j], fold, r,
                     j)
@@ -1809,13 +1881,14 @@ end
 
 @kernel function evaluate_kernel!(values, excluded, status, @Const(leaf), @Const(ys),
                                   @Const(codes), @Const(inside), @Const(patches), atlas,
-                                  @Const(origins), @Const(spacings), @Const(work), factors,
-                                  rotvars, @Const(vars), region, basis, g, ::Val{DV},
-                                  ::Val{DS}, ::Val{M}, ::Val{G}, ::Val{C}, ::Val{S},
+                                  @Const(lows), @Const(bases), @Const(spacings),
+                                  @Const(work), factors, rotvars, @Const(vars), region,
+                                  basis, g, ::Val{DV}, ::Val{DS}, ::Val{M}, ::Val{G},
+                                  ::Val{C}, ::Val{S},
                                   boffset, fillvalue) where {DV,DS,M,G,C,S}
     j = @index(Global, Linear)
     evaluate_located!(values, excluded, status, leaf, ys, codes, inside, patches, atlas,
-                      origins, spacings, work, factors, rotvars, vars, region, basis, g,
+                      lows, bases, spacings, work, factors, rotvars, vars, region, basis, g,
                       DV, DS, Val(M), Val(G), Val(C), Val(S), boffset, fillvalue, j)
 end
 
@@ -1827,7 +1900,8 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::Located
     forest = fs.forest
     backend = get_backend(fs.work)
     npts = length(pts)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     vs = todevice(backend, Int32[v for v in vars])
     status = allocate(backend, Int8, npts)
@@ -1838,9 +1912,9 @@ function launch_evaluation!(values, excluded, fs::FieldSet{T,D}, u, pts::Located
     swapped = rotvars === nothing ? nothing : swapped_derivs(fs.forest, ms)
     pointkernel(evaluate_kernel!, backend, npts)(
         values, excluded, status, pts.leaf, pts.y, pts.code, pts.inside, pts.patch,
-        pts.atlas, origins, spacings, src, fs.factors, rotvars, vs, region, basis, g, Val(ms),
-        Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset, fillvalue;
-        ndrange=npts)
+        pts.atlas, lows, bases, spacings, src, fs.factors, rotvars, vs, region, basis, g,
+        Val(ms), Val(swapped), Val(M), Val(G), Val(staggers(fs)), Val(S), boffset,
+        fillvalue; ndrange=npts)
     synchronize(backend)
     return status
 end

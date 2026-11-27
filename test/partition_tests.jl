@@ -55,6 +55,7 @@ end
     @test serial.comm === SerialCommunicator()
     @test blockrange(serial) == 1:n
     sorigins = block_origins(serial)
+    slows, sbases = block_lows(serial), block_bases(serial)
     sspacings = block_spacings(serial)
     sflags = flag_blocks((b, k) -> (b, k), serial)
     f(x, v) = v + sum(d -> d * x[d]^2, 1:D)
@@ -71,10 +72,12 @@ end
             m = length(range)
             @test nblocks(fs) == m
             @test size(fs.work) == (size(sfs.work)[1:(D + 1)]..., m)
-            @test statelength(fs) == forest.N^D * 2 * m
+            @test statelength(fs) == prod(d -> forest.N + staggers(C)[d], 1:D) * 2 * m
             @test [blockkey(fs, b) for b in 1:m] == serial.leaves[range]
             @test_throws BoundsError blockkey(fs, m + 1)
             @test block_origins(forest) == sorigins[range]
+            @test block_lows(forest) == slows[range]
+            @test block_bases(forest) == sbases[range]
             @test block_spacings(forest) == sspacings[range]
             @test flag_blocks((b, k) -> (b, k), forest) ==
                   [(b - first(range) + 1, k) for (b, k) in sflags[range]]
@@ -92,8 +95,8 @@ end
             fill_by_coordinates!(AllVariables(x -> (f(x, 1), f(x, 2))), fs)
             @test fs.work == sfs.work[ntuple(_ -> :, D + 1)..., range]
             # The per-block reductions are per local block.
-            @test block_mapreduce(abs, max, 0.0, fs) ==
-                  block_mapreduce(abs, max, 0.0, sfs)[range]
+            @test block_mapreduce(abs, max, 0.0, fs; primaries=false) ==
+                  block_mapreduce(abs, max, 0.0, sfs; primaries=false)[range]
             fires(work, idx, b, x) = x[1] < 0.6 * sum(serial.extents[1])
             @test firing_boxes(fires, fs) == firing_boxes(fires, sfs)[range]
         end
@@ -135,20 +138,24 @@ end
                       for b in local_sched.boundaries) ==
                   Set(b for b in sbounds if b[1] in range)
             @test all(g -> issorted(g.targetblocks), schedule_groups(local_sched))
-            @test local_sched.boundaryplan.origins == block_origins(forest)
+            @test local_sched.boundaryplan.lows == block_lows(forest)
+            @test local_sched.boundaryplan.bases == block_bases(forest)
         end
         @test crossing > 0            # so the filter had something to drop
     end
-    # The interface schedule the same way, over a face-centered flux.
+    # The unify schedule the same way, over a face-centered flux, on the
+    # same refinement with outer faces for the reflecting ones (a closed
+    # set at a reflecting face comes back in M22 step 4).
+    serial = faces_forest(map(k -> k === :periodic ? :periodic : :outer, kinds); N=8)
     flux(forest) = FieldSet(forest, 1; G=0, centering=facecentered(D, 1),
                             parity=[EvenParity])
-    sisched = InterfaceSchedule(flux(serial))
+    sisched = UnifySchedule(flux(serial))
     sinterfaces = transfer_set(schedule_groups(sisched), 0)
     @test !isempty(sinterfaces)
     for P in (2, 3), r in 0:(P - 1)
         forest = rank_forest(serial, r, P)
         range = blockrange(forest)
-        isched = InterfaceSchedule(flux(forest))
+        isched = UnifySchedule(flux(forest))
         @test transfer_set(schedule_groups(isched), first(range) - 1) ==
               Set(t for t in sinterfaces if t[4] in range && t[5] in range)
     end

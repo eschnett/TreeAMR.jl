@@ -64,5 +64,4 @@ end
 
 schedule_groups(s::GhostSchedule) = [s.phase1; reduce(vcat, s.phase2; init=eltype(s.phase1)[])]
 
-schedule_groups(s::InterfaceSchedule) =
-    reduce(vcat, s.phases; init=eltype(eltype(s.phases))[])
+schedule_groups(s::UnifySchedule) = s.unify

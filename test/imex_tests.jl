@@ -30,7 +30,7 @@ A candidate for TreeAMR's own API (the open question of the same name in
 both packages' `CODE.md`), kept here until it is named.
 """
 function state_partition(fs::FieldSet{T,D}) where {T,D}
-    L = fs.forest.N^D * fs.nvars
+    L = statelength(fs) ÷ nblocks(fs)             # one block's entries, every copy
     parts = UnitRange{Int}[(first(r) - 1) * L + 1:last(r) * L
                            for r in threadchunks(nblocks(fs))]
     while length(parts) < Threads.nthreads()
@@ -63,6 +63,8 @@ function imex_wave_errors(::Val{D}; N, ops, G=1, L=1.0, m=1, cfl=0.25,
     final = FieldSet(forest, 2; G=G, centering=vertexcentered(D))
     fill_by_coordinates!(wave_exact(D, L, m, t_end), final)
     uexact = statevector(final); gather!(uexact, final)
+    # The secondaries take their primaries' values first, as in `wave_errors`.
+    unify!(u, fs, problem.schedule)
     return (l2=volume_weighted_norm(fs, u .- uexact), h=h)
 end
 
@@ -89,7 +91,7 @@ end
     tid = zeros(Int, nblocks(fs))
     map_blocks!(owner_thread_kernel!, fs, tid)
     offset = Threads.threadpoolsize(:interactive)
-    L = fs.forest.N^2 * fs.nvars
+    L = statelength(fs) ÷ nblocks(fs)
     for (c, r) in enumerate(part), b in unique(cld.(r, L))
         # IMEXRungeKutta places range `c` on default-pool thread `c`, as
         # TreeAMR's `threaded_chunks` does; one thread runs everything

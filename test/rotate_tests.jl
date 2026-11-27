@@ -509,7 +509,9 @@ end
                           parity=vector_parity(D, rot, other))
             schedule = GhostSchedule(fs, ROT_OPS4)
             counts = write_counts(schedule)
-            owned = ntuple(d -> (G[d] + 1):(G[d] + N), D)
+            # The own range, closed along a vertex-like dimension (M22).
+            c = staggers(C)
+            owned = ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D)
             ok = true
             for b in 1:nleaves(forest), idx in CartesianIndices(size(counts)[1:D])
                 inside = all(d -> Tuple(idx)[d] in owned[d], 1:D)
@@ -692,44 +694,54 @@ end
     @test worst < 1e-10
 end
 
-@testset "The interface schedule records nothing across the conforming seam: D=$D" for
+@testset "A flux pair's unify! makes the seam's copies one number through the turn: D=$D" for
         D in (2, 3)
-    # A coarse-fine face across the seam would need a turned restriction,
-    # which the interface schedule does not build; conformity rules it
-    # out. So a rotating forest's schedule must hold no rotated transfer,
-    # and elsewhere restrict exactly as the same leaves without the seam,
-    # whose seam faces are outer faces that nothing restricts either.
+    # Guards the interface restriction across the seam on closed blocks
+    # (M22): a flux normal to `d1` and one normal to `d2` turn into each
+    # other, so a point of the seam plane has its copies in both, and
+    # `unify!` of the pair must make them one number through the turn,
+    # `F_{d1}(0, y) = −F_{d2}(y, 0)`, bit for bit; away from the seam the
+    # pair restricts as the same leaves without the seam do; and a member
+    # alone is refused, since its seam copies are its partner's.
     rot = (1, 2)
     other = D == 2 ? :none : :periodic
     forest = rotating_forest(Val(D); rotating=rot, other=other)
     plain = Forest(forest.roots; N=forest.N, periodic=forest.periodic,
                    extents=forest.extents, leaves=copy(forest.leaves))
     rng = Xoshiro(12)
-    nrestrict = 0
-    for d in 1:D
-        rotation = d == 1 ? (-1,) : (1,)
-        fr = FieldSet(forest, 1; G=0, centering=facecentered(D, d), rotation=rotation)
-        fp = FieldSet(plain, 1; G=0, centering=facecentered(D, d))
-        is = InterfaceSchedule(fr)
-        groups = collect(Iterators.flatten(is.phases))
-        @test all(g -> g.orientation == 0, groups)
-        @test !occursin("rotated", sprint(show, is))
-        nrestrict += sum(ntransfers, groups; init=0)
-        fr.work .= randn(rng, size(fr.work))
-        fp.work .= fr.work
-        restrict_interfaces!(fr, is)
-        restrict_interfaces!(fp, InterfaceSchedule(fp))
-        @test fr.work == fp.work
+    fx = FieldSet(forest, 1; G=0, centering=facecentered(D, 1), rotation=(-1,))
+    fy = FieldSet(forest, 1; G=0, centering=facecentered(D, 2), rotation=(1,))
+    px = FieldSet(plain, 1; G=0, centering=facecentered(D, 1))
+    py = FieldSet(plain, 1; G=0, centering=facecentered(D, 2))
+    @test_throws "Unify it as a RotationPair" unify!(fx, UnifySchedule(fx))
+    for (f, q) in ((fx, px), (fy, py))
+        f.work .= randn(rng, size(f.work))
+        q.work .= f.work
+        unify!(q, UnifySchedule(q))
     end
-    @test nrestrict > 0
-
-    # A seam that is not conforming is a bug the schedule reports, not a
-    # restriction it skips: refine one leaf on the low face of d2 without
-    # balancing, so that its image across the low face of d1 is coarser.
-    broken = Forest((2, 2); N=8, rotating=(1, 2))
-    refine!(broken, only(filter(k -> leafbox(broken, k)[1] == (1, 0), broken.leaves)))
-    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1), rotation=(-1,))
-    @test_throws "this is a bug" InterfaceSchedule(fx)
+    unify!(RotationPair(fx, fy), (UnifySchedule(fx), UnifySchedule(fy)))
+    # The own points by position, off the seam against the plain forest,
+    # and on it against the image in the partner.
+    function points(f)
+        out = Dict{Any,Float64}()
+        for b in 1:nblocks(f), I in CartesianIndices(size(f.work)[1:D])
+            out[coordinates(f, b, Tuple(I))] = f.work[I, 1, b]
+        end
+        return out
+    end
+    bits(x) = reinterpret(UInt64, x)
+    X, Y, PX, PY = points(fx), points(fy), points(px), points(py)
+    turn(x) = Base.setindex(Base.setindex(x, x[2], 1), x[1], 2)
+    nseam = 0
+    @test all(X) do (x, v)
+        if x[1] == 0
+            nseam += 1
+            return bits(v) == bits(-Y[turn(x)] + 0.0)     # a turned zero is +0
+        end
+        return x[2] == 0 || bits(v) == bits(PX[x])
+    end
+    @test all(((y, v),) -> y[2] == 0 || y[1] == 0 || bits(v) == bits(PY[y]), Y)
+    @test nseam > 0
 end
 
 @testset "Rigid rotation conserves mass through the seam and coarse-fine faces" begin

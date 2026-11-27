@@ -94,6 +94,10 @@ function workload_mismatches(ref, out; rtol=1e-12)
 end
 
 @testset "A distributed run prints what a serial run prints, at 2 and 3 ranks" begin
+    # What the serial reference prints while M22 is built: a case pending
+    # until a later step prints one comment line instead (`pending_case`);
+    # none is left.
+    NPENDING, NREGRIDS, NUNCHANGED = 0, 24, 3
     early = take_mpi_jobs!()
     # Beside the serial reference only where there is room; on a small
     # machine the three ranks start once it is done (see the header).
@@ -119,12 +123,12 @@ end
     @test count(l -> occursin(" state ", l), lines) >= 7
     @test count(l -> occursin(" filled ", l), lines) >= 13
     @test any(l -> startswith(l, "B2 conserved true"), lines)
-    # The regrid cycles (step 4) changed the mesh every time, Burgers'
-    # conserved mass through them, and both initial-data cycles converged.
-    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == 24
+    # The regrid cycles changed the mesh every time, Burgers' conserved
+    # mass through them, and both initial-data cycles converged.
+    @test count(l -> occursin(r"^\S+ regrid true ", l), lines) == NREGRIDS
     @test "BR conserved true" in lines
     @test all(l -> split(l)[4] == "true", filter(startswith("A2 "), lines))
-    @test count(l -> occursin(" unchanged false", l), lines) == 3
+    @test count(l -> occursin(" unchanged false", l), lines) == NUNCHANGED
     # Point interpolation (step 5): every point answered, some flagged.
     @test count(startswith("I2"), lines) == 5
     @test all(l -> split(l)[3] == "301", filter(l -> occursin(" values ", l) &&
@@ -132,9 +136,11 @@ end
     @test 0 < parse(Int, split(only(filter(startswith("I2.F64 excluded"), lines)))[3]) < 301
     words(prefix) = split(only(filter(startswith(prefix * " "), lines)))
     # Three levels wherever they were asked for, and four in the nested
-    # octant, whose three prolongation levels run as one group.
+    # octant, whose three prolongation levels run as one group; the closed
+    # blocks' cases (U…, M22) are uniform.
     @test all(l -> split(l)[4] == "2", filter(l -> occursin(" leaves ", l) &&
                                                     !startswith(l, "W1p") &&
+                                                    !startswith(l, "U") &&
                                                     !startswith(l, "E2") &&
                                                     !startswith(l, "N3") &&
                                                     !startswith(l, "P") &&
@@ -152,16 +158,18 @@ end
     # cycles refined and converged.
     @test all(l -> split(l)[5] == "true" && split(l)[6] == "5",
               filter(startswith("E2 adapted "), lines))
-    # The rotating quadrant (M12): the turned ghosts hold `−0` in all
-    # three sets, and three quarters of the points were turned back
-    # across the seam.
-    @test all(w -> parse(Int, w) > 0, words("Q2 negzero")[3:5])
+    # The rotating quadrant (M12): a turned zero is `+0` in all three sets
+    # (the factor path adds `+0`, M22 step 6), and three quarters of the
+    # points were turned back across the seam.
+    @test all(w -> parse(Int, w) == 0, words("Q2 negzero")[3:5])
     @test words("Q2 interpolated")[3:4] == ["257", "193"]
-    # The half plane (M14): the turned ghosts hold `−0` in both sets, and
-    # about half of the points were turned back across the seam.
-    @test all(w -> parse(Int, w) > 0, words("H2 negzero")[3:4])
+    # The half plane (M14): no `−0` in either set, and about half of the
+    # points were turned back across the seam.
+    @test all(w -> parse(Int, w) == 0, words("H2 negzero")[3:4])
     @test all(l -> split(l)[4:5] == ["257", "128"],
               filter(startswith("H2 interpolated "), lines))
+    # The glues (M22 step 8) are pending.
+    @test count(startswith("# pending until M22 step "), lines) == NPENDING
     # Element sets (M16): one stage, and the GLL mass conserved through
     # both regrids.
     @test all(t -> words("$t transfers")[end] == "1" && "$t conserved true" in lines,
@@ -204,10 +212,6 @@ end
         @test isempty(bad)
         hashes = filter(startswith("#"), workload_lines(out))
         refused(what) = only(filter(startswith("# $what refused on"), hashes))
-        # E2's two leaves leave one of three ranks without a block, before
-        # its regrids and after them.
-        @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
-        @test "# E2 empty ranks after the regrids $(n == 3 ? 1 : 0)" in hashes
         # The rotating quadrant (M12): seam transfers crossed ranks, and the
         # single leaf left all ranks but one empty before its regrids and
         # after them, and none in between.
@@ -215,6 +219,16 @@ end
                                            hashes)))[end]) > 0
         @test parse(Int, split(only(filter(startswith("# H2 rotated received"),
                                            hashes)))[end]) > 0
+        # The kinked torus (M20): interpolated ghosts crossed ranks.
+        @test parse(Int, split(only(filter(startswith("# G2 glue received"),
+                                           hashes)))[end]) > 0
+        @test "# QE2 empty ranks $(n - 1)" in hashes
+        @test "# QE2 empty ranks after refining 0" in hashes
+        @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
+        # E2's two leaves leave one of three ranks without a block, before
+        # its regrids and after them.
+        @test "# E2 empty ranks $(n == 3 ? 1 : 0)" in hashes
+        @test "# E2 empty ranks after the regrids $(n == 3 ? 1 : 0)" in hashes
         # An element set's prolongations crossed ranks, in its one stage.
         @test all(t -> parse(Int, split(only(filter(startswith("# $t prolongations"),
                                                     hashes)))[end]) > 0,
@@ -224,13 +238,6 @@ end
         @test all(t -> parse(Int, split(only(filter(startswith("# $t glued received"),
                                                     hashes)))[end]) > 0,
                   ("PR2 cell", "PR2 vertex", "PR2 element", "PS3 element"))
-        # Ghosts interpolated across a glue (M20) were evaluated by the rank
-        # owning their sources and sent to the target's.
-        @test parse(Int, split(only(filter(startswith("# G2 glue received"),
-                                           hashes)))[end]) > 0
-        @test "# QE2 empty ranks $(n - 1)" in hashes
-        @test "# QE2 empty ranks after refining 0" in hashes
-        @test "# QE2 empty ranks after coarsening $(n - 1)" in hashes
         # The nested octant (N3): some rank ran a group of levels with
         # messages, one of them at two ranks and more at three.
         nmessages = parse.(Int, split(only(filter(startswith("# N3 largest groups"),
@@ -265,7 +272,7 @@ end
         @test "# verbs agree on every rank true" in hashes
         @test startswith(refused("interface diverged"),
                          "# interface diverged refused on $n of $n ranks: the forest " *
-                         "differs between ranks, so InterfaceSchedule is refused")
+                         "differs between ranks, so UnifySchedule is refused")
         # regrid!'s checks are agreed in the digest gather (step 4): a bad
         # flag box on rank 1, a flag vector of the wrong length on rank 0,
         # another `buffer` on rank 1, a forest refined on rank 1.

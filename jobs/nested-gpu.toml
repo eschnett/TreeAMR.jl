@@ -10,6 +10,15 @@
 # the versions in the other order in the second. `jobs/nested.toml` is the
 # CPU node's, and says more.
 #
+# On Fir SimLaunch refuses `srun` for a GPU job's ranks, so the site
+# profile used there needs an MPI recipe whose `launcher = "mpiexec"`: in
+# M22 step 5 a profile of the session's own (`base = "fir"`) whose
+# `mpiabi` recipe is the cluster's Open MPI 4.1.5 through
+# mpi_abi_wrapper, started by the wrapper's `mpiexec` with
+# `launcher_args = ["--bind-to", "none"]`, modules `StdEnv/2023` and
+# `cuda/12.9`, and the patched Julia the Alliance sites need; both paths,
+# staged and direct, ran there (job 6364092).
+#
 #     simlaunch snapshot . --study <study> --variant base=<baseline checkout>
 #     simlaunch prepare <study> --site symmetry --spec jobs/nested-gpu.toml
 #     simlaunch submit <study> jobs/nested-gpu.toml --site symmetry
@@ -22,12 +31,20 @@ threads = 1
 vars = { TREEAMR_BENCH_BACKEND = "cuda", TREEAMR_BENCH_N = "32" }
 
 [site.symmetry]                     # four H200s of one node
+julia = "1.13"                      # the project's floor, on Symmetry only: an Alliance
+                                    # site's MPI recipe names its own patched Julia,
+                                    # which cannot be combined with `julia`
 time = "2:00:00"
 resources = { gpus = 4 }
 
 [site.trillium-gpu]                 # four H100s of one node
 time = "2:00:00"
 resources = { gpus = 4 }
+
+[site.fir]                          # four H100s of one node
+time = "2:00:00"
+resources = { gpus = 4 }
+sbatch_args = ["--nodes=1"]         # the four GPUs on one node
 
 [after]
 cmd = 'bash "$PROJECT"/bench/nested_tables.sh "$SPEC" $SIMLAUNCH_JOBDIRS'

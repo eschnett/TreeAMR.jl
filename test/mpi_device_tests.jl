@@ -84,9 +84,10 @@ numbers(lines, words...) =
     backend, T, deviceaware = header[5], header[7], header[9] == "true"
     rtol = T == "Float32" ? 1e-5 : 1e-12
     @info "reference" backend T deviceaware lines = length(serial)
-    @test count(l -> occursin(" state ", l), serial) >= 6
+    @test count(l -> occursin(" state ", l), serial) >= 4
     @test "B2 conserved true" in serial
     @test "M conserved true" in serial
+    @test count(startswith("# pending until M22 step "), serial) == 0
     for n in RANKCOUNTS
         out = workload(n)
         @test split(first(out))[1:3] == ["#", "ranks", string(n)]
@@ -97,19 +98,13 @@ numbers(lines, words...) =
         # Every stage with messages went through host mirrors on a device
         # that is not handed to MPI directly, and none did otherwise.
         stages = [l for l in out if occursin(" stages messages ", l)]
-        @test length(stages) == 7
+        @test length(stages) == 7          # W2v, R2c, Q2v, QP2, W3c, B2 and TP
         for l in stages
             w = split(l)
             messages, staged = parse(Int, w[end - 2]), parse(Int, w[end])
             @test messages > 0
             @test staged == (backend != "cpu" && !deviceaware ? messages : 0)
         end
-        # Ghosts interpolated across a glue (M20) crossed ranks, through host
-        # mirrors exactly where the stages' messages went through them.
-        received, sending, staged = only(numbers(filter(startswith("# G2"), out), "G2",
-                                                 "glue"))
-        @test received > 0 && sending > 0
-        @test staged == (backend != "cpu" && !deviceaware ? sending : 0)
         moved(name) = only(numbers(filter(startswith("# M"), out), name, "migrated"))
         @test moved("M4.refine")[1] > 0              # blocks moved up the ranks
         @test moved("M4.coarsen")[2] > 0             # and back down
@@ -125,5 +120,11 @@ numbers(lines, words...) =
             @test a1 > 0 && a2 == a1 && m2 == m1
             @test (m1 > 0) == (backend != "cpu" && !deviceaware)
         end
+        # Ghosts interpolated across a glue (M20) crossed ranks, through host
+        # mirrors exactly where the stages' messages went through them.
+        received, sending, staged = only(numbers(filter(startswith("# G2"), out), "G2",
+                                                 "glue"))
+        @test received > 0 && sending > 0
+        @test staged == (backend != "cpu" && !deviceaware ? sending : 0)
     end
 end

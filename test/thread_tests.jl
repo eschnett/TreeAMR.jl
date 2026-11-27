@@ -137,8 +137,8 @@ end
     @test length(ghostgroups) > 1
     @test all(g -> issorted(g.targetblocks), ghostgroups)
 
-    isched = InterfaceSchedule(FieldSet(forest, 1; G=0, centering=facecentered(D, 1)))
-    facegroups = vcat(isched.phases...)
+    isched = UnifySchedule(FieldSet(forest, 1; G=0, centering=facecentered(D, 1)))
+    facegroups = isched.unify
     @test sum(ntransfers, facegroups; init=0) > 0
     @test all(g -> issorted(g.targetblocks), facegroups)
 

@@ -63,6 +63,7 @@ of them. Each milestone's steps are listed in its record under
   - [M17 — Multi-patch forests (uniform)](#m17--multi-patch-forests-uniform)
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
+  - [M22 — Closed blocks](#m22--closed-blocks)
 - [Downstream checks](#downstream-checks)
 - [Development environment and CI](#development-environment-and-ci)
 - [Releases](#releases)
@@ -5358,6 +5359,1485 @@ M12 was decided with Erik, after M7 and before M9b.
       its GitHub `main` through `[sources]` until it is registered; 370
       tests. No release yet: General refuses a package whose dependency
       it does not have.
+
+### M22 — Closed blocks
+
+- *Why (2026-11-25).* While symmetries were being put on patches (M21,
+  eschnett/TreeAMR.jl#50), half-open ownership came up again:
+  the half turn's shifted slab needed a third state where the reversed
+  axis' faces are glued, a turn had to join a low face to a low face so
+  that both seam planes were owned, and TreeMultiPatch had oriented its
+  shells for the appendix. Erik put M21 on hold and asked for a clean
+  resolution, in a breaking release if need be, with symmetric domains
+  and refined regions the default, efficiency on devices kept, and
+  duplicated points allowed if they are unified. An inventory of
+  `src/` found about 120 lines for symmetric walls, 750–800 for the
+  appendix, about 100 for the seam shifts with #50's, and three
+  refusals citing ownership; every downstream sizes its state as
+  `N^D`, and TreeGRRMHD carries a wall work-around of its own.
+- *The design, and Erik's decisions (2026-11-25).* "Closed blocks" in
+  [CODE.md](CODE.md#closed-blocks), proposed. Asked seven questions,
+  Erik chose:
+  - *The state is uniform and holds every copy*, `∏(N + c_d)` per
+    block. Set aside: every point once, in a state of non-uniform
+    blocks, which would make M20's appendix — index tables, an accessor
+    type, a discarded write — the layout of every vertex-like set,
+    bricks included; and the uniform state with a mask that lets the
+    right-hand side skip the copies, which saves most of the `D/N` work
+    for a branch or more launch groups on a device and leaves dead
+    entries in the state.
+  - *The fine block is the authority at a coarse-fine face*, over the
+    coarse one. Unifying is then copies and injections only, and
+    prolongation writes ghosts only; with the coarse block prolongation
+    would write into closed boxes in phase 2 and a fine block at a
+    refinement boundary would have slaved planes.
+  - *Half-open ownership is removed*, not kept as an option beside the
+    new partition.
+  - *The copies across a kinked glue are averaged*, replacing M20's
+    decision of 2026-11-23 to evolve them apart. Set aside: leaving
+    them independent, and making the lowest-numbered patch the primary,
+    which is not symmetric (6 × 10⁻⁶ in the prototype).
+  - *An outer wall is evolved unless the hook says it prescribes it.*
+    Set aside: always evolved, which would have every Dirichlet
+    downstream write the wall itself, and always prescribed, which
+    leaves no evolved wall for a radiative condition.
+  - *Unifying is a stage of its own in the fill*, to be measured on
+    Symmetry before it is settled, over merging it into phase 1 with
+    target ranges that depend on who is primary around each block.
+  - *`unify!` on a state vector is offered and optional*, over
+    requiring it in every right-hand side and over not offering it.
+- *After the first reading (2026-11-25).* Erik decided that
+  `restrict_interfaces!` becomes `unify!` on a flux set, which the
+  design had only proposed. He also pointed out that a reduction taking
+  each point once and a right-hand side skipping the secondaries are
+  the same query, and that the first cannot wait; the design had put
+  the second off as an optimization. So the primary mask is one
+  mechanism with both uses, built with the layout, and what is left to the
+  measurement is only whether `map_blocks!` skips by itself, by launch
+  range. Writing that out showed a gap in the prescribed wall: written
+  on every copy after stage 0, a relative hook's coarse and fine copies
+  of one wall point would have differed by the scheme's error. The hook
+  now writes the wall's primaries before stage 0, which carries them to
+  the other copies.
+- *One position per point (2026-11-25).* The design had left open that
+  the copies of a point see positions differing in the last bit, each
+  block forming `origin + (I − 1)h` from its own corner, and had kept
+  the cure out of M22 because it changes the last bit of every
+  position in the package. Erik took it in: positions are formed from
+  integer coordinates, `lo + k h`. Reading the downstreams for it
+  showed that their kernels form positions themselves, from
+  `block_origins` and `block_spacings`, so the rule reaches them only
+  through a public `nodeposition` and two more per-block arrays.
+- *The steps revised before any code (2026-11-25).* Asked whether the
+  plan was enough for the implementation to start, the answer was that
+  the design was and the steps were not, in three ways, and Erik had
+  them revised. The first step bundled positions, the layout and the
+  fill; positions are independent and became a step of their own, on
+  `main`. Removing half-open ownership at once breaks every wall, seam,
+  glue and coarse-fine test until its step, and the plan had not said
+  how the suite stays green; it now has an integration branch, a
+  refusal for what is not rebuilt yet, and testsets pending by step.
+  And the measurement that settles the fill's partition came sixth,
+  after everything built on it; it moved to the first point at which
+  `bench/nested.jl`'s reflecting octant fills, after walls, with
+  regridding, seams and glues behind it. Each step now starts with a
+  written plan that settles what the design leaves to the implementer.
+- *What made closed ownership acceptable now.* M8 rejected it because
+  two copies at a coarse-fine face see different ghosts and drift, and
+  repairing that needed an exchange of `du`. The fill unifying `u`
+  before any read removes the feedback without one: the right-hand side
+  sees the unified state only, so a copy's deviation is integrated
+  along and never read ("Why copies cannot drift"). M8's other reason,
+  that a norm would count shared points twice, goes with the
+  trapezoid's weights.
+- *Step 1, positions from integer coordinates (2026-11-25).* Implemented
+  on `main` by itself, before any of the closed layout: `nodeposition(lo,
+  h, B, I, c, nodes)` forms every position as `lo + k·h` or `lo + (k +
+  ½)·h` from the integer `k = B + I − 1`, `block_origin` and
+  `block_extent` by the same rule, and `block_lows` and `block_bases`
+  reach the kernels beside `block_spacings` ("Positions" under
+  [Centerings](CODE.md#centerings)). The plan against the code found
+  three things the design had wrong or open:
+  - *The high face is not the given extent to the last bit only.* One
+    cell size serves every dimension and every patch, `root_spacing`
+    from patch 1's first dimension, while the old `block_origin` used
+    each dimension's own `(hi − lo)/roots`. The forest accepts extents
+    whose root widths agree to `4096 eps` (`check_brick`), so the domain's
+    high face `lo + K·h` differs from the given `hi` by rounding where
+    the extents are bitwise isotropic and by up to that tolerance where
+    they are not. Erik kept the one isotropic `h` and had the design
+    corrected. A node on the high face then lay an ulp past the given
+    box on a two-patch forest with non-dyadic extents (`Float64`: `ξ₂ =
+    −0.09999999999999998` against `−0.1`; `Float32`: `0.70000005f0`
+    against `0.7f0`), and the interpolator refused it as outside; the
+    new testset found it, and the point geometry now locates in each
+    patch's box widened to its high face, `(lo, max(hi, lo + K·h))`.
+    Extents in root units, as TreeMultiPatch builds them, have `lo + K·h
+    == hi` exactly for every `N` from 4 to 32, one to eight roots and
+    levels 0 to 6 (checked by hand).
+  - *An element's two face nodes do not share an integer part.* The
+    design said the two nodes at one position have "the same integer
+    part and the offsets `0` and `P + 1`"; their integer parts differ by
+    `P + 1`, and where `T` cannot hold them exactly (`Float32` beyond
+    `2²⁴`) the sums round apart. The last node is now formed as the
+    next element's first; the 1D mesh refined to level 21 checks it.
+  - *Fused multiply-add on a device.* The design formed a position as a
+    multiplication and then an addition, never `muladd`, so that a
+    device and the host would round alike. A backend that fused
+    consistently would still give every copy one position, since
+    scaling by two is exact inside a fused product too; what it would
+    break is equality with the host. Measured on the laptop's Metal (M3
+    Pro), in `Float32` on the refined 2D and 3D meshes of non-dyadic
+    extents and the level-21 1D mesh, cell, vertex and element sets
+    through `P = 3`: device and host positions are `===` at every owned
+    point (62,976 in 3D) and every hook-written ghost. On CUDA (an H200
+    on Symmetry, CUDA.jl 6.4, jobs 612315 and 612335, Julia
+    1.14.0-beta1 and 1.13.4 alike) they are not: in `Float64` and
+    `Float32` 30–57 % of the owned points and up to half of the
+    hook-written ghosts differ, by up to 10–13 ulps, the most where
+    `lo + k·h` is near zero, and every differing device value is
+    exactly `fma(k, h, lo)` formed on the host. CUDA contracts the
+    product and the sum of its own accord, so the rule could not be
+    kept there. It was replaced by the one every backend can keep: an
+    explicit `fma`, the position correctly rounded, the cell-like form
+    as `fma(T(2k + 1), h/2, lo)`, which keeps the half one bit longer
+    than `T(k) + ½` would; an element's interior node rounds its
+    integer part plus its offset first. `MultiFloats`' types, which
+    have no `fma`, keep the product and the sum (`position_fma`). The
+    change found two positions formed outside `nodeposition`, both of
+    the `exclude` test: `stencil_position` of an equally spaced stencil
+    and of an `ElementStencil`; both call it now. A new testset checks
+    that every stored position is the exact `lo + k·h` rounded once.
+    One assertion changed with the rule: `element_tests.jl`'s statement of
+    the expression, now the two `fma` forms. Verified with it (Julia
+    1.13.4): on the laptop, the full suite at eight threads (175,952
+    tests in five processes, 13m41), `position_tests.jl` (6,566),
+    `gpu_tests.jl` on Metal (2,679), the Metal position check with no
+    differing point, and the docs build; on an H200 at Julia 1.13 (jobs
+    612445 and 612473), no differing point in `Float64` or `Float32`,
+    and `gpu_tests.jl` with the same two failures at line 1197 as
+    before the change and on step 1's parent (job 612364), a regridded
+    state across a glue compared bit for bit with the host's. The fill
+    of the positions on the H200, best of 20 over 64 blocks of `32³`,
+    takes 174 µs in `Float64` against 175 µs before, and in `Float32`
+    174 µs vertex-like and 193 µs cell-like against 174 and 175 µs; a
+    first form that converted in each branch separately took 214 µs in
+    both `Float32` cases (job 612445), and the stagger now picks the
+    integer before its one conversion.
+  The point interpolator keeps inverting a position relative to the
+  block's corner; its `exclude` stencil positions follow the new rule,
+  through M11's six-argument `stencil_hits`, whose shape
+  TreeGeneralizedHarmonic's override depends on and which keeps it, its
+  arguments reinterpreted as `nodeposition`'s pieces. `query_stencil`
+  keeps its seven-argument form, which TreeWaveOLDG's extraction calls.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  at one thread and at eight with no tolerance changed (175,852 and
+  175,904 tests in five processes, 7m33 and 8m00), the new `test/position_tests.jl`
+  among them (6,518 tests); `gpu_tests.jl` passes on Metal in `Float32`
+  (2,679 tests); the docs build and their doctests pass. The serial
+  `test/mpi_workload.jl` prints exactly what it printed before, `#`
+  lines aside, and compiles in 74.7, 74.6 and 77.9 s with 1746 roots
+  against 74.6, 73.5 and 73.6 s with 1740 for 2f52936
+  (`--trace-compile-timing`, three alternating rounds); the six new
+  roots are the `block_low` closure and three `ntuple`s. One existing
+  assertion changed with its meaning: the M11 test of
+  `stencil_position`'s formula, whose arguments are now
+  `nodeposition`'s pieces. Against this checkout, from scratch copies,
+  TreeWave passes 349 tests in 1m38 and TreeIOHDF5 1088 in 2m36 (its
+  pin widened to 0.2.12 in the copy).
+- *Step 2, the layout, the uniform fill and outer faces (2026-11-25).*
+  Implemented on `m22` in seven commits after a written plan reviewed
+  by Claude, in the session that designed M22 with Erik, not by Erik
+  himself: the refusals of what later steps rebuild and the pending
+  tests; the half-open work-arounds deleted (symmetric walls' trim, the
+  half turn's shifted slab, the appendix with `AppendixArray`,
+  `isowned`, `corelength`, `hasappendix`, `appendix_entries` and
+  `FoldMask`); the closed own range with stage 0 and the symmetric
+  partition; the primary mask and the reductions; `unify!`; stage W and
+  `CellBoundary(…; wall)`; the workloads and documents. The review's
+  decisions on the plan, which Erik has not confirmed: the piece in the key rather than one flag, accepted; the
+  primary's order by global leaf position, never a rank-local index,
+  tested over simulated ranks; the self-neighbour case verified rather
+  than assumed; `walls = :symmetric` refused for a vertex-like set rather
+  than left inert; `wall = :evolved` the default, because the wall is in
+  the state; `primaries` required and without a default for a vertex-like
+  set; the removed keywords (`closed`, `appendix`) throwing with what
+  replaced them; `N ≥ 2G + 2` kept until step 3. What the code showed
+  against the design:
+  - *One flag does not key a unify transfer.* Along a dimension with
+    `δ_d = 0` the target may be any piece: a block's high face plane
+    along `e` takes its value from the block beside it along `d`, at the
+    same index. `GroupKey.piece` holds the target piece's class per
+    dimension, `-1` for every other transfer.
+  - *A ghost-free vertex-like dimension has no hook region.* Under
+    half-open ownership a flux set's high wall plane was the hook's; on
+    closed blocks the wall is its own, and its fill is stage 0 alone. The
+    same takes away the patch-corner refusal of such a dimension, whose
+    test is pending until step 8.
+  - *`fill_by_coordinates!` agrees across copies at one position only.*
+    Across a periodic wrap the copies of a point are a period apart, and
+    a callback gets each its own position; the done-when item holds for
+    the copies at one position, which every shared point inside a period
+    is.
+  - *The relative hook's lockstep helper* ran the boundary hook after the
+    first stage; with stage 0 first it runs after phase 1.
+  - *A cell-centered assertion changed with a deleted name*: the element
+    set's `closedranges == interiorranges` is now `interiorranges` against
+    a cell set's, and the glue test's appendix length is the state length.
+  - *A doctest of what a later step rebuilds* — the rotating
+    `RotationPair` of face-centered sets in `docs/src/index.md` — is a
+    plain example until step 7.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes at
+  eight threads and at one, in five processes, 157,109 tests and 934
+  pending (Broken) in each, 4m35 and 4m22, both MPI jobs included;
+  `test/closed_tests.jl` among them (3,465 tests), which checks every
+  done-when item on the CPU, flat against shaped, and over simulated
+  ranks, and the MPI workload's U2v, U2p, U3 and UU cases, which check
+  them at two and three ranks against the serial run. The docs build and
+  their doctests pass. `gpu_tests.jl` with `closed_tests.jl` on Metal
+  (Float32) passes, 5,353 tests and 99 pending in 4m49. Compile time of
+  `test/mpi_workload.jl` (`--trace-compile-timing`, three alternating
+  rounds against `m22`'s head, 7d99187): 53.6, 53.0 and 52.4 s with 1384,
+  1368 and 1368 roots against 71.2, 71.7 and 72.0 s with 1764; not a
+  measure of the change, since the branch's workload has 22 cases pending
+  and 4 new. The pending tests by step, as call sites: step 3, 26 whole
+  testsets and 19 loops' vertex-like iterations, 4 workload cases; step 4,
+  13 and 20, 8; step 6, 12 and 10, 12; step 7, 22 and 18, 11; step 8, 26
+  and 8, 4.
+  - *The primary by leaf order cost a launch per piece* (2026-11-25,
+    after the step's commits, from the coordinator's measurement of
+    `bench/copies.jl`). The first rule took the copy on the block first
+    in the forest's leaf order, by global leaf position, the low plane
+    where a block was its own neighbour. Its direction to a primary
+    depended on where the blocks sat on the curve, so a secondary piece
+    had, per vertex-like dimension, five combinations of class and
+    direction, and stage 0 one group per piece: 98 groups for a vertex
+    set on a uniform periodic mesh in 3D, `5³ − 3³`, beside phase 1's
+    26, each a launch on a device. The rule became the greatest class
+    tuple, the copy on the block lying lowest along the shared
+    dimensions: local, so every rank decides alike without an index (the
+    simulated-ranks test stays), and its direction to a primary is
+    decided per dimension, `−1` exactly at a low plane with a block below.
+    `GroupKey.piece` became `GroupKey.span`, a span of classes per
+    dimension, and a target's secondaries with one source and direction
+    merge into one box. A block that is its own neighbour now has its
+    high plane primary, and the prescribed-wall test skips the copies on
+    the low side of a periodic wrap rather than the high. Stage 0 / phase
+    1 groups (`GhostSchedule`, `N = 8`, `G = 1`), before and after:
+
+    | set | periodic, 8 roots | 2 roots | 1 root | 8 roots, outer |
+    |---|---|---|---|---|
+    | vertex, D = 1 | 2 → 1 / 2 | 2 → 1 / 2 | 1 → 1 / 2 | 1 → 1 / 2 |
+    | vertex, D = 2 | 16 → 3 / 8 | 16 → 3 / 8 | 5 → 3 / 8 | 7 → 5 / 8 |
+    | vertex, D = 3 | 98 → 7 / 26 | 98 → 7 / 26 | 19 → 7 / 26 | 37 → 19 / 26 |
+    | face, D = 3 | 2 → 1 / 26 | 2 → 1 / 26 | 1 → 1 / 26 | 1 → 1 / 26 |
+    | edge, D = 3 | 16 → 3 / 26 | 16 → 3 / 26 | 5 → 3 / 26 | 7 → 5 / 26 |
+
+  - *Confirmed by Erik (2026-11-27)*, of the decisions above, the removed
+    keywords (`closed`, `appendix`) throwing with what replaced them: on
+    "Throughout", "all good". The rest stay the review's.
+- *Step 3, coarse-fine faces (2026-11-26).* Implemented on `m22` in four
+  commits after a written plan reviewed as step 2's was, by Claude and
+  not by Erik: the primary across levels,
+  by sub-piece, with the mask; stage 0's restrictions and the ghost
+  stages on refined meshes, with `N ≥ 2G`; `UnifySchedule` and `unify!`
+  in place of `InterfaceSchedule` and `restrict_interfaces!`; the
+  workloads and documents. The review's decisions on the plan, which Erik
+  has not confirmed: five sub-classes
+  a vertex-like dimension, the primary rule unchanged and the mask one
+  `UInt32` a block; the mid-plane to the lower fine block, in stage 0
+  and in phase 1's halved ranges alike; restrictions merged only within
+  one piece of the target, for now, with the whole policy in one
+  function so that step 5's measurement can change it; `N ≥ 2G` in place
+  of `N ≥ 2G + 2` along a stagger, tested at the bound; a removed name
+  failing as a missing name. What the code showed against the design:
+  - *A coarse face value along a cell-like dimension has no coincident
+    fine point.* It is secondary all the same, the restriction of the
+    fine cells about it; the mask's oracle and the count of distinct
+    points take "a finer block's closed box contains the point", not "a
+    finer copy coincides".
+  - *A coarse block's copies need not fill a box.* Where some of its
+    pieces face finer blocks, the rest, copied from a block of its own
+    level, do not form one, and merging them into singletons gave 73
+    copy groups on a periodic `4³` brick with one root refined; merging
+    piece by piece where the whole set is not a box gave 37.
+  - *A secondary's state entry drifts at a coarse-fine face.* The coarse
+    copy's `du`, from the coarse stencil over unified values, differs
+    from its fine primary's by the Laplacian's `O(1)` defect next to a
+    prolongated ghost, and the wave study, which measured the state raw,
+    saw it as a rate of 0.54 at order 2 and no convergence in `L∞`.
+    Never read, as the design says; the study now unifies the final
+    state before measuring it, as an application's output would.
+  - *The vertex rates moved* (`L2`, `N = 8 … 32`, the half-open checkout
+    7d99187 run the same day beside): `D = 1`, order 2: 0.99 → 0.97;
+    order 4: 1.99 → 1.92; `D = 2`, order 2: 1.01 → 1.04; order 4: 1.99 →
+    1.95. The review continued both checkouts (this one and the
+    half-open 02bf9d1) to `N = 256` in `D = 1` and `N = 64` in `D = 2`,
+    L2 error and local rate, closed against half-open:
+
+    | `D`, order | `N = 8` | `N = 32` | finest | local rate at the finest |
+    |---|---|---|---|---|
+    | 1, 2 | 7.36e-2 / 5.43e-2 | 1.91e-2 / 1.37e-2 | 2.430e-3 / 1.724e-3 | 0.996 / 0.999 |
+    | 1, 4 | 2.96e-3 / 3.35e-3 | 2.06e-4 / 2.12e-4 | 3.331e-6 / 3.343e-6 | 1.993 / 1.998 |
+    | 2, 2 | 5.87e-2 / 3.86e-2 | 1.39e-2 / 9.46e-3 | 6.881e-3 / 4.720e-3 | 1.014 / 1.003 |
+    | 2, 4 | 3.83e-3 / 4.15e-3 | 2.58e-4 / 2.63e-4 | 6.530e-5 / 6.592e-5 | 1.981 / 1.995 |
+
+    So the order is the same and the error's size moved in opposite
+    directions: at order 2 the L2 error is `√2` larger throughout (both
+    faces of the refined region now carry the fine face's defect, where
+    one did) with the L∞ error unchanged, and at order 4 it is smaller
+    on coarse meshes and equal on fine ones, which is what lowers the
+    fit over `N = 8 … 32`. The implementation's first reading, a larger
+    constant at both orders, was wrong at order 4. Recorded in CODE.md
+    as **(open)** until Erik has reviewed them. The Burgers
+    interface-order table and its static drift rows came out the same
+    to the last digit.
+  - *A ghost-free vertex-like dimension has no hook region*, so the 1D
+    vertex case of the all-variables hook test takes one ghost; tests
+    gated in step 2 that sized a state as `N^D` a block (the IMEX
+    partition, the wave's state length) and the exchange's partition
+    test, which counted `N^D` own points, now count the own range.
+  - *A flux set at a reflecting face is a closed set there*, refused
+    until step 4: partition_tests builds its unify schedule over outer
+    faces.
+  - *Measured* (laptop M3 Pro, Julia 1.13.4, smoke): in 3D, `N = 16`,
+    `G = 2`, order 4, stage 0 copies + restrictions / phase 1 / phase 2:
+    a periodic `4³` brick with one root refined, cell 0 / 82 / 152,
+    vertex 37 + 152 / 82 / 152, face 1 + 8, edge 7 + 40; the nested mesh
+    of `bench/nested.jl` with outer faces, cell 0 / 63 / 273, vertex 19 +
+    61 / 63 / 273. Schedule build, best of three: a uniform periodic
+    `8³` vertex set (`N = 16`, `G = 2`) took 0.046 s at the step-2 head
+    and 0.14 s after the sub-piece search (`5^v` sub-pieces a block); on
+    the nested mesh a vertex set 0.082 s against a cell set's 0.008 s,
+    which is unchanged.
+  - *The build made cheap again* (2026-11-26, after the step's commits,
+    at the review's request, since regridding rebuilds the schedule): each
+    block looks up its neighbours across a direction once
+    (`NeighbourTable`, at most `3^D − 1` searches) instead of once a
+    sub-piece; a block without a finer neighbour decides each piece once;
+    and `piece_copies` walks its steps by a binary count instead of a
+    product of unequal tuples, which did not infer and was most of the
+    cost. Every schedule came out the same: the groups, stencils,
+    targets, sources, stage groups, boundary regions and message layouts
+    of 1,572 `GhostSchedule`s and `UnifySchedule`s (the closed and
+    refined test meshes and the nested mesh, `D = 1, 2, 3`, every closed
+    centering, serially and at two and three simulated ranks), compared
+    byte for byte, a rank's local groups as sorted lists — their order
+    follows `hash(::GroupKey)`, which includes the type's object id and
+    so moves with any change to the package's code. Build times, best of
+    three, at one thread and at eight (laptop, smoke), before → after: a
+    uniform periodic `8³` vertex set, `N = 8`, `G = 1`, 151 → 37 ms and 30
+    → 9 ms; a periodic `4³` brick with one root refined, `N = 16`, `G =
+    2`, cell 2.9 → 3.0 and 2.8 → 2.7 ms, vertex 21 → 6.9 and 6.4 → 3.0 ms;
+    the nested mesh, cell 7.7 → 8.0 and 4.9 → 4.6 ms, vertex 84 → 23 and
+    31 → 8.4 ms.
+    The refined box's fill is mirror-symmetric to 6.7 × 10⁻¹⁶ in 2D and
+    2.4 × 10⁻¹⁵ in 3D at a data scale of 2, against 4.7 × 10⁻⁵ under
+    half-open ownership.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  at eight threads, 176,329 tests and 728 pending (Broken) in 5m20, and
+  at one, 176,277 and 728 in 5m17, both MPI jobs included, W2v and B2
+  among their cases again; `closed_tests.jl` checks every done-when item
+  on the CPU, flat against shaped and over simulated ranks, and the MPI
+  workload's W2v and B2 cases at two and three ranks against the serial
+  run. `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32) passes,
+  20,275 tests and 39 pending in 5m43. The docs build and their doctests
+  pass. The pending tests by step, as call sites (whole testsets, loops'
+  vertex-like iterations, workload cases): step 4, 13, 20 and 8; step 6,
+  12, 10 and 12; step 7, 22, 18 and 11; step 8, 26, 8 and 4; step 3,
+  none.
+  - *Confirmed by Erik (2026-11-27)*, of the decisions above, a removed name
+    failing as a missing name: on "Throughout", "all good". The rest
+    (five sub-classes, the mid-plane to the lower fine block, merging
+    within one piece, `N ≥ 2G`) stay the review's.
+- *Step 4, reflecting and outflow faces (2026-11-26).* Implemented on
+  `m22` in four commits after a written plan reviewed as step 2's was,
+  by Claude and not by Erik: the mirror
+  and the clamp about the wall plane; stage P; `walls` removed; the
+  workloads and documents. The review's decisions on the plan, which
+  Erik has not confirmed (the stage order amends the design he approved):
+  - *The stage order is A → W → P → 0*, not A → P → W → 0 as the design
+    had it. At an edge where an outer face meets a reflecting one a value
+    the hook prescribes lies on the mirror plane, and so does the point
+    one plane in that a relative hook reads there; P after W projects
+    both, where P before W would let a prescribed nonzero odd value
+    stand. CODE.md's fill table and *Ghost filling* say so.
+  - *A mirrored restriction at `N = 2G` reads its child's closed half.*
+    The outermost ghost beyond a high wall mirrors onto the mid-plane,
+    which the halved range of phase 1 gives the lower child while the
+    wall-side source is the upper one; the upper child's low plane is a
+    secondary, legal to read after stage 0, and the read is in the
+    stencil, where `stage_groups` sees it (`mirror_restriction`).
+  - *Stage P is a copy of a block's own wall pieces onto themselves*
+    through the factor column of mirror state 2, which `parityfactors`
+    already held as `(1 + σ)/2` for the derived wall row: the column
+    stays, with a new use. No group for a piece whose variables are all
+    even; `±0` for an odd variable is accepted; `scaled` is unchanged.
+  - *`walls` is removed outright*, keyword and field, as
+    `InterfaceSchedule` was. **Migration (for step 11's release notes):**
+    drop `walls = :symmetric` or `walls = :half_open` from `FieldSet` and
+    from `GhostSchedule`'s forest form; every wall is symmetric. A set
+    that read the high wall plane of a vertex-like dimension as filled now
+    evolves it, and an odd variable on a mirror plane is zero after every
+    fill. Over a forest with reflecting faces a `GhostSchedule` or a
+    `UnifySchedule` built from a field set now serves only sets with that
+    set's parities, and refuses another with the reason; before step 4
+    one schedule served every set of the same layout, so an application
+    that shares one schedule between sets of different parities builds
+    one per set (or a `GhostSchedule` from the forest form without
+    `parity`, which builds stage P for every reflecting wall piece).
+    TreeIOHDF5 reads `fs.walls` for its `symmetric_walls` feature
+    (`hdf5.jl`), which goes in step 10.
+  - *The done-when's bitant norm* was mis-stated: the volume-weighted
+    norm is normalized, so the bitant's equals the full domain's, and its
+    `total_mass` is half; exactly on dyadic data, to a few ulp otherwise,
+    since the full domain's two halves sum their points in mirrored
+    order. PLAN.md is corrected.
+  What the code showed against the design:
+  - *The schedule needs the variables' parities* to leave out stage P
+    for even variables, so `GhostSchedule`'s forest form takes `parity`,
+    and the field-set form passes the set's over a forest with reflecting
+    faces; the fill refuses a set with other parities. Passed as a
+    `Union` it cost the schedule its inferred type (element_tests'
+    `@inferred` caught it); an empty vector, the forest form's default,
+    stands for "unknown", and the field is concretely typed. The review
+    found that `UnifySchedule` was built by the parities but did not check
+    them, so a set with an odd variable kept its wall value under a
+    schedule built for an even one; it stores and checks them now.
+  - *A closure's local `parity` in the factor column reassigned the new
+    keyword*, which Julia captures; renamed `signs`.
+  - *The tests' lockstep fill had no stage P*, and the device's packing
+    test diverged from the serial fill until it ran it.
+  - *Oracles written for half-open ownership* counted `G+1 … G+N` as the
+    owned range and clamped an outflow ghost onto `G+N`; they count the
+    own range and the wall now, and the exchange tests expect stage 0 in
+    front of phase 1. A flat-launch setup at a reflecting face, gated in
+    step 2, comes back without the assertion that a copy at a high wall
+    derives the wall plane.
+  - *Three tests of the derived wall row are replaced*: reflect_tests'
+    "The upper wall point of a vertex-like dimension is derived" by "The
+    wall point of a vertex-like dimension is evolved, an odd variable
+    zero"; bounded_tests' "A bounded derived wall point stays in its
+    bracket" by the bounded cases of closed_tests' mirror-symmetry
+    testset; gpu_tests' "symmetric walls are written on the device" by
+    "stage P projects the mirror planes on the device". test/walls_tests.jl
+    is deleted: its symmetry claims are closed_tests' "A closed box fills
+    mirror-symmetrically under every face kind" and, through a regrid, a
+    testset pending until step 6; its partition claim the reflect, outflow
+    and centering partition testsets; its 4.7 × 10⁻⁵ is this record's.
+  - *Measured* (laptop M3 Pro, Julia 1.13.4): a closed box fills
+    point-symmetrically to 0 (bit for bit) uniform and to 2.2 × 10⁻¹⁶ (1D),
+    1.3 × 10⁻¹⁵ (2D) and 4.0 × 10⁻¹⁵ (3D) refined, under outer,
+    reflecting, outflow and mixed faces alike, at a data scale of about 3.
+    The reflecting vertex wave (L2 / L∞ rate, `N = 8 … 32`), half-open
+    7d99187 → closed: `D = 1` odd 1.91 / 1.95 → 1.92 / 1.95, even 2.02 /
+    2.00 → 1.99 / 2.00; `D = 2` odd 1.96 / 2.05 → 1.95 / 2.05, even 1.99 /
+    2.00 → 1.99 / 2.00 (CODE.md records none). Stage P groups on a
+    reflecting `4³` box, 3D vertex set of three variables, `N = 16`, `G =
+    2`: none for even variables, 56 for a vector; stage 0 as the outer
+    box's, 19 + 0 uniform and 19 + 61 with a corner refined; the build 5.3
+    and 7.2 ms against 5.3 and 6.9 ms.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  at eight threads, 180,434 tests and 456 pending (Broken) in 7m13, and
+  at one, 180,382 and 456 in 6m00, both MPI jobs included with the step-4
+  cases R2v, F2, F3, BP, RH, CS and N3 at two and three ranks; a first
+  eight-thread run stalled for over twenty minutes in type inference
+  (EscapeAnalysis on a top-level testset body) in the group holding
+  element, position, outflow, glue-ball, bounded, staggered-conservative
+  and GPU tests, which alone passed in 4m08, and was killed; the rerun
+  passed. `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32)
+  passes, 21,633 tests and 21 pending in 6m16. The docs build and their
+  doctests pass. The pending tests by step, as call sites: step 6, 12
+  testsets, 10 loops and 12 workload cases; step 7, 22, 18 and 11; step
+  8, 26, 8 and 4; steps 3 and 4, none.
+  - *Confirmed by Erik (2026-11-27)*: the stage order A → W → P → 0,
+    amending the design. On "I swapped them": "agreed". That a schedule
+    is tied to its set's parities on a forest with reflecting faces stays
+    the review's: Erik answered the stage order in that group, not it.
+- *Step 5, the first measurement (2026-11-26).* Measured on clusters,
+  each study a snapshot of the step-5 branch at 96c24f6 — closed blocks
+  through step 4, with the merging prototype of 60421d6 — against the
+  half-open baseline 02bf9d1 as a variant, run after run in one job.
+  The scripts and specs are f99e866 (`bench/rhs.jl`,
+  `bench/schedule_build.jl`, `bench/nested.jl`'s first calls and
+  stages, `jobs/rhs*.toml`); step 9 brought them to `m22` without the
+  prototype. The studies were submitted by the reviewing Claude session
+  after Erik's go-ahead ("Yes, submit the step 5 studies on Symmetry";
+  then, as the GPU study waited, "consider moving them to another
+  system" and "submit the jobs to multiple clusters. cancel the others
+  once one starts"). They predate steps 6–8, the ghost-plane amendment
+  of step 6's review and step 9's schedule build; step 9 repeats them on
+  the finished branch.
+  - *Where, and the moves.* The CPU study ran on Symmetry's cn092, an
+    EPYC 7532, job 613483 (`jobs/nested.toml`); the copy kernels on one
+    H200, job 613493 (`jobs/copies.toml`); the suite on CUDA on one
+    H200, job 613500 (`jobs/gpu.toml`); the right-hand sides on an AMD
+    node and an H200, jobs 613511 and 613512 (`jobs/rhs.toml`,
+    `jobs/rhs-gpu.toml`). The four-GPU study (`jobs/nested-gpu.toml`)
+    first waited on Symmetry (613488, `QOSGrpGRES`, its start estimated
+    a day later), was moved to Trillium's GPU cluster (1415645, whose
+    estimate kept slipping), then was queued on Symmetry (613916),
+    Trillium and Fir at once; Fir started within ten minutes, and the
+    others were cancelled through `simlaunch cancel`. It ran on Fir's
+    fc10113, an EPYC 9454 with four H100s, job 6364092, under a site
+    profile of the session's own (`base = "fir"`, Erik's untouched): its
+    `mpiabi` recipe the cluster's Open MPI 4.1.5 through
+    mpi_abi_wrapper, started by the wrapper's `mpiexec` with
+    `--bind-to none`, modules `StdEnv/2023` and `cuda/12.9`, the patched
+    Julia the Alliance sites need, and `sbatch_args = ["--nodes=1"]`;
+    SimLaunch refuses `srun` for a GPU job's ranks there. Both message
+    paths, staged and direct, ran.
+  - *Two spec defects.* `julia = "1.13"`, added to run at the project's
+    floor rather than a site's newer default, cannot be combined with an
+    Alliance site's MPI recipe, which names its own Julia: Trillium
+    refused `jobs/nested-gpu.toml` until the line went (step 9 moved it
+    into `[site.symmetry]`). And the `compile-base-` runs failed: the
+    study's `test/mpi_workload.jl` uses `UnifySchedule`, which the
+    half-open baseline lacks (step 9's `bench/firstcall.jl` replaces it
+    there).
+  - *The nested mesh on the CPU* (232 leaves, `N = 16`, 20 variables,
+    `G = 3`, order 6; slowest rank, least over two rounds, ms):
+
+    | ranks × threads | base | new | new/base | stage 0 | stage P |
+    |---|---|---|---|---|---|
+    | 1 × 1 | 787.8 | 793.0 | 1.007 | 58.3 | 14.6 |
+    | 2 × 1 | 418.1 | 417.6 | 0.999 | 29.3 | 6.9 |
+    | 4 × 1 | 256.8 | 254.7 | 0.992 | 15.3 | 2.7 |
+    | 8 × 8 | 50.7 | 47.1 | 0.929 | 2.1 | 0.4 |
+
+    Phase 1 is 0.935 of the baseline's and phase 2 0.879 at one rank;
+    stage 0's packs and unpacks at two ranks 1.05 and 0.99 ms. The
+    prototype merging stage 0's restrictions across pieces (80 groups to
+    56) gave 1.006, 0.998, 0.997 and 1.003 of the default: nothing, so it
+    was not kept. `bench/ghosts.jl`, the cell-centered control, moved by
+    under 2 %.
+  - *Schedule build* (best, ms, base → new, one thread and eight):
+    uniform 512 leaves cell 7.24 → 6.83 and 1.32 → 1.35, vertex 7.15 →
+    90.97 (12.7×) and 1.44 → 15.06 (10.5×); nested cell 37.59 → 36.00 and
+    34.81 → 32.67, vertex 29.95 → 63.92 (2.13×) and 27.08 → 35.60
+    (1.31×). Step 9 took this up.
+  - *First calls* (least over three fresh processes, s, base → new):
+    the schedule's compile 4.122 → 5.922 (1.44×), the fill's 4.772 →
+    5.213 (1.09×), start to the first fill 22.546 → 27.308 (1.21×). The
+    traced `test/mpi_workload.jl` of the new version: 154.6–158.5 s over
+    1,446 methods, TreeAMR's 61.5–62.9 s over 758.
+  - *The copy kernels on one H200* (`bench/copies.jl`, uniform, vertex,
+    20 variables, `G = 3`; `fill_ghosts!`, base → new, 26 → 33 groups):
+    512 blocks of `16³` 1.750 → 2.060 ms (+18 %), 512 of `32³` 5.050 →
+    6.284 ms (+24 %), 8 of `128³` 1.024 → 1.316 ms (+29 %), the same
+    ghost points written; `scatter!` and `gather!` unchanged per own
+    point.
+  - *The nested mesh on Fir's four H100s* (`N = 32`; ms, base → new;
+    stage 0, stage P): one GPU 8.269 → 9.285 (1.123; 0.875, 0.159); two
+    staged 8.567 → 9.226 (1.077; 1.199, 0.102), direct 10.675 → 11.526
+    (1.080; 1.666, 0.101); four staged 16.674 → 16.008 (0.960; 1.709,
+    0.069), direct 10.699 → 10.292 (0.962; 1.398, 0.070).
+  - *The suite on CUDA* (one H200, Float64 and Float32): 182,062 passed,
+    468 pending, none failed, in 21 minutes, the first CUDA run of steps
+    2–4.
+  - *A right-hand side three ways* (`bench/rhs.jl`, ns an own point; a
+    at every own point, b behind `isprimary` then `unify!`, c over the
+    primaries' boxes then `unify!`; all three agree bit for bit at every
+    primary):
+
+    | mesh, backend | a | b + unify | c + unify | unify |
+    |---|---|---|---|---|
+    | uniform 16, 1 thread | 539.6 | 484.5 | 478.0 | 33.7 |
+    | uniform 32, 1 thread | 545.2 | 510.8 | 501.4 | 15.7 |
+    | nested 16, 1 thread | 541.0 | 506.2 | 494.5 | 34.9 |
+    | nested 32, 1 thread | 548.3 | 523.8 | 509.5 | 17.5 |
+    | uniform 16, 8 threads | 70.9 | 64.7 | 64.9 | 7.4 |
+    | uniform 32, 8 threads | 71.6 | 67.8 | 67.0 | 3.9 |
+    | nested 16, 8 threads | 71.0 | 67.6 | 82.5 | 7.1 |
+    | nested 32, 8 threads | 71.3 | 69.5 | 83.3 | 4.3 |
+    | uniform 16, H200 | 0.541 | 0.623 | 0.614 | 0.132 |
+    | uniform 32, H200 | 0.659 | 0.675 | 0.695 | 0.063 |
+    | nested 16, H200 | 0.560 | 1.131 | 1.336 | 0.621 |
+    | nested 32, H200 | 0.663 | 0.725 | 0.771 | 0.106 |
+
+  - *The review's reading*, its recommendations to Erik: on the CPU the
+    closed fill costs what the half-open one did; on a device it costs
+    8–12 % more on the nested mesh at one or two GPUs and 18–29 % on a
+    uniform mesh, which is stage 0's own launches; skipping
+    secondaries in a right-hand side saves 3–10 % on the CPU and loses
+    on the device in all four cases. It recommended keeping stage 0 a
+    stage of its own and not skipping by default.
+  - *Erik's decisions (2026-11-26)*, on these numbers: on stage 0 as its
+    own stage, "yes, for now. revisit this later, after stage 9"; on
+    whether `map_blocks!` skips secondaries, "no skipping by default".
+    Both are the review's recommendations. Merging stage 0 into phase 1
+    is step 9a of PLAN.md, after step 9's repeat; skipping stays the
+    caller's choice through the mask, with no keyword of its own.
+- *Step 6, regridding (2026-11-26).* Implemented on `m22` in four
+  commits after a written plan reviewed as the earlier steps' were, by
+  Claude and not by Erik: flagging over the closed box; the transfer with
+  the kept blocks' copies over the created ones; the applications and
+  workloads; the documents. *Built before step 5's cluster numbers*, an
+  ordering departure from PLAN.md that is the review's decision: the
+  plan showed nothing in step 6 depends on step 5's outcome (stage 0 its
+  own stage or merged into phase 1, `map_blocks!` skipping secondaries).
+  The review's decisions on the plan:
+  - *`regrid!` runs neither stage P nor stage 0*; the first fill or
+    `unify!` with the rebuilt schedule does, and the documents give the
+    order and what a `gather!` before it holds.
+  - *The kept-over-created pass is a second stage*, after the transfer
+    and reading the same old storage, rather than a substitution of
+    sources in `classify_regrid!`.
+  - *A vertex-like flag box is the cells touching the firing nodes*,
+    `max(1, lo − 1) … min(N, hi)`. Claude's plan had proposed clamping
+    node `N + 1` to cell `N`; the review rejected it as the half-open
+    bias again (with `buffer = 1` a firing node at `I = N` recruits the
+    high neighbour and its mirror image at `I = 2` not the low one), and
+    rejected changing `markbox` to accept `1:N+1` as well.
+  - *The precondition of the pass* — an old storage unified — is to be
+    stated and guaranteed: `regrid!` fills every set it moves before the
+    transfer, so a set whose copies drifted is unified, never moved as
+    it is.
+  - *Test the pass's claim directly*, and that two created blocks of
+    different parents agree on their plane without one; the mirror
+    testset at `N = 2G` and through refine-then-coarsen.
+  What the code showed against the plan:
+  - *The transfer's targets were already the closed ranges*: step 3's
+    `target_range` gives `regrid_stage`'s δ = 0 stencils the closed
+    range, and its halved restriction the closed halves. What changed is
+    the second stage, the refusal (now `check_closed_blocks`'), the
+    flagging sweep and the comments. A regrid's restriction reads a
+    child's own points only, so it never mirrors at a wall.
+  - *Created beside created agree bit for bit*, bounded or not, periodic
+    and at reflecting walls, D = 1–3, every vertex-like centering, on
+    uniform forests. The review then found it false in general (see the
+    follow-up below): at a concave corner the two parents read different
+    ghosts along the plane, until the ghost stages were amended.
+  - *Three pending testsets predate closed blocks*: the staggered
+    conservative regrid took its old values from unfilled data, whose
+    coarse copies on a coarse-fine face are not yet their fine primaries'
+    restriction (it unifies first now); the several-set initial-data
+    criterion took a maximum without `primaries` (it takes every copy
+    now); and the staging testset's second fill differs from its first in
+    the sign of zeros, which stage P writes as an odd value times 0 (step
+    4's accepted `±0`), so it compares bit for bit but for that.
+  - *The thread workload built its flag box by hand* from the own points,
+    and reported node `N + 1`, which `markbox` refuses; it reports the
+    touching cells now. An application that builds boxes by hand from
+    `interiorview` must do the same; `touching_cells` is internal.
+  - *Re-measured*, against the half-open baseline 02bf9d1: Burgers'
+    regrid runs (cell-centered) are unchanged bit for bit, drift / scale
+    3.33 × 10⁻¹⁶ and 5.55 × 10⁻¹⁶, the controls 3.83 × 10⁻⁵ and 5.13 ×
+    10⁻⁵. The wave's tracked pulse (vertex-centered, 1D, 22 blocks,
+    tracking 1.0) moved by more than rounding, as the closed flagging and
+    fill change which nodes fire and what the coarse-fine faces hold: the
+    adaptive run's worst error 0.023955 → 0.023510 against the uniformly
+    fine 0.023268 (M8a's record had 0.0240 against 0.0233), with a buffer
+    of 4 cells 0.024413 → 0.024518, unbuffered 0.025999 → 0.024649.
+    Every assertion holds with its tolerance unchanged. The MPI
+    workload's regrid count is 20 of the 24 before M22: the rotating
+    cases' (Q2, QE2, H2) wait for step 7.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite passes
+  after the transfer commit, 189,166 tests and 319 pending at eight
+  threads, and after the last, 189,218 and 314 in 7m08 at eight threads
+  and 189,166 and 314 in 6m21 at one, both MPI jobs included with TP,
+  BR, A2, M and E2 at two and three ranks. `gpu_tests.jl` with
+  `closed_tests.jl` on Metal (Float32) passes, 26,223 tests and 18
+  pending in 7m01, and so does `mpi_device_tests.jl` on Metal at two and
+  three ranks, 53 tests, with TP and M back and the stages with messages
+  five. The docs build and their doctests pass. The pending tests by
+  step, as call sites: step 6, none; step 7, 22 testsets, 18
+  loops and 11 workload cases; step 8, 26, 8 and 4.
+  - *Confirmed by Erik (2026-11-27)*: the decisions above. On "Step 6,
+    regridding": "all good".
+- *Step 6's review: a ghost on the extension of a face plane, and
+  fix-ups (2026-11-26).* The review's finding, by Claude and not by Erik,
+  with probes: step 3's ghost stages gave a direction's whole target,
+  closed along the tangential vertex-like dimensions, to the neighbour
+  across it, so where that neighbour is coarser and a block of the
+  target's own level holds the rows on the extension of a face plane —
+  at a concave edge or corner of a refined region — those rows held the
+  coarse interpolant. Two blocks of one level stored two values for one
+  point (8 points, 4e-5 to 2e-4, in a 2D probe); a stencil pass and
+  `unify!` broke mirror symmetry by 1.6 × 10⁻⁴, the class rule picking
+  the interpolated copy at one corner and the copied one at its image;
+  and two created blocks of different parents disagreed on their plane
+  before any fill (1 of 113 shared points in 2D vertex, 3 of 64
+  face-centered; 17 of 3912 and 48 of 1280 in 3D), so step 6's claim
+  held on uniform forests only. Implemented in three commits after a
+  plan the review approved:
+  - *The review's decision, amending the ghost stages* (Erik has not
+    confirmed it, and its commit can be reverted alone): every stored
+    copy of a point takes the value of the finest level holding it. A
+    prolongated ghost's tangential face-plane pieces whose holder on the
+    target's level is not the coarse neighbour become phase-1 copies
+    from that holder; the prolongation keeps the rest as spans
+    (`ghost_plane_parts`, `prolong_stencil_over`). Nothing splits where
+    the block sits inside the coarse neighbour, and a finer holder is
+    refused as a bug (2:1 balance forbids it). The plan had proposed a
+    stage-0 marker field in `GroupKey`; `isunify` became "a span along
+    every dimension" instead, which tells the keys apart without a new
+    field, since a ghost key keeps `-1` along the dimensions its
+    direction leaves by.
+  - *Counts*, against a651a2c: the schedules of every test forest
+    without a concave corner are the same byte for byte (the closed,
+    refined, nested, reflecting and outer forests of the dump, D = 1–3,
+    1–3 ranks), and on `bench/nested.jl`'s mesh and the step-4 boxes the
+    group counts do not move (nested: stage 0 80/1599, P 7/187, phase 1
+    124/4678, phase 2 381/1191; reflecting box uniform 19/279, 4/25,
+    63/1267; with a corner refined 80/352, 4/30, 100/1376, 91/91; outer
+    box 19/279, 26/936 and 80/352, 45/997, 61/61), so step 5's recorded
+    counts stand. The "two corners" and "diagonal" forests gain phase-1
+    groups, 18 → 22 serially in 2D vertex. The build: 28.1 → 29.8 ms on
+    the nested mesh, 7.4 → 8.1 on the refined reflecting box (laptop).
+  - *Probes*, old → new: same-level copies differing, 8 → 0; mirror
+    error after a stencil pass and `unify!`, 1.6 × 10⁻⁴ → 1.8 × 10⁻¹⁵
+    (after the fill alone 9.4 × 10⁻¹⁶ both); created blocks disagreeing
+    at the concave corner, 1/113 → 0 and 3/64 → 0.
+  - *The factor path writes `+0`* (the review's decision): `scaled` adds
+    `+0` after the factor, so a fill is bitwise idempotent; the staging
+    testset compares its second fill bit for bit again, and
+    exchange_tests' packing testset, which asserted that a mirrored zero
+    left a `−0`, asserts there is none. Step 7 inherits expectations
+    that move: the rotating and half-turn exchange testsets
+    (`nnegzero > 0`) and the MPI workload's Q2 and H2 `negzeros` count
+    turned ghosts holding `−0`, which become `+0`. This commit came
+    first, since the amendment's bitwise invariant at reflecting walls
+    needs it.
+  - *The kept-over-created pass made local*: it skips a created block
+    without a kept neighbour on its level, and each rank classifies only
+    its candidates (`kept_candidates`). Laptop, 3D vertex, `N = 16`, one
+    thread, `kept_pairs` per regrid: before, 23 / 27 ms at 512 → 960
+    leaves (a slab refined / moved) and 194 / 227 ms at 4096 → 7680;
+    after the skip, 3.3 / 4.6 and 30 / 39 ms; the slowest rank's share
+    with the candidates, 1.0 / 1.1 and 6.8 / 7.6 ms over 8 ranks, 0.2 and
+    1.4 / 1.5 over 64. `regrid_sources` takes 0.1–1.5 ms on the same
+    regrids. The serial and simulated-rank results are unchanged bit for
+    bit; the lockstep helper checks that each rank's candidates keep
+    what the whole classification keeps.
+  - *Fix-ups*: the created-beside-created claim corrected in the code,
+    the docstring, CODE.md and above; `firing_boxes`' broken paragraph
+    joined; and the flag boxes documented as cell indices `1:N`, a box
+    built by hand from a vertex-like dimension's nodes being the cells
+    touching them.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite at
+  eight threads after the amendment's commit, 189,711 tests and 314
+  pending, and after the last, 189,711 and 314 in 7m02 at eight threads
+  and 189,659 and 314 in 6m57 at one; `gpu_tests.jl` with
+  `closed_tests.jl` on Metal, 26,714 and 18 pending in 7m30; the docs
+  build and their doctests. `--trace-compile-timing` of the serial
+  `test/mpi_workload.jl`, one run each against a651a2c: 90.0 → 84.3 s in
+  all, TreeAMR's 32.1 → 36.6 s over 843 → 861 methods, the new ones the
+  schedule build's (`ghost_plane_parts`, the span stencils), none on a
+  launch path; its output differs only where a reflecting fill held a
+  `−0` (R2v, F2, F3, BP, CS, N3, M2, E2, A2's second digest) and in TP's
+  third cycle, whose regrids leave concave corners (its `l2` sum
+  0.300772035 → 0.300772032). The fill on `bench/nested.jl`'s mesh,
+  serially, 357 → 322 ms (laptop noise; no slower).
+  - *Confirmed by Erik (2026-11-27)*: the ghosts on a face plane's
+    extension taking the finest level's value, and a zero through a
+    factor written `+0`. On "Step 6, regridding": "all good".
+- *Step 7, rotating seams (2026-11-26).* Implemented on `m22`'s step-7
+  branch in four commits after a written plan reviewed as the earlier
+  steps' were, by Claude and not by Erik: the fill, `unify!` and the
+  regrid across a seam; the step-7 testsets and workload cases back; the
+  seam's own tests (`test/seam_tests.jl`); the documents. Glues (step 8)
+  were not waited for: the review's decision. The review's decisions on
+  the plan:
+  - *The orbit's primary* is the copy at the lexicographically greatest
+    real integer position at the finest level, then the class rule in the
+    real frame (`piece_primary`). Any fixed choice would do: the members
+    are computed from stencils that are each other's images, so the
+    choice only moves rounding, which CODE.md says.
+  - *The axis is projected by a dedicated kernel* in stage P, gathering
+    into a buffer and writing back, since a variable there is written
+    from several and an in-place transfer would race: behind a barrier,
+    not launched for a set whose map turns nothing, writing primaries
+    only, stage 0 carrying the result to the secondaries; CODE.md states
+    it as the one exception to "one kernel for every transfer".
+  - *No schedule is tied to the set's map*: the projection reads it at
+    fill time, in all three forms of `unify!` as in the fill.
+  - *Counting*: `primaries = true` counts each orbit once, and the norms
+    and `total_mass` take the trapezoid's weights with no seam mask;
+    CODE.md says both, with "a quarter of a `(2n+1)²` grid holds `n² + n
+    + 1` orbits", and what a `RotationPair` member's mask and sum mean
+    alone.
+  What the code showed against the plan:
+  - *`seam_shift` had already gone in step 2* (7136c4a, "Delete
+    half-open ownership's work-arounds"), with `shifted_range` and
+    `GroupKey.shift`; the step-2 record above did not say so, and
+    PLAN.md's step 7 still listed the deletion. Step 7 only corrected the
+    stale text about it in CODE.md (the half-turn slab's partition, "Two
+    owned seam planes", "Two owned seam half-planes").
+  - *The UnifySchedule's sign column ignored the orientation*: a turned
+    stage-0 transfer of a flux pair took the plain column, and the rigid
+    rotation's mass drifted by 2.6 until `factorcol` took the turn's
+    column as the GhostSchedule's does.
+  - *Summing the orbit in order left `−1.4 × 10⁻¹⁷`* of a negated
+    component on the axis, and a second fill moved it; summed in pairs a
+    half turn apart, `(t₀ + t₂) + (t₁ + t₃)`, the projection is exact and
+    idempotent bit for bit.
+  - *An asymmetric set over a quarter turn needs its partner wherever its
+    seam plane is its own*: a flux normal to `d1`, even with `G = 0`, has
+    its seam copies' primary possibly in the partner. So the fill,
+    `unify!` and `regrid!` refuse such a set alone (`seam_partnered`,
+    "Unify it as a `RotationPair`"), where before closed blocks a lone
+    flux was unified without one; the advection helpers unify their plane
+    fluxes as a pair.
+  - *The kept-over-created pass reads the new arrays*, after every set
+    has moved: across the seam a created copy's kept source may be the
+    partner's, which moves in the same regrid, so the pass runs once all
+    sets have their new storage, and `kept_candidates` takes the new
+    range. The lockstep helper's count of passes crossing ranks takes a
+    source's new owner accordingly.
+  - *A 3D face set normal to `z`* has its seam copies equal to rounding,
+    not bit for bit (≤ 16 ulp of the data): it is cell-like in the
+    plane, and a turned restriction averages its window in the reversed
+    order. A set vertex-like in the plane agrees bit for bit.
+  - *`ghost_plane_parts`' holder may lie across the seam*: it carries the
+    crossing, and the turned diagonal is copied through it; it refuses
+    only a glue (step 8).
+  - *Periodic positions are not wrapped* in `real_position`: a copy's own
+    position and its neighbours' were compared in different periods and
+    the closed periodic tests failed; without the wrap each copy's
+    position is its own block's, so every block holding the point lists
+    the same positions and decides alike, across a periodic face too.
+  Assertions that changed, none on a cell or element set's values: a
+  turned zero is `+0` (step 6's factor path), so the rotating and
+  half-turn exchange testsets and `mpi_tests`' Q2 and H2 counts assert no
+  `−0`; the seam partition counts the closed own range; a rotated level's
+  stage groups have stage 0 in front; the interface-schedule testsets,
+  which claimed nothing crosses the seam, become "a flux pair's `unify!`
+  makes the seam's copies one number through the turn" and its half-turn
+  counterpart, bit for bit, and their non-conforming-seam refusal goes,
+  since stage 0 takes the finest copy through the turn; the seam waves
+  measure their error after `unify!` of the state, as `wave.jl`'s does;
+  the zero-weight testset asserts a vertex prolongation's coincident
+  column only with a tangential dimension or a second ghost row (closed
+  blocks, step 3); the device MPI test counts one pending case (G2) and
+  seven stages with messages.
+  *Measured*, the done-when items against the half-open baseline 02bf9d1
+  (K = 1 / K = 2, 143 steps):
+  - the half plane's seam halves 8.9 × 10⁻⁶ / 4.7 × 10⁻⁵ apart → 0 over
+    79 pairs; the quadrant's seam planes 0 apart, as before;
+  - every stored point of the vertex half plane against the full plane,
+    7.8 × 10⁻⁵ / 2.1 × 10⁻⁴ → 7.6 × 10⁻¹⁴ / 3.1 × 10⁻¹³, the full
+    plane's covariance 1.0 × 10⁻³ / 3.5 × 10⁻³ → 1.1 × 10⁻¹³ / 3.2 ×
+    10⁻¹³; the vertex quadrant 1.9 × 10⁻⁴ / 3.2 × 10⁻⁴ → 1.6 × 10⁻¹³ /
+    4.3 × 10⁻¹³, its covariance 2.0 × 10⁻³ / 3.7 × 10⁻³ → 2.6 × 10⁻¹³ /
+    5.0 × 10⁻¹³; the cell sets unchanged (≤ 5.7 × 10⁻¹³);
+  - a uniform quadrant's `total_mass` against the full plane's,
+    0.29438 → 0.25000000000000006, and the normalized norm the full
+    one's to 64 ulp.
+  The wave's rates, `l2` / `linf`: the vertex quadrant 2.043 / 2.002 →
+  2.104 / 2.022 (K = 1) and 2.018 / 1.996 → 2.100 / 1.986 (K = 2); the
+  vertex half plane 2.011 / 1.923 → 2.095 / 2.022 and 2.020 / 1.981 →
+  2.024 / 1.974; the cell rates and the rigid rotations' drifts (6.1 ×
+  10⁻¹⁵ quarter, 8.1 × 10⁻¹⁵ half) unchanged. Schedules, vertex-centered,
+  `N = 16`, `G = 1`, the seam tests' forests (groups / transfers, 02bf9d1
+  → step 7): the 2D quadrant, 22 leaves, stage 0 none → 15 / 64, phase 1
+  22 / 135 and phase 2 22 / 22 unchanged, turned groups 13 → 16; the 2D
+  half plane, 44 leaves, stage 0 → 24 / 129, turned 9 → 13; the 3D
+  quadrant, 123 leaves, stage 0 → 184 / 999, phase 1 125 / 2010 → 180 /
+  2100, phase 2 268 / 706 → 303 / 713, turned 95 → 144; the 3D half
+  plane, 246 leaves, stage 0 → 225 / 1971, phase 1 103 / 4020 → 183 /
+  4200, phase 2 280 / 1412 → 372 / 1426, turned 53 → 109. The build,
+  0.3 / 0.4 / 5.5 / 7.8 ms → 0.7 / 1.1 / 19.8 / 37.9 ms; the same leaves
+  without a seam build in 0.6 / 1.1 / 19.1 / 36.9 ms, so the threefold
+  rise is closed blocks' stage 0 and `ghost_plane_parts` (steps 2–6), the
+  seam adding about 1 ms. `--trace-compile-timing` of the serial
+  `test/mpi_workload.jl` against aa30c96: 75.2 → 80.9 s in all,
+  TreeAMR's 29.4 → 31.5 s over 861 → 926 methods, with seven cases back
+  (Q2v, Q2, QE2, H2v, H2 and the two refusals); the axis kernels compile
+  once each, for the cases with an axis, `axis_project!` behind its
+  barrier (70 ms), and `transfer_kernel!`'s specializations go 55 → 59,
+  the cases' new set types.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite at eight
+  threads after the first commit, 189,715 tests and 314 pending, and
+  after the last, 198,351 and 98 pending in 16m10 at eight threads (the
+  machine shared) and 198,299 and 98 in 11m19 at one, both MPI jobs
+  included; `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32),
+  26,812 tests and 6 pending in 8m14; `mpi_device_tests.jl` on Metal at
+  two and three ranks, 61 tests, with Q2v and QP2 back and the stages
+  with messages seven; the docs build and their doctests.
+  What step 8 inherits: the glue refusal in `check_closed_blocks` and
+  `ghost_plane_parts`; its pending tests, 26 testsets, 8 loops and 4
+  workload cases (PR2v, PR2 vertex and G2 twice), step 7 having none
+  left; the orbit rule, which a glue's copies are to
+  take too, "the count's lowest patch" deciding where positions do not;
+  `seam_partnered`'s pairs, which a turn written as a glue entry (M21
+  step 3) must keep; and step 5's cluster numbers, still to be taken.
+  - *Confirmed by Erik (2026-11-27)*: the orbit's primary at the greatest
+    position, the axis projected by its own kernel, and `RotationPair`
+    required for a set asymmetric in the seam's plane and vertex-like
+    along it. On "Step 7, seams": "all agreed".
+- *Step 7's review: a pair's stage order in `unify!` (2026-11-26).* The
+  review, by Claude and not by Erik, verified step 7 by its own probe (a
+  fourfold-symmetric scalar on four quadrant forests, concave corners on
+  the seam and at the axis: every ghost beyond the seam its image's own
+  value bit for bit, the two seam faces 3.6 × 10⁻¹⁵ apart after a
+  five-point stencil and 0 after `unify!`) and found one defect by
+  reading the code: `unify!` of a `RotationPair`, in both forms, ran
+  stages P and 0 of `a` and then of `b`, so where `a`'s seam copies lie
+  on a reflecting wall plane they took `b`'s primaries before `b`'s
+  stage P had projected them, and the result depended on which member
+  was `a`. The paired fill already ran P of both before 0 of either.
+  Fixed (`unify_stage_p!`, `unify_stage_0!`); `regrid!` fills a pair
+  through the paired fill and the lockstep helper ran P of both first,
+  so neither changed. The new testset, an edge-centered pair on a 3D
+  quadrant with a reflecting low `z` wall and a variable odd in `z`,
+  fails 5 of its 9 assertions on the old order: the wall plane not zero,
+  the two orders differing, the state form and the paired fill
+  disagreeing with `unify!`. CODE.md now states the order, and the
+  rounding-only seam copies of a set cell-like in the plane as a
+  limitation.
+- *Step 8, glues (2026-11-26).* Implemented on `m22`'s step-8 branch in
+  four commits after a written plan the review approved, by Claude and
+  not by Erik: copying glues; stage A; the tests; the documents. The
+  review's decisions on the plan:
+  - *The primary across a copying glue* is the finest level's copy, then
+    the lowest patch's, then step 7's rule within that patch. Named
+    apart in the code and CODE.md: the **within-patch primary**, which
+    stage A writes on a kinked glue, and the **primary** the mask marks,
+    the lowest patch's.
+  - *Group keys carry the glue's axis map, not its table slot*: the
+    plan had proposed composed glue maps as extra table entries under
+    the `Int8` slot; the review asked for the numbers and for the map
+    alone where a copy or a restriction needs nothing else. Counted: the
+    seven-patch ball's table has 36 entries and the thirteen-patch
+    ball's 72, with 13 distinct maps each, and a signed permutation has
+    at most 47 codes in 3D (`axes_code`); the neighbor search's
+    `Crossing` keeps the slot, widened to `Int32`, with a pointed error
+    for a code that would not fit (`D ≥ 4`). No composed map was needed:
+    a copying set vertex-like along both dimensions of a patch corner is
+    refused (below).
+  - *Stage A in the axis's kernel, generalised* (`mean_gather_kernel!`),
+    with two requirements: bitwise idempotence for every member count
+    that occurs, met by `x₁ + Σ (x_m − x₁)/M`, and the axis keeping its
+    bits, met by its paired sum selected by a flag, checked against
+    fb54af7's fills and state `unify!` (2D and 3D, quarter and half
+    turns) and asserted in `seam_tests.jl` against the paired sum formed
+    in the test.
+  - *Stage A's messages*: every holder receives the other members and
+    sums them itself, one round; buffers kept with the plan, remade on a
+    change of the variable count, freed with the schedule. The axis
+    still makes its `nvars × n` buffer per call.
+  - *Both refusals kept* (no refinement boundary at a kinked glue; patch
+    corners for copying sets), as documented limitations for M21.
+  - *The baseline for M20's numbers is 02bf9d1.*
+  What the code showed against the plan:
+  - *A patch corner refuses more than before*: a copying set
+    vertex-like along both dimensions there holds points on the corner
+    line, whose copy on the patch across the corner one glue at a time
+    does not reach, so `check_patch_corners` refuses it whatever its
+    ghost widths. M17 had refused it for its ghosts already; a set
+    vertex-like along one of the two, with no ghosts along it, fills.
+  - *Conformity rules out a concave corner on a glued plane in 2D*: a
+    coarse-fine face may not cross a glue, so the refined region meets
+    the glue alike on both sides. The tests use a strip across the glue
+    in 2D, and in 3D an L whose concave edge crosses the glued plane,
+    where `ghost_plane_parts` copies 4 face-plane rows across the glue.
+  - *The phase-1 groups merge*: keying by the map put transfers across
+    every glue with one map, and identity glues with the brick's own,
+    into one group (counts below). The MPI workload therefore counts
+    its glued messages by the patches of their ends, the annulus' glue
+    being the identity.
+  - *The overhang rule* treats a block's closed range as its own, so a
+    glue stencil ending on its source block's high plane, refused under
+    the appendix at `a = 0.22` in the test, is accepted; `a = 0.2` reads
+    past it and is refused.
+  - *`check_closed_blocks` went entirely*: nothing was left in it once
+    kinked glues filled.
+  Assertions that changed: the exactness tests' polynomials (torus,
+  every centering and order, both balls) now agree on the glued faces,
+  their patch-dependent terms vanishing there, since stage A averages
+  copies that differ; the appendix testsets (layout, round trip,
+  `map_blocks!(…; appendix = true)`, allocation-free reads, `isowned`)
+  are replaced by the closed state's round trip and the refusal of
+  `appendix`; the folds count with `primaries = true`, the folded
+  pairs' totals `2(nN + 1)² − (nN + 1)` for both pairings where the
+  appendix gave `2(nN)² ∓ nN`; the seven-patch ball's distinct nodes
+  include the outer sphere, own to the outermost blocks, 15,679 →
+  17,217; the vertex-like reversal and high-to-high refusals in
+  `patch_tests.jl` became fills; the interface testset that expected a
+  coarse-fine glue reported as a bug became "unify! across a glue is the
+  brick's"; the exchange cases' data differ by patch, so that stage A's
+  mean is exercised across ranks; `mpi_tests` counts no pending case.
+  *Measured*, against 02bf9d1 (half-open, with the appendix):
+  - derivatives across the kink (the kinked pair, `n = 2, 4, 8`): first
+    9.64e-3, 6.26e-4, 3.98e-5, rates 3.94, 3.97; second 2.43e-2,
+    1.53e-3, 9.68e-5, rates 3.99, 3.98; unchanged to three digits. The
+    torus's interpolated ghosts: 1.0e-2, 1.26e-4, 2.16e-6, rates 6.31,
+    5.87, unchanged;
+  - the seven-patch ball's symmetry error 7.55e-15 → 8.88e-15 and its
+    interpolation error 5.54e-4 → 6.92e-4, and every copy of each of its
+    17,217 points one number after a fill. (The cause of the error's
+    rise given here first, "the copies now averaged", was wrong; the
+    review's correction is below.)
+  - schedules (groups / transfers; stage 0 new): the 3D brick cut and
+    refined beside the glue, phase 1 82/294 → 54/294, phase 2 104/140 →
+    86/140, stage 0 108/198, build 6.7 → 6.8 ms; the annulus refined,
+    phase 1 32/160 → 8/160, stage 0 9/64, 0.9 → 1.5 ms; the 3D layout
+    cycled with two axes reversed, refused → stage 0 33/81, phase 1
+    44/256, 4.4 ms; the kinked torus (`n = 4`), phase 1 12/168 → 8/168,
+    glue 1368 both, stage A 256 targets, 15.8 → 4.8 ms; the seven-patch
+    ball, phase 1 56/128 → 26/128, glue 44,928 → 46,872 ghosts, stage A
+    6,344 targets, 542 → 208 ms
+    (laptop; one build each of five, the minimum);
+  - `--trace-compile-timing` of the serial `test/mpi_workload.jl`
+    against fb54af7, one run each: 88.8 → 96.1 s, TreeAMR's 34.2 → 37.9 s
+    over 926 → 1010 methods, with G2 back; `transfer_kernel!`'s
+    specializations unchanged at 59, the mean kernel compiled twice (the
+    axis and stage A), behind its barriers.
+  Verified on the laptop (M3 Pro, Julia 1.13.4): the full suite at eight
+  threads after the first commit, 198,716 tests and 37 pending, and
+  after the third, 198,981 and none pending at eight threads and
+  198,929 at one, both MPI jobs included with G2 back; `gpu_tests.jl`
+  with `closed_tests.jl` on Metal (Float32), 26,851 tests, stage A on
+  the device included; `mpi_device_tests.jl` on Metal at two and three
+  ranks, 65 tests, with G2's interpolated ghosts crossing ranks; the
+  docs build and their doctests.
+  The last done-when item, the wave on the balls bounded at M20's
+  dissipation, is TreeWave's: its ball right-hand side used
+  `map_blocks!(…; appendix = true)` and `isowned`, and is measured when
+  the downstream is ported to closed blocks.
+  - *Confirmed by Erik (2026-11-27)*: the primary across a copying glue
+    (finest level, then lowest patch), keys carrying the axis map, and
+    both refusals kept with the patch-corner one widened. On "Step 8,
+    glues": "agreed".
+- *Step 8's review (2026-11-26).* The review, by Claude and not by Erik,
+  asked for the cause of the balls' larger interpolation error, since a
+  smooth function's copies at one point are equal and averaging them
+  changes nothing, and for the layouts the wider patch-corner refusal
+  changes. Measured against 02bf9d1 with the symmetry test's function,
+  ghost by ghost:
+  - every ghost of the old fill has the same error in the new one, bit
+    for bit; the maximum rises only over the ghosts that are new, the
+    face-plane rows at stored index `G + N + 1` that every glue ghost
+    region's tangential range now includes (the closed range), 1,944 on
+    the coarsest balls, the worst on a patch's edge with a lop-sided
+    window:
+
+    | ball | ghosts, old → new | max, common | max, new only |
+    |---|---|---|---|
+    | seven (2, 1) | 44,928 → 46,872 | 5.54e-4 | 6.92e-4 |
+    | seven (4, 2) | 217,728 → 221,832 | 9.58e-6 | 8.79e-6 |
+    | seven (8, 4) | 952,128 → 960,552 | 1.24e-7 | 1.13e-7 |
+    | thirteen (2, 1, 1) | 94,824 → 96,768 | 9.01e-3 | 1.20e-2 |
+    | thirteen (4, 2, 2) | 445,824 → 449,928 | 1.36e-4 | 1.57e-4 |
+
+    The overall maximum converges at the same order: rates 5.85, 6.27 →
+    6.17, 6.27 on the seven-patch ball, 6.05 → 6.26 on the
+    thirteen-patch ball. The symmetry under the cube's symmetries at the
+    coarsest size, over every ghost: seven 7.55e-15 → 8.88e-15,
+    thirteen 1.28e-13 → 1.42e-13 (aligned atlas 7.11e-14 → 1.14e-13),
+    rounding both;
+  - the wider refusal, over two L-shaped forests of three patches and
+    every 2D centering and ghost width: newly refused at a corner of two
+    low faces, a set vertex-like along both with `G = (0, 0)`, `(0, 1)`
+    or `(1, 0)`; newly filling at a corner of two high faces,
+    `(:vertex, :cell)` with `G = (0, 1)` and `(:cell, :vertex)` with
+    `G = (1, 0)`. No TreeAMR test, TreeMultiPatch or downstream builds a
+    schedule for any of them: TreeMultiPatch's vertex sets interpolate
+    across their glues, TreeWave's copying ball set builds none, and
+    TreeWaveOLDG's are element sets.
+- *Step 9, what was left in TreeAMR (2026-11-26).* Implemented on
+  `m22`'s step-9 branch after a written plan the review approved, by
+  Claude and not by Erik, in seven commits: step 8's record corrected;
+  the schedule build; compile time and the axis buffer; step 5's scripts
+  and specs; `interpolate!`'s windows tested; the documents; and
+  PrecompileTools, alone and last, for Erik to take or drop. The
+  review's decisions on the plan: a build target of at most 2× a cell
+  set's on the uniform mesh and 1.3× on the nested one, with schedules
+  byte-identical before and after and across thread counts and a memo
+  key that is complete; `@nospecialize` and barriers on host-side
+  builders, PrecompileTools as a separable commit; the axis buffer kept
+  like stage A's; step 5's scripts without the prototype; the migration
+  note in the docs.
+  - *The schedule build.* A profile (laptop, uniform `8³`, 20
+    variables, `G = 3`, order 6, one thread) put 97 % of a vertex set's
+    build in stage 0's search, block by block over 125 sub-pieces, and
+    within it a boxed closure in the sub-piece walk and products of
+    tuples of unequal lengths that did not infer. Now: a block whose
+    neighbourhood an earlier block had takes its transfers relabelled
+    (`UnifyMemo`, keyed by `neighbourhood_signature`: per direction the
+    neighbours' relative level, labels that tell repeated leaves apart,
+    child offsets; a block with a neighbour across a seam or a copying
+    glue is searched, never memoised); the ghost search hands its
+    lookups to stage 0's (`remember!`); a piece without a finer copy is
+    decided once for its sub-pieces; the search returns the mask's bits
+    for stages W and P; `GroupKey` hashes through `keyorder`. Best of
+    10–20 builds (`bench/schedule_build.jl`), against c58f07d:
+
+    | mesh | threads | vertex, before → after | cell | after / cell |
+    |---|---|---|---|---|
+    | uniform `8³` | 1 | 39.6 → 6.4 ms | 3.1–3.3 ms | 1.95–2.08 |
+    | uniform `8³` | 8 | 9.4 → 1.7 ms | 0.9 ms | 1.9 |
+    | nested | 1 | 30.2 → 14.1 ms | 10.9–11.0 ms | 1.28–1.30 |
+    | nested | 8 | 15.0 → 8.9 ms | 9.3–9.4 ms | 0.95 |
+
+    The remaining time on the uniform mesh is the ghost search shared
+    with a cell set and stage 0's lookups and signatures, a fifth of it;
+    on the nested mesh, the stencils of the extra prolongation keys
+    (`ghost_plane_parts`' spans) and the search of 155 distinct
+    neighbourhoods among 232 blocks. The schedules are the same: a
+    canonical dump of 1,826 schedules — the closed, refined, nested and
+    reflecting forests, both seams and four forests of patches, 1 to 3
+    simulated ranks, a `GhostSchedule` and a `UnifySchedule` each — is
+    byte-identical before and after and at 1 and 8 threads
+    (`closed_tests.jl` tests the memo).
+  - *Compile time.* The builders that take the build's closures
+    (`local_groups`, `state_unify_stages`, `selfimage_groups`,
+    `build_stages`, `remote_stage`) take them `@nospecialize`.
+    `bench/firstcall.jl`, the least of three fresh processes (laptop):
+    start to end 19.7 s on `main` (d24d518), 24.4 s on c58f07d, 24.5 s
+    after; the schedules' first calls 2.88, 4.76, 4.87 s; TreeAMR's
+    compile time in the trace 15.1 s over 200 methods, 19.5 s over 268,
+    19.4 s over 286. The closures' specializations were fewer than
+    expected (one a dimension), so the gain is small; PrecompileTools is
+    the larger lever (below).
+  - *The axis buffer* is kept with its points (`MeanPoints.buffer`), as
+    stage A's buffers are kept with their plan.
+  - *Step 5's scripts and specs* came in without the prototype; the
+    specs take `julia = "1.13"` on Symmetry only, gain `[site.fir]` and
+    `[site.trillium-gpu]` sections where they can run there, and the
+    `compile-` runs time `bench/firstcall.jl`, which every TreeAMR since
+    0.2 runs.
+  - *`interpolate!`'s windows* needed no change: a vertex-like stored
+    array, `G | N + 1 | G`, is symmetric under reversal. A new testset
+    checks that mirror-symmetric data interpolates to one value at a
+    point and its image, to 16 ulp, D = 1–3; on `main` it fails in 2D
+    and 3D by 4.4e-10. Left out: a point exactly on a coarse-fine face,
+    which `locate_point`'s half-open rule reads from the fine block on
+    one side and the coarse one at its image, and an odd number of
+    points, whose window sits half a node low by design.
+  - *The documents.* CODE.md's "Closed blocks" is in the present tense,
+    its per-step blocks become *Stage 0, the mask and the hook* and
+    *Across levels*, with step 5's numbers and Erik's two decisions; the
+    migration note for downstream authors is `docs/src/migration.md`,
+    linked from README.md and CODE.md; PLAN.md's step 5 is done, step 9a
+    names the revisit of stage 0, and step 10 the ball wave of step 8.
+  - *The repeat of step 5 on the finished branch*, for the review to
+    submit (the baseline variant a checkout of 02bf9d1, as in step 5;
+    `<base>` its path):
+
+        simlaunch snapshot . --study m22-step9-nested --variant base=<base>
+        simlaunch prepare m22-step9-nested --site symmetry --spec jobs/nested.toml
+        simlaunch submit m22-step9-nested jobs/nested.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-nested-gpu --variant base=<base>
+        simlaunch prepare m22-step9-nested-gpu --site fir --spec jobs/nested-gpu.toml
+        simlaunch submit m22-step9-nested-gpu jobs/nested-gpu.toml --site fir
+        simlaunch snapshot . --study m22-step9-copies --variant base=<base>
+        simlaunch prepare m22-step9-copies --site symmetry --spec jobs/copies.toml
+        simlaunch submit m22-step9-copies jobs/copies.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-gpu
+        simlaunch prepare m22-step9-gpu --site symmetry --spec jobs/gpu.toml
+        simlaunch submit m22-step9-gpu jobs/gpu.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-rhs
+        simlaunch prepare m22-step9-rhs --site symmetry --spec jobs/rhs.toml
+        simlaunch submit m22-step9-rhs jobs/rhs.toml --site symmetry
+        simlaunch prepare m22-step9-rhs --site symmetry --spec jobs/rhs-gpu.toml
+        simlaunch submit m22-step9-rhs jobs/rhs-gpu.toml --site symmetry
+        simlaunch snapshot . --study m22-step9-mpi
+        simlaunch prepare m22-step9-mpi --site trillium --spec jobs/mpi.toml
+        simlaunch submit m22-step9-mpi jobs/mpi.toml --site trillium
+        simlaunch snapshot . --study m22-step9-mpi-gpu
+        simlaunch prepare m22-step9-mpi-gpu --site trillium-gpu --spec jobs/mpi-gpu.toml
+        simlaunch submit m22-step9-mpi-gpu jobs/mpi-gpu.toml --site trillium-gpu
+
+  - *Verified* on the laptop (M3 Pro, Julia 1.13.4): the full suite at
+    eight threads after the schedule build's commit, 199,039 tests and
+    none pending, and at the end, with PrecompileTools, 199,057 at eight
+    threads in 13m29 and 199,005 at one in 12m29, both MPI jobs
+    included; `gpu_tests.jl` with `closed_tests.jl` on Metal (Float32),
+    26,909 tests; `mpi_device_tests.jl` on Metal at two and three ranks,
+    65 tests; the docs build and their doctests.
+  - *Still the review's, unconfirmed by Erik*: the amendments of steps
+    4–8 (the ghost stages' finest-level rows, step 6's review; the
+    orbit's primary and the axis kernel, step 7; map-coded keys, the
+    mean of stage A and the wider patch-corner refusal, step 8; the
+    memo, step 9); the vertex convergence table of step 3; and
+    PrecompileTools as a hard dependency.
+  - *Confirmed by Erik (2026-11-27)*: of the amendments listed as still
+    the review's, those of steps 4 (the stage order), 6, 7 and 8, each
+    with his words in its own record. The vertex convergence table of
+    step 3 and step 9's own plan decisions stay the review's.
+- *Step 9's repeat of step 5's measurements (2026-11-26).* Snapshots of
+  88c9425 against the half-open baseline 02bf9d1, submitted by the
+  review under Erik's standing permission; `CODE.md` takes its current
+  numbers from these, and step 5's stay above.
+  - *Nested mesh, CPU* (Symmetry, EPYC 7543, job 614101; step 5 had a
+    7532): fill 602.6 → 608.1 ms at 1×1 (1.009), 336.0 → 333.6 at 2×1
+    (0.993), 209.5 → 205.9 at 4×1 (0.983), 44.4 → 41.9 at 8×8 (0.944);
+    stage 0 37.6, 19.1, 10.1, 1.8 ms, stage P 7.6, 3.3, 1.9, 0.33.
+    Schedule build, base → new: uniform at one thread cell 4.91 → 3.61
+    ms, vertex 4.94 → 8.28 (1.68×); nested cell 24.9 → 23.8, vertex
+    19.7 → 25.1 (1.27×); at eight threads uniform vertex 1.18 → 2.33
+    (1.98×), nested vertex 17.9 → 18.4 (1.03×) (step 5, before the
+    memo: 12.7× and 2.13× at one thread). First calls, least of three:
+    schedule compile 3.16 → 5.68 s (1.80×), fill compile 3.53 → 3.88
+    (1.10×), start to first fill 17.2 → 23.1 (1.34×), without
+    PrecompileTools (step 5: 1.44×, 1.09×, 1.21×).
+  - *Nested mesh, four H100s* (Fir fc10203, job 6386979, `N = 32`):
+    1 GPU 8.30 → 9.19 ms (1.107), stage 0 0.83; 2 staged 1.071, 2
+    direct 1.085, 4 staged 0.988, 4 direct 0.957.
+  - *Copy kernels, one H200* (job 614151), `fill_ghosts!`, 26 → 33
+    groups: +17 % at 512 × 16³, +25 % at 512 × 32³, +29 % at 8 × 128³.
+  - *Right-hand side three ways* (jobs 614145 and 614149): the numbers
+    now in `CODE.md`, "`map_blocks!` computes at every own point".
+  - *Weak scaling, Trillium* (four nodes, job 2939500, `bench/mpi.jl`,
+    run with `--queue compute`, since SimLaunch chose `debug`, which
+    allows four nodes 15 minutes): efficiency at 32 ranks of 8 threads
+    against one rank, two-level mesh, `rhs` 0.67 at `N = 16` (3.06 →
+    4.60 ms) and 0.76 at 32, `fill_ghosts` 0.59 and 0.63; uniform `rhs`
+    0.75. M7's table on `main` (step 7, Symmetry under HPC-X) had 0.54
+    and 0.68 for `rhs`, 0.45 and 0.62 for the fill: another machine, so
+    not a comparison of the code, but the closed fill scales as the
+    half-open one did, its loss again in the step from one rank to two.
+  - *The suite on CUDA* (one H200, job 614153): every group passes but
+    the device group's `D == 2 && @test rd == rh` in "ghosts across a
+    glue and stage A run on the device", Float32, twice — the assertion
+    that fails on `main` too (`gpu_tests.jl:1197` there). Not new;
+    unexplained.
+  - *`mpi_device_tests` on Fir*: Float64 at four ranks
+    segfaulted once (job 6389475, node fc10207, staged in rank 0 and
+    direct in rank 1; Float32 and two and three ranks pass). The
+    half-open baseline passes on Fir, the same test and three
+    harness-style launches pass on fc10209 and fc10508, and the CPU
+    backend at four ranks under `--check-bounds=yes` is clean; both
+    codes are queued pinned to fc10207 to tell the node from the code.
+    *Closed (2026-11-27): the node, not the code.* Both jobs pinned to
+    fc10207 ran, each `mpi_device_tests` in Float64, staged: the
+    finished branch (study m22-step9-mpi-gpu, 88c9425; job 6421789) and
+    the half-open baseline 02bf9d1 (study m22-step9-mpi-gpu-base; job
+    6421807) alike segfaulted in the harness at ranks "2 3 4", at -n 3
+    in rank 2 (signal 11); "4" alone passed (35 and 34 tests) and the
+    workload by hand at four ranks completed (111 lines) for both. The
+    baseline, which passes on every other node, fails on fc10207 as the
+    new code does, and the failing rank count moves from run to run, so
+    it is a fault of that node, a GPU or its memory. Float64
+    `mpi_device_tests` at 2, 3 and 4 ranks on four H100s stands as
+    passing on the finished branch (fc10508, job 6416795: 95 tests).
+    Whether to report the node to the Alliance is Erik's.
+- *The device regrid's bitwise claim (2026-11-26).* "Ghosts across a
+  glue and stage A run on the device" asserted `rd == rh`, the 2D
+  regrid on the device bit for bit the host's; on CUDA it failed for
+  Float32, on `main` too (`gpu_tests.jl:1197` there), and showed in step
+  9's CUDA suite because the testset was no longer pending. The review's
+  experiment (Symmetry H200, job 614429, CUDA.jl 6.4.2) regridded in
+  Float32 on both and in Float64 on the host: 951 of 9,072 entries
+  differ, by at most 2 ulps (1.19e−7), and the device and the host are
+  each at most 2.60 ulps from the Float64 regrid. Both round the same
+  sums correctly; CUDA contracts the prolongation's multiply-adds and
+  the CPU does not. The assertion asked for more than the code
+  promises, and now compares within `gputol(T)` of the maximum, as the
+  same testset compares the fill.
+- *Steps 10e and 10f, the fallback taken out again (2026-11-27).* The
+  review's probe found what step 10d's table hid: with the centre as
+  anchor a position is `centre + k·h` in one rounding, so its error is an
+  ulp of the centre, not of the point. `[0.1, 5.1]`'s low edge came out
+  0.09999999999999953, 34 ulps of 0.1; `[1e-6, 100]`'s 9.99999993922529e-7,
+  a relative 6e-9. 10d's own table was mixed besides: the half against
+  the full box was worse than the low corner's for `c = 0.3` (11 of 25
+  nodes apart against none). Erik, on the review's report: "julia has a
+  function `range` (or `LinRange`?) which hits both interval boundaries
+  exactly. i think the idea is to use essentially linear interpolation
+  between two values (the boundary coordinates), with weights that are
+  guaranteed to vanish and the respective boundary. can we use this?
+  would this remain efficient? if so, use it. if not, let's go back to
+  the low corner as you recommend." Measured by the review (`scratchpad/
+  dd_positions.jl`, `lerp2.jl`; 3,000 random boxes per type, Float64 and
+  Float32):
+  - *`LinRange`'s lerp*, `(1 − j/n)·lo + (j/n)·hi`: both edges exact, but
+    not antisymmetric on a centred box (2,935 of 3,000), a half unequal to
+    its box (2,978), 35 % of off-zero points not the correctly rounded
+    value (422,183 of 1,210,166 in Float64), a division a coordinate.
+  - *Erik's symmetric weighted forms* (his proposal of 2026-11-27),
+    `((n − j)/n)·lo + (j/n)·hi` and `(jmax − j)/n·lo + (j − jmin)/n·hi`,
+    the same arithmetic: antisymmetric on a centred box and exact at
+    both edges, as he said; but a half differs from its box in 2,956 of
+    3,000 boxes (62 % of the half's points), 60 % of points are not the
+    correctly rounded value, two divisions a coordinate, and contracted
+    to an `fma` by a back end it loses antisymmetry in 2,973 of 3,000.
+  - *The twice-precision step*, as `range` forms its elements: the
+    spacing a pair `(h, δ)`, the reference at zero (10b's test) or the low
+    corner, a TwoSum at the end. Both edges exact in every box,
+    antisymmetric in every centred box, a half's step equal to its box's
+    in every box, correctly rounded but for one point in 5 (Float64) and
+    3 (Float32) centred boxes and 25 and 16 off-zero ones; about four
+    operations a coordinate on zero and a dozen off it, no division.
+    Step 10e began it on `eschnett-claude/m22-step-10e-range`: an
+    `isbits` `PositionReference` in `block_lows`, so that no call to
+    `nodeposition` changes (the review's choice among three options, the
+    other two a seventh argument in every port or the low corner); it
+    needed a change in TreeGRRMHD's typed `point_x` and a formula proof
+    against `fma` contraction on a device (CUDA contracts). Parked there,
+    unfinished and unmerged.
+  Erik, on the weighted forms and the twice-precision design: "this is
+  getting complicated. should we just get back to your original
+  recommendation?"; the review's recommendation was yes, and on its
+  summary of what that means — positions from zero where zero is on the
+  grid, else from the low corner; step 10d's fallback removed; the
+  twice-precision work parked unmerged; this record; CODE.md with twice
+  precision under open questions and the centred box's edge limit stated
+  — he answered "make it so". Step 10f does that: 10b's two cases, one
+  `fma`, `block_lows` plain numbers, no port change. Its tests state
+  what holds: on zero exact multiples of `h`, antisymmetry and the
+  reduced domains equal to the box bit for bit; a centred box's edges
+  exact negatives within an ulp of the extents (6.6 % and 6.0 % off, over
+  10b's sweep); off zero the low edge exact, the high within two ulps,
+  every node of `[1e-6, 100]` within two ulps of itself; no dependence on
+  the face kinds, which TreeIOHDF5's reload test now states (1165
+  tests). GH's acceptance is back: the quadrant against the box after
+  16 steps at `h = 5/48`, `4.97e−14`, the bitant `4.62e−14`. Every port's
+  suite passes with its 10b counts. The suite: 201,327 tests at eight
+  threads and 201,275 at one; Metal `gpu_tests` 2718.
+- *Step 10d, the anchor's fallback (2026-11-27).* Step 10b had left
+  open where positions are anchored when zero is not on a patch's grid,
+  the low corner as before, with Erik's own suggestion beside it. Erik
+  chose: "centre and symmetry face, unless there are disadvantages you
+  found that i haven't seen yet"; the review found none beyond its
+  table. Built per patch and dimension: zero first, then a symmetry
+  face (reflecting, or the seam's; the lower of two), then the centre,
+  `(T(lo) + T(hi))/2`. Measured on `[c − 1, c + 1]`, 48 cells, against
+  the low corner (old in brackets): mirror pairs about the centre that
+  differ, 15 (22) of 24 for `c = 0.3`, 15 (22) for 1/3, 9 (24) for 0.1,
+  12 (24) for 0.3 in `Float32`, at most an ulp; edges off their
+  extents, `c = 0.1` and the `Float32` case one ulp at the low edge
+  (old: one at the high edge), the others none; the half `[c, c + 1]`
+  reflecting at `c` against the full box, 11 (0), 14 (20), 9 (20) and 9
+  (25) of 25 nodes apart, at most 2 ulps. A reflecting high face only
+  anchors at `hi` (21 of 24 pairs apart, edges 1, 0); both reflecting
+  at `lo` (22, edges 0, 1). For `c = 0.3` the low corner had happened to
+  agree with the half on every node, and the centre does not: the
+  centre is `(T(c − 1) + T(c + 1))/2`, which is not `T(0.3)`. Where the
+  centre is the face's number and the spacings agree (`c = 0.75`,
+  `L = 5/2`) the half is the full box's upper half bit for bit. Of four
+  centre expressions, `T(lo) + (T(hi) − T(lo))/2` recovers a decimal
+  centre in 58 % of random boxes and `(T(lo) + T(hi))/2` in 48 %; the
+  latter is kept for its symmetry in the extents. Edge sweep over
+  55,200 boxes (five `c`, 368 `L`, the tests' roots and `N`): an edge
+  one ulp off in 15.1 % (`Float64`) and 16.8 % (`Float32`), never more,
+  against the low corner's high edge off in 24.5 % and 25.8 %, by up to
+  two ulps. What moved in the suite: four testsets that formed positions
+  or the domain's face from the low corner, and the node test's oracle
+  (the commit lists them). TreeIOHDF5 stores the extents, the faces and
+  the seam, and a reload derives the same anchor (a new testset there,
+  1163 tests against 1143). Every port's suite passes against the step
+  with its 10b counts: no port asserts bits or digests of an off-zero
+  domain. The suite: 201,236 tests at eight threads, 201,184 at one;
+  Metal `gpu_tests` 2718.
+- *Step 10c, a point on a coarse-fine face (2026-11-27).* The review's
+  finding: step 9's mirror test of `interpolate!` had left out the
+  points on a coarse-fine face, because `locate_point`'s half-open rule
+  read such a point from the fine block where the fine block lay above
+  it and from the coarse one where it lay below, so a point and its
+  image were read by interpolants of different levels. The review's
+  decision, unconfirmed by Erik: location follows rule 1, a point on a
+  face, edge or corner that leaves of two levels share is read from the
+  finest leaf holding it in its closed box; among leaves of one level
+  the half-open rule stays, since their copies are one number after a
+  fill. No reason to keep the half-open rule at a coarse-fine face
+  turned up: the fine copy is the primary and the coarse one its
+  restriction, the choice is a property of the tree and so the same on
+  every rank, and the extra work is at most `2^D − 1` binary searches
+  for a point exactly on a face. Moved in the suite, at 8 threads and
+  at 1 alike: the position test that a node on a face lands in the
+  block above it (12 failures, on the nodes of coarse-fine faces),
+  whose oracle now says the rule, and the element test that a query at
+  a node reproduces it (`D = 2`, `P = 4`: a node on a lower face with a
+  finer block below is now read there, 5.3 × 10⁻⁷ off against `8 eps`),
+  which now leaves such nodes out as it left the upper face's; the
+  Metal device suite passed unchanged (2718). The mirror test takes the points on `x₁ = 1` and `3`
+  back, for vertex, face and cell sets in `D = 1–3`; the distributed
+  interpolation tests, whose points include every leaf's lower corner
+  on a refined mesh, agree with serial as before. The same step
+  reordered `CODE.md`'s "Closed blocks" (model first, the three
+  paragraphs on a state's copies merged into "Copies in a state") and
+  dropped from its "Why" the present-tense ownership work-arounds: the
+  `GroupKey` fields `low` (symmetric walls), `top` (the appendix of a
+  set interpolated across a glue) and `shift` (the half turn's seam
+  slab), and the measured asymmetries, 4.7 × 10⁻⁵ in
+  `test/walls_tests.jl` and 1.1 × 10⁻² in TreeGRRMHD's refined closed
+  box, which are recorded here. Of the ports only
+  TreeGeneralizedHarmonic (its horizon finder) and TreeWaveOLDG call
+  `interpolate!`; both suites pass against the step unchanged, 6349 and
+  10410 (1 broken, as before), and GH's printed numbers differ from
+  step 10b's in timings only.
+  - *Confirmed by Erik (2026-11-27)*: a point on a coarse-fine face read
+    from the finest leaf. On "Step 10c": "yes".
+- *Step 10b, positions anchored at zero (2026-11-26).* TreeGeneralized-
+  Harmonic's quadrant against its box drifted to `1e−8` at `h = 5/48`,
+  the quadrant's corner (0) not the box's (−5/2) putting the same point
+  an ulp apart. Erik asked whether the patch's centre, or a symmetry
+  face, could be the anchor; the review answered that exactness exists
+  only for an anchor at zero and proposed anchoring at zero where zero
+  is on the patch's grid, else at the low corner; Erik: "yes, design and
+  add this." The review's decisions on the plan, unconfirmed by Erik:
+  the low corner as the fallback (his centre fallback is an open
+  question in `CODE.md`, with its table), no anchor at a zero that is a
+  cell centre only, `locate_leaf` following the anchor, and element
+  nodes' antisymmetry a conditional claim, which holds (their offsets
+  mirror exactly for `P = 1…8` in `Float64` and `Float32`). The edges
+  of a zero anchor were swept: 724 of 11,040 `Float64` boxes and 666 in
+  `Float32` have an edge one ulp off its extent, none more, all
+  antisymmetric. No base is assumed non-negative anywhere: every use of
+  `block_base(s)` and of the kernels' `bases` adds it to an index before
+  `nodeposition`, and the one `÷` near it (the element stencil's
+  `(first − G − 1) ÷ n`) does not involve the base.
+- *PrecompileTools (2026-11-26).* Asked about "PrecompileTools as a
+  dependency", Erik answered "yes, fine": step 9's last commit, the
+  precompile workload, came onto the step-10 branch as it was, and
+  PrecompileTools is a hard dependency.
+- *Step 10, the downstreams (2026-11-26).* Every downstream ported on a
+  branch of a scratch clone against this checkout (version 0.3.0, so
+  that `[compat] "0.3"` resolves), each suite against its base commit on
+  registered 0.2.12; the per-repository record is in each one's history
+  and commit messages. What it found here:
+  - *The stale secondaries.* TreeWave's sine wave, measured from the
+    state RK4 returned, lost its order at `p = 2` (L2 rate 0.54, L∞ 1.57
+    at every `N`). The review's probe located it: only the coarse
+    secondary of a coarse-fine face point drifts, by π/2 in 1D and 2.7
+    in 2D after a quarter period, independent of `N`, and at `t = 0` it
+    is the fine primary's `du` that is off (−59.08 against −39.48
+    exact, a second difference of `1.5 φ″` across a linear ghost). The
+    drift is the difference of the two stencils at one point, integrated
+    without feedback. Drift orders over `N = 8, 16, 32`, 1D/2D: 0.0/0.0
+    at `p = 2` (1.568, 1.571, 1.571 in 1D), 2.0/2.0 at `p = 4`
+    (0.0257, 0.00648, 0.00162), 2.0/2.0 at `p = 6` (0.0130, 0.00323,
+    0.000808); the unified state's L2 rates 0.97, 1.92, 1.98 in 1D.
+    Raw against unified on one adaptive case (the 2D sine wave, BS3,
+    tolerances `1e-4` and `1e-6`, `dtmax = h/2`): 46 and 61 steps
+    accepted, none rejected, raw or unified or kept unified. The price
+    of never letting the copies part, one `unify!` against one
+    right-hand side on the laptop (the sine wave's 28 blocks, `N = 16`,
+    2D; a nested 3D mesh of 498 blocks, `N = 8`): 0.24 and 0.12 of a
+    right-hand side at one thread, 0.18 and 0.11 at eight, so
+    `unify!(du)` in every evaluation of RK4 costs 11–24 % and a
+    per-step callback 3–6 % (with BS3 the callback also costs an
+    evaluation a step, 246 against 186 in all); both keep the state
+    unified to rounding at every step end (2.4e-16, and 0). The
+    migration note and "Copies in a state" in `CODE.md` say what
+    reads a raw state; which way to go is open, for Erik.
+  - *Stage W wrote reflecting faces.* `CellBoundary(g; wall =
+    :prescribed)` wrote the wall plane of a reflecting or outflow face
+    as well as the outer ones (found by the TreeBSSN and TreeWaveGR
+    ports, whose octants took the Dirichlet data on their mirror
+    planes): `wall_regions!` asked only whether a block had a neighbour
+    across. It now asks the face kind too, as `boundary_region` does.
+  - *Dirichlet hooks.* A downstream hook that was Dirichlet must now say
+    `wall = :prescribed`, or its wall plane is evolved: TreeWave's
+    closed ball lost its condition on the sphere in the first port, and
+    its energy rose once by 7 % between `t = 130` and 140; prescribed,
+    its history to `t = 640` follows M20's (the same three rises of at
+    most 0.1 %, at `t = 470`, 500, 530, from the same physical data).
+    TreeBSSN keeps its walls evolved: prescribed, its Kerr–Schild rate
+    fell from 3.70 to 3.52 against an asserted 3.7 (3.75 on 0.2.12), at
+    smaller errors. TreeWaveGR too: its holes at `v = 0.6` converge at
+    2.54 evolved and 2.44 prescribed against an asserted 2.5 (2.66 on
+    0.2.12).
+  - *Erik's decision on the stale copies (2026-11-27).* On "Callers
+    unifying before they read is the most efficient": "make it so".
+    TreeAMR never unifies a state by itself: a reader that reads a raw
+    state unifies it first, and neither `unify!(du)` in every right-hand
+    side nor a per-step callback is added. The three options' costs
+    above are the reason; the migration note's "Settle a state before
+    reading it" is the rule.
 
 ## Downstream checks
 

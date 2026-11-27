@@ -112,8 +112,15 @@ function main()
         synchronize(BACKEND)
     end
 
-    owned = nblocks(fs) * N^D
-    groups = Iterators.flatten((schedule.phase1, schedule.phase2...))
+    # Every own point the state holds: `(N + 1)^D` a block for a
+    # vertex-centered set on closed blocks (M22), every copy of a shared
+    # point; and every point the fill writes, stage 0's secondaries
+    # included.
+    owned = length(u) ÷ NVARS
+    # (A baseline without stage 0, a variant of the study that runs this
+    # file, has no `unify`.)
+    unify = hasproperty(schedule, :unify) ? schedule.unify : eltype(schedule.phase1)[]
+    groups = Iterators.flatten((unify, schedule.phase1, schedule.phase2...))
     ghosts = sum(g -> prod(TreeAMR.boxsize(g)) * TreeAMR.ntransfers(g), groups; init=0)
     nbytes = 2 * sizeof(T) * NVARS
     @printf("backend=%s T=%s threads=%d D=%d N=%d G=%d %s blocks=%d vars=%d levels=%d\n",

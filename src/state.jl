@@ -15,19 +15,14 @@
 """
     statelength(fs::FieldSet)
 
-Number of entries in this field set's state vector: `N^D · nvars ·
-nblocks`, counting interior cells only.
+Number of entries in this field set's state vector: `∏(N + c_d) · nvars ·
+nblocks`, every own point of every block, with `c_d` the stagger of
+dimension `d` ([`staggers`](@ref)): `N^D` per block and variable for a
+cell-centered or element set, and one plane more along each vertex-like
+dimension, every copy of a shared point (M22, "Closed blocks" in
+`CODE.md`).
 """
-statelength(fs::FieldSet{T,D}) where {T,D} =
-    corelength(fs) + (hasappendix(fs) ? Base.inferencebarrier(appendix_total)(fs)::Int : 0)
-
-# The appendix's length (M20), behind a barrier in `statelength`, so that
-# a set without one compiles none of its layout.
-appendix_total(fs::FieldSet) = appendix_layout(fs).total
-
-# The cores' part of the state, `N^D · nvars · nblocks`: all of it but the
-# appendix of a set interpolated across a glue (M20).
-corelength(fs::FieldSet{T,D}) where {T,D} = fs.forest.N^D * fs.nvars * nblocks(fs)
+statelength(fs::FieldSet{T,D}) where {T,D} = prod(ownextents(fs)) * fs.nvars * nblocks(fs)
 
 """
     statevector(fs::FieldSet)
@@ -44,60 +39,47 @@ function statevector(fs::FieldSet{T}) where {T}
     backend = get_backend(fs.work)
     u = allocate(backend, T, (statelength(fs),))
     zerofill!(statearray(u, fs), backend)          # first touch by block owner
-    # The appendix (M20), a few planes, after the cores.
-    hasappendix(fs) && fill!(view(u, (corelength(fs) + 1):length(u)), zero(T))
     return u
 end
 
 """
-    statearray(u, fs::FieldSet; appendix=false)
+    statearray(u, fs::FieldSet)
 
-View a flat state vector as an `(N, ..., N, nvars, nblocks)` array,
-sharing memory. This is the layout application kernels write `du` in;
-the index order matches the working array, minus the ghosts.
-
-A set interpolated across a glue (`glue = :interpolate`, M20) owns the
-high face planes of its blocks at a glued face of their patch, which
-follow the blocks' cores in the state vector. `statearray(u, fs)` is
-then the cores alone, and `statearray(u, fs; appendix = true)` the whole
-state, an [`AppendixArray`](@ref TreeAMR.AppendixArray) whose `i_d` runs
-to `N + 1` where a block owns that plane: what a right-hand side
-launched with `map_blocks!(…; appendix = true)` writes through. Its
-type is not inferred, so that no other set compiles it: hand it to a
-function or a launch, which dispatches on it once. On any other set the
-keyword changes nothing. See "Finite differences across a
-glue" in `CODE.md`.
+View a flat state vector as an `(N+c[1], ..., N+c[D], nvars, nblocks)`
+array, sharing memory, `c` the set's [`staggers`](@ref): a plain reshape.
+This is the layout application kernels write `du` in; the index order
+matches the working array, minus the ghosts.
 """
-# Constant-propagated, so that the default `appendix = false` leaves one
-# return type, the cores'.
-Base.@constprop :aggressive function statearray(u::AbstractVector, fs::FieldSet{T,D};
-                                                appendix::Bool=false) where {T,D}
+function statearray(u::AbstractVector, fs::FieldSet{T,D}; kwargs...) where {T,D}
+    check_removed_appendix(kwargs, "statearray")
     check_statelength(u, fs)
-    appendix && hasappendix(fs) && return Base.inferencebarrier(whole_statearray)(u, fs)
-    return core_statearray(u, fs)
+    shape = (ownextents(fs)..., fs.nvars, nblocks(fs))
+    return state_array(u, shape)
 end
 
-# The cores, `(N, …, N, nvars, nblocks)`: the leading `corelength` entries
-# of `u`, as the one array type `reshape(u, …)` gives, with or without an
-# appendix behind them, so that every set's `statearray` has one type and
-# a kernel taking it compiles once. On the host an `Array` over `u`'s own
-# memory; elsewhere a reshaped view, which on a device is the device's
-# own array type.
-function core_statearray(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
-    shape = (ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs))
-    return core_array(u, corelength(fs), shape)
-end
-core_array(u::AbstractVector, n::Int, shape) =
-    length(u) == n ? reshape(u, shape) : reshape(view(u, 1:n), shape)
-core_array(u::Vector, n::Int, shape) = Base.wrap(Array, u.ref, shape)
+# The state as the one array type `reshape(u, …)` gives, so that every
+# set's `statearray` has one type and a kernel taking it compiles once. On
+# the host an `Array` over `u`'s own memory; elsewhere a reshaped vector,
+# which on a device is the device's own array type.
+state_array(u::AbstractVector, shape) = reshape(u, shape)
+state_array(u::Vector, shape) = Base.wrap(Array, u.ref, shape)
 
-# The whole state of a set with an appendix (M20), behind a barrier in
-# `statearray`.
-function whole_statearray(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
-    n = corelength(fs)
-    L = appendix_cache(fs)
-    return AppendixArray(core_statearray(u, fs), view(u, (n + 1):length(u)), L.dims,
-                         L.base, L.count, fs.forest.N)
+# The keywords closed blocks (M22) replace: `appendix`, a set
+# interpolated across a glue's owned glued high face planes (M20), and
+# `closed`, the launch over the closed range, which is now every block's
+# own range. Say so, rather than a `MethodError` about a keyword.
+function check_removed_appendix(kwargs, what)
+    isempty(kwargs) && return nothing
+    haskey(kwargs, :appendix) && throw(ArgumentError(
+        "$what no longer takes `appendix`: closed blocks (M22, \"Closed blocks\" in " *
+        "CODE.md) make the planes the appendix held part of every block's own range, " *
+        "which the state and the launch cover without a keyword"))
+    haskey(kwargs, :closed) && throw(ArgumentError(
+        "$what no longer takes `closed`: closed blocks (M22, \"Closed blocks\" in " *
+        "CODE.md) make the closed range, both face planes of a vertex-like dimension, " *
+        "every block's own range, which the launch covers without a keyword; " *
+        "`stored = true` still covers every stored point"))
+    throw(ArgumentError("$what got an unsupported keyword: $(join(keys(kwargs), ", "))"))
 end
 
 function check_statelength(u::AbstractVector, fs::FieldSet)
@@ -139,7 +121,7 @@ function run_over_interiors!(kernel, fs::FieldSet{T,D}, a, b;
                              flat::Bool=flatlaunch(get_backend(fs.work))) where {T,D}
     backend = get_backend(fs.work)
     launch_positional!(kernel, backend, a, b, Val(D), Val(fs.G); flat=flat,
-                       extents=(ntuple(_ -> fs.forest.N, D)..., fs.nvars, nblocks(fs)))
+                       extents=(ownextents(fs)..., fs.nvars, nblocks(fs)))
     synchronize(backend)
     return nothing
 end
@@ -153,26 +135,8 @@ ghosts untouched. The first step of every RHS evaluation; follow it with
 """
 function scatter!(fs::FieldSet{T,D}, u::AbstractVector) where {T,D}
     check_statelength(u, fs)
-    hasappendix(fs) && (Base.inferencebarrier(scatter_appendix!)(fs, u); return fs)
     run_over_interiors!(scatter_kernel!, fs, fs.work, u)
     return fs
-end
-
-# `scatter!` and `gather!` of a set with an appendix (M20), behind a
-# barrier, so that no other set compiles their kernels.
-function scatter_appendix!(fs::FieldSet{T,D}, u::AbstractVector) where {T,D}
-    n = corelength(fs)
-    run_over_interiors!(scatter_kernel!, fs, fs.work, view(u, 1:n))
-    move_appendix!(appendix_scatter_kernel!, fs, fs.work, view(u, (n + 1):length(u)),
-                   appendix_cache(fs))
-    return nothing
-end
-function gather_appendix!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
-    n = corelength(fs)
-    run_over_interiors!(gather_kernel!, fs, view(u, 1:n), fs.work)
-    move_appendix!(appendix_gather_kernel!, fs, view(u, (n + 1):length(u)), fs.work,
-                   appendix_cache(fs))
-    return nothing
 end
 
 """
@@ -187,7 +151,6 @@ for reading results back out.
 """
 function gather!(u::AbstractVector, fs::FieldSet{T,D}) where {T,D}
     check_statelength(u, fs)
-    hasappendix(fs) && (Base.inferencebarrier(gather_appendix!)(u, fs); return u)
     run_over_interiors!(gather_kernel!, fs, u, fs.work)
     return u
 end
@@ -275,16 +238,17 @@ function stateview(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
 end
 
 """
-    statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer;
-               appendix=false)
+    statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer)
 
 The `i`-th set's segment of `u` as that set's `(N, ..., N, nvars,
 nblocks)` array, sharing memory: `statearray(stateview(u, sets, i),
-sets[i]; appendix)`.
+sets[i])`.
 """
-Base.@constprop :aggressive statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}},
-                                      i::Integer; appendix::Bool=false) =
-    statearray(stateview(u, sets, i), sets[i]; appendix=appendix)
+function statearray(u::AbstractVector, sets::Tuple{Vararg{FieldSet}}, i::Integer;
+                    kwargs...)
+    check_removed_appendix(kwargs, "statearray")
+    return statearray(stateview(u, sets, i), sets[i])
+end
 
 """
     scatter!(sets::Tuple{Vararg{FieldSet}}, u::AbstractVector)
@@ -353,46 +317,31 @@ function check_statelength(u::AbstractVector, sets::Tuple{Vararg{FieldSet}})
 end
 
 """
-    map_blocks!(kernel!, fs::FieldSet, args...; closed=false, stored=false,
-                workgroupsize=nothing, appendix)
+    map_blocks!(kernel!, fs::FieldSet, args...; stored=false, workgroupsize=nothing)
 
-Launch a KernelAbstractions kernel over every **owned** point of every
-block, with `ndrange = (N, ..., N, nblocks)`. The kernel's global index
-is therefore `(i1, ..., iD, b)` with each `i` running over `1:N`; add
-`G[d]` to reach the working array's stored indices.
-
-With `closed = true` the loop runs over the **closed** range instead —
-`N + c[d]` per dimension, so a vertex-like dimension also covers the
-shared boundary plane (see [`closedview`](@ref)). That is what a
-quantity defined on a block's faces wants: a flux has `N+1` faces per
-dimension, not `N`, and the extra one is the block's own high face. In a
-cell-centered field set the two are the same loop.
-
-On a set interpolated across a glue (M20), which owns the high face
-planes of its blocks at a glued face of their patch, `appendix` is
-required: with `appendix = true` the loop runs over the closed range, and
-a right-hand side written through [`statearray`](@ref)`(du, fs; appendix
-= true)` reaches the planes a block owns and drops the rest, which
-[`isowned`](@ref) lets the kernel skip; with `false` it runs over the
-owned range alone, and the appendix entries of `du` are left as they
-were — not zeroed, so a right-hand side that does not compute them must
-set them itself. On any other set it is ignored.
+Launch a KernelAbstractions kernel over every **own** point of every
+block, with `ndrange = (N+c[1], ..., N+c[D], nblocks)`, `c` the set's
+[`staggers`](@ref): `N` points along a cell-like dimension, and `N + 1`
+along a vertex-like one, both face planes, which the block owns (M22,
+"Closed blocks" in `CODE.md`); a flux has `N+1` faces per dimension. The
+kernel's global index is therefore `(i1, ..., iD, b)`, each `i` an index
+into the own range, and it adds `G[d]` to reach the working array's
+stored indices; it is also the index of [`statearray`](@ref).
 
 With `stored = true` the loop runs over every **stored** point of every
 block, ghosts included — `ndrange = (size(fs.work)[1:D]..., nblocks(fs))`,
 that is `N + 2G[d] + c[d]` per dimension.
 
-!!! warning "The three forms index differently"
+!!! warning "The two forms index differently"
     Under `stored = true` the kernel's global index **is** the stored
-    index: there is nothing to add. Under the default and under
-    `closed = true` it is an offset into the owned range and the kernel
-    adds `G[d]`. A kernel written for one form is wrong under the other
-    — silently so, since both are in bounds — so a kernel meant for the
-    stored form should not add `G` anywhere.
+    index: there is nothing to add. Under the default it is an offset
+    into the own range and the kernel adds `G[d]`. A kernel written for
+    one form is wrong under the other — silently so, since both are in
+    bounds — so a kernel meant for the stored form should not add `G`
+    anywhere.
 
-`stored = true` together with `closed = true` is an error: the closed
-range is a sub-range of the stored one, so asking for both is a
-contradiction.
+The `closed` keyword of half-open blocks is gone with them: its range is
+the default's.
 
 The stored form exists because a pointwise pass sometimes has to cover
 the ghosts too. The case that asked for it is a hydrodynamics code
@@ -442,40 +391,132 @@ end
 ```
 """
 function map_blocks!(kernel!, fs::FieldSet{T,D}, args...;
-                     closed::Bool=false, stored::Bool=false,
-                     workgroupsize=nothing,
-                     appendix::Union{Bool,Nothing}=nothing) where {T,D}
-    # A set with an appendix (M20) says whether the launch covers it: a
-    # right-hand side that forgot it would leave its planes unevolved.
-    if hasappendix(fs)
-        appendix === nothing && throw(ArgumentError(
-            "this field set owns the high face planes of its blocks at a glued face " *
-            "(its appendix, closed ownership across a glue), so map_blocks! needs " *
-            "`appendix = true` or `false`: with `true` the launch covers the closed " *
-            "range and the kernel writes through `statearray(du, fs; appendix = true)`, " *
-            "which keeps the planes a block owns and drops the rest; with `false` it " *
-            "covers the cores alone, and a right-hand side then leaves the appendix " *
-            "unevolved (CODE.md, \"Finite differences across a glue\")"))
-        appendix && (stored && throw(ArgumentError(
-            "map_blocks! takes `appendix = true` or `stored = true`, not both: the " *
-            "appendix is a set of owned planes, which the closed range covers"));
-                     closed = true)
-    end
-    stored && closed && throw(ArgumentError(
-        "map_blocks! takes `closed = true` or `stored = true`, not both: the " *
-        "closed range G+1 … G+N+c is a sub-range of the stored one 1 … N+2G+c, " *
-        "so asking for both names two different loops. Pass `stored = true` for " *
-        "every stored point, ghosts included, and `closed = true` for the owned " *
-        "points plus the shared boundary plane."))
+                     stored::Bool=false, workgroupsize=nothing, kwargs...) where {T,D}
+    check_removed_appendix(kwargs, "map_blocks!")
     backend = get_backend(fs.work)
-    c = staggers(fs)
-    extent = stored ? ntuple(d -> size(fs.work, d), D) :
-             ntuple(d -> fs.forest.N + (closed ? c[d] : 0), D)
+    extent = stored ? ntuple(d -> size(fs.work, d), D) : ownextents(fs)
     launch_by_owner!(kernel!, backend, args...; ndrange=(extent..., nblocks(fs)),
                      workgroupsize=workgroupsize)
     synchronize(backend)
     return nothing
 end
+
+# --- The primary mask (M22) ----------------------------------------------------
+
+"""
+    PrimaryMask
+
+Which own points of a field set are **primaries**: of the copies of a
+point that several blocks hold, on a face plane of a vertex-like
+dimension, the one on the block lying lowest along the dimensions the
+point is shared in, for which it lies on high face planes (M22, "Closed
+blocks" in `CODE.md`). One bit per piece of a block's closed box —
+along each vertex-like dimension its low face plane, its open interior or
+its high face plane, `3^D` pieces — since whether a block's copy is the
+primary is the same at every point of a piece, on a mesh of several levels
+too: a piece facing a finer block is secondary everywhere, the finer copy
+winning. Every point of a cell-centered or element set is a primary.
+
+Built by [`primary_mask`](@ref) and asked by [`isprimary`](@ref); it is
+`isbits` once on its backend, so a kernel takes it as an argument.
+"""
+struct PrimaryMask{D,V<:AbstractVector{UInt32}}
+    pieces::V                      # per local block, bit `Σ cls_d 3^(d-1)`
+    N::Int
+    c::NTuple{D,Int8}
+end
+
+Adapt.adapt_structure(to, m::PrimaryMask) =
+    PrimaryMask(Adapt.adapt(to, m.pieces), m.N, m.c)
+
+"""
+    isprimary(mask::PrimaryMask, i1, …, iD, b) -> Bool
+
+Whether own point `(i1, …, iD)` of local block `b` is the primary copy of
+its point (see [`PrimaryMask`](@ref)): the indices are those
+[`map_blocks!`](@ref) hands a kernel, each in `1:N`, or `1:N+1` along a
+vertex-like dimension, and those of [`statearray`](@ref). A right-hand side
+that computes the primaries only returns early where this is `false`, and
+must then call [`unify!`](@ref) on `du`, which gives every secondary its
+primary's value; a reduction that takes each point once asks it through
+its `primaries` keyword. It costs a load and a few comparisons, and works
+in a device kernel.
+"""
+@inline function isprimary(m::PrimaryMask{D}, I::Vararg{Integer}) where {D}
+    length(I) == D + 1 || throw(ArgumentError(
+        "isprimary takes a point's $D own indices and its block, (i1, …, iD, b), " *
+        "the global index of a map_blocks! kernel; got $(length(I)) numbers"))
+    cls = ntuple(d -> m.c[d] == 0 ? 1 : I[d] == 1 ? 0 : I[d] == m.N + 1 ? 2 : 1, Val(D))
+    piece = sum(ntuple(d -> cls[d] * 3^(d - 1), Val(D)))
+    return (@inbounds(m.pieces[Int(I[D + 1])]) >> piece) & 0x1 == 0x1
+end
+
+"""
+    primary_mask(fs::FieldSet) -> PrimaryMask
+
+The [`PrimaryMask`](@ref) of `fs`'s blocks, on its backend: built from the
+forest's topology and the set's centering once per change of the forest
+and kept with the set. Over a distributed forest each rank's mask is its
+own blocks', decided by a local rule that asks for no index, so every
+rank agrees on every point.
+"""
+function primary_mask(fs::FieldSet{T,D}) where {T,D}
+    backend = get_backend(fs.work)
+    V = typeof(todevice(backend, UInt32[]))
+    g = generation(fs.forest)
+    cached = fs.primary
+    cached !== nothing && cached[1] == g && return cached[2]::PrimaryMask{D,V}
+    forest = fs.forest
+    c = staggers(fs)
+    range = blockrange(forest)
+    pieces = Vector{UInt32}(undef, length(range))
+    # Across a glue the set is interpolated at, the copies of a point are
+    # the patches' within-patch primaries, of which the lowest patch's is
+    # the primary (M22 step 8, `glue_lowest_bits`).
+    kinked = fs.glue === :interpolate && ispatched(forest)
+    threaded_foreach(length(range)) do b
+        j = first(range) + b - 1
+        bits = primary_bits(forest, j, c; acrossglue=!kinked)
+        pieces[b] = kinked ? Base.inferencebarrier(glue_lowest_bits)(forest, j, c, fs.G,
+                                                                    bits)::UInt32 : bits
+    end
+    mask = PrimaryMask{D,V}(todevice(backend, pieces), forest.N, map(Int8, c))
+    fs.primary = (g, mask)
+    return mask
+end
+
+# The mask of a reduction that takes every own point, and the test of one.
+struct NoMask end
+@inline counted(::NoMask, I, b) = true
+@inline counted(m::PrimaryMask, I, b) = isprimary(m, I..., b)
+
+# Whether a reduction over `fs` takes the primaries only (M22): `primaries`
+# is required for a set with a vertex-like dimension, where a sum or a
+# count that silently took a shared point at every copy is the mistake to
+# prevent, and means nothing for any other set, every point of which is a
+# primary.
+function count_primaries(fs::FieldSet, primaries, what::AbstractString)
+    any(==(:vertex), fs.centering) || return false
+    primaries === nothing && throw(ArgumentError(
+        "$what over a set with a vertex-like dimension (centering $(fs.centering)) " *
+        "needs `primaries = true` or `false`: such a set's blocks own both face planes " *
+        "(M22, \"Closed blocks\" in CODE.md), so a point on a block face has a copy on " *
+        "every block that holds it. `true` takes each point once, at its primary — " *
+        "what a sum or a count wants; `false` takes every copy, which is right for a " *
+        "maximum or a minimum."))
+    return primaries::Bool
+end
+
+# The reduction masked to the primaries, as a fold: point by point, every
+# selected variable at a point in turn. Behind a barrier, so that no set
+# without a vertex-like dimension compiles it.
+function primary_mapreduce(f, op, init, array, fs::FieldSet, g, vars::UnitRange{Int})
+    rf(acc, p) = foldvalues(f, op, acc, p.u)
+    return _block_fold(rf, op, init, array, fs, g, vars, nothing; mask=primary_mask(fs))
+end
+@inline foldvalues(f, op, acc, ::Tuple{}) = acc
+@inline foldvalues(f, op, acc, u::Tuple) =
+    foldvalues(f, op, op(acc, f(first(u))), Base.tail(u))
 
 # Per-block reductions.
 #
@@ -541,11 +582,11 @@ const REDUCE_LANES = 256
 # `init`, into its own slot.
 @kernel function block_partials_kernel!(partials, @Const(array), f, op, init,
                                         firstvar::Int, lastvar::Int,
-                                        ::Val{D}, ::Val{G}, ::Val{N},
-                                        ::Val{W}) where {D,G,N,W}
+                                        ::Val{D}, ::Val{G}, ::Val{E},
+                                        ::Val{W}) where {D,G,E,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
-    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    cells = CartesianIndices(E)
     ncells = length(cells)
     acc = init
     for j in l:W:(ncells * (lastvar - firstvar + 1))
@@ -567,15 +608,6 @@ end
     values[b] = acc
 end
 
-# `block_mapreduce` over a set with an appendix, as a fold.
-function appendix_mapreduce(f, op, init, array, fs::FieldSet, g, vars::UnitRange{Int})
-    rf(acc, p) = foldvalues(f, op, acc, p.u)
-    return _block_fold(rf, op, init, array, fs, g, vars, nothing)
-end
-@inline foldvalues(f, op, acc, ::Tuple{}) = acc
-@inline foldvalues(f, op, acc, u::Tuple) =
-    foldvalues(f, op, op(acc, f(first(u))), Base.tail(u))
-
 # The device path: two launches, one synchronization, one copy back.
 function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
                                  backend::Backend, g::NTuple{D,Int},
@@ -587,7 +619,7 @@ function _block_mapreduce_device(f, op, init::R, array, fs::FieldSet{T,D},
     values = allocate(backend, R, (n,))
     block_partials_kernel!(backend)(partials, array, f, op, init,
                                     first(vars), last(vars),
-                                    Val(D), Val(g), Val(fs.forest.N), Val(W);
+                                    Val(D), Val(g), Val(ownextents(fs)), Val(W);
                                     ndrange=W * n)
     fold_lanes_kernel!(backend)(values, partials, op, Val(W); ndrange=n)
     synchronize(backend)
@@ -601,8 +633,8 @@ end
 function _block_mapreduce_host(f, op, init::R, array, fs::FieldSet{T,D},
                                g::NTuple{D,Int},
                                vars::UnitRange{Int}) where {R,T,D}
-    N = fs.forest.N
-    inner = ntuple(d -> (g[d] + 1):(g[d] + N), D)
+    E = ownextents(fs)
+    inner = ntuple(d -> (g[d] + 1):(g[d] + E[d]), D)
     values = Vector{R}(undef, nblocks(fs))
     threaded_foreach(nblocks(fs)) do b
         values[b] = mapreduce(f, op, view(array, inner..., vars, b); init=init)
@@ -646,9 +678,7 @@ lane, not once per block.
 
 The first form reads the working array's interiors, skipping the ghosts;
 the second reads a state vector, which has no ghosts to skip. `vars` is
-an integer or a contiguous range of variable indices. A set interpolated
-across a glue reduces its appendix too, counting each glued face point
-once, as [`mesh_fold`](@ref) does, through which it runs.
+an integer or a contiguous range of variable indices.
 
 This is the read-side counterpart of [`map_blocks!`](@ref), and it is
 the shape every diagnostic here has. Combining the values is left to the
@@ -691,33 +721,24 @@ reproducible from run to run, since the lane fold has a fixed order.
     `oftype(x, 2)` rather than closing over `T` and calling `T(2)`. The
     same rule covers captured arrays and any mutable state.
 """
-function block_mapreduce(f, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars) where {T,D}
-    return _block_mapreduce(f, op, init, fs.work, fs, fs.G,
-                            _varrange(vars, fs.nvars))
+function block_mapreduce(f, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars,
+                         primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_mapreduce")
+    return _block_mapreduce(f, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars),
+                            once)
 end
 
 function block_mapreduce(f, op, init, fs::FieldSet{T,D}, u::AbstractVector;
-                         vars=1:fs.nvars) where {T,D}
-    # A set with an appendix (M20) reads it too, behind a barrier: the
-    # `AppendixArray` is a type of its own.
-    hasappendix(fs) &&
-        return Base.inferencebarrier(_block_mapreduce)(f, op, init,
-                                                       statearray(u, fs; appendix=true), fs,
-                                                       ntuple(_ -> 0, D),
-                                                       _varrange(vars, fs.nvars))::Vector{typeof(init)}
+                         vars=1:fs.nvars, primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_mapreduce")
     return _block_mapreduce(f, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
-                            _varrange(vars, fs.nvars))
+                            _varrange(vars, fs.nvars), once)
 end
 
 function _block_mapreduce(f, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
-                          vars::UnitRange{Int}) where {R,T,D}
-    # A set with an appendix (M20) reduces through the fold, which visits
-    # the appendix and counts a glued face point once: point by point,
-    # every selected variable at a point in turn. Behind a barrier, so
-    # that no other set compiles it.
-    hasappendix(fs) &&
-        return Base.inferencebarrier(appendix_mapreduce)(f, op, init, array, fs, g,
-                                                         vars)::Vector{R}
+                          vars::UnitRange{Int}, once::Bool=false) where {R,T,D}
+    once && return Base.inferencebarrier(primary_mapreduce)(f, op, init, array, fs, g,
+                                                            vars)::Vector{R}
     backend = get_backend(array)
     return backend isa CPU ?
            _block_mapreduce_host(f, op, init, array, fs, g, vars) :
@@ -759,14 +780,15 @@ mass = mesh_mapreduce(identity, +, zero(T), fs; vars=2,
                       weight=key -> spacing(T, fs.forest, key)^D)
 ```
 """
-function mesh_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars, weight=nothing)
-    values = block_mapreduce(f, op, init, fs; vars=vars)
+function mesh_mapreduce(f, op, init, fs::FieldSet; vars=1:fs.nvars, weight=nothing,
+                        primaries=nothing)
+    values = block_mapreduce(f, op, init, fs; vars=vars, primaries=primaries)
     return combine_blocks(op, init, fs, values, weight)
 end
 
 function mesh_mapreduce(f, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars,
-                        weight=nothing)
-    values = block_mapreduce(f, op, init, fs, u; vars=vars)
+                        weight=nothing, primaries=nothing)
+    values = block_mapreduce(f, op, init, fs, u; vars=vars, primaries=primaries)
     return combine_blocks(op, init, fs, values, weight)
 end
 
@@ -924,9 +946,9 @@ What a fold's `rf` is handed for each owned point (see
 - `p.h`: the block's spacing, so `p.h^D` is the point's volume weight;
 - `p.level`: the block's refinement level;
 - `p.tag`: the block's value of the fold's `tag` function, or `nothing`;
-- `p.I`: the owned index, each entry in `1:N` (add `G[d]` for the
-  stored index, as in [`map_blocks!`](@ref)), or `N + 1` on an appendix
-  plane of a set interpolated across a glue;
+- `p.I`: the own index, each entry in `1:N`, or `1:N+1` along a
+  vertex-like dimension (add `G[d]` for the stored index, as in
+  [`map_blocks!`](@ref));
 - `p.b`: the local block index.
 """
 struct FoldPoint{D,NV,T,TG}
@@ -964,24 +986,24 @@ end
 # Lane `l` of block `b` folds points `l, l + W, …` of the block, in
 # linear order with the first dimension fastest, into its own slot. The
 # position is formed by `coordinates_kernel!`'s expression, on the same
-# origin and spacing in the same order, so it reproduces `coordinates`
+# corner and spacing in the same order, so it reproduces `coordinates`
 # bit for bit.
 @kernel function fold_points_kernel!(partials, @Const(array), rf, init,
-                                     @Const(origins), @Const(spacings), nodes,
+                                     @Const(lows), @Const(bases), @Const(spacings), nodes,
                                      @Const(levels),
-                                     tags, masks, firstvar::Int,
-                                     ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N}, ::Val{NV},
-                                     ::Val{W}) where {D,G,C,N,NV,W}
+                                     tags, mask, firstvar::Int,
+                                     ::Val{D}, ::Val{G}, ::Val{C}, ::Val{E}, ::Val{NV},
+                                     ::Val{W}) where {D,G,C,E,NV,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
-    origin, h = origins[b], spacings[b]
-    lev, tag, mask = levels[b], tags[b], masks[b]
-    cells = CartesianIndices(ntuple(_ -> N + fold_extra(masks), Val(D)))
+    lo, B, h = lows[b], bases[b], spacings[b]
+    lev, tag = levels[b], tags[b]
+    cells = CartesianIndices(E)
     acc = init
     for j in l:W:length(cells)
         I = Tuple(cells[j])
-        counted(mask, I, N) || continue
-        x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+        counted(mask, I, b) || continue
+        x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
         c = ntuple(d -> I[d] + G[d], Val(D))
         u = ntuple(v -> array[c..., firstvar + v - 1, b], Val(NV))
         acc = rf(acc, FoldPoint(u, x, h, lev, tag, I, b))
@@ -1026,8 +1048,12 @@ end
 # state array at `g = 0` — with `W` lanes per block: 1 on the CPU, and
 # `fold_lanes(R)` on a device unless the caller says otherwise, which the
 # tests do to reach the device path on `CPU()`.
+#
+# `mask` is `NoMask()` for every own point, or the set's `PrimaryMask` for
+# the primaries only (M22).
 function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
-                     vars::UnitRange{Int}, tag, lanes=nothing) where {R,T,D}
+                     vars::UnitRange{Int}, tag, lanes=nothing;
+                     mask=NoMask()) where {R,T,D}
     forest = fs.forest
     backend = get_backend(array)
     tags = fold_tags(backend, tag, forest)
@@ -1036,21 +1062,13 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     n = nblocks(fs)
     n == 0 && return R[]
     W = lanes !== nothing ? Int(lanes) : backend isa CPU ? 1 : fold_lanes(R)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     levels = todevice(backend, Int[level(k) for k in localleaves(forest)])
     partials = allocate(backend, R, (W, n))
-    # A set with an appendix (M20) visits its appendix planes too, and a
-    # glued face point at one copy only: its masks, behind a barrier, so
-    # that no other set compiles that kernel.
-    args = (backend, partials, array, rf, init, origins, spacings, levels, tags, fs,
-            first(vars), g, Val(NV), Val(W))
-    if hasappendix(fs)
-        Base.inferencebarrier(launch_fold!)(Base.inferencebarrier(fold_masks)(backend, fs),
-                                             args...)
-    else
-        launch_fold!(NoMasks(), args...)
-    end
+    launch_fold!(backend, partials, array, rf, init, lows, bases, spacings, levels, tags,
+                 mask, fs, first(vars), g, Val(NV), Val(W))
     if W == 1
         synchronize(backend)
         return tohost(vec(partials))
@@ -1061,13 +1079,14 @@ function _block_fold(rf, op, init::R, array, fs::FieldSet{T,D}, g::NTuple{D,Int}
     return tohost(values)
 end
 
-function launch_fold!(masks, backend, partials, array, rf, init, origins, spacings,
-                      levels, tags, fs::FieldSet{T,D}, firstvar::Int, g::NTuple{D,Int},
+function launch_fold!(backend, partials, array, rf, init, lows, bases, spacings,
+                      levels, tags, mask, fs::FieldSet{T,D}, firstvar::Int,
+                      g::NTuple{D,Int},
                       nv::Val, w::Val{W}) where {T,D,W}
     with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, origins,
-                         spacings, nodes, levels, tags, masks, firstvar, Val(D), Val(g),
-                         Val(staggers(fs)), Val(fs.forest.N), nv, w;
+        launch_by_owner!(fold_points_kernel!, backend, partials, array, rf, init, lows,
+                         bases, spacings, nodes, levels, tags, mask, firstvar, Val(D),
+                         Val(g), Val(staggers(fs)), Val(ownextents(fs)), nv, w;
                          ndrange=(W * nblocks(fs),))
     end
     return nothing
@@ -1084,21 +1103,26 @@ is the per-block half of [`mesh_fold`](@ref), which says what `rf`, `op`,
 for [`block_mapreduce`](@ref).
 """
 function block_fold(rf, op, init, fs::FieldSet{T,D}; vars=1:fs.nvars,
-                    tag=nothing) where {T,D}
-    return _block_fold(rf, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars), tag)
+                    tag=nothing, primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_fold")
+    return fold_masked(once, rf, op, init, fs.work, fs, fs.G, _varrange(vars, fs.nvars),
+                       tag)
 end
 
 function block_fold(rf, op, init, fs::FieldSet{T,D}, u::AbstractVector; vars=1:fs.nvars,
-                    tag=nothing) where {T,D}
-    # The appendix (M20) behind a barrier, as in `block_mapreduce`.
-    hasappendix(fs) &&
-        return Base.inferencebarrier(_block_fold)(rf, op, init,
-                                                  statearray(u, fs; appendix=true), fs,
-                                                  ntuple(_ -> 0, D),
-                                                  _varrange(vars, fs.nvars), tag)::Vector{typeof(init)}
-    return _block_fold(rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
+                    tag=nothing, primaries=nothing) where {T,D}
+    once = count_primaries(fs, primaries, "block_fold")
+    return fold_masked(once, rf, op, init, statearray(u, fs), fs, ntuple(_ -> 0, D),
                        _varrange(vars, fs.nvars), tag)
 end
+
+# The fold over every own point, or behind a barrier over the primaries,
+# so that no set without a vertex-like dimension compiles the masked one.
+fold_masked(once::Bool, rf, op, init::R, args...) where {R} =
+    once ? Base.inferencebarrier(fold_primaries)(rf, op, init, args...)::Vector{R} :
+    _block_fold(rf, op, init, args...)
+fold_primaries(rf, op, init, array, fs, g, vars, tag) =
+    _block_fold(rf, op, init, array, fs, g, vars, tag; mask=primary_mask(fs))
 
 """
     mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
@@ -1130,11 +1154,7 @@ The first form reads the working array, skipping the ghosts; the second
 reads a state vector. Either way the points are exactly the owned points
 [`map_blocks!`](@ref) visits, `N` per dimension, so a vertex-centered
 block's shared upper plane is not counted and every physical point is
-counted once. A set interpolated across a glue (`glue = :interpolate`)
-also owns its blocks' glued high face planes, its appendix: those are
-visited too, and a point on a glued face, which every patch holding it
-owns, is counted at one copy, the lowest patch's (see "Finite
-differences across a glue" in `CODE.md`).
+counted once.
 
 The laws are those that let a block be split across a device's lanes:
 `op` is associative, to roundoff at least; `op(init, init) == init`; and
@@ -1178,14 +1198,15 @@ l2 = sqrt(r.sq[1].value / r.n.value)
     accumulator lives in each lane's registers; a large one spills,
     which costs time but not correctness.
 """
-function mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing)
-    values = block_fold(rf, op, init, fs; vars=vars, tag=tag)
+function mesh_fold(rf, op, init, fs::FieldSet; vars=1:fs.nvars, tag=nothing,
+                   primaries=nothing)
+    values = block_fold(rf, op, init, fs; vars=vars, tag=tag, primaries=primaries)
     return combine_blocks(op, init, fs, values, nothing)
 end
 
 function mesh_fold(rf, op, init, fs::FieldSet, u::AbstractVector; vars=1:fs.nvars,
-                   tag=nothing)
-    values = block_fold(rf, op, init, fs, u; vars=vars, tag=tag)
+                   tag=nothing, primaries=nothing)
+    values = block_fold(rf, op, init, fs, u; vars=vars, tag=tag, primaries=primaries)
     return combine_blocks(op, init, fs, values, nothing)
 end
 
@@ -1214,7 +1235,7 @@ thread counts as well.
 """
 function volume_weighted_norm(fs::FieldSet{T,D}, u::AbstractVector; p::Real=2) where {T,D}
     R = float(real(T))
-    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u)
+    isinf(p) && return mesh_mapreduce(abs, max, zero(R), fs, u; primaries=false)
     total, volume = norm_parts(fs, u, p)
     volume == 0 && return zero(R)
     # `inv(R(p))`, not `1 / p`: the latter is a Float64 exponent, which
@@ -1270,6 +1291,27 @@ function element_quadrature(f, ::Type{R}, array, fs::FieldSet{T,D}, g::NTuple{D,
     return _block_fold(rf, +, zero(R), array, fs, g, vars, nothing)
 end
 
+# The trapezoid's quadrature of a set with a vertex-like dimension (M22),
+# per block: `Σ w f(u)` over the own points of `array` and the variables
+# `vars`, `w` the product over the vertex-like dimensions of ½ on a face
+# plane and 1 between. Summed over the blocks, a shared point then has its
+# weight in the composite rule — two halves on a plane between blocks, a
+# half at a wall — so a constant is its own norm with no mask. The block's
+# `hᴰ` is left to `combine_blocks`, as for a cell-centered set.
+function trapezoid_quadrature(f, ::Type{R}, array, fs::FieldSet{T,D}, g::NTuple{D,Int},
+                              vars::UnitRange{Int}) where {R,T,D}
+    c, N = staggers(fs), fs.forest.N
+    function rf(acc, p)
+        half = one(acc) / 2
+        w = prod(ntuple(d -> c[d] == 1 && (p.I[d] == 1 || p.I[d] == N + 1) ? half :
+                             one(acc), Val(D)))
+        return acc + w * sum(f, p.u)
+    end
+    return _block_fold(rf, +, zero(R), array, fs, g, vars, nothing)
+end
+trapezoid_quadrature_barrier(f, ::Type{R}, args...) where {R} =
+    Base.inferencebarrier(trapezoid_quadrature)(f, R, args...)::Vector{R}
+
 # `element_quadrature` behind `Base.inferencebarrier`, for the callers
 # that branch on `fs.P` at run time: inferred, the element branch would
 # compile a second fold kernel for every cell or vertex set's norm and
@@ -1294,7 +1336,12 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
     # returns `Any`, which cost the norm a dynamic dispatch per block
     # (found in review, measured at 2x the host time on 1.10.12).
     cellvolume(key) = spacing(float(real(T)), forest, key)^D
-    total = if fs.P == 0
+    total = if any(==(:vertex), fs.centering)
+        # The trapezoid's weights along a vertex-like dimension (M22).
+        values = trapezoid_quadrature_barrier(x -> abs(x)^q, R, statearray(u, fs), fs,
+                                              ntuple(_ -> 0, D), 1:(fs.nvars))
+        combine_blocks(+, zero(R), fs, values, cellvolume)
+    elseif fs.P == 0
         mesh_mapreduce(x -> abs(x)^q, +, zero(R), fs, u; weight=cellvolume)
     else
         # The nodes are not equally spaced, so each gets its quadrature
@@ -1306,15 +1353,12 @@ function norm_parts(fs::FieldSet{T,D}, u::AbstractVector, p::Real) where {T,D}
 
     # The domain volume as the sum of the block volumes, through the same
     # combination as everything else — so `sum`'s association from M3 is
-    # kept, and M7 has one place to reduce across ranks.
-    # With an appendix (M20) a block counts the points its fold visits.
-    # Behind a barrier, so that no other set compiles the masks.
-    counts = hasappendix(fs) ?
-             Base.inferencebarrier(counted_per_block)(fs)::Vector{Int} :
-             fill(forest.N^D, nblocks(fs))
+    # kept, and M7 has one place to reduce across ranks. `N^D` per block
+    # whatever the centering: the trapezoid's weights of a vertex-like
+    # dimension sum to `N` too.
     volumes = Vector{R}(undef, nblocks(fs))
     for b in 1:nblocks(fs)
-        volumes[b] = cellvolume(blockkey(fs, b)) * (counts[b] * fs.nvars)
+        volumes[b] = cellvolume(blockkey(fs, b)) * (forest.N^D * fs.nvars)
     end
     volume = combine_blocks(+, zero(R), fs, volumes, nothing)
     return (total, volume)

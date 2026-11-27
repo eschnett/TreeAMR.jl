@@ -3,11 +3,16 @@
 # builds new stages, and they take their buffers, and host mirrors, from
 # it instead of allocating them again (`BufferPool`). It is made on first
 # use, so a serial forest, whose stages have no messages, never has one.
+# `anchors` holds where positions are anchored, patch by patch
+# (`position_anchors`), computed on first use: it depends on the extents,
+# the roots and `N` only, which a forest never changes, so it is the same
+# on every rank and for every generation.
 mutable struct ForestState
     generation::Int
     pool::Union{Nothing,BufferPool}
+    anchors::Any
 end
-ForestState() = ForestState(0, nothing)
+ForestState() = ForestState(0, nothing, nothing)
 
 function bufferpool(forest)
     state = forest.state
@@ -1376,10 +1381,13 @@ isleaf(forest::Forest{D}, key::MortonKey{D}) where {D} = find_leaf(forest, key) 
 # both. The glue is an index and not its axis map because two patches
 # glued with the identity map still differ from one brick: a coarse-fine
 # face may not cross the glue (conformity, `balance_slack`). The few
-# callers that need the map itself look it up, through `glue_axes`.
+# callers that need the map itself look it up, through `glue_axes`; a
+# transfer is keyed by the map alone (`axes_code`). The slot is an `Int32`:
+# a table holds `2D` slots a patch, which a multi-block forest's hundreds
+# of patches would overflow an `Int8` with.
 struct Crossing
     turns::Int8
-    glue::Int8
+    glue::Int32
 end
 Crossing() = Crossing(0, 0)
 

@@ -143,9 +143,10 @@ end
 fmt(x) = T === Float64 ? @sprintf("%.17g", x) : @sprintf("%.9g", x)
 
 function reductions(tag, fs, u)
-    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs))
+    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs; primaries=true))
     emit(tag, "linf", fmt(volume_weighted_norm(fs, u; p=Inf)))
-    emit(tag, "max", fmt(mesh_mapreduce(identity, max, T(-Inf), fs; vars=1)))
+    emit(tag, "max", fmt(mesh_mapreduce(identity, max, T(-Inf), fs; vars=1,
+                                        primaries=false)))
     emit(tag, "sum l2", fmt(volume_weighted_norm(fs, u)))
     emit(tag, "sum mass", fmt(total_mass(fs, 1)))
     return nothing
@@ -301,8 +302,8 @@ function burgers_rhs!(du, u, state, fluxes, sched, ischeds, spacings, ::Val{D},
     fill_ghosts!(state, sched)
     ntuple(Val(D)) do d
         map_blocks!(flux_kernel!, fluxes[d], fluxes[d].work, state.work, Val(D),
-                    Val(GU), Val(GF), Val(d); closed=true)
-        restrict_interfaces!(fluxes[d], ischeds[d])
+                    Val(GU), Val(GF), Val(d))
+        unify!(fluxes[d], ischeds[d])
         nothing
     end
     map_blocks!(divergence_kernel!, state, statearray(du, state),
@@ -324,7 +325,7 @@ function burgers_case(tag, forest::Forest{D}; G, ops, steps) where {D}
     sched = GhostSchedule(state, ops)
     fluxes = ntuple(d -> FieldSet{T}(forest, 1; G=0, centering=facecentered(D, d),
                                      backend=BACKEND), D)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
     u = statevector(state)
     gather!(u, state)
@@ -502,14 +503,13 @@ function glue_state(fs)
     N = forest.N
     host = zeros(T, statelength(fs))
     A = statearray(host, FieldSet{T}(forest, fs.nvars; G=fs.G, centering=fs.centering,
-                                     glue=:interpolate); appendix=true)
-    dims = TreeAMR.appendix_layout(fs).dims
+                                     glue=:interpolate))
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
-        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
-        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2)), v in 1:fs.nvars
-            x = TreeAMR.chart_map(GlueTorus(), ntuple(d -> Float64(o[d] + (I[d] - 1) * h), 2),
-                                  p)
+        p = patch(forest, k)
+        for I in CartesianIndices((N + 1, N + 1)), v in 1:fs.nvars
+            x = TreeAMR.chart_map(GlueTorus(),
+                                  coordinates(floattype(forest), fs, b, Tuple(I) .+ fs.G), p)
             A[Tuple(I)..., v, b] = T(v * (0.5 + sin(2π * (2x[1] / (1 + GA + GB) + x[2]))))
         end
     end
@@ -529,8 +529,8 @@ function glue_messages(forest, sched)
 end
 
 # The kinked torus interpolated across its glues on the device: a fill,
-# the reductions, a regrid that keeps the glued blocks and carries their
-# appendix, and the fill again.
+# stage A's means (M22) among it, the reductions, a regrid that keeps the
+# glued blocks and carries their points, and the fill again.
 function glue_case(tag)
     forest = glue_torus(4)
     ops = Operators(prolongation=4, restriction=4, glue=6)
@@ -550,6 +550,10 @@ function glue_case(tag)
     emit(tag, "refilled", digest(gathered(forest, fs.work)))
     return nothing
 end
+
+# A case that needs what a later step of M22 ("Closed blocks") rebuilds:
+# one comment line in place of its output, which the comparison skips.
+pending_case(tag, step) = emit("# pending until M22 step $step:", tag)
 
 function main()
     emit("# ranks", NRANKS, "backend", BNAME, "T", T, "deviceaware", DEVICEAWARE)
@@ -574,7 +578,6 @@ function main()
                  steps=4)
     tracked_pulse_case("TP"; cycles=2, steps=3)
     moving_blocks_case("M")
-    # Ghosts interpolated across a glue (M20).
     glue_case("G2")
     return nothing
 end

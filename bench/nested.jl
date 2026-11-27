@@ -33,11 +33,19 @@
 #
 #     fill            fill_ghosts! with the hook
 #     boundary        the hook alone
+#     stage:W         stage W alone, the hook on the wall planes' primaries
+#                     (`wall_boundary!`), where this TreeAMR has it
+#     stage:P         stage P alone, the projection of the reflecting wall
+#                     planes' primaries onto their parities (`selfimage`),
+#                     where this TreeAMR has it
+#     stage:U0        stage 0 alone, every secondary copy of a shared point
+#                     from its primary, where this TreeAMR has it
 #     stage:P1        phase 1 alone (copies and restrictions; `run_stage!`)
 #     stage:L<l>      the prolongation stage onto level l alone
 #     phase2          every prolongation stage, one after another, as a
 #                     fill without stage groups runs them
-#     phase2:grouped  the same through this rank's stage groups but phase 1's,
+#     phase2:grouped  the same through this rank's stage groups but stage 0's
+#                     and phase 1's,
 #                     where the schedule has `stagegroups`, as the fill
 #                     runs them: each through `run_stages!` if this
 #                     TreeAMR has it, else its stages one after another,
@@ -76,8 +84,22 @@
 #
 # Everything but the times is deterministic. The file reads only
 # internals that `main` had before stage groups (`run_stage!`,
-# `run_phase!`, `pack_stage!`, `unpack_stage!`, `stagebuffers`), so the
-# same file runs against a baseline checkout's project.
+# `run_phase!`, `pack_stage!`, `unpack_stage!`, `stagebuffers`), and
+# looks for the later ones (stage groups, stages W, P and 0) before using
+# them, so the same file runs against a baseline checkout's project.
+#
+# With `TREEAMR_BENCH_FIRSTCALL=1` it times compilation instead, and
+# nothing else: in a fresh process, the first and the second call of
+# `GhostSchedule` and of `fill_ghosts!` with the hook, and the seconds
+# from the script's start (package loading included) to the end of the
+# first fill. Lines
+#
+#     F  <label>  <quantity>  <first s>  <second s>
+#
+# the slowest rank's, for `schedule` and `fill`, and `start-to-fill`
+# with the second column empty. The first call less the second is that
+# call's compilation, which is the number to compare between versions:
+# the workload's totals also count whatever cases its version holds.
 #
 #     TREEAMR_BENCH_N            points per block edge (default 16)
 #     TREEAMR_BENCH_NVARS        variables (default 20)
@@ -92,10 +114,12 @@
 #                                "2 4 8"; empty for none)
 #     TREEAMR_BENCH_PIECES       0 to time the fill, the boundary and the
 #                                stages only (default 1)
+#     TREEAMR_BENCH_FIRSTCALL    1 to time the first calls only (default 0)
 #
 # The `# ownership` line gives per rank the blocks and the blocks per
 # level, from the forest's own `leafowner`.
 
+const T0 = time_ns()
 const USE_MPI = "mpi" in ARGS || get(ENV, "TREEAMR_BENCH_MPI", "0") == "1"
 if USE_MPI
     using MPI
@@ -134,6 +158,8 @@ const LABEL = get(ENV, "TREEAMR_BENCH_LABEL", "$(NRANKS)x$(Threads.nthreads())")
 const FOOTPRINT_P = [parse(Int, s)
                      for s in split(get(ENV, "TREEAMR_BENCH_FOOTPRINT_P", "2 4 8"))]
 const PIECES = get(ENV, "TREEAMR_BENCH_PIECES", "1") != "0"
+const FIRSTCALL = get(ENV, "TREEAMR_BENCH_FIRSTCALL", "0") == "1"
+
 const G = 3
 const OPS = Operators(prolongation=6, restriction=6)
 const ROOTS = 4
@@ -195,7 +221,12 @@ function report(quantity, (tmin, tmed, perrank))
                  join([@sprintf("%.6e", t) for t in perrank], ",")))
 end
 
-stagename(st) = st.tag == TreeAMR.PHASE1_TAG ? "P1" : "L$(st.tag - 2)"
+# A stage's name by its tag: stage 0 (`UNIFY_TAG`, where this TreeAMR has
+# it), phase 1, or the prolongation onto level l.
+const UTAG = isdefined(TreeAMR, :UNIFY_TAG) ? TreeAMR.UNIFY_TAG : -1
+tagname(tag) = tag == UTAG ? "U0" : tag == TreeAMR.PHASE1_TAG ? "P1" : "L$(tag - 2)"
+stagename(st) = tagname(st.tag)
+isprolongation(tag) = tag != UTAG && tag != TreeAMR.PHASE1_TAG
 
 # --- Counts: target points against footprints ------------------------------
 
@@ -296,7 +327,7 @@ end
 function check_counts(schedule, predicted)
     mine = Int[]
     for st in schedule.stages
-        st.tag == TreeAMR.PHASE1_TAG && continue
+        isprolongation(st.tag) || continue
         r = st.remote
         r === nothing && continue
         for (peer, c) in zip(r.sendpeers, r.sendcounts)
@@ -346,6 +377,7 @@ function main()
     say("ranks=$NRANKS threads=$(Threads.nthreads()) N=$N nvars=$NVARS G=$G order=6 " *
         "vertex-centered backend=$BNAME T=$T deviceaware=$DEVICEAWARE reps=$REPS " *
         "label=$LABEL Julia $VERSION TreeAMR $(pkgversion(TreeAMR))")
+    FIRSTCALL && return firstcall()
     forest = build_forest(COMM)
     fs = FieldSet{T}(forest, NVARS; G=G, centering=vertexcentered(D), parity=parities(),
                      backend=BACKEND)
@@ -372,7 +404,6 @@ function main()
     tags = sort!(unique(gatherv([st.tag for st in stages])))
     stageof(tag) = (i = findfirst(st -> st.tag == tag, stages);
                     i === nothing ? nothing : stages[i])
-    tagname(tag) = tag == TreeAMR.PHASE1_TAG ? "P1" : "L$(tag - 2)"
     say("# stages: " * join(tagname.(tags), " "))
     # Stage groups, by tag, rank by rank. Their windows are timed one by
     # one only where every rank groups alike: otherwise a rank whose
@@ -402,9 +433,10 @@ function main()
               (length(r.sendpeers), length(r.recvpeers), sum(r.sendcounts; init=0),
                sum(r.recvcounts; init=0))
         loc = st === nothing ? 0 : sum(g -> TreeAMR.ntransfers(g), st.locals; init=0)
-        rows = reshape(gatherv(Int[row..., loc]), 5, :)
+        ngr = st === nothing ? 0 : length(st.locals)
+        rows = reshape(gatherv(Int[row..., loc, ngr]), 6, :)
         say("# stage $(tagname(tag)) per rank (sends, receives, points sent, points " *
-            "received, local transfers): " *
+            "received, local transfers, local groups): " *
             join(["r$(i - 1) $(join(rows[:, i], "/"))" for i in axes(rows, 2)], "; "))
     end
 
@@ -426,6 +458,17 @@ function main()
     sync() = synchronize(BACKEND)
     waitsends(sends) = (sends === nothing || TreeAMR.waitall(comm, sends); nothing)
     report("fill", measure(() -> (fill_ghosts!(fs, schedule; boundary=BOUNDARY); sync())))
+    # Stages W and P, where this TreeAMR has them, as the fill runs them.
+    if isdefined(TreeAMR, :wall_boundary!)
+        report("stage:W",
+               measure(() -> (TreeAMR.wall_boundary!(fs, BOUNDARY, schedule, BACKEND);
+                              sync())))
+    end
+    if hasfield(typeof(schedule), :selfimage)
+        report("stage:P",
+               measure(() -> (isempty(schedule.selfimage) ||
+                              TreeAMR.run_phase!(fs, schedule.selfimage, BACKEND); sync())))
+    end
     if applicable(TreeAMR.apply_boundary!, fs, BOUNDARY, schedule, BACKEND)
         report("boundary",
                measure(() -> (TreeAMR.apply_boundary!(fs, BOUNDARY, schedule, BACKEND);
@@ -440,7 +483,7 @@ function main()
     end
     # Phase 2 whole, the stages one after another as `main` runs them, and
     # through this rank's groups.
-    prolongs = [st for st in stages if st.tag != TreeAMR.PHASE1_TAG]
+    prolongs = [st for st in stages if isprolongation(st.tag)]
     report("phase2", measure(() -> begin
         sends = nothing
         for st in prolongs
@@ -451,12 +494,12 @@ function main()
     end))
     if grouped
         # Phase 2 through this rank's groups, as the fill runs it: every
-        # group but phase 1's, the sends waited on at the end.
+        # group but stage 0's and phase 1's, the sends waited on at the end.
         runners = [(g, group_runner(fs, schedule, forest, g)...)
                    for g in schedule.stagegroups]
         how = isempty(runners) ? "" : runners[1][2]
         later = [f for (g, _, f) in runners
-                 if !any(i -> stages[i].tag == TreeAMR.PHASE1_TAG, g)]
+                 if all(i -> isprolongation(stages[i].tag), g)]
         report("phase2:grouped$how", measure(() -> begin
             sends = nothing
             for f in later
@@ -506,6 +549,27 @@ function main()
         NRANKS > 1 && report("packs:$s", measure(packs!(sts)))
         NRANKS > 1 && report("unpacks:$s", measure(unpacks!(sts)))
     end
+    return nothing
+end
+
+# The first calls, in a fresh process: the schedule and the fill, each
+# twice, the slowest rank's times.
+function firstcall()
+    forest = build_forest(COMM)
+    fs = FieldSet{T}(forest, NVARS; G=G, centering=vertexcentered(D), parity=parities(),
+                     backend=BACKEND)
+    fill_by_coordinates!((x, v) -> sin(T(0.1) * x[1] + v) * cos(T(0.07) * x[2] - x[3] / 50),
+                         fs)
+    timed(f) = (barrier(); t = @elapsed f(); maximum(gather(t)))
+    local schedule
+    s1 = timed(() -> (schedule = GhostSchedule(fs, OPS)))
+    s2 = timed(() -> GhostSchedule(fs, OPS))
+    f1 = timed(() -> (fill_ghosts!(fs, schedule; boundary=BOUNDARY); synchronize(BACKEND)))
+    start = maximum(gather((time_ns() - T0) / 1e9))
+    f2 = timed(() -> (fill_ghosts!(fs, schedule; boundary=BOUNDARY); synchronize(BACKEND)))
+    say(@sprintf("F\t%s\tschedule\t%.4f\t%.4f", LABEL, s1, s2))
+    say(@sprintf("F\t%s\tfill\t%.4f\t%.4f", LABEL, f1, f2))
+    say(@sprintf("F\t%s\tstart-to-fill\t%.4f\t", LABEL, start))
     return nothing
 end
 

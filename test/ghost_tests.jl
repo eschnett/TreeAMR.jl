@@ -313,9 +313,12 @@ end
     ops = Operators(prolongation=6, restriction=6)
     parity = [ntuple(_ -> EvenParity, D)]
     for C in (vertexcentered(D), cellcentered(D))
+        # The octant reflects, and is refined.
         s = GhostSchedule(FieldSet(octant, 1; G=3, centering=C, parity=parity), ops)
         @test s.levels == [1, 2, 3]
-        @test s.stagegroups == [1:1, 2:4]
+        # Stage 0 (M22), where there is one, and phase 1 alone in front.
+        p1 = s.phase1group
+        @test s.stagegroups == [[i:i for i in 1:p1]; [(p1 + 1):(p1 + 3)]]
         @test occursin("levels 1-3 run together", sprint(show, s))
     end
     # A level with rotated prolongations runs alone, and so does every
@@ -325,7 +328,9 @@ end
                       Operators(prolongation=4, restriction=4))
     @test length(s.levels) == 2
     @test all(gs -> any(g -> g.orientation != 0, gs), s.phase2)
-    @test s.stagegroups == [1:1, 2:2, 3:3]
+    # Stage 0 (M22) and phase 1 alone in front, then each level alone.
+    p1 = s.phase1group
+    @test s.stagegroups == [[i:i for i in 1:p1]; [(p1 + 1):(p1 + 1), (p1 + 2):(p1 + 2)]]
     @test !occursin("run together", sprint(show, s))
 end
 
@@ -552,11 +557,6 @@ end
         end
     end
     @test nunit > 0                                # the copy path was taken
-    # A copy at a vertex-like high wall derives the wall plane it does not
-    # own by interpolation, so a `:copy` group is not unit by its kind.
-    wallsched = GhostSchedule(setups[3], ops)
-    @test any(g -> g.kind === :copy && !all(s -> s.unit, g.stencils),
-              wallsched.phase1)
 end
 
 @testset "Skipping zero-weight taps fills bit for bit: D=$D" for D in (1, 2, 3)
@@ -589,6 +589,7 @@ end
                               vertex_prolongation=4), 4))
     nsingle = 0
     for (C, ops, p) in configs
+        # At reflecting and outflow faces (M22 step 4), and across a seam (7).
         G = ghosts_for(C, p)
         _, parity = parity_data(Float64, kinds, p)
         setups = Any[FieldSet(faces_forest(kinds; N=N), 2; G=G, centering=C,
@@ -621,8 +622,12 @@ end
                 @test fillwith(g; flat=false) == full
                 @test fillwith(g; flat=true) == full
             end
-            # The vertex-centered prolongations are what the skip is for.
-            ops.family === PointValue && C[1] === :vertex && @test vertexprolong > 0
+            # The vertex-centered prolongations are what the skip is for:
+            # a coarse node's coincident ghost, which on closed blocks (M22)
+            # needs a tangential dimension or a second ghost row, the first
+            # one beyond a face lying between two coarse nodes.
+            ops.family === PointValue && C[1] === :vertex && (D >= 2 || G[1] >= 2) &&
+                @test vertexprolong > 0
         end
     end
     @test nsingle > 0                              # the one-tap path was taken

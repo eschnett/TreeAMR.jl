@@ -14,6 +14,17 @@ name = "gpu"
 env = "test+cuda"                   # the suite's dependencies, and CUDA
 
 [site.symmetry]                     # one H200 and its 8 host cores
+julia = "1.13"                      # the project's floor, on Symmetry only: an Alliance
+                                    # site's MPI recipe names its own patched Julia,
+                                    # which cannot be combined with `julia`
+time = "1:00:00"
+resources = { gpus = 1 }
+
+[site.trillium-gpu]                 # one H100
+time = "1:00:00"
+resources = { gpus = 1 }
+
+[site.fir]                          # one H100
 time = "1:00:00"
 resources = { gpus = 1 }
 

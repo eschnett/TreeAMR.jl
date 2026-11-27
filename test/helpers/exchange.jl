@@ -2,9 +2,9 @@
 # on its own: every test process includes all of `helpers/` ("Parallel
 # groups" in CODE.md).
 
-using TreeAMR: PHASE1_TAG, prolongation_tag, interface_tag, ntransfers, boxsize,
+using TreeAMR: PHASE1_TAG, UNIFY_TAG, prolongation_tag, ntransfers, boxsize,
                stagebuffers, segment_ranges, pack_stage!, unpack_stage!, run_phase!,
-               apply_boundary!, exchange_ghosts!, exchange_interfaces!, leafowner,
+               apply_boundary!, exchange_ghosts!, leafowner,
                remote_neighbors, equalsplit_part, ntarget
 using KernelAbstractions: CPU, synchronize
 using MultiFloats: Float32x2
@@ -204,11 +204,20 @@ exchange_hook() = CellBoundary((x, v, δ) -> v == 3 ? zero(x[1]) :
 # Run every simulated rank's stages in lockstep, tag by tag, as a real run
 # interleaves them: pack on every rank, deliver each send segment into the
 # peer's receive segment, then run the local groups and unpack on every
-# rank. After the first stage, `between(r)` runs on every rank — the
-# boundary hook of a ghost fill. Returns the number of segments whose two
+# rank. After phase 1, `between(r)` runs on every rank — the boundary hook
+# of a ghost fill, which stage 0 (M22) precedes. Returns the number of segments whose two
 # ends disagreed in length.
 function lockstep!(sets, scheds, backend; between=nothing)
     P = length(sets)
+    # Stage P (M22), local to each rank and before every stage, as the
+    # fill and `unify!` run it.
+    for r in 1:P
+        hasproperty(scheds[r], :selfimage) && !isempty(scheds[r].selfimage) &&
+            run_phase!(sets[r], scheds[r].selfimage, backend)
+        # And a rotating seam's axis.
+        hasproperty(scheds[r], :axis) &&
+            TreeAMR.run_axis!(sets[r].work, sets[r], scheds[r].axis, backend)
+    end
     tags = sort!(unique!([st.tag for sched in scheds for st in sched.stages]))
     stageat(r, tag) = (i = findfirst(st -> st.tag == tag, scheds[r].stages);
                        i === nothing ? nothing : scheds[r].stages[i])
@@ -244,7 +253,7 @@ function lockstep!(sets, scheds, backend; between=nothing)
                               stagebuffers(st.remote, sets[r].nvars, backend), backend)
             synchronize(backend)
         end
-        if k == 1 && between !== nothing
+        if tag == PHASE1_TAG && between !== nothing
             foreach(between, 1:P)
         end
     end
@@ -306,7 +315,7 @@ function lockstep_interfaces(serial::Forest{D}, P, C, G, ::Type{T};
                       backend=backend)
     data = exchange_data(MersenneTwister(seed), T, size(sfs.work))
     copyto!(sfs.work, data)
-    restrict_interfaces!(sfs, InterfaceSchedule(sfs))
+    unify!(sfs, UnifySchedule(sfs))
     reference = Array(sfs.work)
     sets, scheds = [], []
     for r in 0:(P - 1)
@@ -315,7 +324,7 @@ function lockstep_interfaces(serial::Forest{D}, P, C, G, ::Type{T};
                          backend=backend)
         copyto!(fs.work, data[ntuple(_ -> :, D + 1)..., blockrange(forest)])
         push!(sets, fs)
-        push!(scheds, InterfaceSchedule(fs))
+        push!(scheds, UnifySchedule(fs))
     end
     bad = lockstep!(sets, scheds, backend)
     nremote = sum(s -> sum(st -> st.remote === nothing ? 0 : length(st.remote.recvlayout),
@@ -447,6 +456,13 @@ function lockstep_pair!(pairs, schedsa, schedsb, backend; hooks)
     stageat(sched, tag) = (i = findfirst(st -> st.tag == tag, sched.stages);
                            i === nothing ? nothing : sched.stages[i])
     tags = sort!(unique!([st.tag for s in [schedsa; schedsb] for st in s.stages]))
+    # Stage P (M22) of each member, local, before every stage.
+    for r in 1:P, m in 1:2
+        fs, alt, factors, rotvars, sched = member(r, m)
+        isempty(sched.selfimage) ||
+            run_phase!(fs.work, fs.work, sched.selfimage, fs.nvars, backend;
+                       factors=factors, rotvars=rotvars)
+    end
     bad = 0
     for (k, tag) in enumerate(tags), m in 1:2
         for r in 1:P

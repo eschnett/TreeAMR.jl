@@ -12,6 +12,7 @@ makedocs(;
     # (`size_threshold`) fails the build.
     pages=[
         "Home" => "index.md",
+        "Moving to closed blocks" => "migration.md",
         "API reference" => [
             "Tree and geometry" => "api/tree.md",
             "Storage" => "api/storage.md",

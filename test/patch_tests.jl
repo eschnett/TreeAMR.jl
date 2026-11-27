@@ -354,11 +354,26 @@ end
     for C in allcenterings(Val(D))
         @test_throws "a patch corner" GhostSchedule(patch_fieldset(patched, C), PATCH_OPS)
     end
-    # The low side of a vertex-like dimension with no ghosts has no region,
-    # but its high side has the shared plane.
-    vertex = ntuple(d -> d == 1 ? :vertex : :cell, D)
-    @test_throws "a patch corner" GhostSchedule(
-        patch_fieldset(patched, vertex; G=ntuple(d -> Int(d != 1), D)), PATCH_OPS)
+    # A vertex-like dimension with no ghosts has no region beyond either
+    # face on closed blocks (M22), and so no patch corner along it: a set
+    # vertex-like along dimension 1 alone, with no ghosts there, holds no
+    # point on a corner line and fills as the brick, its points on the
+    # glued faces of dimension 1 one number across the glue. Vertex-like
+    # along both cut dimensions, it holds points on the corner line, which
+    # three or more patches share and one glue at a time does not reach,
+    # and is refused whatever its ghost widths.
+    C = ntuple(d -> d == 1 ? :vertex : :cell, D)
+    G = ntuple(d -> Int(d != 1), D)
+    fsp, fsb = patch_fieldset(patched, C; G=G), patch_fieldset(brick, C; G=G)
+    for fs in (fsp, fsb)
+        fill_by_coordinates!(f, fs)
+        fill_ghosts!(fs, GhostSchedule(fs, PATCH_OPS); boundary=boundary_by_coordinates(f))
+    end
+    result = compare_matching_blocks(fsp, fsb)
+    @test result !== nothing && result[1] == 0
+    V = ntuple(d -> d <= 2 ? :vertex : :cell, D)
+    @test_throws "the line where they meet" GhostSchedule(
+        patch_fieldset(patched, V; G=ntuple(d -> d <= 2 ? 0 : 1, D)), PATCH_OPS)
 end
 
 @testset "Patches with swapped and reversed axes fill as the brick: $name" for (name, roots,
@@ -372,10 +387,10 @@ end
     # bit for bit, and no `NaN` may reach a ghost the fill writes. Refined
     # beside the glue, the turned prolongations and restrictions across its
     # edges must agree with the brick's to rounding (their sums run in the
-    # patch's order of dimensions). A layout the axis map does not keep, and
-    # a vertex-like dimension the glue reverses, are refused with their
-    # reasons: the first would read with the wrong ghost widths, the second
-    # a plane the block across does not own.
+    # patch's order of dimensions). A layout the axis map does not keep is
+    # refused with its reason, since it would read with the wrong ghost
+    # widths; a vertex-like dimension the glue reverses fills as any other,
+    # its closed range carried onto a closed range (M22).
     D = length(roots)
     swapped = any(σ -> map(abs, σ) != ntuple(identity, D), σs)
     for refined in (false, true), C in patch_centerings(Val(D))
@@ -385,10 +400,6 @@ end
         fsp = patch_fieldset(patched, C)
         if swapped && !all(==(C[1]), C)
             @test_throws "hold their points alike" GhostSchedule(fsp, patch_ops(fsp))
-            continue
-        end
-        if any(b -> C[b] === :vertex && !(b == 1 && lowlow), reversed)
-            @test_throws "vertex-like" GhostSchedule(fsp, patch_ops(fsp))
             continue
         end
         brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
@@ -418,16 +429,18 @@ end
     # every ghost inside a patch what its neighbor owns, and no `NaN` may
     # reach a ghost the fill writes. The glue is the identity, so its
     # transfers are ordinary copies, turned by nothing.
-    forest = patch_ring(4, (2, 1))
-    patch_refine_all!(forest)
-    fs = patch_fieldset(forest, C)
-    nnan, schedule = undefined_patch_ghosts(fs, patch_ops(fs), (p, x) -> (p, x))
-    @test nnan == 0
-    mismatches, seen = patch_ghost_mismatches(fs, patch_ring_across)
-    @test mismatches == 0
-    @test seen[:glued] > 0 && seen[:inside] > 0
-    @test !occursin("turned", sprint(show, schedule))
-    @test fs.rotvars == reshape(Int32[1, 2], :, 1)
+    begin
+        forest = patch_ring(4, (2, 1))
+        patch_refine_all!(forest)
+        fs = patch_fieldset(forest, C)
+        nnan, schedule = undefined_patch_ghosts(fs, patch_ops(fs), (p, x) -> (p, x))
+        @test nnan == 0
+        mismatches, seen = patch_ghost_mismatches(fs, patch_ring_across)
+        @test mismatches == 0
+        @test seen[:glued] > 0 && seen[:inside] > 0
+        @test !occursin("turned", sprint(show, schedule))
+        @test fs.rotvars == reshape(Int32[1, 2], :, 1)
+    end
 end
 
 @testset "A cubed sphere refuses its patch corners and fills an element set exactly" begin
@@ -471,29 +484,23 @@ end
 @testset "A glue refuses a layout its axis map does not carry, with the reason" begin
     # A turned ghost is read with the target block's own layout through the
     # axis map, so a dimension glued onto another must hold its points as
-    # that one does, and a vertex-like dimension may not be reversed, except
-    # the normal of a low face glued to a low face: the error says which, and
-    # why, rather than the fill reading the wrong points.
+    # that one does: the error says which, and why, rather than the fill
+    # reading the wrong points. A vertex-like dimension may be reversed, and
+    # a high face glued to a high face, since a closed range is carried onto
+    # a closed range (M22), which the fills below show.
     swapped, _ = laid_out((4, 3), ((1, 2), (2, 1)))
     @test_throws "hold their points alike" GhostSchedule(
         patch_fieldset(swapped, cellcentered(2); G=(1, 2)), PATCH_OPS)
     @test_throws "hold their points alike" GhostSchedule(
         patch_fieldset(swapped, (:cell, :vertex)), PATCH_OPS)
-    tangent, _ = laid_out((4, 3), ((1, 2), (1, -2)))
-    @test_throws "with axis 2 of patch 1 reversed" GhostSchedule(
-        patch_fieldset(tangent, vertexcentered(2)), PATCH_OPS)
-    highhigh, _ = laid_out((4, 3), ((1, 2), (-1, 2)))
-    @test_throws "a high face to a high face" GhostSchedule(
-        patch_fieldset(highhigh, (:vertex, :cell)), PATCH_OPS)
-    # What is not refused: the same with the reversed dimension cell-like,
-    # and a low face glued to a low face, vertex-like along its normal.
-    @test GhostSchedule(patch_fieldset(tangent, (:vertex, :cell)), PATCH_OPS) isa
-          GhostSchedule
-    @test GhostSchedule(patch_fieldset(highhigh, (:cell, :vertex)), PATCH_OPS) isa
-          GhostSchedule
-    lowlow, _ = laid_out((4, 3), ((-1, 2), (1, 2)))
-    @test GhostSchedule(patch_fieldset(lowlow, vertexcentered(2)), PATCH_OPS) isa
-          GhostSchedule
+    tangent, tplace = laid_out((4, 3), ((1, 2), (1, -2)))
+    highhigh, hplace = laid_out((4, 3), ((1, 2), (-1, 2)))
+    for (forest, place, C) in ((tangent, tplace, vertexcentered(2)),
+                               (highhigh, hplace, (:vertex, :cell)))
+        fs = patch_fieldset(forest, C)
+        nnan, _ = undefined_patch_ghosts(fs, patch_ops(fs), place)
+        @test nnan == 0
+    end
 end
 
 @testset "Groups across different glued faces are told apart, in one order" begin
@@ -502,8 +509,7 @@ end
     # kernel reads by — and order by it, or two faces' transfers would share
     # one group, or two ranks disagree on where a transfer's slot is.
     z = (Int8(0), Int8(0))
-    key(g) = TreeAMR.GroupKey{2}(:copy, (1, 0), (0, 0), 0, z, Int8(0), Int8(g),
-                                 (false, false), z)
+    key(g) = TreeAMR.GroupKey{2}(:copy, (1, 0), (0, 0), 0, z, Int8(0), Int8(g))
     @test key(1) != key(2)
     @test isless(key(1), key(2)) && !isless(key(2), key(1))
     @test isless(key(0), key(1))
@@ -582,19 +588,37 @@ end
     end
 end
 
-@testset "The interface schedule reports a coarse-fine face across a glue as a bug" begin
-    # A finer neighbor across a glued face can only mean a forest that is not
-    # conforming, which no checked path produces: the interface schedule
-    # says so, rather than skip the restriction, or restrict untransformed.
-    broken = patch_ring(4, (2, 1))
-    refine!(broken, broken.leaves[3])
-    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
-    @test_throws "not across a glue" InterfaceSchedule(fx)
-    @test_throws "this is a bug" InterfaceSchedule(fx)
-    # Balanced, the same forest has coarse-fine faces inside its patches only.
-    balance!(broken)
-    fx = FieldSet(broken, 1; G=0, centering=facecentered(2, 1))
-    @test InterfaceSchedule(fx) isa InterfaceSchedule
+@testset "unify! across a glue is the brick's, refined beside it too: D=$D" for D in (2, 3)
+    # Guards stage 0 across a glued face (M22): the copies of a point on
+    # the face are one number, the lowest patch's, which on a brick cut at
+    # `x = 2` into patches 1 (below) and 2 (above) is the brick's primary,
+    # the copy of the block below. So with the same data in matching
+    # blocks, `unify!` of the patches and of the brick must agree bit for
+    # bit at every own point, for a flux normal to the cut and one along
+    # it (the interface restriction, without ghosts) and a vertex set,
+    # uniform and refined beside the glue, where the coarse copies take the
+    # fine ones' restriction across its edges.
+    roots = ntuple(d -> d == 1 ? 4 : 2, D)
+    rng = Xoshiro(70 + D)
+    for refined in (false, true), C in (facecentered(D, 1), facecentered(D, 2),
+                                        vertexcentered(D))
+        patched, place = brick_cut(roots, ((2,),))
+        refined && patch_refine_one!(patched, place)
+        brick = Forest(roots; N=4, leaves=laid_out_leaves(patched, place, roots))
+        G = C == vertexcentered(D) ? 1 : 0
+        fsp, fsb = patch_fieldset(patched, C; G=G), patch_fieldset(brick, C; G=G)
+        fsb.work .= randn(rng, size(fsb.work))
+        lower(fs, b) = ntuple(d -> block_extent(fs.forest, blockkey(fs, b))[d][1], D)
+        index = Dict((level(blockkey(fsb, b)), lower(fsb, b)) => b for b in 1:nblocks(fsb))
+        for b in 1:nblocks(fsp)
+            bb = index[(level(blockkey(fsp, b)), lower(fsp, b))]
+            selectdim(fsp.work, D + 2, b) .= selectdim(fsb.work, D + 2, bb)
+        end
+        unify!(fsp, UnifySchedule(fsp))
+        unify!(fsb, UnifySchedule(fsb))
+        result = compare_matching_blocks(fsp, fsb)
+        @test result !== nothing && result[1] == 0
+    end
 end
 
 # --- The patch as a number (step 5) -------------------------------------------

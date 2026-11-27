@@ -31,6 +31,7 @@ milestones were planned in, and the list below is in execution order.
   - [M19 — Interpolation on element sets and patches](#m19--interpolation-on-element-sets-and-patches)
   - [M20 — TreeMultiPatch, and finite differences on patches](#m20--treemultipatch-and-finite-differences-on-patches)
   - [M21 — Symmetries on patches](#m21--symmetries-on-patches)
+  - [M22 — Closed blocks](#m22--closed-blocks)
 
 ## Milestones
 
@@ -449,6 +450,10 @@ TreeGeneralizedHarmonic and TreeGRRMHD on patches.
 ### M21 — Symmetries on patches
 
 *(Proposed 2026-11-25; Erik's decisions on refinement taken that day.)*
+*(On hold behind [M22](#m22--closed-blocks) since 2026-11-25: its steps
+1–5 are on eschnett/TreeAMR.jl#50 and resume on closed blocks, which
+remove the shifted slab at a glued axis, the turn's low-to-low rule and
+the appendix those steps work around.)*
 The symmetries a brick has — mirror planes (bitant, quadrant, octant)
 and turns about an axis by 90° and 180° (M12, M14), alone or with a
 mirror plane across the axis — on forests of patches, so that a
@@ -574,3 +579,193 @@ kinked glue, M20's rule; patch-local components; symmetries of a turn
 about any axis but the balls' `z`.
 
 *Done when* steps 1–7 pass.
+### M22 — Closed blocks
+
+*(Proposed 2026-11-25, with Erik's decisions of that day; the
+design is "Closed blocks" in [CODE.md](CODE.md#closed-blocks), the
+record under M22 in [HISTORY.md](HISTORY.md#m22--closed-blocks).)*
+Vertex-like dimensions own their closed range, `N + 1` points, so that
+domains, refined regions, seams and glues are symmetric by
+construction; shared points are stored by every block holding them and
+unified by the fill. It replaces half-open ownership and its
+work-arounds — symmetric walls, the derived wall row, the half turn's
+shifted slab, the appendix of a set interpolated across a glue, and the
+refusals that cite ownership — and it is a breaking release, 0.3.0,
+for TreeAMR, TreeIOHDF5 and every downstream.
+
+**Decided** (Erik): the state is uniform and holds every copy,
+`∏(N + c_d)` per block; at a coarse-fine face the fine block is the
+authority; half-open ownership is removed, not kept as an option; the
+copies across a kinked glue are averaged; an outer wall is evolved
+unless the hook prescribes it; unifying is a stage of its own in the
+fill, to be measured; `unify!` on a state vector is offered and
+optional; the interface restriction becomes `unify!` on a flux set;
+positions are formed from integer coordinates, so that every copy of a
+point is at one position bit for bit.
+
+**How it is built.** Step 1 is independent of the rest and goes to
+`main` by itself. Steps 2–10 are built on an integration branch,
+`m22`, each as a pull request into it, so that `main` stays releasable
+until the branch merges; the releases are step 11.
+
+- *No half-open path is kept beside the new one.* What a later step
+  rebuilds is refused by `GhostSchedule` until then — reflecting and
+  outflow faces, a seam, a forest of patches, a mesh with two levels —
+  with a message naming the step, rather than left half-working.
+- *A test that needs a later step is pending*, by testset, marked in
+  the test file with the step that brings it back, and by case in
+  `test/mpi_workload.jl` and the thread workload. A step is done when
+  the testsets it names are back and pass, on the CPU, in the flat
+  form `gpu_tests.jl` runs, over simulated ranks and under MPI; the
+  branch merges when none is pending.
+- *Each step begins with a written plan against the code*, on its pull
+  request and reviewed before any code: the functions that change, the
+  keys and ranges, what is deleted, and the testsets that come back.
+  The plan settles what the design leaves to the implementer, named
+  under each step below, and records it in `CODE.md` as it lands.
+- *The cost is measured at step 5*, as soon as the downstream's nested
+  mesh fills, so that a change of the fill's partition costs the steps
+  before it and not the whole milestone.
+
+Steps:
+
+1. **Positions from integer coordinates** — done: every position is
+   formed by `nodeposition` from integer coordinates ("Positions" under
+   [Centerings](CODE.md#centerings)); the record is M22 step 1 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
+2. **The layout, the uniform fill and outer faces** — done on `m22`:
+   the closed own range, stage 0 and the symmetric partition, the
+   primary mask with the reductions that take each point once and
+   `isprimary`, the trapezoid's weights, `unify!`, and the hook at an
+   outer face, the wall evolved or prescribed (stage W), on uniform
+   meshes with periodic and outer faces; what later steps rebuild is
+   refused until then, its tests pending. The design text is under
+   [Closed blocks](CODE.md#closed-blocks) (*Stage 0, the mask and the hook*),
+   the record, with what the code corrected in the design, is step 2 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
+3. **Coarse-fine faces.** Stage 0's injections, the mask across
+   levels, prolongation into ghosts only, on meshes refined once and
+   left alone; the interface restriction as `unify!` on a flux set,
+   with `InterfaceSchedule` and `restrict_interfaces!` removed. The
+   plan settles: which finer neighbour fills the mid-plane of a halved
+   range; whether `N ≥ 2G + 2` is still needed anywhere along a
+   stagger. *Done when* the fill of a refined mesh is mirror-symmetric
+   to rounding for a vertex-centered set (4.7 × 10⁻⁵ today); the vertex
+   convergence tables under [Operators](CODE.md#operators) are
+   re-measured and recorded; the interface tests pass on `unify!` with
+   their conservation numbers, exact at same-level faces; and an
+   edge-centered set's copies around an edge beside a diagonal finer
+   block are one number. *Implemented on `m22`*, every done-when item
+   passing but one: the vertex convergence table is re-measured (0.97 /
+   1.92 in `D = 1`, 1.04 / 1.95 in `D = 2`, against 0.99 / 1.99 and 1.01 /
+   1.99) and awaits Erik's review before [CODE.md](CODE.md#operators)
+   records it; the step is done then. The record is step 3 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
+4. **Reflecting and outflow faces** — done on `m22`: the mirror about
+   the wall plane, stage P after stage W, the clamp to the wall row;
+   `walls`, `wall_stencil` and the derived wall row deleted. Its
+   done-when, as corrected: a closed box, uniform and refined, is
+   mirror-symmetric to rounding under every face kind without a
+   keyword; an odd variable is zero on its mirror plane; a bitant
+   domain's `total_mass` is half the full domain's and its
+   `volume_weighted_norm` equal, exactly on dyadic data and to a few ulp
+   otherwise. The design text is under [Closed blocks](CODE.md#closed-blocks)
+   (*Walls*, *Stage P*), the record step 4 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
+5. **The first measurement, and the partition settled** — done: measured
+   on Symmetry and Fir against the half-open baseline, and Erik decided
+   on 2026-11-26 that stage 0 stays a stage of its own and that
+   `map_blocks!` does not skip secondaries by default. The numbers are
+   under [Closed blocks](CODE.md#closed-blocks), the record M22 step 5
+   in [HISTORY.md](HISTORY.md#m22--closed-blocks). Merging stage 0 into
+   phase 1 is to be revisited after step 9's repeated measurements
+   (step 9a below).
+6. **Regridding** — done on `m22`, ahead of step 5's cluster numbers
+   (the review's decision): transfers over closed boxes, the kept
+   blocks' copies over the created ones, flagging over the closed box
+   ("Regridding" under [Closed blocks](CODE.md#closed-blocks)); the
+   record is M22 step 6 in
+   [HISTORY.md](HISTORY.md#m22--closed-blocks).
+7. **Seams** — done on `m22`: quarter and half turns on the ordinary
+   partition, the seam's copies under rule 2 and the axis under rule 3
+   (`seam_shift` had already gone in step 2). The design text is
+   *Seams* under [Closed blocks](CODE.md#closed-blocks), the record M22
+   step 7 in [HISTORY.md](HISTORY.md#m22--closed-blocks).
+8. **Glues** — done on `m22`, but for its last done-when item: a glue
+   that copies in any pairing and with reversed axes, the lowest patch's
+   copy the primary; a kinked glue's copies averaged by stage A; group
+   keys carrying the glue's axis map. The wave on the balls at M20's
+   dissipation is TreeWave's, whose ball code used the appendix, and is
+   checked when the downstream is ported. The design text is *Glues*
+   under [Closed blocks](CODE.md#closed-blocks), the record M22 step 8
+   in [HISTORY.md](HISTORY.md#m22--closed-blocks).
+9. **What is left in TreeAMR** — implemented on `m22` but for its
+   measurements: `interpolate!`'s windows, the schedule build of a
+   vertex-like set made about as fast as a cell set's, the compile time
+   cut, the documentation with the [migration
+   note](docs/src/migration.md); no testset is pending. Outstanding: step
+   5's measurements, `bench/mpi.jl` and the device suite on CUDA
+   repeated on the finished branch (the studies are listed in M22 step
+   9's record in [HISTORY.md](HISTORY.md#m22--closed-blocks)). *Done
+   when* their numbers are recorded and replace step 5's in
+   [CODE.md](CODE.md#closed-blocks).
+   - 9a. **Stage 0 revisited**: on those numbers, whether stage 0 merges
+     into phase 1 (Erik's decision of step 5, "revisit this later").
+10. **TreeIOHDF5 and the downstreams**: the closed format feature and
+    what a file of half-open blocks becomes; TreeWave, TreeHydro and
+    TreeGRRMHD (which drops `walls_to_state!` and its symmetry
+    testset's bound), then the others, sized by `N .+ staggers(fs)`
+    and forming their kernels' positions through `nodeposition`, as
+    the [migration note](docs/src/migration.md) lists. Step 8's last
+    done-when item comes here: TreeWave's wave on the seven-patch ball
+    stays bounded at M20's dissipation, once its right-hand side no
+    longer uses the appendix. *Done when* each suite passes against the
+    branch from a scratch copy.
+    - 10b. **Positions anchored at zero** (Erik's request, 2026-11-26):
+      where zero is on a patch's grid, positions are formed from zero,
+      so that a symmetric domain and its full box agree bit for bit at
+      any spacing and a centred box is antisymmetric; elsewhere the low
+      corner. *Done when* TreeGeneralizedHarmonic's quadrant and bitant
+      against the box agree at `h = 5/48` at `main`'s level (4.0e−11 or
+      better) and every port's suite passes against it. Numbered 10b so
+      that the steps keep their numbers and the releases stay last.
+    - 10c. **A point on a coarse-fine face read from the finest leaf**
+      (the review's request; Erik's "yes", 2026-11-27): `locate_point`
+      gives a point on a face, edge or corner that leaves of two levels
+      share to the finest leaf
+      holding it in its closed box, rule 1 of "One value per point";
+      among leaves of one level the half-open rule stays. And an
+      editing pass over [Closed blocks](CODE.md#closed-blocks). *Done
+      when* step 9's mirror test holds with the coarse-fine face points
+      put back, simulated ranks agree with serial, and the ports that
+      call `interpolate!` pass against it.
+    - 10d. **The anchor's fallback** (Erik's choice, 2026-11-27: "centre
+      and symmetry face, unless there are disadvantages you found that i
+      haven't seen yet"): off zero, a patch is anchored at a symmetry
+      face of the dimension (reflecting, or the seam's), else at its
+      centre (*Positions* under [Centerings](CODE.md#centerings)).
+      *Done when* the rule is tested under each branch, the forward and
+      inverse maps agree there, a reloaded checkpoint keeps its anchor,
+      and every port's suite passes against it. Done, and taken out
+      again by 10f.
+    - 10e. **Positions in twice precision** (Erik, 2026-11-27, on
+      `range`: "if so, use it"): tried and parked unmerged on
+      `eschnett-claude/m22-step-10e-range`; an open question in
+      [CODE.md](CODE.md#open-questions).
+    - 10f. **Back to the low corner** (Erik's question, "this is getting
+      complicated. should we just get back to your original
+      recommendation?", and his decision, 2026-11-27: "make it so"):
+      positions from zero where zero is a level-0 node, else from the
+      low corner, one `fma`, whatever the faces (*Positions* under
+      [Centerings](CODE.md#centerings)). *Done when* the tests state
+      what holds (edges, antisymmetry on zero, accuracy off it, no
+      dependence on the faces), GH's quadrant and bitant agree with the
+      box at about `5e−14` again, and every port's suite passes.
+11. **The releases**: `m22` merged, TreeAMR 0.3.0 first, and M21
+    resumed on it.
+
+Not in M22: refinement at a kinked glue; a patch corner's ghosts for a
+set that copies; `map_blocks!` skipping the secondaries by itself,
+unless step 5's numbers ask for it.
+
+*Done when* steps 1–11 pass.

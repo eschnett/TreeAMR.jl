@@ -100,6 +100,11 @@ end
         fill_arbitrary!(fs)
         nrefined = ncoarsened = 0
         for pass in 1:2
+            # The values a regrid moves are the unified ones: `regrid!` fills
+            # first, and the fill's stage 0 makes a coarse copy of a point on
+            # a coarse-fine face its fine primary's restriction (M22), which
+            # arbitrary data and a fresh regrid's output are not yet.
+            unify!(fs, GhostSchedule(fs, STAGGERED_CONS))
             old = staggered_values(fs; owned=true)
             flags = flag_blocks(forest) do b, k
                 pass == 1 ? (isodd(b) && level(k) < 2 ? Refine : Keep) :

@@ -219,21 +219,19 @@ for one width per dimension; it is stored as an `NTuple{D,Int}`.
 [`edgecentered`](@ref), or, for elements of Gauss–Lobatto nodes, with
 [`elementcentered`](@ref) and the order `P` below; an element dimension
 stores and owns as a cell-centered one does. A vertex-like dimension
-stores one plane more —
-the boundary plane the block **shares** with its high-side neighbor,
-which that neighbor owns and the exchange fills exactly as it fills a
-ghost. Three ranges per dimension have names, with `c_d = 1` in a
+stores one plane more, and its own range is its closed range, both
+boundary planes (M22, "Closed blocks" in `CODE.md`): a point on a block
+face is held by every block whose closed box contains it, and the fill
+gives every copy its primary's value. Per dimension, with `c_d = 1` in a
 vertex-like dimension and `0` otherwise:
 
 | stored index | role | view |
 |---|---|---|
 | `1 … G` | low ghosts | |
-| `G+1 … G+N` | **owned** — what the state vector holds | [`interiorview`](@ref) |
-| `G+1 … G+N+c` | **closed** — both boundary planes included | [`closedview`](@ref) |
-| `G+N+1 … N+2G+c` | high exchange region | |
+| `G+1 … G+N+c` | **own** — what the state vector holds | [`interiorview`](@ref) |
+| `G+N+c+1 … N+2G+c` | high ghosts | |
 
-Everything outside the owned range is exchange-filled, so the asymmetry
-is bookkeeping in the target ranges and nothing more. The invariant
+The invariant
 `N ≥ 2G[d] + 2c[d]` is checked here, per dimension: a block's high
 exchange region must be reachable from one ring of neighbors, and a
 finer neighbor spans only `N/2` of this block's cells.
@@ -263,24 +261,12 @@ a fine block must cover whole parent elements; and a forest with a
 rotating seam. It is stored as the field `P`, `0` for a set that is not
 element-centered.
 
-`walls` says how a vertex-like dimension's two wall planes are filled at
-the domain's non-periodic faces (TreeGRRMHD's AMR-8). Ownership is
-half-open, so along a vertex-like dimension the domain's *high* wall plane
-`G+N+1` belongs to nobody and the fill derives it — by the boundary hook
-at an outer face, by the reflection at a reflecting one, by the clamp at
-an outflow one — while the *low* wall `G+1` is owned and evolved. With
-`walls = :half_open`, the default, that is what happens. With
-`walls = :symmetric` the fill also writes the owned low wall plane of
-every vertex-like dimension at a low domain face, by the rule the high
-wall gets at a high face of that kind: the hook's low region becomes
-`1 … G+1`, a reflecting face derives the wall as the high one is derived,
-and an outflow face clamps it with the ghosts beyond it from the nearest
-evolved point `G+2`. A closed box is then mirror-symmetric, which it is
-not under half-open walls. The wall stays an owned point — the state
-vector does not change — so an application that wants the filled value in
-its state gathers it after the fill. A cell-like dimension has no wall
-plane and is unaffected. See "Shared points and half-open ownership"
-under "Centerings" in `CODE.md`.
+At a face of the domain both wall planes of a vertex-like dimension are
+the block's own (M22, "Closed blocks" in `CODE.md`): evolved, with the
+boundary hook filling the ghosts beyond at an outer face, the mirror at
+a reflecting one and the clamp onto the wall at an outflow one, alike on
+both sides, so a closed box is mirror-symmetric. A cell-like dimension has
+no wall plane.
 
 `glue` says how the set's ghosts across a glued face of a forest of
 patches are filled (M20). With `glue = :copy`, the default, they are
@@ -344,8 +330,7 @@ block slots and rebuilds the storage.
     FieldSet(forest, nvars; G)          # element type = floattype(forest)
     FieldSet{Float32}(forest, nvars; G = (2, 0))
     FieldSet(forest, nvars; G = 0, centering = facecentered(3, 1))
-    FieldSet(forest, nvars; G = 1, centering = edgecentered(3, 1),
-             walls = :symmetric)
+    FieldSet(forest, nvars; G = 1, centering = edgecentered(3, 1))
     FieldSet{Float32}(forest, nvars; G = 2, backend = CUDABackend())
     FieldSet(octant, 4; G = 2,          # ρ, and a vector (vx, vy, vz)
              parity = [EvenParity, (OddParity, EvenParity, EvenParity),
@@ -385,9 +370,6 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # other: what every position, weight and element stencil of the set
     # is built from, so it is passed explicitly wherever those are.
     const P::Int
-    # `:half_open` or `:symmetric`: whether the fill also writes the
-    # owned low wall plane of a vertex-like dimension (AMR-8).
-    const walls::Symbol
     # `:copy` or `:interpolate`: how ghosts across a glued face are
     # filled (M20).
     const glue::Symbol
@@ -420,12 +402,11 @@ mutable struct FieldSet{T,D,R,A<:AbstractArray{T}}
     # into a freshly sized array. Mutable so that references an
     # application already holds stay valid across a regrid.
     work::A
-    # The appendix's layout (M20) over the forest's current leaves, on the
-    # host and on the set's backend, built on first use after each change
-    # of the forest (`appendix_cache`); `nothing` until then and for a set
-    # without an appendix. Untyped, so that a set's type does not say
-    # whether it has one.
-    appendix::Any
+    # The primary mask (M22) over the forest's current leaves, on the set's
+    # backend, built on first use after each change of the forest
+    # (`primary_mask`); `nothing` until then. Untyped, so that a set's type
+    # does not depend on it.
+    primary::Any
 end
 
 # `G` as a sentinel-defaulted keyword rather than a required one, so that
@@ -437,10 +418,9 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
                      G::Union{Integer,Tuple{Vararg{Integer}},Nothing}=nothing,
                      centering=cellcentered(D), P=nothing,
                      parity=nothing, rotation=nothing, halfturn=nothing,
-                     walls::Symbol=:half_open, glue::Symbol=:copy,
+                     glue::Symbol=:copy,
                      backend::Backend=CPU()) where {T,D,R}
     nvars > 0 || throw(ArgumentError("nvars must be positive, got $nvars"))
-    check_walls(walls)
     check_glue(glue)
     G === nothing && throw(ArgumentError(
         "FieldSet has no default ghost width: pass `G` explicitly. It follows " *
@@ -485,19 +465,13 @@ function FieldSet{T}(forest::Forest{D,R}, nvars::Integer;
     # in `zerofill!` below.
     zerofill!(work, backend)
     return FieldSet{T,D,R,typeof(work)}(forest, Int(nvars), ghosts, centers, order,
-                                        walls, glue, parities, rotations, halfturns, factors,
+                                        glue, parities, rotations, halfturns, factors,
                                         rotvars, work, nothing)
 end
 FieldSet(forest::Forest{D,R}, nvars::Integer; kwargs...) where {D,R} =
     FieldSet{R}(forest, nvars; kwargs...)
 
 staggers(fs::FieldSet) = staggers(fs.centering)
-
-check_walls(walls::Symbol) =
-    walls === :half_open || walls === :symmetric || throw(ArgumentError(
-        "walls must be :half_open (the owned low wall plane of a vertex-like " *
-        "dimension is evolved, the high one filled) or :symmetric (both are " *
-        "filled at the domain's faces), got :$walls"))
 
 check_glue(glue::Symbol) =
     glue === :copy || glue === :interpolate || throw(ArgumentError(
@@ -836,10 +810,6 @@ function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
         "dimensions, so every set turns into itself and fills its ghosts alone"))
     d1, d2 = rotating_dims(forest)
     swap(t) = Base.setindex(Base.setindex(t, t[d2], d1), t[d1], d2)
-    a.walls === b.walls || throw(ArgumentError(
-        "the two sets of a RotationPair must fill their walls alike, since each " *
-        "reads the other's points beside them: got walls = :$(a.walls) and " *
-        ":$(b.walls)"))
     (a.G == swap(b.G) && a.centering == swap(b.centering)) || throw(ArgumentError(
         "the two sets of a RotationPair must have each other's layout with the " *
         "seam's dimensions $d1 and $d2 exchanged, since a quarter turn of one is the " *
@@ -878,10 +848,11 @@ function RotationPair(a::FieldSet{T,D}, b::FieldSet{S,E}) where {T,D,S,E}
     return RotationPair{typeof(a),typeof(b),typeof(af),typeof(av)}(a, b, af, bf, av, bv)
 end
 
-# The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d] +
-# 2c[d]` is what makes a block's high exchange region reachable from one
-# ring of neighbors even when those neighbors are finer and each spans
-# only `N/2` coarse cells (see "Blocks" in CODE.md).
+# The uniform shorthand, and the per-dimension invariant. `N ≥ 2G[d]` is
+# what makes a block's high exchange region, `G` points beyond its closed
+# range as the low one is (M22), reachable from one ring of neighbors even
+# when those neighbors are finer and each spans only `N/2` of this block's
+# cells or points (see "Blocks" in CODE.md).
 ghostwidths(G::Integer, ::Val{D}) where {D} = ghostwidths(ntuple(_ -> G, D), Val(D))
 function ghostwidths(G::Tuple{Vararg{Integer}}, ::Val{D}) where {D}
     length(G) == D || throw(ArgumentError(
@@ -892,12 +863,11 @@ function ghostwidths(G::Tuple{Vararg{Integer}}, ::Val{D}) where {D}
 end
 
 function storedsize(N::Int, G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
-    all(d -> N >= 2 * G[d] + 2 * c[d], 1:D) || throw(ArgumentError(
-        "N must be >= 2G + 2c in every dimension, got N=$N, G=$G, c=$c. A block's " *
-        "high exchange region must be reachable from one ring of neighbors, and a " *
-        "finer neighbor spans only N/2 of this block's cells; a vertex-like " *
-        "dimension (c=1) needs one more, because its shared boundary plane makes " *
-        "that region one plane longer."))
+    all(d -> N >= 2 * G[d], 1:D) || throw(ArgumentError(
+        "N must be >= 2G in every dimension, got N=$N, G=$G. A block's exchange " *
+        "regions, G cells or points beyond its own range on either side, must be " *
+        "reachable from one ring of neighbors, and a finer neighbor spans only N/2 " *
+        "of this block's cells or points."))
     return ntuple(d -> N + 2 * G[d] + c[d], D)
 end
 
@@ -948,53 +918,26 @@ blockview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
     interiorview(fs::FieldSet, b::Integer)
     interiorview(fs::FieldSet, b::Integer, v::Integer)
 
-A view of block `b`'s **owned** points — shape `(N, ..., N, nvars)`, or
-`(N, ..., N)` for a single variable `v`. This is the part that tiles the
-domain and that the ODE state vector holds, for every centering: in a
-vertex-like dimension a block owns its points `0 … N-1` and the boundary
-point `N` belongs to the neighbor on that side (see
-[`closedview`](@ref)).
+A view of block `b`'s **own** points — shape `(N+c[1], ..., N+c[D],
+nvars)`, or without the trailing `nvars` for a single variable `v`: what
+the ODE state vector holds. In a vertex-like dimension that is the
+block's closed range, both of its face planes, `N + 1` points, each face
+point shared with the blocks across (M22, "Closed blocks" in `CODE.md`).
 """
 interiorview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
     view(fs.work, interiorranges(fs)..., :, b)
 interiorview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
     view(fs.work, interiorranges(fs)..., v, b)
 
-# The owned range per dimension, `G[d]+1 … G[d]+N`.
-interiorranges(fs::FieldSet{T,D}) where {T,D} =
-    ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D)
-
-"""
-    closedview(fs::FieldSet, b::Integer)
-    closedview(fs::FieldSet, b::Integer, v::Integer)
-
-A view of block `b`'s **closed** range — shape `(N+c[1], ..., N+c[D],
-nvars)`, or without the trailing `nvars` for a single variable `v`: the
-owned points plus the shared boundary plane at the high end of every
-vertex-like dimension.
-
-This is what a quantity defined on a block's faces or edges is computed
-over — a flux `F_d` has `N+1` faces in `d`, not `N` — and it is what
-[`map_blocks!`](@ref)`(...; closed = true)` launches over. In a
-cell-centered field set it is exactly [`interiorview`](@ref).
-
-The extra plane is not owned: it belongs to the high-side neighbor, and
-the exchange fills it. A kernel launched over the closed range
-nevertheless *writes* it, because a flux is needed on both of a block's
-faces; making the two sides of a coarse-fine face agree afterwards is
-the interface restriction's job (see `CODE.md`, "Conservation at
-coarse-fine faces").
-"""
-closedview(fs::FieldSet{T,D}, b::Integer) where {T,D} =
-    view(fs.work, closedranges(fs)..., :, b)
-closedview(fs::FieldSet{T,D}, b::Integer, v::Integer) where {T,D} =
-    view(fs.work, closedranges(fs)..., v, b)
-
-# The closed range per dimension, `G[d]+1 … G[d]+N+c[d]`.
-function closedranges(fs::FieldSet{T,D}) where {T,D}
+# The own range per dimension, `G[d]+1 … G[d]+N+c[d]`.
+function interiorranges(fs::FieldSet{T,D}) where {T,D}
     c = staggers(fs)
     return ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D)
 end
+
+# The points of a block's own range per dimension, `N + c[d]`.
+ownextents(fs::FieldSet{T,D}) where {T,D} =
+    ntuple(d -> fs.forest.N + staggers(fs)[d], D)
 
 # The offset from an owned index to a position along a dimension of an
 # equally spaced set: half a cell in a cell-centered dimension (the value
@@ -1010,33 +953,92 @@ end
 # also what the point interpolator inverts, which refuses element sets.
 @inline uniform_shift(h, c::Integer) = c == 1 ? one(h) : one(h) / 2
 
-# The position along one dimension of owned index `I` (the stored index
-# minus `G[d]`, so `1 … N` for the owned points, `≤ 0` and `> N` for the
-# ghosts and the shared plane) of a block with lower corner `origin` and
-# spacing `h`. Every position the package forms goes through here — the
-# geometry, the coordinate and boundary kernels, the folds and the
-# flagging sweep — so that they agree bit for bit, and `nodes` makes the
-# caller say which kind of set it is: `nothing` for an equally spaced
-# set, with `c` its stagger, or the element offsets for an element set,
-# on the kernel's backend (`with_nodes`).
-#
-# Without elements it is `origin + (I - ½)·h` or `origin + (I - 1)·h`,
-# the expression these positions were always formed by. For an element
-# set (M16) owned point `I` is node `i = (I-1) % (P+1)` of element `q =
-# (I-1) ÷ (P+1)`, at `origin + h·(q(P+1) + offsets[i+1])`, the expression
-# TreeWaveOLDG forms; `q(P+1) + offsets[i+1]` is an integer at both face
-# nodes, so the two face nodes at one position get the same bits. A ghost
-# sits at the face: `origin` below, and above, where `I = N+1` since an
-# element set has at most one ghost layer, the expression gives
-# `origin + h·N`, the last owned node's own position.
-@inline nodeposition(origin, h, I::Integer, c::Integer, ::Nothing) =
-    origin + (I - uniform_shift(h, c)) * h
-@inline function nodeposition(origin, h, I::Integer, c::Integer, nodes::AbstractVector)
-    I <= 0 && return origin
+"""
+    nodeposition(lo, h, B::Integer, I::Integer, c::Integer, nodes)
+
+The position along one dimension of owned index `I` of a block — the
+stored index minus the ghost width, so `1 … N` (`N + 1` on a vertex-like
+dimension's shared plane) for its own points and `≤ 0` or beyond for its
+ghosts — given its patch's anchor `lo` along that dimension (an entry
+of [`block_lows`](@ref): zero where zero is on the patch's grid, else
+its low corner), its level's spacing `h` (of
+[`block_spacings`](@ref)) and its integer corner `B` (of
+[`block_bases`](@ref)). `c` is the set's stagger along the dimension, 1
+vertex-like and 0 cell-like, and `nodes` is `nothing` for an equally
+spaced set, else the element's node offsets (a vector, or a tuple in a
+stencil).
+
+The point's integer coordinate `k = B + I − 1` counts spacings of its
+level from the patch's anchor, and the position is
+
+    fma(T(k), h, lo)            lo + k·h        (vertex-like)
+    fma(T(2k + 1), h/2, lo)     lo + (k + ½)·h  (cell-like)
+
+each correctly rounded: the product is exact inside the `fma` and the sum
+is rounded once, wherever `T(k)` (or `T(2k + 1)`) is exact — `k < 2⁵³` in
+`Float64`, `2²⁴` in `Float32`. The cell-like form takes the odd integer
+`2k + 1` and the half spacing, which is exact, rather than `T(k) + ½`,
+which loses the half one bit earlier. An explicit `fma`, not a multiply
+and an add, because a device may fuse the two of its own accord (CUDA
+does) and the host does not: with the `fma` written out, every backend
+rounds once and forms the same bits. Every block that holds a point at
+one level has the same `k`, `lo` and `h`, and a level up `k` halves and
+`h` doubles, both exactly, so every copy of a point — on a shared plane,
+in a ghost, a coarse point under a fine one — is at one position bit for
+bit, even where `k` is too large for the type to hold exactly. A type
+without an IEEE `fma` takes the product and then the sum (`position_fma`).
+This is the only function that forms a position from an index:
+[`coordinates`](@ref), [`fill_by_coordinates!`](@ref), the boundary
+hooks, [`firing_boxes`](@ref) and the folds all call it, and a kernel
+that forms a position of its own should too. See "Positions" under
+"Centerings" in `CODE.md`.
+
+For an element set (M16) `nodes` are the node offsets in spacings from
+an element's low face, and owned point `I` is node `i = (I-1) mod (P+1)`
+of element `q = (I-1) ÷ (P+1)`, at `fma(T(B + q(P+1)) + oᵢ, h, lo)`: the
+offset is not an integer, so its sum with the integer part rounds once
+before the `fma` does, and the halving of the cell-like form would gain
+nothing. The first node (`o₀ = 0`) is the integer form exactly. The last
+node, whose offset is exactly `P + 1`, is formed as the next element's
+first, at `fma(T(B + (q+1)(P+1)), h, lo)`, so that the two face nodes at
+one position have the same integer and get the same bits. A ghost of an
+element set sits at the face: `lo + B·h` below and `lo + (B + N)·h`
+above, by the same integer form.
+"""
+@inline function nodeposition(lo, h, B::Integer, I::Integer, c::Integer, ::Nothing)
+    # Not `uniform_shift` added to `k`: the shift goes into the integer,
+    # `2k + 1` half spacings for a cell-like dimension, so that the one
+    # rounding is the `fma`'s. One conversion, of whichever integer the
+    # stagger picks: converting in each branch made a `Float32` fill of
+    # the positions on an H200 take 214 µs against 174 (HISTORY.md, M22
+    # step 1).
+    k = B + I - 1
+    m, s = c == 1 ? (k, h) : (2 * k + 1, h / 2)
+    return position_fma(oftype(h, m), s, lo)
+end
+@inline function nodeposition(lo, h, B::Integer, I::Integer, c::Integer,
+                              nodes::Union{AbstractVector,Tuple})
+    I <= 0 && return position_fma(oftype(h, B), h, lo)
     P1 = length(nodes)
     q, i = divrem(I - 1, P1)
-    return origin + h * (q * P1 + @inbounds(nodes[i + 1]))
+    i == P1 - 1 && return position_fma(oftype(h, B + (q + 1) * P1), h, lo)
+    return position_fma(oftype(h, B + q * P1) + @inbounds(nodes[i + 1]), h, lo)
 end
+
+# The one rounding of a position, `x·y + z` (CODE.md, "Positions" under
+# "Centerings"). An IEEE type takes `fma`, which rounds once on the host
+# and on every device alike; a CPU without hardware FMA computes the same
+# bits in software, slowly. Any other type — `MultiFloats`' `Float32x2`
+# and `Float64x2`, whose `fma` is `Base`'s "not defined" error — takes the
+# product and then the sum. Its copies of a point still agree: they all
+# evaluate the same expression on the same `k`, `lo` and `h`, and the
+# coarse copy's `T(k)·2h` is the fine one's `T(2k)·h` because the
+# product scales by two exactly. Such a type is a host type here; no
+# device test uses one. A local function rather than a method of
+# `Base.fma` for a type that is not ours.
+@inline position_fma(x::Base.IEEEFloat, y::Base.IEEEFloat, z::Base.IEEEFloat) =
+    fma(x, y, z)
+@inline position_fma(x, y, z) = x * y + z
 
 # The node offsets the position kernels of a set of order `P` read, in
 # `T`, or `nothing` for a set without elements (`P = 0`), on the host.
@@ -1092,13 +1094,18 @@ and the ghosts, whose positions are still well defined and lie on or
 outside the block's boundary.
 
 The position depends on the field set's ghost width *and* on its
-centering — `origin + (i - G[d] - 1/2)·h` in a cell-centered dimension,
-`origin + (i - G[d] - 1)·h` in a vertex-like one, and for an element set
-(M16; [`elementcentered`](@ref)) the Gauss–Lobatto node the index holds,
-with a ghost at the block's face — which is why this
-takes a field set and a block index rather than a forest and a key
-(replacing `cell_center`, which assumed the forest carried `G` and that
-every dimension was cell-centered).
+centering — `lo + (k + 1/2)·h` in a cell-centered dimension and `lo +
+k·h` in a vertex-like one, with `k = B + i − G[d] − 1` the point's
+integer coordinate in its level's spacings from its patch's anchor
+`lo` ([`block_lows`](@ref)), and for an element set (M16;
+[`elementcentered`](@ref)) the
+Gauss–Lobatto node the index holds, with a ghost at the block's face;
+see [`nodeposition`](@ref TreeAMR.nodeposition), which forms every one
+of them, so that the copies of a point held by several blocks are at one
+position bit for bit — which is why this takes a field set and a block
+index rather than a forest and a key (replacing `cell_center`, which
+assumed the forest carried `G` and that every dimension was
+cell-centered).
 
 The optional leading `S` is the type the arithmetic is done in, as
 everywhere in `geometry.jl`; it defaults to the field set's own element
@@ -1108,11 +1115,12 @@ type `T`, which is what [`fill_by_coordinates!`](@ref) and
 function coordinates(::Type{S}, fs::FieldSet{T,D}, b::Integer,
                      idx::NTuple{D,<:Integer}) where {S,T,D}
     forest = fs.forest
-    origin = block_origin(S, forest, blockkey(fs, b))
-    h = spacing(S, forest, blockkey(fs, b))
+    k = blockkey(fs, b)
+    lo, B = block_low(S, forest, k), block_base(forest, k)
+    h = spacing(S, forest, k)
     c = staggers(fs)
     nodes = element_offsets(S, fs.P)
-    return ntuple(d -> nodeposition(origin[d], h, Int(idx[d]) - fs.G[d], c[d], nodes), D)
+    return ntuple(d -> nodeposition(lo[d], h, B[d], Int(idx[d]) - fs.G[d], c[d], nodes), D)
 end
 coordinates(fs::FieldSet{T,D}, b::Integer, idx::NTuple{D,<:Integer}) where {T,D} =
     coordinates(T, fs, b, idx)
@@ -1209,8 +1217,8 @@ patches' boxes may overlap or coincide — the six faces of a cubed sphere
 are all naturally `[-1, 1]² × [r₀, r₁]` — so the application, whose map
 from each patch's box to space it is, needs the patch to place a point.
 The kernel gets it from [`block_patches`](@ref), as it gets the position
-from [`block_origins`](@ref): a number per block, not a range of
-coordinates to test. On a forest of one brick `p` is always 1.
+from [`block_lows`](@ref) and [`block_bases`](@ref): a number per block,
+not a range of coordinates to test. On a forest of one brick `p` is always 1.
 
 A single field, so `WithPatch(f)` is `isbits` whenever `f` is and can be
 a kernel argument like the bare callback: the forms run on every
@@ -1234,31 +1242,32 @@ end
 # form evaluates at, the first owned point of block 1.
 allvariables_sample_patch(fs::FieldSet) = patch(fs.forest, blockkey(fs, 1))
 
-@kernel function coordinates_kernel!(work, f, @Const(origins), @Const(spacings), nodes,
-                                     ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+@kernel function coordinates_kernel!(work, f, @Const(lows), @Const(bases),
+                                     @Const(spacings), nodes, ::Val{D}, ::Val{G},
+                                     ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
     v, b = I[D + 1], I[D + 2]
-    origin, h = origins[b], spacings[b]
+    lo, B, h = lows[b], bases[b], spacings[b]
     # The stored index of owned point i is i + G[d], so `coordinates`'
     # owned index (idx - G[d]) is just i, and `nodeposition` forms the
-    # same arithmetic, in the same order, on the same origin and spacing:
+    # same arithmetic, in the same order, on the same corner and spacing:
     # this reproduces `coordinates` bit for bit.
-    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
     work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, v)
 end
 
 # The all-variables form: no variable axis in the ndrange, one call per
 # point, every slot written from the tuple that comes back. The position
 # is formed by the same expression as `coordinates_kernel!` above, on the
-# same origin and spacing in the same order, so the two forms fill a
+# same corner and spacing in the same order, so the two forms fill a
 # field set with bit-for-bit the same numbers.
-@kernel function coordinates_all_kernel!(work, f, @Const(origins), @Const(spacings),
-                                         nodes, ::Val{D}, ::Val{G}, ::Val{C},
-                                         ::Val{NV}) where {D,G,C,NV}
+@kernel function coordinates_all_kernel!(work, f, @Const(lows), @Const(bases),
+                                         @Const(spacings), nodes, ::Val{D}, ::Val{G},
+                                         ::Val{C}, ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)                     # (i1..iD, block)
     b = I[D + 1]
-    origin, h = origins[b], spacings[b]
-    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+    lo, B, h = lows[b], bases[b], spacings[b]
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
     vals = f(x)
     idx = ntuple(d -> I[d] + G[d], Val(D))
     # Unrolled through `Val`, so every tuple index is a literal: a
@@ -1270,27 +1279,28 @@ end
 end
 
 # The forms with the patch (M17): the kernels above, handed the block's
-# patch from `block_patches` beside its origin and spacing, and passing it
+# patch from `block_patches` beside its corner and spacing, and passing it
 # to the callback after the position. The position is formed by the same
 # expression, so a callback that ignores the patch fills bit for bit what
 # the form without it does.
-@kernel function coordinates_patch_kernel!(work, f, @Const(origins), @Const(spacings),
-                                           @Const(patches), nodes, ::Val{D}, ::Val{G},
-                                           ::Val{C}) where {D,G,C}
+@kernel function coordinates_patch_kernel!(work, f, @Const(lows), @Const(bases),
+                                           @Const(spacings), @Const(patches), nodes,
+                                           ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)                     # (i1..iD, var, block)
     v, b = I[D + 1], I[D + 2]
-    origin, h, p = origins[b], spacings[b], Int(patches[b])
-    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+    lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
     work[ntuple(d -> I[d] + G[d], Val(D))..., v, b] = f(x, p, v)
 end
 
-@kernel function coordinates_patch_all_kernel!(work, f, @Const(origins), @Const(spacings),
-                                               @Const(patches), nodes, ::Val{D}, ::Val{G},
-                                               ::Val{C}, ::Val{NV}) where {D,G,C,NV}
+@kernel function coordinates_patch_all_kernel!(work, f, @Const(lows), @Const(bases),
+                                               @Const(spacings), @Const(patches), nodes,
+                                               ::Val{D}, ::Val{G}, ::Val{C},
+                                               ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)                     # (i1..iD, block)
     b = I[D + 1]
-    origin, h, p = origins[b], spacings[b], Int(patches[b])
-    x = ntuple(d -> nodeposition(origin[d], h, I[d], C[d], nodes), Val(D))
+    lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], I[d], C[d], nodes), Val(D))
     vals = f(x, p)
     idx = ntuple(d -> I[d] + G[d], Val(D))
     ntuple(Val(NV)) do v
@@ -1305,29 +1315,30 @@ end
     fill_by_coordinates!(WithPatch(f), fs::FieldSet)
     fill_by_coordinates!(WithPatch(AllVariables(f)), fs::FieldSet)
 
-Set every **owned** point of every block from the callback
+Set every **own** point of every block from the callback
 `f(x, v) -> value`, where `x` is that point's position — a cell center,
 a face center, a vertex, an element's Gauss–Lobatto node, whatever this
 field set's centering says (an
 `NTuple{D,T}` in its own element type, see [`coordinates`](@ref)) — and
-`v` the variable index. The ghosts and the shared boundary plane are
-left untouched: they are filled by the ghost exchange (M2). A set
-interpolated across a glue (M20) owns the high face planes of its
-blocks at a glued face of their patch, its appendix, and those are
-filled too.
+`v` the variable index — both face planes of a vertex-like dimension
+included, every copy of a shared point at one position bit for bit, so
+that every copy gets the same value. The ghosts are left untouched: they
+are filled by the ghost exchange (M2).
 
 `f` is called once per point from a KernelAbstractions kernel, so it runs
 concurrently across blocks (M5) and must be a pure function of its
 arguments. The tree is not consulted: the kernel gets the geometry as
-the two plain per-block arrays [`block_origins`](@ref) and
-[`block_spacings`](@ref), which is what makes it a device kernel (M6).
+the plain per-block arrays [`block_lows`](@ref), [`block_bases`](@ref)
+and [`block_spacings`](@ref), which is what makes it a device kernel
+(M6), and forms each position through
+[`nodeposition`](@ref TreeAMR.nodeposition).
 
 Wrapping the callback in [`AllVariables`](@ref) selects the second form:
 `f(x) -> vals` is then called **once per point** and returns all
 `fs.nvars` values as a tuple, which is what a state that is only
 definable as a whole needs. The two forms fill a field set with
 bit-for-bit the same numbers — the position is formed by the same
-expression, on the same origin and spacing, in the same order — so
+expression, on the same corner and spacing, in the same order — so
 switching between them is not a numerical change. The tuple's length is
 checked once on the host, at the first owned point of block 1, before
 anything is launched.
@@ -1352,16 +1363,15 @@ function fill_by_coordinates!(f, fs::FieldSet{T,D}) where {T,D}
     # runs. This is a setup-frequency call (initial data, and one pass of
     # `adapt_to_initial_data!`), not part of the per-evaluation path, so
     # the upload is not worth caching.
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(coordinates_kernel!, backend, fs.work, f, origins, spacings,
-                         nodes, Val(D), Val(fs.G), Val(staggers(fs));
-                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+        launch_by_owner!(coordinates_kernel!, backend, fs.work, f, lows, bases,
+                         spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs));
+                         ndrange=(ownextents(fs)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(f, Val(fs.nvars), false, false), fs)
     return fs
 end
 
@@ -1372,33 +1382,31 @@ function fill_by_coordinates!(w::AllVariables, fs::FieldSet{T,D}) where {T,D}
     # nothing to fill.
     nblocks(fs) == 0 && return fs
     check_allvariables(w.f(allvariables_sample(fs)), fs, "fill callback")
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, origins,
+        launch_by_owner!(coordinates_all_kernel!, backend, fs.work, w.f, lows, bases,
                          spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
-                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+                         Val(fs.nvars); ndrange=(ownextents(fs)..., nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(w.f, Val(fs.nvars), true, false), fs)
     return fs
 end
 
 function fill_by_coordinates!(w::WithPatch, fs::FieldSet{T,D}) where {T,D}
     forest = fs.forest
     backend = get_backend(fs.work)
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     patches = todevice(backend, block_patches(forest))
     with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(coordinates_patch_kernel!, backend, fs.work, w.f, origins,
+        launch_by_owner!(coordinates_patch_kernel!, backend, fs.work, w.f, lows, bases,
                          spacings, patches, nodes, Val(D), Val(fs.G), Val(staggers(fs));
-                         ndrange=(ntuple(_ -> forest.N, D)..., fs.nvars, nblocks(fs)))
+                         ndrange=(ownextents(fs)..., fs.nvars, nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(w.f, Val(fs.nvars), false, true), fs)
     return fs
 end
 
@@ -1409,17 +1417,16 @@ function fill_by_coordinates!(w::WithPatch{<:AllVariables}, fs::FieldSet{T,D}) w
     f = w.f.f
     check_allvariables(f(allvariables_sample(fs), allvariables_sample_patch(fs)), fs,
                        "fill callback")
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     patches = todevice(backend, block_patches(forest))
     with_nodes(backend, T, fs.P) do nodes
-        launch_by_owner!(coordinates_patch_all_kernel!, backend, fs.work, f, origins,
+        launch_by_owner!(coordinates_patch_all_kernel!, backend, fs.work, f, lows, bases,
                          spacings, patches, nodes, Val(D), Val(fs.G), Val(staggers(fs)),
-                         Val(fs.nvars); ndrange=(ntuple(_ -> forest.N, D)..., nblocks(fs)))
+                         Val(fs.nvars); ndrange=(ownextents(fs)..., nblocks(fs)))
     end
     synchronize(backend)
-    hasappendix(fs) && Base.inferencebarrier(fill_appendix_coordinates!)(
-        AppendixCallback(f, Val(fs.nvars), true, true), fs)
     return fs
 end
 

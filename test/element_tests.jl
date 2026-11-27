@@ -181,7 +181,7 @@ end
         @test fs.P == 3
         @test fs.centering == elementcentered(D)
         @test size(fs.work) == size(FieldSet(forest, 2; G=G).work)
-        @test TreeAMR.closedranges(fs) == TreeAMR.interiorranges(fs)
+        @test TreeAMR.interiorranges(fs) == TreeAMR.interiorranges(FieldSet(forest, 2; G=G))
     end
     @test FieldSet(forest, 1; G=1, centering=elementcentered(D), P=1).P == 1
     @test FieldSet(forest, 1; G=1).P == 0
@@ -320,9 +320,15 @@ is_edge_ghost(fs, I) = count(e -> !(fs.G[e] + 1 <= I[e] <= fs.G[e] + fs.forest.N
     fs = FieldSet(forest, D; G=G, centering=E, P=P)
     t = TreeAMR.element_tables(T, P)
     N, P1 = forest.N, P + 1
-    nodepos(b, I) = let o = block_origin(T, forest, blockkey(fs, b)),
-                        h = spacing(T, forest, blockkey(fs, b))
-        ntuple(d -> o[d] + h * (((I[d] - 1) ÷ P1) * P1 + t.offsets[(I[d] - 1) % P1 + 1]), D)
+    # Node `i` of element `q` at `lo + ((B + q(P+1)) + oᵢ)·h`, and the
+    # last node, at offset `P + 1`, as the next element's first.
+    nodepos(b, I) = let k = blockkey(fs, b), lo = TreeAMR.block_low(T, forest, k),
+                        B = TreeAMR.block_base(forest, k), h = spacing(T, forest, k)
+        ntuple(D) do d
+            q, i = divrem(I[d] - 1, P1)
+            i == P ? lo[d] + T(B[d] + (q + 1) * P1) * h :
+            lo[d] + (T(B[d] + q * P1) + t.offsets[i + 1]) * h
+        end
     end
     owned(b) = CartesianIndices(ntuple(_ -> 1:N, D))
     # `coordinates` is TreeWaveOLDG's `node_position` at every owned
@@ -396,10 +402,14 @@ is_edge_ghost(fs, I) = count(e -> !(fs.G[e] + 1 <= I[e] <= fs.G[e] + fs.forest.N
     end
 end
 
-@testset "Equally spaced sets keep their positions bit for bit: D=$D" for D in (1, 2, 3)
-    # Guards the position helper changing a cell or vertex position in
-    # its last bit, which every recorded number of the suite would move
-    # with: it must be the expression these positions always were.
+@testset "Equally spaced positions are formed from integer coordinates: D=$D" for
+    D in (1, 2, 3)
+    # Guards a position formed from a block's own floating-point corner,
+    # or with the shift subtracted in floating point: every position must
+    # be `lo + k·h` or `lo + (k + ½)·h` for the point's integer coordinate
+    # `k` from the patch's anchor `lo`, rounded once by an explicit `fma` (the half as `2k + 1` half
+    # spacings), the expression that puts every copy of a point at one
+    # position (CODE.md, "Positions" under "Centerings").
     for T in (Float64, Float32), C in (cellcentered(D), vertexcentered(D),
                                        facecentered(D, 1)), G in (0, 2)
         forest = Forest{T}(ntuple(_ -> 3, D); N=6,
@@ -407,11 +417,14 @@ end
         fs = FieldSet(forest, 1; G=G, centering=C)
         c = staggers(fs)
         for b in (1, nblocks(fs)), I in stored_indices(fs)
-            o = block_origin(T, forest, blockkey(fs, b))
-            h = spacing(T, forest, blockkey(fs, b))
-            off = ntuple(d -> c[d] == 1 ? one(h) : one(h) / 2, D)
+            k = blockkey(fs, b)
+            lo = TreeAMR.block_low(T, forest, k)       # the anchor: here the centre
+            B = TreeAMR.block_base(forest, k)
+            h = spacing(T, forest, k)
+            kk = ntuple(d -> B[d] + I[d] - G - 1, D)
             @test coordinates(fs, b, Tuple(I)) ===
-                  ntuple(d -> o[d] + (I[d] - G - off[d]) * h, D)
+                  ntuple(d -> c[d] == 1 ? fma(T(kk[d]), h, lo[d]) :
+                                          fma(T(2 * kk[d] + 1), h / 2, lo[d]), D)
         end
     end
 end
@@ -771,7 +784,7 @@ end
     # conservative element scheme would need as mortar fluxes instead.
     forest = element_levels_forest(2, 8, 2)
     fs = FieldSet(forest, 1; G=0, centering=elementcentered(2), P=3)
-    @test_throws "mortar fluxes" InterfaceSchedule(fs)
+    @test_throws "mortar fluxes" UnifySchedule(fs)
 end
 
 # --- The regrid ---------------------------------------------------------

@@ -13,6 +13,7 @@ using KernelAbstractions: @kernel, @index, @Const, get_backend, synchronize,
                           Backend, CPU, allocate, supports_float64
 import KernelAbstractions
 import Adapt
+using PrecompileTools: @setup_workload, @compile_workload
 using Base.MultiplicativeInverses: SignedMultiplicativeInverse
 
 # Tree core (M1)
@@ -21,10 +22,14 @@ export Forest, nleaves, maxlevel, root_position, root_index, alldirections, floa
 export find_leaf, isleaf, neighbor_keys, refine!, coarsen!, balance!, isbalanced, generation
 export root_spacing, spacing, minimum_spacing, block_origin, block_extent,
        block_spacings, block_origins
+# Positions from integer coordinates (M22 step 1): `nodeposition` is
+# public, not exported, since its name is generic.
+export block_lows, block_bases
+public nodeposition
 
 # Multi-patch forests (M17)
 export patch, block_patches
-export FieldSet, nblocks, blockkey, blockview, interiorview, closedview,
+export FieldSet, nblocks, blockkey, blockview, interiorview,
        coordinates, fill_by_coordinates!
 export cellcentered, vertexcentered, facecentered, edgecentered, staggers
 
@@ -38,7 +43,10 @@ export Operators, OperatorFamily, PointValue, Conservative, ElementLocal,
 
 # ODE coupling (M3)
 export statelength, statevector, statearray, scatter!, gather!, map_blocks!,
-       block_mapreduce, mesh_mapreduce, volume_weighted_norm, isowned
+       block_mapreduce, mesh_mapreduce, volume_weighted_norm
+
+# Closed blocks (M22): the primaries of shared points
+export PrimaryMask, primary_mask, isprimary, unify!
 
 # Several field sets in one state vector (for TreeGRRMHD)
 export staterange, stateview
@@ -51,7 +59,7 @@ export RegridFlag, Refine, Coarsen, Keep, flag_blocks, buffered_flags, complete_
 export firing_boxes
 
 # Conservation at coarse-fine faces (M8)
-export InterfaceSchedule, restrict_interfaces!
+export UnifySchedule
 
 # The all-variables form of the coordinate callbacks (for TreeHydro)
 export AllVariables, WithPatch, Relative
@@ -90,12 +98,13 @@ include("storage.jl")
 include("operators.jl")
 include("glue.jl")
 include("schedule.jl")
+include("unify.jl")
 include("ghosts.jl")
-include("interfaces.jl")
 include("state.jl")
 include("regrid.jl")
 include("interpolate.jl")
 include("atlas.jl")
 include("grids.jl")
+include("precompile.jl")
 
 end

@@ -69,7 +69,7 @@ end
 
 """
 The state, flux, velocity and schedules of the rigid-rotation advection
-on a rotating quadrant; `fixup = false` drops `restrict_interfaces!`.
+on a rotating quadrant; `fixup = false` drops `unify!`.
 """
 function advection_problem(forest::Forest{D}; fixup::Bool) where {D}
     d1, d2 = TreeAMR.rotating_dims(forest)
@@ -91,8 +91,12 @@ function advection_problem(forest::Forest{D}; fixup::Bool) where {D}
                                      d == d1 ? -x[d2] : d == d2 ? x[d1] : 0.0
         end
     end
+    # The fluxes normal to `d1` and `d2` turn into each other, so their
+    # copies of a seam point are each other's, and they are unified as a
+    # pair (M22).
     return (; state, fluxes, vel, fixup, schedule=GhostSchedule(state, ROT_OPS4),
-            ischeds=ntuple(d -> InterfaceSchedule(fluxes[d]), D),
+            ischeds=ntuple(d -> UnifySchedule(fluxes[d]), D),
+            pair=RotationPair(fluxes[d1], fluxes[d2]), plane=(d1, d2),
             spacings=block_spacings(forest, Float64),
             hook=CellBoundary((x, v, δ) -> zero(eltype(x))))
 end
@@ -103,9 +107,17 @@ function advect_rhs!(du, u, p)
     fill_ghosts!(p.state, p.schedule; boundary=p.hook)
     ntuple(Val(D)) do d
         map_blocks!(advect_flux_kernel!, p.fluxes[d], p.fluxes[d].work, p.state.work,
-                    p.vel[d].work, Val(D), Val(p.state.G), Val(d); closed=true)
-        p.fixup && restrict_interfaces!(p.fluxes[d], p.ischeds[d])
+                    p.vel[d].work, Val(D), Val(p.state.G), Val(d))
         nothing
+    end
+    if p.fixup
+        # A quarter turn's plane fluxes are a pair; a half turn's turn into
+        # themselves.
+        plane = hasproperty(p, :plane) ? p.plane : ()
+        isempty(plane) || unify!(p.pair, (p.ischeds[plane[1]], p.ischeds[plane[2]]))
+        for d in 1:D
+            d in plane || unify!(p.fluxes[d], p.ischeds[d])
+        end
     end
     map_blocks!(advect_divergence_kernel!, p.state, statearray(du, p.state),
                 map(f -> f.work, p.fluxes), p.spacings, Val(D))
@@ -313,8 +325,13 @@ function rotating_wave(; N, C, K, rotating=(1, 2), full::Bool, p=4, cfl=0.25,
     fill_by_coordinates!(rotwave_exact(K, rotating, t_end), exact)
     uexact = statevector(exact)
     gather!(uexact, exact)
-    err = sol.u[end] .- uexact
-    scatter!(fs, sol.u[end])
+    # A secondary's state entry is integrated along and never read (M22,
+    # "Closed blocks" in CODE.md): `unify!` gives it its primary's value,
+    # the seam's and the axis's included, as an application's output would.
+    u = copy(sol.u[end])
+    unify!(u, fs, schedule)
+    err = u .- uexact
+    scatter!(fs, u)
     fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(rotwave_exact(K, rotating,
                                                                                 t_end)))
     return (l2=volume_weighted_norm(fs, err), linf=volume_weighted_norm(fs, err; p=Inf),

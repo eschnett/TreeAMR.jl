@@ -41,12 +41,12 @@
 #     scatter             scatter! alone (no messages: the ideal line)
 #     norm                volume_weighted_norm (two reductions)
 #     maxabs              mesh_mapreduce(abs, max, …) (one reduction)
-#     interfaces          restrict_interfaces! on a set face-centered along x_D,
+#     interfaces          unify! on a set face-centered along x_D,
 #                         G = 0, whose coarse-fine faces cross the rank boundaries
 #     interpolate         interpolate! of NPTS points per rank, spread over
 #                         the whole domain, so most route to other ranks
 #     ghost_schedule      GhostSchedule(fs, ops): the build, digest included
-#     interface_schedule  InterfaceSchedule(fluxes)
+#     interface_schedule  UnifySchedule(fluxes)
 #     regrid_refine       regrid! refining the lowest layer of roots of tile
 #                         0, the start of the curve: every later rank's range
 #                         shifts, so at P ≥ 2 blocks migrate (up to the
@@ -329,7 +329,7 @@ function run_mesh(mesh)
     schedule = GhostSchedule(fs, OPS)
     fluxes = FieldSet{T}(forest, NVARS; G=0, centering=facecentered(D, D), backend=BACKEND)
     fill_by_coordinates!(initial, fluxes)
-    isched = InterfaceSchedule(fluxes)
+    isched = UnifySchedule(fluxes)
     spacings = let h = block_spacings(forest, T)
         BACKEND isa CPU ? h : TreeAMR.todevice(BACKEND, h)
     end
@@ -391,7 +391,7 @@ function run_mesh(mesh)
     record("scatter", () -> (scatter!(fs, u); sync()))
     record("norm", () -> volume_weighted_norm(fs, u))
     record("maxabs", () -> mesh_mapreduce(abs, max, zero(T), fs, u))
-    record("interfaces", () -> (restrict_interfaces!(fluxes, isched); sync()))
+    record("interfaces", () -> (unify!(fluxes, isched); sync()))
 
     xs = TreeAMR.todevice(BACKEND, points(Val(D)))
     vals = allocate(BACKEND, T, (NVARS, 1, NPTS))
@@ -403,7 +403,7 @@ function run_mesh(mesh)
 
     slow = max(3, REPS ÷ 3)
     record("ghost_schedule", () -> GhostSchedule(fs, OPS), slow)
-    record("interface_schedule", () -> InterfaceSchedule(fluxes), slow)
+    record("interface_schedule", () -> UnifySchedule(fluxes), slow)
 
     # The regrid cycle. Each repetition refines the slab and coarsens it
     # back, so every one starts from the same mesh; the schedules are

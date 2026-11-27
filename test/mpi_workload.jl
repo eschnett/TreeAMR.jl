@@ -57,6 +57,11 @@ const RANK = USE_MPI ? MPI.Comm_rank(MPI.COMM_WORLD) : 0
 const NRANKS = USE_MPI ? MPI.Comm_size(MPI.COMM_WORLD) : 1
 emit(words...) = (RANK == 0 && println(join(words, " ")); nothing)
 
+# A case, or the part of one, that needs what a later step of M22 ("Closed
+# blocks") rebuilds: one comment line in place of its output, which the
+# comparison between rank counts skips, as it skips every `#` line.
+pending_case(tag, step) = emit("# pending until M22 step $step:", tag)
+
 digest(bytes::AbstractVector{UInt8}) = bytes2hex(sha256(bytes))[1:32]
 digest(v::Vector{<:AbstractFloat}) = digest(reinterpret(UInt8, v))
 digest(s::AbstractString) = digest(codeunits(s))
@@ -104,24 +109,28 @@ function transfers(forest, groups, stages)
     return "$total balanced $balanced"
 end
 transfers(forest, s::GhostSchedule) =
-    transfers(forest, [s.phase1; reduce(vcat, s.phase2; init=eltype(s.phase1)[])],
+    transfers(forest, [s.unify; s.phase1; reduce(vcat, s.phase2; init=eltype(s.phase1)[])],
               s.stages)
-transfers(forest, s::InterfaceSchedule) =
-    transfers(forest, reduce(vcat, s.phases; init=eltype(eltype(s.phases))[]), s.stages)
+transfers(forest, s::UnifySchedule) = transfers(forest, s.unify, s.stages)
 
 # The reductions of one variable: exact ones as they are, sums marked.
+# A sum or a count takes each point once, at its primary, and a maximum
+# or a minimum every copy (M22); a set without a vertex-like dimension
+# ignores the keyword.
 function reductions(tag, fs, u)
-    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs))
+    emit(tag, "count", mesh_mapreduce(x -> 1, +, 0, fs; primaries=true))
     emit(tag, "linf", @sprintf("%.17g", volume_weighted_norm(fs, u; p=Inf)))
-    emit(tag, "min", @sprintf("%.17g", mesh_mapreduce(identity, min, Inf, fs; vars=1)))
+    emit(tag, "min", @sprintf("%.17g", mesh_mapreduce(identity, min, Inf, fs; vars=1,
+                                                      primaries=false)))
     emit(tag, "negmax",
-         @sprintf("%.17g", mesh_mapreduce(x -> -abs(x) - 1, max, -Inf, fs; vars=1)))
+         @sprintf("%.17g", mesh_mapreduce(x -> -abs(x) - 1, max, -Inf, fs; vars=1,
+                                          primaries=false)))
     # An `init` that is not neutral, under a weight: every block's value
     # is `0.5 max(1, …) = 0.5`, so a rank with no blocks must contribute
     # nothing rather than its `init`, or this would print 1.
     emit(tag, "initmax",
          @sprintf("%.17g", mesh_mapreduce(x -> -abs(x), max, 1.0, fs; vars=1,
-                                          weight=k -> 0.5)))
+                                          weight=k -> 0.5, primaries=false)))
     emit(tag, "sum l2", @sprintf("%.17g", volume_weighted_norm(fs, u)))
     emit(tag, "sum mass", @sprintf("%.17g", total_mass(fs, 1)))
     # A fold over points (M15): several results from one sweep and one
@@ -129,7 +138,7 @@ function reductions(tag, fs, u)
     # points in a slab of the domain, are exact at any rank count; the sum
     # of squares is marked as a sum.
     init = (n = Sum(0), hi = Max(-Inf), lo = Min(Inf), slab = Sum(0), sq = Sum(0.0))
-    r = mesh_fold(TreeAMR.combine, init, fs; vars=1) do acc, p
+    r = mesh_fold(TreeAMR.combine, init, fs; vars=1, primaries=true) do acc, p
         q = p.u[1]
         return TreeAMR.combine(acc, (n = Sum(1), hi = Max(q), lo = Min(q),
                                      slab = Sum(Int(p.x[1] < 0.5)), sq = Sum(q * q)))
@@ -256,7 +265,7 @@ function pseudorandom!(fs::FieldSet{T,D}) where {T,D}
 end
 
 function fill_case(tag, forest::Forest{D}, centerings; G, ops,
-                   walls::Symbol=:half_open, relative::Bool=false) where {D}
+                   relative::Bool=false) where {D}
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
     mirrored = findall(d -> any(TreeAMR.reflecting_faces(forest)[d]), 1:D)
     f = (x, v) -> sum(d -> (d + v) * x[d]^2 - x[d], 1:D) + v
@@ -264,7 +273,7 @@ function fill_case(tag, forest::Forest{D}, centerings; G, ops,
         parity = isempty(mirrored) ? nothing :
                  [ntuple(d -> d == first(mirrored) ? OddParity : EvenParity, D),
                   ntuple(_ -> EvenParity, D)]
-        fs = FieldSet(forest, 2; G=G, centering=C, parity=parity, walls=walls)
+        fs = FieldSet(forest, 2; G=G, centering=C, parity=parity)
         pseudorandom!(fs)
         sched = GhostSchedule(fs, ops)
         boundary = !hasouter(forest) ? nothing :
@@ -274,10 +283,32 @@ function fill_case(tag, forest::Forest{D}, centerings; G, ops,
         emit(tag, name, "transfers", transfers(forest, sched))
         emit(tag, name, "filled", digest(gathered(forest, fs.work)))
         any(==(:vertex), C) || continue
-        isched = InterfaceSchedule(fs)
-        restrict_interfaces!(fs, isched)
+        isched = UnifySchedule(fs)
+        unify!(fs, isched)
         emit(tag, name, "interfaces", transfers(forest, isched))
         emit(tag, name, "restricted", digest(gathered(forest, fs.work)))
+    end
+    return nothing
+end
+
+# `unify!` on a state vector of pseudorandom copies (M22): every
+# secondary takes its primary's value, through one message round where
+# the primary's block is another rank's; the state, gathered, and the
+# count of points that changed, which a wrong primary would change.
+function unify_case(tag, forest::Forest{D}) where {D}
+    for (name, C) in ("vertex" => vertexcentered(D), "face1" => facecentered(D, 1))
+        fs = FieldSet(forest, 2; G=1, centering=C)
+        sched = GhostSchedule(fs, OPS2)
+        u = statevector(fs)
+        offset = first(blockrange(forest)) - 1
+        A = statearray(u, fs)
+        for b in 1:nblocks(fs), v in 1:2, I in CartesianIndices(size(A)[1:D])
+            A[I, v, b] = 2 * (hash((offset + b, Tuple(I), v)) / typemax(UInt64)) - 1
+        end
+        before = copy(u)
+        unify!(u, fs, sched)
+        changed = TreeAMR.allgather(forest.comm, count(u .!= before))
+        emit(tag, name, "unified", digest(gathered(forest, u)), sum(changed))
     end
     return nothing
 end
@@ -427,8 +458,8 @@ function burgers_rhs!(du, u, state, fluxes, sched, ischeds, spacings, ::Val{D},
     fill_ghosts!(state, sched)
     ntuple(Val(D)) do d
         map_blocks!(flux_kernel!, fluxes[d], fluxes[d].work, state.work, Val(D),
-                    Val(GU), Val(GF), Val(d); closed=true)
-        restrict_interfaces!(fluxes[d], ischeds[d])
+                    Val(GU), Val(GF), Val(d))
+        unify!(fluxes[d], ischeds[d])
         nothing
     end
     map_blocks!(divergence_kernel!, state, statearray(du, state),
@@ -442,7 +473,7 @@ function burgers_case(tag, forest::Forest{D}; G, ops, steps) where {D}
     fill_by_coordinates!(initial, state)
     sched = GhostSchedule(state, ops)
     fluxes = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d)), D)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
     emit(tag, "transfers", transfers(forest, sched))
     for d in 1:D
@@ -605,7 +636,7 @@ function burgers_regrid_case(tag; cycles, steps)
         after = total_mass(state, 1)
         conserved &= abs(after - before) <= 1e-13 * abs(before)
         sched = GhostSchedule(state, OPSC)
-        ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+        ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
         u = statevector(state)
         gather!(u, state)
         spacings = block_spacings(forest)
@@ -853,7 +884,7 @@ function empty_rank_case(tag)
 
     vfs = FieldSet(forest, 2; G=0, centering=vertexcentered(D), parity=EMPTY_PARITY)
     pseudorandom!(vfs)
-    restrict_interfaces!(vfs, InterfaceSchedule(vfs))
+    unify!(vfs, UnifySchedule(vfs))
     emit(tag, "restricted", digest(gathered(forest, vfs.work)))
 
     # Rank 0 asks for every point, beyond the wall too; the others for none.
@@ -1177,10 +1208,13 @@ cubed_sphere_of(N) = Forest([(roots=(2, 2, 1), extents=((-1, 1), (-1, 1), (1, 2)
                              for _ in 1:6]; N=N, glue=cube_glue(), comm=COMM)
 
 # The transfers this rank receives from another across a glued face,
-# summed over the ranks: none serially.
+# summed over the ranks: none serially. Told by the patches of the target
+# and the source, global leaves both, since a key carries the glue's axis
+# map only (M22), which is the identity on the annulus.
 function glued_received(forest, sched)
-    n = sum(st -> st.remote === nothing ? 0 :
-                  count(e -> e.key.glue != 0, st.remote.recvlayout),
+    across(e) = patch(forest, forest.leaves[e.target]) !=
+                patch(forest, forest.leaves[e.source])
+    n = sum(st -> st.remote === nothing ? 0 : count(across, st.remote.recvlayout),
             sched.stages; init=0)
     return sum(TreeAMR.allgather(forest.comm, n))
 end
@@ -1231,19 +1265,18 @@ glue_torus(n) =
 
 const OPSG = Operators(prolongation=4, restriction=4, glue=6)
 
-# Every owned point, the appendix included, from a smooth function of the
-# physical point, through the state vector.
+# Every own point, closed (M22), from a smooth function of the physical
+# point, through the state vector.
 function glue_state(fs)
     forest = fs.forest
     N = forest.N
     u = statevector(fs)
-    A = statearray(u, fs; appendix=true)
-    dims = TreeAMR.appendix_layout(fs).dims
+    A = statearray(u, fs)
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
-        p, h, o = patch(forest, k), spacing(forest, k), block_origin(forest, k)
-        for I in CartesianIndices(ntuple(d -> 1:(N + dims[b][d]), 2)), v in 1:fs.nvars
-            x = TreeAMR.chart_map(GlueTorus(), ntuple(d -> o[d] + (I[d] - 1) * h, 2), p)
+        p = patch(forest, k)
+        for I in CartesianIndices((N + 1, N + 1)), v in 1:fs.nvars
+            x = TreeAMR.chart_map(GlueTorus(), coordinates(fs, b, Tuple(I) .+ fs.G), p)
             A[Tuple(I)..., v, b] = v * (0.5 + sin(2π * (2x[1] / (1 + GA + GB) + x[2]) + 0.3))
         end
     end
@@ -1256,10 +1289,10 @@ glue_received(forest, sched) =
     sum(TreeAMR.allgather(forest.comm, length(sched.glueplan.recvtarget)))
 
 # The kinked torus, vertex-centered and interpolated across its glues:
-# one fill, digested with its ghosts, and the reductions, which count each
-# glued face point once; then a regrid that refines the interior and
-# keeps every block on a glued face, carrying its appendix between ranks,
-# and the fill again on the new partition.
+# one fill, digested with its ghosts and stage A's means (M22), and the
+# reductions, which count each glued face point once; then a regrid that
+# refines the interior and keeps every block on a glued face, carrying its
+# points between ranks, and the fill again on the new partition.
 function glue_case(tag)
     forest = glue_torus(4)
     emit(tag, "leaves", nleaves(forest), maxlevel(forest), digest(string(forest.leaves)))
@@ -1321,10 +1354,11 @@ function refusals()
                                          Operators(prolongation=2, restriction=2)))
     emit("# partial refused on", n, "of", NRANKS, "ranks:", msg)
 
-    # A diverged forest is refused by the interface schedule too.
+    # A diverged forest is refused by the unify schedule too: refined
+    # everywhere on rank 0 only.
     forest = Forest((4, 4); N=8, comm=COMM)
-    RANK == 0 && (refine!(forest, [forest.leaves[end]]); balance!(forest))
-    n, msg = attempt(() -> InterfaceSchedule(FieldSet(forest, 1; G=0,
+    RANK == 0 && refine!(forest, copy(forest.leaves))
+    n, msg = attempt(() -> UnifySchedule(FieldSet(forest, 1; G=0,
                                                       centering=facecentered(2, 1))))
     emit("# interface diverged refused on", n, "of", NRANKS, "ranks:", msg)
 
@@ -1547,30 +1581,23 @@ function main()
                               outflow=((false, true), (true, false)),
                               centre=(0.4, 0.5)),
               ("cell" => cellcentered(2),); G=1, ops=OPSCB)
-    # The bounded point-value interpolation across ranks: prolongations,
-    # interpolating restrictions and the derived wall row of a reflecting
-    # vertex-like face, each clamped by the sender into its bracket.
+    # The bounded point-value interpolation across ranks: prolongations and
+    # interpolating restrictions, mirrored at a reflecting vertex-like face,
+    # each clamped by the sender into its bracket.
     fill_case("BP", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
                               outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
               ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4B)
-    # Staggered sets under the conservative family: averages along the
-    # cell-like dimension, point values along the vertex-like one, the
-    # derived wall row at the reflecting faces included.
-    # Symmetric walls: the owned low wall planes at the reflecting and the
-    # outflow faces are written by the fill, on whichever rank owns them.
-    fill_case("SW", forest_of((3, 3), 8; reflecting=((true, true), (false, false)),
-                              outflow=((false, false), (true, true)),
-                              centre=(0.4, 0.5)),
-              ("vertex" => vertexcentered(2), "face1" => facecentered(2, 1)); G=2,
-              ops=OPS4, walls=:symmetric)
     # The relative hook: the ghosts beyond the outer faces from the block's
     # own data, its corner rows read across block faces after the stage
-    # that fills them, on whichever rank holds them; with symmetric walls.
+    # that fills them, on whichever rank holds them.
     fill_case("RH", forest_of((3, 3), 8; outflow=((false, false), (true, false)),
                               centre=(0.4, 0.5)),
               ("cell" => cellcentered(2), "vertex" => vertexcentered(2)); G=2, ops=OPS4,
-              walls=:symmetric, relative=true)
+              relative=true)
+    # Staggered sets under the conservative family: averages along the
+    # cell-like dimension, point values along the vertex-like one, the wall
+    # planes of the reflecting faces evolved and projected by stage P.
     fill_case("CS", forest_of((3, 3), 8; periodic=(true, false),
                               reflecting=((false, false), (true, true)),
                               centre=(1.4, 0.5)),
@@ -1589,6 +1616,18 @@ function main()
     adapt_case("A2")
     moving_blocks_case("M", Float64)
     moving_blocks_case("M32x2-", Float32x2; full=false)
+    # Closed blocks (M22 step 2), uniform: the vertex-centered wave in a box
+    # of outer faces, its walls evolved, and on a periodic box one root
+    # wide along x, whose blocks are their own neighbours there; every
+    # vertex-like centering through one fill; and `unify!` on a state.
+    wave_case("U2v", forest_of((3, 3), 8); G=1, centering=vertexcentered(2), ops=OPS4,
+              steps=6)
+    wave_case("U2p", forest_of((1, 3), 8; periodic=(true, true)); G=1,
+              centering=vertexcentered(2), ops=OPS4, steps=6)
+    fill_case("U3", forest_of((2, 2, 3), 4; periodic=(true, false, false)),
+              ("vertex" => vertexcentered(3), "face3" => facecentered(3, 3),
+               "edge1" => edgecentered(3, 1)); G=1, ops=OPS2)
+    unify_case("UU", forest_of((3, 2), 8; periodic=(false, true)))
     # Point interpolation, routed to the owners and back.
     interpolate_case("I2")
     # Located batches on a forest of patches (M19): through an atlas,
@@ -1633,7 +1672,7 @@ function main()
     # cubed sphere's element set, whose glue turns what it sends.
     patch_case("PR2", annulus_of(8),
                (("cell", cellcentered(2), 2, nothing, OPS4),
-                ("vertex", vertexcentered(2), 1, nothing, OPS4),
+                ("vertex", vertexcentered(2), 2, nothing, OPS4),
                 ("element", elementcentered(2), 1, 3, OPSE)))
     patch_case("PS3", cubed_sphere_of(4), (("element", elementcentered(3), 1, 1, OPSE),))
     # Ghosts interpolated across a glue (M20), on the kinked torus.

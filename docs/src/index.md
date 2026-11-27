@@ -22,10 +22,11 @@ M8 added the layout and the conservation. The ghost width `G` is a
 [`Forest`](@ref) one, and a field set also carries a **centering** —
 [`cellcentered`](@ref), [`vertexcentered`](@ref), [`facecentered`](@ref)
 or [`edgecentered`](@ref) — so a [`GhostSchedule`](@ref) belongs to a
-*layout* rather than to a forest. [`InterfaceSchedule`](@ref) and
-[`restrict_interfaces!`](@ref) then make a finite-volume scheme
-conservative across coarse-fine faces, which under one global `dt` needs
-nothing but a spatial flux fixup within each right-hand side.
+*layout* rather than to a forest. A flux fixup within each right-hand
+side then makes a finite-volume scheme conservative across coarse-fine
+faces, which under one global `dt` needs nothing else; on the `m22`
+branch it is [`unify!`](@ref) on the flux set with a
+[`UnifySchedule`](@ref).
 
 M10 added reflecting boundaries: a face declared `reflecting` on the
 forest is filled by the ghost exchange itself, with the parity each
@@ -102,8 +103,14 @@ through the application's atlas, physical ones ([`locate`](@ref),
 [`ElementPolynomial`](@ref)). M20, implemented in TreeAMR and awaiting
 TreeWave's use, fills a finite-difference set's ghosts across a glue by
 interpolation through the atlas, for the kinked maps of a cubed sphere
-(`glue = :interpolate` on a [`FieldSet`](@ref)). Next is visualization
-export (M9b).
+(`glue = :interpolate` on a [`FieldSet`](@ref)). M22, closed blocks, is
+being built on the branch `m22`, which this documentation describes:
+step 2, the closed layout on uniform meshes with periodic and outer
+faces, step 3, coarse-fine faces on meshes refined once, step 4,
+reflecting and outflow faces, step 6, regridding, step 7, rotating
+seams, step 8, glues, and step 9's finish are implemented there; what a
+downstream changes for it is in [Moving to closed blocks](migration.md).
+Next is visualization export (M9b).
 
 This page is a guide to the package. The docstrings are in the API
 reference, one page per layer — [Tree and geometry](api/tree.md),
@@ -175,12 +182,14 @@ familiar names are spellings of that tuple — [`cellcentered`](@ref),
 and the stencil for dimension `d` depends on the centering in *that*
 dimension alone.
 
-A vertex-like dimension stores one plane more: the boundary plane a block
-**shares** with its high-side neighbor. Ownership is half-open — a block
-owns its points `0 … N−1` in every dimension, whatever the centering — so
-the state vector still holds `N^D` values per block per variable, and the
-shared plane is filled by the exchange exactly as a ghost is. A flux
-therefore needs no ghosts at all, only that one extra plane:
+A vertex-like dimension stores one plane more, and its blocks are
+**closed** (M22, on the `m22` branch): a block owns both of its face
+planes, `N + 1` points, so a point on a block face is held by every block
+that touches it, and the state vector holds every copy, `∏(N + c_d)`
+values per block per variable. One copy, on the block lying lowest along
+the dimensions the point is shared in, is the primary, and every ghost fill first gives the
+others its value ([`isprimary`](@ref), [`unify!`](@ref)). A flux
+therefore needs no ghosts at all, only its own faces:
 
 ```jldoctest overview
 julia> flux = FieldSet(forest, 2; G = (0, 0), centering = facecentered(2, 1));
@@ -189,20 +198,34 @@ julia> size(flux.work)
 (9, 8, 2, 7)
 ```
 
-At a non-periodic face of the domain this makes the two walls of a
-vertex-like dimension differ: the high wall plane belongs to nobody and
-the fill derives it, while the low one is owned and evolved. A field set
-built with `walls = :symmetric` has the fill write the owned low wall
-too, by the rule the high wall gets at a face of that kind, so that a
-closed box stays mirror-symmetric; the state vector does not change.
+At an outer face of the domain both walls of a vertex-like dimension are
+own points, alike: evolved by default, with the boundary hook filling the
+ghosts beyond, or prescribed by the hook,
+`CellBoundary(g; wall = :prescribed)`. A closed box is therefore
+mirror-symmetric. A sum or a count over such a set says whether it takes
+each point once, `primaries = true`, and the norms weight a face plane by
+a half. On a mesh of several levels the finest copy of a point is the
+primary, and a coarser copy takes its value by the set's restriction, so
+a fine block evolves its whole closed box and a refined region is
+symmetric. At a reflecting face the ghosts are the mirror image about the
+wall plane and an odd variable is zero on it; at an outflow face they
+repeat the wall. Across a rotating seam a seam point's copies are one
+number through the turn, and a point on the axis is projected onto the
+turn's invariant part. Across a glue that copies, the copy on the
+lowest-numbered patch is the primary; across a glue the set is
+interpolated at (`glue = :interpolate`), every patch evolves its own
+copy, and the fill makes them their mean. After a regrid,
+rebuild the schedule and fill or [`unify!`](@ref) before
+[`gather!`](@ref): `regrid!` leaves stages P and 0 to the next fill, and a
+kept block's evolved value on a plane it shares with a created block is
+the one that survives.
 
-[`interiorview`](@ref) returns the owned points and [`closedview`](@ref)
-the owned points plus the shared plane — a block's `N+1` faces in the
-staggered dimension, which is what a flux kernel launched with
-`map_blocks!(...; closed = true)` writes. A third launch range,
+[`interiorview`](@ref) returns the own points — a block's `N+1` faces in
+a staggered dimension, which is what a flux kernel launched with
+`map_blocks!` writes. A second launch range,
 `map_blocks!(...; stored = true)`, covers every stored point, ghosts
 included; there the kernel's global index *is* the stored index, while
-the other two hand out an offset into the owned range that the kernel
+the default hands out an offset into the own range that the kernel
 shifts by `G`.
 
 In a vertex-like dimension the inter-grid operators change with it:
@@ -415,21 +438,20 @@ julia> fs.work[1, 2, :, 1]            # ρ = |x|² and v = x, turned from (0.125
 A set whose layout is not symmetric under exchanging `d1` and `d2` — a
 face-centered `B_x` beside `B_y`, as in constrained transport — turns
 into its partner, so the two are filled together as a
-[`RotationPair`](@ref), each `rotation` naming the partner's variables:
+[`RotationPair`](@ref), each `rotation` naming the partner's variables.
+On closed blocks (M22) `B_x`'s copies of the seam plane are `B_y`'s
+turned, so the pair is unified ([`unify!`](@ref)) and regridded together
+too, a flux with no ghosts included.
 
-```jldoctest rotating
-julia> a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),
-                    rotation = (-1,));                                  # B_x
-
-julia> b = FieldSet(quadrant, 1; G = (2, 1), centering = facecentered(2, 2),
-                    rotation = (1,));                                   # B_y
-
-julia> fill_by_coordinates!((x, v) -> -x[2], a); fill_by_coordinates!((x, v) -> x[1], b);
-
-julia> fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops)));
-
-julia> coordinates(a, 1, (2, 1)), a.work[2, 1, 1, 1]   # B = (−y, x) beyond the low face of y
-((0.0, -0.375), 0.375)
+```julia
+a = FieldSet(quadrant, 1; G = (1, 2), centering = facecentered(2, 1),
+             rotation = (-1,))                                          # B_x
+b = FieldSet(quadrant, 1; G = (2, 1), centering = facecentered(2, 2),
+             rotation = (1,))                                           # B_y
+fill_by_coordinates!((x, v) -> -x[2], a); fill_by_coordinates!((x, v) -> x[1], b)
+fill_ghosts!(RotationPair(a, b), (GhostSchedule(a, ops), GhostSchedule(b, ops)))
+coordinates(a, 1, (2, 1)), a.work[2, 1, 1, 1]   # B = (−y, x) beyond the low face of y:
+                                                # ((0.0, -0.375), 0.375)
 ```
 
 Regridding ([`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref) take
@@ -543,19 +565,25 @@ face set's closed range, restrict them at coarse-fine faces, then apply
 the divergence.
 
 ```julia
-map_blocks!(flux_kernel!, flux, ...; closed = true)   # N+1 faces per dimension
-restrict_interfaces!(flux, isched)                    # the fixup
+map_blocks!(flux_kernel!, flux, ...)                  # N+1 faces per dimension
+unify!(flux, s)                                       # the fixup
 map_blocks!(divergence_kernel!, state, ...)
 ```
 
-[`InterfaceSchedule`](@ref) is built once per tree like a
-[`GhostSchedule`](@ref), and takes no [`Operators`](@ref): the transfer
-is injection and the exact two-cell average, fixed by the geometry, not
-interpolation. It is built over the *flux* field set — the one whose
-centering is vertex-like in the face dimension — and refuses a
-cell-centered one, which has no values lying on a block's face at all. It
-reads and writes closed-range values only, so a computed flux may carry
-`G = 0`.
+On closed blocks (M22, the `m22` branch) the fixup is stage 0 of a fill
+on the flux set: every block owns both of its face planes, so a face
+value at a coarse-fine face has a coarse copy and fine ones, and the
+coarse copy takes the restriction of the fine — injection along the
+normal, the exact two-cell average across it — while the two copies at a
+same-level face become one number, so conservation there is exact. The
+[`UnifySchedule`](@ref) `s = UnifySchedule(flux)` is built once per tree
+like a [`GhostSchedule`](@ref), and takes no [`Operators`](@ref): the
+restriction is fixed by the geometry, not chosen. It is built over the
+*flux* field set — the one whose centering is vertex-like in the face
+dimension — and refuses a cell-centered one, which has no values lying on
+a block's face at all. It reads and writes own values only, so a computed
+flux may carry `G = 0`. It replaces `InterfaceSchedule` and
+`restrict_interfaces!`.
 
 ## Time integration
 
@@ -968,8 +996,8 @@ at a time:
   [`coarsen!`](@ref), [`balance!`](@ref) — since each rank applies it
   to its own copy;
 - the schedule builds, [`GhostSchedule`](@ref) and
-  [`InterfaceSchedule`](@ref), and their use, [`fill_ghosts!`](@ref)
-  and [`restrict_interfaces!`](@ref);
+  [`UnifySchedule`](@ref), and their use, [`fill_ghosts!`](@ref)
+  and [`unify!`](@ref);
 - the reductions, [`mesh_mapreduce`](@ref),
   [`volume_weighted_norm`](@ref) and [`total_mass`](@ref);
 - [`regrid!`](@ref) and [`adapt_to_initial_data!`](@ref);

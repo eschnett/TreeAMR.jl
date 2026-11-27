@@ -86,7 +86,7 @@ digest(s::AbstractString) = digest(codeunits(s))
 function workload_fold(fs, u)
     bin = (n = Sum(0), sq = Sum(0.0), peak = Max(0.0))
     init = (bins = ntuple(_ -> bin, 4), low = Min(Inf))
-    r = mesh_fold(TreeAMR.combine, init, fs, u; vars=1) do acc, p
+    r = mesh_fold(TreeAMR.combine, init, fs, u; vars=1, primaries=true) do acc, p
         q = p.u[1]
         return (bins = addto(acc.bins, min(p.level + 1, 4),
                              (n = Sum(1), sq = Sum(q * q), peak = Max(abs(q)))),
@@ -132,11 +132,17 @@ function workload(::Val{D}; roots, N, G, ops, periodic, σ, steps, buffer,
     outer = !periodic && !all(w -> w[1] && w[2], walls)
     boundary = outer ? boundary_by_coordinates(initial) : nothing
 
-    # Flags that report a box, so the buffer dilation runs too.
+    # Flags that report a box, so the buffer dilation runs too: in cell
+    # indices, along a vertex-like dimension the cells touching the firing
+    # nodes, as `firing_boxes` reports them (M22).
+    c = staggers(fs)
     function flag(b, k)
         fired = findall(x -> abs(x) > 0.05, interiorview(fs, b, 1))
         isempty(fired) && return level(k) > 0 ? Coarsen : Keep
-        box = ntuple(d -> minimum(i -> i[d], fired):maximum(i -> i[d], fired), D)
+        box = ntuple(D) do d
+            lo, hi = minimum(i -> i[d], fired), maximum(i -> i[d], fired)
+            c[d] == 1 ? (max(1, lo - 1):min(N, hi)) : (lo:hi)
+        end
         return level(k) >= 1 ? (Keep, box) : (Refine, box)
     end
 
@@ -237,6 +243,11 @@ end
 const OPS4 = Operators(prolongation=4, restriction=4)
 const OPS2 = Operators(prolongation=2, restriction=2)
 
+# A case that needs what a later step of M22 ("Closed blocks") rebuilds
+# is pending, and says so in one comment line, the same at every thread
+# count, in place of its output.
+pending_case(tag, step) = println("# pending until M22 step $step: $tag")
+
 workload(Val(1); roots=8, N=8, G=2, ops=OPS4, periodic=true, σ=0.04, steps=24, buffer=3)
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=true, σ=0.05, steps=20, buffer=3)
 workload(Val(2); roots=4, N=8, G=2, ops=OPS4, periodic=false, σ=0.05, steps=20, buffer=3)
@@ -278,6 +289,39 @@ workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12,
 # face, with the vertex-centered seam slab partitioned one plane up.
 workload(Val(2); roots=4, N=8, G=1, ops=OPS4, periodic=false, σ=0.05, steps=12, buffer=3,
          centering=vertexcentered(2), halfturn=(1, 2), x0=0.3)
+
+function closed_workload(::Val{D}; roots, N, periodic, steps) where {D}
+    forest = Forest(ntuple(_ -> roots, D); N=N, periodic=ntuple(_ -> periodic, D),
+                    extents=ntuple(_ -> (0.0, 1.0), D))
+    fs = FieldSet(forest, 2; G=1, centering=vertexcentered(D))
+    initial = workload_pulse(D, 1.0, 0.35, 0.08, 0.0)
+    fill_by_coordinates!(initial, fs)
+    schedule = GhostSchedule(fs, OPS4)
+    boundary = periodic ? nothing : boundary_by_coordinates(initial)
+    tag = "C$(D)$(periodic ? "p" : "o")v"
+    println(tag, " schedule ", schedule)
+    u = statevector(fs)
+    gather!(u, fs)
+    rk4!(u, fs, schedule, 0.25 * minimum_spacing(forest), steps, Val(D), Val(fs.G),
+         boundary)
+    println(tag, " state ", digest(u))
+    unify!(u, fs, schedule)
+    println(tag, " unified ", digest(u))
+    scatter!(fs, u)
+    fill_ghosts!(fs, schedule; boundary=boundary)
+    println(tag, " work ", digest(vec(fs.work)))
+    println(tag, " l2 ", @sprintf("%.17g", volume_weighted_norm(fs, u)))
+    println(tag, " mass ", @sprintf("%.17g", total_mass(fs, 1)))
+    println(tag, " fold ", workload_fold(fs, u))
+    return nothing
+end
+
+# Closed blocks (M22 step 2): stage 0's copies, the symmetric partition
+# and the hook at an outer face, on uniform vertex-centered boxes, the
+# evolution without a regrid, and `unify!` on the state; the norms take
+# the trapezoid's weights and the folds each point once.
+closed_workload(Val(2); roots=4, N=8, periodic=false, steps=12)
+closed_workload(Val(3); roots=2, N=4, periodic=true, steps=4)
 
 # --- element sets (M16) ----------------------------------------------------
 #
@@ -485,7 +529,7 @@ end
 let ring = annulus()
     refine!(ring, copy(ring.leaves))
     patch_workload("PR2c", ring, cellcentered(2); G=2, ops=OPS4, layout=1, steps=8)
-    patch_workload("PR2v", ring, vertexcentered(2); G=1, ops=OPS4, layout=1, steps=8)
+    patch_workload("PR2v", ring, vertexcentered(2); G=2, ops=OPS4, layout=1, steps=8)
     patch_workload("PR2e", ring, elementcentered(2); G=1, P=3, ops=OPSE, layout=1, steps=0)
 end
 patch_workload("PL2c", laid_out(), cellcentered(2); G=2, ops=OPS4, layout=2, steps=8)
@@ -500,9 +544,9 @@ end
 # Burgers' equation, which brings in everything the wave cycle above does
 # not: a second field set per dimension with a different centering and no
 # ghosts at all, a kernel launched over the *closed* range, and
-# `restrict_interfaces!` — whose phases are dealt out to threads by the
-# same `run_phase!` that fills ghosts, over target ranges one plane thick.
-# If the interface fixup's slices were ever combined out of order, or if
+# `unify!` — whose groups are dealt out to threads by the same
+# `run_phase!` that fills ghosts, over target ranges one plane thick. If
+# the fixup's slices were ever combined out of order, or if
 # its schedule's neighbour walk merged its per-task lists by anything but
 # block order, the mass line below would move with the thread count.
 #
@@ -554,8 +598,8 @@ function burgers_rhs!(du, u, state, fluxes, schedule, ischeds, spacings,
     fill_ghosts!(state, schedule)
     ntuple(Val(D)) do d
         map_blocks!(workload_flux_kernel!, fluxes[d], fluxes[d].work, state.work,
-                    Val(D), Val(GU), Val(GF), Val(d); closed=true)
-        restrict_interfaces!(fluxes[d], ischeds[d])
+                    Val(D), Val(GU), Val(GF), Val(d))
+        unify!(fluxes[d], ischeds[d])
         nothing
     end
     map_blocks!(workload_divergence_kernel!, state, statearray(du, state),
@@ -618,7 +662,7 @@ function burgers_workload(::Val{D}; roots, N, G, ops, steps, buffer,
         adapt_to_initial_data!(state, ops; initial=initial, flags=flags_now,
                                buffer=buffer, maxpasses=6)
     fluxes = ntuple(d -> FieldSet(forest, 1; G=0, centering=facecentered(D, d)), D)
-    ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+    ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
 
     u = statevector(state)
     gather!(u, state)
@@ -632,7 +676,7 @@ function burgers_workload(::Val{D}; roots, N, G, ops, steps, buffer,
     changed = regrid!(forest, pairs; flags=flags_now(state), buffer=buffer)
     if changed
         schedule = GhostSchedule(state, ops)
-        ischeds = ntuple(d -> InterfaceSchedule(fluxes[d]), D)
+        ischeds = ntuple(d -> UnifySchedule(fluxes[d]), D)
     end
     u = statevector(state)
     gather!(u, state)

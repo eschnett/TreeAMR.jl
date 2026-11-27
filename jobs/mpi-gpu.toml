@@ -39,6 +39,13 @@ resources = { gpus = 4 }
 time = "2:00:00"
 resources = { gpus = 4 }
 
+[site.fir]                          # four H100s of one node
+time = "2:00:00"
+resources = { gpus = 4 }
+sbatch_args = ["--nodes=1"]         # the four GPUs on one node
+# (Fir's profile needs an MPI recipe with `launcher = "mpiexec"`, as
+# `jobs/nested-gpu.toml` says.)
+
 [after]
 cmd = '''
 for p in sys-staged sys-direct; do

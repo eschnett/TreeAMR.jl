@@ -430,27 +430,6 @@ end
     @test minimum(fs.work) < 0
 end
 
-@testset "A bounded derived wall point stays in its bracket" begin
-    # The derived upper wall point of a reflecting vertex-like dimension is
-    # an interpolation at the prolongation order, `(4u₁ − u₂)/3` at order 4,
-    # whatever kind of transfer fills it. Its bracket is the point beside
-    # the wall and that point's mirror image, so a bounded wall of an even
-    # variable is that point: a surface at the wall stays positive where
-    # the unbounded derivation goes negative.
-    N = 8
-    h = 2 / 2N
-    forest = Forest((2,); N=N, reflecting=((false, true),), extents=((0.0, 2.0),))
-    f(x, v) = x[1] > 2 - 1.5h ? 1.0e-13 : 1.0
-    walls = map((PLAIN_PV, BOUNDED_PV)) do ops
-        fs = FieldSet(forest, 1; G=1, centering=vertexcentered(1), parity=[(EvenParity,)])
-        fill_by_coordinates!(f, fs)
-        fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
-        blockview(fs, nblocks(fs), 1)[1 + N + 1]
-    end
-    @test walls[1] < 0
-    @test walls[2] == 1.0e-13
-end
-
 @testset "Bounded point values are mirrored, turned and clamped as the data are: D=$D" for
         D in (1, 2, 3)
     # The bracket is read off the multilinear rows, which a mirrored,

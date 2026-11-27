@@ -28,8 +28,14 @@ stores, with `b` the local block index and `key` its [`MortonKey`](@ref)
 
 `f` may return either a bare [`RegridFlag`](@ref) or a
 `(flag, box)` pair, where `box::NTuple{D,UnitRange{Int}}` is the
-bounding box of the cells that fired, in that block's own interior
-indices `1:N`. Reporting a box is what makes a block a source of the
+bounding box of the cells that fired, in that block's own cell indices
+`1:N`. Along a vertex-like dimension, whose own points are the `N + 1`
+nodes of the closed range (M22), a box built by hand from firing nodes
+`lo … hi` (in `1:N+1`, as [`interiorview`](@ref) indexes them) is the
+cells touching them, `max(1, lo - 1):min(N, hi)`, as
+[`firing_boxes`](@ref) reports it; node `N + 1` is not a cell index, and
+clamping it to `N` would recruit across one face and not the other.
+Reporting a box is what makes a block a source of the
 regrid buffer, so the form carries meaning beyond the flag — see
 [`buffered_flags`](@ref). The two forms may be mixed within one vector.
 
@@ -89,23 +95,27 @@ end
     ntuple(d -> max(hi[d], Int32(i[d])), Val(D))
 
 @kernel function firing_lanes_kernel!(counts, los, his, @Const(work), fires,
-                                      @Const(origins), @Const(spacings), nodes,
-                                      ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
+                                      @Const(lows), @Const(bases), @Const(spacings),
+                                      nodes, ::Val{D}, ::Val{G}, ::Val{C}, ::Val{N},
                                       ::Val{W}) where {D,G,C,N,W}
     g = @index(Global)
     b, l = divrem(g - 1, W) .+ 1
-    origin, h = origins[b], spacings[b]
-    cells = CartesianIndices(ntuple(_ -> N, Val(D)))
+    # `x0`, not `lo`: `lo` is the firing box below.
+    x0, B, h = lows[b], bases[b], spacings[b]
+    # Every own point: `N + 1` along a vertex-like dimension, its closed
+    # range (M22), so that a point on a face fires in every block holding
+    # it.
+    cells = CartesianIndices(ntuple(d -> N + C[d], Val(D)))
 
     n = 0
-    lo = ntuple(_ -> Int32(N + 1), Val(D))
+    lo = ntuple(_ -> Int32(N + 2), Val(D))
     hi = ntuple(_ -> Int32(0), Val(D))
     for k in l:W:length(cells)
         c = Tuple(cells[k])
-        i = ntuple(d -> c[d], Val(D))                  # owned index, 1:N
+        i = ntuple(d -> c[d], Val(D))                  # own index, 1:N+c
         idx = ntuple(d -> i[d] + G[d], Val(D))         # stored index
         # The same expression `coordinates` forms, per centering.
-        x = ntuple(d -> nodeposition(origin[d], h, i[d], C[d], nodes), Val(D))
+        x = ntuple(d -> nodeposition(x0[d], h, B[d], i[d], C[d], nodes), Val(D))
         if fires(work, idx, b, x)
             n += 1
             lo = widen_lo(lo, i)
@@ -136,13 +146,21 @@ end
 """
     firing_boxes(fires, fs::FieldSet) -> Vector{Tuple{Int,NTuple{D,UnitRange{Int}}}}
 
-Per block, how many interior cells satisfied `fires` and the bounding
-box of those cells, in that block's own interior indices `1:N`. The
+Per block, how many own points satisfied `fires` and the bounding box of
+the cells they lie in, in that block's own cell indices `1:N`. Along a
+cell-like dimension that is the box of the firing cells; along a
+vertex-like one, whose points are the `N + 1` nodes of the closed range
+(M22, "Closed blocks" in `CODE.md`), it is **the cells touching a firing
+point**: for firing nodes `lo … hi` the cells `max(1, lo − 1) … min(N,
+hi)`. That box is mirror-symmetric — the mirror image of a firing
+pattern gives the mirror image of its box — and a node on a face fires
+in every block holding it, so a face point flags both sides alike and
+the buffer reaches across neither face more than the other. The
 blocks are the ones this rank stores (see [`blockrange`](@ref)), so over
 a distributed forest the result is this rank's part of the flags, which
 is what [`regrid!`](@ref) takes; nothing is communicated.
 
-`fires(work, idx, b, x) -> Bool` is evaluated at every **owned** point of
+`fires(work, idx, b, x) -> Bool` is evaluated at every **own** point of
 every block from a kernel, so it runs on the field set's backend and
 must be a pure function of its arguments. `work` is the whole working
 array, `idx` the point's **stored** index (so `work[idx..., v, b]` reads
@@ -190,10 +208,11 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
     counts = allocate(backend, Int32, (n,))
     los = allocate(backend, NTuple{D,Int32}, (n,))
     his = allocate(backend, NTuple{D,Int32}, (n,))
-    origins = todevice(backend, block_origins(forest, T))
+    lows = todevice(backend, block_lows(forest, T))
+    bases = todevice(backend, block_bases(forest))
     spacings = todevice(backend, block_spacings(forest, T))
     with_nodes(backend, T, fs.P) do nodes
-        firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, origins,
+        firing_lanes_kernel!(backend)(lcounts, llos, lhis, fs.work, fires, lows, bases,
                                       spacings, nodes, Val(D), Val(fs.G),
                                       Val(staggers(fs)), Val(forest.N), Val(W);
                                       ndrange=W * n)
@@ -202,11 +221,21 @@ function firing_boxes(fires, fs::FieldSet{T,D}) where {T,D}
                                  ndrange=n)
     synchronize(backend)
 
+    c = staggers(fs)
     hc, hlo, hhi = tohost(counts), tohost(los), tohost(his)
-    return [(Int(hc[b]),
-             ntuple(d -> hc[b] == 0 ? (1:0) : Int(hlo[b][d]):Int(hhi[b][d]), D))
+    return [(Int(hc[b]), ntuple(d -> hc[b] == 0 ? (1:0) :
+                                     touching_cells(Int(hlo[b][d]), Int(hhi[b][d]),
+                                                    forest.N, c[d]), D))
             for b in 1:n]
 end
+
+# The cells of a block touching the firing points `lo … hi` along one
+# dimension: the points themselves along a cell-like one, and along a
+# vertex-like one the cells on either side of each firing node, `max(1,
+# lo − 1) … min(N, hi)`, so that node `I` and its mirror image `N + 2 −
+# I` give mirror-image boxes (`firing_boxes`).
+touching_cells(lo::Int, hi::Int, N::Int, c::Int) =
+    c == 1 ? (max(1, lo - 1):min(N, hi)) : (lo:hi)
 
 # Whatever a flagging function reported, reduced to its flag and to the
 # box of firing cells. An omitted box means the whole interior — the
@@ -706,11 +735,17 @@ end
 # every leaf, nothing is split, and the stage is the serial groups with
 # no messages.
 #
-# Every target here is the new block's *owned* range — the δ = 0 case of
-# the ghost builders. A fresh block's shared plane and ghosts are left
-# to the next `fill_ghosts!`, as ghosts always are; in a vertex-like
-# dimension that makes coarsening halved injection from the children's
-# even points, all of which they own.
+# Every target here is the new block's own range — the δ = 0 case of
+# the ghost builders, closed along a vertex-like dimension (M22): a
+# prolongation writes the created fine block's `G+1 … G+N+1` from its
+# parent, and a restriction the coarse block's closed halves, the
+# mid-plane from the lower child (`target_range`), by injection from the
+# children's even points, all of them own points. A restriction reads a
+# child's own points only, so none mirrors at a wall: the closed-half
+# rule of `mirror_restriction` never arises here. The ghosts are left to
+# the next `fill_ghosts!`, as ghosts always are, and the kept blocks'
+# copies of a shared point over the created blocks' to the second stage
+# (`regrid_kept_pairs`).
 #
 # `P` is the layout's element order, `0` for none, and is required, as
 # for `kind_stencil`. An element set (M16) refines by `I` and coarsens by
@@ -729,8 +764,8 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     # interpolates.
     bounded(key) = boundedmode(operators, key.kind, key.mirror, c)
     build1(key) = ntuple(d -> kind_stencil(T, N, G[d], c[d], key.kind, 0, key.offset[d],
-                                           operators, bounded(key); P=P, regrid=true,
-                                           top=key.top[d]), D)
+                                           operators, bounded(key); P=P, regrid=true),
+                          D)
     built = Dict{GroupKey{D},Any}()
     stencils(key) = get!(() -> build1(key), built, key)
 
@@ -750,6 +785,157 @@ function regrid_stage(::Type{T}, N::Int, G::NTuple{D,Int}, c::NTuple{D,Int},
     return ST(REGRID_TAG, locals, remote)
 end
 
+# The kept-over-created pass (M22, "Closed blocks" in CODE.md): the
+# regrid transfer's second stage, which gives every created copy of a
+# shared point the value a kept block holds there, wherever a kept block
+# holds the point at the finest level holding it. A created fine block's
+# face planes are prolongated from its parent, so at the hanging nodes
+# of a plane it shares with a kept fine block it holds interpolated
+# values where the kept block holds evolved ones, and stage 0 of the
+# next fill would carry whichever copy the class rule makes the primary
+# to the others: the interpolated one, where the created block is the
+# lower. Every other pair already agrees. Created beside created: each
+# child's stencils read its parent's copy of the plane and the parent's
+# ghosts along it, and the fill before the regrid gives every stored copy
+# of a point the value of the finest level holding it
+# (`ghost_plane_parts`), so both parents read the same values through
+# the same weights. A created fine block beside a kept coarser one is
+# the finer, so the primary; a created coarse block beside a kept finer
+# one has the secondary. The pass runs once every set has moved, reading
+# the new arrays, where the first stage copied each kept block's points
+# bit for bit, and across a rotating seam the turned copy of a
+# `RotationPair`'s partner; its targets are disjoint sub-pieces, each
+# from one source, so its groups never write the same point. Its keys
+# carry the orientation of a copy across the seam, with the turn's axis
+# map and sign column (`regrid_kept_stage`).
+#
+# The kept block's value is the evolved one only if the old storage is
+# unified — every copy of a point at its level equal, a coarse copy its
+# fine primary's restriction — which `regrid!` makes so itself: it fills
+# every set it moves before the transfer, and the fill's stage 0 does
+# exactly that.
+#
+# `view` is a serial forest holding the new leaves, for the neighbour
+# lookups. A created block's pairs depend on it and the tree alone, so
+# each rank classifies only the created blocks among `among` — every new
+# leaf serially; over a distributed forest the ones it receives for and
+# the ones it sends to (`kept_candidates`) — and `split_regrid` keeps this
+# rank's ends, so the sender and the receiver find the same transfers.
+# Its sources are new leaf indices, its keys same-level copies over the
+# spans `merged_transfers` gives.
+function regrid_kept_pairs(view::Forest{D}, oldleaves::AbstractVector{MortonKey{D}},
+                           newleaves::AbstractVector{MortonKey{D}},
+                           c::NTuple{D,Int}; among=nothing, acrossglue::Bool=true) where {D}
+    pairs = TransferPairs{D}()
+    any(==(1), c) || return pairs
+    oldindex(k) = (i = searchsortedfirst(oldleaves, k);
+                   i <= length(oldleaves) && oldleaves[i] == k ? i : 0)
+    kept = [oldindex(k) for k in newleaves]
+    created = among === nothing ? findall(iszero, kept) :
+              [j for j in among if kept[j] == 0]
+    allowed = closed_subpieces(c, view.N).iterators
+    perblock = [Pair{GroupKey{D},Int32}[] for _ in created]
+    threaded_chunks(length(created)) do _, chunk
+        for i in chunk
+            j = created[i]
+            t = NeighbourTable(view, j; acrossglue=acrossglue)
+            # A kept holder on this block's level is a neighbour across a
+            # face, edge or corner of a vertex-like dimension; most created
+            # blocks have none, and are skipped before their sub-pieces.
+            steps = ntuple(d -> c[d] == 1 ? (-1, 0, 1) : (0,), D)
+            any(Iterators.product(steps...)) do δ
+                all(iszero, δ) && return false
+                lv, nbrs, _ = neighbours(t, δ)
+                lv == t.level && any(x -> kept[x[1]] != 0, nbrs)
+            end || continue
+            entries = StageEntry{D}[]
+            for sub in closed_subpieces(c, view.N)
+                all(==(1), piece_of(sub)) && continue      # the open interior
+                copies = piece_copies(t, sub, c)
+                finest = maximum(x -> x[1], copies)
+                t.level == finest || continue
+                holders = filter(x -> x[1] == finest && kept[x[2]] != 0, copies)
+                isempty(holders) && continue
+                # The kept holder that would be the primary among them, by
+                # the rule of `piece_primary`.
+                _, s, _, δ, o, r, _, _, g = piece_primary(holders)
+                push!(entries, (sub, :copy, s, δ, o, r, g))
+            end
+            for (kind, s, δ, o, r, g, spans) in merged_transfers(entries, allowed)
+                key = GroupKey{D}(kind, δ, o, 0, ntuple(_ -> Int8(0), D), Int8(r), g,
+                                  spans)
+                push!(perblock[i], key => Int32(s))
+            end
+        end
+    end
+    for (i, j) in enumerate(created), (key, s) in perblock[i]
+        push!.(get!(pairs, key, (Int32[], Int32[])), (Int32(j), s))
+    end
+    return pairs
+end
+
+# The new leaves whose kept-over-created pairs this rank needs, over a
+# distributed forest: the ones it stores after the regrid, `newrange`, for
+# the pairs it receives or keeps, and every new leaf sharing a point with
+# a kept block it stores, for the pairs whose source it sends (the pass
+# reads the new arrays, so a source's owner is its new one). A pair's target holds a point with its source, so it is a
+# neighbour of the source across a face, edge or corner.
+function kept_candidates(view::Forest{D}, newleaves::AbstractVector{MortonKey{D}},
+                         oldleaves::AbstractVector{MortonKey{D}},
+                         newrange::UnitRange{Int}) where {D}
+    cand = Set{Int}(newrange)
+    dirs = alldirections(Val(D))
+    for j in newrange
+        k = newleaves[j]
+        i = searchsortedfirst(oldleaves, k)
+        i <= length(oldleaves) && oldleaves[i] == k || continue   # not kept
+        for δ in dirs, nbr in neighbor_keys(view, k, δ)
+            push!(cand, find_leaf(view, nbr)::Int)
+        end
+    end
+    return sort!(collect(cand))
+end
+
+# The leaves `leaves` over `forest`'s geometry, as one serial forest: what
+# the neighbour lookups of the kept-over-created pass ask, before the
+# forest itself holds them.
+leaves_view(forest::Forest{D,T}, leaves::Vector{MortonKey{D}}) where {D,T} =
+    Forest{D,T}(forest.roots, forest.periodic, forest.faces, forest.rotating,
+                forest.extents, forest.N, leaves, ForestState(), SerialCommunicator(),
+                forest.conn)
+
+# The kept-over-created pass as a stage (tag `REGRID_KEPT_TAG`), from its
+# pairs, built as `regrid_stage` builds the first: same-level copies over
+# stage 0's spans, with no factor, mirror or bound.
+function regrid_kept_stage(::Type{T}, view::Forest{D}, G::NTuple{D,Int},
+                           c::NTuple{D,Int}, backend::Backend, pairs::TransferPairs{D};
+                           newrange::UnitRange{Int}, nnew::Int, newowner) where {T,D}
+    N = view.N
+    built = Dict{GroupKey{D},Any}()
+    stencils(key) = get!(() -> ntuple(d -> copy_stencil(T, N, G[d], c[d], key.direction[d];
+                                                        span=key.span[d]), D),
+                         built, key)
+    # Across a rotating seam, the turn's sign column and axis map (M12).
+    factorcol(key) = key.orientation == 0 ? 0 :
+                     mirrorcolumn(ntuple(_ -> 0, D)) + 3^D * Int(key.orientation)
+    serial = newrange == 1:nnew
+    local_, sent, received = serial ? (pairs, nothing, nothing) :
+                             split_regrid(pairs, newrange, newrange)
+    GRP = grouptype(backend, T, Val(D))
+    locals = GRP[todevice(backend, TransferGroup{T,D}(:copy, stencils(key), targets,
+                                                      sources, factorcol(key),
+                                                      key.orientation,
+                                                      group_axes(view, key), UNBOUNDED))
+                 for (key, (targets, sources)) in local_]
+    ST = stagetype(backend, T, Val(D))
+    remote = serial ? nothing :
+             remote_stage(remotetype(ST), T, backend, sent, received, stencils, factorcol;
+                          targetowner=newowner, sourceowner=newowner,
+                          targetrange=newrange, sourcerange=newrange,
+                          axesof=key -> group_axes(view, key), bounded=key -> UNBOUNDED)
+    return ST(REGRID_KEPT_TAG, locals, remote)
+end
+
 # The serial regrid transfer's groups, from the old and the new leaf
 # arrays: what `regrid!` runs over a forest on one rank, kept as a
 # function of its own for the tests and `bench/gpu.jl`.
@@ -767,8 +953,7 @@ end
 
 # The regrid of a set interpolated across a glue (M20). Every leaf on a
 # glued face keeps its level, so that the ghosts across a glue are never
-# interpolated across levels and a block's appendix only ever moves with
-# it (CODE.md, "Finite differences across a glue", *No refinement
+# interpolated across levels (CODE.md, "Finite differences across a glue", *No refinement
 # boundary at a glue*).
 
 # Whether any set `regrid!` moves is interpolated across a glue of the
@@ -842,24 +1027,6 @@ function check_glue_kept(forest::Forest{D}, newleaves::Vector{MortonKey{D}},
     return nothing
 end
 
-# The transfers of a set with an appendix: a copy into a block that owns
-# high face planes copies them too, under the `top` flag of its key. Any
-# other transfer into such a block is a bug, since the guard above keeps
-# it at its level.
-function appendix_pairs(pairs::TransferPairs{D}, forest::Forest{D},
-                        newleaves::Vector{MortonKey{D}}, c::NTuple{D,Int}) where {D}
-    out = TransferPairs{D}()
-    for (key, (targets, sources)) in pairs, i in eachindex(targets)
-        top = appendix_dims(forest, newleaves[targets[i]], c)
-        any(top) && key.kind !== :copy &&
-            error("a $(key.kind) into a block with an appendix; this is a bug")
-        k2 = GroupKey{D}(key.kind, key.direction, key.offset, key.level, key.mirror,
-                         key.orientation, key.glue, key.low, key.shift, top)
-        push!.(get!(out, k2, (Int32[], Int32[])), (targets[i], sources[i]))
-    end
-    return out
-end
-
 # The argument checks of `regrid!`, run on every rank before anything is
 # gathered so that a refusal on some ranks is raised on all of them
 # (`collective_checks`). Returns this rank's flags in canonical form and
@@ -903,8 +1070,7 @@ function check_regrid(forest::Forest{D}, sets, flags, buffer::Integer, transfer:
             check_regrid_set!(layout, forest, fs, sched)
             # What `fill_ghosts!` would refuse before the transfer, refused
             # here, where the refusal is agreed between the ranks.
-            transfer && sched !== nothing && hasrotating(forest) &&
-                !symmetric_layout(fs) && seam_ghosts(fs) && throw(ArgumentError(
+            transfer && sched !== nothing && seam_partnered(fs) && throw(ArgumentError(
                     "this field set's layout is not symmetric in the rotating seam's " *
                     "dimensions $(rotating_dims(forest)) (G = $(fs.G), centering " *
                     "$(fs.centering)), so the fill before its transfer needs its " *
@@ -949,7 +1115,7 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "field set has $(nblocks(fs)) blocks but the forest has " *
         "$(length(blockrange(forest))) on this rank"))
     backend = get_backend(fs.work)
-    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.walls, fs.glue,
+    push!(layout, (fs.nvars, fs.G, fs.centering, fs.P, fs.glue,
                    eltype(fs.work), nameof(typeof(backend)), sched === nothing))
     sched === nothing && return nothing
     sched.forest === forest || throw(ArgumentError(
@@ -967,9 +1133,6 @@ function check_regrid_set!(layout, forest::Forest, fs::FieldSet, sched)
         "the field set has element order P = $(fs.P) but its schedule was built for " *
         "P = $(sched.P); the transfer's stencils follow from the element order, so " *
         "pair each field set with its own schedule"))
-    fs.walls === sched.walls || throw(ArgumentError(
-        "the field set has walls = :$(fs.walls) but its schedule was built for " *
-        ":$(sched.walls); pair each field set with its own schedule"))
     fs.glue === sched.glue || throw(ArgumentError(
         "the field set has glue = :$(fs.glue) but its schedule was built for " *
         ":$(sched.glue); pair each field set with its own schedule"))
@@ -1004,9 +1167,12 @@ copied, newly refined blocks prolongated from their parent, coarsened
 blocks restricted from their children.
 
 `flags` holds a [`RegridFlag`](@ref) or a `(flag, box)` pair per leaf,
-as [`flag_blocks`](@ref) produces; `buffer` is a width in cells, the
-application's choice (feature speed × regrid cadence), and defaults to
-no buffering.
+as [`flag_blocks`](@ref) produces; a box is in cell indices `1:N`, and
+along a vertex-like dimension one built by hand from the own points
+(nodes `lo … hi` in `1:N+1`) is the cells touching them, `max(1, lo -
+1):min(N, hi)`, as [`firing_boxes`](@ref) reports it. `buffer` is a
+width in cells, the application's choice (feature speed × regrid
+cadence), and defaults to no buffering.
 
 `pairs` is one `fs => schedule` or a collection of them, each field set
 over `forest` and each schedule the current one *for that field set*
@@ -1028,11 +1194,24 @@ seam, and a pair stays valid, since its sets' storage is replaced in
 place. The regridded mesh is conforming at the seam, as
 [`balance!`](@ref) leaves it.
 
-The target of every transfer is the new block's **owned** range, whatever
-the centering: a fresh block's shared boundary plane and its ghosts are
-left to the next [`fill_ghosts!`](@ref), as ghosts always are. A test
-that inspects a staggered field set after a regrid has to fill ghosts
-first.
+The target of every transfer is the new block's **own** range, whatever
+the centering: along a vertex-like dimension its closed range, both face
+planes (M22, "Closed blocks" in `CODE.md`); its ghosts are left to the
+next [`fill_ghosts!`](@ref), as ghosts always are. A created block takes
+its face planes from its parent, or its children, and two created
+blocks agree on a common plane, since the fill before the transfer gives
+every stored copy of a point, own or ghost, the value of the finest
+level holding it; where a *kept* block holds the
+same point at the finest level holding it, a second pass gives the
+created copy the kept block's value, which is evolved where the created
+one is interpolated. Stages P and 0 are not run: the first
+[`fill_ghosts!`](@ref) or [`unify!`](@ref) with the rebuilt schedule
+runs them, so the order is regrid, rebuild the schedule, fill or
+`unify!`, then [`gather!`](@ref). A `gather!` before that takes every
+copy as the transfer left it: the copies of a point on one level equal,
+a coarse copy its fine primary's restriction only to the operators'
+order along a cell-like dimension (exactly along a vertex-like one), and
+an odd variable on a reflecting wall zero.
 
 An element-centered set (M16, [`ElementLocal`](@ref) operators) is
 refined by its elements' polynomials evaluated at the fine nodes and
@@ -1057,6 +1236,7 @@ rebuild both:
 ```julia
 if regrid!(forest, fs => schedule; flags = flags)
     schedule = GhostSchedule(fs, operators)
+    unify!(fs, schedule)                     # one value per point (M22)
     u = statevector(fs); gather!(u, fs)      # then reinit! the integrator
 end
 ```
@@ -1065,8 +1245,7 @@ Over a forest of patches, if any set moved is interpolated across a
 glue (`glue = :interpolate`), every block on a glued face keeps its
 level: its flag, or the buffer's, is dropped, and a refinement that 2:1
 balance would carry into it is refused, saying which block, so that no
-refinement boundary reaches a glue. Such a kept block's copy carries
-its appendix. See "Finite differences across a glue" in `CODE.md`.
+refinement boundary reaches a glue. See "Finite differences across a glue" in `CODE.md`.
 
 Set `transfer = false` to rebuild the mesh and storage without moving
 data at all — what the initial-data cycle wants, since it re-evaluates
@@ -1134,6 +1313,9 @@ function regrid!(forest::Forest{D}, pairs;
     oldowner(i) = equalsplit_part(nold, P, Int(i)) - 1
     newowner(j) = equalsplit_part(nnew, P, Int(j)) - 1
     sources = nothing                            # classified once, on first use
+    keptsets = FieldSet[]                        # the sets the second stage runs on
+    # The kept-over-created pairs, per set of staggers, on first use.
+    kept = Dict{Tuple{NTuple{D,Int},Bool},TransferPairs{D}}()
 
     for (fs, sched, fill, hook) in regrid_steps(sets)
         # Per field set, not once from the first one: nothing says two
@@ -1161,14 +1343,8 @@ function regrid!(forest::Forest{D}, pairs;
             sources === nothing && (sources = regrid_sources(oldleaves, newleaves;
                                                              oldrange=oldrange,
                                                              newrange=newrange))
-            # A block that owns its glued high face planes (M20) carries
-            # them through its copy.
-            setpairs = hasappendix(fs) ?
-                       Base.inferencebarrier(appendix_pairs)(sources, forest, newleaves,
-                                                             staggers(fs))::TransferPairs{D} :
-                       sources
             stage = regrid_stage(eltype(fs.work), forest.N, fs.G, staggers(fs),
-                                 sched.operators, backend, setpairs; P=fs.P,
+                                 sched.operators, backend, sources; P=fs.P,
                                  oldrange=oldrange,
                                  newrange=newrange, nold=nold, nnew=nnew,
                                  oldowner=oldowner, newowner=newowner)
@@ -1187,8 +1363,46 @@ function regrid!(forest::Forest{D}, pairs;
             # forest's pool now that nothing is in flight, for the next
             # field set's stage or the next regrid to take.
             stage.remote === nothing || release_stage!(forest, stage.remote)
+            any(==(1), staggers(fs)) && push!(keptsets, fs)
         end
         fs.work = fresh
+    end
+
+    # A set with a vertex-like dimension (M22): the kept blocks' copies of a
+    # shared point over the created blocks' at the finest level holding it
+    # (`regrid_kept_pairs`), once every set has moved, from the new arrays,
+    # where a kept block's points are its old ones bit for bit; across a
+    # rotating seam an odd orientation reads a `RotationPair`'s partner,
+    # through the pair's tables, which is why the pass waits for both.
+    if !isempty(keptsets)
+        view = leaves_view(forest, newleaves)
+        tables = IdDict{Any,Any}()
+        for p in sets
+            x = p.first
+            x isa RotationPair || continue
+            tables[x.a] = (x.afactors, x.arotvars, x.b)
+            tables[x.b] = (x.bfactors, x.brotvars, x.a)
+        end
+        for fs in keptsets
+            c = staggers(fs)
+            backend = get_backend(fs.work)
+            # A set interpolated across its glues has no copy across one.
+            across = fs.glue !== :interpolate
+            pairs = get!(kept, (c, across)) do
+                among = distributed ? kept_candidates(view, newleaves, oldleaves, newrange) :
+                        nothing
+                regrid_kept_pairs(view, oldleaves, newleaves, c; among=among,
+                                  acrossglue=across)
+            end
+            second = regrid_kept_stage(eltype(fs.work), view, fs.G, c, backend, pairs;
+                                       newrange=newrange, nnew=nnew, newowner=newowner)
+            factors, rotvars, partner = get(tables, fs, (fs.factors, fs.rotvars, fs))
+            sends = run_stages!(fs.work, fs.work, fs.nvars, factors, [second], 1:1,
+                                second.locals, forest, backend, nothing, partner.work,
+                                rotvars)
+            sends === nothing || waitall(comm, sends)
+            second.remote === nothing || release_stage!(forest, second.remote)
+        end
     end
 
     rebuild_leaves!(forest, newleaves)
@@ -1474,6 +1688,12 @@ function total_mass(fs::FieldSet{T,D}, var::Integer=1) where {T,D}
     # where the lanes split the cells differently.
     # `float(real(T))` inline, not the local `R`: see `volume_weighted_norm`.
     cellvolume(key) = spacing(float(real(T)), forest, key)^D
+    # The trapezoid's weights along a vertex-like dimension (M22).
+    any(==(:vertex), fs.centering) &&
+        return combine_blocks(+, zero(R), fs,
+                              trapezoid_quadrature_barrier(identity, R, fs.work, fs, fs.G,
+                                                           _varrange(var, fs.nvars)),
+                              cellvolume)
     fs.P == 0 && return mesh_mapreduce(identity, +, zero(R), fs; vars=var,
                                        weight=cellvolume)
     # An element set's nodes are weighted by the GLL quadrature (M16).

@@ -351,6 +351,16 @@ runs it on four of Symmetry's nodes under each MPI and collective
 setting, then `bench/mpi.jl` at 32 ranks (`HISTORY.md`, *Cluster jobs*,
 the fifth run).
 
+`bench/schedule_build.jl` times a schedule's build, cell- and
+vertex-centered, on a uniform and a nested mesh; `bench/firstcall.jl`
+times each step's first call in a fresh process, on the API every
+TreeAMR since 0.2 has, so that a half-open baseline runs it too (the
+`compile-` runs of `jobs/nested.toml`); `bench/rhs.jl` times a
+right-hand side at every own point, behind `isprimary`, and over the
+primaries' boxes, each with `unify!` (`jobs/rhs.toml`,
+`jobs/rhs-gpu.toml`). `HISTORY.md`'s M22 step 5 and step 9 have the
+numbers.
+
 `bench/stepping.jl` times one time step by integrator — OrdinaryDiffEq's
 RK4 and SSPRK33 against IMEXRungeKutta's, broadcast and by owner — and
 runs in the test environment, which has both:
@@ -383,7 +393,9 @@ the one that says why.
   schedule's type must not depend on `P`, so that cell and vertex sets
   compile none of it. Compare `--trace-compile-timing` of
   `test/mpi_workload.jl` against `main` for any change to a launch path
-  ("The copy kernels on a device").
+  ("The copy kernels on a device"). A rotating seam's axis projection
+  (M22) is the one fill kernel that is not `transfer_kernel!`, behind a
+  barrier ("Seams" under "Closed blocks").
 - **The copy kernels launch flat on a device, shaped on the CPU**; a new
   copy-like kernel goes the same way. KA's CPU emitter only rewrites
   `@index` at statement level, so assign it before passing it to a
@@ -399,21 +411,27 @@ the one that says why.
   explicitly to whatever builds a stencil or a position, and form every
   position through `nodeposition` ("Centerings", *The element
   centering*).
-- **A set interpolated across a glue owns an appendix.** Under `glue =
-  :interpolate` the blocks' glued high face planes follow the cores in
-  the state vector: a new state-layer function must handle them, behind
-  `Base.inferencebarrier`, since the switch is a run-time field. Leaves
-  on a glued face, and those a glue stencil reads, keep their level
-  through `regrid!` ("Finite differences across a glue").
-- **Symmetric walls trim target ranges.** Under `walls = :symmetric` a
-  block at a low domain face has its own range start at `G+2` along that
-  vertex-like dimension; the trim is part of `GroupKey` ("Centerings").
-- **A half turn shifts its seam slab.** Across a half-turn seam (M14) a
-  vertex-like `d2` has the target's partition one plane up, so that each
-  region is the image of one real block's owned points; the shift is
-  part of `GroupKey`. Read the seam through `seam_plane`, `ishalfturn`
-  and `seam_keywords`, never `forest.rotating` raw, whose second entry
-  is negative for a half turn ("Rotating seams", *Half turns*).
+- **Closed blocks (M22).** A vertex-like dimension owns its closed
+  range, `G+1 … G+N+1`; the state holds every copy of a shared point,
+  `∏(N + c_d)` per block. The fill's stages run A → W → P → 0 → 1 → hook
+  → glue → 2. Stage 0 gives every secondary its primary's value (finest
+  level, then lowest patch, then greatest position, then greatest class
+  tuple: a local rule, no index) by a copy or the set's restriction,
+  keyed by `GroupKey.span`, merged only in `merged_transfers`; stage 0
+  is a stage of its own (Erik's decision), and `map_blocks!` does not
+  skip secondaries. The search for stage 0's transfers is memoised by
+  neighbourhood (`neighbourhood_signature`): anything new it reads must
+  enter the key, or be a reason to search. The interface restriction is
+  `unify!` with a `UnifySchedule`. A reflecting wall plane is projected
+  by stage P; a seam's axis and a kinked glue's copies are averaged in
+  the one kernel that is not `transfer_kernel!` (`mean_gather_kernel!`).
+  A group key carries a glue's axis map (`axes_code`), never its table
+  slot. `N ≥ 2G` in every dimension. A sum or a count over such a set
+  takes `primaries = true`. An asymmetric set on a quarter turn is
+  filled and unified as a `RotationPair`, both members' stage P before
+  either's stage 0. Read the seam through `seam_plane`, `ishalfturn` and
+  `seam_keywords`, never `forest.rotating` raw. The [migration
+  note](docs/src/migration.md) lists what changed for downstreams.
 - **Reflecting and outflow faces are transfers, not hooks**, and
   **rotating seams are oriented transfers**; the boundary hook sees only
   outer faces ("Domain and boundaries", "Ghost filling"). The face kinds

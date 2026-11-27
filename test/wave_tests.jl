@@ -191,9 +191,9 @@ end
     @test !all(iszero, du)
     @test all(isfinite, du)
 
-    # The state vector is N^D per variable per block for every
-    # centering, so its shape has not moved either.
-    @test length(u) == forest.N * 2 * nblocks(fs)
+    # The state vector holds a block's own range, every copy of a shared
+    # point (M22): `N + 1` points a variable along a vertex-like dimension.
+    @test length(u) == (forest.N + 1) * 2 * nblocks(fs)
 
     # ∂ₜu = v, so the first half of du is exactly the second field.
     state, dstate = statearray(u, fs), statearray(du, fs)

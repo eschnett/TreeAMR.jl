@@ -1,6 +1,6 @@
-# The definitions of `walls_tests.jl`, split off so that each test file runs
-# on its own: every test process includes all of `helpers/` ("Parallel
-# groups" in CODE.md).
+# The point-symmetric data and the mirror oracle of a closed box's
+# symmetry tests (`closed_tests.jl`), once `walls_tests.jl`'s; every test
+# process includes all of `helpers/` ("Parallel groups" in CODE.md).
 
 # Point symmetric about the centre of a `faces_forest` box of side `L`,
 # so even under every reflection of a dimension through the centre, and
@@ -32,13 +32,3 @@ function point_mirror_error(fs::FieldSet{T,D}, L) where {T,D}
     end
     return worst, count
 end
-
-# One kind for both faces of every dimension, so that the box is
-# symmetric under its point reflection: the hook's, mirrored, clamped,
-# or a mix of the three.
-const WALL_BOXES = Dict(1 => [(:outer,), (:reflect_both,), (:outflow_both,)],
-                        2 => [(:outer, :outer), (:reflect_both, :reflect_both),
-                              (:outflow_both, :outflow_both), (:outflow_both, :reflect_both)],
-                        3 => [(:outer, :reflect_both, :outflow_both)])
-
-staggered_or_vertex(D) = filter(C -> any(==(:vertex), C), allcenterings(Val(D)))

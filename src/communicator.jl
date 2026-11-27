@@ -336,7 +336,7 @@ hoststaging(::Communicator, buffer::AbstractVector) = !(buffer isa Array)
 #   waited on (`release_stage!`). A schedule's leases are reclaimed once
 #   the forest's generation has moved past the one they were leased at —
 #   or their holder has been collected — since a stale schedule can never
-#   run again (`fill_ghosts!`, `restrict_interfaces!` and `regrid!` refuse
+#   run again (`fill_ghosts!`, `unify!` and `regrid!` refuse
 #   one) and every message of the call it last ran in was waited on in
 #   that call. Reclaiming deletes the lease from the holder's dictionary
 #   too, so that a stale stage asked for its buffers directly (the tests

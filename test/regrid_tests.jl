@@ -830,7 +830,7 @@ end
     seen = Ref{Any}(nothing)
     byg = function (sets)
         seen[] = map(fs -> fs.nvars, sets)
-        hi = block_mapreduce(identity, max, -Inf, sets[2])
+        hi = block_mapreduce(identity, max, -Inf, sets[2]; primaries=false)
         return [level(blockkey(sets[2], b)) < 1 && hi[b] > 1.5 ? Refine : Keep
                 for b in 1:nblocks(sets[2])]
     end

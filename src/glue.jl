@@ -7,7 +7,9 @@
 # then evaluates one tensor-product Lagrange stencil per ghost point and
 # variable. See "Finite differences across a glue" in CODE.md, which this
 # file implements serially and over a distributed forest, on the CPU and
-# on a device, with closed ownership's appendix.
+# on a device. On closed blocks (M22) every patch holding a point of a
+# glued face holds a copy of it, and stage A, at the end of this file,
+# makes the copies their mean.
 
 """
     TreeAMR.chart_aligned(atlas, p, q) -> NTuple{D,Bool}
@@ -164,22 +166,6 @@ function glued_faces(conn::Patches{D}, k::MortonKey{D}) where {D}
     g = ntuple(e -> (rootpos[e] << lvl) + Int(k.coords[e]), D)
     return [(e, s) for e in 1:D for s in 1:2
             if (s == 1 ? g[e] == 0 : g[e] == (n[e] << lvl) - 1) && isglued(conn, p, e, s)]
-end
-
-# Along which dimensions leaf `k` owns its high face plane under closed
-# ownership (M20): the vertex-like ones along which its high face lies on
-# a glued high face of its patch. That plane is the block's appendix.
-function appendix_dims(forest::Forest{D}, k::MortonKey{D}, c::NTuple{D,Int}) where {D}
-    conn = forest.conn::Patches{D}
-    lvl = level(k)
-    p = searchsortedlast(conn.firstroot, Int(k.root))
-    n = conn.roots[p]
-    rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
-    return ntuple(D) do e
-        c[e] == 1 || return false
-        g = (rootpos[e] << lvl) + Int(k.coords[e])
-        return g == (n[e] << lvl) - 1 && isglued(conn, p, e, 2)
-    end
 end
 
 # Whether the ghost region of leaf `k` in direction `δ` lies across a
@@ -373,8 +359,8 @@ function ghost_position(::Type{R}, forest::Forest{D}, key::MortonKey{D},
                         idx::NTuple{D,<:Integer}, G::NTuple{D,Int},
                         c::NTuple{D,Int}) where {R,D}
     h = spacing(R, forest, level(key))
-    origin = block_origin(R, forest, key)
-    return ntuple(d -> nodeposition(origin[d], h, Int(idx[d]) - G[d], c[d], nothing), D)
+    lo, B = block_low(R, forest, key), block_base(forest, key)
+    return ntuple(d -> nodeposition(lo[d], h, B[d], Int(idx[d]) - G[d], c[d], nothing), D)
 end
 
 # Every interpolated ghost of `regions`, located: the atlas names the
@@ -468,8 +454,7 @@ function glue_stencil!(weights::Vector{T}, at::Int, cache, forest::Forest{D,R}, 
         t = (S(ξ′[e]) - S(lo[e][1])) / S(h) - (c[e] == 1 ? 0 : S(1) / 2)
         n = (npts[e] << lvl) * N
         # The window: the patch's own points, its high face plane included
-        # along a vertex-like dimension, owned where it is glued (the
-        # appendix) and the hook's at an outer face.
+        # along a vertex-like dimension, every block's own (M22).
         hi = c[e] == 1 ? n : n - 1
         if al[e]
             r = round(Int, t)
@@ -492,14 +477,10 @@ function glue_stencil!(weights::Vector{T}, at::Int, cache, forest::Forest{D,R}, 
         1 <= first && last <= N + 2G[e] + c[e] || throw(ArgumentError(
             "the stencil of the ghost at $(where_()[1]) of patch $p reaches outside the " *
             "stored array of its source block $skey along dimension $e"))
-        # Beyond the owned range: the ghosts below, or from the high plane
-        # of a vertex-like dimension up, which the neighbor within the
-        # patch fills — except the plane at the patch's high face, which
-        # the block owns at a glue (the appendix) and the hook fills at an
-        # outer face, both before this stage.
-        top = c[e] == 1 && start[e] + N == n
+        # Beyond the own range, closed along a vertex-like dimension (M22):
+        # the ghosts, which the neighbor within the patch fills.
         overhang = Base.setindex(overhang,
-                                 first <= G[e] ? -1 : last > G[e] + N + top ? 1 : 0, e)
+                                 first <= G[e] ? -1 : last > G[e] + N + c[e] ? 1 : 0, e)
         fs = Base.setindex(fs, Int32(first), e)
         ws = Base.setindex(ws, Int8(w), e)
     end
@@ -738,397 +719,11 @@ function run_glue!(fs::FieldSet{T,D}, plan::GluePlan{T,D}, tables, backend,
     return nothing
 end
 
-# --- The appendix (M20) ---------------------------------------------------------
+# --- The copies of a point across glues --------------------------------------
 #
-# Under closed ownership a block whose high face lies on a glued high face
-# of its patch owns that face plane too, along every such vertex-like
-# dimension. Those planes follow the cores in the state vector: block by
-# block, variable by variable, the block's points in a fixed order — the
-# plane of each dimension in turn, every point once (one on two planes,
-# at an edge or a corner, in the plane of the lower dimension), each
-# plane lexicographic in its other dimensions, the first fastest. See
-# "Closed ownership and the appendix" in CODE.md, "Finite differences
-# across a glue".
-
-# Whether a field set has an appendix: interpolated across the glue of a
-# forest of patches, with a vertex-like dimension.
-hasappendix(fs::FieldSet) =
-    fs.glue === :interpolate && ispatched(fs.forest) && any(==(:vertex), fs.centering)
-
-# The appendix of one field set over its forest's current leaves: per
-# local block its dimensions, its offset in the appendix and its number
-# of points per variable; and every point, owned index `1 … N+1` per
-# dimension, block after block in the order above, with its block.
-struct AppendixLayout{D}
-    dims::Vector{NTuple{D,Bool}}
-    base::Vector{Int}
-    count::Vector{Int}
-    points::Vector{NTuple{D,Int32}}
-    block::Vector{Int32}
-    first::Vector{Int}
-    total::Int
-end
-
-# The layout, built once per change of the forest and kept in the field
-# set with its tables on the set's backend: `scatter!`, `gather!` and
-# `statearray` run on every evaluation, and a device kernel reads the
-# tables where it runs.
-struct AppendixCache{D,VD,VI,VP,VB}
-    generation::Int
-    host::AppendixLayout{D}
-    dims::VD
-    base::VI
-    count::VI
-    points::VP
-    block::VB
-    first::VI
-end
-
-function appendix_cache(fs::FieldSet{T,D}) where {T,D}
-    cached = fs.appendix
-    g = generation(fs.forest)
-    cached !== nothing && cached.generation == g && return cached
-    L = build_appendix_layout(fs)
-    backend = get_backend(fs.work)
-    dev(a) = todevice(backend, a)
-    fresh = AppendixCache(g, L, dev(L.dims), dev(L.base), dev(L.count), dev(L.points),
-                          dev(L.block), dev(L.first))
-    fs.appendix = fresh
-    return fresh
-end
-
-appendix_layout(fs::FieldSet{T,D}) where {T,D} = appendix_cache(fs).host::AppendixLayout{D}
-
-function build_appendix_layout(fs::FieldSet{T,D}) where {T,D}
-    forest = fs.forest
-    N = forest.N
-    c = staggers(fs.centering)
-    range = blockrange(forest)
-    dims = NTuple{D,Bool}[]
-    base = Int[]
-    count = Int[]
-    points = NTuple{D,Int32}[]
-    block = Int32[]
-    first = Int[]
-    total = 0
-    for (b, j) in enumerate(range)
-        e = hasappendix(fs) ? appendix_dims(forest, forest.leaves[j], c) :
-            ntuple(_ -> false, D)
-        push!(dims, e)
-        push!(base, total)
-        push!(first, length(points) + 1)
-        n0 = length(points)
-        for d in 1:D
-            e[d] || continue
-            ranges = ntuple(D) do d′
-                d′ == d && return (N + 1):(N + 1)
-                return d′ < d ? (1:N) : (1:(N + e[d′]))
-            end
-            for I in CartesianIndices(ranges)
-                push!(points, ntuple(d′ -> Int32(I[d′]), D))
-                push!(block, Int32(b))
-            end
-        end
-        push!(count, length(points) - n0)
-        total += fs.nvars * (length(points) - n0)
-    end
-    return AppendixLayout{D}(dims, base, count, points, block, first, total)
-end
-
-# The points of the appendix of a block whose high face planes along the
-# dimensions `e` it owns: each plane once, a point on several in the plane
-# of the lowest dimension, as `build_appendix_layout` enumerates them.
-function appendix_count(e::NTuple{D,Bool}, N::Int) where {D}
-    n = 0
-    for d in 1:D
-        e[d] || continue
-        size = 1
-        for d′ in 1:D
-            d′ == d && continue
-            size *= d′ < d ? N : N + e[d′]
-        end
-        n += size
-    end
-    return n
-end
-
-# The entries of the appendix of global leaf `j` in `fs`'s state vector,
-# its points times the variables, on any rank: what TreeIOHDF5 streams and
-# stores for that block (a name of the companion interface, CODE.md).
-appendix_entries(fs::FieldSet{T,D}, j::Integer) where {T,D} =
-    hasappendix(fs) ?
-    fs.nvars * appendix_count(appendix_dims(fs.forest, fs.forest.leaves[j],
-                                            staggers(fs.centering)), fs.forest.N) : 0
-
-# The position, from 1, of the point `I` (owned index `1 … N+1`) among its
-# block's appendix points, `e` the block's appendix dimensions: the planes
-# of the lower dimensions first, then lexicographic within its own.
-@inline function appendix_rank(I::NTuple{D,Int}, e::NTuple{D,Bool}, N::Int) where {D}
-    # The first dimension at the high plane, by a loop: a device kernel
-    # reads through this, and `findfirst` returns a union.
-    d = D
-    for d′ in D:-1:1
-        I[d′] == N + 1 && (d = d′)
-    end
-    off = 0
-    for d2 in 1:(d - 1)
-        e[d2] || continue
-        size = 1
-        for d′ in 1:D
-            d′ == d2 && continue
-            size *= d′ < d2 ? N : N + e[d′]
-        end
-        off += size
-    end
-    r = 0
-    stride = 1
-    for d′ in 1:D
-        d′ == d && continue
-        r += (I[d′] - 1) * stride
-        stride *= d′ < d ? N : N + e[d′]
-    end
-    return off + r + 1
-end
-
-"""
-    AppendixArray
-
-The whole state of a set with an appendix, as `statearray(u, fs;
-appendix = true)` returns it: an `(i1, …, iD, var, b)` array whose `i_d`
-runs to `N + 1` along a dimension where block `b` owns its high face
-plane, reading and writing the core or the appendix as the index says. A
-write to a point the block does not own is discarded, so that a kernel
-launched over the closed range may write every point it visits; reading
-one is an error. See "Finite differences across a glue" in `CODE.md`.
-"""
-struct AppendixArray{T,D,C<:AbstractArray{T},A<:AbstractVector{T},
-                     VD<:AbstractVector{NTuple{D,Bool}},VI<:AbstractVector{Int}}
-    core::C
-    appendix::A
-    dims::VD
-    base::VI
-    count::VI
-    N::Int
-end
-AppendixArray(core::AbstractArray{T}, appendix::AbstractVector{T},
-              dims::AbstractVector{NTuple{D,Bool}}, base::AbstractVector{Int},
-              count::AbstractVector{Int}, N::Int) where {T,D} =
-    AppendixArray{T,D,typeof(core),typeof(appendix),typeof(dims),typeof(base)}(
-        core, appendix, dims, base, count, N)
-
-# Into a device kernel, as a right-hand side launched with `map_blocks!(…;
-# appendix = true)` takes it: every array converted for the device.
-Adapt.adapt_structure(to, a::AppendixArray) =
-    AppendixArray(Adapt.adapt(to, a.core), Adapt.adapt(to, a.appendix),
-                  Adapt.adapt(to, a.dims), Adapt.adapt(to, a.base),
-                  Adapt.adapt(to, a.count), a.N)
-
-@inline function appendix_slot(a::AppendixArray{T,D}, I::NTuple{D,Int}, v::Int,
-                               b::Int) where {T,D}
-    e = a.dims[b]
-    all(d -> I[d] <= a.N + e[d], 1:D) || return 0
-    return a.base[b] + (v - 1) * a.count[b] + appendix_rank(I, e, a.N)
-end
-
-# Inlined, so that a kernel's index arithmetic folds into them: on the
-# CPU a call per point allocated its tuples (90 ns and 160 B a read).
-@inline function Base.getindex(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
-    i = ntuple(d -> I[d], Val(D))
-    v, b = I[D + 1], I[D + 2]
-    all(d -> i[d] <= a.N, 1:D) && return a.core[i..., v, b]
-    s = appendix_slot(a, i, v, b)
-    @boundscheck s == 0 && throw(BoundsError(a, I))
-    return @inbounds a.appendix[s]
-end
-
-@inline function Base.setindex!(a::AppendixArray{T,D}, x, I::Vararg{Int}) where {T,D}
-    i = ntuple(d -> I[d], Val(D))
-    v, b = I[D + 1], I[D + 2]
-    if all(d -> i[d] <= a.N, 1:D)
-        a.core[i..., v, b] = x
-        return a
-    end
-    s = appendix_slot(a, i, v, b)
-    s == 0 || (a.appendix[s] = x)
-    return a
-end
-
-Base.eltype(::Type{<:AppendixArray{T}}) where {T} = T
-
-"""
-    isowned(A, i1, …, iD, v, b) -> Bool
-
-Whether the point `(i1, …, iD)` of variable `v` of block `b` is one the
-state owns, `A` being [`statearray`](@ref)`(u, fs; appendix = true)`:
-for a set with an appendix (`glue = :interpolate`, M20), `i_d ≤ N` or
-block `b` owns its high face plane along `d`; for any other array,
-whether the index is in its bounds.
-
-A right-hand side launched with [`map_blocks!`](@ref)`(…; appendix =
-true)` runs over the closed range, `N + 1` points along every
-vertex-like dimension, and a write to a point the block does not own is
-dropped; with `isowned` the kernel can skip the work for those points
-instead, about `D/N` of it. It works in a device kernel. See "Finite
-differences across a glue" in `CODE.md`.
-"""
-@inline function isowned(a::AppendixArray{T,D}, I::Vararg{Int}) where {T,D}
-    e = @inbounds a.dims[I[D + 2]]
-    return all(d -> I[d] <= a.N + e[d], 1:D)
-end
-@inline isowned(a::AbstractArray, I::Vararg{Int}) = checkbounds(Bool, a, I...)
-Base.size(a::AppendixArray{T,D}) where {T,D} =
-    (ntuple(_ -> a.N + 1, D)..., size(a.core, D + 1), size(a.core, D + 2))
-
-# The appendix's points between the working array and the state vector,
-# one work item per point and variable.
-@kernel function appendix_scatter_kernel!(work, @Const(app), @Const(points),
-                                          @Const(block), @Const(first), @Const(base),
-                                          @Const(count), ::Val{D}, ::Val{G}) where {D,G}
-    j, v = @index(Global, NTuple)
-    @inbounds begin
-        b = block[j]
-        I = points[j]
-        s = base[b] + (v - 1) * count[b] + (j - first[b]) + 1
-        work[ntuple(d -> Int(I[d]) + G[d], Val(D))..., v, b] = app[s]
-    end
-end
-@kernel function appendix_gather_kernel!(app, @Const(work), @Const(points),
-                                         @Const(block), @Const(first), @Const(base),
-                                         @Const(count), ::Val{D}, ::Val{G}) where {D,G}
-    j, v = @index(Global, NTuple)
-    @inbounds begin
-        b = block[j]
-        I = points[j]
-        s = base[b] + (v - 1) * count[b] + (j - first[b]) + 1
-        app[s] = work[ntuple(d -> Int(I[d]) + G[d], Val(D))..., v, b]
-    end
-end
-
-# The appendix's points of `fill_by_coordinates!` (M20): every form of its
-# callback as one that returns all the variables from the position and
-# the patch. `all` and `patch` say which form `f` is: `f(x, v)`,
-# `f(x) -> vals`, `f(x, p, v)` or `f(x, p) -> vals`.
-struct AppendixCallback{F,NV,A,P}
-    f::F
-end
-AppendixCallback(f, ::Val{NV}, all::Bool, patch::Bool) where {NV} =
-    AppendixCallback{typeof(f),NV,all,patch}(f)
-@inline (g::AppendixCallback{F,NV,false,false})(x, p) where {F,NV} =
-    ntuple(v -> g.f(x, v), Val(NV))
-@inline (g::AppendixCallback{F,NV,true,false})(x, p) where {F,NV} = g.f(x)
-@inline (g::AppendixCallback{F,NV,false,true})(x, p) where {F,NV} =
-    ntuple(v -> g.f(x, p, v), Val(NV))
-@inline (g::AppendixCallback{F,NV,true,true})(x, p) where {F,NV} = g.f(x, p)
-
-# One work item per appendix point: its position formed by the expression
-# `coordinates_kernel!` uses, from the owned index `N + 1` on its plane, so
-# that a point the patches share is filled from the same arithmetic.
-@kernel function appendix_coordinates_kernel!(work, g, @Const(points), @Const(block),
-                                              @Const(origins), @Const(spacings),
-                                              @Const(patches), nodes, ::Val{D}, ::Val{G},
-                                              ::Val{C}, ::Val{NV}) where {D,G,C,NV}
-    j = @index(Global, Linear)
-    @inbounds begin
-        b = Int(block[j])
-        I = points[j]
-        origin, h, p = origins[b], spacings[b], Int(patches[b])
-        x = ntuple(d -> nodeposition(origin[d], h, Int(I[d]), C[d], nodes), Val(D))
-        vals = g(x, p)
-        idx = ntuple(d -> Int(I[d]) + G[d], Val(D))
-        ntuple(Val(NV)) do v
-            work[idx..., v, b] = vals[v]
-            nothing
-        end
-    end
-end
-
-function fill_appendix_coordinates!(g::AppendixCallback, fs::FieldSet{T,D}) where {T,D}
-    L = appendix_cache(fs)
-    isempty(L.host.points) && return nothing
-    forest = fs.forest
-    backend = get_backend(fs.work)
-    origins = todevice(backend, block_origins(forest, T))
-    spacings = todevice(backend, block_spacings(forest, T))
-    patches = todevice(backend, block_patches(forest))
-    with_nodes(backend, T, fs.P) do nodes
-        appendix_coordinates_kernel!(backend)(fs.work, g, L.points, L.block, origins,
-                                              spacings, patches, nodes, Val(D), Val(fs.G),
-                                              Val(staggers(fs)), Val(fs.nvars);
-                                              ndrange=length(L.host.points))
-    end
-    synchronize(backend)
-    return nothing
-end
-
-function move_appendix!(kernel, fs::FieldSet{T,D}, a, b, L::AppendixCache) where {T,D}
-    isempty(L.host.points) && return nothing
-    backend = get_backend(fs.work)
-    kernel(backend)(a, b, L.points, L.block, L.first, L.base, L.count, Val(D), Val(fs.G);
-                    ndrange=(length(L.host.points), fs.nvars))
-    synchronize(backend)
-    return nothing
-end
-
-# --- Counting a glued face point once (M20) ----------------------------------------
-#
-# Under closed ownership a point on a glued face is owned by every patch
-# holding it, so a fold or a norm that read every owned point would count
-# it twice, or three or four times at an edge or a corner. It is counted
-# at one copy: the one with the lowest `(patch, position)`, the position
-# in the patch's own integer coordinates, so that a patch glued to itself
-# (a wrap) counts its low plane and not its high one. See "Closed
-# ownership and the appendix" in CODE.md, "Finite differences across a
-# glue".
-#
-# A block's owned points fall into at most `3^D` pieces: along each
-# dimension, the low face plane where it lies on a glued face of the
-# patch (class 0), the high appendix plane (class 2), or neither (class
-# 1). Every point of a piece lies on the same glued faces, and a glue
-# joins a whole face to a whole face, so its copies lie on the same
-# patches, and the decision is one bit per piece. The one exception, two
-# copies on the lowest patch, is checked point by point.
-
-# Which of a block's owned points a fold visits: the dimensions with a
-# glued low face plane and with an appendix plane, and one bit per piece,
-# piece `Σ class_d 3^(d-1)`.
-struct FoldMask{D}
-    low::NTuple{D,Bool}
-    high::NTuple{D,Bool}
-    pieces::UInt32
-end
-
-# The masks of a set without an appendix: every block visits its `N^D`
-# owned points, and the kernel compiles none of this.
-struct NoMasks end
-@inline Base.getindex(::NoMasks, ::Integer) = nothing
-fold_extra(::NoMasks) = 0
-fold_extra(::AbstractVector) = 1
-
-@inline counted(::Nothing, I, N) = true
-@inline function counted(m::FoldMask{D}, I::NTuple{D,Int}, N::Int) where {D}
-    piece, stride = 0, 1
-    for d in 1:D
-        i = I[d]
-        cls = i > N ? 2 : (i == 1 && m.low[d]) ? 0 : 1
-        cls == 2 && !m.high[d] && return false
-        piece += cls * stride
-        stride *= 3
-    end
-    return (m.pieces >> piece) & 0x1 == 0x1
-end
-
-# The number of points a mask counts, of `N^D` per block without one.
-function counted_points(m::FoldMask{D}, N::Int) where {D}
-    total = 0
-    for cls in CartesianIndices(ntuple(_ -> 0:2, D))
-        piece = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
-        (m.pieces >> piece) & 0x1 == 0x1 || continue
-        total += prod(ntuple(D) do d
-            cls[d] == 0 ? Int(m.low[d]) : cls[d] == 2 ? Int(m.high[d]) : N - m.low[d]
-        end)
-    end
-    return total
-end
+# What stage A's members and the mask's primary at a kinked glue are found
+# from (M22): the copies of a point across the glues of a forest of
+# patches.
 
 # Every copy of the point at doubled coordinates `y` of patch `p` (twice
 # its position in spacings of level `lvl`, so that a cell center is odd
@@ -1160,73 +755,279 @@ function glue_copies(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::In
     return copies
 end
 
-# Whether the copy of the point `y` of patch `p` is the one counted.
-counted_copy(conn::Patches{D}, p::Int, y::NTuple{D,Int}, lvl::Int, N::Int,
-             c::NTuple{D,Int}) where {D} =
-    minimum(glue_copies(conn, p, y, lvl, N, c)) == (p, y)
+# --- Stage A: the copies of a point on a kinked glue (M22) -------------------
+#
+# Across a glue a set is interpolated at (`glue = :interpolate`), the
+# patches holding a point of a glued face evolve it by different stencils,
+# and their copies differ by the scheme's error. Stage A makes them one
+# number, their mean (M22 rule 4; the prototype's "averaged right-hand
+# sides", M20 in HISTORY.md), before stages W, P and 0, which carry it to
+# every other copy inside each patch. The members of a point are the
+# within-patch primaries of the patches holding it, one a patch, or more
+# where a patch is glued to itself: found by following the glues of every
+# glued face the point lies on (`glue_copies`), in each patch's integer
+# coordinates, so exactly, and ordered by patch and then by position. Every
+# block holding a member writes the same mean, computed by every rank alike
+# from the members in that order (`mean_gather_kernel!`), so the copies are
+# one number bit for bit.
+#
+# Over a distributed forest the members another rank holds come in one
+# message round under `GLUE_MEAN_TAG`, the sender packing its members'
+# values unchanged; the means are computed where they are written, so no
+# second round is needed. Both ends derive the layout from the tree: per
+# peer, the entries sorted by the receiving member's global leaf and stored
+# index, then the sending member's, the variables of a value together.
+#
+# The buffers — the means, `nvars × n`; the values sent and received —
+# are made on the first fill and kept with the plan, remade when the
+# variable count changes, and freed with the schedule, as the glue plan's
+# are.
 
-# The masks of this rank's blocks, on `backend`, for a set with an
-# appendix; a set without one passes `NoMasks()`.
-fold_masks(backend, fs::FieldSet) = todevice(backend, host_fold_masks(fs))
+# The tag of stage A's round, past the interpolated ghosts'.
+const GLUE_MEAN_TAG = 37
 
-# The points a fold counts in each block, which a norm's volume weights.
-counted_per_block(fs::FieldSet) = [counted_points(m, fs.forest.N) for m in host_fold_masks(fs)]
+mutable struct MeanBuffers
+    means::Any
+    send::Any
+    recv::Any
+    wiresend::Any
+    wirerecv::Any
+    nvars::Int
+end
+MeanBuffers() = MeanBuffers(nothing, nothing, nothing, nothing, nothing, 0)
 
-function host_fold_masks(fs::FieldSet{T,D}) where {T,D}
-    forest = fs.forest
-    conn = forest.conn::Patches{D}
+struct GlueMeans{MP}
+    targets::MP            # the members of this rank's within-patch primaries
+    sends::MP              # one member each: a value another rank needs
+    sendpeers::Vector{Int}
+    sendcounts::Vector{Int}
+    recvpeers::Vector{Int}
+    recvcounts::Vector{Int}
+    buffers::MeanBuffers
+end
+Base.isempty(g::GlueMeans) = length(g.targets) == 0 && length(g.sends) == 0
+
+# The doubled patch coordinates of stored index `idx` of leaf `k` (twice its
+# position in spacings of `k`'s level, a cell centre odd), as `glue_copies`
+# takes a point.
+function doubled_point(forest::Forest{D}, k::MortonKey{D}, idx::NTuple{D,Int},
+                       G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    lvl = level(k)
     N = forest.N
-    c = staggers(fs.centering)
-    masks = FoldMask{D}[]
-    # The refusal below depends on the block, so over a distributed forest
-    # with a patch glued to itself every rank asks it of every leaf, and
-    # all refuse alike (every forest's other folds pay nothing for it).
-    range = blockrange(forest)
-    selfglued = any(p -> any(e -> e.patch == p, conn.glue[glue_slot(p, d, s, D)]
-                                                for d in 1:D, s in 1:2),
-                    eachindex(conn.roots))
-    blocks = isdistributed(forest) && selfglued ? (1:nleaves(forest)) : range
-    for j in blocks
-        k = forest.leaves[j]
-        lvl = level(k)
-        p = patch(forest, k)
-        n = conn.roots[p]
-        rootpos = root_position(n, Int(k.root) - conn.firstroot[p])
-        o = ntuple(e -> N * ((rootpos[e] << lvl) + Int(k.coords[e])), D)
-        low = ntuple(e -> c[e] == 1 && o[e] == 0 && isglued(conn, p, e, 1), D)
-        high = appendix_dims(forest, k, c)
-        position(I) = ntuple(e -> 2 * (o[e] + I[e] - 1) + 1 - c[e], D)
-        pieces = UInt32(0)
-        for cls in CartesianIndices(ntuple(_ -> 0:2, D))
-            ranges = ntuple(D) do d
-                cls[d] == 0 ? (low[d] ? (1:1) : (1:0)) :
-                cls[d] == 2 ? (high[d] ? ((N + 1):(N + 1)) : (1:0)) : ((1 + low[d]):N)
-            end
-            any(isempty, ranges) && continue
-            piece = sum(ntuple(d -> cls[d] * 3^(d - 1), D))
-            I0 = map(first, ranges)
-            copies = glue_copies(conn, p, position(I0), lvl, N, c)
-            bit = minimum(copies) == (p, position(I0))
-            # Two copies on the lowest patch, a patch glued to itself:
-            # which counts may depend on the point, so every point is
-            # asked. A wrap answers alike for the whole piece.
-            if count(x -> x[1] == minimum(copies)[1], copies) > 1
-                for I in CartesianIndices(ranges)
-                    counted_copy(conn, p, position(Tuple(I)), lvl, N, c) == bit && continue
-                    throw(ArgumentError(
-                        "patch $p is glued to itself so that the points of one face of " *
-                        "leaf $k, $(Tuple(I)) and $I0, are counted at different copies: " *
-                        "a fold over a set with closed ownership counts each glued face " *
-                        "point once, at the copy with the lowest patch and position, " *
-                        "and decides it per face of a block, which this glue does not " *
-                        "allow (CODE.md, \"Finite differences across a glue\")"))
-                end
-            end
-            bit && (pieces |= UInt32(1) << piece)
-        end
-        push!(masks, FoldMask{D}(low, high, pieces))
+    rootpos = root_position(forest, k.root)
+    return ntuple(D) do e
+        g = (rootpos[e] << lvl) + Int(k.coords[e])
+        return 2 * (g * N + idx[e] - G[e] - 1) + 1 - c[e]
     end
-    return blocks == range ? masks : masks[range]
 end
 
-KernelAbstractions.get_backend(a::AppendixArray) = get_backend(a.core)
+# The within-patch primary of the point at doubled coordinates `z` of patch
+# `q`, at level `lvl`: the global leaf holding it on its high planes where a
+# block lies below along a dimension it is shared in (the greatest class
+# tuple, as `piece_primary` decides inside a patch), and its stored index.
+# Every leaf within reach of a kinked glue is at one level (*No refinement
+# boundary at a glue*), so the leaf is at `lvl`.
+function patch_primary(forest::Forest{D}, q::Int, z::NTuple{D,Int}, lvl::Int,
+                       G::NTuple{D,Int}, c::NTuple{D,Int}) where {D}
+    N = forest.N
+    conn = forest.conn::Patches{D}
+    g = ntuple(e -> (c[e] == 1 && z[e] > 0 && z[e] % (2N) == 0) ? z[e] ÷ (2N) - 1 :
+                    z[e] ÷ (2N), D)
+    root, coords, _ = glued_node(conn, q, g, lvl, Crossing())
+    j = find_leaf(forest, MortonKey{D}(Int32(root), Int8(lvl), map(UInt32, coords)))
+    j === nothing && error(
+        "a point on a kinked glue at $z of patch $q has no leaf at level $lvl " *
+        "holding it; every leaf within reach of the glue is at one level, so this " *
+        "is a bug")
+    idx = ntuple(e -> (z[e] - (1 - c[e])) ÷ 2 - g[e] * N + G[e] + 1, D)
+    return j, idx
+end
+
+# The members of the point at stored index `idx` of global leaf `j`: every
+# patch's within-patch primary of it, as `(patch, doubled point, leaf,
+# stored index)`, by patch and then by position.
+function glue_members(forest::Forest{D}, j::Int, idx::NTuple{D,Int}, G::NTuple{D,Int},
+                      c::NTuple{D,Int}) where {D}
+    k = forest.leaves[j]
+    lvl = level(k)
+    y = doubled_point(forest, k, idx, G, c)
+    copies = sort!(glue_copies(forest.conn::Patches{D}, patch(forest, k), y, lvl,
+                               forest.N, c))
+    return [(q, z, patch_primary(forest, q, z, lvl, G, c)...) for (q, z) in copies]
+end
+
+# Stage A's plan for a set of ghost widths `G` and staggers `c` over a
+# forest of patches it is interpolated across, or `nothing` where no own
+# point lies on a glued face (a set cell-like along every glued normal).
+function glue_means(forest::Forest{D}, G::NTuple{D,Int}, c::NTuple{D,Int},
+                    backend) where {D}
+    conn = forest.conn::Patches{D}
+    N = forest.N
+    owned = blockrange(forest)
+    offset = first(owned) - 1
+    me = commrank(forest.comm)
+    # This rank's members: per block on a glued face, the pieces of its
+    # closed box on that face whose copy is the within-patch primary.
+    targets = Tuple{Int,NTuple{D,Int},Vector{Tuple{Int,NTuple{D,Int},Int,NTuple{D,Int}}}}[]
+    for b in eachindex(owned)
+        j = offset + b
+        k = forest.leaves[j]
+        faces = filter(((e, s),) -> c[e] == 1, glued_faces(conn, k))
+        isempty(faces) && continue
+        bits = primary_bits(forest, j, c; acrossglue=false)
+        for cls in closed_pieces(c)
+            (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+            any(((e, s),) -> cls[e] == (s == 1 ? 0 : 2), faces) || continue
+            rng = ntuple(d -> piece_range(N, G[d], c[d], piece_span(cls[d])), D)
+            for I in CartesianIndices(rng)
+                idx = Tuple(I)
+                members = glue_members(forest, j, idx, G, c)
+                length(members) > 1 || continue
+                any(m -> m[3] == j && m[4] == idx, members) || error(
+                    "the within-patch primary at $idx of leaf $j is not among the " *
+                    "members of its point on a kinked glue; this is a bug")
+                push!(targets, (j, idx, members))
+            end
+        end
+    end
+    isempty(targets) && !isdistributed(forest) && return nothing
+    # What is sent and received: a member held elsewhere, per pair of a
+    # target and a member, keyed by both, so both ends sort alike.
+    Key = Tuple{Int,Int,NTuple{D,Int},Int,NTuple{D,Int}}
+    recv = Key[]
+    send = Key[]
+    for (j, idx, members) in targets, (_, _, mj, midx) in members
+        (mj == j && midx == idx) && continue
+        o = leafowner(forest, mj)
+        o == me && continue
+        # Received: member `(mj, midx)` of target `(j, idx)`, from `o`.
+        push!(recv, (o, j, idx, mj, midx))
+        # Sent: this target's value to `o`, for its target `(mj, midx)`,
+        # keyed as `o` keys the receive, so that both sort alike.
+        push!(send, (o, mj, midx, j, idx))
+    end
+    sort!(recv)
+    sort!(send)
+    M = isempty(targets) ? 1 : maximum(t -> length(t[3]), targets)
+    host = host_means(Val(D), length(targets), M, false)
+    slot = Dict{Tuple{Int,NTuple{D,Int},Int,NTuple{D,Int}},Int}(
+        (r[2], r[3], r[4], r[5]) => i for (i, r) in enumerate(recv))
+    for (i, (j, idx, members)) in enumerate(targets)
+        host.blocks[i] = Int32(j - offset)
+        host.points[i] = map(Int32, idx)
+        host.statepoints[i] = ntuple(d -> Int32(idx[d] - G[d]), D)
+        host.mcount[i] = Int32(length(members))
+        for (m, (_, _, mj, midx)) in enumerate(members)
+            if leafowner(forest, mj) == me
+                host.mblock[m, i] = Int32(mj - offset)
+                host.mpoint[m, i] = map(Int32, midx)
+                host.mstatepoint[m, i] = ntuple(d -> Int32(midx[d] - G[d]), D)
+            else
+                host.mslot[m, i] = Int32(slot[(j, idx, mj, midx)])
+            end
+        end
+    end
+    sends = host_means(Val(D), length(send), 1, false)
+    for (i, (_, _, _, j, idx)) in enumerate(send)
+        sends.mcount[i] = Int32(1)
+        sends.mblock[1, i] = Int32(j - offset)
+        sends.mpoint[1, i] = map(Int32, idx)
+        sends.mstatepoint[1, i] = ntuple(d -> Int32(idx[d] - G[d]), D)
+    end
+    function peers(list)
+        ps = unique(first.(list))
+        return ps, [count(x -> x[1] == p, list) for p in ps]
+    end
+    sendpeers, sendcounts = peers(send)
+    recvpeers, recvcounts = peers(recv)
+    return GlueMeans(todevice(backend, host), todevice(backend, sends), sendpeers,
+                     sendcounts, recvpeers, recvcounts, MeanBuffers())
+end
+
+# The buffers of a run of `nv` variables, made or remade when the count
+# changes.
+function mean_buffers!(g::GlueMeans, ::Type{T}, backend, comm, nv::Int) where {T}
+    bufs = g.buffers
+    if bufs.means === nothing || bufs.nvars != nv
+        ns, nr = sum(g.sendcounts; init=0), sum(g.recvcounts; init=0)
+        bufs.means = allocate(backend, T, (nv, length(g.targets)))
+        bufs.send = allocate(backend, T, (nv, ns))
+        bufs.recv = allocate(backend, T, (nv, nr))
+        staged = hoststaging(comm, vec(bufs.send))
+        bufs.wiresend = staged ? Vector{T}(undef, nv * ns) : vec(bufs.send)
+        bufs.wirerecv = staged ? Vector{T}(undef, nv * nr) : vec(bufs.recv)
+        bufs.nvars = nv
+    end
+    return bufs
+end
+
+# Stage A on `A`, `fs`'s working array or, with `state`, a state-shaped
+# one: the receives posted, this rank's members packed and sent, the
+# means formed once the receives are in and written back. Its sends are
+# waited for here, so the stages after it see nothing of this one.
+function run_glue_means!(A::AbstractArray{T}, fs::FieldSet, g::GlueMeans, backend, comm;
+                         state::Bool=false) where {T}
+    nv = fs.nvars
+    bufs = mean_buffers!(g, T, backend, comm, nv)
+    recvs = Any[]
+    for (peer, r) in zip(g.recvpeers, segment_ranges(g.recvcounts, nv))
+        push!(recvs, irecv(comm, view(bufs.wirerecv, r), peer, GLUE_MEAN_TAG))
+    end
+    sends = Any[]
+    # Every member is read as stored (orientation 0), so the set's sign
+    # and variable tables are not read; a set without a seam has none, and
+    # the means buffer stands in for them.
+    dummy = bufs.means
+    if !isempty(g.sendpeers)
+        gather_means!(bufs.send, A, bufs.recv, g.sends, nv, dummy, dummy, backend;
+                      state=state)
+        synchronize(backend)
+        bufs.wiresend === vec(bufs.send) || copyto!(bufs.wiresend, vec(bufs.send))
+        for (peer, r) in zip(g.sendpeers, segment_ranges(g.sendcounts, nv))
+            push!(sends, isend(comm, view(bufs.wiresend, r), peer, GLUE_MEAN_TAG))
+        end
+    end
+    if !isempty(recvs)
+        waitall(comm, recvs)
+        bufs.wirerecv === vec(bufs.recv) || copyto!(vec(bufs.recv), bufs.wirerecv)
+    end
+    gather_means!(bufs.means, A, bufs.recv, g.targets, nv, dummy, dummy, backend;
+                  state=state)
+    write_means!(A, bufs.means, g.targets, nv, backend; state=state)
+    synchronize(backend)
+    isempty(sends) || waitall(comm, sends)
+    return nothing
+end
+
+# Stage A where a schedule has one, behind a barrier, so that a forest
+# without a kinked glue compiles none of it.
+function run_stage_a!(A, fs::FieldSet, means, backend, comm; state::Bool=false)
+    means === nothing && return nothing
+    Base.inferencebarrier(run_glue_means!)(A, fs, means, backend, comm; state=state)
+    return nothing
+end
+
+# The mask's bits of global leaf `j` of a set interpolated across its
+# glues: of the within-patch primaries `bits`, those of a piece on a glued
+# face only where the block's copy is the member on the lowest patch,
+# then at the greatest position within it, which is the primary the
+# reductions count once. The patches holding a point are the same along a
+# piece, since a glue joins a whole face to a whole face.
+function glue_lowest_bits(forest::Forest{D}, j::Int, c::NTuple{D,Int}, G::NTuple{D,Int},
+                          bits::UInt32) where {D}
+    conn = forest.conn::Patches{D}
+    k = forest.leaves[j]
+    N = forest.N
+    faces = filter(((e, s),) -> c[e] == 1, glued_faces(conn, k))
+    isempty(faces) && return bits
+    for cls in closed_pieces(c)
+        (bits >> piece_index(cls)) & 0x1 == 0x1 || continue
+        any(((e, s),) -> cls[e] == (s == 1 ? 0 : 2), faces) || continue
+        idx = ntuple(d -> c[d] == 0 || cls[d] == 0 ? G[d] + 1 :
+                          cls[d] == 2 ? G[d] + N + 1 : G[d] + 1 + N ÷ 2, D)
+        members = glue_members(forest, j, idx, G, c)
+        _, _, mj, midx = argmin(m -> (m[1], map(-, m[2])), members)
+        mj == j && midx == idx || (bits &= ~(UInt32(1) << piece_index(cls)))
+    end
+    return bits
+end

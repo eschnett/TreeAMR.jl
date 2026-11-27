@@ -129,27 +129,28 @@ end
     @test max_deviation(fs, f) > 1e-2
 end
 
-@testset "The upper wall point of a vertex-like dimension is derived: D=$D" for
+@testset "The wall point of a vertex-like dimension is evolved, an odd variable zero: D=$D" for
         D in (1, 2)
-    # Beyond a high reflecting face the wall point is shared with nobody
-    # and the mirror maps it onto itself. It is derived: exactly zero for
-    # an odd variable, and for an even one the folded symmetric
-    # interpolant, (4u₁ - u₂)/3 at order 4 — exact for an even quadratic
-    # and not for an even quartic, which is what an order-4 interpolant
-    # of an even function is.
+    # On closed blocks (M22) a reflecting wall plane is the block's own on
+    # both sides, and the mirror maps it onto itself: the fill leaves an
+    # even variable's wall value as the state holds it, bit for bit — it
+    # is evolved, not derived — and projects an odd one onto zero (stage
+    # P). Under half-open ownership the high wall point was derived by an
+    # interpolant, `(4u₁ − u₂)/3` at order 4.
     forest = Forest(ntuple(_ -> 1, D); N=8, extents=ntuple(_ -> (0.0, 1.0), D),
-                    reflecting=ntuple(d -> d == 1 ? (false, true) : (false, false), D))
+                    reflecting=ntuple(d -> d == 1 ? (true, true) : (false, false), D))
     fs = FieldSet(forest, 3; G=1, centering=vertexcentered(D),
                   parity=[EvenParity, OddParity, EvenParity])
-    f(x, v) = v == 1 ? 1 + (x[1] - 1)^2 : v == 2 ? (x[1] - 1) : (x[1] - 1)^4
+    f(x, v) = v == 1 ? 1 + (x[1] - 1)^2 : v == 2 ? 1 + x[1] : 1 + (x[1] - 1)^4
     fill_by_coordinates!(f, fs)
+    before = copy(fs.work)
     fill_ghosts!(fs, GhostSchedule(fs, OPS4); boundary=boundary_by_coordinates(f))
-    wall = fs.G[1] + forest.N + 1
-    row(v) = fs.work[wall, ntuple(_ -> fs.G[1] + 1, D - 1)..., v, 1]
-    @test row(1) ≈ 1.0 atol = 1e-14
-    @test row(2) == 0
-    h = 1 / forest.N
-    @test row(3) ≈ (4 * h^4 - (2h)^4) / 3 atol = 1e-14   # the interpolant, not 0
+    for wall in (fs.G[1] + 1, fs.G[1] + forest.N + 1)
+        at(w, v) = w[wall, ntuple(_ -> fs.G[1] + 1, D - 1)..., v, 1]
+        @test at(fs.work, 1) === at(before, 1)
+        @test at(fs.work, 2) == 0
+        @test at(fs.work, 3) === at(before, 3)
+    end
 end
 
 @testset "A reflecting face reproduces the mirrored doubled domain: D=$D" for
@@ -163,7 +164,7 @@ end
     # the half domain derives while the doubled domain owns it.
     N = 8                                        # order 4 restricts from N >= 5
     for (side, C) in ((:lo, cellcentered(D)), (:hi, cellcentered(D)),
-                      (:lo, vertexcentered(D)))
+                      (:lo, vertexcentered(D)), (:hi, vertexcentered(D)))
         result = reflecting_vs_doubled(Val(D); side=side, centering=C, N=N)
         @test result !== nothing
         result === nothing && continue
@@ -191,7 +192,7 @@ end
             fs = FieldSet(forest, 2; G=G, centering=C, parity=parity)
             schedule = GhostSchedule(fs, OPS4)
             counts = write_counts(schedule)
-            owned = ntuple(d -> (G[d] + 1):(G[d] + N), D)
+            owned = ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D)
             ok = true
             for b in 1:nleaves(forest), idx in CartesianIndices(size(counts)[1:D])
                 inside = all(d -> Tuple(idx)[d] in owned[d], 1:D)

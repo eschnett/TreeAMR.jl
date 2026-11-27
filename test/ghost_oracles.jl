@@ -151,13 +151,13 @@ arbitrary_value(::Type{T}, p, v::Integer) where {T} =
     T(2 * (hash((p, v)) / typemax(UInt64)) - 1)
 
 """
-Fill every owned point of every block from [`arbitrary_value`](@ref), or
-every *closed*-range point with `closed = true` — which is what a block
-computes for itself when it holds a flux or an EMF, the shared plane
-included, and so what the interface restriction finds in place.
+Fill every own point of every block from [`arbitrary_value`](@ref): the
+closed range along a vertex-like dimension, both face planes (M22). The
+keyword `closed` asked for that range under half-open ownership, and is
+the default's now.
 """
-function fill_arbitrary!(fs::FieldSet{T,D}; closed::Bool=false) where {T,D}
-    c = closed ? staggers(fs) : ntuple(_ -> 0, D)
+function fill_arbitrary!(fs::FieldSet{T,D}; closed::Bool=true) where {T,D}
+    c = staggers(fs)
     owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D))
     for b in 1:nblocks(fs), v in 1:fs.nvars, idx in owned
         fs.work[Tuple(idx)..., v, b] =
@@ -421,18 +421,21 @@ function closed_values(fs::FieldSet{T,D}) where {T,D}
 end
 
 """
-The interface restriction computed by hand, as `(block, stored index) =>
-expected value` for every point it should touch.
+The coarse copies `unify!` restricts, computed by hand, as `(block, stored
+index) => expected value` (M22 rule 1).
 
-For every block, every vertex-like dimension and both sides,
-`neighbor_keys` says whether the neighbours across that face are finer;
-where they are, the block's boundary plane must come back as the average
-of the coincident fine values. *Which* fine values those are is decided
-by position and nothing else — a cell-like tangential dimension
+An own point of a block on one of its face planes along a vertex-like
+dimension is the coarse copy of a finer one wherever a block one level
+finer holds the point in its closed box — across a face, an edge or a
+corner, a diagonal finer block's included. Its value must come back as
+the average of the coincident fine values: a cell-like dimension
 contributes the two fine points half a fine spacing to either side, a
-vertex-like one the single coincident point — from the exact rational
-geometry of [`exact_point`](@ref), never from the package's stencils or
-target ranges.
+vertex-like one the single coincident point. Which points those are is
+decided by position and nothing else, from the exact rational geometry
+of [`exact_point`](@ref) and [`leafbox`](@ref), never from the package's
+stencils or target ranges. Same-level secondaries, which `unify!` also
+writes, are not listed: on data from [`arbitrary_value`](@ref) they keep
+their value.
 
 `values` is [`closed_values`](@ref) of the *pristine* field set, taken
 before the restriction runs.
@@ -441,54 +444,51 @@ function interface_targets(fs::FieldSet{T,D}, values) where {T,D}
     forest = fs.forest
     N, G, c = forest.N, fs.G, staggers(fs)
     wrap(d, x) = forest.periodic[d] ? mod(x, forest.roots[d]) : x
+    boxes = Dict(l => [leafbox(forest, k) for k in forest.leaves if level(k) == l]
+                 for l in unique(level.(forest.leaves)))
+    holds((lo, hi), p) = all(1:D) do d
+        any(x -> lo[d] <= x <= hi[d],
+            forest.periodic[d] ? (p[d], p[d] + forest.roots[d]) : (p[d],))
+    end
     out = Dict{Tuple{Int,NTuple{D,Int}},Vector{T}}()
     for b in 1:nblocks(fs)
         k = blockkey(fs, b)
         l = level(k)
+        haskey(boxes, l + 1) || continue
         half = 1 // (2 * N * (1 << (l + 1)))        # half a fine spacing, in root cells
-        for d in 1:D
-            c[d] == 1 || continue
-            for s in (-1, 1)
-                δ = ntuple(e -> e == d ? s : 0, D)
-                nbrs = neighbor_keys(forest, k, δ)
-                (isempty(nbrs) || level(first(nbrs)) <= l) && continue
-                # 2:1 balance, so the finer side is exactly one level down.
-                @assert all(nbr -> level(nbr) == l + 1, nbrs)
-                plane = s == 1 ? G[d] + N + 1 : G[d] + 1
-                rng = ntuple(e -> e == d ? (plane:plane) :
-                             ((G[e] + 1):(G[e] + N + c[e])), D)
-                shifts = Iterators.product(ntuple(e -> (e != d && c[e] == 0) ?
-                                                  (-1, 1) : (0,), D)...)
-                for idx in CartesianIndices(rng)
-                    p = exact_point(fs, b, Tuple(idx))
-                    acc = zeros(T, fs.nvars)
-                    n = 0
-                    for sh in shifts
-                        q = ntuple(e -> wrap(e, p[e] + sh[e] * half), D)
-                        acc .+= values[(l + 1, q)]
-                        n += 1
-                    end
-                    out[(b, Tuple(idx))] = acc ./ n
-                end
+        shifts = Iterators.product(ntuple(e -> c[e] == 0 ? (-1, 1) : (0,), D)...)
+        for idx in CartesianIndices(ntuple(d -> (G[d] + 1):(G[d] + N + c[d]), D))
+            I = Tuple(idx)
+            any(d -> c[d] == 1 && (I[d] == G[d] + 1 || I[d] == G[d] + N + 1), 1:D) ||
+                continue
+            p = exact_point(fs, b, I)
+            any(bx -> holds(bx, p), boxes[l + 1]) || continue
+            acc = zeros(T, fs.nvars)
+            n = 0
+            for sh in shifts
+                q = ntuple(e -> wrap(e, p[e] + sh[e] * half), D)
+                acc .+= values[(l + 1, q)]
+                n += 1
             end
+            out[(b, I)] = acc ./ n
         end
     end
     return out
 end
 
 """
-How many times each phase of an [`InterfaceSchedule`](@ref) writes each
-stored point: one count array per phase, in phase order.
+How many times the one stage of a [`UnifySchedule`](@ref) writes each
+stored point, as a one-element vector of count arrays.
 
-A phase must write every target exactly once — the fixup overwrites a
-block's own computed values, so a double write would make the result
-depend on which of two fine sources landed last.
+The stage must write every target exactly once — it overwrites a block's
+own computed values, so a double write would make the result depend on
+which of two sources landed last.
 """
-function interface_write_counts(isched::InterfaceSchedule{T,D}) where {T,D}
+function interface_write_counts(isched::UnifySchedule{T,D}) where {T,D}
     forest = isched.forest
     c = staggers(isched.centering)
     stored = ntuple(d -> forest.N + 2 * isched.G[d] + c[d], D)
-    return map(isched.phases) do groups
+    return map([isched.unify]) do groups
         counts = zeros(Int, stored..., nleaves(forest))
         for group in groups
             blen = boxsize(group)
@@ -505,13 +505,13 @@ function interface_write_counts(isched::InterfaceSchedule{T,D}) where {T,D}
 end
 
 """
-Every `(block, stored index)` an [`InterfaceSchedule`](@ref) writes and
-every one it reads, as two sets over all phases.
+Every `(block, stored index)` a [`UnifySchedule`](@ref) writes and every
+one it reads, as two sets.
 """
-function interface_touches(isched::InterfaceSchedule{T,D}) where {T,D}
+function interface_touches(isched::UnifySchedule{T,D}) where {T,D}
     targets = Set{Tuple{Int,NTuple{D,Int}}}()
     sources = Set{Tuple{Int,NTuple{D,Int}}}()
-    for groups in isched.phases, group in groups
+    for group in isched.unify
         blen = boxsize(group)
         tfirst = ntuple(d -> group.stencils[d].targetfirst, D)
         srcstart = ntuple(d -> group.stencils[d].srcstart, D)
@@ -683,58 +683,6 @@ function undefined_ghosts(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
     return nnan, worst
 end
 
-"""
-The owned low wall planes of `fs` that a fill writes under symmetric
-walls (AMR-8), by the oracle's own geometry: every vertex-like dimension
-of every block whose box starts at the domain's non-periodic low face.
-Returns `(b, d)` pairs.
-"""
-function low_wall_planes(fs::FieldSet{T,D}) where {T,D}
-    forest = fs.forest
-    out = Tuple{Int,Int}[]
-    for b in 1:nblocks(fs), d in 1:D
-        fs.centering[d] === :vertex && !forest.periodic[d] || continue
-        block_extent(forest, blockkey(fs, b))[d][1] == forest.extents[d][1] &&
-            push!(out, (b, d))
-    end
-    return out
-end
-
-"""
-[`undefined_ghosts`](@ref) for a set with `walls`: every stored value
-`NaN`, the data written into the owned points, then the owned low wall
-planes a symmetric fill is to write set back to `NaN` before the fill.
-Returns `(nnan, worst, nwalls)`: with `walls = :symmetric` nothing may
-stay `NaN` and every value must be the data, which a wall read before it
-is written would spoil; with `:half_open` the walls are not the fill's,
-and stay `NaN`.
-"""
-function undefined_walls(kinds::NTuple{D,Symbol}, C::NTuple{D,Symbol};
-                         T::Type=Float64, p::Int=4, N::Int=8, walls::Symbol=:symmetric,
-                         backend=CPU(), bounded=false) where {D}
-    forest = faces_forest(kinds; T=T, N=N)
-    f, parity = parity_data(T, kinds, p)
-    ops = Operators(prolongation=p, restriction=p, bounded=bounded)
-    fs = FieldSet{T}(forest, 2; G=ghosts_for(C, p), centering=C, parity=parity,
-                     walls=walls, backend=backend)
-    fill!(fs.work, T(NaN))
-    fill_by_coordinates!(f, fs)
-    work = Array(fs.work)
-    planes = low_wall_planes(fs)
-    for (b, d) in planes
-        sel = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : Colon(), D)
-        work[sel..., :, b] .= T(NaN)
-    end
-    copyto!(fs.work, work)
-    fill_ghosts!(fs, GhostSchedule(fs, ops); boundary=boundary_by_coordinates(f))
-    work = Array(fs.work)
-    worst = 0.0
-    for b in 1:nblocks(fs), v in 1:2, idx in CartesianIndices(size(work)[1:D])
-        x = coordinates(fs, b, Tuple(idx))
-        worst = max(worst, Float64(abs(work[idx, v, b] - f(x, v))))
-    end
-    return count(isnan, work), worst, length(planes)
-end
 
 """
 How many transfers of each kind the schedule *mirrors* across a
@@ -1739,18 +1687,14 @@ schedule)` after one fill of `NaN`-prefilled storage with the polynomial
 [`halfturn_data`](@ref).
 """
 function undefined_halfturn_ghosts(::Val{D}; plane, other, C, p, T::Type=Float64, N=8,
-                                   walls=:half_open, backend=CPU()) where {D}
+                                   backend=CPU()) where {D}
     forest = halfturn_forest(Val(D); plane=plane, other=other, T=T, N=N)
     f = halfturn_data(D, plane, other; poly=p)
-    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C, walls=walls,
+    fs = FieldSet{T}(forest, D + 1; G=ghosts_for(C, p), centering=C,
                      halfturn=vector_halfturn(D, plane),
                      parity=vector_parity(D, plane, other), backend=backend)
     fill!(fs.work, T(NaN))
     fill_by_coordinates!(f, fs)
-    # Under symmetric walls the low wall planes are owned but written by
-    # the hook: `NaN` there catches a transfer that reads one before the
-    # hook has written it.
-    walls === :symmetric && poison_low_walls!(fs)
     schedule = GhostSchedule(fs, Operators(prolongation=p, restriction=p))
     fill_ghosts!(fs, schedule; boundary=boundary_by_coordinates(f))
     work = Array(fs.work)
@@ -1763,25 +1707,6 @@ function undefined_halfturn_ghosts(::Val{D}; plane, other, C, p, T::Type=Float64
         end
     end
     return nnan, worst, schedule
-end
-
-"""
-Set the owned low wall planes of a set with symmetric walls to `NaN`:
-plane `G + 1` along every vertex-like dimension whose low face is a face
-of the domain, in the blocks on it.
-"""
-function poison_low_walls!(fs::FieldSet{T,D}) where {T,D}
-    c = staggers(fs.centering)
-    work = fs.work
-    for b in 1:nblocks(fs)
-        walls = TreeAMR.lowwalls(fs.forest, blockkey(fs, b), c, true)
-        for d in 1:D
-            walls[d] || continue
-            idx = ntuple(e -> e == d ? (fs.G[d] + 1:fs.G[d] + 1) : (:), D)
-            work[idx..., :, b] .= T(NaN)
-        end
-    end
-    return fs
 end
 
 """
@@ -1814,16 +1739,16 @@ hook from the same formula. Returns [`compare_matching_blocks`](@ref)'s
 `(worst, npoints)`, or `nothing`.
 """
 function halfturn_vs_doubled(::Val{D}; plane, centering::NTuple{D,Symbol},
-                             other=:periodic, N=8, p=4, walls=:half_open,
+                             other=:periodic, N=8, p=4,
                              ops=Operators(prolongation=p, restriction=p)) where {D}
     half = halfturn_forest(Val(D); plane=plane, other=other, N=N)
     full = halfturn_forest(Val(D); plane=plane, other=other, N=N, full=true)
     G = ghosts_for(centering, p)
     f = halfturn_data(D, plane, other)
     parity = vector_parity(D, plane, other)
-    fsh = FieldSet(half, D + 1; G=G, centering=centering, parity=parity, walls=walls,
+    fsh = FieldSet(half, D + 1; G=G, centering=centering, parity=parity,
                    halfturn=vector_halfturn(D, plane))
-    fsf = FieldSet(full, D + 1; G=G, centering=centering, parity=parity, walls=walls)
+    fsf = FieldSet(full, D + 1; G=G, centering=centering, parity=parity)
     for fs in (fsh, fsf)
         fill!(fs.work, NaN)
         fill_by_coordinates!(f, fs)
@@ -1909,7 +1834,9 @@ Fill every owned point of every block of `fs` with [`arbitrary_value`](@ref) of
 patches over one logical box are given different data.
 """
 function fill_patch_arbitrary!(fs::FieldSet{T,D}, place) where {T,D}
-    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N), D))
+    # The own range, closed along a vertex-like dimension (M22).
+    c = staggers(fs)
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + fs.forest.N + c[d]), D))
     for b in 1:nblocks(fs)
         p = patch(fs.forest, blockkey(fs, b))
         for v in 1:fs.nvars, idx in owned
@@ -1988,7 +1915,11 @@ edge and corner ghosts are never written and are skipped too. Returns
 """
 function patch_ghost_mismatches(fs::FieldSet{T,D}, across) where {T,D}
     forest = fs.forest
-    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N), D))
+    # The own range, closed along a vertex-like dimension (M22): a point on
+    # a block face is own to every block holding it, all copies equal after
+    # a fill.
+    c = staggers(fs)
+    owned = CartesianIndices(ntuple(d -> (fs.G[d] + 1):(fs.G[d] + forest.N + c[d]), D))
     owners = Dict{Tuple{Int,NTuple{D,Rational{Int}}},Vector{T}}()
     for b in 1:nblocks(fs), idx in owned
         p = patch(forest, blockkey(fs, b))
@@ -2006,7 +1937,8 @@ function patch_ghost_mismatches(fs::FieldSet{T,D}, across) where {T,D}
             outside = count(d -> !(idx[d] in owned.indices[d]), 1:D)
             fs.P > 0 && outside > 1 && continue
             x = exact_point(fs, b, Tuple(idx))
-            exits = [(d, x[d] < 0 ? 1 : 2) for d in 1:D if !(0 <= x[d] < roots[d])]
+            exits = [(d, x[d] < 0 ? 1 : 2) for d in 1:D
+                     if !(0 <= x[d] < roots[d] || (c[d] == 1 && x[d] == roots[d]))]
             length(exits) > 1 && continue
             where_ = isempty(exits) ? (p, x) : across(p, x, only(exits)...)
             where_ === nothing && continue

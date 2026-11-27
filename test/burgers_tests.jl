@@ -8,7 +8,7 @@
 #
 #   * **Total mass is conserved to roundoff**, with a shock crossing a
 #     refined region that follows it and regrids in between. The
-#     negative control -- the identical run with `restrict_interfaces!`
+#     negative control -- the identical run with `unify!`
 #     skipped -- is what makes the claim a measurement rather than a
 #     tautology.
 #   * **The interface-order rule carries over to the conservative
@@ -31,7 +31,7 @@
     # is a same-level face, and the two blocks sharing one compute its
     # flux from the same four cell values — their own and their ghosts,
     # which are bit-for-bit copies — with the same kernel. So mass is
-    # already conserved to roundoff there, `restrict_interfaces!` or not,
+    # already conserved to roundoff there, `unify!` or not,
     # and everything the fixup is measured on below is attributable to
     # the coarse-fine faces alone.
     #

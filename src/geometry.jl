@@ -60,23 +60,106 @@ block_spacings(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
 # The leaves whose blocks this rank stores, in local block order.
 localleaves(forest::Forest) = view(forest.leaves, blockrange(forest))
 
+# Where positions are anchored (M22 step 10b), patch by patch and
+# dimension by dimension: `m`, the number of level-0 spacings from the
+# patch's low face to coordinate zero, when zero is one of the patch's
+# level-0 nodes along that dimension, `lo + K·(hi − lo)/n` for an integer
+# `K` in `0…n`, `n` the roots times `N`; and `0` otherwise. With `m > 0`
+# a position is formed from zero, `0 + k·h`, which makes it an exact
+# multiple of the spacing and a box centred on zero exactly antisymmetric;
+# with `m = 0` from the low corner, as before (CODE.md, "Positions" under
+# "Centerings"). The test is exact, in `Rational{BigInt}` of the extents
+# in the forest's own type, and is made once per forest, on the host, and
+# kept in its `ForestState`: it depends on the extents, the roots and `N`
+# only, the same on every rank. A zero that is a cell centre and not a
+# node does not anchor.
+function position_anchors(forest::Forest{D}) where {D}
+    cached = forest.state.anchors
+    cached === nothing || return cached::Vector{NTuple{D,Int}}
+    anchors = map(1:npatches(forest)) do p
+        extents, roots = patch_extents(forest, p), patch_roots(forest, p)
+        return ntuple(D) do d
+            lo = Rational{BigInt}(extents[d][1])
+            hi = Rational{BigInt}(extents[d][2])
+            n = roots[d] * forest.N
+            m = -lo * n / (hi - lo)
+            return denominator(m) == 1 && 0 <= m <= n ? Int(m) : 0
+        end
+    end
+    forest.state.anchors = anchors
+    return anchors
+end
+
+# The anchor of patch `p` along each dimension, in `T`, and its integer
+# coordinate in level-0 spacings: zero at `m` where zero is on the grid,
+# else the low corner at `0`.
+function patch_anchor(::Type{T}, forest::Forest{D}, p::Integer) where {T,D}
+    m = position_anchors(forest)[p]
+    extents = patch_extents(forest, p)
+    return ntuple(d -> m[d] > 0 ? zero(T) : T(extents[d][1]), D), m
+end
+
+# The integer corner of block `k` along each dimension: the number of
+# spacings of its level from its patch's anchor to its low face — from
+# the low face of the patch, `g·N` for `g` its integer coordinate at its
+# level within the patch, less the anchor's `m` at that level, so that it
+# is negative below a zero anchor. An `Int`, since `MAX_LEVEL` levels
+# below a few roots overflow 32 bits. Positions are formed from it by
+# `nodeposition` (CODE.md, "Positions" under "Centerings").
+function block_base(forest::Forest{D}, k::MortonKey{D}) where {D}
+    rootpos = root_position(forest, k.root)
+    lvl = level(k)
+    m = position_anchors(forest)[patch(forest, k)]
+    return ntuple(d -> ((rootpos[d] << lvl) + Int(k.coords[d])) * forest.N - (m[d] << lvl),
+                  D)
+end
+
+# The anchor of block `k`'s patch, in `T` (`patch_anchor`): zero where
+# zero is on the patch's grid, else its low corner — on a forest of one
+# brick, the forest's own extents'.
+block_low(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D} =
+    patch_anchor(T, forest, patch(forest, k))[1]
+
+# The box points of patch `p` are located in, in `T`: from the smaller of
+# the low corner it was given and its low face as positions form it to
+# the larger of the high corner and its high face, the faces formed from
+# the patch's anchor (`patch_anchor`), `a + (K − m)·h` for `K` its
+# spacings across at level 0 (the same bits at every level). The two differ by rounding: one cell
+# size serves every dimension and every patch, and the extents need only
+# agree with it to `check_brick`'s tolerance. The larger one, so that
+# every point `coordinates` returns is located, and every point of the
+# box the forest was given still is (CODE.md, "Positions" under
+# "Centerings").
+function location_box(::Type{T}, forest::Forest{D}, p::Integer) where {T,D}
+    extents, roots = patch_extents(forest, p), patch_roots(forest, p)
+    a, m = patch_anchor(T, forest, p)
+    h = spacing(T, forest, 0)
+    return ntuple(D) do d
+        lo, hi = T(extents[d][1]), T(extents[d][2])
+        bottom = nodeposition(a[d], h, -m[d], 1, 1, nothing)
+        top = nodeposition(a[d], h, -m[d], roots[d] * forest.N + 1, 1, nothing)
+        return (min(lo, bottom), max(hi, top))
+    end
+end
+
 """
     block_origin([T], forest, k::MortonKey)
 
 The physical position of the lower corner of block `k`'s interior (the
 outer corner of its first interior cell, not that cell's center). On a
 forest of patches (M17) it is in the logical coordinates of `k`'s patch.
+
+It is a node's position, formed by [`nodeposition`](@ref
+TreeAMR.nodeposition) as `lo + B·h` from the patch's anchor `lo` (zero
+where zero is a node of the patch's level-0 grid, else its low corner;
+[`block_lows`](@ref)), the block's integer corner `B` counted from it
+and its level's spacing `h`, so that it
+is bit for bit the corner the blocks around it see and the first vertex
+`coordinates` gives.
 """
 function block_origin(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D}
-    rootpos = root_position(forest, k.root)
-    p = patch(forest, k)
-    roots, extents = patch_roots(forest, p), patch_extents(forest, p)
-    scale = 1 << level(k)
-    return ntuple(D) do d
-        lo, hi = T(extents[d][1]), T(extents[d][2])
-        rootwidth = (hi - lo) / roots[d]
-        lo + (rootpos[d] + T(k.coords[d]) / T(scale)) * rootwidth
-    end
+    lo, B, h = block_low(T, forest, k), block_base(forest, k), spacing(T, forest, k)
+    return ntuple(d -> nodeposition(lo[d], h, B[d], 1, 1, nothing), D)
 end
 block_origin(forest::Forest{D,T}, k::MortonKey{D}) where {D,T} = block_origin(T, forest, k)
 
@@ -84,16 +167,51 @@ block_origin(forest::Forest{D,T}, k::MortonKey{D}) where {D,T} = block_origin(T,
     block_origins(forest, T=floattype(forest))
 
 The lower corner of the interior of every block this rank stores,
-indexed by local block — the companion of [`block_spacings`](@ref), and
-what a kernel needs to turn its cell index into a position without
-consulting the tree. Interior cell `i` of block `b` is centred at
-`origins[b][d] + (i - 1/2) * spacings[b]`.
+indexed by local block — the companion of [`block_spacings`](@ref), for
+what in a kernel is not a point's position: a point is placed through
+[`nodeposition`](@ref TreeAMR.nodeposition) from [`block_lows`](@ref)
+and [`block_bases`](@ref) instead, which puts every copy of a point that
+several blocks hold at one position bit for bit. The corners themselves
+are formed by the same rule, so `origins[b]` is the position of block
+`b`'s first vertex.
 
-Together the two arrays are the whole geometry a device-side kernel
+Together these arrays are the whole geometry a device-side kernel
 sees: plain `isbits` arrays indexed by block, no keys and no forest.
 """
 block_origins(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
     NTuple{D,T}[block_origin(T, forest, k) for k in localleaves(forest)]
+
+"""
+    block_lows(forest, T=floattype(forest))
+
+The anchor of the patch (M17) of every block this rank stores, as an
+`NTuple{D,T}` indexed by local block, dimension by dimension: zero where
+zero is a node of the patch's level-0 grid, else the patch's low corner
+(the forest's own on a forest of one brick). The name is from when it
+was always the low corner. With [`block_bases`](@ref) and
+[`block_spacings`](@ref) it is what [`nodeposition`](@ref
+TreeAMR.nodeposition) forms a point's position from, `lo + k·h` with `k`
+an integer counted from the anchor, and why every block holding a point puts it at the same
+position bit for bit. A number per block rather than per patch, so that
+a kernel reads it as it reads the spacing.
+"""
+block_lows(forest::Forest{D,R}, ::Type{T}=R) where {D,R,T} =
+    NTuple{D,T}[block_low(T, forest, k) for k in localleaves(forest)]
+
+"""
+    block_bases(forest)
+
+The integer corner of every block this rank stores, as an
+`NTuple{D,Int}` indexed by local block: along each dimension the number
+of spacings of the block's level from its patch's low face to the
+block's low face. Owned index `I` of block `b` has the integer
+coordinate `bases[b][d] + I − 1` there, which every block holding the
+point agrees on and which [`nodeposition`](@ref TreeAMR.nodeposition)
+turns into its position. `Int` on every backend, since a deep forest's
+coordinates overflow 32 bits.
+"""
+block_bases(forest::Forest{D}) where {D} =
+    NTuple{D,Int}[block_base(forest, k) for k in localleaves(forest)]
 
 """
     block_patches(forest)
@@ -111,11 +229,17 @@ block_patches(forest::Forest) = Int32[patch(forest, k) for k in localleaves(fore
     block_extent([T], forest, k::MortonKey)
 
 The `(lo, hi)` physical extent of block `k`'s interior, per dimension.
-The leaves' extents tile the domain exactly.
+Both ends are node positions ([`nodeposition`](@ref
+TreeAMR.nodeposition)), so the leaves' extents tile the domain bit for
+bit: a block's `hi` is its neighbour's `lo`, at one level or across two.
+The domain's faces are then at `lo + K·h` from the anchor, `K` an
+integer, which are the extents the forest was given up to rounding
+(CODE.md, "Positions" under "Centerings").
 """
 function block_extent(::Type{T}, forest::Forest{D}, k::MortonKey{D}) where {T,D}
-    origin = block_origin(T, forest, k)
-    width = spacing(T, forest, k) * forest.N
-    return ntuple(d -> (origin[d], origin[d] + width), D)
+    lo, B, h = block_low(T, forest, k), block_base(forest, k), spacing(T, forest, k)
+    N = forest.N
+    return ntuple(d -> (nodeposition(lo[d], h, B[d], 1, 1, nothing),
+                        nodeposition(lo[d], h, B[d], N + 1, 1, nothing)), D)
 end
 block_extent(forest::Forest{D,T}, k::MortonKey{D}) where {D,T} = block_extent(T, forest, k)

@@ -389,7 +389,7 @@ end
     sflux = FieldSet(reference, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
     fdata = exchange_data(MersenneTwister(22), Float64, size(sflux.work))
     copyto!(sflux.work, fdata)
-    restrict_interfaces!(sflux, InterfaceSchedule(sflux))
+    unify!(sflux, UnifySchedule(sflux))
     sflags = Any[f === Refine ? (Refine, ntuple(_ -> 1:2, D)) : f
                  for f in regrid_test_flags(reference)]
     @test regrid!(reference, sfs => ssched; flags=sflags, buffer=2, boundary=hook)
@@ -418,8 +418,8 @@ end
                                               for m in st.remote.mirrors[nvars]]))
         flux = FieldSet(forest, nvars; G=0, centering=C, parity=EXCHANGE_PARITY)
         copyto!(flux.work, fdata[:, :, :, owned])
-        isched = InterfaceSchedule(flux)
-        restrict_interfaces!(flux, isched)
+        isched = UnifySchedule(flux)
+        unify!(flux, isched)
         imirrors = [m for st in isched.stages if st.remote !== nothing
                     for m in st.remote.mirrors[nvars]]
         empty!(comm.handed)

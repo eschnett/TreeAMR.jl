@@ -9,13 +9,15 @@ staterange
 statevector
 stateview
 statearray
-isowned
 scatter!
 gather!
 map_blocks!
 block_mapreduce
 mesh_mapreduce
 volume_weighted_norm
+PrimaryMask
+primary_mask
+isprimary
 ```
 
 A fold over points yields many results from one sweep: its callback sees

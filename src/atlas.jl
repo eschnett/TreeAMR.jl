@@ -148,7 +148,7 @@ end
 @inline mapped_region(::Nothing, ::Nothing, p) = nothing
 
 @inline function stencil_hits(m::MappedRegion, place, ::Val{n}) where {n}
-    D = length(place.origin)
+    D = length(place.lo)
     for J in CartesianIndices(ntuple(_ -> n, Val(D)))
         ξ = ntuple(d -> stencil_position(place, d, J[d] - 1), Val(D))
         inside(m.region, chart_map(m.atlas, ξ, m.p)) && return true

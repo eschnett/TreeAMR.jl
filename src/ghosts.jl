@@ -360,8 +360,14 @@ end
     end
 end
 
+# A transfer's value times its factor (a parity sign, a turn's sign, or
+# stage P's `(1 + σ)/2`), with `+ 0` after it: a factor of `-1` or `0`
+# applied to `+0`, or to a value of the other sign, would give `-0`, whose
+# sign depends on the data's history, and a fill applied twice would then
+# differ from once in the sign of a zero. `x + 0` is `+0` for `x = ±0` and
+# `x` otherwise, NaN included, and IEEE forbids folding it away.
 @inline scaled(acc, ::Nothing, v, col) = acc
-@inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col]
+@inline scaled(acc, factors, v, col) = @inbounds acc * factors[v, col] + zero(acc)
 
 @kernel function transfer_kernel!(shape, dest, src,
                                   @Const(targetblocks), @Const(sourceblocks),
@@ -589,6 +595,176 @@ end
 run_phase!(fs::FieldSet{T,D}, groups, backend) where {T,D} =
     run_phase!(fs.work, fs.work, groups, fs.nvars, backend; factors=fs.factors,
                rotvars=fs.rotvars)
+
+# --- Means over a point's members: the axis and stage A (M22) ----------------
+#
+# Two places of the fill write a variable from several values of one
+# point: a rotating seam's axis (stage P), its own image under the turn,
+# whose variables become the mean of their images under the orbit's powers
+# of the set's map (`AxisPoints`), and stage A, where the copies of a point
+# on a kinked glue, the within-patch primaries of the patches holding it,
+# become their mean (`GlueMeans`). Every other transfer writes a variable
+# from one source variable, so one kernel serves them all; these write a
+# variable from several, which an in-place transfer would race on between
+# the variables of a point and between the members, so one kernel gathers
+# every target's mean into a buffer first and a second writes it back: the
+# one exception to "one kernel for every transfer". Both sit behind a
+# barrier, so that a forest without an axis or a kinked glue compiles none
+# of it.
+#
+# A target `i` has `mcount[i]` members, column `i` of the member tables: a
+# member is the stored point `mpoint[m, i]` of local block `mblock[m, i]`,
+# read through the set's tables in orientation `mr[m, i]` (`rotvars[v, r +
+# 1]` and the sign at column `1 + 3^D·r`, as a turned transfer reads; in
+# orientation 0 as stored, the tables then unread), or,
+# where `mblock` is 0, the value another rank sent, at column `mslot[m, i]`
+# of `recv`. Two rules of summation, one per use:
+#
+# - `paired`, the axis's: the members in pairs a half turn apart, `(t₀ +
+#   t₂) + (t₁ + t₃)`, so that a component the half turn negates cancels
+#   exactly within its pair, and the images of one variable sum the same
+#   pairs in swapped order, which addition does not see: exact under the
+#   map and idempotent bit for bit.
+# - otherwise stage A's: `x₁ + Σ_{m≥2} (x_m − x₁) / M`, in member order, the
+#   same on every rank, which gives `x₁` exactly when the members are equal,
+#   whatever their count, so that a second fill changes no bit; a mean of
+#   one member is the member itself, which is how a value is packed for
+#   another rank (`-0` kept).
+@kernel function mean_gather_kernel!(buf, @Const(src), @Const(recv), @Const(mblock),
+                                     @Const(mpoint), @Const(mslot), @Const(mr),
+                                     @Const(mcount), @Const(factors), @Const(rotvars),
+                                     ncol::Int, paired::Bool)
+    i, v = @index(Global, NTuple)
+    @inbounds begin
+        M = Int(mcount[i])
+        # A member read in its own orientation (`mr` 0) is the stored
+        # value, whose sign column is one, as is every member of stage A.
+        term(m) = mblock[m, i] == 0 ? recv[v, Int(mslot[m, i])] :
+                  mr[m, i] == 0 ? src[mpoint[m, i]..., v, Int(mblock[m, i])] :
+                  factors[v, 1 + ncol * Int(mr[m, i])] *
+                  src[mpoint[m, i]..., Int(rotvars[v, Int(mr[m, i]) + 1]),
+                      Int(mblock[m, i])]
+        if paired
+            acc = term(1) + term(2)
+            M == 4 && (acc += term(3) + term(4))
+            buf[v, i] = acc / M
+        else
+            x1 = term(1)
+            if M == 1
+                buf[v, i] = x1
+            else
+                s = zero(x1)
+                for m in 2:M
+                    s += term(m) - x1
+                end
+                buf[v, i] = x1 + s / M
+            end
+        end
+    end
+end
+
+@kernel function mean_write_kernel!(dest, @Const(buf), @Const(blocks), @Const(points))
+    i, v = @index(Global, NTuple)
+    @inbounds dest[points[i]..., v, Int(blocks[i])] = buf[v, i]
+end
+
+# The members of a set of targets, as `mean_gather_kernel!` reads them, on
+# a backend, with the targets themselves (`blocks`, `points`) and the same
+# for a state-shaped array, every point moved down by the ghost widths
+# (`statepoints`, `mstatepoint`). `buffer` holds the means, `nvars × n`,
+# made on the first use and kept, remade only when the variable count or
+# the element type changes, as stage A's buffers are kept with its plan.
+struct MeanPoints{VB,VP,MB,MP,MR}
+    blocks::VB
+    points::VP
+    statepoints::VP
+    mblock::MB
+    mpoint::MP
+    mstatepoint::MP
+    mslot::MB
+    mr::MR
+    mcount::VB
+    paired::Bool
+    buffer::Base.RefValue{Any}
+end
+Base.length(p::MeanPoints) = length(p.blocks)
+
+# The means buffer of `p` for `nvars` variables of type `T` on `backend`.
+function means_buffer!(p::MeanPoints, ::Type{T}, nvars::Integer, backend) where {T}
+    buf = p.buffer[]
+    (buf isa AbstractMatrix{T} && size(buf) == (Int(nvars), length(p))) && return buf
+    buf = allocate(backend, T, (Int(nvars), length(p)))
+    p.buffer[] = buf
+    return buf
+end
+
+# The tables of `n` targets of up to `M` members each, on the host, filled
+# by the builder; then moved to `backend`.
+function host_means(::Val{D}, n::Int, M::Int, paired::Bool) where {D}
+    z = ntuple(_ -> Int32(1), D)
+    return MeanPoints(zeros(Int32, n), fill(z, n), fill(z, n), zeros(Int32, M, n),
+                      fill(z, M, n), fill(z, M, n), zeros(Int32, M, n), zeros(Int8, M, n),
+                      zeros(Int32, n), paired, Ref{Any}(nothing))
+end
+todevice(backend, p::MeanPoints) =
+    MeanPoints(todevice(backend, p.blocks), todevice(backend, p.points),
+               todevice(backend, p.statepoints), todevice(backend, p.mblock),
+               todevice(backend, p.mpoint), todevice(backend, p.mstatepoint),
+               todevice(backend, p.mslot), todevice(backend, p.mr),
+               todevice(backend, p.mcount), p.paired, Ref{Any}(nothing))
+
+# The means of `p`'s targets in `A`, a working array or, with `state`, a
+# state-shaped one, into `buf` (`nvars × length(p)`), `recv` holding what
+# other ranks sent; and their write back.
+function gather_means!(buf, A, recv, p::MeanPoints, nvars::Integer, factors, rotvars,
+                       backend; state::Bool=false)
+    n = length(p)
+    n == 0 && return nothing
+    ncol = 3^(ndims(A) - 2)
+    mean_gather_kernel!(backend)(buf, A, recv, p.mblock, state ? p.mstatepoint : p.mpoint,
+                                 p.mslot, p.mr, p.mcount, factors, rotvars, ncol,
+                                 p.paired; ndrange=(n, Int(nvars)))
+    return nothing
+end
+function write_means!(A, buf, p::MeanPoints, nvars::Integer, backend; state::Bool=false)
+    n = length(p)
+    n == 0 && return nothing
+    mean_write_kernel!(backend)(A, buf, p.blocks, state ? p.statepoints : p.points;
+                                ndrange=(n, Int(nvars)))
+    return nothing
+end
+
+# Project the axis points of `axis` in `A`, a working array or, with
+# `state`, a state-shaped one, through the means buffer the points keep;
+# nothing is received, so the buffer stands in for `recv`, which no member
+# reads.
+function axis_project!(A::AbstractArray{T}, axis::MeanPoints, nvars::Integer, factors,
+                       rotvars, backend; state::Bool=false) where {T}
+    n = length(axis)
+    n == 0 && return nothing
+    buf = means_buffer!(axis, T, nvars, backend)
+    gather_means!(buf, A, buf, axis, nvars, factors, rotvars, backend; state=state)
+    write_means!(A, buf, axis, nvars, backend; state=state)
+    synchronize(backend)
+    return nothing
+end
+
+# Whether `fs`'s map across its forest's seam turns any variable: where it
+# does not, the axis projection is the identity and is not launched.
+function turns_variables(fs::FieldSet)
+    map = ishalfturn(fs.forest) ? fs.halfturn : fs.rotation
+    return map !== nothing && map != 1:fs.nvars
+end
+
+# Stage P's axis part on `A` (`fs`'s working array, or a state with
+# `state`), for a schedule's axis points `axis`.
+function run_axis!(A, fs::FieldSet, axis, backend; state::Bool=false)
+    axis === nothing && return nothing
+    turns_variables(fs) || return nothing
+    Base.inferencebarrier(axis_project!)(A, axis, fs.nvars, fs.factors, fs.rotvars,
+                                         backend; state=state)
+    return nothing
+end
 
 # --- Stages (M7) -----------------------------------------------------------
 #
@@ -925,9 +1101,31 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     stages = schedule.stages
     groups = schedule.stagegroups
     locals = schedule.grouplocals
-    # Phase 1: same-level copies and restrictions. Both read interiors
-    # only, so they cannot race with each other.
-    sends = run_stages!(fs, stages, groups[1], locals[1], forest, backend, nothing)
+    p1 = schedule.phase1group
+    # Stage A (M22): the copies of a point on a glue the set is
+    # interpolated at, the patches' within-patch primaries, become their
+    # mean, before anything else reads or writes them.
+    run_stage_a!(fs.work, fs, schedule.means, backend, forest.comm)
+    # Stage W (M22): a hook that prescribes the wall writes the wall's
+    # primaries first, so that stage 0 carries them to every other copy.
+    boundary === nothing || wall_boundary!(fs, boundary, schedule, backend)
+    # Stage P (M22): a point on a reflecting wall plane, its own mirror
+    # image, projected onto its parity, at the primaries, after stage W so
+    # that a prescribed value there is projected too.
+    isempty(schedule.selfimage) || run_phase!(fs, schedule.selfimage, backend)
+    # And a rotating seam's axis, its own image under the turn.
+    run_axis!(fs.work, fs, schedule.axis, backend)
+    # Stage 0 (M22): every secondary copy of a shared point from its
+    # primary, which no transfer of the stage writes; before anything
+    # reads a copy.
+    sends = nothing
+    for k in 1:(p1 - 1)
+        sends = run_stages!(fs, stages, groups[k], locals[k], forest, backend, sends)
+    end
+    # Phase 1: same-level copies and restrictions. Both read own points
+    # only, which stage 0 has made final, so they cannot race with each
+    # other.
+    sends = run_stages!(fs, stages, groups[p1], locals[p1], forest, backend, sends)
 
     # Physical boundaries, before prolongation rather than after
     # everything: a block against the domain edge has prolongation
@@ -950,7 +1148,7 @@ function exchange_ghosts!(fs::FieldSet, schedule::GhostSchedule, boundary, backe
     # one group of stages (`stagegroups`). The relative hook's regions
     # that read prolongated ghosts run after the group whose stage fills
     # them (`boundary_after_stage!`), in level order.
-    for k in 2:length(groups)
+    for k in (p1 + 1):length(groups)
         sends = run_stages!(fs, stages, groups[k], locals[k], forest, backend, sends)
         boundary === nothing && continue
         for i in groups[k]
@@ -974,11 +1172,12 @@ boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
 # a second, narrower form: a pure per-cell function, which the package
 # itself launches as a kernel. The offset arithmetic below is the same
 # as `transfer_kernel!`'s, and the position is formed exactly as
-# `coordinates` forms it, from the same origin and spacing, so the two
-# agree bit for bit.
+# `coordinates` forms it, through `nodeposition` from the same corner and
+# spacing, so the two agree bit for bit.
 @kernel function boundary_kernel!(work, g, @Const(blocks), @Const(directions),
-                                  @Const(firsts), @Const(origins), @Const(spacings),
-                                  nodes, ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+                                  @Const(firsts), @Const(lows), @Const(bases),
+                                  @Const(spacings), nodes, ::Val{D}, ::Val{G},
+                                  ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     v = I[D + 1]
     t = I[D + 2]
@@ -988,12 +1187,12 @@ boundary_after_stage!(fs, boundary, schedule, backend, tag) = nothing
 
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
-    @inbounds origin, h = origins[b], spacings[b]
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
     # The same expression `coordinates` forms, in the same order, from
-    # the same origin and spacing, so the two agree bit for bit — half a
+    # the same corner and spacing, so the two agree bit for bit — half a
     # cell in a cell-centered dimension, a whole one in a vertex-like
     # dimension, the face for an element set's ghost.
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     # `g` is the user's, and is deliberately *outside* the `@inbounds`
     # above: whatever it indexes is checked as it would be anywhere else.
     val = g(x, v, ntuple(d -> Int(δ[d]), Val(D)))
@@ -1005,7 +1204,7 @@ end
 # comes back. The index and position arithmetic is the same as above, so
 # the two forms write bit-for-bit the same numbers.
 @kernel function boundary_all_kernel!(work, g, @Const(blocks), @Const(directions),
-                                      @Const(firsts), @Const(origins),
+                                      @Const(firsts), @Const(lows), @Const(bases),
                                       @Const(spacings), nodes,
                                       ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
@@ -1017,8 +1216,8 @@ end
 
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
 
-    @inbounds origin, h = origins[b], spacings[b]
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     vals = g(x, ntuple(d -> Int(δ[d]), Val(D)))
     # Unrolled through `Val`, as in `coordinates_all_kernel!`.
     ntuple(Val(NV)) do v
@@ -1039,8 +1238,9 @@ end
     ntuple(d -> clamps[d] == 0 ? idx[d] : Int(clamps[d]), Val(D))
 
 @kernel function relative_kernel!(work, f, @Const(blocks), @Const(firsts),
-                                  @Const(clamps), @Const(origins), @Const(spacings),
-                                  nodes, ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
+                                  @Const(clamps), @Const(lows), @Const(bases),
+                                  @Const(spacings), nodes, ::Val{D}, ::Val{G},
+                                  ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     t = I[D + 1]
     @inbounds b = blocks[t]
@@ -1048,16 +1248,16 @@ end
     @inbounds cl = clamps[t]
     idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
     r = relative_point(idx, cl, Val(D))
-    @inbounds origin, h = origins[b], spacings[b]
-    xg = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
-    xr = ntuple(d -> nodeposition(origin[d], h, r[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
+    xg = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
+    xr = ntuple(d -> nodeposition(lo[d], h, B[d], r[d] - G[d], C[d], nodes), Val(D))
     @inbounds ur = work[r..., 1, b]
     @inbounds work[idx..., 1, b] = f(xg) + (ur - f(xr))
 end
 
 @kernel function relative_all_kernel!(work, f, @Const(blocks), @Const(firsts),
-                                      @Const(clamps), @Const(origins), @Const(spacings),
-                                      nodes, ::Val{D}, ::Val{G}, ::Val{C},
+                                      @Const(clamps), @Const(lows), @Const(bases),
+                                      @Const(spacings), nodes, ::Val{D}, ::Val{G}, ::Val{C},
                                       ::Val{NV}) where {D,G,C,NV}
     I = @index(Global, NTuple)
     t = I[D + 1]
@@ -1066,9 +1266,9 @@ end
     @inbounds cl = clamps[t]
     idx = ntuple(d -> Int(first_[d]) + I[d] - 1, Val(D))
     r = relative_point(idx, cl, Val(D))
-    @inbounds origin, h = origins[b], spacings[b]
-    xg = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
-    xr = ntuple(d -> nodeposition(origin[d], h, r[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h = lows[b], bases[b], spacings[b]
+    xg = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
+    xr = ntuple(d -> nodeposition(lo[d], h, B[d], r[d] - G[d], C[d], nodes), Val(D))
     fg = f(xg)
     fr = f(xr)
     ntuple(Val(NV)) do v
@@ -1078,12 +1278,12 @@ end
 end
 
 # The forms with the patch (M17), `WithPatch`: the two kernels above,
-# handed the region's block's patch from the plan beside its origin and
+# handed the region's block's patch from the plan beside its corner and
 # spacing, and passing it to the callback after the position.
 @kernel function boundary_patch_kernel!(work, g, @Const(blocks), @Const(directions),
-                                        @Const(firsts), @Const(origins), @Const(spacings),
-                                        @Const(patches), nodes, ::Val{D}, ::Val{G},
-                                        ::Val{C}) where {D,G,C}
+                                        @Const(firsts), @Const(lows), @Const(bases),
+                                        @Const(spacings), @Const(patches), nodes,
+                                        ::Val{D}, ::Val{G}, ::Val{C}) where {D,G,C}
     I = @index(Global, NTuple)
     v = I[D + 1]
     t = I[D + 2]
@@ -1091,14 +1291,14 @@ end
     @inbounds δ = directions[t]
     @inbounds f = firsts[t]
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
-    @inbounds origin, h, p = origins[b], spacings[b], Int(patches[b])
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     val = g(x, p, v, ntuple(d -> Int(δ[d]), Val(D)))
     @inbounds work[idx..., v, b] = val
 end
 
 @kernel function boundary_patch_all_kernel!(work, g, @Const(blocks), @Const(directions),
-                                            @Const(firsts), @Const(origins),
+                                            @Const(firsts), @Const(lows), @Const(bases),
                                             @Const(spacings), @Const(patches), nodes,
                                             ::Val{D}, ::Val{G}, ::Val{C},
                                             ::Val{NV}) where {D,G,C,NV}
@@ -1108,8 +1308,8 @@ end
     @inbounds δ = directions[t]
     @inbounds f = firsts[t]
     idx = ntuple(d -> Int(f[d]) + I[d] - 1, Val(D))
-    @inbounds origin, h, p = origins[b], spacings[b], Int(patches[b])
-    x = ntuple(d -> nodeposition(origin[d], h, idx[d] - G[d], C[d], nodes), Val(D))
+    @inbounds lo, B, h, p = lows[b], bases[b], spacings[b], Int(patches[b])
+    x = ntuple(d -> nodeposition(lo[d], h, B[d], idx[d] - G[d], C[d], nodes), Val(D))
     vals = g(x, p, ntuple(d -> Int(δ[d]), Val(D)))
     ntuple(Val(NV)) do v
         @inbounds work[idx..., v, b] = vals[v]
@@ -1172,6 +1372,23 @@ it.
     fill_ghosts!(fs, schedule;                         # nvars == 2
                  boundary = CellBoundary(AllVariables((x, δ) -> (x[1], -x[1]))))
 
+At an outer face of a vertex-like dimension the wall plane is an own
+point of every block that holds it (M22, "Closed blocks" in `CODE.md`):
+in the state, and by default **evolved** by the application, while the
+hook fills the `G` ghosts beyond it, alike on both sides of the domain.
+That is the default, `wall = :evolved`, because the wall is in the state
+and so the application's to evolve, as a radiative condition wants; a
+cell-centered set has no wall plane and is not affected.
+`CellBoundary(g; wall = :prescribed)` declares that the hook prescribes
+the wall plane as well, a Dirichlet condition: every fill then writes
+the wall's primaries from the hook first, in any of the forms above, the
+relative one from the point one plane in, and gives every other copy
+their value, so that the copies of a prescribed point are one number.
+The entries of `du` at a prescribed wall are the application's to write,
+zero or the hook's time derivative. Any other `wall` is refused.
+
+    fill_ghosts!(fs, schedule; boundary = CellBoundary(g; wall = :prescribed))
+
 !!! note "Callbacks on a device"
     The callback becomes a kernel argument, so everything it closes over
     must be `isbits`. A captured `Type` is the usual trip: write
@@ -1180,9 +1397,23 @@ it.
     the one the callback is already given) and any mutable state, which
     the purity requirement rules out anyway.
 """
-struct CellBoundary{F}
+struct CellBoundary{F,W}
     g::F
+    CellBoundary{F,W}(g) where {F,W} = new{F,W}(g)
 end
+
+function CellBoundary(g; wall::Symbol=:evolved)
+    wall === :evolved || wall === :prescribed || throw(ArgumentError(
+        "wall must be :evolved (the wall plane of a vertex-like dimension is an own point " *
+        "of the state, evolved by the application, and the hook fills the ghosts beyond " *
+        "it) or :prescribed (the hook gives the wall plane its value too, a Dirichlet " *
+        "condition), got :$wall"))
+    return CellBoundary{typeof(g),wall === :prescribed}(g)
+end
+
+# Whether a hook prescribes the wall planes (M22): stage W runs for one.
+prescribes_wall(::CellBoundary{F,W}) where {F,W} = W
+prescribes_wall(hook) = false
 
 """
     Relative(f)
@@ -1206,10 +1437,9 @@ order, so that data equal to `f` come back as `f(x_g)` bit for bit.
 
 `x_r` is the ghost's point clamped, along each component of its region's
 direction that leaves the domain through an outer face, onto the block's
-last evolved point there: `G + N` on the high side — the shared high
-plane of a vertex-like dimension counts as a ghost — and `G + 1` on the
-low side, or `G + 2` for a set with symmetric walls, whose low wall
-plane the fill writes. Along every other component the point keeps the
+wall: `G + N + 1` on the high side of a vertex-like dimension, `G + N`
+of a cell-like one, and `G + 1` on the low side — the wall plane of a
+vertex-like dimension is the block's own on both sides (M22). Along every other component the point keeps the
 ghost's own index: in a corner region beyond an outer face along one
 dimension and across another block's face along another, `x_r` is the
 block's own ghost there, filled from the neighbour — never the block's
@@ -1248,16 +1478,17 @@ apply_boundary!(fs::FieldSet{T,D}, hook::CellBoundary, schedule::GhostSchedule{T
                 backend::CPU) where {T,D} = cell_boundary!(fs, hook, schedule, backend)
 
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary,
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
         with_nodes(plan.nodes) do nodes
             boundary_kernel!(backend)(fs.work, hook.g, batch.blocks, batch.directions,
-                                      batch.firsts, plan.origins, plan.spacings, nodes,
-                                      Val(D), Val(fs.G), Val(staggers(fs));
+                                      batch.firsts, plan.lows, plan.bases, plan.spacings,
+                                      nodes, Val(D), Val(fs.G), Val(staggers(fs));
                                       ndrange=(blen..., fs.nvars, n))
         end
     end
@@ -1271,36 +1502,40 @@ end
 # `boundary_after_stage!`.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative},
                         schedule::GhostSchedule{T,D}, backend;
-                        slot::Int=PHASE1_TAG) where {T,D}
+                        slot::Int=PHASE1_TAG,
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     f = hook.g.f
     fs.nvars == 1 || throw(ArgumentError(
         "CellBoundary(Relative(f)) sets one variable from `f(x)`, but the field set " *
         "has nvars = $(fs.nvars); for several, wrap the function in AllVariables, " *
         "`CellBoundary(Relative(AllVariables(x -> (u1, u2, ...))))`"))
-    return relative_launch!(relative_kernel!(backend), fs, f, schedule, backend, slot)
+    return relative_launch!(relative_kernel!(backend), fs, f, schedule, backend, slot,
+                            batches)
 end
 
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative{<:AllVariables}},
                         schedule::GhostSchedule{T,D}, backend;
-                        slot::Int=PHASE1_TAG) where {T,D}
+                        slot::Int=PHASE1_TAG,
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     f = hook.g.f.f
     check_allvariables(f(allvariables_sample(fs)), fs, "boundary hook")
     return relative_launch!(relative_all_kernel!(backend), fs, f, schedule, backend, slot,
-                            Val(fs.nvars))
+                            batches, Val(fs.nvars))
 end
 
-function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot,
+function relative_launch!(kernel!, fs::FieldSet{T,D}, f, schedule, backend, slot, batches,
                           nv...) where {T,D}
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         batch.slot == slot || continue
         n = nregions(batch)
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
-            kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.origins,
-                    plan.spacings, nodes, Val(D), Val(fs.G), Val(staggers(fs)), nv...;
+            kernel!(fs.work, f, batch.blocks, batch.firsts, batch.clamps, plan.lows,
+                    plan.bases, plan.spacings, nodes, Val(D), Val(fs.G),
+                    Val(staggers(fs)), nv...;
                     ndrange=(batch.boxlen..., n))
         end
     end
@@ -1318,21 +1553,22 @@ boundary_after_stage!(fs::FieldSet, hook::CellBoundary{<:Relative}, schedule, ba
 # at, and no boundary to fill; the hook is not collective, so returning
 # alone is safe.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:AllVariables},
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     g = hook.g.f
     δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
     check_allvariables(g(allvariables_sample(fs), δ), fs, "boundary hook")
 
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         blen = batch.boxlen
         with_nodes(plan.nodes) do nodes
             boundary_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
-                                          batch.firsts, plan.origins, plan.spacings,
-                                          nodes, Val(D), Val(fs.G),
+                                          batch.firsts, plan.lows, plan.bases,
+                                          plan.spacings, nodes, Val(D), Val(fs.G),
                                           Val(staggers(fs)), Val(fs.nvars);
                                           ndrange=(blen..., n))
         end
@@ -1344,16 +1580,17 @@ end
 # The forms with the patch (M17). As above, but for the patch the plan
 # holds per block; the all-variables check hands the sample point's.
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch},
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
             boundary_patch_kernel!(backend)(fs.work, hook.g.f, batch.blocks,
-                                            batch.directions, batch.firsts, plan.origins,
-                                            plan.spacings, plan.patches, nodes, Val(D),
-                                            Val(fs.G), Val(staggers(fs));
+                                            batch.directions, batch.firsts, plan.lows,
+                                            plan.bases, plan.spacings, plan.patches, nodes,
+                                            Val(D), Val(fs.G), Val(staggers(fs));
                                             ndrange=(batch.boxlen..., fs.nvars, n))
         end
     end
@@ -1362,21 +1599,22 @@ function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch},
 end
 
 function cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:WithPatch{<:AllVariables}},
-                        schedule::GhostSchedule{T,D}, backend) where {T,D}
+                        schedule::GhostSchedule{T,D}, backend;
+                        batches=schedule.boundaryplan.batches) where {T,D}
     nblocks(fs) == 0 && return nothing
     g = hook.g.f.f
     δ = ntuple(d -> d == 1 ? -1 : 0, D)            # the sample direction
     check_allvariables(g(allvariables_sample(fs), allvariables_sample_patch(fs), δ), fs,
                        "boundary hook")
     plan = schedule.boundaryplan
-    for batch in plan.batches
+    for batch in batches
         n = nregions(batch)
         n == 0 && continue
         with_nodes(plan.nodes) do nodes
             boundary_patch_all_kernel!(backend)(fs.work, g, batch.blocks, batch.directions,
-                                                batch.firsts, plan.origins, plan.spacings,
-                                                plan.patches, nodes, Val(D), Val(fs.G),
-                                                Val(staggers(fs)), Val(fs.nvars);
+                                                batch.firsts, plan.lows, plan.bases,
+                                                plan.spacings, plan.patches, nodes, Val(D),
+                                                Val(fs.G), Val(staggers(fs)), Val(fs.nvars);
                                                 ndrange=(batch.boxlen..., n))
         end
     end
@@ -1388,13 +1626,30 @@ end
 # with the patch: say so here, on the host, rather than call the wrapper
 # inside a kernel.
 cell_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{<:Relative{<:WithPatch}},
-               schedule::GhostSchedule{T,D}, backend; slot::Int=PHASE1_TAG) where {T,D} =
+               schedule::GhostSchedule{T,D}, backend; slot::Int=PHASE1_TAG,
+               batches=nothing) where {T,D} =
     throw(ArgumentError(
         "CellBoundary(Relative(WithPatch(f))) is not a form the package has: the " *
         "relative hook calls `f` at the ghost and at the nearest evolved point, by " *
         "position alone, and is not handed the patch. WithPatch takes the hooks that " *
         "set a ghost outright, CellBoundary(WithPatch((x, p, v, δ) -> …)) and " *
         "boundary_by_coordinates(WithPatch((x, p, v) -> …))"))
+
+# Stage W (M22): a hook that prescribes the wall planes writes the wall's
+# primaries, `wall_regions!`'s, before stage 0. Any other hook does
+# nothing here, and a cell-centered set has no such region.
+wall_boundary!(fs, hook, schedule, backend) = nothing
+function wall_boundary!(fs::FieldSet{T,D}, hook::CellBoundary{F,true},
+                        schedule::GhostSchedule{T,D}, backend) where {T,D,F}
+    walls = schedule.boundaryplan.walls
+    isempty(walls) && return nothing
+    if hook isa CellBoundary{<:Relative}
+        cell_boundary!(fs, hook, schedule, backend; slot=UNIFY_TAG, batches=walls)
+    else
+        cell_boundary!(fs, hook, schedule, backend; batches=walls)
+    end
+    return nothing
+end
 
 # The region form. It may do anything to the region it is handed, which
 # is exactly why it cannot be run on a device on the caller's behalf: a
@@ -1488,13 +1743,14 @@ reaches an outer face of the patch across, so a fill without the hook
 leaves the ghosts across the glue near that face reading whatever the
 plane held; fill such a set with its hook.
 
-In a vertex-like dimension the outward region on the domain's **high**
-side starts at the shared boundary plane `G+N+1`, one plane further in
-than a ghost slab: those points belong to nobody, since ownership is
-half-open, so the hook fills them and the application never evolves them.
-The low boundary points are owned and evolved as usual. This asymmetry is
-the price of a uniform `N^D` state layout for every centering; see
-"Centerings" in `CODE.md`.
+A set with a vertex-like dimension owns its closed range (M22, "Closed
+blocks" in `CODE.md`): a point on a block face is held by every block
+whose closed box contains it, and the fill first gives every copy its
+primary's value, the copy on the block lying lowest along the dimensions
+the point is shared in (stage 0), before anything reads one. At an outer face the wall plane is the
+block's own on both sides, evolved, and the hook fills the `G` ghosts
+beyond it, so a set without ghosts along a vertex-like dimension (a
+flux, `G = 0`) has no hook region there at all: its wall is its own.
 
 !!! note "Where the boundary hook runs"
     The hook runs after the copies and restrictions but **before** the
@@ -1533,17 +1789,259 @@ function fill_ghosts!(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D};
     # dimension of the plane — every block on a seam face then has a
     # region beyond it — which is a property of the layout, the same on
     # every rank.
-    if hasrotating(fs.forest) && !symmetric_layout(fs) && seam_ghosts(fs)
-        throw(ArgumentError(
-            "this field set's layout is not symmetric in the rotating seam's " *
-            "dimensions $(rotating_dims(fs.forest)) (G = $(fs.G), centering " *
-            "$(fs.centering)), so its ghosts across the seam are a quarter turn of " *
-            "another set's data, which a fill of this set alone does not have. Fill " *
-            "it as a RotationPair with the set of the exchanged layout: " *
-            "`fill_ghosts!(RotationPair(a, b), (schedule_a, schedule_b))`."))
-    end
+    check_unpartnered(fs, "fill_ghosts!")
     return exchange_ghosts!(fs, schedule, boundary, backend)
 end
+
+"""
+    unify!(fs::FieldSet, schedule)
+    unify!(v::AbstractVector, fs::FieldSet, schedule)
+    unify!(sets::Tuple, schedules::Tuple)
+    unify!(v::AbstractVector, sets::Tuple, schedules::Tuple)
+
+Give every secondary copy of a shared point its primary's value: stage 0
+of the fill alone (M22, "Closed blocks" in `CODE.md`). A set with a
+vertex-like dimension owns both face planes of its blocks, so a point on
+a block face has a copy on every block that holds it, and one of them,
+the copy on the finest level holding it, there on the block lying lowest
+along the dimensions the point is shared in, is the primary
+([`isprimary`](@ref)). A copy on a coarser block takes the fine value by
+the set's restriction: injection along a vertex-like dimension, the
+restriction stencil along a cell-like one.
+
+`schedule` is a [`GhostSchedule`](@ref), whose stage 0 restricts with its
+operators' restriction, or a [`UnifySchedule`](@ref), which holds stage 0
+alone with the restriction the geometry fixes (the exact two-cell
+average) and is what a flux set takes: `unify!(flux, s)` is the
+interface restriction of a conservative scheme ("Conservation at
+coarse-fine faces" in `CODE.md`).
+
+The first form unifies the field set's working array: what a set without
+ghosts, a flux computed on every block's own range, needs before its
+copies are read. The second unifies a state-shaped vector — `u`, or `du`
+at the end of a right-hand side — through the same transfers moved past
+the ghosts, which a state does not have, with one message round over a
+distributed forest: after it every secondary of `du` is its primary's,
+so a state that starts unified stays so, exactly where the copies are
+copies. It is optional, since [`fill_ghosts!`](@ref) unifies the working
+array on every call and a right-hand side reads nothing else, but not for
+a right-hand side that computes the primaries only, whose secondaries of
+`du` are otherwise undefined. The tuple forms run each set with its own
+schedule, a state's segments as [`stateview`](@ref) lays them out.
+
+On a set without a vertex-like dimension every point is a primary and
+nothing is done. The call is collective over a distributed forest, as a
+fill is.
+"""
+function unify!(fs::FieldSet, schedule::GhostSchedule)
+    backend = check_fill(fs, schedule)
+    check_unpartnered(fs, "unify!")
+    unify_arrays!(fs.work, fs.work, fs, fs.factors, fs.rotvars, schedule, backend)
+    return fs
+end
+
+function unify!(fs::FieldSet, schedule::UnifySchedule)
+    backend = check_unify(fs, schedule)
+    check_unpartnered(fs, "unify!")
+    unify_arrays!(fs.work, fs.work, fs, fs.factors, fs.rotvars, schedule, backend)
+    return fs
+end
+
+function unify!(v::AbstractVector, fs::FieldSet,
+                schedule::Union{GhostSchedule,UnifySchedule})
+    backend = schedule isa GhostSchedule ? check_fill(fs, schedule) :
+              check_unify(fs, schedule)
+    check_unpartnered(fs, "unify!")
+    A = statearray(v, fs)
+    unify_arrays!(A, A, fs, fs.factors, fs.rotvars, schedule, backend; state=true)
+    return v
+end
+
+# Stages P and 0 of `schedule` on `A`, `fs`'s working array or, with
+# `state`, a state-shaped one, through the tables `factors` and `rotvars`,
+# a turned transfer of odd orientation reading `alt`: the set's own array,
+# or a `RotationPair`'s partner's (M12).
+function unify_arrays!(A, alt, fs::FieldSet, factors, rotvars, schedule, backend;
+                       state::Bool=false)
+    unify_stage_p!(A, fs, factors, rotvars, schedule, backend; state=state)
+    unify_stage_0!(A, alt, fs, factors, rotvars, schedule, backend; state=state)
+    return nothing
+end
+
+# Stages A and P alone: a kinked glue's means and the wall planes' and the
+# axis's projections, on the primaries.
+function unify_stage_p!(A, fs::FieldSet, factors, rotvars, schedule, backend;
+                        state::Bool=false)
+    run_stage_a!(A, fs, schedule.means, backend, schedule.forest.comm; state=state)
+    selfimage = state ? schedule.stateselfimage : schedule.selfimage
+    isempty(selfimage) ||
+        run_phase!(A, A, selfimage, fs.nvars, backend; factors=factors, rotvars=rotvars)
+    run_axis!(A, fs, schedule.axis, backend; state=state)
+    return nothing
+end
+
+# Stage 0 alone: every secondary takes its primary's value, which stage P
+# has projected, a partner's included.
+function unify_stage_0!(A, alt, fs::FieldSet, factors, rotvars, schedule, backend;
+                        state::Bool=false)
+    forest = schedule.forest
+    sends = nothing
+    if state
+        stages = schedule.stateunify
+        isempty(stages) && return nothing
+        sends = run_stages!(A, A, fs.nvars, factors, stages, 1:1, stages[1].locals, forest,
+                            backend, nothing, alt, rotvars)
+    elseif schedule isa GhostSchedule
+        for k in 1:(schedule.phase1group - 1)
+            sends = run_stages!(A, A, fs.nvars, factors, schedule.stages,
+                                schedule.stagegroups[k], schedule.grouplocals[k], forest,
+                                backend, sends, alt, rotvars)
+        end
+    else
+        sends = run_stages!(A, A, fs.nvars, factors, schedule.stages, 1:1, schedule.unify,
+                            forest, backend, nothing, alt, rotvars)
+    end
+    sends === nothing || waitall(forest.comm, sends)
+    return nothing
+end
+
+"""
+    unify!(pair::RotationPair, (schedule_a, schedule_b))
+    unify!(v::AbstractVector, pair::RotationPair, (schedule_a, schedule_b))
+
+`unify!` for the two sets of a [`RotationPair`](@ref): a member's copies of
+a point on its seam plane are its partner's turned (M22 rule 2), and the
+primary among them may be the partner's, so the two are unified
+together, as the paired fill does: stage P of both members, so that a
+primary on a reflecting wall plane is projected before any copy reads it,
+then `a`'s stage 0 and `b`'s, each reading the other through the pair's
+tables. The result does not depend on which member is `a`. The second
+form unifies a state-shaped vector of the two sets, laid out as
+[`stateview`](@ref) lays out `(a, b)`.
+"""
+function unify!(pair::RotationPair, schedules::Tuple)
+    a, b = pair.a, pair.b
+    sa, sb = check_pair_unify(pair, schedules)
+    backend = get_backend(a.work)
+    unify_stage_p!(a.work, a, pair.afactors, pair.arotvars, sa, backend)
+    unify_stage_p!(b.work, b, pair.bfactors, pair.brotvars, sb, backend)
+    unify_stage_0!(a.work, b.work, a, pair.afactors, pair.arotvars, sa, backend)
+    unify_stage_0!(b.work, a.work, b, pair.bfactors, pair.brotvars, sb, backend)
+    return pair
+end
+
+function unify!(v::AbstractVector, pair::RotationPair, schedules::Tuple)
+    a, b = pair.a, pair.b
+    sa, sb = check_pair_unify(pair, schedules)
+    check_statelength(v, (a, b))
+    backend = get_backend(a.work)
+    A = statearray(stateview(v, (a, b), 1), a)
+    B = statearray(stateview(v, (a, b), 2), b)
+    unify_stage_p!(A, a, pair.afactors, pair.arotvars, sa, backend; state=true)
+    unify_stage_p!(B, b, pair.bfactors, pair.brotvars, sb, backend; state=true)
+    unify_stage_0!(A, B, a, pair.afactors, pair.arotvars, sa, backend; state=true)
+    unify_stage_0!(B, A, b, pair.bfactors, pair.brotvars, sb, backend; state=true)
+    return v
+end
+
+function check_pair_unify(pair::RotationPair, schedules::Tuple)
+    length(schedules) == 2 || throw(ArgumentError(
+        "unify! of a RotationPair takes a tuple of two schedules, one per set; got " *
+        "$(length(schedules))"))
+    sa, sb = schedules
+    for (fs, s) in ((pair.a, sa), (pair.b, sb))
+        s isa GhostSchedule ? check_fill(fs, s) : s isa UnifySchedule ? check_unify(fs, s) :
+        throw(ArgumentError("unify! takes a GhostSchedule or a UnifySchedule per set; " *
+                            "got $(typeof(s))"))
+    end
+    return sa, sb
+end
+
+# A set whose layout is not symmetric in a rotating seam's plane has its
+# copies of the seam plane's points in its partner, turned (M22 rule 2),
+# when it has a vertex-like dimension of the plane, and its ghosts across
+# the seam there when it has ghosts along one (M12): either way it is
+# filled and unified as a `RotationPair`. Decided from the layout, the same
+# on every rank.
+function seam_partnered(fs::FieldSet)
+    hasrotating(fs.forest) && !ishalfturn(fs.forest) || return false
+    symmetric_layout(fs) && return false
+    d1, d2 = rotating_dims(fs.forest)
+    c = staggers(fs)
+    return seam_ghosts(fs) || c[d1] == 1 || c[d2] == 1
+end
+
+function check_unpartnered(fs::FieldSet, what::AbstractString)
+    seam_partnered(fs) || return nothing
+    throw(ArgumentError(
+        "this field set's layout is not symmetric in the rotating seam's dimensions " *
+        "$(rotating_dims(fs.forest)) (G = $(fs.G), centering $(fs.centering)), so its " *
+        "copies of the seam's points, or its ghosts across the seam, are a quarter " *
+        "turn of another set's data, which $what of this set alone does not have. " *
+        "$(what == "unify!" ? "Unify" : "Fill") it as a RotationPair with the set of " *
+        "the exchanged layout: " *
+        "`$what(RotationPair(a, b), (schedule_a, schedule_b))`."))
+end
+
+function unify!(sets::Tuple{Vararg{FieldSet}}, schedules::Tuple)
+    check_unify_tuple(sets, schedules)
+    foreach(unify!, sets, schedules)
+    return sets
+end
+
+function unify!(v::AbstractVector, sets::Tuple{Vararg{FieldSet}}, schedules::Tuple)
+    check_unify_tuple(sets, schedules)
+    check_statelength(v, sets)
+    for i in eachindex(sets)
+        unify!(stateview(v, sets, i), sets[i], schedules[i])
+    end
+    return v
+end
+
+# A `UnifySchedule`'s layout checks, as `check_fill`'s for a ghost
+# schedule: every target range and stencil in it is the layout's.
+function check_unify(fs::FieldSet{T,D}, schedule::UnifySchedule{T,D}) where {T,D}
+    schedule.forest === fs.forest || throw(ArgumentError(
+        "unify schedule was built for a different forest than the field set"))
+    isstale(schedule) && throw(ArgumentError(
+        "the forest changed since this unify schedule was built (generation " *
+        "$(schedule.generation) -> $(generation(schedule.forest))); rebuild it"))
+    nblocks(fs) == length(blockrange(schedule.forest)) || throw(ArgumentError(
+        "field set has $(nblocks(fs)) blocks but the schedule's forest has " *
+        "$(length(blockrange(schedule.forest))) on this rank; rebuild both"))
+    fs.G == schedule.G || throw(ArgumentError(
+        "the field set has ghost width G=$(fs.G) but this unify schedule was built " *
+        "for G=$(schedule.G); every target range in it is wrong for this layout. " *
+        "Build one with `UnifySchedule(fs)`."))
+    isempty(schedule.parities) || schedule.parities == fs.parity ||
+        throw(ArgumentError(
+            "the field set's variables have the parities $(fs.parity) but this unify " *
+            "schedule was built for $(schedule.parities); its stage P projects the " *
+            "wall planes by them. Build one with `UnifySchedule(fs)`."))
+    fs.centering == schedule.centering || throw(ArgumentError(
+        "the field set has centering $(fs.centering) but this unify schedule was " *
+        "built for $(schedule.centering); which points are shared, the target ranges " *
+        "and the one-dimensional stencils all follow from the centering. Build one " *
+        "with `UnifySchedule(fs)`."))
+    backend = get_backend(fs.work)
+    samebackend(backend, schedule.backend) || throw(ArgumentError(
+        "the field set lives on $(nameof(typeof(backend))) but this unify schedule " *
+        "was built for $(nameof(typeof(schedule.backend))); its stencils are in the " *
+        "wrong memory. Build it with `UnifySchedule(fs)` from a field set on the " *
+        "backend you mean to run on."))
+    return backend
+end
+
+# As for `fill_ghosts!`: the transfer accumulates in `eltype(dest)`.
+check_unify(fs::FieldSet{T}, schedule::UnifySchedule{S}) where {T,S} =
+    throw(ArgumentError(
+        "the field set stores $T but this unify schedule carries $S weights; build " *
+        "the schedule from the field set itself, `UnifySchedule(fs)`"))
+
+check_unify_tuple(sets, schedules) =
+    length(sets) == length(schedules) || throw(ArgumentError(
+        "unify! takes one schedule per field set, in the sets' order; got " *
+        "$(length(sets)) sets and $(length(schedules)) schedules"))
 
 # Whether a set has ghost regions across a rotating seam: ghosts along
 # either dimension of the seam's plane. A set with none there, as a
@@ -1581,10 +2079,11 @@ function check_fill(fs::FieldSet{T,D}, schedule::GhostSchedule{T,D}) where {T,D}
         "for P = $(schedule.P) ($(schedule.P == 0 ? "no elements" : "elements")); " *
         "every node position and element stencil in it is wrong for this layout. " *
         "Build one with `GhostSchedule(fs, operators)`."))
-    fs.walls === schedule.walls || throw(ArgumentError(
-        "the field set has walls = :$(fs.walls) but this schedule was built for " *
-        ":$(schedule.walls); the target ranges at a low domain face differ between " *
-        "the two. Build one with `GhostSchedule(fs, operators)`."))
+    isempty(schedule.parities) || schedule.parities == fs.parity ||
+        throw(ArgumentError(
+            "the field set's variables have the parities $(fs.parity) but this " *
+            "schedule was built for $(schedule.parities); its stage P projects the wall " *
+            "planes by them. Build one with `GhostSchedule(fs, operators)`."))
     fs.glue === schedule.glue || throw(ArgumentError(
         "the field set has glue = :$(fs.glue) but this schedule was built for " *
         ":$(schedule.glue); the ghosts across a glued face are copied under one and " *
@@ -1629,9 +2128,10 @@ function fill_ghosts!(pair::RotationPair, schedules::Tuple{GhostSchedule,GhostSc
 end
 
 # The paired fill (M12), once its checks have passed: the two schedules'
-# stages merged by (stage, member). Phase 1 of `a` and then of `b`, then
-# the two hooks, then each phase-2 target level of `a` and then of `b`,
-# a stage that only one member has running alone. A rotated
+# stages merged by (stage, member). Stages W and P of each (M22), then
+# stage 0 and phase 1 of `a` and then of `b`, then the two hooks, then
+# each phase-2 target level of `a` and then of `b`, a stage that only one
+# member has running alone. A rotated
 # prolongation of one member may read its partner's coarser ghosts,
 # which the partner's earlier stages, phase 1 or a coarser level, have
 # filled by then, as its own coarser ghosts are in a single fill. Under
@@ -1648,12 +2148,31 @@ function exchange_pair!(pair::RotationPair, sa::GhostSchedule, sb::GhostSchedule
     runb(i, sends) = run_stages!(b.work, b.work, b.nvars, pair.bfactors, sb.stages, i:i,
                                  sb.stages[i].locals, forest, backend, sends, a.work,
                                  pair.brotvars)
-    sends = runa(1, nothing)
-    sends = runb(1, sends)
+    # Stages W and P (M22) on each member's own primaries; the axis is a
+    # symmetric layout's alone, and a pair's members are not symmetric.
+    hooks[1] === nothing || wall_boundary!(a, hooks[1], sa, backend)
+    hooks[2] === nothing || wall_boundary!(b, hooks[2], sb, backend)
+    isempty(sa.selfimage) ||
+        run_phase!(a.work, a.work, sa.selfimage, a.nvars, backend; factors=pair.afactors,
+                   rotvars=pair.arotvars)
+    isempty(sb.selfimage) ||
+        run_phase!(b.work, b.work, sb.selfimage, b.nvars, backend; factors=pair.bfactors,
+                   rotvars=pair.brotvars)
+    # Then stage 0 and phase 1 of each, in that order, merged by member: a
+    # member's secondaries on its seam plane are its partner's primaries
+    # turned, which stage 0 reads where they are final; then the hooks,
+    # and the prolongations level by level.
+    sends = nothing
+    for tag in (UNIFY_TAG, PHASE1_TAG)
+        i = findfirst(st -> st.tag == tag, sa.stages)
+        i === nothing || (sends = runa(i, sends))
+        j = findfirst(st -> st.tag == tag, sb.stages)
+        j === nothing || (sends = runb(j, sends))
+    end
     hooks[1] === nothing || apply_boundary!(a, hooks[1], sa, backend)
     hooks[2] === nothing || apply_boundary!(b, hooks[2], sb, backend)
-    tags = sort!(unique!([[st.tag for st in sa.stages[2:end]];
-                          [st.tag for st in sb.stages[2:end]]]))
+    tags = sort!(unique!(filter(>(PHASE1_TAG), [[st.tag for st in sa.stages];
+                                                [st.tag for st in sb.stages]])))
     for tag in tags
         i = findfirst(st -> st.tag == tag, sa.stages)
         i === nothing || (sends = runa(i, sends))
@@ -1690,8 +2209,11 @@ handed the patch of the ghost's block (M17), as
 [`fill_by_coordinates!`](@ref) hands it, so that the same callback sets
 the initial data and the boundary values of a forest of patches.
 """
-boundary_by_coordinates(f) = CellBoundary((x, v, δ) -> f(x, v))
-boundary_by_coordinates(w::AllVariables) = CellBoundary(AllVariables((x, δ) -> w.f(x)))
-boundary_by_coordinates(w::WithPatch) = CellBoundary(WithPatch((x, p, v, δ) -> w.f(x, p, v)))
-boundary_by_coordinates(w::WithPatch{<:AllVariables}) =
-    CellBoundary(WithPatch(AllVariables((x, p, δ) -> w.f.f(x, p))))
+boundary_by_coordinates(f; wall::Symbol=:evolved) =
+    CellBoundary((x, v, δ) -> f(x, v); wall=wall)
+boundary_by_coordinates(w::AllVariables; wall::Symbol=:evolved) =
+    CellBoundary(AllVariables((x, δ) -> w.f(x)); wall=wall)
+boundary_by_coordinates(w::WithPatch; wall::Symbol=:evolved) =
+    CellBoundary(WithPatch((x, p, v, δ) -> w.f(x, p, v)); wall=wall)
+boundary_by_coordinates(w::WithPatch{<:AllVariables}; wall::Symbol=:evolved) =
+    CellBoundary(WithPatch(AllVariables((x, p, δ) -> w.f.f(x, p))); wall=wall)
