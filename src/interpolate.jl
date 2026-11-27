@@ -677,22 +677,34 @@ end
 # included — lands in the upper node, whatever the division rounded to; a
 # point on the upper face of the domain lands in the last node. `h_L` is
 # the level-0 spacing halved `L` times, exact, and `k` an integer `T`
-# holds exactly wherever positions are exact (`nodeposition`). Then the
-# last leaf not after that node in curve order, which is the covering
-# leaf: the leaves tile the domain, and an ancestor sorts immediately
-# before its descendants, which are contiguous.
-@inline function locate_leaf(leaves, g::PointGeometry{D,T}, x) where {D,T}
+# holds exactly wherever positions are exact (`nodeposition`). Returns the
+# node and, as bits, the dimensions along which `x` lies exactly on the
+# node's low face with a node below it (across a periodic wrap too).
+@inline function locate_node(g::PointGeometry{D,T}, x) where {D,T}
     hL = g.h0 / (1 << g.L)
-    cell = ntuple(Val(D)) do d
+    found = ntuple(Val(D)) do d
         a, mL, N = g.anchor[d], g.m[d] << g.L, g.N
         last = (g.roots[d] << g.L) - 1
         b = clamp(floorindex(((x[d] - a) / hL + T(mL)) / T(N)), 0, last)
         b > 0 && x[d] < position_fma(T(b * N - mL), hL, a) && (b -= 1)
         b < last && x[d] >= position_fma(T((b + 1) * N - mL), hL, a) && (b += 1)
-        (b >> g.L, b & ((1 << g.L) - 1))
+        onface = (b > 0 || g.periodic[d]) && x[d] == position_fma(T(b * N - mL), hL, a)
+        (b, onface)
     end
-    root = g.firstroot + root_index(g.roots, ntuple(d -> cell[d][1], Val(D)))
-    pc = ntuple(d -> UInt64(cell[d][2]) << (MAX_LEVEL - g.L), Val(D))
+    node = ntuple(d -> found[d][1], Val(D))
+    face = 0
+    for d in 1:D
+        found[d][2] && (face |= 1 << (d - 1))
+    end
+    return node, face
+end
+
+# The leaf covering the level-`L` node `node`: the last leaf not after it
+# in curve order — the leaves tile the domain, and an ancestor sorts
+# immediately before its descendants, which are contiguous.
+@inline function covering_leaf(leaves, g::PointGeometry{D,T}, node) where {D,T}
+    root = g.firstroot + root_index(g.roots, ntuple(d -> node[d] >> g.L, Val(D)))
+    pc = ntuple(d -> UInt64(node[d] & ((1 << g.L) - 1)) << (MAX_LEVEL - g.L), Val(D))
     # Largest `i` with `leaves[i] ≤ query`; `lo` and `hi` bracket it.
     # (Named apart from the extents above: a closure that assigned to a
     # captured `lo` would box it, and the search would infer as `Any`.)
@@ -710,6 +722,35 @@ end
     return lo
 end
 
+# The block index of the leaf a point is read from (M22 step 10c): the
+# leaf covering its level-`L` node (`locate_node`), unless the point lies
+# exactly on a face, edge or corner that a finer leaf holds too — then the
+# finest leaf holding it in its closed box, as rule 1 makes the finest
+# level's copy of a point its primary, so that a point on a coarse-fine
+# face is read from the fine side whichever side the coarse block is on,
+# and its mirror image alike. Among leaves of one level the half-open rule
+# stays (the upper one): their data agree after a fill. A property of the
+# tree, the same on every rank. Through a rotating seam or a glue nothing
+# is looked for: a point is read on its own side of those.
+@inline function locate_leaf(leaves, g::PointGeometry{D,T}, x) where {D,T}
+    node, face = locate_node(g, x)
+    best = covering_leaf(leaves, g, node)
+    face == 0 && return best
+    level_ = Int(leaves[best].level)
+    for mask in 1:((1 << D) - 1)
+        mask & ~face == 0 || continue
+        below = ntuple(Val(D)) do d
+            (mask >> (d - 1)) & 1 == 0 && return node[d]
+            node[d] > 0 && return node[d] - 1
+            return (g.roots[d] << g.L) - 1                      # across the wrap
+        end
+        j = covering_leaf(leaves, g, below)
+        l = Int(leaves[j].level)
+        l > level_ && (best = j; level_ = l)
+    end
+    return best
+end
+
 """
     locate_point(forest, x) -> Union{Int,Nothing}
 
@@ -719,9 +760,12 @@ every tree query's is: serially it is also the block index of every
 [`FieldSet`](@ref) over `forest`, and over a distributed forest the
 block is stored by the rank whose [`blockrange`](@ref) contains it.
 
-Leaves own half-open boxes, so a point on a face shared by two leaves
-belongs to the upper one; a point on the domain's upper face belongs to
-the last leaf there. Along a periodic dimension `x` is wrapped into the
+A point on a face, edge or corner shared by leaves of two levels belongs
+to the finest leaf holding it in its closed box, as the finest level's
+copy of a point is its primary (M22, "Closed blocks" in `CODE.md`); among
+leaves of one level, whose data agree after a fill, to the upper one, as
+if leaves owned half-open boxes; a point on the domain's upper face
+belongs to the last leaf there. Along a periodic dimension `x` is wrapped into the
 domain first, beyond a reflecting face it is mirrored once, and beyond a
 rotating seam (M12) it is turned back into the quadrant by as many
 quarter turns as it lay away — which is where [`interpolate`](@ref)

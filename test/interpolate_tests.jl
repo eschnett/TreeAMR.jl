@@ -11,20 +11,32 @@
 
 using TreeAMR: query_stencil, stencil_hits, lagrange_weights, PointGeometry
 
-@testset "locate_point finds the leaf whose half-open box holds the point: D=$D" for
+@testset "locate_point finds the finest leaf holding the point: D=$D" for
         D in (1, 2, 3)
     # A wrong covering leaf is a wrong value everywhere downstream, and
     # the single search depends on the curve order putting an ancestor
     # just before its subtree. The oracle is the exact rational leaf box:
-    # the unique leaf with lo ≤ x < hi, the upper domain face going to
-    # the last leaf there.
+    # among the leaves whose closed box holds `x` (across a periodic wrap
+    # too), one of the finest; and the one with lo ≤ x < hi, the upper
+    # domain face going to the last leaf there, where that one is among
+    # the finest (M22 step 10c: a point on a coarse-fine face is read from
+    # the fine side, whichever side that is).
     rng = Xoshiro(20260925 + D)
     for trial in 1:8
         forest = random_forest(rng, Val(D); nsteps=12 * D, maxlvl=3)
         balance!(forest)
         roots = forest.roots
-        function oracle(x)
+        function finest(x)
             # A periodic dimension's upper face *is* its lower face.
+            x = ntuple(d -> forest.periodic[d] && x[d] == roots[d] ? 0.0 : x[d], D)
+            holds(k) = (b = leafbox(forest, k);
+                        all(d -> b[1][d] <= x[d] <= b[2][d] ||
+                                 (forest.periodic[d] && x[d] == 0 && b[2][d] == roots[d]), 1:D))
+            cands = findall(holds, forest.leaves)
+            top = maximum(j -> level(forest.leaves[j]), cands)
+            return filter(j -> level(forest.leaves[j]) == top, cands)
+        end
+        function oracle(x)
             x = ntuple(d -> forest.periodic[d] && x[d] == roots[d] ? 0.0 : x[d], D)
             hits = findall(forest.leaves) do k
                 lo, hi = leafbox(forest, k)
@@ -39,14 +51,18 @@ using TreeAMR: query_stencil, stencil_hits, lagrange_weights, PointGeometry
         append!(pts, [ntuple(d -> rand(rng, 0:(roots[d] << L)) / (1 << L), D)
                       for _ in 1:40])
         for x in pts
-            @test locate_point(forest, x) == oracle(x)
+            j, f = locate_point(forest, x), finest(x)
+            @test j in f
+            oracle(x) in f && @test j == oracle(x)
         end
         # Outside a non-periodic dimension there is nothing; a periodic
         # one wraps.
         for d in 1:D
             x = ntuple(e -> e == d ? roots[d] + 0.25 : 0.5, D)
             if forest.periodic[d]
-                @test locate_point(forest, x) == oracle(ntuple(e -> e == d ? 0.25 : 0.5, D))
+                w = ntuple(e -> e == d ? 0.25 : 0.5, D)
+                @test locate_point(forest, x) == locate_point(forest, w)
+                @test locate_point(forest, w) in finest(w)
             else
                 @test locate_point(forest, x) === nothing
             end
@@ -530,17 +546,18 @@ end
     # rounding (the weights sum in the other order), for an even number
     # of points, whose window is centered; an odd number's sits half a
     # node low by design. The mesh is refined symmetrically about the
-    # mirror plane, so the points' blocks are each other's images, but for
-    # a point on a coarse-fine face, `x₁ = 1` or `3`: the location is
-    # half-open (`locate_point`), so such a point is read from the fine
-    # block on one side and from the coarse one at its image, and the two
-    # differ by the interpolation error; those points are left out.
+    # mirror plane, so the points' blocks are each other's images, a point
+    # on a coarse-fine face, `x₁ = 1` or `3`, included: it is read from the
+    # finest block holding it on both sides (M22 step 10c), where a
+    # half-open location read the fine block on one side and the coarse
+    # one at the image. Cell-centered sets too: the location is the
+    # forest's.
     forest = Forest(ntuple(d -> d == 1 ? 4 : 2, D); N=8,
                     extents=ntuple(d -> (0.0, d == 1 ? 4.0 : 2.0), D))
     refine!(forest, filter(k -> block_extent(forest, k)[1][1] in (1.0, 2.0), forest.leaves))
     balance!(forest)
     g(x, v) = exp(-(x[1] - 2)^2) * prod(ntuple(d -> d == 1 ? 1.0 : cos(x[d]), D)) + v
-    for C in (vertexcentered(D), facecentered(D, 1))
+    for C in (vertexcentered(D), facecentered(D, 1), cellcentered(D))
         fs = FieldSet(forest, 2; G=3, centering=C)
         fill_by_coordinates!(g, fs)
         fill_ghosts!(fs, GhostSchedule(fs, Operators(prolongation=6, restriction=6));
@@ -548,8 +565,12 @@ end
         # Points on a grid of 1/256, so that the mirror image is exact,
         # near every block face along dimension 1 and between them.
         rng = Xoshiro(30 + D)
-        xs = [ntuple(d -> d == 1 ? rand(rng, setdiff(1:1023, (256, 768))) / 256 :
+        xs = [ntuple(d -> d == 1 ? rand(rng, 1:1023) / 256 :
                           rand(rng, 1:511) / 256, D) for _ in 1:200]
+        # And on the coarse-fine faces themselves, with every kind of
+        # transverse position.
+        append!(xs, [ntuple(d -> d == 1 ? x1 : rand(rng, 1:511) / 256, D)
+                     for x1 in (1.0, 3.0) for _ in 1:20])
         mirrored = [Base.setindex(x, 4 - x[1], 1) for x in xs]
         for n in (2, 4, 6)
             a = interpolate(fs, xs, Lagrange(n)).values
