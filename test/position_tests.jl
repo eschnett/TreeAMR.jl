@@ -408,11 +408,14 @@ end
 @testset "Every node, block face and domain edge is located as the forward map places it: D=$D, $T" for
     D in (1, 2, 3), T in (Float64, Float32)
     # Guards an inverse map that rounds differently from the forward one: a
-    # point on a face must land in the block above it, a node at the
-    # domain's high edge in the last block, whichever way the division in
-    # `locate_leaf` rounds.
+    # point on a face must land in a block whose closed box holds it, the
+    # finest such (M22 step 10c), and among blocks of one level in the one
+    # above it; a node at the domain's high edge in the last block,
+    # whichever way the division in `locate_leaf` rounds.
     for forest in (centred_forest(T, D; N=D == 3 ? 6 : 12), position_forest(T, D; N=6))
         n = 0
+        exts = [block_extent(forest, k) for k in forest.leaves]
+        holds(e, x) = all(d -> e[d][1] <= x[d] <= e[d][2], 1:D)
         for k in forest.leaves
             ext = block_extent(forest, k)
             h = spacing(T, forest, k)
@@ -422,10 +425,13 @@ end
                 x = ntuple(d -> TreeAMR.nodeposition(a[d], h, B[d], I[d], 1, nothing), D)
                 j = locate_point(forest, x)
                 j === nothing && (n += 1; continue)
-                e = block_extent(forest, forest.leaves[j])
+                e = exts[j]
                 top = ntuple(d -> TreeAMR.location_box(T, forest, 1)[d][2], D)
-                ok = all(d -> e[d][1] <= x[d] &&
-                              (x[d] < e[d][2] || e[d][2] >= top[d]), 1:D)
+                levels = [Int(forest.leaves[i].level) for i in eachindex(exts)
+                          if holds(exts[i], x)]
+                ok = holds(e, x) && forest.leaves[j].level == maximum(levels)
+                ok &= minimum(levels) < maximum(levels) ||
+                      all(d -> x[d] < e[d][2] || e[d][2] >= top[d], 1:D)
                 ok || (n += 1)
             end
         end

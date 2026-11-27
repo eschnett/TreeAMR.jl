@@ -3790,7 +3790,15 @@ first step on its own.
   so no leaf lies between the covering leaf and the node. The
   comparison is `curve_less` on `(root, padded coordinates, level)`, the
   same function `isless` on keys now calls, because the checking key
-  constructor cannot run in a kernel.
+  constructor cannot run in a kernel. A point exactly on a face, edge
+  or corner of its node (`locate_node` reports which) is also held by
+  the nodes below it along those dimensions, across a periodic wrap
+  too; `locate_leaf` searches each of them, at most `2^D − 1` more
+  searches, and keeps the finest covering leaf, so a point on a face
+  that leaves of two levels share is read from the finer, rule 1 of
+  "One value per point" under [Closed blocks](#closed-blocks). Among
+  leaves of one level the first search's, the upper, stays. A rotating
+  seam or a glue is not searched across.
 - **Folding at faces.** Along a periodic dimension the point is wrapped
   into the domain — and the *wrapped* point is what the stencil is built
   from. Beyond a reflecting face it is mirrored once, `x →
@@ -4126,9 +4134,10 @@ multi_indices(Val(D), maxorder)
   weights beside the element tables). The offsets are `nodeposition`'s,
   so a query at a node evaluates the polynomial where it interpolates
   the node, and reproduces it to a few roundings — for a node not on
-  the block's upper face, which belongs to the block above, as every
-  face point does, and is interpolated there to that block's accuracy
-  where the levels differ. The element is `q = ⌊t/(P+1)⌋`, with `t` the
+  the block's upper face where the block above is of the same level,
+  which reads it there, as every such face point does; where the levels
+  differ a face point is read from the finer block, and interpolated
+  there to that block's accuracy. The element is `q = ⌊t/(P+1)⌋`, with `t` the
   position in spacings from the block's origin, clamped to the block's
   elements, so a point on an element face takes the upper element. The
   weights `ℓᵢ(t) = λᵢ ∏_{j≠i}(t − oⱼ)` are M11's truncated Taylor
