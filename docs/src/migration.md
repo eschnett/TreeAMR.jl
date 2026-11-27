@@ -181,6 +181,13 @@ to make, in one place.
   only.
 - A zero that a seam's turn or a wall's parity negates is `+0`, not
   `−0`.
+- `interpolate!` and `locate_point` read a point lying exactly on a
+  face, edge or corner that leaves of two levels share from the finest
+  leaf holding it, on either side of the face; before 0.3 the
+  half-open rule gave it the upper leaf, coarse or fine. Among leaves
+  of one level the upper one still holds it. A value interpolated at
+  such a point moves by the scheme's error there, and its mirror image
+  now comes from the same level.
 - A cell-centered set's numbers are unchanged; a vertex-like set's
   change where half-open ownership made a mesh asymmetric (refined
   regions, walls, seams), by the scheme's error there.

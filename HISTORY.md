@@ -6586,6 +6586,43 @@ M12 was decided with Erik, after M7 and before M9b.
   the CPU does not. The assertion asked for more than the code
   promises, and now compares within `gputol(T)` of the maximum, as the
   same testset compares the fill.
+- *Step 10c, a point on a coarse-fine face (2026-11-27).* The review's
+  finding: step 9's mirror test of `interpolate!` had left out the
+  points on a coarse-fine face, because `locate_point`'s half-open rule
+  read such a point from the fine block where the fine block lay above
+  it and from the coarse one where it lay below, so a point and its
+  image were read by interpolants of different levels. The review's
+  decision, unconfirmed by Erik: location follows rule 1, a point on a
+  face, edge or corner that leaves of two levels share is read from the
+  finest leaf holding it in its closed box; among leaves of one level
+  the half-open rule stays, since their copies are one number after a
+  fill. No reason to keep the half-open rule at a coarse-fine face
+  turned up: the fine copy is the primary and the coarse one its
+  restriction, the choice is a property of the tree and so the same on
+  every rank, and the extra work is at most `2^D − 1` binary searches
+  for a point exactly on a face. Moved in the suite, at 8 threads and
+  at 1 alike: the position test that a node on a face lands in the
+  block above it (12 failures, on the nodes of coarse-fine faces),
+  whose oracle now says the rule, and the element test that a query at
+  a node reproduces it (`D = 2`, `P = 4`: a node on a lower face with a
+  finer block below is now read there, 5.3 × 10⁻⁷ off against `8 eps`),
+  which now leaves such nodes out as it left the upper face's; the
+  Metal device suite passed unchanged (2718). The mirror test takes the points on `x₁ = 1` and `3`
+  back, for vertex, face and cell sets in `D = 1–3`; the distributed
+  interpolation tests, whose points include every leaf's lower corner
+  on a refined mesh, agree with serial as before. The same step
+  reordered `CODE.md`'s "Closed blocks" (model first, the three
+  paragraphs on a state's copies merged into "Copies in a state") and
+  dropped from its "Why" the present-tense ownership work-arounds: the
+  `GroupKey` fields `low` (symmetric walls), `top` (the appendix of a
+  set interpolated across a glue) and `shift` (the half turn's seam
+  slab), and the measured asymmetries, 4.7 × 10⁻⁵ in
+  `test/walls_tests.jl` and 1.1 × 10⁻² in TreeGRRMHD's refined closed
+  box, which are recorded here. Of the ports only
+  TreeGeneralizedHarmonic (its horizon finder) and TreeWaveOLDG call
+  `interpolate!`; both suites pass against the step unchanged, 6349 and
+  10410 (1 broken, as before), and GH's printed numbers differ from
+  step 10b's in timings only.
 - *Step 10b, positions anchored at zero (2026-11-26).* TreeGeneralized-
   Harmonic's quadrant against its box drifted to `1e−8` at `h = 5/48`,
   the quadrant's corner (0) not the box's (−5/2) putting the same point
@@ -6637,7 +6674,7 @@ M12 was decided with Erik, after M7 and before M9b.
     per-step callback 3–6 % (with BS3 the callback also costs an
     evaluation a step, 246 against 186 in all); both keep the state
     unified to rounding at every step end (2.4e-16, and 0). The
-    migration note and "A state's secondaries" in `CODE.md` say what
+    migration note and "Copies in a state" in `CODE.md` say what
     reads a raw state; which way to go is open, for Erik.
   - *Stage W wrote reflecting faces.* `CellBoundary(g; wall =
     :prescribed)` wrote the wall plane of a reflecting or outflow face

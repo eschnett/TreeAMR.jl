@@ -729,6 +729,15 @@ Steps:
       against the box agree at `h = 5/48` at `main`'s level (4.0e−11 or
       better) and every port's suite passes against it. Numbered 10b so
       that the steps keep their numbers and the releases stay last.
+    - 10c. **A point on a coarse-fine face read from the finest leaf**
+      (the review's request): `locate_point` gives a point on a face,
+      edge or corner that leaves of two levels share to the finest leaf
+      holding it in its closed box, rule 1 of "One value per point";
+      among leaves of one level the half-open rule stays. And an
+      editing pass over [Closed blocks](CODE.md#closed-blocks). *Done
+      when* step 9's mirror test holds with the coarse-fine face points
+      put back, simulated ranks agree with serial, and the ports that
+      call `interpolate!` pass against it.
 11. **The releases**: `m22` merged, TreeAMR 0.3.0 first, and M21
     resumed on it.
 
