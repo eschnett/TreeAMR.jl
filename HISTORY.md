@@ -6573,6 +6573,19 @@ M12 was decided with Erik, after M7 and before M9b.
     harness-style launches pass on fc10209 and fc10508, and the CPU
     backend at four ranks under `--check-bounds=yes` is clean; both
     codes are queued pinned to fc10207 to tell the node from the code.
+- *The device regrid's bitwise claim (2026-11-26).* "Ghosts across a
+  glue and stage A run on the device" asserted `rd == rh`, the 2D
+  regrid on the device bit for bit the host's; on CUDA it failed for
+  Float32, on `main` too (`gpu_tests.jl:1197` there), and showed in step
+  9's CUDA suite because the testset was no longer pending. The review's
+  experiment (Symmetry H200, job 614429, CUDA.jl 6.4.2) regridded in
+  Float32 on both and in Float64 on the host: 951 of 9,072 entries
+  differ, by at most 2 ulps (1.19e−7), and the device and the host are
+  each at most 2.60 ulps from the Float64 regrid. Both round the same
+  sums correctly; CUDA contracts the prolongation's multiply-adds and
+  the CPU does not. The assertion asked for more than the code
+  promises, and now compares within `gputol(T)` of the maximum, as the
+  same testset compares the fill.
 - *PrecompileTools (2026-11-26).* Asked about "PrecompileTools as a
   dependency", Erik answered "yes, fine": step 9's last commit, the
   precompile workload, came onto the step-10 branch as it was, and
