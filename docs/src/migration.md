@@ -155,7 +155,10 @@ to make, in one place.
 - TreeAMR precompiles a fill (PrecompileTools, a new hard dependency):
   the package's own precompilation takes longer (2.3 → 16–21 s on a
   laptop, once per environment), and the first fill in a fresh process
-  comes sooner (9.3 → 2.5 s after the start).
+  comes sooner (9.3 → 2.5 s after the start). An environment that
+  takes TreeAMR from a checkout through `[sources]` needs `Pkg.resolve()`
+  once to pick up the new dependency; `Pkg.instantiate()` alone leaves
+  `using TreeAMR` failing to load PrecompileTools.
 
 - The fill runs its stages as A (kinked glues), W (prescribed walls),
   P (wall planes and a seam's axis), 0 (secondaries), 1, the hook, the
@@ -171,4 +174,9 @@ to make, in one place.
   written before 0.3 that holds such a set (M20's appendix and AMR-8's
   symmetric walls included); its cell-like sets still load through
   `load_checkpoint(…; fieldsets)`. Cell and element files load as
-  before. Whether a half-open file can be converted is open.
+  before. Erik decided (2026-11-26): every file written from 0.3 with a
+  vertex-like set carries the feature `closed_blocks`; a half-open file
+  with such a set, M20's `interpolated_glue` files included, is refused
+  and not converted, since the planes it lacks are what a fill with the
+  application's hook computes; and TreeIOHDF5 0.2.0, which bounds
+  TreeAMR at `=0.3.0`, is released right after TreeAMR 0.3.0.
