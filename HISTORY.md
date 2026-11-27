@@ -6614,6 +6614,41 @@ M12 was decided with Erik, after M7 and before M9b.
   the CPU does not. The assertion asked for more than the code
   promises, and now compares within `gputol(T)` of the maximum, as the
   same testset compares the fill.
+- *Step 10d, the anchor's fallback (2026-11-27).* Step 10b had left
+  open where positions are anchored when zero is not on a patch's grid,
+  the low corner as before, with Erik's own suggestion beside it. Erik
+  chose: "centre and symmetry face, unless there are disadvantages you
+  found that i haven't seen yet"; the review found none beyond its
+  table. Built per patch and dimension: zero first, then a symmetry
+  face (reflecting, or the seam's; the lower of two), then the centre,
+  `(T(lo) + T(hi))/2`. Measured on `[c − 1, c + 1]`, 48 cells, against
+  the low corner (old in brackets): mirror pairs about the centre that
+  differ, 15 (22) of 24 for `c = 0.3`, 15 (22) for 1/3, 9 (24) for 0.1,
+  12 (24) for 0.3 in `Float32`, at most an ulp; edges off their
+  extents, `c = 0.1` and the `Float32` case one ulp at the low edge
+  (old: one at the high edge), the others none; the half `[c, c + 1]`
+  reflecting at `c` against the full box, 11 (0), 14 (20), 9 (20) and 9
+  (25) of 25 nodes apart, at most 2 ulps. A reflecting high face only
+  anchors at `hi` (21 of 24 pairs apart, edges 1, 0); both reflecting
+  at `lo` (22, edges 0, 1). For `c = 0.3` the low corner had happened to
+  agree with the half on every node, and the centre does not: the
+  centre is `(T(c − 1) + T(c + 1))/2`, which is not `T(0.3)`. Where the
+  centre is the face's number and the spacings agree (`c = 0.75`,
+  `L = 5/2`) the half is the full box's upper half bit for bit. Of four
+  centre expressions, `T(lo) + (T(hi) − T(lo))/2` recovers a decimal
+  centre in 58 % of random boxes and `(T(lo) + T(hi))/2` in 48 %; the
+  latter is kept for its symmetry in the extents. Edge sweep over
+  55,200 boxes (five `c`, 368 `L`, the tests' roots and `N`): an edge
+  one ulp off in 15.1 % (`Float64`) and 16.8 % (`Float32`), never more,
+  against the low corner's high edge off in 24.5 % and 25.8 %, by up to
+  two ulps. What moved in the suite: four testsets that formed positions
+  or the domain's face from the low corner, and the node test's oracle
+  (the commit lists them). TreeIOHDF5 stores the extents, the faces and
+  the seam, and a reload derives the same anchor (a new testset there,
+  1163 tests against 1143). Every port's suite passes against the step
+  with its 10b counts: no port asserts bits or digests of an off-zero
+  domain. The suite: 201,236 tests at eight threads, 201,184 at one;
+  Metal `gpu_tests` 2718.
 - *Step 10c, a point on a coarse-fine face (2026-11-27).* The review's
   finding: step 9's mirror test of `interpolate!` had left out the
   points on a coarse-fine face, because `locate_point`'s half-open rule

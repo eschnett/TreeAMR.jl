@@ -739,6 +739,14 @@ Steps:
       when* step 9's mirror test holds with the coarse-fine face points
       put back, simulated ranks agree with serial, and the ports that
       call `interpolate!` pass against it.
+    - 10d. **The anchor's fallback** (Erik's choice, 2026-11-27: "centre
+      and symmetry face, unless there are disadvantages you found that i
+      haven't seen yet"): off zero, a patch is anchored at a symmetry
+      face of the dimension (reflecting, or the seam's), else at its
+      centre (*Positions* under [Centerings](CODE.md#centerings)).
+      *Done when* the rule is tested under each branch, the forward and
+      inverse maps agree there, a reloaded checkpoint keeps its anchor,
+      and every port's suite passes against it.
 11. **The releases**: `m22` merged, TreeAMR 0.3.0 first, and M21
     resumed on it.
 

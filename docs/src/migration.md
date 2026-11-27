@@ -108,18 +108,27 @@ to make, in one place.
 - **Positions are `nodeposition`'s, in tests too.** A test comparing
   positions bit for bit with `block_origins + (I − 1) h` fails against
   the kernels' `nodeposition`. Every position is now formed from the
-  patch's low corner and the block's integer corner, so two forests
-  whose patches start at different corners place the same physical point
-  alike only to rounding (TreeWaveOLDG's nested boxes against a uniform
+  patch's anchor and the block's integer corner, so two forests
+  anchored at different points place the same physical point alike
+  only to rounding (TreeWaveOLDG's nested boxes against a uniform
   box over the finest cube, element nodes off the integers: 3e-15 of the
   field). Where zero is on a patch's grid, positions are anchored at
   zero instead (step 10b): two domains that both have zero on their grid
   — a quadrant, bitant or half-turn domain and its full box — place a
   point alike bit for bit at any spacing, and a box centred on zero is
   exactly antisymmetric. Its edges are then `∓(n/2)·h`, one ulp off the
-  extents in about 6 % of boxes, always each other's negation. Domains
-  without zero on their grid keep the low corner, and compare to
-  rounding.
+  extents in about 6 % of boxes, always each other's negation. Off
+  zero (step 10d, Erik's choice) a patch is anchored at a symmetry face
+  along a dimension that has one — a reflecting face or a face of the
+  rotating seam, the lower of two — and at its centre, `(lo + hi)/2` in
+  the forest's type, otherwise. Every off-zero position moves from the
+  low corner's by an ulp or so, and so does any digest of one; off zero
+  a half domain agrees with its full one bit for bit only where its face
+  is the same number as the full one's computed centre, and positions
+  depend on the face kinds: the same extents with a reflecting face and
+  with an outer one place a point apart in the last bits. A checkpoint
+  reloads into the faces it was saved with, so its positions are the
+  saved ones.
 - A hand-written loop over `interiorview` that counts or sums visits
   every copy; skip the secondaries with `isprimary(primary_mask(fs), i…,
   b)`, as `primaries = true` does.
