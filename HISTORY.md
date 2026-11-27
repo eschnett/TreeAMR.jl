@@ -6529,6 +6529,50 @@ M12 was decided with Erik, after M7 and before M9b.
     mean of stage A and the wider patch-corner refusal, step 8; the
     memo, step 9); the vertex convergence table of step 3; and
     PrecompileTools as a hard dependency.
+- *Step 9's repeat of step 5's measurements (2026-11-26).* Snapshots of
+  88c9425 against the half-open baseline 02bf9d1, submitted by the
+  review under Erik's standing permission; `CODE.md` takes its current
+  numbers from these, and step 5's stay above.
+  - *Nested mesh, CPU* (Symmetry, EPYC 7543, job 614101; step 5 had a
+    7532): fill 602.6 → 608.1 ms at 1×1 (1.009), 336.0 → 333.6 at 2×1
+    (0.993), 209.5 → 205.9 at 4×1 (0.983), 44.4 → 41.9 at 8×8 (0.944);
+    stage 0 37.6, 19.1, 10.1, 1.8 ms, stage P 7.6, 3.3, 1.9, 0.33.
+    Schedule build, base → new: uniform at one thread cell 4.91 → 3.61
+    ms, vertex 4.94 → 8.28 (1.68×); nested cell 24.9 → 23.8, vertex
+    19.7 → 25.1 (1.27×); at eight threads uniform vertex 1.18 → 2.33
+    (1.98×), nested vertex 17.9 → 18.4 (1.03×) (step 5, before the
+    memo: 12.7× and 2.13× at one thread). First calls, least of three:
+    schedule compile 3.16 → 5.68 s (1.80×), fill compile 3.53 → 3.88
+    (1.10×), start to first fill 17.2 → 23.1 (1.34×), without
+    PrecompileTools (step 5: 1.44×, 1.09×, 1.21×).
+  - *Nested mesh, four H100s* (Fir fc10203, job 6386979, `N = 32`):
+    1 GPU 8.30 → 9.19 ms (1.107), stage 0 0.83; 2 staged 1.071, 2
+    direct 1.085, 4 staged 0.988, 4 direct 0.957.
+  - *Copy kernels, one H200* (job 614151), `fill_ghosts!`, 26 → 33
+    groups: +17 % at 512 × 16³, +25 % at 512 × 32³, +29 % at 8 × 128³.
+  - *Right-hand side three ways* (jobs 614145 and 614149): the numbers
+    now in `CODE.md`, "`map_blocks!` computes at every own point".
+  - *Weak scaling, Trillium* (four nodes, job 2939500, `bench/mpi.jl`,
+    run with `--queue compute`, since SimLaunch chose `debug`, which
+    allows four nodes 15 minutes): efficiency at 32 ranks of 8 threads
+    against one rank, two-level mesh, `rhs` 0.67 at `N = 16` (3.06 →
+    4.60 ms) and 0.76 at 32, `fill_ghosts` 0.59 and 0.63; uniform `rhs`
+    0.75. M7's table on `main` (step 7, Symmetry under HPC-X) had 0.54
+    and 0.68 for `rhs`, 0.45 and 0.62 for the fill: another machine, so
+    not a comparison of the code, but the closed fill scales as the
+    half-open one did, its loss again in the step from one rank to two.
+  - *The suite on CUDA* (one H200, job 614153): every group passes but
+    the device group's `D == 2 && @test rd == rh` in "ghosts across a
+    glue and stage A run on the device", Float32, twice — the assertion
+    that fails on `main` too (`gpu_tests.jl:1197` there). Not new;
+    unexplained.
+  - **(open)** *`mpi_device_tests` on Fir*: Float64 at four ranks
+    segfaulted once (job 6389475, node fc10207, staged in rank 0 and
+    direct in rank 1; Float32 and two and three ranks pass). The
+    half-open baseline passes on Fir, the same test and three
+    harness-style launches pass on fc10209 and fc10508, and the CPU
+    backend at four ranks under `--check-bounds=yes` is clean; both
+    codes are queued pinned to fc10207 to tell the node from the code.
 - *PrecompileTools (2026-11-26).* Asked about "PrecompileTools as a
   dependency", Erik answered "yes, fine": step 9's last commit, the
   precompile workload, came onto the step-10 branch as it was, and

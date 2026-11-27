@@ -12,9 +12,10 @@ steps 1–7 implemented; TreeWaveOLDG's acceptance remains. M20, finite
 differences on patches, has TreeAMR's step 4 implemented — ghosts
 interpolated across a glue; TreeWave on the patch systems remains. M22,
 closed blocks, is implemented in TreeAMR on the integration branch `m22`
-([Closed blocks](#closed-blocks)), its step 9's repeat of step 5's
-measurements on the finished branch outstanding; TreeIOHDF5, the
-downstreams and the releases follow. Next is visualization export
+([Closed blocks](#closed-blocks)), step 9's repeat of step 5's
+measurements taken on the finished branch, and TreeIOHDF5 and the
+downstreams ported on branches of their own (step 10); the releases
+follow. Next is visualization export
 (M9b). The plan is in [PLAN.md](PLAN.md).
 How the package got here — who decided what and when, the alternatives
 tried, measurements that later ones replaced, and the milestone records
@@ -1007,21 +1008,22 @@ combination of piece and child occurs once.
 
 **Stage 0 is a stage of its own** (Erik's decision, 2026-11-26, on the
 numbers below: "yes, for now. revisit this later, after stage 9").
-Measured in M22 step 5 against the half-open baseline 02bf9d1 —
-*taken at 96c24f6, before steps 6–8, the ghost-plane amendment and step
-9's faster schedule build, until step 9's repeat on the finished branch
-replaces them* (HISTORY.md, M22 step 5, has the jobs and every table):
+Measured in M22 step 9 on the finished branch (88c9425) against the
+half-open baseline 02bf9d1 (step 5's numbers, at 96c24f6, are in
+HISTORY.md, with every table):
 
 - on the CPU the closed fill costs what the half-open one did: on
   `bench/nested.jl`'s mesh (232 leaves, `N = 16`, 20 variables, `G = 3`,
-  order 6) 787.8 → 793.0 ms at one rank, 1.007, and 0.929 at 8 ranks of
-  8 threads on Symmetry's EPYC 7532, stage 0 58.3 ms of the 793;
+  order 6) on Symmetry's EPYC 7543, 602.6 → 608.1 ms at one rank
+  (1.009), 0.993 at two, 0.983 at four and 0.944 at 8 ranks of 8
+  threads; stage 0 37.6 ms of the 608 at one rank, stage P 7.6;
 - on a device it costs more, which is stage 0's own launches: the
-  nested mesh at `N = 32` on Fir's H100s 1.123 at one GPU, 1.077–1.080
-  at two and 0.96 at four; the uniform mesh on an H200 (`bench/copies.jl`,
-  26 → 33 groups) 1.18, 1.24 and 1.29 at `16³`, `32³` and `128³` blocks;
-- merging stage 0's restrictions across pieces (the prototype of step 5,
-  56 groups for 80) changed the fill by 0.997–1.006: nothing, and it was
+  nested mesh at `N = 32` on Fir's H100s 1.107 at one GPU, 1.071
+  (staged) and 1.085 (direct) at two, 0.988 and 0.957 at four; the
+  uniform mesh on an H200 (`bench/copies.jl`, 26 → 33 groups) 1.17,
+  1.25 and 1.29 at `16³`, `32³` and `128³` blocks;
+- merging stage 0's restrictions across pieces (step 5's prototype, 56
+  groups for 80) changed the fill by 0.997–1.006: nothing, and it was
   not kept.
 
 **(open)** Merging stage 0 into phase 1, every transfer reading
@@ -1292,16 +1294,18 @@ lowest patch. It has two uses, and they are the same query:
 **`map_blocks!` computes at every own point**, every copy; skipping the
 secondaries is the caller's choice through the mask, not a default, and
 has no keyword of its own (Erik's decision, 2026-11-26: "no skipping by
-default"). Measured in M22 step 5 with `bench/rhs.jl`, a 20-variable
-right-hand side of 540 ns a point on Symmetry's EPYC 7532 — *at 96c24f6,
-before steps 6–8* — skipping saves 3–10 % on the CPU (one thread: every
-point 539.6 ns a point against 478.0 launched over the primaries, then
-`unify!`, on the uniform mesh at `N = 16`; 541.0 against 494.5 on the
-nested one; 8 threads 70.9 against 64.7–64.9 uniform, and 71.0 against
-67.6, or 82.5 over the primaries, nested) and loses on an H200 in every
-case (uniform `N = 16` 0.541 against 0.614–0.623 ns, nested `N = 16`
-0.560 against 1.131–1.336), where `unify!` costs more than the skipped
-points save.
+default"). Measured in M22 step 9 with `bench/rhs.jl`, a 20-variable
+right-hand side of 540 ns a point on Symmetry's AMD node, at 88c9425:
+skipping saves 3–10 % on the CPU (one thread: every point 542.4 ns a
+point against 479.0–487.7 launched over the primaries, then `unify!`,
+on the uniform mesh at `N = 16`; 541.9 against 497.5–511.4 on the
+nested one; 8 threads 70.8 against 64.8–65.1 uniform, and 70.9 against
+67.6, or 82.3 over the primaries, nested) and loses on an H200 in most
+cases (uniform `N = 16` 0.540 against 0.607–0.615 ns, nested `N = 16`
+0.558 against 1.006–1.212), where `unify!` costs more than the skipped
+points save; `unify!` alone is 3–6 % of the every-point form at one
+thread, 6–10 % at eight, 10–23 % on the H200 and 89 % on the small
+nested mesh there.
 
 **Invariants.** The high exchange region is `G` points, as the low one
 is, so its condition is `N ≥ 2G` in every dimension, and nothing else
